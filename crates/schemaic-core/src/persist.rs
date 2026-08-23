@@ -739,8 +739,20 @@ pub fn save_ui_state(state: &UiState) {
 /// on that evidence. Widening a consent setting is not a decision to make from
 /// an absence, and the migration never re-resolves.
 pub fn legacy_ai_run_queries() -> Option<bool> {
-    let bytes = std::fs::read(config_path()?).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    legacy_ai_run_queries_in(&std::fs::read(config_path()?).ok()?)
+}
+
+/// [`legacy_ai_run_queries`]'s decision, over the bytes rather than the file.
+///
+/// Split out because the decision is the whole point and the `std::fs::read`
+/// put it out of reach: what counts as *evidence* that the user had the
+/// assistant running queries. Four answers, and three of them are `None` —
+/// unparsable JSON, no such key, a key holding something that is not a boolean.
+/// Only a recorded boolean is evidence, because the thing it decides is a
+/// one-way promotion of every saved connection to
+/// [`crate::connection::AiData::Full`].
+pub(crate) fn legacy_ai_run_queries_in(bytes: &[u8]) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     value.get("ai_run_queries")?.as_bool()
 }
 
@@ -820,7 +832,8 @@ pub fn clear_connections_backup() {
 mod tests {
     use super::{
         ConnectionsFile, FileStore, Load, RECOVERIES, RightPanelState, UiState, classify,
-        read_bytes, recover, recovery_notice, sibling, take_recoveries, write_bytes,
+        legacy_ai_run_queries_in, read_bytes, recover, recovery_notice, sibling, take_recoveries,
+        write_bytes,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1153,6 +1166,42 @@ mod tests {
         });
         assert_eq!(v, 0);
         assert!(corrupt.is_some());
+    }
+
+    /// **Widening a consent setting is not a decision to make from an absence.**
+    /// The one-way `AiData` migration promotes every saved connection to `Full`
+    /// on this answer and never re-resolves, so the three ways a file can fail
+    /// to say anything all have to read as "no evidence" — which is exactly what
+    /// `load_ui_state`'s `true` default got wrong, and the reason this function
+    /// exists at all. It opened with `std::fs::read`, so nothing could reach it.
+    #[test]
+    fn only_a_recorded_boolean_is_evidence_of_the_legacy_flag() {
+        // A recorded flag is read as written — both ways round.
+        assert_eq!(
+            legacy_ai_run_queries_in(br#"{"ai_run_queries": true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            legacy_ai_run_queries_in(br#"{"ai_run_queries": false}"#),
+            Some(false)
+        );
+        // A file that never mentioned the flag says nothing about it.
+        assert_eq!(legacy_ai_run_queries_in(b"{}"), None);
+        // Nor does one holding something that is not a boolean…
+        assert_eq!(
+            legacy_ai_run_queries_in(br#"{"ai_run_queries": "yes"}"#),
+            None
+        );
+        assert_eq!(legacy_ai_run_queries_in(br#"{"ai_run_queries": 1}"#), None);
+        assert_eq!(
+            legacy_ai_run_queries_in(br#"{"ai_run_queries": null}"#),
+            None
+        );
+        // …nor a file nothing can be got out of, nor an empty one.
+        assert_eq!(legacy_ai_run_queries_in(b"{"), None);
+        assert_eq!(legacy_ai_run_queries_in(b""), None);
+        // A top-level value that isn't an object has no key to read.
+        assert_eq!(legacy_ai_run_queries_in(b"true"), None);
     }
 
     #[test]

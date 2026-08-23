@@ -140,9 +140,83 @@ pub fn others_to_close(tabs: &[ClosableRef], conn: u64, keep: usize) -> Vec<usiz
         .collect()
 }
 
+/// The database a question about "the current tab" should be answered with:
+/// the focused tab's, but **only when that tab is on `active_conn`** —
+/// otherwise `fallback`, which the caller has already scoped to the active
+/// connection.
+///
+/// Switching connections does not move the focused tab, and a tab keeps the
+/// connection it was opened on, so the focused tab routinely names a database
+/// that exists somewhere else. Handing that name to the active connection's
+/// `Db` is how the MCP endpoint ended up asking MariaDB for `chinook`.
+///
+/// **Here, and not in each caller, because the callers are not all harmless.**
+/// Three ask this question — the AI's turn context, the terminal's DB-CLI
+/// button, and the AI proposal card — and the third pairs the answer with
+/// `edit_ctx`'s *active* connection and stamps that `conn_id` into the plan
+/// `run_ddl` executes: getting it wrong runs an `ALTER` on prod against a
+/// proposal written about dev. That one had the rule spelled out inline,
+/// expression for expression, with no test, because `schemaic-ui` cannot depend
+/// on `schemaic-app` — which made it a misplaced function rather than an
+/// unavoidable duplicate.
+pub fn scoped_database(
+    tab: Option<(u64, Option<String>)>,
+    active_conn: u64,
+    fallback: Option<&str>,
+) -> Option<String> {
+    tab.filter(|(conn_id, _)| *conn_id == active_conn)
+        .and_then(|(_, database)| database)
+        .or_else(|| fallback.map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_database_takes_the_tab_database_on_the_active_connection() {
+        let tab = Some((7, Some("classicmodels".to_string())));
+        assert_eq!(
+            scoped_database(tab, 7, Some("world")),
+            Some("classicmodels".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_database_ignores_a_tab_from_another_connection() {
+        // A tab keeps its own connection, so the active tab can name a database
+        // that doesn't exist on the connection the AI is bound to — handing that
+        // name over produced `Unknown database 'chinook'` against MariaDB. The
+        // active connection's own default stands in.
+        let tab = Some((9, Some("chinook".to_string())));
+        assert_eq!(
+            scoped_database(tab, 7, Some("classicmodels")),
+            Some("classicmodels".to_string())
+        );
+        // …and with no default to fall back on, nothing rather than the wrong
+        // connection's database. This is the case the AI proposal card turns
+        // into "switch to that tab first" rather than an `ALTER` on the wrong
+        // server.
+        assert_eq!(
+            scoped_database(Some((9, Some("chinook".into()))), 7, None),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_database_falls_back_for_no_tab_and_a_server_level_tab() {
+        assert_eq!(
+            scoped_database(None, 7, Some("world")),
+            Some("world".to_string())
+        );
+        // A tab on this connection but with no database (server-level) also
+        // takes the default, as it did before the connection guard.
+        assert_eq!(
+            scoped_database(Some((7, None)), 7, Some("world")),
+            Some("world".to_string())
+        );
+        assert_eq!(scoped_database(None, 7, None), None);
+    }
 
     /// Tabs interleaved across two connections, as the flat list really is.
     fn mixed() -> Vec<TabRef> {

@@ -28,9 +28,10 @@ static GLOBAL: heap::Tracking = heap::Tracking;
 use ai::{
     AiContextParams, AiSession, AiSettings, AiStreamMsg, RECAP_QUESTIONS, StartAiParams,
     active_tab_database, ai_context, apply_turn_delta, extract_sql, inline_system_prompt,
-    mcp_endpoint_from_env, render_recap, scoped_database, start_ai_session, turn_context,
+    mcp_endpoint_from_env, needs_respawn, render_recap, start_ai_session, turn_context,
 };
 use claude_cli::{claude_bin, claude_reachable, detect_claude_bin};
+use schemaic_core::tabsel::scoped_database;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -6232,29 +6233,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
             let active_id = active_conn.get_untracked();
             let data_now = conn_ai_data();
-            // A live session's tools and MCP blob were fixed at spawn, so
-            // tightening (or widening) the connection's data access has to
+            // A live session's tools and MCP blob were fixed at spawn, so a
+            // change to any setting that decides *what may leave* has to
             // respawn — otherwise the setting the user just changed keeps not
-            // applying, which is the worst possible failure for this control.
-            // The hidden set rides in the same once-written MCP blob, so it has
-            // the same rule: hiding a database mid-session used to leave
-            // `list_schema` enumerating it and its tables to the vendor.
-            let hidden_now = hidden_dbs.get_untracked();
-            let scope_now = ai_schema_scope.get_untracked();
-            let need_new = ai_session
-                .borrow()
-                .as_ref()
-                .map(|s| {
-                    s.conn_id != active_id
-                        || s.settings.data != data_now
-                        || s.settings.hidden != hidden_now
-                        // The tools list and the MCP blob are both written once
-                        // at spawn, so a mid-session change to this had to
-                        // respawn or the subprocess kept the old answer — the
-                        // same reason `data` and `hidden` are here.
-                        || s.settings.schema_scope != scope_now
-                })
-                .unwrap_or(true);
+            // applying, which is the worst possible failure for those controls.
+            // The rule is `ai::needs_respawn`, where a test can reach it.
+            let settings_now = ai_settings_now();
+            let scope_now = settings_now.schema_scope;
+            let need_new = needs_respawn(
+                ai_session
+                    .borrow()
+                    .as_ref()
+                    .map(|s| (s.conn_id, &s.settings)),
+                active_id,
+                &settings_now,
+            );
             // The live context as it stands *now* — the system prompt is written
             // once at spawn, so every later turn carries the delta (see
             // `apply_turn_delta`).

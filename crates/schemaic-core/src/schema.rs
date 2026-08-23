@@ -5698,13 +5698,19 @@ mod tests {
         assert_eq!(r.sql_mode.as_deref(), Some("NO_ENGINE_SUBSTITUTION"));
     }
 
-    /// **A keystroke before the reply lands must not cost the wrapper.** The
-    /// editor holds the body patch behind an equality guard so it can't
-    /// overwrite what somebody typed; the session state is not editable
-    /// anywhere, so it is applied either way — and on MySQL the `CREATE` it
-    /// wraps is preceded by a `DROP` that has already committed.
+    /// **The two appliers touch different fields**, which is what lets the
+    /// editor apply the session state unconditionally while holding the body
+    /// patch back: the session state is not editable anywhere, and on MySQL the
+    /// `CREATE` it wraps is preceded by a `DROP` that has already committed.
+    ///
+    /// It does **not** test *whether* the body patch is withheld. That decision
+    /// is `ddl::routine_source_outcome`, and this test's docstring used to claim
+    /// it — while nothing here computes the guard, and a live bug in exactly
+    /// that guard passed unchanged. The guard's own test is
+    /// `ddl::tests::a_keystroke_before_the_source_lands_leaves_the_draft_stale`,
+    /// which has a case per outcome including the one that destroys a routine.
     #[test]
-    fn session_state_survives_a_body_the_user_already_edited() {
+    fn the_two_source_appliers_touch_different_fields() {
         let mut r = RoutineInfo {
             body: "what the user typed".into(),
             ..Default::default()

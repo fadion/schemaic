@@ -911,22 +911,7 @@ pub(crate) fn active_tab_database(p: AiContextParams, fallback: Option<&str>) ->
             .find(|t| t.id == p.active.get_untracked())
             .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
     });
-    scoped_database(tab, p.active_conn.get_untracked(), fallback)
-}
-
-/// Pure core of [`active_tab_database`]: the tab's `(conn_id, database)` pair
-/// yields a database only when the connection matches; anything else falls back.
-///
-/// Also used by the terminal's DB-CLI button, which has the same question and
-/// the same way of getting it wrong.
-pub(crate) fn scoped_database(
-    tab: Option<(u64, Option<String>)>,
-    active_conn: u64,
-    fallback: Option<&str>,
-) -> Option<String> {
-    tab.filter(|(conn_id, _)| *conn_id == active_conn)
-        .and_then(|(_, database)| database)
-        .or_else(|| fallback.map(str::to_string))
+    schemaic_core::tabsel::scoped_database(tab, p.active_conn.get_untracked(), fallback)
 }
 
 /// The `- database: table, table` outline, filtered per the scope setting.
@@ -1033,20 +1018,68 @@ fn snapshot_databases(
     hidden_dbs: Memo<HashSet<String>>,
     active_db: Option<&str>,
 ) -> Vec<DbSnapshot> {
-    hidden_dbs.with_untracked(|hidden| {
-        db_nodes.with_untracked(|v| {
-            v.iter()
-                .filter(|n| schemaic_core::schema::db_contributes(hidden, &n.database, active_db))
-                .map(|n| {
-                    let schema = match n.schema.get_untracked() {
-                        SchemaState::Loaded(s) => Some(s),
-                        _ => None,
-                    };
-                    (n.database.clone(), schema)
-                })
-                .collect()
-        })
-    })
+    let all: Vec<DbSnapshot> = db_nodes.with_untracked(|v| {
+        v.iter()
+            .map(|n| {
+                let schema = match n.schema.get_untracked() {
+                    SchemaState::Loaded(s) => Some(s),
+                    _ => None,
+                };
+                (n.database.clone(), schema)
+            })
+            .collect()
+    });
+    hidden_dbs.with_untracked(|hidden| visible_snapshot(all, hidden, active_db))
+}
+
+/// The filtering half of [`snapshot_databases`], over plain data.
+///
+/// Split out because the guarantee the funnel's doc states — every prompt is
+/// filtered, because there is only one place that filters — was enforced by
+/// reading alone: the function takes two signals, so nothing could call it, and
+/// the two renderers it feeds take an already-filtered `&[DbSnapshot]`, so their
+/// tests never saw a hidden set at all. `db_contributes` is tested in core;
+/// *that this funnel is what calls it* was not.
+fn visible_snapshot(
+    all: Vec<DbSnapshot>,
+    hidden: &HashSet<String>,
+    active_db: Option<&str>,
+) -> Vec<DbSnapshot> {
+    all.into_iter()
+        .filter(|(database, _)| schemaic_core::schema::db_contributes(hidden, database, active_db))
+        .collect()
+}
+
+/// Does a change to the AI settings require the live session to be **replaced**,
+/// rather than carried into the next turn?
+///
+/// The rule is not "any setting changed": it is **a setting that decides what
+/// may leave this machine**. Those three ride in the tools list and the MCP
+/// blob, both written once at spawn, so a live session goes on applying the old
+/// answer — which is the worst possible failure for a control whose whole
+/// purpose is to withhold. `hidden` is the one that shipped without this: hiding
+/// a database mid-session left `list_schema` enumerating it and its every table
+/// to the vendor, while the *prompt* half of the same feature updated per turn,
+/// so the user watched the assistant stop volunteering the database with no way
+/// to know the tool it can call still saw it.
+///
+/// The other four settings ([`AiSettings::model`], `effort`, `cli_path`,
+/// `instructions`) decide how the assistant *answers*, and a change to one of
+/// them waits for the next session. This function records that split rather
+/// than endorsing it — nothing here is a judgement that waiting is right, only
+/// that waiting is what happens.
+///
+/// A different connection is always a new session: the level, the hidden set
+/// and the `Db` handle all belong to it.
+pub(crate) fn needs_respawn(live: Option<(u64, &AiSettings)>, conn: u64, now: &AiSettings) -> bool {
+    let Some((live_conn, prev)) = live else {
+        // No session yet — the next message spawns one.
+        return true;
+    };
+    live_conn != conn
+        || prev.data != now.data
+        || prev.hidden != now.hidden
+        || prev.schema_scope != now.schema_scope
 }
 
 /// What to call the SQL block carrying the editor's contents.
@@ -2131,48 +2164,148 @@ mod tests {
         assert!(!out.contains("Assistant:"));
     }
 
+    /// **The single funnel, checked rather than asserted in a doc comment.**
+    /// Every prompt the assistant gets is filtered here — the chat panel's
+    /// context and Ctrl+K's generator prompt both snapshot through it — and the
+    /// guarantee was enforced by reading: the funnel took two signals so nothing
+    /// could call it, and both renderers take an already-filtered slice so their
+    /// tests never saw a hidden set.
     #[test]
-    fn scoped_database_takes_the_tab_database_on_the_active_connection() {
-        let tab = Some((7, Some("classicmodels".to_string())));
+    fn a_hidden_database_is_not_in_the_snapshot_unless_it_is_the_one_being_worked_in() {
+        let all = || -> Vec<DbSnapshot> {
+            ["shop", "blog", "scratch"]
+                .into_iter()
+                .map(|d| (d.to_string(), None))
+                .collect()
+        };
+        let names = |v: Vec<DbSnapshot>| -> Vec<String> { v.into_iter().map(|(d, _)| d).collect() };
+        let hidden: HashSet<String> = ["blog".to_string(), "scratch".to_string()]
+            .into_iter()
+            .collect();
+
+        // Nothing hidden: everything contributes.
         assert_eq!(
-            scoped_database(tab, 7, Some("world")),
-            Some("classicmodels".to_string())
+            names(visible_snapshot(all(), &HashSet::new(), Some("shop"))),
+            vec!["shop", "blog", "scratch"]
+        );
+        // Hidden databases are gone — name, tables, columns and all.
+        assert_eq!(
+            names(visible_snapshot(all(), &hidden, Some("shop"))),
+            vec!["shop"]
+        );
+        // …except the one being worked *in*: a tab bound to a hidden database
+        // still runs there, and an assistant blind to its schema is useless in
+        // it. The same exception autocomplete makes.
+        assert_eq!(
+            names(visible_snapshot(all(), &hidden, Some("blog"))),
+            vec!["shop", "blog"]
+        );
+        // With no active database, the exception has nothing to except.
+        assert_eq!(names(visible_snapshot(all(), &hidden, None)), vec!["shop"]);
+        // The schema `Arc` rides along untouched — a pending node stays pending.
+        assert!(
+            visible_snapshot(all(), &HashSet::new(), None)[0]
+                .1
+                .is_none()
         );
     }
 
-    #[test]
-    fn scoped_database_ignores_a_tab_from_another_connection() {
-        // A tab keeps its own connection, so the active tab can name a database
-        // that doesn't exist on the connection the AI is bound to — handing that
-        // name over produced `Unknown database 'chinook'` against MariaDB. The
-        // active connection's own default stands in.
-        let tab = Some((9, Some("chinook".to_string())));
-        assert_eq!(
-            scoped_database(tab, 7, Some("classicmodels")),
-            Some("classicmodels".to_string())
-        );
-        // …and with no default to fall back on, nothing rather than the wrong
-        // connection's database.
-        assert_eq!(
-            scoped_database(Some((9, Some("chinook".into()))), 7, None),
-            None
-        );
+    fn settings() -> AiSettings {
+        AiSettings {
+            model: AiModel::Haiku,
+            effort: AiEffort::Medium,
+            data: AiData::OnRequest,
+            cli_path: String::new(),
+            instructions: String::new(),
+            schema_scope: SchemaScope::Active,
+            hidden: HashSet::new(),
+        }
     }
 
+    /// **The whole mechanism by which a tightened setting reaches a
+    /// conversation already open**, and it lived in a closure in `main.rs` with
+    /// nothing on it. The three that force a respawn are the three that decide
+    /// what may leave: they ride in the tools list and the MCP blob, written
+    /// once at spawn, so a live session goes on applying the old answer. That is
+    /// how hiding a database mid-session left `list_schema` still enumerating it
+    /// to the vendor while the prompt half of the same feature updated per turn.
     #[test]
-    fn scoped_database_falls_back_for_no_tab_and_a_server_level_tab() {
-        assert_eq!(
-            scoped_database(None, 7, Some("world")),
-            Some("world".to_string())
+    fn a_setting_that_decides_what_leaves_replaces_the_session() {
+        let live = settings();
+        assert!(
+            !needs_respawn(Some((7, &live)), 7, &settings()),
+            "nothing changed"
         );
-        // A tab on this connection but with no database (server-level) also
-        // takes the default, as it did before the connection guard.
-        assert_eq!(
-            scoped_database(Some((7, None)), 7, Some("world")),
-            Some("world".to_string())
-        );
-        assert_eq!(scoped_database(None, 7, None), None);
+        // No session yet is always a spawn.
+        assert!(needs_respawn(None, 7, &settings()));
+        // A different connection brings its own level, hidden set and handle.
+        assert!(needs_respawn(Some((9, &live)), 7, &settings()));
+
+        for (what, now) in [
+            (
+                "data",
+                AiSettings {
+                    data: AiData::SchemaOnly,
+                    ..settings()
+                },
+            ),
+            (
+                "hidden",
+                AiSettings {
+                    hidden: ["blog".to_string()].into_iter().collect(),
+                    ..settings()
+                },
+            ),
+            (
+                "schema_scope",
+                AiSettings {
+                    schema_scope: SchemaScope::None,
+                    ..settings()
+                },
+            ),
+        ] {
+            assert!(needs_respawn(Some((7, &live)), 7, &now), "{what}");
+        }
+
+        // And the four that decide how it *answers* wait for the next session.
+        // Recorded, not endorsed — see `needs_respawn`.
+        for (what, now) in [
+            (
+                "model",
+                AiSettings {
+                    model: AiModel::Opus,
+                    ..settings()
+                },
+            ),
+            (
+                "effort",
+                AiSettings {
+                    effort: AiEffort::High,
+                    ..settings()
+                },
+            ),
+            (
+                "cli_path",
+                AiSettings {
+                    cli_path: "/usr/local/bin/claude".to_string(),
+                    ..settings()
+                },
+            ),
+            (
+                "instructions",
+                AiSettings {
+                    instructions: "be terse".to_string(),
+                    ..settings()
+                },
+            ),
+        ] {
+            assert!(!needs_respawn(Some((7, &live)), 7, &now), "{what}");
+        }
     }
+
+    // The `scoped_database` tests moved to `core::tabsel` with the function, so
+    // the AI proposal card — which re-derived the same rule inline, on the path
+    // that stamps a `conn_id` into a `run_ddl` plan — is covered by them too.
 
     #[test]
     fn turn_delta_is_none_when_nothing_changed() {
