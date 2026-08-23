@@ -85,6 +85,26 @@ impl Chrome {
         !matches!(self.host, Host::MacOs)
     }
 
+    /// How many caption buttons we draw ourselves: minimize, maximize and close,
+    /// or none where the OS still draws them.
+    ///
+    /// [`Self::draws_own_controls`] answers *whether*; this answers *how much of
+    /// the title bar's trailing edge they occupy*, which is a different question
+    /// with a caller of its own. A modal's backdrop covers the whole window,
+    /// including the title bar, and the band the app then lays over it to keep
+    /// the window draggable has to stop exactly where the buttons begin — cover
+    /// them and they are as unreachable as they were before, stop short and a
+    /// strip of title bar is left undimmed and dead. The count is here rather
+    /// than at that band because it is a fact about *this platform's chrome*,
+    /// and the module rule is to ask the capability, never the host.
+    ///
+    /// A count, not a width: the pixels are the UI's (`window_chrome::CONTROL_W`
+    /// is the Windows caption metric), and core has no business holding a
+    /// measurement it cannot check.
+    pub const fn own_control_count(self) -> usize {
+        if self.draws_own_controls() { 3 } else { 0 }
+    }
+
     /// Do we have to provide our own resize handles?
     ///
     /// This is the one that bites: an undecorated Windows window has no
@@ -190,6 +210,26 @@ mod tests {
                 "{host:?} reserves header space that nothing occupies (or fails to)"
             );
         }
+    }
+
+    /// The trailing edge is reserved for buttons exactly when there are buttons
+    /// to reserve it for — the same shape as the leading inset above, at the
+    /// other end of the bar. A host that counted controls it doesn't draw would
+    /// leave a dead 138px hole in the drag band; one that drew controls it
+    /// doesn't count would have the band lie on top of them.
+    #[test]
+    fn controls_are_counted_exactly_where_they_are_drawn() {
+        for host in ALL {
+            let c = Chrome::of(host);
+            assert_eq!(
+                c.own_control_count() > 0,
+                c.draws_own_controls(),
+                "{host:?} disagrees with itself about whether it has caption buttons"
+            );
+        }
+        assert_eq!(Chrome::of(Host::Windows).own_control_count(), 3);
+        assert_eq!(Chrome::of(Host::Linux).own_control_count(), 3);
+        assert_eq!(Chrome::of(Host::MacOs).own_control_count(), 0);
     }
 
     /// A shadow is something we ask the OS for *because* the frame is gone. A

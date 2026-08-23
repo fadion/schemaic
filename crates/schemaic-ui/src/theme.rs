@@ -647,6 +647,12 @@ pub fn scrollbar_hover() -> Color {
 
 // Fixed chrome dimensions (logical px).
 pub const HEADER_H: f64 = 40.0;
+/// The rule under the header, and part of its [`HEADER_H`] (border-box), so it
+/// occupies the bar's last logical pixel. Named because a second view has to
+/// find it: the band `window_chrome::over_backdrop` lays over a modal stops
+/// short of the caption buttons, and the border running on under them has to be
+/// dimmed separately or the rule ends in a lit tail.
+pub const HEADER_BORDER: f64 = 1.0;
 pub const FOOTER_H: f64 = 28.0;
 pub const SCHEMA_W: f64 = 300.0;
 // AI and Terminal share this width (see `TERM_W` in lib.rs).

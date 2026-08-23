@@ -2914,6 +2914,16 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             .font_size(theme::FONT_TITLE)
     });
 
+    // The three grouped wrappers below and the modal layer around them all ask
+    // the same questions, so each is asked once. `modal_up` is also what the
+    // title-bar band is raised by, and the two must not be able to disagree:
+    // a band without a backdrop dims a live header, a backdrop without a band
+    // is the bug this whole layer exists to fix.
+    let ddl_modals_up = ddl_modals_up(&ui);
+    let workspace_modals_up = workspace_modals_up(&ui);
+    let settings_modals_up = settings_modals_up(&ui);
+    let modal_up = modal_backdrop_up(&ui);
+
     let root = stack((
         shell,
         conn_menu_overlay(ui.clone()),
@@ -2922,120 +2932,128 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         schema_settings_overlay(ui.clone()),
         activity_menu_overlay(ui.clone()),
         context_menu_overlay(ui.clone()),
-        find_overlay(ui.clone()),
-        // **Before the confirm below, because it raises one.** Siblings paint in
-        // tuple order, so a modal that can put a question up has to come *first*
-        // or its own panel covers the question: right-click a connection →
-        // Delete, and the "are you sure" opened behind Manage Connections, its
-        // backdrop dimming the modal that was still on top of it. The rule is
-        // the one the popup menu states at the end of this tuple — this is the
-        // second instance of it, and the reason it is worth stating as a rule.
+        // **Every modal, in one layer that starts below the title bar.**
         //
-        // Nothing else in the group below is reachable from here (the schema
-        // editors are opened from the tree, and a full-screen backdrop keeps the
-        // title bar out of reach while this is up), so moving it up costs
-        // nothing else its place.
-        manage_modal(ui.clone()),
-        // Error modal + open-transaction prompt + the shared confirm share one
-        // tuple element, for the same 16-arity reason as monitor/ERD below (and
-        // with the same fill-only-when-open wrapper, or it would eat every click).
-        {
-            let err_open = ui.overlay.error_modal_open;
-            let tx_prompt = ui.overlay.tx_prompt;
-            let confirm = ui.overlay.confirm;
-            let import_open = ui.import.target;
-            let designer_open = ui.ddl.designer;
-            let view_open = ui.ddl.view;
-            let trigger_open = ui.ddl.trigger;
-            let routine_open = ui.ddl.routine;
-            let object_open = ui.ddl.object;
-            let ddl_preview_open = ui.ddl.preview;
-            stack((
-                error_modal_overlay(ui.clone()),
-                confirm_overlay(ui.clone()),
-                import_view::import_overlay(ui.clone()),
-                table_designer::table_designer_overlay(ui.clone()),
-                view_editor::view_editor_overlay(ui.clone()),
-                // The trigger and routine editors share one tuple element —
-                // this stack is at Floem's 16-arity `ViewTuple` limit, and only
-                // one of the pair is ever painted (the trigger editor renders
-                // nothing while the routine editor it opened is up).
+        // "Modal" here is *what a surface does*, not what it is called. Find
+        // Anywhere is a palette that closes on a click away, and it is in here
+        // with the rest because it dims the window behind it exactly as they do
+        // — and because it had the bug they had, in a form of its own: its
+        // backdrop covered the title bar, so a press meant for the caption
+        // buttons landed on the click-away instead and the only thing that
+        // happened was the palette closing. The test is whether the surface
+        // paints `theme::modal_backdrop()`; every view in the app that does is
+        // in this layer.
+        //
+        // A backdrop is `absolute().inset(0)` *against its parent*, so what this
+        // wrapper is worth is where its box stops: `HEADER_H` down from the top.
+        // The scrim, and every panel centred in it, is bounded by that — which
+        // is what lets `WindowChrome::over_backdrop` lay a drag band across the
+        // title bar without ever landing on a modal. Hoisting the band over a
+        // full-window layer instead would have put it on top of whatever the
+        // modal had up there: a 620px-tall panel centred in a 700px window
+        // reaches into the top 40px, and its close × would have been answering
+        // to the window's caption buttons.
+        //
+        // The grouping pays for itself twice: this tuple was at floem's 16-arity
+        // limit, and five entries becoming one is the room the next overlay will
+        // want.
+        //
+        // **A modal that is not in here does not work at all** — its
+        // `inset(0)` would resolve against this box while `modal_up` says
+        // nothing is open, which is zero by zero. That is the guard: there is no
+        // way to add a modal to the app, forget the predicate, and have it look
+        // fine. Keep the two in step by construction, not by memory.
+        stack((
+            // First, so it keeps the place it had in the root stack: under every
+            // modal. A palette raised over one would be painted behind it, and
+            // that is the right way round — the modal is the thing being
+            // answered.
+            find_overlay(ui.clone()),
+            // **Before the confirm below, because it raises one.** Siblings paint in
+            // tuple order, so a modal that can put a question up has to come *first*
+            // or its own panel covers the question: right-click a connection →
+            // Delete, and the "are you sure" opened behind Manage Connections, its
+            // backdrop dimming the modal that was still on top of it. The rule is
+            // the one the popup menu states at the end of this tuple — this is the
+            // second instance of it, and the reason it is worth stating as a rule.
+            //
+            // Nothing else in the group below is reachable from here (the schema
+            // editors are opened from the tree, and a full-screen backdrop keeps the
+            // title bar out of reach while this is up), so moving it up costs
+            // nothing else its place.
+            manage_modal(ui.clone()),
+            // Error modal + open-transaction prompt + the shared confirm share one
+            // tuple element, for the same 16-arity reason as monitor/ERD below (and
+            // with the same fill-only-when-open wrapper, or it would eat every click).
+            {
+                let trigger_open = ui.ddl.trigger;
+                let routine_open = ui.ddl.routine;
                 stack((
-                    trigger_editor::trigger_editor_overlay(ui.clone()),
-                    routine_editor::routine_editor_overlay(ui.clone()),
+                    error_modal_overlay(ui.clone()),
+                    confirm_overlay(ui.clone()),
+                    import_view::import_overlay(ui.clone()),
+                    table_designer::table_designer_overlay(ui.clone()),
+                    view_editor::view_editor_overlay(ui.clone()),
+                    // The trigger and routine editors share one tuple element —
+                    // this stack is at Floem's 16-arity `ViewTuple` limit, and only
+                    // one of the pair is ever painted (the trigger editor renders
+                    // nothing while the routine editor it opened is up).
+                    stack((
+                        trigger_editor::trigger_editor_overlay(ui.clone()),
+                        routine_editor::routine_editor_overlay(ui.clone()),
+                    ))
+                    .style(move |s| {
+                        if trigger_open.get().is_some() || routine_open.get().is_some() {
+                            s.absolute().inset(0.0)
+                        } else {
+                            s
+                        }
+                    }),
+                    object_editor::object_editor_overlay(ui.clone()),
+                    ddl_preview::ddl_preview_overlay(ui.clone()),
+                    // **Last in this group, because the DDL preview raises it.**
+                    // `run_ddl` asks about every open transaction on the connection
+                    // *before* applying (`tx::ddl_blocking_tabs`), and the preview is
+                    // still on screen while it asks — painted earlier, the question
+                    // sat entirely behind the preview's own backdrop, so an Apply
+                    // looked hung on "Applying…" with nothing to answer and no way to
+                    // reach it. Same rule as `manage_modal` above and the popup menu
+                    // below: whatever can raise a question comes first.
+                    tx_prompt_overlay(ui.clone()),
                 ))
                 .style(move |s| {
-                    if trigger_open.get().is_some() || routine_open.get().is_some() {
+                    if ddl_modals_up() {
                         s.absolute().inset(0.0)
                     } else {
                         s
                     }
-                }),
-                object_editor::object_editor_overlay(ui.clone()),
-                ddl_preview::ddl_preview_overlay(ui.clone()),
-                // **Last in this group, because the DDL preview raises it.**
-                // `run_ddl` asks about every open transaction on the connection
-                // *before* applying (`tx::ddl_blocking_tabs`), and the preview is
-                // still on screen while it asks — painted earlier, the question
-                // sat entirely behind the preview's own backdrop, so an Apply
-                // looked hung on "Applying…" with nothing to answer and no way to
-                // reach it. Same rule as `manage_modal` above and the popup menu
-                // below: whatever can raise a question comes first.
-                tx_prompt_overlay(ui.clone()),
-            ))
-            .style(move |s| {
-                if err_open.get()
-                    || tx_prompt.get().is_some()
-                    || confirm.get().is_some()
-                    || import_open.get().is_some()
-                    || designer_open.get().is_some()
-                    || view_open.get().is_some()
-                    || trigger_open.get().is_some()
-                    || routine_open.get().is_some()
-                    || object_open.get().is_some()
-                    || ddl_preview_open.get().is_some()
-                {
-                    s.absolute().inset(0.0)
-                } else {
-                    s
-                }
-            })
-        },
-        plan_overlay(ui.clone()),
-        // Monitor + ER-diagram modals share one tuple element (the workspace stack
-        // is at Floem's 16-arity `ViewTuple` limit). The wrapper must fill the
-        // window when either is open — so their own `.absolute().inset(0)` resolves
-        // against the root and the dim backdrop covers everything — but stay
-        // out-of-flow (zero-size) when both are closed, or it would intercept every
-        // click meant for the app beneath it.
-        {
-            let mon_open = ui.overlay.monitor_open;
-            let erd_open = ui.overlay.erd;
-            let props_open = ui.overlay.properties;
+                })
+            },
+            plan_overlay(ui.clone()),
+            // Monitor + ER-diagram modals share one tuple element (the workspace stack
+            // is at Floem's 16-arity `ViewTuple` limit). The wrapper must fill the
+            // layer when either is open — so their own `.absolute().inset(0)` resolves
+            // against it and the dim backdrop covers everything below the title bar —
+            // but stay out-of-flow (zero-size) when both are closed, or it would
+            // intercept every click meant for the app beneath it.
             stack((
                 monitor_overlay(ui.clone()),
                 erd_overlay(ui.clone()),
                 properties::properties_overlay(ui.clone()),
             ))
             .style(move |s| {
-                if mon_open.get() || erd_open.get().is_some() || props_open.get().is_some() {
+                if workspace_modals_up() {
                     s.absolute().inset(0.0)
                 } else {
                     s
                 }
-            })
-        },
-        // The four settings/help modals share one tuple element — this stack is
-        // at Floem's 16-arity `ViewTuple` limit, the same squeeze the trigger and
-        // function editors are under above. They are mutually exclusive (each is
-        // reached from a different chrome control, and each takes the window with
-        // its own backdrop), and the wrapper fills only while one is open, or an
-        // always-full-window box would eat every click in the app.
-        {
-            let term_open = ui.term.settings_open;
-            let ai_open = ui.ai.settings_open;
-            let theme_open = ui.layout.theme_settings_open;
-            let help_open_g = ui.layout.help_open;
+            }),
+            // The four settings/help modals share one tuple element — this stack is
+            // at Floem's 16-arity `ViewTuple` limit, the same squeeze the trigger and
+            // function editors are under above. They are mutually exclusive (each is
+            // reached from a different chrome control, and each takes the window with
+            // its own backdrop), and the wrapper fills only while one is open, or an
+            // always-full-window box would eat every click in the app.
             stack((
                 term_settings_overlay(ui.clone()),
                 ai_settings_overlay(ui.clone()),
@@ -3043,13 +3061,24 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 help_overlay(ui.clone()),
             ))
             .style(move |s| {
-                if term_open.get() || ai_open.get() || theme_open.get() || help_open_g.get() {
+                if settings_modals_up() {
                     s.absolute().inset(0.0)
                 } else {
                     s
                 }
-            })
-        },
+            }),
+        ))
+        .style(move |s| {
+            if modal_up() {
+                s.absolute()
+                    .inset_top(theme::HEADER_H)
+                    .inset_left(0.0)
+                    .inset_right(0.0)
+                    .inset_bottom(0.0)
+            } else {
+                s
+            }
+        }),
         // **After every modal, on purpose.** A sibling paints in tuple order, so
         // anything before this is covered by it — and the shared popup menu is
         // opened from *inside* modals too (the designer's type shortcut), where
@@ -3289,12 +3318,105 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     // it cost a build where nothing was clickable). Eight small siblings are each
     // skipped on a miss, and the walk reaches `root`.
     //
-    // They also can't join `root`'s own tuple: that one is already at Floem's
-    // 16-arity `ViewTuple` limit (see the trigger/function editors sharing an
-    // element). An outer stack is the honest shape anyway — the frame is not one
-    // more overlay in the app, it is the window around all of them.
+    // An outer stack is the honest shape anyway — the frame is not one more
+    // overlay in the app, it is the window around all of them.
+    //
+    // **The title-bar band joins them, and for the same reason.** A modal's
+    // backdrop covered the header along with everything else, so the window
+    // could not be dragged, minimized, maximized or closed until it was
+    // dismissed — the resize edges were the only part of the frame that stayed
+    // reachable, precisely because they are mounted out here. The band sits
+    // *before* the zones so a press in the top corners still resizes rather
+    // than drags, which is the order the frame already reads in. It is two
+    // siblings for the same reason the zones are eight: the drag band, and the
+    // sliver of the header's rule that runs on under the caption buttons, which
+    // the band cannot dim without covering them.
     let [n, s, w, e, nw, ne, sw, se] = chrome.resize_zones();
-    stack((root, n, s, w, e, nw, ne, sw, se)).style(|s| s.size_full())
+    let [band, band_border] = chrome.over_backdrop(modal_up);
+    stack((root, band, band_border, n, s, w, e, nw, ne, sw, se)).style(|s| s.size_full())
+}
+
+/// The DDL/editor group's modals — is any of them up?
+///
+/// One list, read by the wrapper that gives them their box *and* by
+/// [`modal_backdrop_up`]. Spelling it twice is how the two drift apart, and the
+/// failure is silent in the worst direction: a modal the aggregate doesn't know
+/// about opens with the title bar left live and undimmed over it.
+fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
+    let err_open = ui.overlay.error_modal_open;
+    let tx_prompt = ui.overlay.tx_prompt;
+    let confirm = ui.overlay.confirm;
+    let import_open = ui.import.target;
+    let designer_open = ui.ddl.designer;
+    let view_open = ui.ddl.view;
+    let trigger_open = ui.ddl.trigger;
+    let routine_open = ui.ddl.routine;
+    let object_open = ui.ddl.object;
+    let ddl_preview_open = ui.ddl.preview;
+    move || {
+        err_open.get()
+            || tx_prompt.get().is_some()
+            || confirm.get().is_some()
+            || import_open.get().is_some()
+            || designer_open.get().is_some()
+            || view_open.get().is_some()
+            || trigger_open.get().is_some()
+            || routine_open.get().is_some()
+            || object_open.get().is_some()
+            || ddl_preview_open.get().is_some()
+    }
+}
+
+/// The workspace group's modals — Live Monitor, the ER diagram, Properties.
+fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
+    let mon_open = ui.overlay.monitor_open;
+    let erd_open = ui.overlay.erd;
+    let props_open = ui.overlay.properties;
+    move || mon_open.get() || erd_open.get().is_some() || props_open.get().is_some()
+}
+
+/// The settings/help group's modals.
+fn settings_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
+    let term_open = ui.term.settings_open;
+    let ai_open = ui.ai.settings_open;
+    let theme_open = ui.layout.theme_settings_open;
+    let help_open = ui.layout.help_open;
+    move || term_open.get() || ai_open.get() || theme_open.get() || help_open.get()
+}
+
+/// Is a **full-window modal backdrop** on screen?
+///
+/// The three groups plus the three surfaces mounted on their own, which is every
+/// view in the app that paints `theme::modal_backdrop()`. That is the test, and
+/// it is a test about behaviour rather than about naming: **Find Anywhere is in
+/// here** even though it is a palette that closes on a click away, because it
+/// dims the window exactly as a modal does and so had exactly a modal's bug —
+/// its backdrop covered the title bar, and a press aimed at the caption buttons
+/// only closed the palette.
+///
+/// Menus are not here and must not be: they are shrink-wrapped to their panel,
+/// they never cover the title bar, and raising the band over one would dim a
+/// header the user can still use.
+///
+/// Two things read this and they must agree — the modal layer's box (which
+/// starts below the title bar) and the band that then covers the title bar. If
+/// only the first knew, the band would never appear; if only the second did,
+/// it would dim a live header with no modal in sight.
+fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
+    let find_open = ui.overlay.find_open;
+    let manage_open = ui.conn.manage_open;
+    let plan_open = ui.overlay.plan_open;
+    let ddl = ddl_modals_up(ui);
+    let workspace = workspace_modals_up(ui);
+    let settings = settings_modals_up(ui);
+    move || {
+        find_open.get()
+            || manage_open.get()
+            || plan_open.get()
+            || ddl()
+            || workspace()
+            || settings()
+    }
 }
 
 // ── Header ────────────────────────────────────────────────────────────────
@@ -3631,7 +3753,10 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
             .items_center()
             .justify_between()
             .background(theme::bg_chrome())
-            .border_bottom(1.0)
+            // Named, because `window_chrome::over_backdrop` has to dim the run
+            // of this rule that passes under the caption buttons separately —
+            // the band it lays over the bar stops short of them.
+            .border_bottom(theme::HEADER_BORDER)
             .border_color(theme::border())
     })
 }

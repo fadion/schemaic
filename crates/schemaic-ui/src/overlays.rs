@@ -55,6 +55,15 @@ const MENU_EDGE_PAD: f64 = 4.0;
 /// glyph is only what is drawn in it.
 const MENU_ICON_DROP: f64 = 3.0;
 
+/// How far down the **window** the Find Anywhere palette hangs — a command
+/// palette is anchored near the top rather than centred, so it reads as
+/// something you summoned rather than something that interrupted you.
+///
+/// From the window's top edge, not its container's: `find_overlay` sits in the
+/// modal layer, which starts `theme::HEADER_H` down, and that is subtracted
+/// where the margin is set.
+const FIND_TOP: f64 = 80.0;
+
 /// Is the active connection read-only? Every schema-editing menu entry asks,
 /// because a write it can't perform is shown dimmed rather than hidden — a
 /// missing item reads as "not supported", a dimmed one as "not here".
@@ -3737,7 +3746,13 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                 panel_style(s)
                     .width(580.0)
                     .padding(15.0)
-                    .margin_top(80.0)
+                    // 80px from the top of the *window*, which is not the top of
+                    // this margin's container: the modal layer every backdrop
+                    // hangs in starts `HEADER_H` down, so the bar's height comes
+                    // off the figure. Written as the subtraction rather than as
+                    // the answer, because 40 next to a 40px-tall title bar reads
+                    // like a coincidence.
+                    .margin_top(FIND_TOP - theme::HEADER_H)
                     .border_color(theme::modal_border())
             });
 

@@ -1164,8 +1164,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     modal over the new one.
   - `window_chrome.rs` — which half of the window frame the app draws itself, now that it launches
     with `WindowConfig::show_titlebar(false)`. `Chrome::current()` answers per `Host`
-    (Windows/Linux/macOS): `draws_own_controls`, `draws_own_resize_border`, `wants_drop_shadow`,
-    `leading_inset`. **Ask the capability, never `cfg!(target_os = …)` at the use site** — the same
+    (Windows/Linux/macOS): `draws_own_controls`, `own_control_count`, `draws_own_resize_border`,
+    `wants_drop_shadow`, `leading_inset`. **Ask the capability, never `cfg!(target_os = …)` at the
+    use site** — the same
     rule the engines follow, for the same reason. The split is not cosmetic: floem reads that one
     flag as *undecorated* on Windows/Linux but as a *transparent* title bar over a full-size content
     view on macOS, so the traffic lights, the native resize border and the move behaviour all
@@ -1173,6 +1174,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `leading_inset` reserves it. The Windows half is the one with teeth: winit strips
     `WS_CAPTION | WS_SIZEBOX` from an undecorated window, so without our own edge zones the window
     cannot be resized at all. `ui::window_chrome` draws what this module decides.
+    `own_control_count` is the *how much* to `draws_own_controls`'s *whether*, and it has a caller
+    of its own: the band the app lays over a modal's backdrop to keep the title bar working has to
+    stop exactly where the caption buttons begin. A count, not a width — the pixels are the UI's.
   - `tx.rs` — the **manual-transaction** state machine behind `TxMode::Manual` (no DB, no UI).
     Two engines only: **SQLite has no manual mode**, so the status-bar segment offering it is
     hidden on such a connection and `Session::open` refuses one — not because SQLite lacks
@@ -2576,6 +2580,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     never under a full-window parent, which would swallow every press in the app (see *Floem 0.2
     gotchas*, "a full-window sibling ends the pointer walk"); they wrap the root rather than
     joining its tuple because that one is at Floem's 16-arity limit.
+    `over_backdrop` joins them out there, and for the same reason: **a modal used to take the
+    window frame with it.** Every backdrop covers the whole window, the title bar included, so with
+    a modal up the window could not be dragged, minimized, maximized or closed until it was
+    dismissed — the resize edges were the only part of the frame that stayed reachable, precisely
+    because they are mounted outside the root. `over_backdrop` is one draggable strip across the
+    bar, raised only while `modal_backdrop_up` says a backdrop is on screen, carrying the scrim
+    colour itself (the modal layer no longer reaches the header) and stopping short of the caption
+    buttons at `controls_width` so the *header's own* buttons stay the live ones — one set of
+    close handlers, and the strip it leaves clear is exactly the strip that still works. It is
+    deliberately not a copy of the header: a press anywhere along it moves the window, because
+    nothing else up there does anything while a modal is up and a real title bar drags from
+    anywhere. It sits **before** the resize zones, so the top corners still resize rather than
+    drag. `controls_width` is the one place `CONTROL_W` meets `Chrome::own_control_count`, and a
+    source-scanning test pins that against the buttons `controls` actually builds — a fourth
+    caption button added without touching the count would leave 46px of title bar dimmed and dead.
+    It returns **two** siblings, not one, for the reason the zones are eight: the header's
+    `border_bottom` (`theme::HEADER_BORDER`, inside the 40px box) is one rule across the whole
+    width, and the band stopping short of the buttons left it dimmed up to them and lit for the
+    last 138px. The second view dims that sliver, and is `pointer_events(false)` — paint only,
+    since it lies across the bottom edge of all three buttons and a 1px sibling on top of a control
+    still ends the walk. That flag's usual objection (it takes the subtree with it) costs nothing
+    on a view with no children.
   - `trigger_editor.rs` — the **trigger** modal, over `core::ddl`'s
     `TriggerSetDraft`. Reached from the schema context menu's per-table
     **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
@@ -2705,7 +2731,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     check what was sent snapped shut the moment the answer landed. That scope outlives the rebuilds
     and dies with the message.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
-    menu, generic grid popup, Find-Anywhere, error modal.
+    menu, generic grid popup, Find-Anywhere, error modal. **What separates the two kinds here is
+    the backdrop, not the name.** The menus are shrink-wrapped to their panel; Find-Anywhere and
+    the error/confirm/transaction prompts paint `modal_backdrop()` over the window, which puts
+    them in `workspace`'s modal layer with the rest of the modals. Find-Anywhere is the one that
+    looks like it belongs on the other side of that line — it is a palette, and a click away
+    closes it — and it is the reason the line is drawn where it is: mounted with the menus, its
+    backdrop covered the title bar, and a press aimed at the caption buttons found the click-away
+    instead, so the only thing the window did was dismiss the palette. Its `FIND_TOP` is measured
+    from the top of the *window*, so the layer's `HEADER_H` comes off it where the margin is set.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav). The standalone objects hang off the same levels the tables do, in
     `Types`/`Domains`/`Sequences`/`Functions`/`Procedures` folders after them
@@ -4223,6 +4257,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   full-window wrapper first — one holding no handler at all, on the theory that a view returning
   `Continue` passes the press on. It does not; the walk had already ended at it, and **nothing in
   the app was clickable**.
+- **An absolute child resolves against its direct parent, and that is a lever, not just a hazard.**
+  Floem does not look for a nearest *positioned* ancestor the way CSS does: an
+  `absolute().inset(0)` child fills whichever box its parent happens to be. Every modal backdrop in
+  the app is written that way, so what they cover is decided entirely by the wrapper they are
+  mounted in — and `workspace` uses that to hold all of them in **one modal layer inset
+  `HEADER_H` from the top** (*all*: the membership test is "does this view paint
+  `modal_backdrop()`", which is why the Find Anywhere palette is in there beside the DDL editors),
+  which is what leaves the title bar free for
+  `window_chrome::over_backdrop`'s drag band. The alternative, hoisting the band above a
+  full-window layer, would have put it on top of whatever the modal had in that strip: a 620px
+  panel centred in a 700px window reaches into the top 40px, and its close × would have been
+  answering to the window's caption buttons. The same lever has a matching trap — a wrapper that
+  is *zero-sized* (the out-of-flow state every one of these overlays takes when closed) gives its
+  absolute children a zero box, so a modal left out of the layer's `modal_backdrop_up` predicate
+  does not open half-right, it does not open at all. That is deliberate: the loud failure is the
+  guard that keeps the layer and the predicate in step.
 - **And nothing bounds them.** An absolute child is out of flow, so text in one that is longer than
   the box lays out at its natural width and **paints across the border** into whatever sits beside
   it — not clipped, not ellipsized. `edit_field`'s placeholder did this for every field in the app
