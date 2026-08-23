@@ -126,6 +126,16 @@ pub struct UiTheme {
     /// The tab close (×) glyph — a fixed, muted tint (doesn't follow the label).
     pub tab_close: Color,
     pub accent: Color,
+    /// Hover brighten for an **accent-coloured control that carries no fill** —
+    /// the results strip's read-more offer. Same hue as [`Self::accent`], one
+    /// step more prominent, in the same spirit as `grid_edit_staged_hover`.
+    ///
+    /// **Not "a lighter accent".** It moves *away from the surface*, which is
+    /// lighter on dark and **darker on light**: the light palette's accent
+    /// (`#3D66D6`) already sits on a near-white `bg_results`, and lightening it
+    /// there walks a Body-weight label towards failing AA rather than
+    /// emphasising it. A hover that reduces contrast is not a hover.
+    pub accent_hover: Color,
     pub cmdk_placeholder: Color,
     pub cmdk_text: Color,
     pub diff_add_bg: Color,
@@ -334,6 +344,8 @@ impl UiTheme {
             tab_text: c("#707485"),
             tab_close: c("#323543"),
             accent: c("#7C9CF0"),
+            // A tint of the accent towards white — same hue, ~25% of the way.
+            accent_hover: c("#A3BCF8"),
             cmdk_placeholder: c("#353A43"),
             cmdk_text: c("#AAB1BE"),
             diff_add_bg: c("#1E3A24"),
@@ -479,6 +491,9 @@ impl UiTheme {
             tab_text: c("#8A8F9E"),
             tab_close: c("#C2C6D0"),
             accent: c("#3D66D6"),
+            // The same step, taken the other way: on a near-white results
+            // surface the more prominent blue is the *deeper* one.
+            accent_hover: c("#2B4FB0"),
             cmdk_placeholder: c("#B9BDCA"),
             cmdk_text: c("#2B2E3A"),
             diff_add_bg: c("#E2F3E6"),

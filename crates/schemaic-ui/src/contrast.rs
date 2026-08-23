@@ -431,6 +431,12 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // ── Results grid.
     pair!(text on bg_results, Body, "grid: a cell value"),
     pair!(text_faint on bg_results, Recessive, "grid: a NULL / auto placeholder"),
+    // The results strip sits on the panel's own surface, so its accent is a
+    // `bg_results` pair and not the `bg_panel` one above. Body, not Icon: it is
+    // a word the user has to read and press, at `FONT_LABEL`.
+    pair!(accent on bg_results, Body, "grid toolbar: the read-more offer"),
+    pair!(accent_hover on bg_results, Body, "grid toolbar: that offer, hovered"),
+    pair!(text_dim on bg_results, Body, "grid toolbar: the stats line"),
     pair!(text_dim on bg_header_row, Body, "grid: a column name"),
     pair!(text_faint on bg_header_row, Recessive, "grid: the type line under a name"),
     pair!(chip_active on bg_header_row, Body, "grid: the sorted column's name"),

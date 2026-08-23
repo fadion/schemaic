@@ -1809,9 +1809,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
         whose `None` namespace means "this engine has none", `find`'s means "the statement didn't
         say", so it matches by name alone and **only when exactly one table carries it**: an
         unqualified PostgreSQL name resolves through `search_path`, which the client does not know.
-      - `rows_read_of` is the toolbar's row segment (`1k` alone, or `1k of ~4.2m`), and it drops a
-        total at or below what was already read — `1k of ~400` reads as a bug rather than as the
-        stale estimate it is. `truncate_prompt`/`drop_prompt` are the destructive confirmations'
+      - `rows_read_clause` is the toolbar's whole row segment — figure, noun, and the `(capped)`
+        notice — and the reason it is one function rather than three fragments the view assembles
+        is that only the composition can decide whether the notice is still needed. Its private
+        half `rows_read_of` prints `1k` alone or `1k of ~4.2m`, dropping a total at or below what
+        was already read (`1k of ~400` reads as a bug rather than as the stale estimate it is);
+        **whether that comparison got printed is then what silences the word.** A total is in hand
+        only for a capped read — `grid_view`'s `scanned` is gated on `truncated` before the
+        catalogue is asked — so `200k of ~292.02k rows` cannot mean anything but a read that
+        stopped short, and `200k of ~292.02k rows (capped)` spent nine characters restating it on
+        a strip already wide enough to push its own buttons off a narrow panel. The word stays
+        wherever there is no comparison to make. The noun follows the last figure named, which is
+        the total when there is one: `1 of ~4.2m row` and `0 of 1 rows` are both wrong.
+        `truncate_prompt`/`drop_prompt` are the destructive confirmations'
         wording, and they name a figure only above `CONFIRM_ROW_FLOOR` (1,000) when it is an
         *estimate*: the point of naming one is scale, and InnoDB's sampled `TABLE_ROWS` is at its
         least reliable exactly below that — it reports 0 for a table holding a handful of rows, so
@@ -3196,9 +3206,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   pressing, and rounded up to two significant figures so the offer reads as a figure rather than as
   arithmetic. **The step alone is not the offer, because it can name rows that do not exist**:
   `stats::read_more_offer` takes the same `row_total` the stats line prints and, when the step
-  already covers it, says *"read all ~292.02k rows"* instead. That case shipped wrong — a 200k read
-  of a ~292k table stepped to a million and the toolbar read "read 1m rows", on a line that had
-  just described the table as ~292.02k. The total is consulted, never trusted: it is usually the
+  already covers it, says *"read all rows"* instead. That case shipped wrong — a 200k read of a
+  ~292k table stepped to a million and the toolbar read "read 1m rows", on a line that had just
+  described the table as ~292.02k. It then shipped wrong the other way: *"read all ~292.02k rows"*
+  named the total a second time, three words from where `rows_read_clause` had already printed it,
+  and the pair was the widest thing on the strip. **The offer names a figure only when the figure
+  is its own** — the step is a number that appears nowhere else on the line, and dropping it would
+  leave "read more" implying a cursor the row cap has none of; "all" needs no number, because
+  there is only one thing it could mean. The total is consulted, never trusted: it is usually the
   engine's sampled estimate, so the cap that goes with "read all" is the total *rounded up*, and an
   estimate that was low simply comes back capped and offers again. A total at or below the rows
   already read is stale and says nothing, the same rule `rows_read_of` follows. The offer is a
@@ -3211,6 +3226,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (`an_ineligible_base_is_still_ineligible_with_nothing_to_splice` pins the premise). Clearing the
   override on a fresh manual run is the other half: a raised cap belongs to the result it was
   raised for, and carrying it forward would be the global setting the user didn't change.
+  **The offer wears the accent, and its separator does not.** It shipped `text_dim` like the
+  description beside it, reaching the accent only under the pointer — which put the one escape from
+  the row cap behind a hover nobody had a reason to perform. It is now accent at rest (registered
+  as `accent on bg_results` in `contrast.rs`, Body threshold) and **stays blue on hover**, stepping
+  to `accent_hover`: trading the accent for `text` on hover read as the link switching off at the
+  moment it was aimed at. `accent_hover` is a themed role and deliberately not "a lighter accent" —
+  it moves *away from the surface*, which is lighter on dark (`#7C9CF0` → `#A3BCF8`, 6.5:1 → 9.18:1
+  on `bg_results`) and **darker on light** (`#3D66D6` → `#2B4FB0`, 5.03:1 → 7.19:1), because
+  lightening the light palette's accent on a near-white surface walks a Body-weight label towards
+  failing AA. A hover that reduces contrast is not a hover. Both states are registered pairs, so
+  the suite measures them in every theme. That makes it two views rather than one string — the `·` stays `text_dim`,
+  because a blue separator reads as part of the link — and the colour is driven off an explicit
+  `offer_hov` signal rather than `.hover()`, since a parent's hover colour does not cascade to a
+  child and the click target is the pair.
   **The statement timeout is a clock wired to the Cancel button, not a second way to stop a
   query.** `RunTimeout::arm` spawns one sleeper racing a `done` token and, when the sleep wins,
   cancels *the run's own* `CancellationToken` — the same one Cancel fires, which each backend
@@ -5330,7 +5359,7 @@ for keyboard nav.
   catch. `sql::use_target` reads it and is deliberately conservative: a `USE` it can't read plainly
   drops the label to `None`, which prints nothing, rather than carrying a name now certainly wrong.
 - **A capped result says what it capped, when it can say it honestly**: the stats line reads
-  `1,000 of ~4.2m rows (capped)` rather than `1,000 rows (capped)`. Three things have to line up, and
+  `1,000 of ~4.2m rows` rather than `1,000 rows (capped)`. Three things have to line up, and
   `grid_view`'s `row_total` memo is where they do. The read must be capped
   (`ResultSet::truncated`); `grid_query` must be empty, because a spliced header filter re-runs a
   statement that is *not* `base_sql`; and `base_sql` must return the table entire
@@ -5342,10 +5371,22 @@ for keyboard nav.
   live on that slot and dropped it immediately, and an ask that ran only at grid-build time meant
   `of ~2.84m` vanished from an unchanged on-screen result and never came back — unless the *opt-in*
   size column happened to be on and that database expanded, which is the tree's refetch and not this
-  one. A repeated ask is free: the slot is the guard. `plural` still follows the rows
-  actually *read*: they are the subject of the sentence, and `1 of ~4.2m row` is the wrong noun.
-  The cap itself is unchanged and is still a **client-side stream cutoff**, not a `LIMIT`; this only
-  says how much of the table went past it.
+  one. A repeated ask is free: the slot is the guard. The wording of the segment — including
+  whether `(capped)` is still worth saying once the comparison is there, and which figure the noun
+  agrees with — belongs to `stats::rows_read_clause`, not to the view; the view supplies
+  `truncated` and the total and prints what comes back. The cap itself is unchanged and is still a
+  **client-side stream cutoff**, not a `LIMIT`; this only says how much of the table went past it.
+- **The results strip shrinks its prose, never its controls.** It is one flex row — stats, the
+  read-more offer, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
+  flex row squeezes its children before it overflows, so whichever child refuses to shrink is the
+  one that wins. The description lost that fight by default: at a 200k cap on a ~292k table the
+  line was long enough to push the icon cluster off the right edge of a narrow panel, and the user
+  saw a sentence where the export button should be. The rule is now explicit — `min_width(0)` +
+  `text_ellipsis` on the stats label and on both warnings, `flex_shrink(0)` on the icon cluster and
+  on the read-more label. A control clipped in half is not a control, while a description ending in
+  `…` is still one; and the read-more offer counts as a control, not as prose, even though it is
+  made of words. The `dyn_container` wrapping the sort caveat needs the `min_width(0)` too — a
+  wrapper sitting at its min-content width holds the text at full size however the child is styled.
 - **The RESULTS title bar carries Properties, Live Monitor and the editor-collapse toggle**, in that
   order and all tooltipped. Properties leads because it describes the table as it stands while the
   monitor watches it change — the same order the schema tree's Read group puts them in. Both act on
