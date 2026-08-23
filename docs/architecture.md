@@ -2285,6 +2285,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the four floem work-arounds a keyboard-operable dropdown needs). `themed_toggle` and
     `settings_dropdown` are the un-ringed builders beneath, and are **private** on purpose: a
     control nobody can Tab to is one left out of the modal's keyboard order by accident.
+    `log_row` is the General section's one non-toggle: it names the log's **full path** (`log_hint`,
+    which is the pure half and is tested) and reveals the folder holding it through
+    `Ui::open_config_dir`. The log had been written and rotated since `logging.rs` landed, and
+    locating it was still the user's problem — the one artefact a crash report needs sat at a path
+    the app never said out loud, which the panic hook made worse by putting more in it. The
+    *directory*, not the file: `schemaic.log` has no natural handler on Windows, `schemaic.log.1`
+    is a second file worth reaching, and the same folder holds `tabs.json` and `connections.json`.
+    Spawning a file manager is a process launch, so it is the app boundary's `open_config_dir` and
+    not a `Command` in a view; a machine with no config directory gets the path-less hint and a
+    disabled button rather than a control that silently does nothing.
   - `shortcuts.rs` — the app's keyboard shortcuts as **one table** (`SHORTCUTS`), which
     `settings::help_overlay` renders straight from — plus the tests that keep it honest. This list
     is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance of any

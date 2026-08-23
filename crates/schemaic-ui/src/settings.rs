@@ -10,7 +10,8 @@ use floem::prelude::*;
 
 use crate::consts::{CHAT_PAD_H, TERM_FONT_SIZES};
 use crate::widgets::{
-    autohide, focus_root_with_ring, form_hint, form_label_style, modal_title, panel_style,
+    ActionKind, action_button, autohide, focus_root_with_ring, form_hint, form_label_style,
+    modal_title, panel_style,
 };
 use crate::{AiEffort, AiModel, FieldCfg, SchemaScope, TermCursor, Ui, edit_field, icons, theme};
 
@@ -982,6 +983,48 @@ fn thousands(n: usize) -> String {
 }
 
 // A bold section header separating the functional groups.
+/// Where the app's log lives, as the Settings row's hint.
+///
+/// The **full path**, not "your config directory": the row exists because the
+/// log was undiscoverable, and a description of the location is not the
+/// location. It stays readable even where the button cannot work — a headless
+/// or sandboxed machine with no file manager — which is the case the fallback
+/// string is for.
+fn log_hint(dir: Option<&std::path::Path>) -> String {
+    match dir {
+        Some(d) => format!("Diagnostics, including crashes, are written to {}.", d.join("schemaic.log").display()),
+        None => "No config directory is available on this machine, so nothing is being logged to a file.".to_string(),
+    }
+}
+
+/// The Settings row that points at the log file, and opens the folder holding
+/// it.
+///
+/// Reveals the *directory* rather than opening the file: the log has no natural
+/// handler on Windows, `schemaic.log.1` is a second file worth reaching, and the
+/// same folder is where `tabs.json` and `connections.json` live — everything
+/// anyone would be asked for.
+fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -> impl IntoView {
+    let dir = schemaic_core::persist::config_dir();
+    let enabled = dir.is_some();
+    h_stack((
+        v_stack((
+            text("Log file").style(|s| s.color(theme::text()).font_size(theme::FONT_LABEL)),
+            form_hint(log_hint(dir.as_deref())),
+        ))
+        .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
+        action_button(
+            "Open folder",
+            ActionKind::Quiet,
+            enabled,
+            ring,
+            tabindex,
+            move || open(),
+        ),
+    ))
+    .style(|s| s.items_center().width_full().gap(10.0))
+}
+
 fn settings_section_header(t: &'static str) -> impl IntoView {
     text(t).style(|s| {
         s.font_size(theme::FONT_BODY)
@@ -1000,6 +1043,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
     let confirm_writes = ui.layout.confirm_writes;
     let live_validate = ui.layout.live_validate;
     let restore_tabs = ui.layout.restore_tabs;
+    let open_config_dir = ui.open_config_dir.clone();
 
     dyn_container(
         move || open.get(),
@@ -1023,8 +1067,12 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 ring.clone(),
                 10,
             );
-            let general_group = v_stack((settings_section_header("General"), restore_row))
-                .style(|s| s.flex_col().gap(16.0));
+            let general_group = v_stack((
+                settings_section_header("General"),
+                restore_row,
+                log_row(open_config_dir.clone(), ring.clone(), 20),
+            ))
+            .style(|s| s.flex_col().gap(16.0));
 
             // Editor group. (Tab width, spaces-vs-tabs, and word wrap live in the
             // status bar.)
@@ -1197,10 +1245,33 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDITOR_FONT_SIZES, ROW_LIMITS, editor_font_label, row_limit_label, term_font_label,
-        thousands,
+        EDITOR_FONT_SIZES, ROW_LIMITS, editor_font_label, log_hint, row_limit_label,
+        term_font_label, thousands,
     };
     use crate::consts::TERM_FONT_SIZES;
+
+    /// The row's whole purpose is to *say where the log is*, so the hint must
+    /// carry the full path and the file's name. "In your config directory" is
+    /// the answer the user already didn't have.
+    #[test]
+    fn the_log_hint_names_the_file_and_its_full_path() {
+        let hint = log_hint(Some(std::path::Path::new("/home/x/.config/schemaic")));
+        assert!(hint.contains("/home/x/.config/schemaic"), "{hint}");
+        assert!(hint.contains("schemaic.log"), "{hint}");
+    }
+
+    /// No config directory means no file writer at all (`logging::init` says so
+    /// and degrades to stdout), and a row that still promised a path would be
+    /// pointing at nothing.
+    #[test]
+    fn the_log_hint_says_when_there_is_no_log_at_all() {
+        let hint = log_hint(None);
+        assert!(!hint.contains("schemaic.log"), "{hint}");
+        assert!(
+            hint.to_lowercase().contains("no config directory"),
+            "{hint}"
+        );
+    }
 
     /// The invariant the three dropdown labels used to rely on silently: that
     /// every offered value has a label of its own.
