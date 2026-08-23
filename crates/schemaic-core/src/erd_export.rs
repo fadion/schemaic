@@ -271,7 +271,7 @@ pub fn to_mermaid(graph: &DiagramGraph) -> String {
             continue;
         };
         let (p, c) = crow_ends(e);
-        let label = label_text(&e.from_columns.join(", "));
+        let label = plain_label(&e.from_columns.join(", "));
         out.push_str(&format!("    {to} {p}--{c} {from} : \"{label}\"\n"));
     }
     out
@@ -279,23 +279,23 @@ pub fn to_mermaid(graph: &DiagramGraph) -> String {
 
 // ── DBML ────────────────────────────────────────────────────────────────────
 
-/// A server-authored string on its way **inside a double-quoted label** in one
-/// of the plain-text formats.
+/// A server-authored string on its way inside **DOT's** `label="…"`.
 ///
 /// The backslash first, then the quote, or the escape swallows itself. A column
 /// named `a"b` is legal on all three engines (`` `a"b` ``, `"a""b"`) and closed
 /// DOT's `label="…"` early, so `dot` rejected the whole file at that line; a
-/// column named `a\` swallowed the closing quote and the rest of the line. The
-/// module escapes correctly everywhere else — `dot_text` through
-/// `export::html_escape`, `dbml_name` by doubling — and these three sites are one
-/// missing habit rather than three oversights.
+/// column named `a\` swallowed the closing quote and the rest of the line.
+///
+/// **DOT is the only one of the four formats with a backslash escape**, and this
+/// spelling is verified against real graphviz (`@viz-js/viz`, wasm):
+/// `label="x\"y"` and `label="x\\"` both render. Mermaid, PlantUML and DBML have
+/// none, so they take [`plain_label`] instead — the same string put through this
+/// function was rejected outright by mermaid 11 and by `@dbml/core`, and drew a
+/// stray backslash in PlantUML's unquoted attribute lines.
 ///
 /// **Not** `html_escape`: that escapes `&<>` for a text node and leaves `"`
 /// alone, which is right for the SVG and exactly wrong here.
-///
-/// A control character becomes a space as well, because all three formats end a
-/// label at the end of its line — PlantUML's runs unquoted to one.
-fn label_text(s: &str) -> String {
+fn dot_label(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .flat_map(|c| match c {
@@ -306,8 +306,36 @@ fn label_text(s: &str) -> String {
         .collect()
 }
 
+/// A server-authored string on its way into a format that **has no escape at
+/// all** — Mermaid, PlantUML, DBML.
+///
+/// Each of the three was probed against its real consumer, and each rejects the
+/// escaped form outright: `@dbml/core` 3.x refuses both `"a\"b"` *and* `"a""b"`,
+/// mermaid 11 refuses `: "a\"b"`, and PlantUML's attribute and relationship
+/// lines are **unquoted**, so an escape there is a stray backslash in the
+/// picture rather than a fix. Substitution is the only handling that works, and
+/// it is what `to_plantuml`'s entity name has always done.
+///
+/// A control character becomes a space, because every one of these formats ends
+/// a label at the end of its line — and a newline in a *name* split PlantUML's
+/// `entity "…"` declaration in two and made the whole `.dbml` unparseable.
+///
+/// **One function for all three, because DBML needs it on both sides of a
+/// `Ref`.** A name sanitised one way in a table body and another in the
+/// reference to it leaves the reference pointing at nothing.
+fn plain_label(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
+}
+
 /// A DBML name, quoted when it isn't a bare identifier. DBML keeps the real name —
-/// `Table "sales.orders"` is legal — so nothing is renamed here.
+/// `Table "sales.orders"` is legal — so nothing is renamed here beyond what
+/// [`plain_label`] must substitute to keep the file parseable at all.
 fn dbml_name(s: &str) -> String {
     if !s.is_empty()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -315,7 +343,7 @@ fn dbml_name(s: &str) -> String {
     {
         s.to_string()
     } else {
-        format!("\"{}\"", s.replace('"', "\\\""))
+        format!("\"{}\"", plain_label(s))
     }
 }
 
@@ -443,15 +471,15 @@ pub fn to_plantuml(graph: &DiagramGraph) -> String {
         };
         out.push_str(&format!(
             "entity \"{}\" as {a}{stereotype} {{\n",
-            n.id.replace('"', "'")
+            plain_label(&n.id)
         ));
         let cols = columns(n);
         let (keys, rest): (Vec<_>, Vec<_>) = cols.iter().partition(|c| c.pk);
         for c in &keys {
             out.push_str(&format!(
                 "  * {} : {}\n",
-                label_text(&c.name),
-                label_text(&c.type_name)
+                plain_label(&c.name),
+                plain_label(&c.type_name)
             ));
         }
         if !keys.is_empty() && !rest.is_empty() {
@@ -462,8 +490,8 @@ pub fn to_plantuml(graph: &DiagramGraph) -> String {
             let fk = if c.fk { " <<FK>>" } else { "" };
             out.push_str(&format!(
                 "  {req}{} : {}{fk}\n",
-                label_text(&c.name),
-                label_text(&c.type_name)
+                plain_label(&c.name),
+                plain_label(&c.type_name)
             ));
         }
         out.push_str("}\n\n");
@@ -475,7 +503,7 @@ pub fn to_plantuml(graph: &DiagramGraph) -> String {
         let (p, c) = crow_ends(e);
         out.push_str(&format!(
             "{to} {p}--{c} {from} : {}\n",
-            label_text(&e.from_columns.join(", "))
+            plain_label(&e.from_columns.join(", "))
         ));
     }
     out.push_str("\n@enduml\n");
@@ -485,8 +513,42 @@ pub fn to_plantuml(graph: &DiagramGraph) -> String {
 // ── Graphviz ────────────────────────────────────────────────────────────────
 
 /// Escape for a Graphviz HTML-like label's text content.
+///
+/// Through [`svg_text`] rather than `html_escape` alone for the same reason the
+/// SVG is: a Graphviz HTML-like label is parsed as XML too, so a C0 character in
+/// a name would make the `.dot` unparseable where it makes the `.svg`
+/// unopenable.
 fn dot_text(s: &str) -> String {
-    crate::export::html_escape(s)
+    svg_text(s)
+}
+
+/// A server-authored string on its way into an **XML text node** — the SVG's
+/// four, and Graphviz's HTML-like labels.
+///
+/// `html_escape` rewrites `&`, `<` and `>` and touches no control character, but
+/// C0 characters other than tab, LF and CR **are not XML 1.0 characters**: the
+/// document is malformed, not merely odd. Verified against `roxmltree` 0.20, the
+/// parser `usvg` uses — U+0001, U+000B and U+001F all fail; tab and newline are
+/// fine.
+///
+/// The two outcomes it produced came from one cause. **SVG export** wrote the
+/// file, returned `Ok(())`, and the modal said `Saved diagram.svg` — a file no
+/// renderer opens, reported as a success. **PNG export** failed inside
+/// `usvg::Tree::from_str` with *a non-XML character found at …*, an error naming
+/// a codepoint and not a column.
+///
+/// A column named `a<U+0001>b` is legal on both engines — MySQL permits the
+/// whole BMP except U+0000 in a quoted identifier, PostgreSQL anything but NUL.
+fn svg_text(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '\t' | '\n' | '\r' => c,
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    crate::export::html_escape(&cleaned)
 }
 
 /// The graph as a Graphviz `digraph`, one HTML-like table per node.
@@ -570,7 +632,7 @@ pub fn to_dot(graph: &DiagramGraph) -> String {
         let head = if e.optional { "odot" } else { "tee" };
         out.push_str(&format!(
             "  {from}{fp} -> {to}{tp} [arrowtail={tail}, arrowhead={head}, label=\"{}\"];\n",
-            label_text(&e.from_columns.join(", "))
+            dot_label(&e.from_columns.join(", "))
         ));
     }
     out.push_str("}\n");
@@ -935,7 +997,7 @@ pub fn to_svg(scene: &SvgScene) -> String {
             n(node.y + m.header_h / 2.0),
             n(m.title_size),
             node.title_fill,
-            crate::export::html_escape(&node.title)
+            svg_text(&node.title)
         );
         for (i, row) in node.rows.iter().enumerate() {
             let cy = node.y + m.header_h + (i as f64 + 0.5) * m.row_h;
@@ -962,7 +1024,7 @@ pub fn to_svg(scene: &SvgScene) -> String {
                 n(cy),
                 n(m.name_size),
                 name_fill,
-                crate::export::html_escape(&row.name)
+                svg_text(&row.name)
             );
             if !row.type_name.is_empty() {
                 let _ = write!(
@@ -972,7 +1034,7 @@ pub fn to_svg(scene: &SvgScene) -> String {
                     n(cy),
                     n(m.type_size),
                     c.type_text,
-                    crate::export::html_escape(&row.type_name)
+                    svg_text(&row.type_name)
                 );
             }
         }
@@ -989,7 +1051,7 @@ pub fn to_svg(scene: &SvgScene) -> String {
                 n(cy),
                 n(m.type_size),
                 c.muted,
-                crate::export::html_escape(more)
+                svg_text(more)
             );
         }
         out.push_str("</g>\n");
@@ -1201,6 +1263,7 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("Ref: orders.user_id > users.id\n"), "{out}");
+        dbml_bodies_and_refs_resolve(&out);
     }
 
     #[test]
@@ -1214,6 +1277,7 @@ mod tests {
             out.contains("Ref: orders.user_id > \"sales.users\".id"),
             "{out}"
         );
+        dbml_bodies_and_refs_resolve(&out);
     }
 
     #[test]
@@ -1221,14 +1285,24 @@ mod tests {
         let mut g = sample();
         g.edges[0].from_columns = vec!["a".to_string(), "b".to_string()];
         g.edges[0].to_columns = vec!["x".to_string(), "y".to_string()];
-        assert!(to_dbml(&g).contains("Ref: orders.(a, b) > users.(x, y)"));
+        // The endpoints name columns neither table declares, so the graph has
+        // to declare them for the gate to be about the *grouping*.
+        g.nodes[1].columns[1].name = "a".to_string();
+        g.nodes[1].columns.push(col("b", "int", false, true, false));
+        g.nodes[0].columns[0].name = "x".to_string();
+        g.nodes[0].columns.push(col("y", "int", true, false, false));
+        let out = to_dbml(&g);
+        assert!(out.contains("Ref: orders.(a, b) > users.(x, y)"), "{out}");
+        dbml_bodies_and_refs_resolve(&out);
     }
 
     #[test]
     fn dbml_uses_the_one_to_one_operator_for_a_unique_fk() {
         let mut g = sample();
         g.edges[0].cardinality = Cardinality::OneToOne;
-        assert!(to_dbml(&g).contains("Ref: orders.user_id - users.id"));
+        let out = to_dbml(&g);
+        assert!(out.contains("Ref: orders.user_id - users.id"), "{out}");
+        dbml_bodies_and_refs_resolve(&out);
     }
 
     /// **A DBML table body needs a column, and every `Ref` endpoint has to name
@@ -1268,26 +1342,126 @@ mod tests {
         let mut g = sample();
         g.edges[0].from_columns = vec!["a\"b\\".to_string()];
         g.nodes[1].columns[1].name = "a\"b\\".to_string();
-        for out in [to_dot(&g), to_mermaid(&g), to_plantuml(&g)] {
-            for line in out.lines().filter(|l| l.contains("a\\\"b")) {
-                // Every quote in the line is either a delimiter or escaped, so
-                // the delimiters still pair up. Walked rather than counted with
-                // a lookbehind, because `\\"` ends in a backslash that is itself
-                // escaped and the quote after it is real.
-                let mut escaped = false;
-                let mut delimiters = 0usize;
-                for c in line.chars() {
-                    match c {
-                        _ if escaped => escaped = false,
-                        '\\' => escaped = true,
-                        '"' => delimiters += 1,
-                        _ => {}
-                    }
+        // **DOT alone**, because DOT is the only one of the four that has a
+        // backslash escape. This oracle — quote parity — was the whole test's
+        // and it is satisfied by output no other consumer accepts: it certified
+        // Mermaid's `\"` as fixed while Mermaid 11 rejects the file, and passed
+        // vacuously over PlantUML's unquoted attribute lines, which contain no
+        // delimiter at all. `to_dbml` was never in the loop.
+        let out = to_dot(&g);
+        for line in out.lines().filter(|l| l.contains("a\\\"b")) {
+            // Every quote in the line is either a delimiter or escaped, so
+            // the delimiters still pair up. Walked rather than counted with
+            // a lookbehind, because `\\"` ends in a backslash that is itself
+            // escaped and the quote after it is real.
+            let mut escaped = false;
+            let mut delimiters = 0usize;
+            for c in line.chars() {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => delimiters += 1,
+                    _ => {}
                 }
-                assert_eq!(delimiters % 2, 0, "odd quote count: {line:?}");
-                assert!(line.contains("a\\\"b\\\\"), "{line:?}");
             }
+            assert_eq!(delimiters % 2, 0, "odd quote count: {line:?}");
+            assert!(line.contains("a\\\"b\\\\"), "{line:?}");
         }
+    }
+
+    /// **The other three formats have no backslash escape, so the quote must be
+    /// substituted rather than escaped.** Each of these was reproduced against
+    /// the real consumer parser:
+    ///
+    /// * `@dbml/core` 3.x rejects the whole file at `"a\"b"` *and* at `"a""b"` —
+    ///   DBML has no escape for a `"` inside a quoted name at all.
+    /// * mermaid 11 rejects `: "a\"b"` — `Parse error on line 19`.
+    /// * PlantUML's three attribute/relationship lines are **unquoted**, so the
+    ///   escape put a stray backslash in the picture where the pre-range code
+    ///   was correct.
+    ///
+    /// The oracle is "no delimiter and no control character survives", which is
+    /// a property of the output rather than of one escaping convention.
+    #[test]
+    fn the_three_formats_without_an_escape_substitute_instead() {
+        let hostile = "a\"b\\ c\u{1}d";
+        let mut g = sample();
+        g.edges[0].from_columns = vec![hostile.to_string()];
+        g.nodes[1].columns[1].name = hostile.to_string();
+        g.nodes[1].columns[1].type_name = hostile.to_string();
+
+        for (what, out) in [
+            ("mermaid", to_mermaid(&g)),
+            ("plantuml", to_plantuml(&g)),
+            ("dbml", to_dbml(&g)),
+        ] {
+            for line in out.lines().filter(|l| l.contains("a") && l.contains("b")) {
+                assert!(
+                    !line.contains("\\\""),
+                    "{what}: an escape no parser here honours: {line:?}"
+                );
+            }
+            assert!(
+                !out.chars().any(|c| c.is_control() && c != '\n'),
+                "{what}: a control character survived"
+            );
+        }
+        // …and the DBML `Ref`s still resolve, which is what catches a name
+        // sanitised one way in the body and another in the reference.
+        dbml_bodies_and_refs_resolve(&to_dbml(&g));
+    }
+
+    /// A newline in a **table** name split PlantUML's `entity "…"` declaration
+    /// across two lines, which is not a declaration, and made the whole `.dbml`
+    /// unparseable at the opening quote. The columns of the same table were
+    /// already safe; only the id was unhandled.
+    #[test]
+    fn a_newline_in_a_table_name_does_not_split_a_declaration() {
+        let mut g = sample();
+        g.nodes[1].id = "a\nb".to_string();
+        g.edges[0].from = "a\nb".to_string();
+
+        let puml = to_plantuml(&g);
+        let entity = puml
+            .lines()
+            .find(|l| l.trim_start().starts_with("entity "))
+            .expect("an entity line");
+        assert!(entity.ends_with('{'), "declaration split: {entity:?}");
+        assert!(!puml.contains("entity \"a\n"), "{puml}");
+
+        let dbml = to_dbml(&g);
+        assert!(!dbml.contains("\"a\n"), "{dbml}");
+        dbml_bodies_and_refs_resolve(&dbml);
+    }
+
+    /// **A control character in a name writes an `.svg` no viewer opens, under a
+    /// "Saved …" notice.** `html_escape` rewrites `&<>` and nothing else, and C0
+    /// characters other than tab/LF/CR are not XML 1.0 characters — verified
+    /// against `roxmltree` 0.20, the parser `usvg` uses: U+0001, U+000B and
+    /// U+001F all FAIL, tab and newline are fine. SVG export wrote the file and
+    /// reported success; PNG export failed with an error naming a codepoint and
+    /// no column.
+    ///
+    /// The range fixed this class for the three text formats and did not carry
+    /// it to the picture path — the one that fails silently.
+    #[test]
+    fn a_control_character_never_reaches_the_svg() {
+        let mut s = scene();
+        s.nodes[0].title = "or\u{1}ders".to_string();
+        s.nodes[0].rows[1].name = "a\u{b}b".to_string();
+        s.nodes[0].rows[1].type_name = "va\u{1f}rchar".to_string();
+        s.nodes[0].more = Some("+3\u{7}more".to_string());
+
+        let svg = to_svg(&s);
+        for c in svg.chars() {
+            assert!(
+                !c.is_control() || c == '\n' || c == '\t' || c == '\r',
+                "a non-XML character reached the SVG: {c:?}"
+            );
+        }
+        // …and the names are still there, one space where the byte was.
+        assert!(svg.contains("or ders"), "{svg}");
+        assert!(svg.contains("a b"), "{svg}");
     }
 
     /// The sample graph plus a stub something actually points at — the shape
@@ -1317,49 +1491,84 @@ mod tests {
     /// enforceable in-tree is the invariants *they* check — which is what the 41
     /// `assert!(out.contains(…))` tests around this could never do: they answer
     /// "did we write what we meant to", never "is what we meant to write legal".
+    /// One DBML name: a bare identifier, or a `"…"` run **which may contain
+    /// spaces and dots**. Returns it unquoted, plus what follows.
+    ///
+    /// The naive `split_whitespace` / `rsplit_once('.')` this replaced could
+    /// only read names that needed no quoting — so the one gate the suite has
+    /// was blind to exactly the hostile names it exists to police, and would
+    /// have reported a perfectly good file as broken.
+    fn dbml_word(s: &str) -> (String, &str) {
+        let s = s.trim_start();
+        if let Some(rest) = s.strip_prefix('"') {
+            match rest.split_once('"') {
+                Some((name, tail)) => (name.to_string(), tail),
+                None => (rest.to_string(), ""),
+            }
+        } else {
+            let end = s
+                .find(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ')')
+                .unwrap_or(s.len());
+            (s[..end].to_string(), &s[end..])
+        }
+    }
+
     fn dbml_bodies_and_refs_resolve(out: &str) {
         let mut columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut table: Option<String> = None;
         for line in out.lines() {
             if let Some(rest) = line.strip_prefix("Table ") {
-                let name = rest.trim_end_matches(" {").trim_matches('"').to_string();
+                let (name, _) = dbml_word(rest);
                 table = Some(name.clone());
                 columns.entry(name).or_default();
             } else if line == "}" {
                 table = None;
-            } else if let (Some(t), Some(word)) = (
-                table.as_ref(),
-                line.split_whitespace()
-                    .next()
-                    .filter(|w| !w.starts_with("Note")),
-            ) {
+            } else if let Some(t) = table.as_ref()
+                && !line.trim_start().starts_with("Note")
+                && !line.trim().is_empty()
+            {
+                let (name, _) = dbml_word(line);
                 columns
                     .get_mut(t)
                     .expect("the table was declared")
-                    .push(word.trim_matches('"').to_string());
+                    .push(name);
             }
         }
         for (t, cols) in &columns {
             assert!(!cols.is_empty(), "table {t} has an empty body:\n{out}");
         }
+        // `Ref: <side> > <side>` — each side is `table.column` or
+        // `table.(a, b)`, and every part of it may be a quoted run.
         for line in out.lines().filter(|l| l.starts_with("Ref: ")) {
-            for side in line.trim_start_matches("Ref: ").split([' ', '>', '-']) {
-                let side = side.trim();
-                if side.is_empty() {
-                    continue;
-                }
-                let (t, c) = side.rsplit_once('.').expect("table.column");
-                let t = t.trim_matches('"');
+            let mut rest = line.trim_start_matches("Ref: ");
+            while !rest.trim().is_empty() {
+                let (t, after) = dbml_word(rest);
+                let after = after.trim_start().trim_start_matches('.');
+                let (cols, tail) = if let Some(inner) = after.strip_prefix('(') {
+                    let (group, tail) = inner.split_once(')').expect("a closed group");
+                    let mut names = Vec::new();
+                    let mut g = group;
+                    while !g.trim().is_empty() {
+                        let (c, t2) = dbml_word(g);
+                        names.push(c);
+                        g = t2.trim_start().trim_start_matches(',');
+                    }
+                    (names, tail)
+                } else {
+                    let (c, tail) = dbml_word(after);
+                    (vec![c], tail)
+                };
                 let declared = columns
-                    .get(t)
+                    .get(&t)
                     .unwrap_or_else(|| panic!("Ref names undeclared table {t}:\n{out}"));
-                for c in c.trim_matches(['(', ')']).split(", ") {
-                    let c = c.trim_matches('"');
+                for c in cols {
                     assert!(
-                        declared.iter().any(|d| d == c),
+                        declared.contains(&c),
                         "Ref names {t}.{c}, which {t} does not declare:\n{out}"
                     );
                 }
+                // Past the relationship operator to the other side, if any.
+                rest = tail.trim_start().trim_start_matches(['<', '>', '-']);
             }
         }
     }
