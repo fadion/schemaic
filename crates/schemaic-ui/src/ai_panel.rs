@@ -104,19 +104,21 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 // `active_db` memo can name a database that lives somewhere
                 // else, and `preview_proposal` pairs whatever it is given with
                 // `edit_ctx`'s **active** connection and stamps that `conn_id`
-                // into the plan `run_ddl` executes. That pairing is the one
-                // `ai::scoped_database` exists to prevent; here it could run an
-                // `ALTER` on prod against a proposal written about dev.
+                // into the plan `run_ddl` executes: an `ALTER` on prod against a
+                // proposal written about dev.
+                //
+                // `tabsel::scoped_database` is that rule, and the call is here
+                // rather than a second spelling of it because this is the one
+                // caller that can destroy something. It was written out inline —
+                // expression for expression identical, with no test — because
+                // `schemaic-ui` cannot depend on `schemaic-app`, where it lived.
                 let conn = active_conn.get_untracked();
                 let tab = tabs.with_untracked(|v| {
                     v.iter()
                         .find(|t| t.id == active.get_untracked())
                         .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
                 });
-                let Some(db) = tab
-                    .filter(|(tab_conn, _)| *tab_conn == conn)
-                    .and_then(|(_, db)| db)
-                else {
+                let Some(db) = schemaic_core::tabsel::scoped_database(tab, conn, None) else {
                     return Err(
                         "This change is about a tab on a different connection — switch to it, or \
                          pick a database on this one, before applying a schema change."

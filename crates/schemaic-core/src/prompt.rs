@@ -146,7 +146,8 @@ pub fn pipe_table(columns: &[String], rows: &[Vec<String>], cell_chars: usize) -
 /// `Duplicate entry 'alice@corp.com' for key 'users.email'` is a stored cell,
 /// quoted back by the server.
 ///
-/// The gate is [`AiData::may_query`] — `Full` alone — because that reason is
+/// The gate is [`crate::connection::AiData::may_query`] — `Full` alone —
+/// because that reason is
 /// level-independent and `Full` is the only level whose consent covers a value
 /// the user did not hand over. It was `may_attach`, which let the text out on
 /// **Only what I attach**, the default, whose consent line reads *"Rows you

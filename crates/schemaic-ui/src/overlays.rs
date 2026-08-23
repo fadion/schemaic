@@ -4147,7 +4147,14 @@ fn find_matches(
     hidden.with_untracked(|hidden| {
         db_nodes.with_untracked(|nodes| {
             for node in nodes {
-                if hidden.contains(&node.database) {
+                // **The predicate, not a second spelling of it.** They agree
+                // today (`db_visible` *is* `!hidden.contains(…)`), and the
+                // palette is the surface `core::db_hidden`'s module doc names
+                // first among those a hidden database must disappear from — so
+                // it is the one that would silently stop following the rule if
+                // the rule ever grew a clause (an active-database exception, a
+                // case-insensitive match, a per-namespace key).
+                if !db_visible(hidden, &node.database) {
                     continue;
                 }
                 if let SchemaState::Loaded(schema) = node.schema.get_untracked()
