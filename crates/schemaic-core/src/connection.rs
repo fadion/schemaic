@@ -568,9 +568,21 @@ impl Connection {
     /// a saved connection at another `.db` reaches an entirely different set of
     /// tables, which is the case this exists to catch, and it is reached by
     /// editing a connection in place exactly as a repointed host is.
+    ///
+    /// **`id` is deliberately not part of it**, and used to be. A connection's
+    /// id decides nothing about which server a query reaches — it is *caller
+    /// policy*, belonging to the one caller that means "is this a reload of the
+    /// same connection", which is now [`Connection::is_reload_of`]. Encoding it
+    /// here made the function answer a different question from the one its name
+    /// and this doc ask, two paragraphs below an argument *against* an id
+    /// comparison. What that cost: the killed-session repair asks the honest
+    /// question — two saved connections routinely point at one server, `local
+    /// (app)` and `local (root)`, or two entries differing only in default
+    /// database — and is reached only when the ids differ, so it was `false` by
+    /// construction and a pinned Manual tab was left holding a dead socket with
+    /// Commit and Rollback still offered.
     pub fn targets_same_server(&self, other: &Connection) -> bool {
-        self.id == other.id
-            && self.db_type == other.db_type
+        self.db_type == other.db_type
             && self.file == other.file
             && self.host == other.host
             && self.port == other.port
@@ -579,6 +591,25 @@ impl Connection {
             && self.ssh.host == other.ssh.host
             && self.ssh.port == other.ssh.port
             && self.ssh.user == other.ssh.user
+    }
+
+    /// Is `other` **this same saved connection, still pointing where it did** —
+    /// the question the schema tree asks before keeping the databases it is
+    /// already showing?
+    ///
+    /// Two terms, and they are two different things. The id says it is the same
+    /// entry in the list rather than a *switch* to another connection, whose
+    /// databases would be somebody else's for as long as the connect takes;
+    /// [`targets_same_server`](Connection::targets_same_server) says the entry
+    /// has not been edited to point somewhere new, which an id comparison alone
+    /// gets wrong because repointing a host is an edit *in place*.
+    ///
+    /// Split out so the two questions cannot be confused again: the killed-
+    /// session repair asks the second one about two genuinely different
+    /// connections, and while the id term lived inside the shared predicate its
+    /// call was dead code.
+    pub fn is_reload_of(&self, other: &Connection) -> bool {
+        self.id == other.id && self.targets_same_server(other)
     }
 }
 
@@ -1088,7 +1119,11 @@ mod tests {
             edit(&mut edited);
             !conn().targets_same_server(&edited)
         }
-        assert!(moved(|c| c.id = 2), "id");
+        // `id` is **not** on this list, and used to head it. A connection's id
+        // decides nothing about which server a query reaches; asserting it here
+        // under this docstring is what presented the term as settled and let
+        // the killed-session repair's honest call go dead. It is
+        // `is_reload_of`'s, below.
         assert!(moved(|c| c.db_type = "PostgreSQL".into()), "engine");
         assert!(moved(|c| c.host = "other.example.com".into()), "host");
         assert!(moved(|c| c.port = 3306), "port");
@@ -1097,6 +1132,50 @@ mod tests {
         assert!(moved(|c| c.ssh.host = "bastion".into()), "ssh host");
         assert!(moved(|c| c.ssh.port = 2222), "ssh port");
         assert!(moved(|c| c.ssh.user = "deploy".into()), "ssh user");
+    }
+
+    /// **Two saved connections on one server target the same server**, which is
+    /// the case the killed-session repair exists for: `local (app)` and `local
+    /// (root)`, or two entries differing only in their default database. It
+    /// answered `false`, because the predicate opened with `self.id ==
+    /// other.id` and the repair's call site is reached *only* when the ids
+    /// differ — dead code, and a pinned Manual tab left holding a dead socket
+    /// with Commit and Rollback still offered.
+    #[test]
+    fn two_connections_on_one_server_target_the_same_server() {
+        let mut b = conn();
+        b.id = 2;
+        b.name = "local (root)".into();
+        assert!(conn().targets_same_server(&b));
+    }
+
+    /// The other half of the split: the schema tree keeps its rows only for a
+    /// **reload of the same entry**, not for a switch to a different connection
+    /// that happens to reach the same server — those rows are a different
+    /// connection's and the toolbar, colour and read-only guard go with them.
+    /// And not for the same entry repointed at a new host, which is an edit *in
+    /// place* and keeps its id.
+    #[test]
+    fn a_reload_is_the_same_entry_still_pointing_where_it_did() {
+        assert!(conn().is_reload_of(&conn()));
+
+        let mut renamed = conn();
+        renamed.name = "production (eu)".into();
+        assert!(conn().is_reload_of(&renamed), "presentation moves nothing");
+
+        let mut other_entry = conn();
+        other_entry.id = 2;
+        assert!(
+            !conn().is_reload_of(&other_entry),
+            "a switch, even to the same server"
+        );
+
+        let mut repointed = conn();
+        repointed.host = "other.example.com".into();
+        assert!(
+            !conn().is_reload_of(&repointed),
+            "the same entry, edited in place to point somewhere new"
+        );
     }
 
     /// **A SQLite connection opens no tunnel, whatever the flag says.**

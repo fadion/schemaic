@@ -3128,8 +3128,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // it to the active connection) — no server-side `USE` / session state to track.
     let active_db_menu_open = RwSignal::new(false);
     let active_db_anchor = RwSignal::new(floem::kurbo::Point::ZERO);
-    // The last database the user explicitly switched to; new tabs default to it.
-    let last_db: RwSignal<Option<String>> = RwSignal::new(None);
+    // The last database the user explicitly switched to **on each connection**;
+    // new tabs default to it. Keyed by `conn_id` like `last_tab`, and for the
+    // same reason: it was one global name, so picking `world` on MariaDB (where
+    // it is visible) and switching to a PostgreSQL connection that also has a
+    // `world` (hidden there) bound the new tab to the hidden one — the
+    // per-connection guarantee `core::db_hidden` exists to give, defeated a
+    // layer above it.
+    let last_db: RwSignal<HashMap<u64, String>> = RwSignal::new(HashMap::new());
     let active_db: floem::reactive::Memo<Option<String>> = create_memo(move |_| {
         let id = active.get();
         tabs.with(|v| v.iter().find(|t| t.id == id).and_then(|t| t.database.get()))
@@ -3174,7 +3180,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             false
                         }
                     });
-                    last_db.set(Some(name.clone()));
+                    // Remembered against the connection it was picked on — the
+                    // selector lists that connection's databases and nothing
+                    // else, so the name means nothing anywhere else.
+                    last_db.update(|m| {
+                        m.insert(active_conn.get_untracked(), name.clone());
+                    });
                     if manual {
                         (open_session)(id);
                     }
@@ -3190,19 +3201,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // has loaded.
     let default_tab_target: Rc<dyn Fn() -> (u64, Option<String>)> = Rc::new(move || {
         let conn_id = active_conn.get_untracked();
-        let database = db_nodes.with_untracked(|v| {
-            last_db
-                .get_untracked()
-                .filter(|name| v.iter().any(|n| &n.database == name))
-                .or_else(|| {
-                    // The first database a *list* would show — the same rule the
-                    // schema load's binding uses. Ctrl+T before ever touching
-                    // the selector otherwise landed the tab in a hidden one.
-                    let names: Vec<String> = v.iter().map(|n| n.database.clone()).collect();
-                    hidden_dbs.with_untracked(|h| {
-                        schemaic_core::schema::first_bindable(&names, h).map(str::to_string)
-                    })
-                })
+        // **The whole decision is `schema::tab_target`.** It used to be spelled
+        // here as a `.filter(exists).or_else(first_bindable)`, and only the
+        // fallback asked about visibility — so hiding the database you were in
+        // and pressing Ctrl+T bound the new tab straight back into it, past
+        // every list that had stopped showing it.
+        let remembered = last_db.with_untracked(|m| m.get(&conn_id).cloned());
+        let names: Vec<String> =
+            db_nodes.with_untracked(|v| v.iter().map(|n| n.database.clone()).collect());
+        let database = hidden_dbs.with_untracked(|h| {
+            schemaic_core::schema::tab_target(remembered.as_deref(), &names, h).map(str::to_string)
         });
         (conn_id, database)
     });
@@ -5017,10 +5025,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Refresh) keeps its databases visible while the list is re-fetched;
             // only a *switch* clears, where the rows would otherwise be another
             // server's for as long as the connect takes.
+            // `is_reload_of`, not `targets_same_server`: the id term is *this
+            // caller's* policy — a switch to a different connection that
+            // happens to reach the same server must still clear, because those
+            // rows belong to the other entry. It used to live inside the shared
+            // predicate, where it made the killed-session repair's call dead.
             let reload = nodes_conn
                 .borrow()
                 .as_ref()
-                .is_some_and(|c| c.targets_same_server(&conn));
+                .is_some_and(|c| c.is_reload_of(&conn));
             if !reload {
                 db_nodes.set(Vec::new());
             }

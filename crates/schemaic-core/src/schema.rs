@@ -681,6 +681,35 @@ pub fn first_bindable<'a>(
         .map(String::as_str)
 }
 
+/// The database a **new tab** on this connection should bind to: the one the
+/// user last switched to here, if it is still there and still visible, else
+/// [`first_bindable`].
+///
+/// **The whole decision, not half of it.** The remembered branch used to test
+/// only that the name still *existed* — so putting the current database away
+/// with the SCHEMA eye and pressing Ctrl+T bound the new tab straight back into
+/// it, and [`db_contributes`]' active-database exception then carried its every
+/// table and column into autocomplete's pool, both AI prompts and the MCP
+/// overview. That exception exists because "hiding it doesn't move the tab";
+/// this is the app moving the tab *into* it. The fallback had been fixed and
+/// this branch, one line above, had not.
+///
+/// `last` is **this connection's** remembered database. It used to be one global
+/// signal with no connection dimension: picking `world` on MariaDB, where it is
+/// visible, and then switching to a PostgreSQL connection where a `world` exists
+/// and *is* hidden, bound the new tab to PostgreSQL's hidden one — the
+/// per-connection guarantee `crate::db_hidden` exists to give, defeated a layer
+/// above it. Keying the caller's map by connection is what makes that
+/// impossible; this function only has to be told the right one.
+pub fn tab_target<'a>(
+    last: Option<&'a str>,
+    names: &'a [String],
+    hidden: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    last.filter(|name| names.iter().any(|n| n == name) && db_visible(hidden, name))
+        .or_else(|| first_bindable(names, hidden))
+}
+
 /// The database name the QUERY toolbar's selector may show, given the databases
 /// the active connection actually loaded.
 ///
@@ -4535,12 +4564,67 @@ mod tests {
         );
         assert_eq!(first_bindable(&[], &hidden(&[])), None);
 
-        // The composed property: what gets bound never resurrects a hidden
-        // database through the active-database exception.
+        // The composed property, over the whole decision rather than the
+        // fallback alone. `tab_target` is what a new tab actually asks — the
+        // remembered branch used to test existence and not visibility, so this
+        // property held for every input except the one the user creates by
+        // hiding the database they are in and pressing Ctrl+T.
         let h = hidden(&["actdemo"]);
-        let bound = first_bindable(&names, &h).unwrap();
-        assert!(db_contributes(&h, bound, Some(bound)));
-        assert!(!db_contributes(&h, "actdemo", Some(bound)));
+        for last in [None, Some("actdemo"), Some("sakila"), Some("gone")] {
+            let bound = tab_target(last, &names, &h).unwrap();
+            assert!(db_contributes(&h, bound, Some(bound)), "{last:?}");
+            assert!(!db_contributes(&h, "actdemo", Some(bound)), "{last:?}");
+        }
+    }
+
+    /// The remembered database wins **when it is still bindable**, and the three
+    /// ways it stops being so all fall through to the same fallback a fresh
+    /// connection takes.
+    #[test]
+    fn a_remembered_database_is_taken_only_while_it_is_still_bindable() {
+        let names: Vec<String> = ["actdemo", "bigschema", "sakila"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hidden = |v: &[&str]| -> std::collections::HashSet<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        };
+        // Remembered, present, visible → it.
+        assert_eq!(
+            tab_target(Some("sakila"), &names, &hidden(&[])),
+            Some("sakila")
+        );
+        // Remembered but since hidden → the first visible one, not back into it.
+        assert_eq!(
+            tab_target(Some("sakila"), &names, &hidden(&["sakila"])),
+            Some("actdemo")
+        );
+        // Remembered but gone from this connection → the same fallback. (Before
+        // the map was keyed by connection this was the *cross-connection* case:
+        // a name picked on one server that happens to exist, hidden, on
+        // another.)
+        assert_eq!(
+            tab_target(Some("gone"), &names, &hidden(&[])),
+            Some("actdemo")
+        );
+        // Nothing remembered → `first_bindable`, unchanged.
+        assert_eq!(
+            tab_target(None, &names, &hidden(&["actdemo"])),
+            Some("bigschema")
+        );
+        // Everything hidden: the remembered one is as good as any, and both
+        // arms answer the same way rather than one of them answering `None`.
+        assert_eq!(
+            tab_target(
+                Some("sakila"),
+                &names,
+                &hidden(&["actdemo", "bigschema", "sakila"])
+            ),
+            Some("actdemo")
+        );
+        // No databases loaded yet.
+        assert_eq!(tab_target(Some("sakila"), &[], &hidden(&[])), None);
+        assert_eq!(tab_target(None, &[], &hidden(&[])), None);
     }
 
     #[test]
