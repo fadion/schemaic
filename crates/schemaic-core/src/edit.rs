@@ -730,6 +730,85 @@ pub fn plan_paste(
     plan
 }
 
+/// What a finished paste has to say for itself, and **in which voice**.
+///
+/// The grid's bottom bar has two surfaces: a red one for a failure, and the
+/// ordinary chrome for a note. A partial paste went out on the red one, so
+/// "Pasted 5 cells, skipping 1 in read-only columns." — an ordinary success with
+/// a caveat — was indistinguishable from a write-back that failed. The
+/// distinction is not a rendering detail: the red bar is the one that means
+/// *nothing landed and you must do something*.
+///
+/// Split out of the view so the decision can be tested. It is the whole of it —
+/// which sentence, and which surface — and the caller only picks a signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteReport {
+    /// Every cell landed. The bar stays down.
+    Clean,
+    /// Some landed and some didn't: a success, with what was skipped named.
+    Notice(String),
+    /// **Nothing** landed. A read-only result (a join, an expression column) is
+    /// the case, and it is the one where the user most needs telling why the
+    /// paste appeared to do nothing at all.
+    Failed(String),
+}
+
+/// Everything [`paste_report`] needs from a [`PastePlan`], taken **before**
+/// staging consumes its `cells`.
+///
+/// A snapshot rather than a borrow of the plan, because the caller drains the
+/// cell list into the grid — reading `plan.cells.len()` afterwards would report
+/// every paste as having landed nothing. Named fields rather than three
+/// positional `usize`s, which transpose silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteCounts {
+    pub planned: usize,
+    pub dropped: usize,
+    pub read_only: usize,
+}
+
+impl PastePlan {
+    /// This plan's counts, for [`paste_report`]. Call it before staging.
+    pub fn counts(&self) -> PasteCounts {
+        PasteCounts {
+            planned: self.cells.len(),
+            dropped: self.dropped,
+            read_only: self.read_only,
+        }
+    }
+}
+
+/// Turn a plan's counts, plus what the caller itself skipped, into the sentence
+/// and the surface.
+///
+/// `skipped_deleted` is the view's own: a row marked for deletion is a display
+/// state the plan knows nothing about. What actually *landed* is what decides
+/// between the two voices — not whether anything was skipped.
+pub fn paste_report(counts: PasteCounts, skipped_deleted: usize) -> PasteReport {
+    let mut notes = Vec::new();
+    if counts.dropped > 0 {
+        notes.push(format!("{} outside the grid", counts.dropped));
+    }
+    if counts.read_only > 0 {
+        notes.push(format!("{} in read-only columns", counts.read_only));
+    }
+    if skipped_deleted > 0 {
+        notes.push(format!("{skipped_deleted} in rows marked for deletion"));
+    }
+    if notes.is_empty() {
+        return PasteReport::Clean;
+    }
+    let staged = counts.planned.saturating_sub(skipped_deleted);
+    if staged == 0 {
+        PasteReport::Failed(format!("Nothing pasted: {}.", notes.join(", ")))
+    } else {
+        PasteReport::Notice(format!(
+            "Pasted {staged} cells, skipping {}.",
+            notes.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1836,6 +1915,82 @@ mod tests {
         assert_eq!(
             plan_paste(&block, (0, 0, 0, 0), 5, 0, all_editable),
             PastePlan::default()
+        );
+    }
+
+    /// Built through [`PastePlan::counts`] rather than by hand, so the test
+    /// exercises the same snapshot the caller takes — the field that had to be
+    /// captured before staging drains it is `planned`, and reading it off a
+    /// real plan is what says the two agree.
+    fn planned(cells: usize, dropped: usize, read_only: usize) -> PasteCounts {
+        PastePlan {
+            cells: (0..cells).map(|i| (i, 0, String::new())).collect(),
+            dropped,
+            read_only,
+        }
+        .counts()
+    }
+
+    /// A paste that lost nothing says nothing. A bar on every paste is a bar
+    /// nobody reads.
+    #[test]
+    fn a_clean_paste_reports_nothing() {
+        assert_eq!(paste_report(planned(6, 0, 0), 0), PasteReport::Clean);
+    }
+
+    /// **The finding this split exists for.** Five cells landed and one didn't:
+    /// that is a success with a caveat, and it went out on the grid's *red*
+    /// error surface — indistinguishable from a write-back that failed.
+    #[test]
+    fn a_partial_paste_is_a_notice_and_not_an_error() {
+        let r = paste_report(planned(5, 0, 1), 0);
+        assert_eq!(
+            r,
+            PasteReport::Notice("Pasted 5 cells, skipping 1 in read-only columns.".into())
+        );
+        assert!(
+            !matches!(r, PasteReport::Failed(_)),
+            "a paste that landed is not a failure"
+        );
+    }
+
+    /// Nothing landed: that *is* a failure, and the red surface is right for it
+    /// — a read-only result is exactly where the user needs telling why the
+    /// paste appeared to do nothing.
+    #[test]
+    fn a_paste_that_lands_nothing_is_a_failure() {
+        assert_eq!(
+            paste_report(planned(0, 0, 4), 0),
+            PasteReport::Failed("Nothing pasted: 4 in read-only columns.".into())
+        );
+    }
+
+    /// The view's own count comes off the staged total, so a block whose cells
+    /// *all* landed on rows marked for deletion is a failure rather than a
+    /// notice claiming cells were pasted.
+    #[test]
+    fn rows_marked_for_deletion_count_against_what_landed() {
+        assert_eq!(
+            paste_report(planned(3, 0, 0), 3),
+            PasteReport::Failed("Nothing pasted: 3 in rows marked for deletion.".into())
+        );
+        assert_eq!(
+            paste_report(planned(3, 0, 0), 1),
+            PasteReport::Notice("Pasted 2 cells, skipping 1 in rows marked for deletion.".into())
+        );
+    }
+
+    /// Every reason is named, in one sentence, in a fixed order — so two pastes
+    /// that lost the same things read the same way.
+    #[test]
+    fn every_reason_a_cell_was_skipped_is_named() {
+        assert_eq!(
+            paste_report(planned(4, 2, 3), 1),
+            PasteReport::Notice(
+                "Pasted 3 cells, skipping 2 outside the grid, 3 in read-only columns, \
+                 1 in rows marked for deletion."
+                    .into()
+            )
         );
     }
 }

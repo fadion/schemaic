@@ -5387,7 +5387,14 @@ for keyboard nav.
   rows the user just added. What falls outside, what lands on a read-only column, and what lands
   on a row marked for deletion are **counted and reported** in the same bottom bar a commit error
   uses (set *after* staging, since `stage` clears it), because a paste that discarded half a
-  spreadsheet looks exactly like one that worked; a read-only column is skipped **in place**, never
+  spreadsheet looks exactly like one that worked. **Which surface** is
+  `core::edit::paste_report`'s to decide, pushed down there so it can be tested: a partial paste is
+  a `Notice` — an ordinary success with a caveat, on the ordinary chrome — while a paste that
+  landed *nothing* is a `Failed` and earns the red fill. Both were errors, so "Pasted 5 cells,
+  skipping 1 in read-only columns." was rendered indistinguishably from a write-back that failed.
+  The counts are snapshotted through `PastePlan::counts` **before** staging drains the cell list,
+  which is what stops the report claiming every paste landed nothing. A read-only column is
+  skipped **in place**, never
   shifted, which would write one column's values into the next. Nothing is interpreted: a pasted
   cell reading `NULL` stages the four-character string, because that is what the copy side wrote
   and turning text into SQL `NULL` would be editing the user's data on their behalf. An open
@@ -5526,6 +5533,18 @@ for keyboard nav.
   unwrapped across the middle of the window and out over the schema sidebar. A batch has no editor
   bar to fall back on — `run_all` sets the tab's `results` to `Idle` — which is why the panel bar is
   where this goes, **View** (`text::hides_detail`) and all.
+- **That bar has three surfaces, and the surface is the message.** The red fill means an error; the
+  ordinary chrome carries both the wait note (a write taking long enough to explain, with its
+  one-click `Rollback`) and a plain **note** — something worth saying about an operation that
+  *worked*. The note exists because there was no non-red channel: a partial paste used
+  `commit_err`, so an ordinary success was drawn in the colour that means a write-back failed. The
+  five signals travel as one `BarSignals`, whose `any_up` is asked by the bar's own style **and**
+  by the selection summary that lifts itself above it — two hand-written copies of the same
+  `is_some` chain before, which a new surface would have had to be added to twice, and a bar that
+  is up while the summary thinks it isn't is the two of them drawn on top of each other. On the
+  writing side, `GridState::clear_bar` is the one way the bar comes down: seven identical copies of
+  `if commit_err.is_some() { … }` were what a second signal would otherwise have had to be added to
+  seven times.
 - **A result says which database it came from, and the answer lives on the result.** The grid's
   stats line leads with `ResultSet::database` (`world · 100 rows · 15 cols · 1 ms`), stamped by the
   loader that knows the scope — `Db::fetch_query`, `Session::fetch_query` (its *pinned* database,
