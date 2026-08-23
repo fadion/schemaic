@@ -19,7 +19,7 @@ members = [
 private_intra_doc_links = "allow"
 
 [workspace.package]
-version = "0.17.1"
+version = "0.18.0"
 edition = "2024"
 license = "MIT"
 authors = ["Schemaic contributors"]
