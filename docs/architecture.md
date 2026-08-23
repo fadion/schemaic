@@ -3178,6 +3178,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   server (`--mcp-serve`) the AI panel talks to. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
   switch.
+  **The statement timeout is a clock wired to the Cancel button, not a second way to stop a
+  query.** `RunTimeout::arm` spawns one sleeper racing a `done` token and, when the sleep wins,
+  cancels *the run's own* `CancellationToken` — the same one Cancel fires, which each backend
+  already honours its own way (MySQL `KILL QUERY` on a second connection, PostgreSQL
+  `cancel_query`, SQLite the interrupt handle). Nothing new can go wrong at the database. Three
+  things about it are load-bearing. **`0` is off**, read once in
+  `core::persist::statement_timeout`, and off is the default — every release before this ran
+  statements unbounded, so a default timeout would start killing the long imports and reports
+  people already rely on. **Disarming is `Drop`**, because dropping a `CancellationToken` does not
+  cancel it: without that, every finished statement would leave an hour-long `sleep` behind, one
+  per run, for the life of the process (`a_dropped_watchdog_never_fires` pins it, and fails
+  against a tree with the `Drop` body removed). **One watchdog per statement, not per run** — the
+  setting says *statement*, so a ten-statement script gets the full allowance each, which in the
+  batch path means re-arming inside `run_batch`'s per-statement callback; a statement that does
+  expire still stops the batch, because the token it fires is the batch's. A timeout and the
+  Cancel button arrive as the identical `DbError::Cancelled`, so the watchdog's `fired` flag is the
+  only thing that can tell the user which stopped their query — hence `timeout_message`, which
+  quotes the timeout in the very words the settings dropdown uses (`persist::statement_timeout_label`
+  is shared for exactly that reason). `EXPLAIN` is bounded too: `EXPLAIN ANALYZE` *executes* the
+  statement, so it is as runaway-capable as the query itself, and there the timeout must produce a
+  `PlanState::Failed` rather than the plain-cancel `return`, which would leave the modal spinning
+  on `Running` for ever.
   **The Server Activity poll is generation-guarded, and only runs while the panel is open *and the
   window has focus*.** One effect watches `(right_panel, active_conn, activity_interval,
   window_focused)`; it bumps `activity_gen`, clears the snapshot when the *connection* changed, then

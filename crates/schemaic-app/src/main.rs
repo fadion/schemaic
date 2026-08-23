@@ -1333,6 +1333,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let soft_tabs = RwSignal::new(ui_state.soft_tabs);
     let word_wrap = RwSignal::new(ui_state.word_wrap);
     let row_limit = RwSignal::new(ui_state.row_limit);
+    let statement_timeout = RwSignal::new(ui_state.statement_timeout_secs);
     let confirm_writes = RwSignal::new(ui_state.confirm_writes);
     let live_validate = RwSignal::new(ui_state.live_validate);
     let restore_tabs = RwSignal::new(ui_state.restore_tabs);
@@ -1723,10 +1724,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             );
             // Read the row cap on the UI thread (signals are single-threaded).
             let cap = row_limit.get_untracked();
+            let timeout_secs = statement_timeout.get_untracked();
             handle.spawn(async move {
                 // Wall-clock, and around everything: connecting, the statement,
-                // and pulling the rows back are all time the user waited.
+                // and pulling the rows back are all time the user waited — which
+                // is also what the timeout below bounds, deliberately: a
+                // connection that never completes is as much a hang as a query
+                // that never returns.
                 let started = std::time::Instant::now();
+                let watchdog = RunTimeout::arm(&token, timeout_secs);
                 let (res, stmt) = match &session {
                     Some(s) => {
                         // `BEGIN` is issued lazily, on the first statement of a
@@ -1747,6 +1753,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         None,
                     ),
                 };
+                let timed_out = watchdog.fired();
+                drop(watchdog);
                 let state = match res {
                     Ok(rs) => {
                         tracing::info!(
@@ -1757,6 +1765,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             rs.elapsed_ms
                         );
                         QueryState::Loaded(Arc::new(rs))
+                    }
+                    // A timeout and the Cancel button arrive as the same error,
+                    // so the watchdog's flag is the only thing that can tell the
+                    // user which of the two stopped their query.
+                    Err(DbError::Cancelled) if timed_out => {
+                        QueryState::Failed(timeout_message(timeout_secs))
                     }
                     Err(DbError::Cancelled) => {
                         tracing::info!("query cancelled");
@@ -1832,9 +1846,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             plan_state.set(PlanState::Running);
 
             let send = create_ext_action(cx, move |st: PlanState| plan_state.set(st));
+            // `analyze` *executes* the statement to measure it, so an EXPLAIN
+            // ANALYZE is exactly as runaway-capable as the query itself. Plain
+            // EXPLAIN only plans and is bounded too — it costs nothing, and an
+            // introspection query that hangs is still a hang.
+            let timeout_secs = statement_timeout.get_untracked();
             handle.spawn(async move {
-                let st = match db.explain(database.as_deref(), &sql, analyze, token).await {
+                let watchdog = RunTimeout::arm(&token, timeout_secs);
+                let res = db.explain(database.as_deref(), &sql, analyze, token).await;
+                let timed_out = watchdog.fired();
+                drop(watchdog);
+                let st = match res {
                     Ok(rs) => PlanState::Loaded(schemaic_core::plan::QueryPlan::from_result(&rs)),
+                    // A timeout is not a supersede: nothing is coming to replace
+                    // this state, so returning would leave the modal spinning on
+                    // `Running` for ever.
+                    Err(DbError::Cancelled) if timed_out => {
+                        PlanState::Failed(timeout_message(timeout_secs))
+                    }
                     Err(DbError::Cancelled) => return, // superseded — leave state alone
                     Err(e) => PlanState::Failed(e.to_string()),
                 };
@@ -2061,6 +2090,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 },
             );
             let cap = row_limit.get_untracked();
+            let timeout_secs = statement_timeout.get_untracked();
             handle.spawn(async move {
                 let mut states: Vec<QueryState> = vec![QueryState::Cancelled; n];
                 let mut outcomes: Vec<Option<StmtOutcome>> = vec![None; n];
@@ -2088,12 +2118,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 states[i] = QueryState::Cancelled;
                                 continue;
                             }
+                            // Per statement, so a long script isn't bounded as
+                            // one long statement. Dropped before the next arms.
+                            let watchdog = RunTimeout::arm(&token, timeout_secs);
                             let out = s.fetch_query(sql, cap, token.clone()).await;
+                            let timed_out = watchdog.fired();
+                            drop(watchdog);
                             took[i] = clock.elapsed().as_millis() as u64;
                             clock = std::time::Instant::now();
                             outcomes[i] = Some(out.stmt);
                             states[i] = match out.result {
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
+                                Err(DbError::Cancelled) if timed_out => {
+                                    stopped = true;
+                                    QueryState::Failed(timeout_message(timeout_secs))
+                                }
                                 Err(DbError::Cancelled) => {
                                     stopped = true;
                                     QueryState::Cancelled
@@ -2109,11 +2148,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // The callback fires as each statement lands, so the gap
                         // since the previous one *is* that statement's wall-clock
                         // — the batch runs them back to back on one connection.
-                        db.run_batch(database.as_deref(), &stmts, cap, token, |i, res| {
+                        // One watchdog at a time, re-armed as each statement
+                        // lands — the callback is the only per-statement seam
+                        // this path has. It is dropped (and so disarmed) when
+                        // the closure is, which is when `run_batch` returns.
+                        let mut watchdog = RunTimeout::arm(&token, timeout_secs);
+                        db.run_batch(database.as_deref(), &stmts, cap, token.clone(), |i, res| {
+                            let timed_out = watchdog.fired();
+                            watchdog = RunTimeout::arm(&token, timeout_secs);
                             took[i] = clock.elapsed().as_millis() as u64;
                             clock = std::time::Instant::now();
                             states[i] = match res {
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
+                                Err(DbError::Cancelled) if timed_out => {
+                                    QueryState::Failed(timeout_message(timeout_secs))
+                                }
                                 Err(DbError::Cancelled) => QueryState::Cancelled,
                                 Err(e) => QueryState::Failed(e.to_string()),
                             };
@@ -4552,6 +4601,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             editor_theme: editor_theme.get_untracked().key().to_string(),
             editor_font_size: editor_font.get_untracked(),
             row_limit: row_limit.get_untracked(),
+            statement_timeout_secs: statement_timeout.get_untracked(),
             confirm_writes: confirm_writes.get_untracked(),
             tab_width: tab_width.get_untracked(),
             soft_tabs: soft_tabs.get_untracked(),
@@ -4595,6 +4645,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             soft_tabs.get();
             word_wrap.get();
             row_limit.get();
+            statement_timeout.get();
             confirm_writes.get();
             restore_tabs.get();
             live_validate.get();
@@ -7830,6 +7881,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             soft_tabs,
             word_wrap,
             row_limit,
+            statement_timeout,
             confirm_writes,
             restore_tabs,
             live_validate,
@@ -8216,6 +8268,94 @@ fn start_resource_monitor(sample: RwSignal<schemaic_core::resource::ResourceSamp
     });
 }
 
+/// A statement timeout armed over one run's own cancellation token.
+///
+/// **It fires the token the Cancel button fires**, which is the whole design:
+/// cancelling a running statement already works end to end — MySQL gets a
+/// `KILL QUERY` on a second connection, PostgreSQL a `cancel_query`, SQLite an
+/// interrupt handle — so a timeout is a clock wired to that, not a second way
+/// to stop a query. Nothing new can go wrong at the database.
+///
+/// The sleeper races `done` rather than running free, so a statement that
+/// finishes in a second does not leave an hour-long task holding a token; and
+/// `fired` is what lets the settle path tell a timeout from the user pressing
+/// Cancel, which arrive as the identical [`DbError::Cancelled`].
+///
+/// **One of these per statement, not per run.** "Statement timeout" is what the
+/// setting says, so a ten-statement script with a one-minute timeout gets a
+/// minute *each* — a batch bounded as a whole would kill honest work whose only
+/// fault was being long. A statement that does expire still stops the batch,
+/// because the token it fires is the batch's.
+struct RunTimeout {
+    /// Cancelled when the statement settles, ending the sleeper. Cancelled by
+    /// `Drop`, so a path that returns early can't leak the task.
+    done: CancellationToken,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunTimeout {
+    /// Arm `secs` over `token`. `0` — the default — arms nothing at all, so an
+    /// unconfigured app spawns no task per statement.
+    ///
+    /// Must be called from inside the runtime (it `tokio::spawn`s), i.e. within
+    /// the `handle.spawn` block that runs the statement, not on the UI thread.
+    fn arm(token: &CancellationToken, secs: u64) -> RunTimeout {
+        let done = CancellationToken::new();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(after) = persist::statement_timeout(secs) {
+            let token = token.clone();
+            let settled = done.clone();
+            let flag = fired.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(after) => {
+                        // Set before cancelling, so the settle path can never
+                        // read the cancellation without the reason for it.
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::warn!("statement timeout after {secs}s — cancelling the run");
+                        token.cancel();
+                    }
+                    _ = settled.cancelled() => {}
+                }
+            });
+        }
+        RunTimeout { done, fired }
+    }
+
+    /// Whether the watchdog fired. Disarming is [`Drop`]'s job, so reading this
+    /// twice — or not at all — is safe.
+    ///
+    /// A `true` here alongside an `Ok` result is possible: the timeout landed in
+    /// the gap between the rows arriving and this call. That is why callers
+    /// consult it only on [`DbError::Cancelled`].
+    fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for RunTimeout {
+    fn drop(&mut self) {
+        // Dropping a `CancellationToken` does not cancel it, so this has to be
+        // explicit — otherwise every finished statement would leave an
+        // hour-long `sleep` behind, one per run, for the life of the process.
+        self.done.cancel();
+    }
+}
+
+/// What the results pane says when the timeout cancelled a statement.
+///
+/// A bare "Cancelled" is what the user's own Cancel button produces, and
+/// reusing it here would leave someone staring at a query they never stopped.
+/// So: what happened, the setting that caused it *in the same words the
+/// dropdown uses*, and where to change it.
+fn timeout_message(secs: u64) -> String {
+    format!(
+        "Cancelled: the statement ran longer than the {} statement timeout. \
+         Change or turn it off in Settings → Query.",
+        persist::statement_timeout_label(secs).to_lowercase()
+    )
+}
+
 /// Reveal the app's config directory — `schemaic.log` and the rest of the state
 /// — in the OS file manager.
 ///
@@ -8272,11 +8412,80 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod app_tests {
     use super::{
-        CliLauncher, inline_outcome, mysql_shell_config, psql_database, psql_shell_config,
-        resolve_native_cli, sqlite_shell_config, unique_name,
+        CliLauncher, RunTimeout, inline_outcome, mysql_shell_config, psql_database,
+        psql_shell_config, resolve_native_cli, sqlite_shell_config, timeout_message, unique_name,
     };
     use schemaic_core::connection::Connection;
     use schemaic_ui::InlineAiState;
+    use tokio_util::sync::CancellationToken;
+
+    /// **A timeout and the Cancel button arrive as the same `DbError`.** If the
+    /// message were the plain "Cancelled" the user's own button produces, they
+    /// would be left staring at a query nobody stopped — so it has to name the
+    /// cause, and name the setting in the words the dropdown uses so the two
+    /// can be matched up.
+    #[test]
+    fn a_timed_out_statement_says_what_stopped_it_and_where_to_change_it() {
+        let msg = timeout_message(900);
+        assert!(msg.contains("15 minutes"), "{msg}");
+        assert!(msg.contains("Settings"), "{msg}");
+        assert_ne!(msg, "Cancelled");
+    }
+
+    /// The label is shared with the settings dropdown for exactly this reason:
+    /// a message quoting "900 seconds" against a dropdown reading "15 minutes"
+    /// leaves the user unable to tell which setting fired.
+    #[test]
+    fn the_message_quotes_the_same_words_the_setting_shows() {
+        for secs in [60u64, 300, 900, 1_800, 3_600] {
+            let label = schemaic_core::persist::statement_timeout_label(secs);
+            assert!(
+                timeout_message(secs).contains(&label.to_lowercase()),
+                "{secs}s: {label}"
+            );
+        }
+    }
+
+    /// Off is the default, and an unconfigured app must not pay a spawned task
+    /// per statement for a feature nobody turned on. `fired()` staying false is
+    /// the observable half of that.
+    #[tokio::test]
+    async fn a_zero_timeout_arms_no_watchdog() {
+        let token = CancellationToken::new();
+        let watchdog = RunTimeout::arm(&token, 0);
+        tokio::task::yield_now().await;
+        assert!(!watchdog.fired());
+        assert!(!token.is_cancelled(), "nothing should cancel a run at 0s");
+    }
+
+    /// The seam the whole feature is: the clock expires, and **the run's own
+    /// cancellation token** — the one the Cancel button fires, the one the
+    /// backends already know how to honour — is what gets cancelled. Driven on
+    /// a paused clock so the test does not actually wait a minute.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_timeout_cancels_the_runs_own_token() {
+        let token = CancellationToken::new();
+        let watchdog = RunTimeout::arm(&token, 60);
+        assert!(!watchdog.fired(), "not yet");
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+        assert!(token.is_cancelled(), "the run was not cancelled");
+        assert!(watchdog.fired(), "the reason was not recorded");
+    }
+
+    /// A statement that finishes must not leave an hour-long `sleep` behind,
+    /// and it must not cancel a token the app has since reused. `Drop` is what
+    /// disarms — dropping a `CancellationToken` does not cancel it, so the
+    /// watchdog has to say so itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_watchdog_never_fires() {
+        let token = CancellationToken::new();
+        drop(RunTimeout::arm(&token, 60));
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        assert!(
+            !token.is_cancelled(),
+            "a finished statement's watchdog fired anyway"
+        );
+    }
 
     /// Every bump of `activity_gen` must arm the poll loop in the same breath.
     ///

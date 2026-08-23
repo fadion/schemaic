@@ -250,6 +250,45 @@ pub struct UiState {
     /// squiggles. Adds a debounced DB round-trip per edit pause. Default: off.
     #[serde(default)]
     pub live_validate: bool,
+    /// Cancel a running statement after this many seconds. **`0` means no
+    /// timeout**, which is the default and the behaviour every release before
+    /// this one had — a runaway `SELECT` ran until somebody noticed.
+    ///
+    /// Seconds rather than a `Duration` because this is a JSON file a human may
+    /// edit, and `{"secs":30,"nanos":0}` is not something to ask them to type.
+    /// [`statement_timeout`] is the one place the `0` is read as "off".
+    #[serde(default)]
+    pub statement_timeout_secs: u64,
+}
+
+/// The configured statement timeout as a duration, or `None` when there is
+/// none.
+///
+/// **`0` is off, not "cancel immediately"** — a zero-second timeout would kill
+/// every statement the instant it started, and it is the value a fresh install,
+/// a hand-edited file and `#[serde(default)]` all produce. One function so that
+/// reading is never spelled a second way.
+pub fn statement_timeout(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// A statement timeout in words — `"No timeout"`, `"1 minute"`, `"15 minutes"`,
+/// `"1 hour"`.
+///
+/// Here rather than beside the settings dropdown that shows it, because the
+/// message a timed-out statement leaves in the results pane quotes the same
+/// value back at the user: two spellings of "15 minutes" is how the setting and
+/// the error come to disagree about what was configured. **Computed from the
+/// value**, never looked up in the option list — a label with a list to fall off
+/// the end of is the trap `row_limit_label` documents.
+pub fn statement_timeout_label(secs: u64) -> String {
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    match secs {
+        0 => "No timeout".to_string(),
+        s if s.is_multiple_of(3600) => plural(s / 3600, "hour"),
+        s if s.is_multiple_of(60) => plural(s / 60, "minute"),
+        s => plural(s, "second"),
+    }
 }
 
 // Manual `Default` (not derived) so a missing file defaults `schema_visible` to
@@ -284,6 +323,7 @@ impl Default for UiState {
             word_wrap: false,
             restore_tabs: true,
             live_validate: false,
+            statement_timeout_secs: 0,
         }
     }
 }
@@ -832,12 +872,88 @@ pub fn clear_connections_backup() {
 mod tests {
     use super::{
         ConnectionsFile, FileStore, Load, RECOVERIES, RightPanelState, UiState, classify,
-        legacy_ai_run_queries_in, read_bytes, recover, recovery_notice, sibling, take_recoveries,
-        write_bytes,
+        legacy_ai_run_queries_in, read_bytes, recover, recovery_notice, sibling, statement_timeout,
+        statement_timeout_label, take_recoveries, write_bytes,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+
+    // ── Statement timeout ─────────────────────────────────────────────────
+
+    /// **Zero is off, not instant death.** It is what a fresh install, a
+    /// hand-edited `ui_state.json` and `#[serde(default)]` all produce, and
+    /// reading it as `Duration::from_secs(0)` would cancel every statement the
+    /// moment it started — an app that cannot run a query, from a setting
+    /// nobody touched.
+    #[test]
+    fn a_zero_statement_timeout_means_no_timeout() {
+        assert_eq!(statement_timeout(0), None);
+    }
+
+    #[test]
+    fn a_configured_statement_timeout_is_that_many_seconds() {
+        assert_eq!(
+            statement_timeout(30),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            statement_timeout(900),
+            Some(std::time::Duration::from_secs(900))
+        );
+    }
+
+    /// The default has to stay `0`: every release before the setting existed
+    /// ran statements unbounded, and shipping a default timeout would start
+    /// killing the long imports and reports people already rely on.
+    #[test]
+    fn the_default_ui_state_has_no_statement_timeout() {
+        assert_eq!(UiState::default().statement_timeout_secs, 0);
+        assert_eq!(
+            statement_timeout(UiState::default().statement_timeout_secs),
+            None
+        );
+    }
+
+    #[test]
+    fn the_statement_timeout_label_reads_in_the_largest_whole_unit() {
+        assert_eq!(statement_timeout_label(0), "No timeout");
+        assert_eq!(statement_timeout_label(60), "1 minute");
+        assert_eq!(statement_timeout_label(300), "5 minutes");
+        assert_eq!(statement_timeout_label(1_800), "30 minutes");
+        assert_eq!(statement_timeout_label(3_600), "1 hour");
+        assert_eq!(statement_timeout_label(7_200), "2 hours");
+    }
+
+    /// Singular and plural both, because "1 minutes" in the one dropdown whose
+    /// job is to report a setting accurately is the kind of thing nobody fixes.
+    #[test]
+    fn the_statement_timeout_label_gets_its_singulars_right() {
+        assert_eq!(statement_timeout_label(1), "1 second");
+        assert_eq!(statement_timeout_label(2), "2 seconds");
+        assert_eq!(statement_timeout_label(90), "90 seconds");
+    }
+
+    /// Computed from the value, never looked up — so a value outside the
+    /// dropdown's option list (a hand-edited file, or an option added or
+    /// removed later) still labels as itself rather than as the default's
+    /// label. Same trap `row_limit_label`'s doc comment records.
+    #[test]
+    fn a_statement_timeout_outside_the_offered_list_labels_as_itself() {
+        assert_eq!(statement_timeout_label(45), "45 seconds");
+        assert_eq!(statement_timeout_label(120), "2 minutes");
+        assert_ne!(statement_timeout_label(45), statement_timeout_label(0));
+    }
+
+    /// A `ui_state.json` written by an older build has no such key at all, and
+    /// it must load as "off" rather than failing the whole file.
+    #[test]
+    fn a_ui_state_from_before_the_setting_loads_with_it_off() {
+        let old = r#"{"row_limit": 1000}"#;
+        let state: UiState = serde_json::from_str(old).expect("older files still parse");
+        assert_eq!(state.statement_timeout_secs, 0);
+        assert_eq!(state.row_limit, 1000);
+    }
 
     // ── The save/load composition ─────────────────────────────────────────
     //

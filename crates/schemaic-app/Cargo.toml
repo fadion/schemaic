@@ -44,6 +44,12 @@ keyring = { version = "3", default-features = false, features = ["async-secret-s
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
 
+# `test-util` for tokio's paused clock, so the statement-timeout tests can let a
+# 60-second timeout expire without waiting a minute. Dev-only on purpose: it is
+# not a feature a shipped binary should carry.
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 # Embed the app icon into the Windows .exe (Explorer/taskbar icon of the file).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

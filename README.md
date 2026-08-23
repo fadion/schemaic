@@ -47,6 +47,9 @@ production data, or any data you care about.
   server-side filter and sort straight from the column headers; per-column freeze;
   a whole-row JSON view/edit panel; per-column display formatters; and export to
   CSV / JSON / SQL / Markdown / HTML.
+- **Statement timeout** — optional, off by default: cancel a statement that runs
+  longer than you meant it to, per statement rather than per script, using the
+  same server-side cancellation the Cancel button does.
 - **Transactions** — a per-tab manual mode that pins one connection and waits for
   an explicit commit or rollback, with a status pill saying what is open and how
   many statements are in it. MySQL/MariaDB and PostgreSQL; on SQLite the control
