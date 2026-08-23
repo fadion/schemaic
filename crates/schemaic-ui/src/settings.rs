@@ -1078,6 +1078,13 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
 
             // The modal's Tab order: one group per section, spaced by 10 within
             // it and by 100 between them — see `FocusRing`.
+            //
+            // **The number follows the layout, not the order the control was
+            // added.** A control appended by number rather than inserted at its
+            // place walks the user backwards through the form: the statement
+            // timeout was written last and numbered 230 while sitting *second*
+            // in its group, so Tab went row limit → confirm → validate → back up
+            // to timeout.
             let ring = crate::widgets::FocusRing::new();
 
             // General group.
@@ -1113,12 +1120,21 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 focusable_dropdown(row_limit, ROW_LIMITS, row_limit_label, ring.clone(), 200);
             let row_section =
                 v_stack((settings_group_label("Default row limit"), row_dd)).style(ctrl);
+            // 210, because `timeout_section` is the row *below* the row limit in
+            // the group below — the two toggles come after it.
+            let timeout_dd = focusable_dropdown(
+                statement_timeout,
+                STATEMENT_TIMEOUTS,
+                statement_timeout_label,
+                ring.clone(),
+                210,
+            );
             let confirm_row = focusable_toggle_row(
                 "Confirm before running writes",
                 "Ask before executing any statement that modifies data or schema.",
                 confirm_writes,
                 ring.clone(),
-                210,
+                220,
             );
             let validate_row = focusable_toggle_row(
                 "Live database validation",
@@ -1126,13 +1142,6 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                  (a non-executing PREPARE) to surface exact errors. Adds a DB round-trip \
                  on each pause.",
                 live_validate,
-                ring.clone(),
-                220,
-            );
-            let timeout_dd = focusable_dropdown(
-                statement_timeout,
-                STATEMENT_TIMEOUTS,
-                statement_timeout_label,
                 ring.clone(),
                 230,
             );
