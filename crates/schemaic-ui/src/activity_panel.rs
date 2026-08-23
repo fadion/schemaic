@@ -200,6 +200,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
                         term.clone(),
                         kill.clone(),
                         overlay,
+                        menus,
                         read_only.get(),
                     )
                 })
@@ -544,6 +545,7 @@ fn session_row(
     term: Option<String>,
     kill: Rc<dyn Fn(i64, KillKind)>,
     overlay: crate::OverlayUi,
+    menus: crate::widgets::MenuFlags,
     read_only: bool,
 ) -> floem::AnyView {
     let color = state_color(s.state);
@@ -660,7 +662,13 @@ fn session_row(
     let menu_session = s;
     floem::views::stack_from_iter(rows)
         .on_secondary_click_stop(move |_| {
-            overlay.context_menu.set(None);
+            // The shared list, not a fourth hand-written spelling of it. The
+            // root's dismissal has already run on the secondary *press* — this
+            // row absorbs no pointer-down — so in practice nothing is left open
+            // to close; what this buys is that a menu added later is closed here
+            // without anyone remembering to extend the line, which is exactly
+            // how `MenuId`'s doc records the flags drifting apart before.
+            menus.close_except(Some(crate::widgets::MenuId::Popup));
             overlay.popup_anchor.set(None);
             overlay.popup_width.set(160.0);
             overlay
