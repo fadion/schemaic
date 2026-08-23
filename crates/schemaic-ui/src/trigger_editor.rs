@@ -158,42 +158,85 @@ fn fetch_sources(ui: &Ui) {
         return;
     };
     let session = d.session.get_untracked();
+    // **One request per trigger, but one write of `current`.** This modal's
+    // `dyn_container` key is the raw `d.trigger`, deliberately — the rebuild it
+    // causes is how the corrected body reaches the Body field, which seeds
+    // itself at build. `dyn_container` never dedups, so a patch per reply meant
+    // a full teardown per reply, and a table with three triggers (sakila's
+    // `customer` and `film` both qualify) dropped the caret three times
+    // mid-word, each one also resetting `FocusRing`'s remembered cursor. The
+    // note at that key describes the cost as *one* rebuild; it was N.
+    //
+    // So the replies are collected and applied together, which is one rebuild
+    // for any number of triggers and changes nothing about *what* is delivered
+    // — only that it lands after the last reply rather than after each. The
+    // real fix the key's note names is still the right one (a signal per row
+    // the fetch can write, as `DdlUi::routine_body` is for the routine editor);
+    // this is the part of it that costs no delivery change.
+    //
+    // If a request never answers, `outstanding` never reaches zero and nothing
+    // is applied — which is exactly what happened before when *no* reply
+    // arrived, since each reply was the only thing that applied itself. The one
+    // path that drops a request (`db_for` failing in the app's
+    // `trigger_source`) drops all of them together, from the same synchronous
+    // loop, so a partial answer is not reachable through it.
+    let outstanding = Rc::new(std::cell::Cell::new(names.len()));
+    let landed: Rc<std::cell::RefCell<Vec<(String, schemaic_core::schema::TriggerSource)>>> =
+        Rc::new(std::cell::RefCell::new(Vec::new()));
     for name in names {
+        let outstanding = outstanding.clone();
+        let landed = landed.clone();
         let done: TriggerSrcDoneFn = Rc::new(move |name: String, src| {
-            let Some(src) = src else {
-                return;
-            };
-            if d.session.get_untracked() != session {
+            outstanding.set(outstanding.get().saturating_sub(1));
+            if let Some(src) = src
+                && d.session.get_untracked() == session
+            {
+                landed.borrow_mut().push((name, src));
+            }
+            if outstanding.get() != 0 {
                 return;
             }
-            // The body the editor opened with — the corrupt one — is what says
-            // whether the user has since edited this row, so it is read before
-            // `current` is corrected.
-            let opened_with = d.trigger.with_untracked(|t| {
-                t.as_ref()
-                    .and_then(|t| t.current.iter().find(|c| c.name == name))
-                    .map(|c| c.action.clone())
+            let replies = std::mem::take(&mut *landed.borrow_mut());
+            if replies.is_empty() || d.session.get_untracked() != session {
+                return;
+            }
+            // The bodies the editor opened with — the corrupt ones — are what
+            // say whether the user has since edited a row, so they are read
+            // before `current` is corrected.
+            let opened_with: Vec<Option<TriggerAction>> = d.trigger.with_untracked(|t| {
+                replies
+                    .iter()
+                    .map(|(name, _)| {
+                        t.as_ref()
+                            .and_then(|t| t.current.iter().find(|c| &c.name == name))
+                            .map(|c| c.action.clone())
+                    })
+                    .collect()
             });
             // `current` — the left-hand side of every diff.
             d.trigger.update(|t| {
-                if let Some(cur) = t
-                    .as_mut()
-                    .and_then(|t| t.current.iter_mut().find(|c| c.name == name))
-                {
-                    src.apply_to(cur);
+                for (name, src) in &replies {
+                    if let Some(cur) = t
+                        .as_mut()
+                        .and_then(|t| t.current.iter_mut().find(|c| &c.name == name))
+                    {
+                        src.apply_to(cur);
+                    }
                 }
             });
-            // …and the draft, unless the user has already edited this row: the
-            // round trip lands in milliseconds, but that is not a reason to
-            // overwrite what somebody typed.
+            // …and the draft, row by row, skipping any the user has already
+            // edited: the round trip lands in milliseconds, but that is not a
+            // reason to overwrite what somebody typed.
             d.trigger_draft.update(|dr| {
-                if let Some(row) = dr
-                    .triggers
-                    .iter_mut()
-                    .find(|r| r.original.as_deref() == Some(name.as_str()))
-                    .filter(|r| opened_with.as_ref() == Some(&r.info.action))
-                {
-                    src.apply_to(&mut row.info);
+                for ((name, src), opened) in replies.iter().zip(&opened_with) {
+                    if let Some(row) = dr
+                        .triggers
+                        .iter_mut()
+                        .find(|r| r.original.as_deref() == Some(name.as_str()))
+                        .filter(|r| opened.as_ref() == Some(&r.info.action))
+                    {
+                        src.apply_to(&mut row.info);
+                    }
                 }
             });
         });
@@ -1184,10 +1227,16 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
         // and its Body field seeds itself from the draft at build, so the
         // escape-corrected trigger body reaches the screen no other way. Dedup
         // this key and a MySQL trigger silently keeps editing
-        // `information_schema`'s resolved copy. The cost is the routine editor's
-        // old bug — a reply landing mid-keystroke drops the caret — and the fix
-        // is the same one: give the Body field a signal the fetch can write
-        // (there, `DdlUi::routine_body`), which needs one per row here.
+        // `information_schema`'s resolved copy.
+        //
+        // The cost is the routine editor's old bug — a reply landing
+        // mid-keystroke drops the caret — and it is **one** rebuild, which this
+        // used to assert without it being true: `fetch_sources` fires one
+        // request per trigger, and patching per reply cost a teardown per
+        // trigger. It collects them now, so the count here does not grow with
+        // the table. The fix that removes the last one is still the routine
+        // editor's: give the Body field a signal the fetch can write (there,
+        // `DdlUi::routine_body`), which needs one per row here.
         move || {
             (
                 d.trigger.get().is_some(),
