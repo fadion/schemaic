@@ -144,9 +144,15 @@ pub fn pipe_table(columns: &[String], rows: &[Vec<String>], cell_chars: usize) -
 /// **`data` gates the one arm that can carry a value.** Everything here is
 /// shape except a failed run's error text, and an engine's error is not shape:
 /// `Duplicate entry 'alice@corp.com' for key 'users.email'` is a stored cell,
-/// quoted back by the server. On a **Schema only** connection that is precisely
-/// what may not leave, so the text is withheld there and the failure is still
-/// reported — the model needs to know the run failed, and can be told to ask.
+/// quoted back by the server.
+///
+/// The gate is [`AiData::may_query`] — `Full` alone — because that reason is
+/// level-independent and `Full` is the only level whose consent covers a value
+/// the user did not hand over. It was `may_attach`, which let the text out on
+/// **Only what I attach**, the default, whose consent line reads *"Rows you
+/// attach from a result leave this machine with that question."* Nobody
+/// attached that one. The failure is still reported at every level; only the
+/// text is withheld, and the arm tells the model to ask for it.
 pub fn result_shape(
     state: &crate::model::QueryState,
     data: crate::connection::AiData,
@@ -156,13 +162,13 @@ pub fn result_shape(
         QueryState::Idle => return None,
         QueryState::Running => "A query is running; no result yet.".to_string(),
         QueryState::Cancelled => "The last run was cancelled by the user.".to_string(),
-        QueryState::Failed(e) if data.may_attach() => format!(
+        QueryState::Failed(e) if data.may_query() => format!(
             "The last run FAILED. The engine's error, verbatim:\n{}",
             fenced(e)
         ),
-        QueryState::Failed(_) => "The last run FAILED. This connection is set to send names \
-             and types only, so the engine's message is withheld — it can quote a stored \
-             value. Ask the user to paste it if you need it."
+        QueryState::Failed(_) => "The last run FAILED. This connection sends rows only when \
+             the user attaches them, so the engine's message is withheld — it can quote a \
+             stored value. Ask the user to paste it if you need it."
             .to_string(),
         QueryState::Loaded(rs) => match rs.affected {
             // A write/DDL: no grid to describe, just what the server reported.
@@ -358,25 +364,35 @@ mod tests {
         assert!(out.contains(UNTRUSTED_NOTE), "{out}");
     }
 
-    /// **An engine's error is not shape.** `Duplicate entry 'alice@corp.com' for
-    /// key 'users.email'` is a stored cell, quoted back by the server — so on a
-    /// connection set to send names and types only it is exactly what may not
-    /// leave. The failure is still reported; only the text is withheld.
+    /// **An engine's error is not shape, and that reason is level-independent.**
+    /// `Duplicate entry 'alice@corp.com' for key 'users.email'` is a stored
+    /// cell, quoted back by the server, and the only level whose consent covers
+    /// a value the user did not hand over is `Full` — *"the assistant may run
+    /// read-only queries and read sample rows by itself"*. `OnRequest`'s says
+    /// rows leave when the user attaches them, and nobody attached this one.
+    ///
+    /// So the gate is [`AiData::may_query`], not `may_attach`. The failure is
+    /// still reported at every level; only the text is withheld, and the arm
+    /// tells the model to ask.
     #[test]
-    fn a_schema_only_connection_withholds_the_engines_error() {
+    fn the_engines_error_leaves_only_where_the_consent_line_covers_it() {
         let failed = QueryState::Failed(
             "ERROR 1062: Duplicate entry 'alice@corp.com' for key 'users.email'".into(),
         );
-        let out = result_shape(&failed, AiData::SchemaOnly).unwrap();
-        assert!(!out.contains("alice@corp.com"), "{out}");
-        assert!(out.contains("FAILED"), "{out}");
-        assert!(out.contains("withheld"), "{out}");
-        // The level that lets the user hand rows over gets the text.
-        assert!(
-            result_shape(&failed, AiData::OnRequest)
-                .unwrap()
-                .contains("alice@corp.com")
-        );
+        // The property, over every level — the same shape as `connection.rs`'s
+        // hint tests, so a fourth level can't be added on the wrong side.
+        for level in AiData::ALL {
+            let out = result_shape(&failed, level).unwrap();
+            assert!(out.contains("FAILED"), "{level:?}: {out}");
+            assert_eq!(
+                out.contains("alice@corp.com"),
+                level.may_query(),
+                "{level:?}: {out}"
+            );
+            if !level.may_query() {
+                assert!(out.contains("withheld"), "{level:?}: {out}");
+            }
+        }
     }
 
     #[test]
