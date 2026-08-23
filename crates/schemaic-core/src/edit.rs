@@ -557,7 +557,7 @@ impl GridCells<'_> {
     }
 
     /// The block `(r0, c0, r1, c1)` as TSV, for the clipboard. Raw values — see
-    /// [`GridCells::text`].
+    /// [`GridCells::text`]. [`parse_tsv_block`] is its exact inverse.
     pub fn tsv(&self, (r0, c0, r1, c1): (usize, usize, usize, usize)) -> String {
         let mut out = String::new();
         for i in r0..=r1 {
@@ -615,6 +615,119 @@ impl GridCells<'_> {
 pub fn attach_span(r0: usize, r1: usize, cap: usize) -> (usize, usize) {
     let total = r1.saturating_sub(r0) + 1;
     (total.min(cap), total)
+}
+
+/// A clipboard block, parsed for pasting into the grid: rows of cell text.
+///
+/// **The exact inverse of [`GridCells::tsv`]** — lines split on `\n` (a trailing
+/// `\r` dropped, so a Windows clipboard behaves), cells split on `\t`, and *no
+/// quote interpretation at all*. The symmetry is the whole rule and it is worth
+/// stating, because a CSV-style parser here would be the obvious mistake: this
+/// codebase's copy side emits no quoting, so there is none to undo, and
+/// unquoting would silently turn a cell whose value genuinely is `"hello"` —
+/// ordinary in a database, and exactly what a user is most likely to be moving
+/// between rows — into `hello`. The cost is that a spreadsheet cell containing
+/// a newline arrives as two rows; that is the rarer wrong answer, and it is
+/// visible in the grid rather than silent.
+///
+/// A trailing newline (which every spreadsheet appends) is not a row. Text that
+/// is entirely empty yields no rows at all.
+pub fn parse_tsv_block(text: &str) -> Vec<Vec<String>> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.split('\n')
+        .map(|line| {
+            line.strip_suffix('\r')
+                .unwrap_or(line)
+                .split('\t')
+                .map(str::to_string)
+                .collect()
+        })
+        .collect()
+}
+
+/// Where a pasted block lands, and what of it doesn't.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PastePlan {
+    /// `(display row, column, value)` for every cell that will be staged.
+    pub cells: Vec<(usize, usize, String)>,
+    /// Cells the block carried that fell off the bottom or right of the grid.
+    /// **Reported, never silent**: a paste that quietly discarded half a
+    /// spreadsheet would look like it worked.
+    pub dropped: usize,
+    /// Cells that landed on a column no edit can reach (an expression, a binary
+    /// column, a generated column). Skipped in place rather than shifted, so
+    /// the columns either side still line up with what was copied.
+    pub read_only: usize,
+}
+
+/// Lay a parsed clipboard block over the grid, anchored at the selection.
+///
+/// Two shapes, because they are the two things people actually do:
+///
+/// - **A single copied cell fills the whole selection.** Selecting a column's
+///   worth of cells and pasting one value is how a column gets set to a
+///   constant, and refusing it would leave the user pasting the same thing N
+///   times.
+/// - **Anything larger extends from the selection's top-left**, whatever the
+///   selection's own size. A block is a shape; honouring the selection's shape
+///   instead would mean either truncating what was copied or tiling it, and
+///   both guess at an intent the user did not express.
+///
+/// Everything is clipped to the grid — `rows` counts the *display* rows,
+/// pending new rows included, so a paste can fill rows the user just added —
+/// and what falls outside is counted rather than dropped quietly. `editable`
+/// answers per column; a cell over a read-only column is skipped **in place**,
+/// never shifted onto the next column, which would write the wrong data into a
+/// column that happens to accept it.
+pub fn plan_paste(
+    block: &[Vec<String>],
+    (r0, c0, r1, c1): (usize, usize, usize, usize),
+    rows: usize,
+    cols: usize,
+    editable: impl Fn(usize) -> bool,
+) -> PastePlan {
+    let mut plan = PastePlan::default();
+    if block.is_empty() || rows == 0 || cols == 0 {
+        return plan;
+    }
+    let single = block.len() == 1 && block[0].len() == 1;
+    // A single value covers the selection; anything else covers its own shape.
+    let (span_r, span_c) = if single {
+        (r1.saturating_sub(r0) + 1, c1.saturating_sub(c0) + 1)
+    } else {
+        (
+            block.len(),
+            block.iter().map(Vec::len).max().unwrap_or_default(),
+        )
+    };
+    for dr in 0..span_r {
+        for dc in 0..span_c {
+            let Some(value) = (if single {
+                Some(block[0][0].clone())
+            } else {
+                block.get(dr).and_then(|r| r.get(dc)).cloned()
+            }) else {
+                // A ragged block: this row is shorter than the widest. Nothing
+                // to write and nothing lost — the cell already there stays.
+                continue;
+            };
+            let (row, col) = (r0 + dr, c0 + dc);
+            if row >= rows || col >= cols {
+                plan.dropped += 1;
+                continue;
+            }
+            if !editable(col) {
+                plan.read_only += 1;
+                continue;
+            }
+            plan.cells.push((row, col, value));
+        }
+    }
+    plan
 }
 
 #[cfg(test)]
@@ -1558,5 +1671,171 @@ mod tests {
         let m = analyze_edit(&r, schema);
         let t = refetch_template(&r, &m).expect("the plain unique index is still a usable key");
         assert_eq!(t.key_cols, vec![1]); // code, not an empty key
+    }
+
+    // ── Pasting a clipboard block ────────────────────────────────────────────
+
+    /// A lone value is the common paste, and it must arrive verbatim — not as
+    /// an empty row, not trimmed.
+    #[test]
+    fn a_single_cell_parses_as_one_row_of_one() {
+        assert_eq!(parse_tsv_block("hello"), vec![vec!["hello".to_string()]]);
+        assert_eq!(parse_tsv_block(" 42 "), vec![vec![" 42 ".to_string()]]);
+    }
+
+    #[test]
+    fn a_block_splits_on_tabs_and_newlines() {
+        assert_eq!(
+            parse_tsv_block("a\tb\nc\td"),
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string(), "d".to_string()]
+            ]
+        );
+    }
+
+    /// Every spreadsheet appends a newline to the block it copies, and Windows
+    /// makes it a CRLF. Neither is a row, and neither belongs on the last cell.
+    #[test]
+    fn a_trailing_line_break_is_not_a_row() {
+        assert_eq!(parse_tsv_block("a\tb\n").len(), 1);
+        assert_eq!(
+            parse_tsv_block("a\tb\r\n"),
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
+        assert_eq!(
+            parse_tsv_block("a\r\nb\r\n"),
+            vec![vec!["a".to_string()], vec!["b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn an_empty_clipboard_is_no_block_at_all() {
+        assert!(parse_tsv_block("").is_empty());
+        assert!(parse_tsv_block("\n").is_empty());
+    }
+
+    /// An empty cell in the middle of a row is a value — SQL empty string, or a
+    /// cell the user cleared — and dropping it would shift every column after
+    /// it one to the left.
+    #[test]
+    fn an_empty_cell_holds_its_place() {
+        assert_eq!(
+            parse_tsv_block("a\t\tc"),
+            vec![vec!["a".to_string(), String::new(), "c".to_string()]]
+        );
+    }
+
+    /// **The rule this parser exists to keep.** A CSV-style reader would
+    /// unquote this and hand back `hello` — a silent edit to the user's data,
+    /// on a value shape that is ordinary in a database. The copy side emits no
+    /// quoting, so there is none to undo.
+    #[test]
+    fn a_quoted_looking_value_is_left_exactly_as_it_is() {
+        assert_eq!(
+            parse_tsv_block("\"hello\""),
+            vec![vec!["\"hello\"".to_string()]]
+        );
+        assert_eq!(
+            parse_tsv_block("{\"a\": 1}"),
+            vec![vec!["{\"a\": 1}".to_string()]]
+        );
+    }
+
+    fn all_editable(_: usize) -> bool {
+        true
+    }
+
+    /// Copy a block out of the grid, paste it back: the same values, in the
+    /// same places. The two functions are inverses and this is the assertion
+    /// that says so — the property a reader of either one would assume.
+    #[test]
+    fn a_block_round_trips_through_the_clipboard_shape() {
+        let block = parse_tsv_block("a\tb\tc\nd\te\tf");
+        let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, all_editable);
+        assert_eq!(plan.dropped, 0);
+        assert_eq!(plan.cells.len(), 6);
+        assert!(plan.cells.contains(&(0, 0, "a".to_string())));
+        assert!(plan.cells.contains(&(1, 2, "f".to_string())));
+    }
+
+    /// Setting a whole column to one value is the reason this case exists; a
+    /// paste that put the value in only the top-left cell would leave the user
+    /// pasting N times.
+    #[test]
+    fn one_copied_cell_fills_the_whole_selection() {
+        let block = parse_tsv_block("x");
+        let plan = plan_paste(&block, (1, 1, 3, 2), 10, 10, all_editable);
+        assert_eq!(plan.cells.len(), 6);
+        for r in 1..=3 {
+            for c in 1..=2 {
+                assert!(plan.cells.contains(&(r, c, "x".to_string())), "({r},{c})");
+            }
+        }
+    }
+
+    /// A block bigger than one cell keeps **its own** shape. Honouring the
+    /// selection's instead would mean truncating what was copied or tiling it,
+    /// and both guess at an intent nobody expressed.
+    #[test]
+    fn a_multi_cell_block_ignores_the_selections_size() {
+        let block = parse_tsv_block("a\tb\nc\td");
+        // A single-cell selection, and a huge one, land the same four cells.
+        let from_one = plan_paste(&block, (0, 0, 0, 0), 10, 10, all_editable);
+        let from_many = plan_paste(&block, (0, 0, 9, 9), 10, 10, all_editable);
+        assert_eq!(from_one, from_many);
+        assert_eq!(from_one.cells.len(), 4);
+    }
+
+    /// Silently discarding half a pasted spreadsheet looks exactly like a paste
+    /// that worked. The count is what lets the grid say otherwise.
+    #[test]
+    fn cells_that_fall_off_the_grid_are_counted_not_dropped_quietly() {
+        let block = parse_tsv_block("a\tb\tc\nd\te\tf");
+        // A 3-column block anchored on the last column of a 2-column grid.
+        let plan = plan_paste(&block, (0, 1, 0, 1), 1, 2, all_editable);
+        assert_eq!(plan.cells, vec![(0, 1, "a".to_string())]);
+        assert_eq!(plan.dropped, 5, "{plan:?}");
+    }
+
+    /// A read-only column is skipped **in place**. Shifting past it would write
+    /// column 2's values into column 3 — data in the wrong column, accepted by
+    /// the database, and invisible until someone reads it.
+    #[test]
+    fn a_read_only_column_is_skipped_rather_than_shifted() {
+        let block = parse_tsv_block("a\tb\tc");
+        let plan = plan_paste(&block, (0, 0, 0, 0), 5, 5, |ci| ci != 1);
+        assert_eq!(plan.read_only, 1);
+        assert!(plan.cells.contains(&(0, 0, "a".to_string())));
+        assert!(plan.cells.contains(&(0, 2, "c".to_string())));
+        assert!(!plan.cells.iter().any(|(_, c, _)| *c == 1));
+    }
+
+    /// A ragged block — the shape a spreadsheet produces from trailing empty
+    /// cells — must not report the gaps as lost data.
+    #[test]
+    fn a_short_row_leaves_the_cells_it_does_not_reach_alone() {
+        let block = parse_tsv_block("a\tb\nc");
+        let plan = plan_paste(&block, (0, 0, 0, 0), 5, 5, all_editable);
+        assert_eq!(plan.dropped, 0);
+        assert_eq!(plan.cells.len(), 3);
+        assert!(!plan.cells.iter().any(|(r, c, _)| *r == 1 && *c == 1));
+    }
+
+    #[test]
+    fn an_empty_block_or_an_empty_grid_plans_nothing() {
+        assert_eq!(
+            plan_paste(&[], (0, 0, 0, 0), 5, 5, all_editable),
+            PastePlan::default()
+        );
+        let block = parse_tsv_block("a");
+        assert_eq!(
+            plan_paste(&block, (0, 0, 0, 0), 0, 5, all_editable),
+            PastePlan::default()
+        );
+        assert_eq!(
+            plan_paste(&block, (0, 0, 0, 0), 5, 0, all_editable),
+            PastePlan::default()
+        );
     }
 }

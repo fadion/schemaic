@@ -5134,6 +5134,25 @@ for keyboard nav.
   menu used to do unconditionally) destroys the very block the menu is about, and the entries then
   describe one cell. Outside it, the press selects first, so a menu never describes something
   invisible. Copy (Ctrl+C / toolbar) emits TSV; a lone cell copies its raw value.
+- **Paste (Ctrl+V / the cell menu) stages, it does not write.** Every pasted cell goes through the
+  same `GridState::stage`/`stage_new` a typed edit does, so it lands as ordinary green edits and
+  the write-back plan, the one-row safety net and Commit/Discard all apply unchanged — a paste is
+  a batch of edits the user can still look at and throw away. The parse is
+  `core::edit::parse_tsv_block`, **the exact inverse of `GridCells::tsv`**: split on newlines and
+  tabs, no quote interpretation. A CSV-style reader here would be the obvious mistake — the copy
+  side emits no quoting, so there is none to undo, and unquoting would silently turn a cell whose
+  value genuinely is `"hello"` into `hello`. The cost is that a spreadsheet cell containing a
+  newline arrives as two rows, which is the rarer wrong answer and a visible one. `plan_paste`
+  lays the block over the grid: **one copied cell fills the whole selection** (that is how a column
+  gets set to a constant), anything larger keeps **its own** shape from the selection's top-left,
+  and everything is clipped to the display rows — pending new rows included, so a paste can fill
+  rows the user just added. What falls outside, what lands on a read-only column, and what lands
+  on a row marked for deletion are **counted and reported** in the same bottom bar a commit error
+  uses (set *after* staging, since `stage` clears it), because a paste that discarded half a
+  spreadsheet looks exactly like one that worked; a read-only column is skipped **in place**, never
+  shifted, which would write one column's values into the next. Nothing is interpreted: a pasted
+  cell reading `NULL` stages the four-character string, because that is what the copy side wrote
+  and turning text into SQL `NULL` would be editing the user's data on their behalf.
 - **What a cell *says* is resolved in one place, and it isn't the view.** `copy_selection` and
   `attached_rows` read the signals once into `grid_cells` — a `core::edit::GridCells` borrow over
   `rs`, `order`, `formats`, `dirty` and `new_rows` — and ask it for `tsv(rect)` or

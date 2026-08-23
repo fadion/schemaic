@@ -1482,6 +1482,86 @@ fn copy_selection(gs: GridState) {
     let _ = floem::Clipboard::set_contents(cells.tsv(rect));
 }
 
+/// Paste the clipboard over the selection, staged as ordinary green edits.
+///
+/// **Staged, not written.** Everything a pasted cell touches goes through
+/// [`GridState::stage`]/[`GridState::stage_new`] exactly as a typed edit does,
+/// so the write-back plan, the one-row safety net and the Commit/Discard pair
+/// apply unchanged — a paste is a batch of edits the user can still look at and
+/// throw away, not a write.
+///
+/// Deliberately **not** interpreted: the block is split on tabs and newlines and
+/// nothing else (see `core::edit::parse_tsv_block`), and a cell reading `NULL`
+/// stages the four-character string, because that is what the copy side wrote
+/// and a paste that quietly turned text into SQL `NULL` would be editing the
+/// user's data on their behalf.
+fn paste_selection(gs: GridState) {
+    let Ok(text) = floem::Clipboard::get_contents() else {
+        return;
+    };
+    let Some(rect) = gs.bounds_untracked() else {
+        return;
+    };
+    let block = schemaic_core::edit::parse_tsv_block(&text);
+    let rs = gs.rs.get_untracked();
+    let nrows = rs.row_count();
+    // Display rows, pending new rows included: a paste that stopped at the last
+    // *fetched* row could not fill the rows the user just added, which is one of
+    // the two things this feature is for.
+    let rows = nrows + gs.new_rows.with_untracked(Vec::len);
+    let model = gs.edit_model.get_untracked();
+    let plan = schemaic_core::edit::plan_paste(&block, rect, rows, rs.col_count(), |ci| {
+        model.editable(ci)
+    });
+    if plan.cells.is_empty() && plan.dropped == 0 && plan.read_only == 0 {
+        return;
+    }
+    let order = gs.order.get_untracked();
+    let del = gs.del_rows.get_untracked();
+    let mut skipped_deleted = 0usize;
+    let planned = plan.cells.len();
+    for (row, ci, value) in plan.cells {
+        if row >= nrows {
+            gs.stage_new(row - nrows, ci, Some(value));
+            continue;
+        }
+        let di = order.get(row).copied().unwrap_or(row);
+        // A row marked for deletion is going away; editing it would stage a
+        // change to something the same commit deletes. Same rule `start_edit`
+        // follows on Enter.
+        if del.contains(&di) {
+            skipped_deleted += 1;
+            continue;
+        }
+        gs.stage(di, ci, Some(value));
+    }
+    // After staging, because `stage` clears this bar on every edit. Silence
+    // would be the wrong answer here: a paste that discarded half a spreadsheet
+    // looks exactly like one that worked.
+    let mut notes = Vec::new();
+    if plan.dropped > 0 {
+        notes.push(format!("{} outside the grid", plan.dropped));
+    }
+    if plan.read_only > 0 {
+        notes.push(format!("{} in read-only columns", plan.read_only));
+    }
+    if skipped_deleted > 0 {
+        notes.push(format!("{skipped_deleted} in rows marked for deletion"));
+    }
+    if notes.is_empty() {
+        return;
+    }
+    // "Pasted, skipping …" would be a lie where nothing landed at all — which is
+    // what a read-only result (a join, an expression column) produces, and the
+    // one case where the user most needs to be told why nothing happened.
+    let staged = planned - skipped_deleted;
+    gs.commit_err.set(Some(if staged == 0 {
+        format!("Nothing pasted: {}.", notes.join(", "))
+    } else {
+        format!("Pasted {staged} cells, skipping {}.", notes.join(", "))
+    }));
+}
+
 /// Rows of the grid as the user sees them — display order, staged edits and
 /// pending new rows included — over the rectangle `(r0, c0, r1, c1)`, capped at
 /// `core::prompt::ATTACH_ROW_CAP`.
@@ -5186,6 +5266,7 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
             }
         }
         Key::Character(s) if ctrl && matches!(s.as_str(), "c" | "C") => copy_selection(gs),
+        Key::Character(s) if ctrl && matches!(s.as_str(), "v" | "V") => paste_selection(gs),
         Key::Character(s) if ctrl && matches!(s.as_str(), "a" | "A") => {
             gs.anchor.set(Some((0, 0)));
             gs.active.set(Some((last_r, last_c)));
@@ -7027,6 +7108,13 @@ fn data_cell(
                 entries.push(MenuEntry::action("Copy formatted", move || {
                     let _ = floem::Clipboard::set_contents(formatted_val.clone());
                 }));
+            }
+            // Beside Copy, and gated the same way Edit Field is: a paste is a
+            // batch of edits, so a result nothing can be typed into has nothing
+            // to paste into either. The action still lands on the *selection*,
+            // not on this cell — Ctrl+V and this entry do the same thing.
+            if editable && !deleted {
+                entries.push(MenuEntry::action("Paste", move || paste_selection(gs)));
             }
             // Server-side filter: splice this value into the base query's WHERE and
             // re-run (full table). NULL cells become IS NULL / IS NOT NULL.
