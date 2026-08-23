@@ -4364,7 +4364,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   and pulls the arrow keys off whatever had them — the grid's cell navigation, in the case that
   motivated the conditional slot. `widgets::menu_trigger_press` is that handler, and every trigger
   installs it in place of a bare `|_| {}`: the grid's Copy / Save / AI icons, the status-bar
-  segments, the schema panel's eye and gear, and `suggest_chevron`. The *panels* that swallow a
+  segments, the schema panel's eye and gear, the Server Activity clock, the connection switcher, the
+  QUERY toolbar's database selector, and `suggest_chevron`. The *panels* that swallow a
   press keep the bare closure, and the distinction is the point: they do it so a click inside isn't
   read as a click away, and where focus goes when one closes was settled by `set_menu_return` when
   it opened, not by the press that dismisses it.
@@ -4755,7 +4756,35 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   connection switcher, the active-database selector, the Server Activity clock), gathered by
   `MenuFlags::of(&ui)` and closed by `close_except(keep)`. A trigger has to enforce this *itself*,
   because it absorbs its own pointer-down — it must, or the root's dismissal would close the menu the
-  click is about to open — so the root handler never runs for it. That list was written out three
+  click is about to open — so the root handler never runs for it. **Both halves of that bargain are
+  the trigger's**, and until recently two of the five click-opened menus had neither: the connection
+  switcher (`lib::header`'s `switcher`) and the QUERY toolbar's active-database selector
+  (`editor_pane`'s `db_selector`) registered only `on_click_stop`, which floem turns into an
+  `EventListener::Click` handler and nothing else — so the root's `close_except(None)` ran first,
+  closed the menu, and the `Click` behind it reopened it, and neither could be shut from the control
+  that opened it. Both now carry
+  `.on_event_stop(EventListener::PointerDown, widgets::menu_trigger_press)`, which is what makes the
+  premise above true rather than nearly true. Absorbing the press is not free, though: it transfers
+  the mutual-exclusivity duty from the root to the trigger, so each also calls
+  `close_except(Some(MenuId::Connection))` / `close_except(Some(MenuId::ActiveDb))` in its own click
+  handler — the shape the schema eye, the gear and the activity clock already had. Those three were
+  the only ones making the call, and the two that weren't were exactly the two that weren't
+  absorbing, which is why the gap stranded nothing on screen and nothing pointed at it. The
+  selector's call sits **after** its "nothing offerable" early return, so an inert trigger closes
+  nothing; its absorb is unconditional, because the root's dismissal is about the *other* menus and
+  pressing a dead control should not close one elsewhere. `query_pane` carries a `menus: MenuFlags`
+  on `QueryPaneParams` to make that call possible at all — `editor_pane` has no `Ui`.
+  **`widgets::menu_trigger_gate::every_click_opened_menu_closes_the_others_itself` is what holds it**,
+  a sibling of `popup_anchor_gate` and a source scan for the same reason: the thing under test is a
+  set of call sites. It reads every `src/*.rs` in the crate with the test modules cut off and asserts
+  each click-opened `MenuId` — `SchemaEye`, `SchemaGear`, `Connection`, `ActiveDb`, `ActivityClock`,
+  but not `Popup` or `Context`, which are opened on `SecondaryClick` where the root dismisses on the
+  press and the opener runs on the release, one gesture — appears in a `close_except(Some(…))`
+  somewhere, in any of the three spellings the crate uses for the path (`crate::widgets::MenuId::`,
+  `widgets::MenuId::`, bare `MenuId::`). Deliberately
+  weak: it counts `close_except(Some(` and `menu_trigger_press` registrations against the number of
+  click-opened menus so a rename can't make it pass by finding nothing, but which site is which is
+  not checkable from source. That list was written out three
   times in three files, and the third one added a flag the other two never learned about: opening the
   activity clock's interval dropdown and then clicking the schema tree's eye left **both** on screen.
   A stranded dropdown is not merely visible — its `focus_root` stays registered, and
@@ -4788,7 +4817,10 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   never toggles however it decides. That was `suggest_chevron`'s bug, and it is a different one from
   the grid icons', which had the guard and no toggle: there the menu never closed at all. Guard
   without toggle re-opens what was never closed; toggle without guard closes what the click then
-  reopens. The status-bar segments have carried both for as long as they have toggled. Stop it with
+  reopens. The status-bar segments have carried both for as long as they have toggled; the
+  connection switcher and the QUERY toolbar's database selector carried the toggle without the guard
+  until they were given `menu_trigger_press` (above), and behaved exactly as this says — every press
+  an open. Stop it with
   `widgets::menu_trigger_press` and not a bare `|_| {}` — swallowing the press also swallows the
   root's `keyboard_nav` clear, which that handler is there to repay (see *`widgets::keyboard_nav`*).
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
