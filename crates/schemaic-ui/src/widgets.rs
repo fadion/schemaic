@@ -3987,6 +3987,84 @@ mod exit_tests {
 
         target.set(None);
         assert_eq!(builds.get(), 6, "and so is closing");
+
+        // **The other half of the contract, and the half that shipped a
+        // regression.** Dedupping the rebuild is only safe if everything that
+        // still needs the patched value reads the signal itself. A consumer
+        // keyed on `(target, draft)` — which is what the editors' footers are —
+        // must see a target-only patch that the modal's key correctly ignores.
+        target.set(Some("BEGIN SELECT 1; END".into()));
+        let draft: RwSignal<String> = RwSignal::new("BEGIN SELECT 1; END".into());
+        let footer = Rc::new(std::cell::Cell::new(0u32));
+        let f = footer.clone();
+        create_effect(move |_| {
+            let _ = (target.get(), draft.get());
+            f.set(f.get() + 1);
+        });
+        let before = footer.get();
+        target.update(|t| *t = Some("BEGIN SELECT 'it''s'; END".into()));
+        assert_eq!(
+            footer.get(),
+            before + 1,
+            "a footer keyed on the target still sees the fetch's correction"
+        );
+    }
+
+    /// **The editors' footers must take `current` from their own key.**
+    ///
+    /// The regression the memo above introduced: both modals captured
+    /// `d.view.get_untracked()` / `d.routine.get_untracked()` **once** when the
+    /// modal was built and handed clones of it to the change count and to
+    /// *Preview SQL*. Before the memo, the raw key rebuilt the modal on every
+    /// patch and refreshed that capture as a side effect; the memo dedups the
+    /// rebuild, which was the only thing delivering the corrected `current`. So
+    /// the footers diffed a draft the fetch had corrected against a `current` it
+    /// had not — a view opening on "1 change" over an edit nobody made, and a
+    /// routine offering a `DROP`+`CREATE` plan for a body nobody touched.
+    ///
+    /// **What the footers must not do is read it in the *modal's* key**, which
+    /// is the caret bug `c11dfb8` fixed. There is no runtime subject for that
+    /// distinction — it is which closure a signal is read in — so the subject is
+    /// the source text, the way `core/tests/doc_coverage.rs` takes a file as
+    /// its subject.
+    #[test]
+    fn the_ddl_editors_footers_key_on_the_target_they_diff_against() {
+        let dense = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        for (file, src, keyed, bare) in [
+            (
+                "view_editor.rs",
+                include_str!("view_editor.rs"),
+                "(d.view.get(),d.view_draft.get())",
+                "move||d.view_draft.get(),",
+            ),
+            (
+                "routine_editor.rs",
+                include_str!("routine_editor.rs"),
+                "(d.routine.get(),d.routine_draft.get(),d.routine_source_pending.get(),)",
+                "move||(d.routine_draft.get(),d.routine_source_pending.get()),",
+            ),
+        ] {
+            let d = dense(src);
+            assert_eq!(
+                d.matches(keyed).count(),
+                2,
+                "{file}: both footers — the change count and the actions — must \
+                 key on the target signal"
+            );
+            assert!(
+                !d.contains(bare),
+                "{file}: a footer keyed on the draft alone cannot see the fetch \
+                 correct `current`"
+            );
+            // And the stale capture itself is gone, so there is nothing left in
+            // scope to hand a footer by mistake.
+            for capture in [
+                "letstatus_target=target.clone();",
+                "letpreview_target=target.clone();",
+            ] {
+                assert!(!d.contains(capture), "{file}: {capture} is the bug");
+            }
+        }
     }
 }
 
