@@ -102,6 +102,7 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             // Ctrl+G in the grid has no affordance anywhere else either.
             ("Ctrl+G", "Go to row"),
             ("Ctrl+C", "Copy"),
+            ("Ctrl+V", "Paste as staged edits"),
             ("Ctrl+A", "Select all"),
             ("Ctrl+Home / Ctrl+End", "First / last cell"),
             // "Edit cell" only. Enter on a **read-only** cell does nothing —

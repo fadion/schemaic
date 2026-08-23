@@ -45,8 +45,10 @@ production data, or any data you care about.
 - **Results grid** — inline editing that writes back to the database
   (transactional, with a per-row safety net); add / duplicate / delete rows;
   server-side filter and sort straight from the column headers; per-column freeze;
-  a whole-row JSON view/edit panel; per-column display formatters; and export to
-  CSV / JSON / SQL / Markdown / HTML.
+  a whole-row JSON view/edit panel; per-column display formatters; paste a block
+  from a spreadsheet straight onto the selection (staged as ordinary edits, so
+  you still commit or discard it); and export to CSV / JSON / SQL / Markdown /
+  HTML.
 - **Statement timeout** — optional, off by default: cancel a statement that runs
   longer than you meant it to, per statement rather than per script, using the
   same server-side cancellation the Cancel button does.
