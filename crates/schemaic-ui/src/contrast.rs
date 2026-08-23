@@ -242,8 +242,12 @@ macro_rules! disabled {
 /// it was named with instead.
 ///
 /// **It is expanded by
-/// [`a_faded_foreground_is_measured_against_what_the_eye_sees`], and that is
-/// what keeps it from rotting.** A `macro_rules!` body is only checked when it
+/// `a_faded_foreground_is_measured_against_what_the_eye_sees`, and that is
+/// what keeps it from rotting.**
+///
+/// (Named in plain backticks, not an intra-doc link: the test lives in
+/// `#[cfg(test)] mod tests`, which rustdoc does not compile, so a link to it
+/// cannot resolve and CI's `--document-private-items` pass fails on it.) A `macro_rules!` body is only checked when it
 /// is expanded, so under a bare `#[allow(unused_macros)]` this one sat outside
 /// the compiler entirely: `Pairing` gained `role` as a key field in an earlier
 /// round and `UI_SHORTFALL`'s tuple changed with it, and the next such change
