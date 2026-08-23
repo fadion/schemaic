@@ -206,13 +206,67 @@ where
     T: Send + 'static,
     F: FnOnce(&mut SqliteConn) -> Result<T, DbError> + Send + 'static,
 {
+    with_conn_holding(db, (), f).await
+}
+
+/// [`with_conn`], with something the blocking task must keep alive for as long
+/// as it runs.
+///
+/// One funnel, still: `hold` is moved *into* the blocking closure rather than
+/// kept by the caller, which is the whole point of it existing. A
+/// `spawn_blocking` task **cannot be cancelled** — dropping the `JoinHandle`
+/// future frees the awaiting caller and leaves the thread exactly where it was —
+/// so anything meant to track the *work* has to travel with the work. The one
+/// caller is [`probe_permit`].
+async fn with_conn_holding<T, F, H>(db: &Db, hold: H, f: F) -> Result<T, DbError>
+where
+    T: Send + 'static,
+    H: Send + 'static,
+    F: FnOnce(&mut SqliteConn) -> Result<T, DbError> + Send + 'static,
+{
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
+        let _hold = hold;
         let mut conn = open(&db)?;
         f(&mut conn)
     })
     .await
     .map_err(|e| DbError::Query(format!("worker failed: {e}")))?
+}
+
+/// One reachability probe at a time, per file.
+///
+/// **The deadline bounds the caller; this bounds the work.** `Db::ping` and
+/// [`fetch_databases`] both wrap their await in `PING_TIMEOUT`, which frees the
+/// caller at five seconds — but a `spawn_blocking` task is not cancellable, and
+/// a file on a share that has gone away stays parked inside the OS `open` for as
+/// long as the mount allows, which for some mount options is indefinitely. The
+/// health poll re-arms (10 s, backing off to 120 s) and *each attempt parked
+/// another thread*. Tokio's blocking pool caps at 512 by default, and past that
+/// every `spawn_blocking` in the app queues behind the dead share — every SQLite
+/// query, and every `export_file`/`export_erd` write, on connections that have
+/// nothing to do with it.
+///
+/// A single permit turns unbounded accumulation into a constant: at most one
+/// parked thread per file, whatever the poll does. It cannot be *released* by a
+/// thread that never returns, which is the correct behaviour and not a leak of
+/// its own — every later probe then waits on the permit and its own
+/// `PING_TIMEOUT` reports "timed out", which is what the health check was
+/// already saying.
+///
+/// Keyed by file rather than held on [`Db`], because a `Db` is a value rebuilt
+/// per operation (`Db::connect`) and two of them for one file must share the
+/// permit. Only the probe path takes one: serialising real queries behind it
+/// would make one slow statement block the next, and a query is a gesture the
+/// user is waiting on rather than a timer nobody is watching.
+fn probe_permit(file: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut map = PERMITS.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(file.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
 }
 
 /// One cell, read as the storage class SQLite actually returned.
@@ -1255,12 +1309,15 @@ fn fk_violations(conn: &SqliteConn) -> Result<FkViolations, DbError> {
 ///
 /// **And both are bounded by the same deadline**, which is the other half of not
 /// drifting apart. The listing called the module-private `ping` directly, past
-/// the `tokio::time::timeout` `Db::ping` wraps it in — so a file on a share that
-/// has gone away blocked inside `open` for as long as the OS allowed (minutes on
-/// SMB, indefinitely for some mount options), holding a blocking-pool thread per
-/// selection, while the health check on the same connection gave up after five
-/// seconds and said "Disconnected". The hazard is the one `Db::ping`'s own
-/// comment names.
+/// the `tokio::time::timeout` `Db::ping` wraps it in, so a file on a share that
+/// has gone away left the schema tree hanging while the health check on the same
+/// connection gave up after five seconds and said "Disconnected".
+///
+/// **The deadline frees the caller and not the thread**, and that half is
+/// [`probe_permit`]'s. A `spawn_blocking` task cannot be cancelled: the parked
+/// `open` stays parked for as long as the mount allows, so the timeout alone
+/// left one thread behind per poll tick rather than per selection. This doc used
+/// to claim the deadline had fixed that.
 pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     match tokio::time::timeout(crate::PING_TIMEOUT, ping(db)).await {
         Ok(r) => r?,
@@ -1275,8 +1332,12 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
 /// actually parsed the file header — `SELECT 1` would succeed against any file at
 /// all, since the header is not read until something needs it, and a "connected"
 /// status for a JPEG is worse than no status.
+/// **One at a time per file** — see [`probe_permit`] for why the deadline the
+/// two callers wrap this in is not enough on its own.
 pub(crate) async fn ping(db: &Db) -> Result<(), DbError> {
-    with_conn(db, |conn| {
+    // `acquire_owned` never fails here: the semaphore is never closed.
+    let permit = probe_permit(&db.file).acquire_owned().await;
+    with_conn_holding(db, permit, |conn| {
         conn.query_row("PRAGMA schema_version", [], |_| Ok(()))
             .map_err(query_err)
     })
@@ -3497,6 +3558,76 @@ mod tests {
             .query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0))
             .unwrap();
         assert_eq!(after, 0, "the draft wrote a row");
+    }
+
+    /// **A hung probe costs one parked thread, not one per tick.** The deadline
+    /// the two probe paths wrap themselves in frees the *caller* at five seconds
+    /// and nothing else: a `spawn_blocking` task cannot be cancelled, so a file
+    /// on a share that has gone away stays parked inside the OS `open` for as
+    /// long as the mount allows, and the health poll re-arms and parks another.
+    /// Past tokio's 512-thread blocking pool, every `spawn_blocking` in the app
+    /// queues behind it — every SQLite query and every export write, on
+    /// connections that have nothing to do with the share.
+    ///
+    /// The parked thread cannot be simulated here, so what this pins is the
+    /// mechanism that bounds it: one permit per file, held by the *work*, shared
+    /// between two `Db` values for one file (a `Db` is rebuilt per operation, so
+    /// the permit cannot live on it), and separate per file so one dead share
+    /// does not serialise probes of a live one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_holds_the_only_permit_for_its_file() {
+        let a = probe_permit("/mnt/share/notes.sqlite");
+        let same = probe_permit("/mnt/share/notes.sqlite");
+        let other = probe_permit("/local/other.sqlite");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &same),
+            "two `Db`s for one file share the permit"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &other),
+            "a dead share must not serialise probes of a live file"
+        );
+
+        let held = a.clone().acquire_owned().await.expect("never closed");
+        // A second probe of the same file cannot start…
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), same.acquire())
+                .await
+                .is_err(),
+            "a second probe of the same file must wait"
+        );
+        // …while the other file's is unaffected.
+        assert!(other.try_acquire().is_ok());
+        // And the permit comes back when the work finishes rather than when the
+        // caller gives up — which is why it is moved into the blocking closure.
+        drop(held);
+        assert!(a.try_acquire().is_ok());
+    }
+
+    /// The composition, which is the half a test of the permit alone would miss:
+    /// **`ping` is the thing that takes it.** A permit nothing acquires bounds
+    /// nothing, and `ping` is the funnel both probe paths (`Db::ping` and
+    /// `fetch_databases`) go through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_waits_for_the_permit_its_file_already_owes() {
+        let (_keeper, db) = shared_memory("probe_permit_ping");
+        let held = probe_permit(db.file())
+            .acquire_owned()
+            .await
+            .expect("never closed");
+        // This file is in memory and answers instantly, so the only thing that
+        // can stop the probe finishing is the permit.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), ping(&db))
+                .await
+                .is_err(),
+            "a probe started while one is outstanding must wait for it"
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), ping(&db))
+            .await
+            .expect("the permit is free")
+            .expect("the file is openable");
     }
 
     #[tokio::test]
