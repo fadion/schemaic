@@ -934,6 +934,13 @@ pub struct Tab {
     /// The active server-side filter/sort for this tab's result (persists across
     /// result reloads; reset on a fresh manual run). Session-only.
     pub grid_query: RwSignal<schemaic_core::filter::GridQuery>,
+    /// A one-off row cap for this tab, overriding the global setting — set by
+    /// the capped notice's "read more" action, cleared on a fresh manual run.
+    ///
+    /// Per-tab and transient on purpose: getting past the cap once, for one
+    /// result, is not a decision about every query the user will ever run, and
+    /// making it one is what the global setting already is.
+    pub row_cap_override: RwSignal<Option<usize>>,
     /// A filter/sort re-run's DB error, shown as a dismissible bar at the bottom of
     /// the *table* (the previous results stay put — unlike a manual run, which
     /// replaces the grid with the error). Cleared on a table click / new run.
@@ -1021,6 +1028,7 @@ impl Tab {
             font_zoom: cx.create_rw_signal(None),
             base_sql: cx.create_rw_signal(None),
             grid_query: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
+            row_cap_override: cx.create_rw_signal(None),
             view_err: cx.create_rw_signal(None),
             load_gen: cx.create_rw_signal(0),
             path: cx.create_rw_signal(None),
@@ -4591,6 +4599,7 @@ fn center(ui: Ui) -> impl IntoView {
                     highlight_col: tab.highlight_col,
                     base_sql: tab.base_sql,
                     grid_query: tab.grid_query,
+                    row_cap_override: tab.row_cap_override,
                     view_err: tab.view_err,
                     load_gen: tab.load_gen,
                     apply_view: apply_view.clone(),

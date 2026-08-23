@@ -712,6 +712,46 @@ pub fn rows_read_of(loaded: usize, total: Option<RowCount>) -> String {
     }
 }
 
+/// How much bigger the next read of a capped result should be.
+///
+/// Five, because two barely moves and ten walks a 200k default straight into
+/// two million rows in one click.
+const CAP_STEP: usize = 5;
+
+/// The cap a "read more of this" re-run should ask for, given how many rows the
+/// last one actually read.
+///
+/// **There is no cursor here, and the label must not imply one.** The row cap is
+/// a client-side cutoff of the result stream (`db::collect_rows`), not a
+/// `LIMIT`/`OFFSET` — so "load more" is a *re-run of the whole statement* with a
+/// bigger ceiling, and on an unordered query the second read can legitimately
+/// disagree with the first. Naming the concrete number is what keeps the offer
+/// honest: the user is choosing to fetch N rows, not to page.
+///
+/// Stepping off the rows **read** rather than off the configured cap is the
+/// reason this is a function at all. The two differ whenever a filter or a
+/// smaller table means the read stopped short of the setting, and stepping off
+/// the setting there would offer a number the result gives no reason to expect.
+/// The result is rounded up to a whole power-of-ten multiple so the offer reads
+/// as a round number (`1,000` → `5,000`, `1,024` → `5,200`) rather than as
+/// arithmetic done in public.
+pub fn next_row_cap(rows_read: usize) -> usize {
+    // At least a thousand: five times a three-row result is fifteen, and
+    // re-running a whole statement to read twelve more rows is not an offer.
+    let target = rows_read.saturating_mul(CAP_STEP).max(1_000);
+    // Round **up** to two significant figures — enough to tidy the tail without
+    // collapsing the figure. One would turn 20,480 into 30,000, handing the user
+    // half again as much as they asked for; none would print 20,480.
+    let mut unit = 1usize;
+    while target / unit >= 100 {
+        let Some(next) = unit.checked_mul(10) else {
+            break;
+        };
+        unit = next;
+    }
+    target.div_ceil(unit).saturating_mul(unit)
+}
+
 /// Below this many rows an **estimate** is not named in a destructive
 /// confirmation.
 ///
@@ -1491,6 +1531,59 @@ mod tests {
         assert_eq!(rows_read_of(1_000, Some(RowCount::Estimate(400))), "1k");
         // Equal is not more: the read already accounts for every row.
         assert_eq!(rows_read_of(1_000, Some(RowCount::Exact(1_000))), "1k");
+    }
+
+    // ── Reading more of a capped result ──────────────────────────────────────
+
+    /// The offer is a concrete number, so it has to be a *round* one — an
+    /// action reading "Read 5,120 rows" looks like arithmetic leaking, and an
+    /// action reading "Read more" would imply a cursor this has none of.
+    #[test]
+    fn the_next_cap_is_a_round_multiple_of_what_was_read() {
+        assert_eq!(next_row_cap(1_000), 5_000);
+        assert_eq!(next_row_cap(10_000), 50_000);
+        assert_eq!(next_row_cap(100_000), 500_000);
+        assert_eq!(next_row_cap(200_000), 1_000_000);
+        assert_eq!(next_row_cap(1_000_000), 5_000_000);
+    }
+
+    /// Rounding tidies the tail; it must not swallow the figure. Two
+    /// significant figures: 20,480 belongs at 21,000, not at 30,000 — a user
+    /// who asked for five times more should not silently get seven and a half.
+    #[test]
+    fn rounding_the_next_cap_keeps_its_magnitude() {
+        assert_eq!(next_row_cap(1_024), 5_200);
+        assert_eq!(next_row_cap(1_500), 7_500);
+        assert_eq!(next_row_cap(4_096), 21_000);
+        assert_eq!(next_row_cap(1_234_567), 6_200_000);
+    }
+
+    /// A result capped at a handful of rows still has to offer something worth
+    /// pressing: five times three is fifteen, and re-running a whole statement
+    /// to read twelve more rows is not an offer.
+    #[test]
+    fn a_tiny_read_still_steps_up_to_something_useful() {
+        assert_eq!(next_row_cap(0), 1_000);
+        assert_eq!(next_row_cap(3), 1_000);
+        assert_eq!(next_row_cap(199), 1_000);
+    }
+
+    /// It must always ask for *more* than was read, or the action does nothing
+    /// and the notice stays exactly as it was.
+    #[test]
+    fn the_next_cap_always_exceeds_what_was_read() {
+        for read in [0usize, 1, 999, 1_000, 1_001, 12_345, 200_000, 999_999] {
+            assert!(next_row_cap(read) > read, "{read} → {}", next_row_cap(read));
+        }
+    }
+
+    /// A cap near `usize::MAX` must not wrap into a smaller number — which
+    /// would turn "read more" into "read less" and is the one arithmetic bug
+    /// this function can have.
+    #[test]
+    fn an_absurd_read_saturates_rather_than_wrapping() {
+        assert!(next_row_cap(usize::MAX) >= usize::MAX / 2);
+        assert!(next_row_cap(usize::MAX / 2) > usize::MAX / 2);
     }
 
     // ── What a destructive confirmation asks ─────────────────────────────────

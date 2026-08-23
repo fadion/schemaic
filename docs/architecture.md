@@ -3178,6 +3178,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   server (`--mcp-serve`) the AI panel talks to. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
   switch.
+  **Getting past the row cap is a per-tab override, not a fetch mode.** The cap is read once per
+  run, so `Tab::row_cap_override` — set by the results toolbar's "read N rows", cleared by the next
+  manual run — is all it takes; there is no second path through the DB layer. The label names a
+  **number** on purpose: the cap is a client-side cutoff of the result stream (`db::collect_rows`),
+  not a `LIMIT`/`OFFSET`, so there is no cursor to advance, "load more" would be a lie, and the
+  action re-runs the whole statement at a bigger ceiling — on an unordered query the second read
+  can legitimately disagree with the first. `stats::next_row_cap` picks that number: five times the
+  rows actually **read** (not the configured cap, which differs whenever a filter or a small table
+  stopped the read short), floored at a thousand so a three-row result still offers something worth
+  pressing, and rounded up to two significant figures so the offer reads as a figure rather than as
+  arithmetic. The re-run goes through `GridState::current_statement`, **not** `apply_grid_query`:
+  the latter reports a base it cannot rewrite as a *filter* failure ("not a simple single-table
+  SELECT"), and a join is perfectly re-runnable at a bigger cap — telling a user with no filter
+  that their filter is at fault is worse than the cap they were trying to get past
+  (`an_ineligible_base_is_still_ineligible_with_nothing_to_splice` pins the premise). Clearing the
+  override on a fresh manual run is the other half: a raised cap belongs to the result it was
+  raised for, and carrying it forward would be the global setting the user didn't change.
   **The statement timeout is a clock wired to the Cancel button, not a second way to stop a
   query.** `RunTimeout::arm` spawns one sleeper racing a `done` token and, when the sleep wins,
   cancels *the run's own* `CancellationToken` — the same one Cancel fires, which each backend

@@ -365,6 +365,9 @@ struct GridState {
     /// (wrapped so `GridState` stays `Copy`). See `schemaic_core::filter`.
     base_sql: RwSignal<Option<String>>,
     grid_query: RwSignal<schemaic_core::filter::GridQuery>,
+    /// A one-off, per-tab row cap the capped notice's read-more action sets; the
+    /// app's run path reads it in place of the global setting.
+    row_cap_override: RwSignal<Option<usize>>,
     apply_view: RwSignal<Option<ApplyViewFn>>,
     /// A filter/sort error — a bad WHERE fragment / un-rewritable base (client-side)
     /// or a live DB error from the re-run (tab-level). Rendered in the grid's bottom
@@ -514,6 +517,7 @@ impl GridState {
             dialect,
             base_sql: gctx.base_sql,
             grid_query: gctx.grid_query,
+            row_cap_override: gctx.row_cap_override,
             apply_view: RwSignal::new(Some(gctx.apply_view.clone())),
             view_err: gctx.view_err,
             fmt_rules: gctx.formats,
@@ -584,6 +588,31 @@ impl GridState {
             )),
             Err(FilterError::BadCondition(msg)) => self.view_err.set(Some(msg)),
         }
+    }
+
+    /// The statement that produced the result currently on screen, for a re-run
+    /// that changes nothing about the query itself — the capped notice's "read
+    /// N rows".
+    ///
+    /// **Not [`GridState::apply_grid_query`]**, which is the wrong tool here even
+    /// though it would usually work: it treats a base it cannot rewrite as a
+    /// *filter* failure and says "Can't filter this query — not a simple
+    /// single-table SELECT". A join or a CTE is perfectly re-runnable at a bigger
+    /// cap, and telling the user their filter is at fault when they have no
+    /// filter is worse than the cap they were trying to get past.
+    ///
+    /// With no filter or sort the base *is* the statement. With one, the rewrite
+    /// already succeeded once — that is how the filter got applied — so this asks
+    /// again rather than caching the answer.
+    fn current_statement(&self) -> Option<String> {
+        let base = self.base_sql.get_untracked()?;
+        let gq = self.grid_query.get_untracked();
+        if gq.is_empty() {
+            return Some(base);
+        }
+        build_query(&base, &gq.filter, &gq.sort, self.dialect)
+            .ok()
+            .flatten()
     }
 
     /// Append a cell-derived condition (`col = 'val'` / `IS NULL` / negated) to the
@@ -1966,6 +1995,9 @@ pub(crate) struct GridCtx {
     /// The active server-side filter/sort for this result (persists across result
     /// reloads; reset on a fresh manual run).
     pub(crate) grid_query: RwSignal<schemaic_core::filter::GridQuery>,
+    /// A one-off row cap for this tab, set by the capped notice's read-more
+    /// action and read by the app's run path in place of the global setting.
+    pub(crate) row_cap_override: RwSignal<Option<usize>>,
     /// A filter/sort re-run's DB error (tab-level) — rendered in the grid's bottom
     /// bar so the current table stays put. Cleared on a table click / new run.
     pub(crate) view_err: RwSignal<Option<String>>,
@@ -5488,6 +5520,53 @@ fn grid_toolbar(
             }
         },
     );
+    // **Getting past the cap, for this result only.**
+    //
+    // The cap is a client-side cutoff of the result stream (`db::collect_rows`),
+    // not a `LIMIT`/`OFFSET`, so there is no cursor to advance and nothing to
+    // "load more" of: the action **re-runs the whole statement** with a bigger
+    // ceiling, and on an unordered query the second read can legitimately
+    // disagree with the first. So the label names the number rather than saying
+    // "more", and the verb is *read*, not *load*.
+    //
+    // Shown only where the re-run can actually happen — `apply_grid_query`
+    // rebuilds the statement from `base_sql`, which a Run Everything panel does
+    // not have. A missing action beats one that does nothing.
+    let read_more = dyn_container(
+        move || truncated && gs.base_sql.get().is_some(),
+        move |show| {
+            if !show {
+                return empty().into_any();
+            }
+            let next = schemaic_core::stats::next_row_cap(nrows);
+            // `human_count`, because the stats line to its left prints the rows
+            // read with the same printer — "1k of ~4.2m rows · read 5k rows"
+            // only reads as one sentence if both figures are spelled one way.
+            text(format!(
+                "· read {} rows",
+                schemaic_core::text::human_count(next)
+            ))
+            .on_click_stop(move |_| {
+                let Some(sql) = gs.current_statement() else {
+                    return;
+                };
+                // The override is per-tab and transient: the next manual run
+                // clears it, because getting past the cap once is not a
+                // decision about every query the user will ever run.
+                gs.row_cap_override.set(Some(next));
+                if let Some(run) = gs.apply_view.get_untracked() {
+                    run(sql);
+                }
+            })
+            .style(|s| {
+                s.color(theme::text_dim())
+                    .font_size(theme::FONT_LABEL)
+                    .hover(|s| s.color(theme::accent()))
+            })
+            .into_any()
+        },
+    );
+
     // Commit / discard, shown only when there are staged changes (cell edits +
     // pending new rows + pending deletes). Sits first in the icon cluster, followed
     // by a separator. Commit is a green (grid_edit_staged #509950) button — check
@@ -5980,6 +6059,7 @@ fn grid_toolbar(
 
     h_stack((
         stats,
+        read_more,
         arena_note,
         caveat,
         empty().style(|s| s.flex_grow(1.0_f32)),
