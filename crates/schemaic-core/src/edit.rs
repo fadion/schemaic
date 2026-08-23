@@ -468,6 +468,142 @@ pub fn copy_scope(
     }
 }
 
+/// The literal a staged SQL NULL reads as, everywhere a surface reads the grid.
+/// The cell paints it, so the clipboard and an attachment say it too.
+const STAGED_NULL: &str = "NULL";
+
+/// The grid's cell values as plain data: what the view's signals hold, borrowed
+/// for one read.
+///
+/// **The surfaces that *read* the grid resolve a cell here, not in the view.**
+/// The painted cell, the clipboard and an AI attachment are all answering "what
+/// is in this cell", so a second spelling of the resolution is a second chance
+/// to disagree — and each time it has. `attached_rows` first read `rs.cell` and
+/// never `dirty`, so a green uncommitted edit was on screen while the pre-edit
+/// value went to the model; the fix for *that* left the resolution in the view
+/// where nothing could test it, and it then went out one source short again —
+/// no [`crate::format::apply`], so a `Timestamp` column sent `1709294400` where
+/// the grid showed `2024-03-01 12:00:00`, with the sent-attachment card
+/// agreeing with the wrong copy because it is built from the same rows.
+///
+/// The painter itself is not a caller: it runs per cell per frame inside a
+/// reactive closure and reads the signals one at a time. It stays the reference
+/// implementation, and [`GridCells::text`] is written to match it.
+pub struct GridCells<'a> {
+    pub rs: &'a ResultSet,
+    /// Display → data row map (`compute_order`); shorter than the result only
+    /// before the first sort, where the display index *is* the data index.
+    pub order: &'a [usize],
+    /// The saved formatter per result column, as the painter reads it.
+    pub formats: &'a [crate::format::ColumnFormat],
+    /// Staged edits, keyed by (**data** row, column).
+    pub dirty: &'a HashMap<(usize, usize), Option<String>>,
+    /// Pending new rows, in the display order they are drawn past the real ones.
+    pub new_rows: &'a [HashMap<usize, Option<String>>],
+}
+
+impl GridCells<'_> {
+    /// The text **display** row `i`, column `ci` shows.
+    ///
+    /// Resolves the sources in the painter's order: a pending new row's typed
+    /// value, then a staged edit, then the stored cell.
+    ///
+    /// `formatted` says whether the column's saved formatter applies. An
+    /// attachment passes `true` — its whole promise is that the model is
+    /// answering about what the user is looking at. The clipboard passes
+    /// `false`: Ctrl+C is raw **by design**, and the cell menu offers *Copy
+    /// formatted* as its own entry.
+    ///
+    /// A staged value is never formatted, because the painter doesn't format
+    /// one either — it is the text the user typed, still uncommitted.
+    ///
+    /// **Raw is [`crate::model::CellRef::display`], not `apply(None, …)`**,
+    /// though the painter uses the latter for every column. The two differ on
+    /// one thing: `apply` goes through [`crate::model::CellRef::to_value`], so a
+    /// `Float` cell the server sent as `1.50` comes back `1.5`. That is a
+    /// pre-existing one-glyph divergence between the painter and the clipboard,
+    /// and quietly widening it into what Ctrl+C yields is not this reader's to
+    /// do.
+    pub fn text(&self, i: usize, ci: usize, formatted: bool) -> String {
+        let nreal = self.rs.row_count();
+        // Display rows past the real ones are the pending new rows, whose values
+        // live in `new_rows` — resolving one through `order` would fall back to
+        // the display index and read a committed row that isn't it. A pending
+        // row has no stored value at all: an unset cell is empty, because what
+        // it will hold is a server default the cell previews as `<auto>`.
+        if i >= nreal {
+            return match self.new_rows.get(i - nreal).and_then(|r| r.get(&ci)) {
+                Some(Some(t)) => t.clone(),
+                Some(None) => STAGED_NULL.to_string(),
+                None => String::new(),
+            };
+        }
+        let di = self.order.get(i).copied().unwrap_or(i);
+        match self.dirty.get(&(di, ci)) {
+            Some(Some(t)) => t.clone(),
+            Some(None) => STAGED_NULL.to_string(),
+            None => {
+                let fmt = match formatted {
+                    true => self.formats.get(ci).copied().unwrap_or_default(),
+                    false => crate::format::ColumnFormat::None,
+                };
+                match self.rs.cell(di, ci) {
+                    None => String::new(),
+                    Some(c) if fmt == crate::format::ColumnFormat::None => c.display().to_string(),
+                    Some(c) => crate::format::apply(fmt, &c.to_value()),
+                }
+            }
+        }
+    }
+
+    /// The block `(r0, c0, r1, c1)` as TSV, for the clipboard. Raw values — see
+    /// [`GridCells::text`].
+    pub fn tsv(&self, (r0, c0, r1, c1): (usize, usize, usize, usize)) -> String {
+        let mut out = String::new();
+        for i in r0..=r1 {
+            if i > r0 {
+                out.push('\n');
+            }
+            for ci in c0..=c1 {
+                if ci > c0 {
+                    out.push('\t');
+                }
+                out.push_str(&self.text(i, ci, false));
+            }
+        }
+        out
+    }
+
+    /// The block `(r0, c0, r1, c1)` as an AI attachment: its column names, its
+    /// rows **as the user sees them**, and how many rows were selected in all.
+    ///
+    /// Two figures, and the header says the second: `cap`
+    /// ([`crate::prompt::ATTACH_ROW_CAP`]) is about the context window, not
+    /// about consent, so going over it is *reported* rather than silently
+    /// applied.
+    pub fn attached(
+        &self,
+        (r0, c0, r1, c1): (usize, usize, usize, usize),
+        cap: usize,
+    ) -> (Vec<String>, Vec<Vec<String>>, usize) {
+        let columns: Vec<String> = (c0..=c1)
+            .map(|ci| {
+                self.rs
+                    .columns
+                    .get(ci)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let (send, total) = attach_span(r0, r1, cap);
+        let rows: Vec<Vec<String>> = (r0..=r1)
+            .take(send)
+            .map(|i| (c0..=c1).map(|ci| self.text(i, ci, true)).collect())
+            .collect();
+        (columns, rows, total)
+    }
+}
+
 /// How many rows an attachment **sends** and how many the user **selected**,
 /// given the cap.
 ///
@@ -1203,6 +1339,182 @@ mod tests {
         assert_eq!(attach_span(0, 899, 200), (200, 900));
         // One row is one row, not zero.
         assert_eq!(attach_span(5, 5, 200), (1, 1));
+    }
+
+    /// **A right-click inside a block is about the block, and the two amounts
+    /// get two words.** Preserving the selection through a right-click was the
+    /// point of the change; an entry reading "Copy" that took one cell out of
+    /// nine said the same word Ctrl+C and the gutter menu's Copy say for three
+    /// different amounts.
+    ///
+    /// Each case below has been wrong once: the `r0 != r1 || c0 != c1` guard is
+    /// the easily-dropped first conjunct that keeps a lone cell out of
+    /// `Selection`, a click outside the rectangle must be about the cell even
+    /// when a block is live, and a one-row or one-column block is still a
+    /// block. The labels are pinned by name because they read **inverted from
+    /// intuition** — `Cell` is the one that says "Copy value".
+    #[test]
+    fn a_right_click_inside_a_block_copies_the_block() {
+        let block = Some((0, 0, 2, 2));
+        assert_eq!(copy_scope(block, 1, 1), CopyScope::Selection);
+        // Outside the rectangle — the menu acts on what was clicked.
+        assert_eq!(copy_scope(block, 5, 1), CopyScope::Cell);
+        assert_eq!(copy_scope(block, 1, 5), CopyScope::Cell);
+        // A degenerate "block" of one cell is a cell.
+        assert_eq!(copy_scope(Some((1, 1, 1, 1)), 1, 1), CopyScope::Cell);
+        // …but one row of four columns, or one column of four rows, is a block.
+        assert_eq!(copy_scope(Some((0, 0, 0, 3)), 0, 2), CopyScope::Selection);
+        assert_eq!(copy_scope(Some((0, 0, 3, 0)), 2, 0), CopyScope::Selection);
+        // Nothing selected at all.
+        assert_eq!(copy_scope(None, 0, 0), CopyScope::Cell);
+
+        assert_eq!(CopyScope::Cell.label(), "Copy value");
+        assert_eq!(CopyScope::Selection.label(), "Copy");
+    }
+
+    // ── what the surfaces that *read* the grid see ───────────────────────────
+
+    /// `placed_at | note`, two committed rows, sorted so the display order is
+    /// the reverse of the data order — the case where reading a cell by the
+    /// display index silently answers about the wrong row.
+    fn cells_fixture() -> (ResultSet, Vec<usize>, Vec<crate::format::ColumnFormat>) {
+        let rs = ResultSet::from_rows(
+            vec![
+                Column {
+                    name: "placed_at".into(),
+                    type_name: "BIGINT".into(),
+                    origin: None,
+                },
+                Column {
+                    name: "note".into(),
+                    type_name: "VARCHAR".into(),
+                    origin: None,
+                },
+            ],
+            vec![
+                vec![Value::Int(1_709_294_400), Value::Str("first".into())],
+                vec![Value::Int(1_709_380_800), Value::Str("second".into())],
+            ],
+        );
+        (
+            rs,
+            vec![1, 0],
+            vec![
+                crate::format::ColumnFormat::Timestamp,
+                crate::format::ColumnFormat::None,
+            ],
+        )
+    }
+
+    fn cells<'a>(
+        rs: &'a ResultSet,
+        order: &'a [usize],
+        formats: &'a [crate::format::ColumnFormat],
+        dirty: &'a HashMap<(usize, usize), Option<String>>,
+        new_rows: &'a [HashMap<usize, Option<String>>],
+    ) -> GridCells<'a> {
+        GridCells {
+            rs,
+            order,
+            formats,
+            dirty,
+            new_rows,
+        }
+    }
+
+    /// **An attachment is answered about as though it were the grid**, which is
+    /// the reason its doc gives for reading the displayed value rather than the
+    /// stored one. It resolved three of the painter's four sources and never
+    /// [`crate::format::apply`], so a `Timestamp` column sent `1709294400`
+    /// where the cell showed `2024-03-01 12:00:00` — and the sent-attachment
+    /// card the user opens to check agreed with the wrong copy, because it is
+    /// built from the same rows.
+    #[test]
+    fn an_attachment_reads_the_column_the_way_the_grid_paints_it() {
+        let (rs, order, formats) = cells_fixture();
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (columns, rows, total) = g.attached((0, 0, 1, 1), 200);
+        assert_eq!(columns, vec!["placed_at", "note"]);
+        assert_eq!(total, 2);
+        // Display row 0 is data row 1 — `order` is not the identity here.
+        assert_eq!(
+            rows,
+            vec![
+                vec!["2024-03-02 12:00:00".to_string(), "second".to_string()],
+                vec!["2024-03-01 12:00:00".to_string(), "first".to_string()],
+            ]
+        );
+    }
+
+    /// The other side of the same parameter: Ctrl+C is raw **by design** — the
+    /// cell menu offers *Copy formatted* as its own entry — so the clipboard
+    /// must not start following the formatter along with the attachment.
+    #[test]
+    fn the_clipboard_takes_the_stored_value_not_the_formatted_one() {
+        let (rs, order, formats) = cells_fixture();
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(g.tsv((0, 0, 1, 1)), "1709380800\tsecond\n1709294400\tfirst");
+    }
+
+    /// A staged edit is on screen and uncommitted; both surfaces have to show
+    /// it, and a staged SQL NULL reads as the word the cell paints. Neither is
+    /// formatted — the painter doesn't format one either, since it is the text
+    /// the user just typed.
+    #[test]
+    fn a_staged_edit_is_what_both_surfaces_read() {
+        let (rs, order, formats) = cells_fixture();
+        let new_rows = Vec::new();
+        // Data row 1 = display row 0.
+        let dirty: HashMap<(usize, usize), Option<String>> =
+            [((1, 0), Some("999".to_string())), ((0, 1), None)]
+                .into_iter()
+                .collect();
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(g.tsv((0, 0, 1, 1)), "999\tsecond\n1709294400\tNULL");
+        assert_eq!(
+            g.attached((0, 0, 1, 1), 200).1,
+            vec![
+                vec!["999".to_string(), "second".to_string()],
+                vec!["2024-03-01 12:00:00".to_string(), "NULL".to_string()],
+            ]
+        );
+    }
+
+    /// A pending new row is drawn past the real ones and has no committed row
+    /// behind it: resolving it through `order` would fall back to the display
+    /// index and read a committed row that isn't it. An unset cell is empty,
+    /// not `NULL` — what it will hold is a server default the cell previews as
+    /// `<auto>`.
+    #[test]
+    fn a_pending_new_row_reads_only_what_was_typed() {
+        let (rs, order, formats) = cells_fixture();
+        let dirty = HashMap::new();
+        let new_rows: Vec<HashMap<usize, Option<String>>> = vec![
+            [(0, Some("42".to_string())), (1, None)]
+                .into_iter()
+                .collect(),
+        ];
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(g.text(2, 0, true), "42");
+        assert_eq!(g.text(2, 1, true), "NULL");
+        // A row past `new_rows` too, and a column nobody typed into.
+        let empty: Vec<HashMap<usize, Option<String>>> = Vec::new();
+        let g = cells(&rs, &order, &formats, &dirty, &empty);
+        assert_eq!(g.text(2, 0, true), "");
+    }
+
+    /// The cap is reported, not silently applied, and the columns come back
+    /// whatever the row cap does.
+    #[test]
+    fn an_attachment_over_the_cap_still_says_how_many_were_picked() {
+        let (rs, order, formats) = cells_fixture();
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let (_, rows, total) = g.attached((0, 0, 1, 1), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(total, 2);
     }
 
     /// **An expression-only unique index keys nothing.** PostgreSQL models
