@@ -83,8 +83,10 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
     d.routine_draft.set(draft);
     // Cleared here rather than on close, so the one path that raises it —
     // `fetch_source`, at the end of this function — is the only one that can
-    // leave it raised.
+    // leave it raised. Same for the staleness flag, which is that same reply's
+    // third outcome.
     d.routine_source_pending.set(false);
+    d.routine_body_stale.set(false);
     d.view_rows.set(BODY_ROWS);
     d.error.set(None);
     d.preview.set(None);
@@ -254,16 +256,22 @@ fn fetch_source(ui: &Ui) {
             t.as_ref()
                 .and_then(|t| t.current.as_ref())
                 .map(|c| c.body.clone())
+                .unwrap_or_default()
         });
-        // Has the user typed in Body since the modal opened? The body it opened
-        // with is the only thing that can answer, so it is read before `current`
-        // is corrected below.
-        let untouched = d
-            .routine_draft
-            .with_untracked(|dr| opened_with.as_deref() == Some(dr.info.body.as_str()));
+        // **The whole decision is `routine_source_outcome`**, read before
+        // `current` is corrected below — the body the editor opened with is the
+        // only thing that can say whether the user has typed since. This used to
+        // be an inline `untouched` boolean acted on in three places, and the
+        // case it had no name for is `Stale`: the guard that stops the reply
+        // overwriting a body somebody is typing is exactly what leaves the draft
+        // resting on the escape-resolved copy, which the server refuses *after*
+        // this engine's `DROP` has committed.
+        let outcome = d.routine_draft.with_untracked(|dr| {
+            ddl::routine_source_outcome(&opened_with, src.body.as_deref(), &dr.info.body)
+        });
         d.routine_draft.update(|dr| {
             src.apply_session_to(&mut dr.info);
-            if untouched {
+            if outcome == ddl::SourceOutcome::Adopted {
                 src.apply_body_to(&mut dr.info);
             }
         });
@@ -271,9 +279,17 @@ fn fetch_source(ui: &Ui) {
         // `edit_field` reconciles its doc from that signal in place, caret and
         // all, where the field seeding itself once at build could only be
         // corrected by rebuilding the form around it.
-        if untouched && let Some(body) = src.body.clone() {
+        if outcome == ddl::SourceOutcome::Adopted
+            && let Some(body) = src.body.clone()
+        {
             d.routine_body.set(body);
         }
+        // Preview refuses while this is set, and the footer says why. Written
+        // rather than left to be recomputed: the reply is the only moment the
+        // question can be answered, because `current` is corrected two
+        // statements below and the evidence is gone afterwards.
+        d.routine_body_stale
+            .set(outcome == ddl::SourceOutcome::Stale);
         // `current` — the left-hand side of every diff — unconditionally. This
         // used to be guarded on "would it actually change?", because `routine`
         // is the overlay's `dyn_container` key and floem never dedups a write,
@@ -809,6 +825,22 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
+            // Every routine of this kind in this namespace, so the footer can
+            // see a rename landing on one. Read once per open rather than per
+            // keystroke: it is the same `db_nodes` snapshot the tree is drawing
+            // from, and it cannot change while this modal is up — the schema
+            // reload that would change it runs after Apply, which closes this.
+            let taken = taken_names(
+                &ui,
+                &target.database,
+                d.routine_draft
+                    .with_untracked(|r| r.info.schema.clone())
+                    .as_deref(),
+                d.routine_draft.with_untracked(|r| r.info.kind),
+            );
+            let taken_status = taken.clone();
+            let taken_actions = taken;
+
             // **The target comes from the key, not from the capture above.**
             // `fetch_source` corrects `current` after the modal is up — the
             // escape-resolved body `information_schema` gave becomes the routine
@@ -828,12 +860,21 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                     (
                         d.routine.get(),
                         d.routine_draft.get(),
-                        d.routine_source_pending.get(),
+                        (d.routine_source_pending.get(), d.routine_body_stale.get()),
                     )
                 },
-                move |(status_target, draft, pending)| {
+                move |(status_target, draft, (pending, stale))| {
                     let Some(status_target) = status_target else {
                         return empty().into_any();
+                    };
+                    let say = |m: String| {
+                        text(m)
+                            .style(|s| {
+                                s.color(theme::error())
+                                    .font_size(theme::FONT_LABEL)
+                                    .max_width(460.0)
+                            })
+                            .into_any()
                     };
                     // Said before the change count, because until the source
                     // lands the count is over `information_schema`'s resolved
@@ -843,15 +884,22 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                             .style(|s| s.color(theme::text_faint()).font_size(theme::FONT_LABEL))
                             .into_any();
                     }
+                    // …and once it has landed, the case waiting cannot cover.
+                    if stale {
+                        return say("The routine's real source arrived after you started \
+                             typing, so this Body is built on the catalogue's \
+                             copy — which isn't what the server holds. Close and \
+                             reopen to edit it."
+                            .to_string());
+                    }
                     let errs = draft.validate(dialect);
                     if let Some(first) = errs.first() {
-                        return text(first.clone())
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
-                                    .max_width(460.0)
-                            })
-                            .into_any();
+                        return say(first.clone());
+                    }
+                    if let Some(clash) =
+                        draft.name_clash(status_target.current.as_ref(), &taken_status, dialect)
+                    {
+                        return say(clash);
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(match n {
@@ -880,20 +928,34 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                     (
                         d.routine.get(),
                         d.routine_draft.get(),
-                        d.routine_source_pending.get(),
+                        (d.routine_source_pending.get(), d.routine_body_stale.get()),
                     )
                 },
-                move |(current, draft, pending)| {
+                move |(current, draft, (pending, stale))| {
                     let ui = preview_ui.clone();
                     let Some(target) = current else {
                         return empty().into_any();
                     };
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
+                    // **Three refusals, all of them about a `CREATE` the server
+                    // would reject after the `DROP` had committed.**
+                    //
                     // `!pending`: the draft is still on the escape-resolved
                     // copy until the `SHOW CREATE` lands, and a MySQL recreate
-                    // `DROP`s before it `CREATE`s.
-                    let ready = !pending && draft.validate(dialect).is_empty() && !cs.is_empty();
+                    // `DROP`s before it `CREATE`s. `!stale`: the reply landed,
+                    // it *did* correct the body, and the draft had already
+                    // moved — so waiting no longer helps and only a refusal
+                    // does. `name_clash`: on this engine a rename is a drop and
+                    // a create, and landing on a name that is taken answers
+                    // 1304 with the original already gone.
+                    let ready = !pending
+                        && !stale
+                        && draft.validate(dialect).is_empty()
+                        && draft
+                            .name_clash(target.current.as_ref(), &taken_actions, dialect)
+                            .is_none()
+                        && !cs.is_empty();
                     let subject = draft.info.name.clone();
                     h_stack((
                         action_button(

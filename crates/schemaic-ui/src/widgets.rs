@@ -4040,7 +4040,10 @@ mod exit_tests {
             (
                 "routine_editor.rs",
                 include_str!("routine_editor.rs"),
-                "(d.routine.get(),d.routine_draft.get(),d.routine_source_pending.get(),)",
+                // A prefix, so a footer may key on more than these two without
+                // this test having to be rewritten — what it pins is that the
+                // target is in the key at all.
+                "(d.routine.get(),d.routine_draft.get(),",
                 "move||(d.routine_draft.get(),d.routine_source_pending.get()),",
             ),
         ] {
