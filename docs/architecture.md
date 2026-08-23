@@ -5143,7 +5143,12 @@ for keyboard nav.
 - **Paste (Ctrl+V / the cell menu) stages, it does not write.** Every pasted cell goes through the
   same `GridState::stage`/`stage_new` a typed edit does, so it lands as ordinary green edits and
   the write-back plan, the one-row safety net and Commit/Discard all apply unchanged — a paste is
-  a batch of edits the user can still look at and throw away. The parse is
+  a batch of edits the user can still look at and throw away — staged through
+  `stage_many`/`stage_new_many`, which are where the revert-to-original and
+  blank-means-default rules now live (`stage`/`stage_new` are one-element calls into
+  them) and which take **one** signal update for the whole paste: `dirty` and `new_rows` are read
+  by the painter and by every derived view, so a per-cell update would invalidate the grid ten
+  thousand times for one gesture. The parse is
   `core::edit::parse_tsv_block`, **the exact inverse of `GridCells::tsv`**: split on newlines and
   tabs, no quote interpretation. A CSV-style reader here would be the obvious mistake — the copy
   side emits no quoting, so there is none to undo, and unquoting would silently turn a cell whose
