@@ -3147,7 +3147,36 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   discipline, since a pending timer can outlive its signals at shutdown. An in-flight fetch carries
   the generation too and is **dropped** on arrival if it no longer matches: a reply describing the
   previous server, landing under the new one's heading, is a list of session ids the user might kill.
-  Clearing the snapshot on a connection change is the same rule stated once more. A refresh over a
+  Clearing the snapshot on a connection change is the same rule stated once more.
+  **A switch is not the only way the server under the panel changes, and `reset_activity` is the
+  other way in.** The effect keys on `active_conn`, which is an *id*, and editing a connection in
+  place does not move it — so repointing the active connection from host X to host Y with the panel
+  open left X's sessions on screen, live-looking, under a connection now pointing at Y, and a kill
+  from that list would have sent X's thread ids to Y. `save_conn` calls `reset_activity` for **any**
+  save of the active connection, beside the tunnel it already drops for the same reason, without
+  asking whether the target actually moved: comparing would mean carrying the old host/port/socket
+  alongside the snapshot — a second copy of connection identity kept in step by hand — to save one
+  `PROCESSLIST` query when someone renames a connection. **`delete_conn_now` calls it too**, and for
+  the same reason rather than a related one: deleting the *last* connection sets `active_conn` to
+  `startup_active_id(None, &[])`, which is `next_id(&[])`, which is `1` — the id the first connection
+  ever created holds — so deleting that one leaves the signal on the value it already had and the
+  effect sees no change. The panel went on listing a deleted connection's sessions, offering to kill
+  them. Two call sites, one for each way an id can fail to move.
+  Inside it the generation bump comes first
+  and is the load-bearing half, since a fetch already in flight against the old host would otherwise
+  land and refill the panel with the rows being thrown away. **The refetch, unlike the clear, is
+  conditional on `db_for` succeeding**: clearing is always right, but refetching *now* is right only
+  when the connection can be reached this instant, and after an edit it routinely cannot — `save_conn`
+  has just dropped the tunnel and `load_schema` re-opens it asynchronously, so `db_for` answers "SSH
+  tunnel is not established yet" and refreshing anyway painted that across the panel as `Failed`, with
+  no tick to retire it when the interval is off. `Failed` is the right answer for a refresh the *user*
+  asked for and the wrong one for a reset nobody asked for, where "no snapshot yet" is the truth; the
+  delete path reaches the same guard through `db_for`'s "connection no longer exists". For the same
+  ordering reason `save_conn` calls `load_schema` **before** the reset, so the re-open has at least
+  been asked for. Both the effect and `reset_activity` take the "is the panel polling" gate from one
+  `activity_polling` closure — its reads are tracked, which is what the effect needs and what makes
+  them inert at the other caller — because that gate has grown a conjunct before and a second copy is
+  how the next one reaches one asker and not the other. A refresh over a
   live snapshot leaves it on screen rather than passing back through `Loading`, or a two-second
   interval would be a panel that flashes instead of one that updates. The interval is the only part
   persisted, and it is **per connection**: `UiState::activity_intervals` holds the rules and
