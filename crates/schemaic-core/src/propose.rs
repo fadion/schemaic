@@ -347,6 +347,44 @@ fn display_target(proposal: &Proposal) -> String {
     crate::schema::display_name(proposal.schema.as_deref(), &proposal.table)
 }
 
+/// Does `proposal` name the table `current` is, decomposed the way
+/// [`resolve_target`] decomposes it?
+///
+/// **[`apply`]'s guard has to agree with the resolver, or a form that resolves
+/// dead-ends one line later.** Both callers resolve and then hand the resolved
+/// `TableInfo` straight to `apply`, so a guard that compared the *raw*
+/// `proposal.table` to the *bare* `current.name` refused every qualified
+/// `sales.orders` — the form `propose_table_change`'s own description asks the
+/// model to write, on exactly the databases (more than one namespace) where the
+/// listing prints it that way.
+///
+/// The guard is not dropped, because it still protects the case it was written
+/// for: a caller that opened a table itself and never resolved anything. So the
+/// namespace is enforced **where the resolver enforces it** and nowhere else —
+/// an explicit `schema` field is an exact lookup there, while a qualifier
+/// written into `table` is a first attempt the resolver falls back from, and on
+/// MySQL `mydb.orders` legitimately lands on the unqualified `orders`.
+fn names_the_same_table(proposal: &Proposal, current: &TableInfo) -> bool {
+    let (namespace, bare) = match &proposal.schema {
+        Some(ns) => (Some(ns.as_str()), proposal.table.as_str()),
+        None => match proposal.table.split_once('.') {
+            // A qualifier here is a hint, not a claim — see above.
+            Some((_, name)) => (None, name),
+            None => (None, proposal.table.as_str()),
+        },
+    };
+    if !bare.eq_ignore_ascii_case(&current.name) {
+        return false;
+    }
+    match namespace {
+        Some(ns) => current
+            .schema
+            .as_deref()
+            .is_some_and(|cur| ns.eq_ignore_ascii_case(cur)),
+        None => true,
+    }
+}
+
 /// Lay `proposal` over `current` and return the draft it describes.
 ///
 /// The draft is validated the same way the designer's is before it is returned,
@@ -357,10 +395,10 @@ pub fn apply(
     proposal: &Proposal,
     dialect: SqlDialect,
 ) -> Result<TableDraft, ProposeError> {
-    if !proposal.table.eq_ignore_ascii_case(&current.name) {
+    if !names_the_same_table(proposal, current) {
         return Err(ProposeError::WrongTable {
-            proposed: proposal.table.clone(),
-            actual: current.name.clone(),
+            proposed: display_target(proposal),
+            actual: crate::schema::display_name(current.schema.as_deref(), &current.name),
         });
     }
     if proposal.ops.is_empty() {
@@ -703,6 +741,105 @@ mod tests {
             target("nope", None),
             Err(ProposeError::NoSuchTable(_))
         ));
+    }
+
+    /// **Resolving is not enough: the table has to survive `apply` too.** Both
+    /// real callers (`app/mcp.rs`'s `propose_table_change` and
+    /// `ui/ddl_preview.rs`'s card) do `resolve_target` and then hand the very
+    /// same `TableInfo` to `apply`, so the property "every form the listings can
+    /// print lands on the same table" is a property of the *composition*. The
+    /// resolver test above stops one line short of it, which is how the
+    /// qualified `sales.orders` form — the one the tool's own description asks
+    /// the model to write — went on dead-ending at ``the proposal is for table
+    /// `sales.orders`, but `orders` is open`` after the resolver had already
+    /// accepted it.
+    #[test]
+    fn every_naming_form_that_resolves_also_applies() {
+        let in_ns = |ns: &str| TableInfo {
+            schema: Some(ns.into()),
+            ..orders()
+        };
+        let schema = crate::schema::DbSchema {
+            tables: vec![in_ns("public"), in_ns("sales")],
+            ..Default::default()
+        };
+        let round_trip = |table: &str, ns: Option<&str>| {
+            let p = Proposal {
+                table: table.into(),
+                schema: ns.map(str::to_string),
+                ops: vec![ProposedOp::DropColumn {
+                    name: "placed_at".into(),
+                }],
+                ..Default::default()
+            };
+            let info = resolve_target(&schema, &p)?;
+            let found = info.schema.clone().unwrap_or_default();
+            apply(info, &p, SqlDialect::Postgres).map(|_| found)
+        };
+        assert_eq!(round_trip("orders", Some("sales")).unwrap(), "sales");
+        assert_eq!(round_trip("sales.orders", None).unwrap(), "sales");
+        assert_eq!(round_trip("orders", None).unwrap(), "public");
+    }
+
+    /// The over-reach side: the guard still exists, and it still refuses a
+    /// `TableInfo` a caller opened without resolving. A namespace stated in the
+    /// **`schema` field** is enforced, because that is the one `resolve_target`
+    /// enforces exactly; a qualifier written into `table` is not, because
+    /// `resolve_target` falls back from it — on MySQL `mydb.orders` resolves to
+    /// the unqualified `orders`, and refusing it here would be the same
+    /// dead-end by another route.
+    #[test]
+    fn a_qualifier_does_not_let_a_proposal_reach_another_table() {
+        let ops = || {
+            vec![ProposedOp::DropColumn {
+                name: "placed_at".into(),
+            }]
+        };
+        let public_orders = TableInfo {
+            schema: Some("public".into()),
+            ..orders()
+        };
+        // Wrong bare name, qualified — still the wrong table.
+        assert!(matches!(
+            apply(
+                &public_orders,
+                &Proposal {
+                    table: "sales.customers".into(),
+                    ops: ops(),
+                    ..Default::default()
+                },
+                SqlDialect::Postgres,
+            ),
+            Err(ProposeError::WrongTable { .. })
+        ));
+        // Right name, but an explicit `schema` the open table doesn't carry.
+        assert!(matches!(
+            apply(
+                &public_orders,
+                &Proposal {
+                    table: "orders".into(),
+                    schema: Some("sales".into()),
+                    ops: ops(),
+                    ..Default::default()
+                },
+                SqlDialect::Postgres,
+            ),
+            Err(ProposeError::WrongTable { .. })
+        ));
+        // …and on MySQL, where the model may still write `db.table`, the
+        // qualifier is a hint the resolver drops, so `apply` drops it too.
+        assert!(
+            apply(
+                &orders(),
+                &Proposal {
+                    table: "mydb.orders".into(),
+                    ops: ops(),
+                    ..Default::default()
+                },
+                SqlDialect::MySql,
+            )
+            .is_ok()
+        );
     }
 
     /// **A view is not a table, and this is the one caller whose name comes from
