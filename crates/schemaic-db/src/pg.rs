@@ -835,8 +835,8 @@ pub(crate) async fn count_rows(
 /// `LIMIT` can apply. The outer projection restates the columns in order because
 /// `simple_query` hands them back positionally.
 ///
-/// **`backend_type IS NULL` keeps the rows the role may not inspect.**
-/// PostgreSQL masks `pg_stat_activity` for backends the caller has no
+/// **The masked-row branch keeps the rows the role may not inspect — and only
+/// those.** PostgreSQL masks `pg_stat_activity` for backends the caller has no
 /// `HAS_PGSTAT_PERMISSIONS` over, and `backend_type` is one of the masked
 /// columns — so `backend_type = 'client backend'` is `NULL` for them and the
 /// rows were filtered out entirely rather than merely showing blanks. Connected
@@ -844,9 +844,25 @@ pub(crate) async fn count_rows(
 /// sessions and stated the count as the server's total; a blocked row could name
 /// a holder that was nowhere in the list, so the banner never appeared and there
 /// was nothing to kill. `pid` and `pg_blocking_pids(pid)` are *not* masked, so a
-/// kept row is still killable and still a usable node in the graph — verified
-/// live on PostgreSQL 16.15 under a non-privileged role: 7 rows unfiltered
-/// against 0 through the old predicate.
+/// kept row is still killable and still a usable node in the graph.
+///
+/// The masking is why the branch cannot be a bare `backend_type IS NULL`: the
+/// equality test was also the only thing excluding PostgreSQL's **auxiliary
+/// processes** — checkpointer, background writer, walwriter, both launchers —
+/// and NULL is exactly what an ordinary role reads for their `backend_type` too.
+/// Live on PostgreSQL 16.15 under a non-privileged role, the bare form admitted
+/// five rows and **all five were auxiliary processes**, each drawn with a live
+/// *Kill session* under it that answers `f` and a WARNING.
+///
+/// **`usename` and `datname` are the columns that are not masked, and it takes
+/// both.** Probed live on 16.15, plain role against a superuser's `psql`: a
+/// masked client backend keeps `usename` *and* `datname` and loses only `state`,
+/// `query`, `backend_type` and the timestamps — while every auxiliary process
+/// has `datname` NULL, the logical replication launcher included, and that one
+/// runs as `postgres` so a `usename` test alone still admits it. Requiring both
+/// also keeps out autovacuum workers (no `usename`) and walsenders (no
+/// `datname`), which is where the pre-range equality test had them.
+/// `activity::is_pg_session` is the second guard, at the level a test can reach.
 ///
 /// **The state term in the sort** is the half MySQL's query has and this one
 /// didn't. Blocked-ness is only rank 0 of `activity::rank`'s four; an idle pool
@@ -855,6 +871,15 @@ pub(crate) async fn count_rows(
 /// running statement and the `idle in transaction` holder the panel exists to
 /// show — while keeping the waiter, whose note then named a holder that had been
 /// cut.
+///
+/// **Both sort terms have to survive the mask, and neither did.** A masked row
+/// reads `state` NULL, so `state IS DISTINCT FROM 'idle'` is `true` for every
+/// one of them and separates nothing; its `age` is NULL too, and PostgreSQL
+/// sorts `DESC` as `NULLS FIRST`. Live under a plain role the effect was exact:
+/// past the `LIMIT` the rows kept were the ones the role **cannot read** and the
+/// ones cut were its own running statements. `NULLS LAST` and an explicit `state
+/// IS NOT NULL` demote an unreadable row below a readable working one, which is
+/// where `pg_state` and `activity::rank` put it once it arrives.
 const PG_ACTIVITY_SQL: &str = "SELECT s.pid, s.usename, s.client_host, s.datname, s.state, \
      s.query, s.age, s.blockers FROM ( \
      SELECT pid, usename, host(client_addr) AS client_host, datname, state, query, \
@@ -862,10 +887,12 @@ const PG_ACTIVITY_SQL: &str = "SELECT s.pid, s.usename, s.client_host, s.datname
      AS age, \
      pg_blocking_pids(pid)::text AS blockers \
      FROM pg_stat_activity \
-     WHERE (backend_type = 'client backend' OR backend_type IS NULL) \
+     WHERE (backend_type = 'client backend' \
+     OR (backend_type IS NULL AND usename IS NOT NULL AND datname IS NOT NULL)) \
      AND pid <> pg_backend_pid() \
      ) s ORDER BY (s.blockers <> '{}') DESC, \
-     (s.state IS DISTINCT FROM 'idle') DESC, s.age DESC LIMIT ";
+     (s.state IS DISTINCT FROM 'idle' AND s.state IS NOT NULL) DESC, \
+     s.age DESC NULLS LAST LIMIT ";
 
 /// The PostgreSQL half of [`Db::fetch_sessions`].
 ///
@@ -897,10 +924,15 @@ pub(crate) async fn backend_pid(client: &Client) -> Option<i64> {
 
 /// The PostgreSQL half of [`Db::kill_session`].
 ///
-/// Both functions return a boolean rather than raising: `false` means the pid was
-/// gone by the time the request landed (it finished, or someone else killed it),
-/// which is not a failure worth a modal — the next poll will simply not show it.
-/// A missing *privilege*, on the other hand, raises, and that error does surface.
+/// Both functions **answer with a boolean rather than raising**, so the reply is
+/// the only place a refusal appears: `false` comes back with a `WARNING`, which
+/// is a notice and not an error, and `simple_query` succeeds either way. The
+/// answer used to be discarded, and the caller then treated every such kill as
+/// completed — killed-session repair, generation bump, refresh, and the row
+/// straight back with nothing said anywhere. `activity::kill_verdict` is where
+/// the reading of it lives.
+///
+/// A missing *privilege* does raise, and that error surfaces as it always did.
 pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(), DbError> {
     let client = connect_maintenance(db).await?;
     let func = match kind {
@@ -908,11 +940,9 @@ pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(),
         KillKind::Session => "pg_terminate_backend",
     };
     // `id` came from the server as an integer and goes back as a decimal literal.
-    client
-        .simple_query(&format!("SELECT {func}({id})"))
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    Ok(())
+    let rows = query_all(&client, &format!("SELECT {func}({id})")).await?;
+    let cell = rows.first().and_then(|r| opt(r, 0));
+    activity::kill_verdict(cell.as_deref(), kind, id).map_err(DbError::Query)
 }
 
 pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
@@ -2680,6 +2710,50 @@ pub(crate) async fn refetch_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decision this pins lives in the SQL string, so the string is the
+    /// subject — a `from_pg_rows` case is a level too low to see it.
+    ///
+    /// `backend_type` is masked to NULL for every row an ordinary role has no
+    /// `HAS_PGSTAT_PERMISSIONS` over, **including PostgreSQL's own auxiliary
+    /// processes**, so a bare `backend_type IS NULL` admits the checkpointer,
+    /// the background writer, the walwriter and both launchers as killable
+    /// sessions. Live on PostgreSQL 16.15 as a plain role, the bare form
+    /// returned five rows and all five were auxiliary processes.
+    ///
+    /// It takes **both** surviving columns: the logical replication launcher
+    /// runs as `postgres`, so `usename IS NOT NULL` alone still admits it, and
+    /// `datname` is the one every auxiliary process leaves NULL.
+    #[test]
+    fn the_activity_query_admits_masked_backends_without_admitting_aux_processes() {
+        assert!(
+            PG_ACTIVITY_SQL
+                .contains("backend_type IS NULL AND usename IS NOT NULL AND datname IS NOT NULL"),
+            "the masked-row branch must require both unmasked identity columns"
+        );
+        assert!(
+            !PG_ACTIVITY_SQL.contains("OR backend_type IS NULL)"),
+            "a bare `backend_type IS NULL` is the aux-process hole"
+        );
+    }
+
+    /// Both sort terms have to survive the mask, because the `LIMIT` is applied
+    /// on the server and `activity::prepare` only ever re-sorts what survived
+    /// it. A masked row reads `state` NULL — so `IS DISTINCT FROM 'idle'` is
+    /// true for all of them — and `age` NULL, which `DESC` sorts **first** by
+    /// default. Live under a plain role the `LIMIT` kept the unreadable rows and
+    /// cut that role's own running statements.
+    #[test]
+    fn the_activity_sort_puts_unknown_ages_and_unreadable_states_last() {
+        assert!(
+            PG_ACTIVITY_SQL.contains("s.age DESC NULLS LAST"),
+            "PostgreSQL's default for DESC is NULLS FIRST"
+        );
+        assert!(
+            PG_ACTIVITY_SQL.contains("s.state IS DISTINCT FROM 'idle' AND s.state IS NOT NULL"),
+            "a NULL state is not evidence of work"
+        );
+    }
 
     /// The four catalogue signals fold into three model fields, and only one
     /// combination per row is legal — so each is pinned rather than trusted.
