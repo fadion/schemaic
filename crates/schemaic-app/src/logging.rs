@@ -18,6 +18,14 @@
 //! through the `log` crate, which `tracing-subscriber` already bridges into
 //! `tracing`, but a filter of `schemaic=info` discarded all of it because those
 //! records carry a `velopack` target. [`DEFAULT_FILTER`] admits both.
+//!
+//! A panic went the same way for the same reason, and worse: the default hook
+//! writes the payload to *stderr*, which on a GUI-subsystem release build is
+//! nowhere at all, so the one class of failure that kills the process left no
+//! trace of itself. [`install_panic_hook`] routes it through the writer above
+//! instead — payload, thread, source location and a forced backtrace — and
+//! still calls the hook it replaced, so a debug build keeps its console
+//! message.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -97,6 +105,68 @@ fn open_log() -> Option<File> {
         .ok()
 }
 
+/// Route panics through the log file, then on to the hook we replaced.
+///
+/// Call once, after [`init`] — before it, the report would be formatted and then
+/// dropped by a subscriber that does not exist yet.
+///
+/// Chained rather than replacing outright: the default hook is what prints to
+/// stderr, which is still worth having in a debug build (and on the terminal
+/// launch of a release build on Linux). This adds a destination, it does not
+/// take one away.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // `force_capture`, not `capture`: the latter is governed by
+        // `RUST_BACKTRACE`, which nobody sets on a machine that just crashed a
+        // GUI app. The cost only lands on a process that is already dying.
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed").to_string();
+        let location = info.location().map(|l| l.to_string());
+        tracing::error!(
+            "{}",
+            panic_report(
+                &name,
+                &payload_text(info.payload()),
+                location.as_deref(),
+                &backtrace,
+            )
+        );
+        previous(info);
+    }));
+}
+
+/// The panic message, as a string, from the `Any` the hook is handed.
+///
+/// `panic!("…")` with no arguments boxes a `&'static str` and the formatting
+/// form boxes a `String`; anything else came from `panic_any` and has no text
+/// to show, so it is named rather than silently rendered as an empty message.
+fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Format one panic into the block that lands in the log.
+///
+/// Split out from the hook because the hook itself cannot be called under test
+/// — installing it is process-global and a panic inside a test harness is not
+/// the panic we want to observe — while the thing worth guarding is that the
+/// report actually carries all four pieces. A report missing the location or
+/// the backtrace is the same undiagnosable failure this module exists to end.
+fn panic_report(thread: &str, payload: &str, location: Option<&str>, backtrace: &str) -> String {
+    format!(
+        "panic in thread '{thread}' at {}: {payload}\nbacktrace:\n{}",
+        location.unwrap_or("<unknown location>"),
+        backtrace.trim_end(),
+    )
+}
+
 /// A `MakeWriter` over one shared append handle.
 ///
 /// Hand-rolled rather than pulling in `tracing-appender`: the whole requirement
@@ -162,5 +232,107 @@ mod tests {
     fn the_default_filter_admits_velopack() {
         assert!(DEFAULT_FILTER.contains("velopack"));
         assert!(DEFAULT_FILTER.contains("schemaic"));
+    }
+
+    /// All four pieces, or the report is the undiagnosable crash again: the
+    /// payload says what, the location says where in the source, the thread
+    /// says which of the app's many workers, the backtrace says how it got
+    /// there.
+    #[test]
+    fn a_panic_report_carries_payload_location_thread_and_backtrace() {
+        let report = panic_report(
+            "grid-write",
+            "index out of bounds: the len is 0 but the index is 3",
+            Some("crates/schemaic-ui/src/grid.rs:412:9"),
+            "   0: schemaic::foo\n   1: schemaic::bar\n",
+        );
+        assert!(report.contains("grid-write"), "{report}");
+        assert!(report.contains("index out of bounds"), "{report}");
+        assert!(report.contains("grid.rs:412:9"), "{report}");
+        assert!(report.contains("schemaic::bar"), "{report}");
+    }
+
+    /// `PanicHookInfo::location` is an `Option`, and a report that renders
+    /// `None` as nothing reads as though the panic had no source at all.
+    #[test]
+    fn a_panic_report_without_a_location_says_so() {
+        let report = panic_report("main", "boom", None, "");
+        assert!(report.contains("<unknown location>"), "{report}");
+        assert!(report.contains("boom"), "{report}");
+    }
+
+    #[test]
+    fn a_str_payload_is_read_as_its_message() {
+        assert_eq!(payload_text(&"boom"), "boom");
+    }
+
+    /// `panic!("{x}")` boxes a `String`, not a `&str` — downcasting only to
+    /// `&str` would lose every formatted panic, which is most of them.
+    #[test]
+    fn a_string_payload_is_read_as_its_message() {
+        assert_eq!(payload_text(&String::from("boom 3")), "boom 3");
+    }
+
+    /// `panic_any(42)` has no message. Naming that beats an empty line that
+    /// reads like a lost payload.
+    #[test]
+    fn a_non_string_payload_is_named_rather_than_blank() {
+        let text = payload_text(&42_u32);
+        assert!(!text.is_empty());
+        assert!(text.contains("non-string"), "{text}");
+    }
+
+    /// Collects everything a subscriber writes, so a test can read it back.
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The seam, not the pieces: `panic_report` being well-formed proves
+    /// nothing if the hook never reaches a subscriber, and that composition —
+    /// hook fires → `tracing::error!` → writer — is the whole feature. Panics
+    /// go through a global hook and `catch_unwind`, so this drives the real
+    /// path rather than calling the formatter directly.
+    #[test]
+    fn an_installed_hook_writes_the_panic_through_tracing() {
+        // The hook we chain onto is the default one, which prints to stderr and
+        // would litter the test output with a crash that is on purpose.
+        std::panic::set_hook(Box::new(|_| {}));
+        install_panic_hook();
+
+        let sink = Capture(Arc::new(Mutex::new(Vec::new())));
+        // `set_default`, not `init`: thread-local, so a parallel test's logging
+        // is untouched. The hook runs on the panicking thread — this one — so
+        // the thread-local dispatcher is the one it finds.
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let outcome = std::panic::catch_unwind(|| panic!("grid write exploded"));
+        assert!(outcome.is_err(), "the test's own panic should have unwound");
+        drop(guard);
+
+        let text = String::from_utf8(sink.0.lock().expect("capture lock").clone())
+            .expect("subscriber output is utf-8");
+        assert!(text.contains("grid write exploded"), "{text}");
+        assert!(text.contains("panic in thread"), "{text}");
+        assert!(text.contains("logging.rs:"), "no source location: {text}");
     }
 }

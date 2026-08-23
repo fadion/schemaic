@@ -201,6 +201,9 @@ fn main() {
     velopack::VelopackApp::build().run();
 
     logging::init();
+    // Strictly after `init()`: the hook writes through the subscriber, and a
+    // panic before there is one would be formatted and thrown away.
+    logging::install_panic_hook();
 
     tracing::info!(
         "{} v{} starting",
