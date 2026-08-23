@@ -803,8 +803,29 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             let effort_section = v_stack((settings_group_label("Effort"), effort_dd)).style(group);
             let instr_section =
                 v_stack((settings_group_label("Custom instructions"), instr_field)).style(group);
-            let scope_section =
-                v_stack((settings_group_label("Schema context"), scope_dd)).style(group);
+            // **What this setting is, said out loud.** It reads as a context
+            // budget — how much structure is worth spending the model's window
+            // on — and *Data access*, below and per-connection, is the consent
+            // control. But a budget of zero that one tool call walks around is
+            // neither, so `None` withholds `list_schema` and `describe_table`
+            // too; the hint says so, because a setting whose reach a user has to
+            // infer is one they will infer wrongly in the safe direction or the
+            // unsafe one.
+            let scope_section = v_stack((
+                settings_group_label("Schema context"),
+                scope_dd,
+                text(
+                    "How much database structure rides in every message. None also withholds \
+                     the schema tools, so the assistant asks you for names instead of reading \
+                     the catalogue itself.",
+                )
+                .style(|s| {
+                    s.width_full()
+                        .font_size(theme::FONT_HINT)
+                        .color(theme::text_muted())
+                }),
+            ))
+            .style(group);
             // Data access is *not* settable here: it belongs to the connection,
             // because a scratch database and a client's production server are
             // not the same risk and one global answer forces the careless

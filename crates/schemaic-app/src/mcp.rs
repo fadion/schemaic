@@ -68,6 +68,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
         database,
         samples: reads_data,
         hidden,
+        schema,
     } = endpoint;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -94,7 +95,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     "serverInfo": { "name": "schemaic", "version": env!("CARGO_PKG_VERSION") }
                 }))
             }
-            "tools/list" => Some(json!({ "tools": tools_list(db.engine(), reads_data) })),
+            "tools/list" => Some(json!({ "tools": tools_list(db.engine(), reads_data, schema) })),
             "tools/call" => {
                 let name = req
                     .pointer("/params/name")
@@ -105,7 +106,18 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                Some(call_tool(&db, database.as_deref(), reads_data, &hidden, &name, &args).await)
+                Some(
+                    call_tool(
+                        &db,
+                        database.as_deref(),
+                        reads_data,
+                        schema,
+                        &hidden,
+                        &name,
+                        &args,
+                    )
+                    .await,
+                )
             }
             "ping" => Some(json!({})),
             // Unknown request → empty result; notifications (no id) → nothing.
@@ -131,6 +143,25 @@ fn reads_row_data(tool: &str) -> bool {
     tool == "run_query"
 }
 
+/// Does this tool read the **catalogue** — the thing *Schema context* governs?
+///
+/// The same one-predicate-consulted-twice shape [`reads_row_data`] has, and for
+/// the same reason. `propose_table_change` is deliberately not on the list: it
+/// carries the table it is about in the call and reads nothing the model did not
+/// already have.
+fn reads_schema(tool: &str) -> bool {
+    matches!(tool, "list_schema" | "describe_table")
+}
+
+/// What the server says when a schema tool is called at *Schema context: None*.
+///
+/// Names the setting, because the model's next move should be to ask the user
+/// for the table and column names (or to raise the setting) rather than retry.
+const NO_SCHEMA_ACCESS: &str = "Refused: the user's Schema context setting is None, so the \
+     assistant is given no database structure and list_schema and describe_table are \
+     unavailable. Ask the user for the table and column names you need — or tell them to set \
+     Schema context to a database in AI settings.";
+
 /// What the server says when a withheld tool is called anyway. It names the
 /// setting, because the model's next move should be to ask the user for the
 /// values (or to change the level) rather than to retry the same call.
@@ -141,8 +172,11 @@ const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set s
 
 /// The refusal a tool call earns from the connection's data-access level, if
 /// any. Pure, so the gate is unit-tested without a live endpoint.
-fn refusal_for(tool: &str, reads_data: bool) -> Option<&'static str> {
-    (!reads_data && reads_row_data(tool)).then_some(NO_DATA_ACCESS)
+fn refusal_for(tool: &str, reads_data: bool, schema: bool) -> Option<&'static str> {
+    if !reads_data && reads_row_data(tool) {
+        return Some(NO_DATA_ACCESS);
+    }
+    (!schema && reads_schema(tool)).then_some(NO_SCHEMA_ACCESS)
 }
 
 /// The tools this server offers, described for **this** connection's engine.
@@ -159,7 +193,14 @@ fn refusal_for(tool: &str, reads_data: bool) -> Option<&'static str> {
 /// than not listing it — the model plans a turn around the tool it can see,
 /// offers the user an analysis it cannot deliver, and only discovers the denial
 /// once the user has said yes.
-pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool) -> Value {
+///
+/// `schema` is the app's *Schema context* setting, and it withholds the
+/// catalogue tools the same way. With the setting at `None` the system prompt
+/// carries no databases and no tables — and the model held `list_schema`, whose
+/// first call hands back every database and every table name. Whether that
+/// setting is read as a token budget or as consent, a budget of zero that one
+/// tool call walks around is neither.
+pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool, schema: bool) -> Value {
     let dialect = engine.dialect();
     let heads = schemaic_core::sql::read_only_heads(dialect).join("/");
     let mut tools = json!([
@@ -275,8 +316,11 @@ pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool) -> Value
             }
         }
     ]);
-    if !reads_data && let Some(list) = tools.as_array_mut() {
-        list.retain(|t| !reads_row_data(t["name"].as_str().unwrap_or("")));
+    if let Some(list) = tools.as_array_mut() {
+        list.retain(|t| {
+            let name = t["name"].as_str().unwrap_or("");
+            (reads_data || !reads_row_data(name)) && (schema || !reads_schema(name))
+        });
     }
     tools
 }
@@ -285,6 +329,7 @@ async fn call_tool(
     db: &Db,
     database: Option<&str>,
     reads_data: bool,
+    schema: bool,
     hidden: &HashSet<String>,
     name: &str,
     args: &Value,
@@ -292,7 +337,7 @@ async fn call_tool(
     // The level gates the call as well as the listing: a client working from a
     // stale `tools/list` must not reach the DB through a tool this connection
     // withheld.
-    if let Some(why) = refusal_for(name, reads_data) {
+    if let Some(why) = refusal_for(name, reads_data, schema) {
         return json!({ "content": [ { "type": "text", "text": why } ], "isError": true });
     }
     let arg = |key: &str| {
@@ -796,7 +841,15 @@ mod tests {
 
     /// Tool names the server advertises, in order.
     fn offered(engine: schemaic_db::Engine, reads_data: bool) -> Vec<String> {
-        super::tools_list(engine, reads_data)
+        offered_with(engine, reads_data, true)
+    }
+
+    fn offered_with(
+        engine: schemaic_db::Engine,
+        reads_data: bool,
+        reads_schema: bool,
+    ) -> Vec<String> {
+        super::tools_list(engine, reads_data, reads_schema)
             .as_array()
             .expect("a list")
             .iter()
@@ -863,11 +916,55 @@ mod tests {
     /// itself, and told which setting to point the user at.
     #[test]
     fn a_call_to_the_withheld_tool_is_refused_with_the_reason() {
-        assert_eq!(refusal_for("run_query", false), Some(NO_DATA_ACCESS));
-        assert_eq!(refusal_for("run_query", true), None);
+        assert_eq!(refusal_for("run_query", false, true), Some(NO_DATA_ACCESS));
+        assert_eq!(refusal_for("run_query", true, true), None);
         for schema_tool in ["list_schema", "describe_table", "propose_table_change"] {
-            assert_eq!(refusal_for(schema_tool, false), None);
+            assert_eq!(refusal_for(schema_tool, false, true), None);
         }
+    }
+
+    /// **"Schema context: None" has to reach the tools, or it means nothing.**
+    ///
+    /// With the setting at `None` the system prompt carries no databases and no
+    /// tables — and the model still held `list_schema`, whose first call returns
+    /// every database and every table name, and `list_schema {"database": …}`,
+    /// which returns every column, key and foreign key. The setting the user
+    /// just chose was defeated in one tool call, with only the tool's collapsed
+    /// result line on screen. `c7bc9d7` closed exactly this on the inline path
+    /// and left the tool path open.
+    ///
+    /// The same shape `reads_data` already has: withheld from the listing *and*
+    /// refused on call, so a stale `tools/list` cannot reach it either.
+    #[test]
+    fn the_schema_tools_are_withheld_when_the_user_asked_for_no_schema() {
+        for engine in [
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            let names = offered_with(engine, true, false);
+            for gone in ["list_schema", "describe_table"] {
+                assert!(
+                    !names.contains(&gone.to_string()),
+                    "{engine:?} still advertises {gone}: {names:?}"
+                );
+            }
+            // `run_query` is the connection's decision, not this one, and a
+            // proposal carries its own schema in the call.
+            for kept in ["run_query", "propose_table_change"] {
+                assert!(
+                    names.contains(&kept.to_string()),
+                    "{engine:?} dropped {kept}: {names:?}"
+                );
+            }
+        }
+        // …and a call to one anyway is refused with the setting named.
+        for gone in ["list_schema", "describe_table"] {
+            let refusal = refusal_for(gone, true, false).expect("refused");
+            assert!(refusal.contains("Schema context"), "{refusal}");
+        }
+        assert_eq!(refusal_for("run_query", true, false), None);
+        assert_eq!(refusal_for("propose_table_change", true, false), None);
     }
 
     /// The tool's arguments carry `database` alongside the proposal's own
@@ -909,7 +1006,7 @@ mod tests {
             schemaic_db::Engine::Postgres,
             schemaic_db::Engine::Sqlite,
         ] {
-            let tools = super::tools_list(engine, true);
+            let tools = super::tools_list(engine, true, true);
             let tool = tools
                 .as_array()
                 .expect("a list")
@@ -937,7 +1034,7 @@ mod tests {
             schemaic_db::Engine::Sqlite,
         ] {
             let dialect = engine.dialect();
-            let tools = super::tools_list(engine, true);
+            let tools = super::tools_list(engine, true, true);
             let desc = tools[0]["description"].as_str().expect("a description");
             assert_eq!(tools[0]["name"], "run_query");
             assert!(
