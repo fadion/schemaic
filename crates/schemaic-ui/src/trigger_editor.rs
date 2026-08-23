@@ -208,12 +208,6 @@ fn fetch_sources(ui: &Ui) {
     }
 }
 
-/// Load the database's trigger functions once the editor is already open.
-///
-/// Guarded on `session` — a *DDL editor session*, not `generation`, which counts
-/// preview opens. See [`crate::DdlUi::session`]: with the old guard an in-flight
-/// fetch from one database landed on a modal since reopened on another, and
-/// opening the preview mid-fetch threw the result away for good.
 /// Whether the nested function editor closing back to here should re-fetch the
 /// function list. `prev` is the last-seen open state, `None` on the effect's
 /// first run.
@@ -235,6 +229,12 @@ fn refetch_functions_on_return(prev: Option<bool>, fn_open: bool, trigger_open: 
     prev == Some(true) && !fn_open && trigger_open
 }
 
+/// Load the database's trigger functions once the editor is already open.
+///
+/// Guarded on `session` — a *DDL editor session*, not `generation`, which counts
+/// preview opens. See [`crate::DdlUi::session`]: with the old guard an in-flight
+/// fetch from one database landed on a modal since reopened on another, and
+/// opening the preview mid-fetch threw the result away for good.
 fn fetch_functions(ui: &Ui) {
     let d = ui.ddl;
     let Some((conn_id, database)) = d
@@ -1187,7 +1187,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
         // `information_schema`'s resolved copy. The cost is the routine editor's
         // old bug — a reply landing mid-keystroke drops the caret — and the fix
         // is the same one: give the Body field a signal the fetch can write
-        // (there, `Ui::routine_body`), which needs one per row here.
+        // (there, `DdlUi::routine_body`), which needs one per row here.
         move || {
             (
                 d.trigger.get().is_some(),

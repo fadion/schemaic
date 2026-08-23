@@ -335,7 +335,7 @@ fn bound_field(
 /// [`bound_field`] over a signal the **caller** owns.
 ///
 /// One field needs this: Body, whose text a late `SHOW CREATE` reply has to
-/// correct after the form is built (see [`Ui`]'s `routine_body`). A view-local
+/// correct after the form is built (see [`crate::DdlUi::routine_body`]). A view-local
 /// signal could only be corrected by rebuilding the form around it, which is
 /// how the caret came to be dropped mid-word. The write-back contract is
 /// unchanged — `prev` is `None` on the first run, so seeding is never mistaken
