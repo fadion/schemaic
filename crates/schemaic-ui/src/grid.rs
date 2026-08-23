@@ -661,20 +661,40 @@ impl GridState {
     /// Stage a value for data-row `di`, column `ci` (`None` = SQL NULL). If it
     /// equals the original the entry is dropped (no longer dirty).
     fn stage(&self, di: usize, ci: usize, val: Option<String>) {
-        // Original as `Option<String>`: NULL → `None`.
-        let orig = self.rs.get_untracked().cell(di, ci).map(|c| {
-            if c.is_null() {
-                None
-            } else {
-                Some(c.display().to_string())
-            }
-        });
-        let orig = orig.unwrap_or(None);
+        self.stage_many(vec![(di, ci, val)]);
+    }
+
+    /// [`GridState::stage`] for a whole batch — **one** signal update for the
+    /// lot, and the one copy of the revert-to-original rule (`stage` is a
+    /// one-element call into this).
+    ///
+    /// The batching is not a micro-optimisation. `dirty` is read by the painter
+    /// and by every derived view, so updating it per cell makes a 10,000-cell
+    /// paste ten thousand invalidations of the grid — each one re-resolving the
+    /// visible cells — where the user asked for one edit.
+    fn stage_many(&self, cells: Vec<(usize, usize, Option<String>)>) {
+        if cells.is_empty() {
+            return;
+        }
+        let rs = self.rs.get_untracked();
         self.dirty.update(|d| {
-            if orig == val {
-                d.remove(&(di, ci)); // reverted to original → no longer dirty
-            } else {
-                d.insert((di, ci), val.clone());
+            for (di, ci, val) in cells {
+                // Original as `Option<String>`: NULL → `None`.
+                let orig = rs
+                    .cell(di, ci)
+                    .map(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            Some(c.display().to_string())
+                        }
+                    })
+                    .unwrap_or(None);
+                if orig == val {
+                    d.remove(&(di, ci)); // reverted to original → no longer dirty
+                } else {
+                    d.insert((di, ci), val);
+                }
             }
         });
         // A fresh edit clears a stale commit error.
@@ -703,8 +723,20 @@ impl GridState {
     /// original to diff against, so an empty `Some("")` reverts the cell to unset
     /// (server default) rather than inserting an empty string.
     fn stage_new(&self, pidx: usize, ci: usize, val: Option<String>) {
+        self.stage_new_many(vec![(pidx, ci, val)]);
+    }
+
+    /// [`GridState::stage_new`] for a whole batch, one signal update — see
+    /// [`GridState::stage_many`] for why that matters.
+    fn stage_new_many(&self, cells: Vec<(usize, usize, Option<String>)>) {
+        if cells.is_empty() {
+            return;
+        }
         self.new_rows.update(|rows| {
-            if let Some(row) = rows.get_mut(pidx) {
+            for (pidx, ci, val) in cells {
+                let Some(row) = rows.get_mut(pidx) else {
+                    continue;
+                };
                 match &val {
                     Some(s) if s.is_empty() => {
                         row.remove(&ci); // blank → fall back to the DB default
@@ -1520,9 +1552,14 @@ fn paste_selection(gs: GridState) {
     let del = gs.del_rows.get_untracked();
     let mut skipped_deleted = 0usize;
     let planned = plan.cells.len();
+    // Collected, then staged in **two** signal updates rather than one per cell:
+    // `dirty` and `new_rows` are read by the painter and by every derived view,
+    // so a per-cell update would invalidate the grid once for every cell of a
+    // paste the user made in a single gesture.
+    let (mut real, mut pending) = (Vec::new(), Vec::new());
     for (row, ci, value) in plan.cells {
         if row >= nrows {
-            gs.stage_new(row - nrows, ci, Some(value));
+            pending.push((row - nrows, ci, Some(value)));
             continue;
         }
         let di = order.get(row).copied().unwrap_or(row);
@@ -1533,8 +1570,10 @@ fn paste_selection(gs: GridState) {
             skipped_deleted += 1;
             continue;
         }
-        gs.stage(di, ci, Some(value));
+        real.push((di, ci, Some(value)));
     }
+    gs.stage_many(real);
+    gs.stage_new_many(pending);
     // After staging, because `stage` clears this bar on every edit. Silence
     // would be the wrong answer here: a paste that discarded half a spreadsheet
     // looks exactly like one that worked.
