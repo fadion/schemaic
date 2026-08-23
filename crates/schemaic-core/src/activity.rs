@@ -217,8 +217,18 @@ pub struct SessionInfo {
     /// their own queries in `pg_stat_activity`).
     pub sql: Option<String>,
     /// How long the session has been in this state, in seconds, as the server
-    /// measured it.
-    pub seconds: f64,
+    /// measured it — `None` when the server would not say.
+    ///
+    /// **`None` is not zero.** PostgreSQL masks `state_change`, `query_start`
+    /// and `backend_start` for a backend the role may not inspect, so its age
+    /// arrives NULL; folded to `0.0` it drew as **"0s"**, and a connection open
+    /// for three hours claimed to have just arrived on the list a person scans
+    /// for what has been sitting there. Everything that reads this has an
+    /// answer for the unknown: [`format_age`] draws an em dash, both sorts put
+    /// it last (`None < Some`, which is also what the query's `NULLS LAST`
+    /// does), and [`lock_wait_text`] drops the duration from its sentence
+    /// rather than inventing one.
+    pub seconds: Option<f64>,
     /// Sessions this one is waiting for. The engines answer this direction; see
     /// [`prepare`] for the other.
     pub blocked_by: Vec<i64>,
@@ -539,15 +549,26 @@ pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
             if others == 1 { "s" } else { "" }
         )
     };
+    // **An age the server withheld is left out of the sentence, not drawn as a
+    // number.** Either side can be masked (`SessionInfo::seconds`), and "has
+    // been waiting 0s for a lock" was a claim nothing had made.
+    let waiting = match waiter.seconds {
+        Some(_) => format!("has been waiting {} for", format_age(waiter.seconds)),
+        None => "is waiting for".to_string(),
+    };
+    let held_for = match holder.seconds {
+        Some(_) => format!(" for {}", format_age(holder.seconds)),
+        None => String::new(),
+    };
     format!(
-        "Session {} ({}) has been waiting {} for a lock held by session {} ({}), {} for {}.{}",
+        "Session {} ({}) {} a lock held by session {} ({}), {}{}.{}",
         waiter.id,
         waiter.who(),
-        format_age(waiter.seconds),
+        waiting,
         holder.id,
         holder.who(),
         holder_doing,
-        format_age(holder.seconds),
+        held_for,
         and_others,
     )
 }
@@ -687,7 +708,9 @@ pub fn from_mysql_rows(
                 // `TIME` is signed and goes negative when the system clock steps
                 // back under a live thread; `format_age` floors it, but the sort
                 // key must not hoist such a row to the top of its group.
-                seconds: r.seconds.max(0) as f64,
+                // MySQL's `PROCESSLIST.TIME` is a plain integer the server
+                // always fills, so the age is never unknown on this engine.
+                seconds: Some(r.seconds.max(0) as f64),
                 blocked_by: blocked_by.remove(&r.id).unwrap_or_default(),
                 blocks: Vec::new(),
             }
@@ -695,9 +718,86 @@ pub fn from_mysql_rows(
         .collect()
 }
 
-/// One `pg_stat_activity` row, every column as the text `simple_query` returns:
-/// `(pid, usename, client_host, datname, state, query, age, blockers)`.
-pub type PgActivityRow = [Option<String>; 8];
+/// The columns a `pg_stat_activity` fetch projects, **in the order the row
+/// arrives in** — the outer `SELECT` of `db::pg`'s `PG_ACTIVITY_SQL` is built
+/// from this list, and [`PgActivityRow::from_slots`] destructures a row in the
+/// same order.
+///
+/// The list is here, and not beside the query, because it is the only thing
+/// holding the two ends together. The fold used to index the row with bare
+/// literals — `text(r, 5)` for the query, `r[7]` for the blockers — against a
+/// `const` SQL string in another crate, filled by `std::array::from_fn(|i|
+/// opt(r, i))`, which checks no arity at all: `opt` answers `None` past the end
+/// of the row, so a query that lost a column folded silently into a session
+/// whose tail was all `None` — user empty, state `Idle`, blockers gone — and
+/// the panel whose one decision is what to kill went on working and stopped
+/// being true.
+pub const PG_ACTIVITY_COLUMNS: [&str; 8] = [
+    "pid",
+    "usename",
+    "client_host",
+    "datname",
+    "state",
+    "query",
+    "age",
+    "blockers",
+];
+
+/// One `pg_stat_activity` row, every column as the text `simple_query` returns.
+///
+/// Named rather than positional, and the names are
+/// [`PG_ACTIVITY_COLUMNS`]' in [`PG_ACTIVITY_COLUMNS`]' order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PgActivityRow {
+    pub pid: Option<String>,
+    pub usename: Option<String>,
+    pub client_host: Option<String>,
+    pub datname: Option<String>,
+    pub state: Option<String>,
+    pub query: Option<String>,
+    pub age: Option<String>,
+    pub blockers: Option<String>,
+}
+
+impl PgActivityRow {
+    /// Bind one fetched row's cells to their names, or refuse it.
+    ///
+    /// The slice pattern is the arity check the old `array::from_fn` didn't
+    /// have: a row that isn't exactly [`PG_ACTIVITY_COLUMNS`]`.len()` cells is
+    /// `None` and reaches no fold, rather than being padded with `None`s that
+    /// read as "the server said nothing about that".
+    pub fn from_slots(slots: &[Option<String>]) -> Option<Self> {
+        let [
+            pid,
+            usename,
+            client_host,
+            datname,
+            state,
+            query,
+            age,
+            blockers,
+        ] = slots
+        else {
+            return None;
+        };
+        Some(Self {
+            pid: pid.clone(),
+            usename: usename.clone(),
+            client_host: client_host.clone(),
+            datname: datname.clone(),
+            state: state.clone(),
+            query: query.clone(),
+            age: age.clone(),
+            blockers: blockers.clone(),
+        })
+    }
+
+    /// One cell, empty text treated as absent — a column the server returned
+    /// blank says no more than one it returned NULL.
+    fn cell(v: &Option<String>) -> Option<String> {
+        v.clone().filter(|s| !s.is_empty())
+    }
+}
 
 /// Is this `pg_stat_activity` row a **session** at all, or one of PostgreSQL's
 /// own auxiliary processes?
@@ -743,40 +843,43 @@ pub fn is_pg_session(usename: Option<&str>, datname: Option<&str>, blocked: bool
 ///
 /// A row whose **pid** won't parse is dropped, not admitted under a made-up id:
 /// a session `0` renders a full row with a live "Kill session" under it, and
-/// other rows' `blocked_by` edges would point at it. An unreadable *age* has a
-/// safe default — it only decides where the row sorts.
+/// other rows' `blocked_by` edges would point at it. An unreadable *age* stays
+/// unreadable ([`SessionInfo::seconds`]) rather than folding to zero, which the
+/// row drew as "0s".
 ///
 /// **A row with no user *or* no database is not a session** — see
 /// [`is_pg_session`]. The `WHERE` clause is the primary guard for that and this
 /// is the second one, at the level a test can reach.
 pub fn from_pg_rows(rows: &[PgActivityRow]) -> Vec<SessionInfo> {
-    let text = |r: &PgActivityRow, i: usize| r[i].clone().filter(|s| !s.is_empty());
+    let cell = PgActivityRow::cell;
     rows.iter()
         .filter_map(|r| {
-            let query = text(r, 5)
+            let query = cell(&r.query)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty() && s != PG_MASKED_QUERY);
-            let blocked_by = parse_pid_array(r[7].as_deref().unwrap_or(""));
-            let id: i64 = r[0].as_deref()?.trim().parse().ok()?;
+            let blocked_by = parse_pid_array(r.blockers.as_deref().unwrap_or(""));
+            let id: i64 = r.pid.as_deref()?.trim().parse().ok()?;
             if !is_pg_session(
-                text(r, 1).as_deref(),
-                text(r, 3).as_deref(),
+                cell(&r.usename).as_deref(),
+                cell(&r.datname).as_deref(),
                 !blocked_by.is_empty(),
             ) {
                 return None;
             }
             Some(SessionInfo {
                 id,
-                user: text(r, 1).unwrap_or_default(),
-                client: text(r, 2),
-                database: text(r, 3),
+                user: cell(&r.usename).unwrap_or_default(),
+                client: cell(&r.client_host),
+                database: cell(&r.datname),
                 state: pg_state(
-                    text(r, 4).as_deref(),
+                    cell(&r.state).as_deref(),
                     query.is_some(),
                     !blocked_by.is_empty(),
                 ),
                 sql: query,
-                seconds: text(r, 6).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                // A masked backend's age is NULL and stays unknown — see
+                // `SessionInfo::seconds`.
+                seconds: cell(&r.age).and_then(|s| s.parse().ok()),
                 blocked_by,
                 blocks: Vec::new(),
             })
@@ -992,7 +1095,13 @@ fn cancel_transaction_note(dialect: SqlDialect) -> &'static str {
 /// Separate from [`crate::history::format_duration`], which formats a *query's*
 /// millisecond runtime and has no arm past minutes — a connection open since
 /// yesterday would render there as `1873m 04s`.
-pub fn format_age(secs: f64) -> String {
+/// An age the server withheld is `None` and draws as an em dash. It used to
+/// fall to `0.0` and draw "0s", which reads as a fact rather than as a blank —
+/// see [`SessionInfo::seconds`].
+pub fn format_age(secs: Option<f64>) -> String {
+    let Some(secs) = secs else {
+        return "—".to_string();
+    };
     let secs = if secs.is_finite() && secs > 0.0 {
         secs
     } else {
@@ -1024,7 +1133,7 @@ mod tests {
             database: Some("employees".to_string()),
             state,
             sql: Some("SELECT 1".to_string()),
-            seconds,
+            seconds: Some(seconds),
             blocked_by: Vec::new(),
             blocks: Vec::new(),
         }
@@ -1503,13 +1612,15 @@ mod tests {
         assert_eq!(out[3].client, None);
         assert_eq!(out[2].database, None);
         assert_eq!(out[3].sql, None);
-        assert_eq!(out[3].seconds, 0.0);
+        assert_eq!(out[3].seconds, Some(0.0));
         // Duplicates survive here; `prepare` is the one place they are dropped.
         assert_eq!(out[2].blocked_by, vec![2, 2]);
     }
 
+    /// A readable client backend, built through `from_slots` so the fixture
+    /// goes through the same binding the fetch does.
     fn pg_row(pid: &str) -> PgActivityRow {
-        [
+        PgActivityRow::from_slots(&[
             Some(pid.to_string()),
             Some("app".to_string()),
             Some("10.0.0.4".to_string()),
@@ -1518,7 +1629,8 @@ mod tests {
             Some("SELECT 1".to_string()),
             Some("12.5".to_string()),
             Some("{}".to_string()),
-        ]
+        ])
+        .expect("the fixture is the projection's arity")
     }
 
     /// **A masked backend is kept, and does not claim to be running.**
@@ -1530,16 +1642,16 @@ mod tests {
     #[test]
     fn the_pg_fold_keeps_a_masked_backend_without_inventing_anything() {
         let mut masked = pg_row("41207");
-        masked[1] = None;
-        masked[2] = None;
-        masked[3] = None;
-        masked[4] = None;
-        masked[5] = Some(PG_MASKED_QUERY.to_string());
-        masked[6] = None;
-        masked[7] = Some("{4102}".to_string());
+        masked.usename = None;
+        masked.client_host = None;
+        masked.datname = None;
+        masked.state = None;
+        masked.query = Some(PG_MASKED_QUERY.to_string());
+        masked.age = None;
+        masked.blockers = Some("{4102}".to_string());
 
         let mut unparseable = pg_row("not-a-pid");
-        unparseable[7] = Some("{}".to_string());
+        unparseable.blockers = Some("{}".to_string());
 
         let out = from_pg_rows(&[pg_row("100"), masked, unparseable]);
         // The row with no readable identity is dropped; a session `0` would
@@ -1547,7 +1659,7 @@ mod tests {
         assert_eq!(out.len(), 2);
 
         assert_eq!(out[0].state, SessionState::Running);
-        assert_eq!(out[0].seconds, 12.5);
+        assert_eq!(out[0].seconds, Some(12.5));
 
         let m = &out[1];
         assert_eq!(m.id, 41207);
@@ -1560,9 +1672,102 @@ mod tests {
         assert_eq!(m.state, SessionState::Blocked);
         // …and with no blocker it would be the far more common idle backend.
         let mut alone = pg_row("41207");
-        alone[4] = None;
-        alone[5] = Some(PG_MASKED_QUERY.to_string());
+        alone.state = None;
+        alone.query = Some(PG_MASKED_QUERY.to_string());
         assert_eq!(from_pg_rows(&[alone])[0].state, SessionState::Idle);
+    }
+
+    /// **Every slot is the column the query selects, and a short row is
+    /// refused.** The projection is built from [`PG_ACTIVITY_COLUMNS`] in
+    /// `db::pg` and destructured from it here, so this is the assertion that
+    /// keeps the two orders the same one: it fails if the list is reordered, if
+    /// `from_slots` binds a field to the wrong slot, or if a column is renamed
+    /// against its field.
+    ///
+    /// Nothing checked it before. The fold indexed the row with bare literals —
+    /// `text(r, 5)` for the query, `r[7]` for the blockers — against a `const`
+    /// SQL string in another crate, filled by `array::from_fn(|i| opt(r, i))`,
+    /// which pads past the end of the row with `None`. A column added at
+    /// position 3 shifted every field after it with no compile error and no
+    /// failing test; the existing fold test builds its rows from a helper that
+    /// restates the same positions, so it pinned the fold against itself.
+    #[test]
+    fn every_slot_of_an_activity_row_is_the_column_the_query_selects() {
+        let named: Vec<Option<String>> = PG_ACTIVITY_COLUMNS
+            .iter()
+            .map(|c| Some(c.to_string()))
+            .collect();
+        let r = PgActivityRow::from_slots(&named).expect("eight columns is the projection");
+        assert_eq!(r.pid.as_deref(), Some("pid"));
+        assert_eq!(r.usename.as_deref(), Some("usename"));
+        assert_eq!(r.client_host.as_deref(), Some("client_host"));
+        assert_eq!(r.datname.as_deref(), Some("datname"));
+        assert_eq!(r.state.as_deref(), Some("state"));
+        assert_eq!(r.query.as_deref(), Some("query"));
+        assert_eq!(r.age.as_deref(), Some("age"));
+        assert_eq!(r.blockers.as_deref(), Some("blockers"));
+        // A row of the wrong arity reaches no fold: it used to be padded with
+        // `None`s, which read as "the server said nothing about that".
+        assert_eq!(PgActivityRow::from_slots(&named[..7]), None);
+        assert_eq!(PgActivityRow::from_slots(&[]), None);
+        let mut long = named.clone();
+        long.push(Some("surprise".to_string()));
+        assert_eq!(PgActivityRow::from_slots(&long), None);
+    }
+
+    /// **An age the server withheld is not zero.** PostgreSQL masks
+    /// `state_change`/`query_start`/`backend_start` for a backend the role may
+    /// not inspect, so a masked row's age arrives NULL — folded to `0.0` it
+    /// drew as "0s", and a connection open for three hours claimed to have just
+    /// arrived, on the list a person scans for what has been sitting there.
+    /// Every masked row in the live probe behind `is_pg_session` had one.
+    #[test]
+    fn a_masked_backends_age_is_unknown_rather_than_zero() {
+        let mut masked = pg_row("41207");
+        masked.age = None;
+        let out = from_pg_rows(&[masked]);
+        assert_eq!(out[0].seconds, None);
+        assert_eq!(format_age(out[0].seconds), "—");
+        // A real zero still reads as a real zero.
+        assert_eq!(format_age(Some(0.0)), "0s");
+    }
+
+    /// The two consumers past the row: an unknown age sorts **last** (which is
+    /// what the query's `NULLS LAST` does at the other end), and the lock
+    /// banner drops the duration from its sentence rather than inventing one.
+    #[test]
+    fn an_unknown_age_sorts_last_and_is_left_out_of_the_banner() {
+        let mut rows = vec![
+            sess(1, SessionState::Running, 5.0),
+            sess(2, SessionState::Running, 90.0),
+            sess(3, SessionState::Running, 5.0),
+        ];
+        rows[2].seconds = None;
+        prepare(&mut rows);
+        assert_eq!(
+            rows.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 1, 3],
+            "longest first, unknown last"
+        );
+
+        let mut waiter = sess(7, SessionState::Blocked, 30.0);
+        waiter.blocked_by = vec![9];
+        let holder = sess(9, SessionState::IdleInTx, 300.0);
+        assert!(
+            lock_wait_text(&waiter, &holder)
+                .contains("has been waiting 30s for a lock held by session 9")
+        );
+        let mut unknown_waiter = waiter.clone();
+        unknown_waiter.seconds = None;
+        let mut unknown_holder = holder.clone();
+        unknown_holder.seconds = None;
+        let both = lock_wait_text(&unknown_waiter, &unknown_holder);
+        assert!(
+            both.contains("is waiting for a lock held by session 9"),
+            "{both}"
+        );
+        assert!(both.ends_with("idle in transaction."), "{both}");
+        assert!(!both.contains("0s"), "{both}");
     }
 
     /// PostgreSQL's own auxiliary processes are not sessions, and under an
@@ -1576,7 +1781,7 @@ mod tests {
     #[test]
     fn the_pg_fold_drops_postgres_own_auxiliary_processes() {
         let row = |pid: &str, usename: Option<&str>, datname: Option<&str>| -> PgActivityRow {
-            [
+            PgActivityRow::from_slots(&[
                 Some(pid.to_string()),
                 usename.map(str::to_string),
                 None,
@@ -1585,7 +1790,8 @@ mod tests {
                 Some(PG_MASKED_QUERY.to_string()),
                 None,
                 Some("{}".to_string()),
-            ]
+            ])
+            .expect("the fixture is the projection's arity")
         };
         // checkpointer, background writer, walwriter, autovacuum launcher —
         // and the logical replication launcher, which runs as `postgres` and is
@@ -1610,7 +1816,7 @@ mod tests {
         );
         // …and a lock waiter is a session however little else it will say.
         let mut waiter = row("5551", None, None);
-        waiter[7] = Some("{4102}".to_string());
+        waiter.blockers = Some("{4102}".to_string());
         assert_eq!(from_pg_rows(&[waiter]).len(), 1);
     }
 
@@ -1894,25 +2100,25 @@ mod tests {
 
     #[test]
     fn format_age_scales_from_seconds_to_days() {
-        assert_eq!(format_age(0.0), "0s");
-        assert_eq!(format_age(12.44), "12s");
-        assert_eq!(format_age(59.9), "59s");
-        assert_eq!(format_age(60.0), "1m 00s");
-        assert_eq!(format_age(252.0), "4m 12s");
-        assert_eq!(format_age(3599.0), "59m 59s");
-        assert_eq!(format_age(3600.0), "1h 00m");
-        assert_eq!(format_age(86_399.0), "23h 59m");
-        assert_eq!(format_age(86_400.0), "1d 00h");
-        assert_eq!(format_age(200_000.0), "2d 07h");
+        assert_eq!(format_age(Some(0.0)), "0s");
+        assert_eq!(format_age(Some(12.44)), "12s");
+        assert_eq!(format_age(Some(59.9)), "59s");
+        assert_eq!(format_age(Some(60.0)), "1m 00s");
+        assert_eq!(format_age(Some(252.0)), "4m 12s");
+        assert_eq!(format_age(Some(3599.0)), "59m 59s");
+        assert_eq!(format_age(Some(3600.0)), "1h 00m");
+        assert_eq!(format_age(Some(86_399.0)), "23h 59m");
+        assert_eq!(format_age(Some(86_400.0)), "1d 00h");
+        assert_eq!(format_age(Some(200_000.0)), "2d 07h");
     }
 
     #[test]
     fn format_age_refuses_to_render_a_nonsense_clock() {
         // Clock skew between the server's `now()` and a row's start timestamp can
         // hand us a negative age; NaN comes from a missing timestamp parsed loose.
-        assert_eq!(format_age(-5.0), "0s");
-        assert_eq!(format_age(f64::NAN), "0s");
-        assert_eq!(format_age(f64::INFINITY), "0s");
+        assert_eq!(format_age(Some(-5.0)), "0s");
+        assert_eq!(format_age(Some(f64::NAN)), "0s");
+        assert_eq!(format_age(Some(f64::INFINITY)), "0s");
     }
 
     #[test]
