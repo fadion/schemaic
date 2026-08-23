@@ -246,9 +246,24 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             // the only thing separating one turn from the next; the first label
             // sits 10px below the title, and messages carry their own margins.
             dyn_stack(
-                move || 0..msg_count.get(),
-                |i| *i,
-                move |i| {
+                // **The conversation's identity is in the item, not just the
+                // index.** Keyed by index alone, floem retains item 0's scope
+                // across every conversation change that does not pass through
+                // zero messages — `dyn_stack` disposes an item scope only in
+                // `remove_index`, for keys that leave the set — and the count is
+                // the only thing this closure read, so switching between two
+                // conversations of equal length was invisible to it. Anything
+                // the item scope owns then belonged to the wrong conversation:
+                // `attach_open` most of all, so expanding a card on connection A
+                // and switching to B rendered B's attachment card already open,
+                // printing rows nobody asked to see. The same "equal length is
+                // invisible" trap the scroll floor above documents.
+                move || {
+                    let conn = active_conn.get();
+                    (0..msg_count.get()).map(move |i| (conn, i))
+                },
+                |k| *k,
+                move |(_conn, i)| {
                     let actions = actions.clone();
                     let regen = regen.clone();
                     // Newly appended bubbles get the entrance pop; ones that were
@@ -271,8 +286,12 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     // flag living inside it was a fresh `false` after each — so
                     // reading what was sent while the answer streamed in closed
                     // the card the moment the answer arrived. This scope is the
-                    // `dyn_stack` item's: it survives those rebuilds and is
-                    // disposed with the message.
+                    // `dyn_stack` item's: it survives those rebuilds, and — since
+                    // the item key carries the connection — it is disposed when
+                    // the conversation changes as well as when the message goes.
+                    // It used to say "disposed with the message", which was true
+                    // only of *New chat*: that clears to zero messages and
+                    // rebuilds the outer container, and nothing else did.
                     let attach_open = RwSignal::new(false);
                     // `is_last` rides in the memo rather than being captured: it
                     // drives the regenerate affordance, and appending a message
