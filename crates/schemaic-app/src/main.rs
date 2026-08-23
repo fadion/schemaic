@@ -2885,44 +2885,55 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // re-pinned its connection underneath it — losing the uncommitted work of a
     // tab the user never acted on, while the tab that actually lost its socket
     // stayed broken.
-    let repair_killed_session: Rc<dyn Fn(u64, i64, schemaic_core::activity::KillKind)> = {
+    // Which of our own tabs holds this server session, if any.
+    //
+    // **Two callers, and the earlier one is the point.** `repair_killed_session`
+    // has always asked this *after* the kill, to put the tab back together. The
+    // confirm has to ask it *before*: a Manual tab's pinned session is an
+    // ordinary row in the panel and wears the same `user@host` as every other row
+    // from that connection, so without this the modal described the user's own
+    // uncommitted work as somebody else's client. One lookup rather than two
+    // spellings of it.
+    let owning_tab: Rc<dyn Fn(u64, i64) -> Option<schemaic_ui::Tab>> = {
         let sessions = sessions.clone();
+        Rc::new(move |conn_id: u64, id: i64| {
+            let owners: Vec<usize> = sessions
+                .borrow()
+                .iter()
+                .filter(|(_, s)| s.server_id() == Some(id))
+                .map(|(tab_id, _)| *tab_id)
+                .collect();
+            // The tab has to be on **the same server**, which is not the same
+            // question as the same `conn_id`. Two Schemaic connections routinely
+            // point at one server — `local (app)` and `local (root)`, or two
+            // entries differing only in default database — and a `conn_id`
+            // comparison rejected exactly that true match, leaving the tab
+            // holding a dead socket with Commit and Rollback still offered.
+            let killed_on =
+                connections.with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned());
+            owners.into_iter().find_map(|tab_id| {
+                let tab = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())?;
+                let tab_conn = tab.conn_id.get_untracked();
+                if tab_conn == conn_id {
+                    return Some(tab);
+                }
+                let killed_on = killed_on.as_ref()?;
+                let owner_conn = connections
+                    .with_untracked(|cs| cs.iter().find(|c| c.id == tab_conn).cloned())?;
+                owner_conn.targets_same_server(killed_on).then_some(tab)
+            })
+        })
+    };
+
+    let repair_killed_session: Rc<dyn Fn(u64, i64, schemaic_core::activity::KillKind)> = {
+        let owning_tab = owning_tab.clone();
         let open_session = open_session.clone();
         Rc::new(
             move |conn_id: u64, id: i64, kind: schemaic_core::activity::KillKind| {
                 if kind != schemaic_core::activity::KillKind::Session {
                     return;
                 }
-                let owners: Vec<usize> = sessions
-                    .borrow()
-                    .iter()
-                    .filter(|(_, s)| s.server_id() == Some(id))
-                    .map(|(tab_id, _)| *tab_id)
-                    .collect();
-                // The tab has to be on **the same server**, which is not the same
-                // question as the same `conn_id`. Two Schemaic connections
-                // routinely point at one server — `local (app)` and
-                // `local (root)`, or two entries differing only in default
-                // database — and a `conn_id` comparison rejected exactly that
-                // true match, leaving the tab holding a dead socket with Commit
-                // and Rollback still offered. `targets_same_server` is the
-                // predicate that separates "the same box" from "a different box
-                // that happens to have handed out thread 42 too".
-                let killed_on =
-                    connections.with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned());
-                let owner = owners.into_iter().find_map(|tab_id| {
-                    let tab =
-                        tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())?;
-                    let tab_conn = tab.conn_id.get_untracked();
-                    if tab_conn == conn_id {
-                        return Some(tab);
-                    }
-                    let killed_on = killed_on.as_ref()?;
-                    let owner_conn = connections
-                        .with_untracked(|cs| cs.iter().find(|c| c.id == tab_conn).cloned())?;
-                    owner_conn.targets_same_server(killed_on).then_some(tab)
-                });
-                let Some(tab) = owner else {
+                let Some(tab) = (owning_tab)(conn_id, id) else {
                     return;
                 };
                 tab.tx.set(TxState::closed());
@@ -2981,15 +2992,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .is_some_and(|c| c.read_only)
             });
             if !schemaic_ui::may_launch_destructive(false, read_only) {
-                activity_kill_error.set(Some(
-                    "This connection is marked read-only, so Schemaic won't terminate \
-                     sessions on it. Clear read-only in the connection's settings first."
-                        .to_string(),
-                ));
+                // Per kind: this refusal answered *Cancel query* with a sentence
+                // about terminating sessions, which is a different action.
+                activity_kill_error.set(Some(schemaic_core::activity::read_only_refusal(kind)));
                 return;
             }
             let dialect = db.engine().dialect();
-            let (title, message) = schemaic_core::activity::kill_confirm(kind, &session, dialect);
+            // **Asked before the confirm, not after the kill.** A Manual tab's
+            // pinned session is an ordinary row here and wears the same
+            // `user@host` as every other row from that connection, so the modal
+            // was describing the user's own uncommitted work as a stranger's.
+            let ours = (owning_tab)(conn_id, id).map(|t| t.title());
+            let (title, message) =
+                schemaic_core::activity::kill_confirm(kind, &session, dialect, ours.as_deref());
             let (handle, refresh) = (handle.clone(), refresh.clone());
             let repair_killed_session = repair_killed_session.clone();
             confirm.set(Some(Confirm {
