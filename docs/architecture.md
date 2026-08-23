@@ -4079,6 +4079,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     captured *by value* freezes at build time. Prefer `fn() -> Color` for anything themable (see
     `FieldCfg::background`).
 - **Reactive text**: use `dyn_container` (no `floem::views::label`).
+- **There is no accessibility tree, and there is nothing in this repository that can add one.**
+  Floem 0.2.0 ships no AccessKit integration and no a11y surface of any kind — grepping the crate
+  for `accesskit`/`accessibility`/`a11y` turns up only the English word in two doc comments about
+  platform config — so nothing the app builds is exposed to Narrator, VoiceOver or Orca, whatever
+  it is labelled. What the app *does* have is keyboard operability, and that is the axis worth
+  spending on: `FocusRing`, `focus_root_with_ring`, spaced tab indices, `widgets::accept_launch`,
+  and the `shortcuts.rs` table with the test that fails when a binding has no row. The README says
+  this out loud under *Accessibility* rather than leaving someone to discover it after the
+  download; revisit if a later Floem grows the layer.
 
 ## Floem 0.2 gotchas (learned the hard way)
 
