@@ -211,9 +211,16 @@ fn key_tags(c: &DiagramColumn) -> Option<String> {
 /// more" for a 1:many FK and "zero or one" for a unique one — zero either way,
 /// since nothing obliges a parent row to have children.
 ///
-/// **Every text export says this the same way.** Mermaid and PlantUML take the
-/// two strings straight; Graphviz can't use them but spells the same pair
-/// `crowodot`/`teeodot` (see [`to_dot`]). The *canvas* is the one surface that
+/// **The three crow's-foot exports say this the same way.** Mermaid and
+/// PlantUML take the two strings straight; Graphviz can't use them but spells
+/// the same pair `crowodot`/`teeodot` (see [`to_dot`]). **DBML is the fourth
+/// text format and says none of it** — its grammar has no optionality notation
+/// at all, so `Ref: orders.user_id > users.id` is the whole vocabulary and a
+/// nullable FK writes the same line as a `NOT NULL` one. Nothing is lost: the
+/// nullability survives in the column's own `[not null]`, which is where a DBML
+/// reader looks for it. [`to_dbml`] does not call this function.
+///
+/// The *canvas* is the one surface that
 /// draws no zero at the child end, and deliberately: on screen the marker would
 /// be on every edge of every diagram without exception, so it distinguishes
 /// nothing and only adds twenty stroked segments per edge to a view that is
