@@ -2921,6 +2921,11 @@ pub(crate) async fn collect_rows(
         );
     }
 
+    // Which columns hold raw bytes, answered **once for the result** rather than
+    // once per cell. `Column::is_binary` splits a type name and walks a keyword
+    // list; at the 200k-row cap on a wide result that is tens of millions of
+    // calls in the row loop, for an answer that cannot change between rows.
+    let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
     // Assemble the result columnar, one row at a time, so we never hold a
     // row-major `Vec<Vec<Value>>` copy alongside the final storage.
     let mut builder = ResultBuilder::new(columns);
@@ -2929,7 +2934,7 @@ pub(crate) async fn collect_rows(
         while let Some(row) = stream.next().await {
             let row = row.map_err(qerr)?;
             if builder.row_count() < row_cap {
-                let cells = convert_row(&row, builder.columns());
+                let cells = convert_row(&row, builder.columns(), &binary);
                 builder.push_row(&cells);
             } else {
                 // A row beyond the cap exists → the result is truncated.
@@ -3120,6 +3125,11 @@ fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
 /// column's type exactly as the old code did; the typed arms cover the binary
 /// protocol defensively.
 ///
+/// `binary[i]` is whether column `i` holds raw bytes, computed **once for the
+/// result** by the caller: `Column::is_binary` splits a type name and walks a
+/// keyword list, which is not an answer to re-derive per cell in a loop that
+/// runs up to the row cap times the column count.
+///
 /// **A raw-bytes column is the exception, and it used to be a data bug.** A
 /// BLOB/BINARY/BIT value arrives as its literal bytes, and
 /// `from_utf8_lossy`-ing those produced mojibake that *looks like data* — so a
@@ -3127,11 +3137,11 @@ fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
 /// re-imported as the wrong bytes. It renders as `binary_display` now, the same
 /// `<n bytes>` SQLite and PostgreSQL show, which says what it is and cannot be
 /// mistaken for the value.
-fn convert_row(row: &Row, columns: &[Column]) -> Vec<Value> {
+fn convert_row(row: &Row, columns: &[Column], binary: &[bool]) -> Vec<Value> {
     (0..columns.len())
         .map(|i| match row.as_ref(i) {
             None | Some(MyValue::NULL) => Value::Null,
-            Some(MyValue::Bytes(b)) if columns[i].is_binary() => {
+            Some(MyValue::Bytes(b)) if binary.get(i).copied().unwrap_or(false) => {
                 Value::Str(binary_display(b.len()))
             }
             Some(MyValue::Bytes(b)) => parse_typed(
@@ -3771,7 +3781,8 @@ pub(crate) async fn refetch_on(
         let columns: Vec<Column> = result.columns_ref().iter().map(map_column).collect();
         let fetched: Vec<Row> = result.collect::<Row>().await.map_err(qerr)?;
         if let Some(r) = fetched.first() {
-            out.push((row.data_row, convert_row(r, &columns)));
+            let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
+            out.push((row.data_row, convert_row(r, &columns, &binary)));
         }
     }
     Ok(out)
