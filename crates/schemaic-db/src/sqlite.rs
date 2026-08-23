@@ -117,28 +117,67 @@ fn query_err(e: rusqlite::Error) -> DbError {
 /// box, and [`rejects_uri_filename`] is where that is decided, in string logic a
 /// test can reach.
 fn open(db: &Db) -> Result<SqliteConn, DbError> {
-    if db.file.trim().is_empty() {
-        return Err(DbError::Connect("no database file is set".to_string()));
-    }
-    // The test suites' own shared-memory URIs are the one exception, and they
-    // are the reason the flag exists at all.
-    #[cfg(not(test))]
-    if rejects_uri_filename(&db.file) {
-        return Err(DbError::Connect(format!(
-            "{}: this is a URI, not a database file — SQLite would read the part after `?` \
-             as open options, and `?mode=memory` opens a scratch database that accepts every \
-             write and keeps none. Give the path to the file itself.",
-            db.file
-        )));
-    }
+    // The `cfg` is an **argument**, not a branch. The refusal used to sit in a
+    // `#[cfg(not(test))]` block, and `schemaic-db` has no `tests/` directory —
+    // so no build in the workspace contained the guard, and deleting it left the
+    // suite green. See [`open_target`].
+    let target = open_target(&db.file, cfg!(test))?;
     #[allow(unused_mut)]
     let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
     #[cfg(test)]
     {
         flags |= OpenFlags::SQLITE_OPEN_URI;
     }
-    SqliteConn::open_with_flags(&db.file, flags)
+    SqliteConn::open_with_flags(target, flags)
         .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))
+}
+
+/// The name [`open`] may hand to SQLite, or why it may not.
+///
+/// **Every name SQLite treats specially, in one place.** The field is a database
+/// *file*; SQLite's `sqlite3_open_v2` reads three things that are not one, and
+/// each of them reports **Connected**, lists `main`, answers `Ok` to a write —
+/// and loses it, because this module opens a fresh connection per operation and
+/// the database went with the last one.
+///
+/// The enumeration is **closed**, settled by running the workspace's exact
+/// rusqlite against twelve filename forms with `open`'s release flags: exactly
+/// two special names (`:memory:` and the empty string) and one prefix (`file:`).
+/// Nothing else in the list produces "Connected, `Ok`, writes go nowhere" —
+/// every near-miss spelling (`" :memory:"`, `:MEMORY:`, `FILE:…`, a bare
+/// `?mode=memory` query string, a directory, a missing relative path) fails
+/// loudly with *unable to open database file*.
+///
+/// So the comparisons here are **untrimmed and case-sensitive for `:memory:`**,
+/// which is what SQLite's own `strcmp` is. Trimming would start refusing names
+/// SQLite already rejects clearly — harmless, but it would trade a precise error
+/// for a guess, and it is written down so a later tidy-up doesn't invert it.
+///
+/// `allow_uri` is `cfg!(test)` at the one call site: the suites' shared-memory
+/// URIs (`file:name?mode=memory&cache=shared`) are the documented exception and
+/// the reason `SQLITE_OPEN_URI` is set at all. It is a parameter rather than a
+/// `cfg` block so that both answers are reachable from a test.
+fn open_target(file: &str, allow_uri: bool) -> Result<&str, DbError> {
+    if file.trim().is_empty() {
+        return Err(DbError::Connect("no database file is set".to_string()));
+    }
+    if file == ":memory:" {
+        return Err(DbError::Connect(
+            ":memory: is not a database file — SQLite keeps an in-memory database only for as \
+             long as the connection that made it, and this app opens a new connection per \
+             operation, so every write would be reported as saved and then discarded. Give the \
+             path to a file."
+                .to_string(),
+        ));
+    }
+    if !allow_uri && rejects_uri_filename(file) {
+        return Err(DbError::Connect(format!(
+            "{file}: this is a URI, not a database file — SQLite would read the part after `?` \
+             as open options, and `?mode=memory` opens a scratch database that accepts every \
+             write and keeps none. Give the path to the file itself."
+        )));
+    }
+    Ok(file)
 }
 
 /// Would SQLite read this path as a **URI** rather than as a filename?
@@ -3350,6 +3389,61 @@ mod tests {
         assert!(!rejects_uri_filename("./file:weird.sqlite"));
         assert!(!rejects_uri_filename("db.sqlite"));
         assert!(!rejects_uri_filename(""));
+    }
+
+    /// **The whole of `open`'s boundary, including its wiring.**
+    ///
+    /// The URI refusal used to live in a `#[cfg(not(test))]` block, and
+    /// `schemaic-db` has no `tests/` directory — so there was no build anywhere
+    /// in the workspace in which `open` contained the guard. Deleting the four
+    /// lines left the suite green and the app back to opening
+    /// `file:vanish?mode=memory` as a scratch database that accepts every write
+    /// and keeps none. The `cfg` is now an *argument*, so the decision and its
+    /// adoption are both reachable from here.
+    ///
+    /// `:memory:` is the other name with that behaviour, and it was never
+    /// guarded. Reproduced against the workspace's exact rusqlite with `open`'s
+    /// release flags: ping ok, `CREATE TABLE` + `INSERT` Ok, and the next
+    /// connection — one per operation, per this module's rule — sees 0 rows.
+    #[test]
+    fn open_target_refuses_every_name_that_keeps_nothing() {
+        // The two that report success and discard the writes.
+        assert!(open_target(":memory:", true).is_err(), "in-memory");
+        assert!(open_target(":memory:", false).is_err());
+        assert!(open_target("file:vanish?mode=memory", false).is_err());
+        assert!(open_target("", false).is_err());
+        assert!(open_target("   ", false).is_err());
+
+        // The suites' own shared-memory URIs are the documented exception, and
+        // they are the reason the URI flag exists at all.
+        assert!(
+            open_target("file:probe?mode=memory&cache=shared", true).is_ok(),
+            "the test suites' own databases"
+        );
+
+        // **Every near-miss stays allowed**, because SQLite's own comparisons
+        // are exact and it refuses each of these loudly — verified against the
+        // shipped rusqlite. Refusing them here instead would trade a clear
+        // "unable to open database file" for a guess about what the user meant.
+        for ordinary in [
+            " :memory:",  // SQLite's strcmp is exact, so this is a filename
+            ":MEMORY:",   // …and case-sensitive
+            "memory:",    //
+            "./:memory:", //
+            "C:/db.sqlite",
+            "/var/lib/app/db.sqlite",
+            "./file:weird.sqlite",
+            "db.sqlite",
+            "/real/path.db?mode=memory", // a query string is not a URI without `file:`
+        ] {
+            assert!(
+                open_target(ordinary, false).is_ok(),
+                "refused an ordinary filename: {ordinary}"
+            );
+        }
+
+        // …and what it hands back is the name to open, untouched.
+        assert_eq!(open_target("C:/db.sqlite", false).unwrap(), "C:/db.sqlite");
     }
 
     /// **SQLite accepts `:name`, so the driver's parameter count is what stops a
