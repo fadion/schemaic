@@ -68,6 +68,19 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
     let kill = ui.activity_actions.kill.clone();
     let overlay = ui.overlay;
     let menus = crate::widgets::MenuFlags::of(&ui);
+    // **Reactive**, because a connection switch and the read-only toggle both
+    // change the answer while this panel is up, and the entries this dims are
+    // the most destructive thing the app can do to a server it was told not to
+    // write to. A `Memo` rather than a read here: the two containers below read
+    // it inside their own bodies, and a value captured at build would freeze.
+    let read_only = {
+        let conn = ui.conn;
+        floem::reactive::create_memo(move |_| {
+            let id = conn.active_conn.get();
+            conn.connections
+                .with(|cs| cs.iter().find(|c| c.id == id).is_some_and(|c| c.read_only))
+        })
+    };
 
     // Panel-local search filter, debounced like the history panel's so a burst of
     // typing re-filters once. Local to this panel build.
@@ -105,7 +118,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
                 truncated,
             } => {
                 let counts = counts_line(&sessions, truncated).into_any();
-                let warn = banner(&sessions, kill.clone());
+                let warn = banner(&sessions, kill.clone(), read_only.get());
                 v_stack((counts, warn))
                     .style(|s| s.width_full().flex_col())
                     .into_any()
@@ -181,7 +194,15 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
             // context menu share it rather than taking a copy each.
             let mut items = rows
                 .iter()
-                .map(|s| session_row(Rc::new((*s).clone()), term.clone(), kill.clone(), overlay))
+                .map(|s| {
+                    session_row(
+                        Rc::new((*s).clone()),
+                        term.clone(),
+                        kill.clone(),
+                        overlay,
+                        read_only.get(),
+                    )
+                })
                 .collect::<Vec<_>>();
             if undrawn > 0 {
                 items.push(list_message(
@@ -413,7 +434,11 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
 /// that ends the wait. Cancelling the holder's *statement* does not: an
 /// idle-in-transaction holder has no statement, and one that does keeps its locks
 /// until the transaction ends either way.
-fn banner(sessions: &[SessionInfo], kill: Rc<dyn Fn(i64, KillKind)>) -> floem::AnyView {
+fn banner(
+    sessions: &[SessionInfo],
+    kill: Rc<dyn Fn(i64, KillKind)>,
+    read_only: bool,
+) -> floem::AnyView {
     let Some((waiter, holder)) = activity::lock_wait(sessions) else {
         return empty().into_any();
     };
@@ -445,18 +470,42 @@ fn banner(sessions: &[SessionInfo], kill: Rc<dyn Fn(i64, KillKind)>) -> floem::A
     // `widgets::action_button`: that family is the modal-footer one and requires
     // a `FocusRing` this panel has none of. Same fill, hover and radius, like the
     // header's ring-less Retry.
+    //
+    // **Dimmed and inert on a read-only connection.** `kill_session` refuses
+    // before the confirm and there is no "Run anyway", but a fully enabled
+    // button in the danger fill that silently does nothing is the half
+    // `accept_launch`'s contract asks this side to supply: "The disabled button
+    // stays: it is what *says* the action is unavailable."
     let kill_btn = text(format!("Kill {holder_id}"))
-        .on_click_stop(move |_| (kill)(holder_id, KillKind::Session))
-        .style(|s| {
-            s.font_size(FONT_BODY)
-                .background(theme::btn_danger())
+        .on_click_stop(move |_| {
+            if !read_only {
+                (kill)(holder_id, KillKind::Session);
+            }
+        })
+        .style(move |s| {
+            let s = s
+                .font_size(FONT_BODY)
                 .color(theme::btn_danger_text())
                 .padding_horiz(10.0)
                 .padding_vert(4.0)
                 .border_radius(5.0)
                 .flex_shrink(0.0_f32)
-                .cursor(floem::style::CursorStyle::Default)
-                .hover(|s| s.background(theme::btn_danger_hover()))
+                .cursor(floem::style::CursorStyle::Default);
+            if read_only {
+                s.background(theme::btn_danger().multiply_alpha(0.45))
+                    .color(theme::btn_danger_text().multiply_alpha(0.6))
+            } else {
+                s.background(theme::btn_danger())
+                    .hover(|s| s.background(theme::btn_danger_hover()))
+            }
+        })
+        .tooltip(move || {
+            text(if read_only {
+                "This connection is marked read-only.".to_string()
+            } else {
+                format!("Terminate session {holder_id}")
+            })
+            .style(tooltip_style)
         });
 
     v_stack((
@@ -495,6 +544,7 @@ fn session_row(
     term: Option<String>,
     kill: Rc<dyn Fn(i64, KillKind)>,
     overlay: crate::OverlayUi,
+    read_only: bool,
 ) -> floem::AnyView {
     let color = state_color(s.state);
     // The identity group, then the age hard against the right edge.
@@ -615,7 +665,7 @@ fn session_row(
             overlay.popup_width.set(160.0);
             overlay
                 .popup_menu
-                .set(Some(row_menu(&menu_session, kill.clone())));
+                .set(Some(row_menu(&menu_session, kill.clone(), read_only)));
         })
         .style(|s| {
             s.flex_col()
@@ -635,17 +685,27 @@ fn session_row(
 /// "Cancel query" is *dimmed* rather than absent on a session with nothing
 /// running, so the menu keeps the same shape on every row — an entry that moves
 /// between rows is one you click by muscle memory and miss.
-fn row_menu(s: &SessionInfo, kill: Rc<dyn Fn(i64, KillKind)>) -> Vec<MenuEntry> {
+///
+/// **`read_only` dims both kills**, which is the half `accept_launch`'s contract
+/// asks for and this panel was missing. The launch guard is where it belongs —
+/// `kill_session` refuses before the confirm, and there is no "Run anyway" — but
+/// the entries were drawn fully enabled in the danger fill with nothing saying
+/// they would not run, so the only way to learn was to click. `accept_launch`'s
+/// own doc states the pairing: "The disabled button stays: it is what *says* the
+/// action is unavailable. This is what makes it so." The runtime refusal stays
+/// as the backstop.
+fn row_menu(s: &SessionInfo, kill: Rc<dyn Fn(i64, KillKind)>, read_only: bool) -> Vec<MenuEntry> {
     let id = s.id;
     let cancel = kill.clone();
     let mut entries = vec![
         MenuEntry::action(KillKind::Query.label(), move || {
             (cancel)(id, KillKind::Query)
         })
-        .disabled(!KillKind::Query.applies_to(s)),
+        .disabled(read_only || !KillKind::Query.applies_to(s)),
         MenuEntry::action(KillKind::Session.label(), move || {
             (kill)(id, KillKind::Session)
-        }),
+        })
+        .disabled(read_only),
     ];
     if let Some(sql) = s.sql.clone() {
         entries.push(MenuEntry::Separator);

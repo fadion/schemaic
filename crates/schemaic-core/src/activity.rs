@@ -900,18 +900,39 @@ pub fn kill_verdict(cell: Option<&str>, kind: KillKind, id: i64) -> Result<(), S
 /// it would be under a terminate. Telling a PostgreSQL user their transaction
 /// "stays open" is true and useless; what they need to know is that it is no
 /// longer usable.
-pub fn kill_confirm(kind: KillKind, s: &SessionInfo, dialect: SqlDialect) -> (String, String) {
+///
+/// **`ours` is the tab this session belongs to, when it is one of ours.** A
+/// Manual-transaction tab's pinned session is an ordinary row in the panel —
+/// neither engine's activity query excludes it, only the connection doing the
+/// polling — and it is the row most likely to be sitting there as the
+/// idle-in-transaction holder blocking everything else. Without this the confirm
+/// described the user's own uncommitted work as somebody else's client, in the
+/// same `user@host` every other row from that connection wears. The app has
+/// always known the answer: `repair_killed_session` scans for exactly this and
+/// its comment opens "A killed session may be one of ours" — but it runs *after*
+/// the kill.
+pub fn kill_confirm(
+    kind: KillKind,
+    s: &SessionInfo,
+    dialect: SqlDialect,
+    ours: Option<&str>,
+) -> (String, String) {
     let who = s.who();
     let where_ = match s.database.as_deref() {
         Some(db) if !db.is_empty() => format!(" on {db}"),
         _ => String::new(),
     };
+    // Appended rather than woven in, so the sentence about a stranger's session
+    // stays exactly as it was when it is one.
+    let mine = ours.map_or(String::new(), |tab| {
+        format!(" This is {tab}'s own connection in this window, so the work you lose is yours.")
+    });
     match kind {
         KillKind::Query => (
             format!("Cancel query on session {}", s.id),
             format!(
                 "Stop the statement {who} is running{where_}? \
-                 The session stays connected and the client sees the query fail. {}",
+                 The session stays connected and the client sees the query fail. {}{mine}",
                 cancel_transaction_note(dialect)
             ),
         ),
@@ -920,10 +941,28 @@ pub fn kill_confirm(kind: KillKind, s: &SessionInfo, dialect: SqlDialect) -> (St
             format!(
                 "Disconnect {who}{where_}? \
                  Any transaction it has open is rolled back and its client sees the \
-                 connection drop. This can't be undone."
+                 connection drop. This can't be undone.{mine}"
             ),
         ),
     }
+}
+
+/// Why a kill didn't run on a read-only connection.
+///
+/// Pure and per-kind because the message used to be one string for both, so
+/// clicking **Cancel query** was answered with a sentence about *terminating
+/// sessions* — a different action, with the materially different consequences
+/// [`kill_confirm`] spells out. The word here is the word on the control
+/// ([`KillKind::label`]).
+pub fn read_only_refusal(kind: KillKind) -> String {
+    let what = match kind {
+        KillKind::Query => "cancel queries",
+        KillKind::Session => "terminate sessions",
+    };
+    format!(
+        "This connection is marked read-only, so Schemaic won't {what} on it. \
+         Clear read-only in the connection's settings first."
+    )
 }
 
 /// What a cancelled statement leaves behind, per engine — the second half of
@@ -1664,13 +1703,13 @@ mod tests {
     #[test]
     fn kill_confirm_names_the_consequence_of_the_kind_chosen() {
         let s = sess(1148, SessionState::IdleInTx, 300.0);
-        let (title, body) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql);
+        let (title, body) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql, None);
         assert_eq!(title, "Kill session 1148");
         assert!(body.contains("app@10.0.0.1"), "{body}");
         assert!(body.contains("on employees"), "{body}");
         assert!(body.contains("rolled back"), "{body}");
 
-        let (title, body) = kill_confirm(KillKind::Query, &s, SqlDialect::MySql);
+        let (title, body) = kill_confirm(KillKind::Query, &s, SqlDialect::MySql, None);
         assert_eq!(title, "Cancel query on session 1148");
         assert!(body.contains("stays connected"), "{body}");
         assert!(!body.contains("rolled back"), "cancelling does not: {body}");
@@ -1685,14 +1724,14 @@ mod tests {
     fn cancelling_says_what_it_costs_on_each_engine() {
         let s = sess(1148, SessionState::Running, 30.0);
 
-        let (_, my) = kill_confirm(KillKind::Query, &s, SqlDialect::MySql);
+        let (_, my) = kill_confirm(KillKind::Query, &s, SqlDialect::MySql, None);
         assert!(my.contains("stays open"), "{my}");
         assert!(
             !my.contains("aborted"),
             "MySQL's transaction survives: {my}"
         );
 
-        let (_, pg) = kill_confirm(KillKind::Query, &s, SqlDialect::Postgres);
+        let (_, pg) = kill_confirm(KillKind::Query, &s, SqlDialect::Postgres, None);
         assert!(pg.contains("aborted"), "{pg}");
         assert!(pg.contains("roll it back"), "{pg}");
         assert!(
@@ -1701,19 +1740,71 @@ mod tests {
         );
 
         // Terminating means the same thing on both, so its sentence doesn't move.
-        let (_, a) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql);
-        let (_, b) = kill_confirm(KillKind::Session, &s, SqlDialect::Postgres);
+        let (_, a) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql, None);
+        let (_, b) = kill_confirm(KillKind::Session, &s, SqlDialect::Postgres, None);
         assert_eq!(a, b);
+    }
+
+    /// **The one case the confirm was describing as somebody else's client.**
+    ///
+    /// A Manual-transaction tab's pinned session is an ordinary row in the panel
+    /// — neither engine's activity query excludes it, only the *polling*
+    /// connection — and it is exactly the row most likely to be sitting there as
+    /// the idle-in-transaction holder blocking everything else. Wearing the same
+    /// `user@host` as every other row from the same connection, it read
+    /// "Disconnect app@10.0.0.1 on employees? … its client sees the connection
+    /// drop", and the user accepted a sentence about a stranger and lost their
+    /// own uncommitted work in another tab of the same window.
+    ///
+    /// `repair_killed_session` already scans for exactly this and its comment
+    /// opens "A killed session may be one of ours" — but it runs *after* the
+    /// kill.
+    #[test]
+    fn the_confirm_says_when_the_session_is_one_of_our_own_tabs() {
+        let s = sess(1148, SessionState::IdleInTx, 300.0);
+
+        let (_, ours) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql, Some("Query 3"));
+        assert!(ours.contains("Query 3"), "names the tab: {ours}");
+        assert!(
+            ours.contains("this window") || ours.contains("your own"),
+            "says it is ours: {ours}"
+        );
+        // The ordinary case is unchanged — a sentence about somebody else's
+        // client must not start hinting it might be yours.
+        let (_, theirs) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql, None);
+        assert!(!theirs.contains("Query 3"));
+        assert!(!theirs.contains("this window"), "{theirs}");
+
+        // A **cancel** of our own tab says so too: on PostgreSQL it leaves the
+        // transaction aborted, which costs the same uncommitted work.
+        let (_, ours) = kill_confirm(KillKind::Query, &s, SqlDialect::Postgres, Some("Query 3"));
+        assert!(ours.contains("Query 3"), "{ours}");
+    }
+
+    /// The refusal has to name the action on the control the user clicked.
+    /// *Cancel query* was answered with a sentence about terminating sessions —
+    /// a different action with materially different consequences.
+    #[test]
+    fn the_read_only_refusal_names_the_action_that_was_asked_for() {
+        let cancel = read_only_refusal(KillKind::Query);
+        assert!(cancel.contains("cancel"), "{cancel}");
+        assert!(!cancel.contains("terminate"), "{cancel}");
+        let kill = read_only_refusal(KillKind::Session);
+        assert!(kill.contains("terminate"), "{kill}");
+        // Both say what to do about it.
+        for m in [cancel, kill] {
+            assert!(m.contains("read-only"), "{m}");
+        }
     }
 
     #[test]
     fn kill_confirm_omits_a_database_the_session_has_none_of() {
         let mut s = sess(7, SessionState::Idle, 0.0);
         s.database = None;
-        let (_, body) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql);
+        let (_, body) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql, None);
         assert!(!body.contains(" on "), "{body}");
         s.database = Some(String::new());
-        let (_, body) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql);
+        let (_, body) = kill_confirm(KillKind::Session, &s, SqlDialect::MySql, None);
         assert!(
             !body.contains(" on "),
             "an empty name is not a database: {body}"
