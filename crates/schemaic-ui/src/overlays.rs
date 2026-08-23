@@ -408,12 +408,22 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                                     .items_center()
                                     .justify_center()
                             });
-                    // Truncate long names to 20 chars (+ ellipsis) so the row —
+                    // Truncate long names to 15 chars (+ ellipsis) so the row —
                     // and thus the fixed-width menu — never overflows past the
                     // panel edge; the endpoint stays fully visible on the right.
+                    //
+                    // **Both numbers here are one measurement**, so neither moves
+                    // alone: 15 chars against the 350px panel below. At 20 and
+                    // 300 a name that hit the limit still pushed `127.0.0.1:3306`
+                    // off the right edge — the truncation bounded the *name* and
+                    // nothing bounded the row, so the thing that fell off was the
+                    // endpoint, which is the half you cannot reconstruct from the
+                    // other. Five characters back and fifty pixels wider clears
+                    // the longest name the limit allows next to a full
+                    // `host:port`.
                     let name = c.name.clone();
-                    let name = if name.chars().count() > 20 {
-                        format!("{}…", name.chars().take(20).collect::<String>())
+                    let name = if name.chars().count() > 15 {
+                        format!("{}…", name.chars().take(15).collect::<String>())
                     } else {
                         name
                     };
@@ -471,7 +481,9 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
             .style(|s| {
                 panel_style(s)
                     .background(theme::bg_chrome())
-                    .min_width(300.0)
+                    // Paired with the 15-char name limit above — see the note
+                    // there. Neither number moves without the other.
+                    .min_width(350.0)
                     .padding_vert(6.0)
                     .margin_left(36.0)
                     // 3px below the switcher button (which sits ~HEADER_H-7 down).

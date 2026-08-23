@@ -560,12 +560,31 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                         |(name, color)| {
                             h_stack((
                                 conn_color_dot(color),
-                                text(name).style(|s| s.font_size(theme::FONT_BODY)),
+                                // **Ellipsis, not the pane's clip.** A name longer
+                                // than the list is wide used to run under the
+                                // divider and stop mid-glyph, which reads as a
+                                // rendering fault rather than as "there is more
+                                // name here". Three parts, and all three are
+                                // needed: `width_full` on the wrapper makes the
+                                // row's width definite (a label sizes to its own
+                                // content otherwise and simply overflows the box
+                                // meant to bound it), `min_width(0)` lets the
+                                // label shrink below that content width, and
+                                // `text_ellipsis` is what puts the "…" there.
+                                // The dot carries its own `flex_shrink(0)`, so
+                                // the name is the only thing that gives.
+                                text(name).style(|s| {
+                                    s.font_size(theme::FONT_BODY)
+                                        .text_ellipsis()
+                                        .flex_shrink(1.0_f32)
+                                        .min_width(0.0)
+                                }),
                             ))
-                            .style(|s| s.flex_row().items_center().gap(8.0))
+                            .style(|s| s.flex_row().items_center().gap(8.0).width_full())
                             .into_any()
                         },
-                    );
+                    )
+                    .style(|s| s.width_full().min_width(0.0));
                     container(label)
                         .on_click_stop(move |_| (select)(id))
                         // Right-click opens the row's own menu, and **selects on
