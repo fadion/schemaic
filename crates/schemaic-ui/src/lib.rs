@@ -2355,6 +2355,10 @@ pub struct LayoutUi {
     pub word_wrap: RwSignal<bool>,
     /// Max rows fetched per query (results-grid cap).
     pub row_limit: RwSignal<usize>,
+    /// Cancel a running statement after this many seconds; **`0` is off**, and
+    /// off is the default. Read once per run at the app boundary and handed to
+    /// the run's own cancellation token — see `persist::statement_timeout`.
+    pub statement_timeout: RwSignal<u64>,
     /// Confirm before running any write/DDL statement.
     pub confirm_writes: RwSignal<bool>,
     /// Reopen the previous session's query tabs on startup.

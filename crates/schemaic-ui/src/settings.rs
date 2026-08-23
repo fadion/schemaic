@@ -968,6 +968,26 @@ fn row_limit_label(n: usize) -> String {
     thousands(n)
 }
 
+/// The statement-timeout choices, in seconds. **`0` leads and means off**,
+/// which is the default and what every release before the setting did.
+///
+/// The shortest real option is a minute rather than a handful of seconds: this
+/// cancels the statement the user asked for, and an import, a report or a
+/// `CREATE INDEX` on a large table legitimately takes longer than a person's
+/// patience. A timeout tight enough to kill honest work is worse than none.
+const STATEMENT_TIMEOUTS: [u64; 6] = [0, 60, 300, 900, 1_800, 3_600];
+
+/// Label a statement timeout, **computed from the value** rather than looked up
+/// — the trap `row_limit_label`'s doc comment describes, and the reason none of
+/// these labels has a list to fall off the end of.
+///
+/// The wording itself lives in `core::persist` because the app's
+/// timed-out-statement message quotes the same value back, and two spellings of
+/// "15 minutes" is how the dropdown and the error come to disagree.
+fn statement_timeout_label(secs: u64) -> String {
+    schemaic_core::persist::statement_timeout_label(secs)
+}
+
 /// `1234567` → `"1,234,567"`. The row-limit dropdown's only formatting need, and
 /// the reason its label no longer has a list to fall off the end of.
 fn thousands(n: usize) -> String {
@@ -1040,6 +1060,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
     let editor_theme = ui.layout.editor_theme;
     let editor_font = ui.layout.editor_font;
     let row_limit = ui.layout.row_limit;
+    let statement_timeout = ui.layout.statement_timeout;
     let confirm_writes = ui.layout.confirm_writes;
     let live_validate = ui.layout.live_validate;
     let restore_tabs = ui.layout.restore_tabs;
@@ -1108,9 +1129,26 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 ring.clone(),
                 220,
             );
+            let timeout_dd = focusable_dropdown(
+                statement_timeout,
+                STATEMENT_TIMEOUTS,
+                statement_timeout_label,
+                ring.clone(),
+                230,
+            );
+            let timeout_section = v_stack((
+                settings_group_label("Statement timeout"),
+                timeout_dd,
+                form_hint(
+                    "Cancel a statement that runs longer than this. Off by default — \
+                     an import or a report can legitimately take a while.",
+                ),
+            ))
+            .style(ctrl);
             let query_group = v_stack((
                 settings_section_header("Query"),
                 row_section,
+                timeout_section,
                 confirm_row,
                 validate_row,
             ))
@@ -1245,8 +1283,8 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDITOR_FONT_SIZES, ROW_LIMITS, editor_font_label, log_hint, row_limit_label,
-        term_font_label, thousands,
+        EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, editor_font_label, log_hint,
+        row_limit_label, statement_timeout_label, term_font_label, thousands,
     };
     use crate::consts::TERM_FONT_SIZES;
 
@@ -1294,6 +1332,38 @@ mod tests {
                 row_limit_label(n).replace(',', "").parse::<usize>() == Ok(n),
                 "{n} labelled {}",
                 row_limit_label(n)
+            );
+        }
+        // Every timeout option reads distinctly, so no two rows of the dropdown
+        // are the same words — which is the failure mode a shared `_` arm has.
+        let labels: Vec<String> = STATEMENT_TIMEOUTS
+            .iter()
+            .map(|&s| statement_timeout_label(s))
+            .collect();
+        let mut seen = labels.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), labels.len(), "duplicate labels in {labels:?}");
+    }
+
+    /// The list leads with `0`, and `0` is what makes the feature opt-in. An
+    /// option list without it leaves a user who turned the timeout on with no
+    /// row that turns it back off.
+    #[test]
+    fn the_timeout_list_offers_turning_it_off() {
+        assert_eq!(STATEMENT_TIMEOUTS[0], 0);
+        assert_eq!(statement_timeout_label(0), "No timeout");
+    }
+
+    /// The dropdown's label is `core::persist`'s, deliberately: the message a
+    /// timed-out statement leaves in the results pane quotes the same words, so
+    /// a local reimplementation here is how the two come to disagree.
+    #[test]
+    fn the_timeout_label_is_the_shared_one() {
+        for &s in &STATEMENT_TIMEOUTS {
+            assert_eq!(
+                statement_timeout_label(s),
+                schemaic_core::persist::statement_timeout_label(s)
             );
         }
     }
