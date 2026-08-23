@@ -3485,7 +3485,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     hand-rolled `MakeWriter` over one `Arc<Mutex<File>>` rather than a dependency on
     `tracing-appender`: the whole requirement is "append to one file", and the rotation it needs is
     a startup size check rather than the time-based scheme that crate exists for. A poisoned lock
-    drops the line instead of panicking a second time from inside the logger.
+    drops the line instead of panicking a second time from inside the logger. **A panic went the
+    same way, for the same reason, and worse:** Rust's default hook writes the payload to *stderr*,
+    which on a GUI-subsystem release build is the same console that does not exist — so the one
+    failure class that kills the process left no trace of itself at all. `install_panic_hook()`,
+    called from `main` immediately after `init()` (before it, the report would be formatted and
+    handed to a subscriber that does not exist yet), routes the payload, thread name, source
+    location and a **forced** backtrace through `tracing::error!` and so into the same file.
+    `Backtrace::force_capture`, not `capture`: the latter is governed by `RUST_BACKTRACE`, which
+    nobody has set on the machine that just crashed a GUI app, and the cost only lands on a process
+    that is already dying. The hook **chains** the one it replaced rather than replacing it
+    outright, so a debug build (and a terminal launch on Linux) keeps its stderr message — this
+    adds a destination, it does not take one away. `panic_report` and `payload_text` are split out
+    as pure functions because the hook itself is process-global and cannot be driven from a test
+    that is not itself panicking; `payload_text` downcasts to both `&str` and `String` because
+    `panic!("{x}")` boxes the latter and a `&str`-only downcast would lose most panics.
+    `an_installed_hook_writes_the_panic_through_tracing` guards the *seam* rather than the pieces —
+    a thread-local subscriber over a capture buffer, a real `catch_unwind` panic — since a
+    well-formed `panic_report` proves nothing if the hook never reaches a subscriber.
   - `update.rs` — the Velopack half of `core::update`: a background check at startup and every three
     hours after (`RECHECK_INTERVAL`), and the "Restart to update" action `start` hands back for the
     header chip. **Velopack's API is synchronous and does network + file I/O**, so every call into it
