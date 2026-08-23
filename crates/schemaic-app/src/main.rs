@@ -6000,11 +6000,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let load_schema = load_schema.clone();
         let tunnels = tunnels.clone();
         let reset_activity = reset_activity.clone();
+        let drop_session = drop_session.clone();
+        let ai_session = ai_session.clone();
         Rc::new(move || {
             let id = draft
                 .id
                 .get_untracked()
                 .unwrap_or_else(|| connections.with_untracked(|cs| Connection::next_id(cs)));
+            // The entry as it stood *before* this save, so the edit can be asked
+            // what it moved. `None` for a connection being created, where there is
+            // nothing yet to invalidate.
+            let previous = connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned());
             let conn = draft.to_connection(id);
             connections.update(|cs| {
                 if let Some(existing) = cs.iter_mut().find(|c| c.id == id) {
@@ -6015,10 +6021,69 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
             draft.id.set(Some(id));
             persist_conns(Some(active_conn.get_untracked()));
-            // The edit may have changed the host / SSH settings, so any cached
-            // tunnel for this connection is stale — drop it (its listener is torn
-            // down) so `load_schema` re-establishes a fresh one (review H9).
-            tunnels.borrow_mut().remove(&id);
+            // **Did this edit move the connection to a different server?** Asked
+            // through `targets_same_server`, the predicate that already answers it
+            // for the schema tree, rather than a second reading of the same
+            // fields. Everything below is invalid exactly when the answer is yes.
+            //
+            // It used to be asked of nothing at all: the tunnel was dropped on
+            // *every* save (review H9, "the edit may have changed the host / SSH
+            // settings"). True of an edit that moved something, and quietly
+            // destructive of one that didn't — tearing the listener down takes the
+            // forwarded connections with it, so changing a connection's **colour**
+            // killed the socket under a pinned Manual transaction and rolled back
+            // uncommitted work, while the tab went on offering Commit and
+            // Rollback. Unconditional was the cheap answer in the wrong place:
+            // cheap is right for throwing a *snapshot* away, and wrong for
+            // throwing a *transaction* away.
+            let repointed = previous
+                .as_ref()
+                .is_some_and(|p| !p.targets_same_server(&conn));
+            if repointed {
+                // The cached tunnel reaches the old server — drop it (its listener
+                // is torn down) so `load_schema` establishes a fresh one.
+                tunnels.borrow_mut().remove(&id);
+                // Every pinned Manual session on this connection is now either on
+                // a dead socket or on a server the user has left, and its
+                // transaction is gone either way. This is `delete_conn_now`'s
+                // treatment, for the same reason and with the same absence of a
+                // prompt: the server rolls back on disconnect, and the tab
+                // dropping to Auto-commit is what stops its footer claiming a
+                // transaction that no longer exists. **Not**
+                // `repair_killed_session`'s reopen — that one puts the tab back on
+                // a server that is still there, whereas here the tunnel has just
+                // gone and `open_session` would fail on the spot, flip the tab to
+                // Auto anyway and raise an error modal on top.
+                let orphaned: Vec<usize> = tabs.with_untracked(|v| {
+                    v.iter()
+                        .filter(|t| t.conn_id.get_untracked() == id)
+                        .map(|t| {
+                            t.tx_mode.set(TxMode::Auto);
+                            t.tx.set(TxState::closed());
+                            t.id
+                        })
+                        .collect()
+                });
+                for tab_id in orphaned {
+                    (drop_session)(tab_id);
+                }
+                // And the AI session, whose MCP subprocess holds a `Db` built at
+                // spawn from the old target and the old tunnel port. `needs_respawn`
+                // cannot see this: it compares the conn id, which did not move, and
+                // the `AiSettings`, none of which name a host. Left alone, the
+                // assistant's tools went on reading the previous server while the
+                // whole UI said otherwise — or, tunnelled, reached a local port
+                // that no longer answers. Dropping it costs nothing: `ai_send`
+                // replays the conversation into the prompt of the session it
+                // spawns next.
+                let ours = ai_session
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.conn_id == id);
+                if ours {
+                    ai_session.borrow_mut().take();
+                }
+            }
             if active_conn.get_untracked() == id {
                 // Same reasoning as the tunnel above, for the other thing that
                 // was taken against wherever this connection pointed *before* the
@@ -6026,12 +6091,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // effect that clears it cannot see an in-place edit, because the
                 // id it keys on doesn't move.
                 //
-                // **After `load_schema`, not before.** `load_schema` is what
-                // re-opens the tunnel this function just dropped, and the reset
-                // wants to refetch. Ordered the other way the refetch is not
-                // merely at risk of finding no tunnel — it is *guaranteed* to,
-                // because the removal is two lines up and the re-open has not
-                // been asked for yet.
+                // **After `load_schema`, not before.** When the edit repointed the
+                // connection, `load_schema` is what re-opens the tunnel dropped
+                // above, and the reset wants to refetch. Ordered the other way the
+                // refetch is not merely at risk of finding no tunnel — it is
+                // *guaranteed* to, the removal being a few lines up with the
+                // re-open not yet asked for. Unconditional, unlike the block
+                // above: a rename moves no server but the snapshot is cheap, and
+                // `reset_activity` skips its own refetch when nothing is
+                // reachable.
                 load_schema(conn);
                 (reset_activity)();
             }
@@ -6052,6 +6120,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let save_formats = save_formats.clone();
         let save_ui = save_ui.clone();
         let reset_activity = reset_activity.clone();
+        let ai_session = ai_session.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -6084,6 +6153,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 "chats.json",
                 &schemaic_core::chat::ChatFile::of(&saved_chats.get_untracked()),
             );
+            // The **live** session too, which the line above does not touch: it
+            // clears the transcript on disk while a `claude` child goes on holding
+            // an MCP endpoint aimed at the server just deleted. `needs_respawn`
+            // usually covers this by the side door, since deleting the active
+            // connection moves `active_conn` and a different id always respawns —
+            // but not when the id is *recycled*. `next_id` is `max + 1`, so
+            // deleting the highest-numbered connection frees its id for the next
+            // one created; that connection becomes active under the same id, and
+            // with the settings unchanged nothing asks for a respawn. The
+            // assistant would answer about the deleted connection's server from a
+            // new connection's panel.
+            let ours = ai_session
+                .borrow()
+                .as_ref()
+                .is_some_and(|s| s.conn_id == id);
+            if ours {
+                ai_session.borrow_mut().take();
+            }
             connections.update(|cs| cs.retain(|c| c.id != id));
             let fallback = connections.with_untracked(|cs| cs.first().map(|c| c.id));
             let new_active = if was_active {
