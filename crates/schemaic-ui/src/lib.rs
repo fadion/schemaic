@@ -662,6 +662,18 @@ pub struct DdlUi {
     /// what was written — after a `DROP` that committed on its own. So Preview
     /// waits for it, and the footer says why.
     pub routine_source_pending: RwSignal<bool>,
+    /// The `SHOW CREATE` landed, it **did** correct the body, and the draft had
+    /// already moved — so what the draft rests on is still the escape-resolved
+    /// copy and applying it recreates the routine from text the server will
+    /// refuse, after a `DROP` that has committed.
+    ///
+    /// The third outcome of the same reply `routine_source_pending` waits for
+    /// ([`schemaic_core::ddl::SourceOutcome`]); waiting is what closes the
+    /// window for the *untouched* draft, and this is what closes it for the one
+    /// the user had already typed into. Preview refuses while it is set, and the
+    /// footer says why — a refusal is enough here, a three-way merge is not
+    /// needed.
+    pub routine_body_stale: RwSignal<bool>,
     /// The object editor's target; doubles as its open flag.
     pub object: RwSignal<Option<ObjectTarget>>,
     /// The enum / domain / sequence being edited. Same rule as `draft`: one

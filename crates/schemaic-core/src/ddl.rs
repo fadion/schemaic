@@ -1272,6 +1272,107 @@ impl RoutineDraft {
         }
         out
     }
+
+    /// Would applying this draft land on a routine that is already there?
+    ///
+    /// **On MySQL a rename is a `DROP` and a `CREATE`**, because the engine has
+    /// no verb for one ([`supports_routine_rename`]) — so renaming `p1` onto an
+    /// existing `p2` emits ``DROP PROCEDURE IF EXISTS `p1`;`` and then
+    /// ``CREATE PROCEDURE `p2```, the drop commits, the create answers 1304
+    /// *PROCEDURE p2 already exists*, and `p1` is gone while `p2` is untouched.
+    /// Reproduced live on MariaDB 10.11.14: `p1,p2` before, `p2` after.
+    ///
+    /// Only where the engine does **not** overload
+    /// ([`overloads_routines`]): on PostgreSQL a name already in the list is
+    /// `f(int)` beside the `f(text)` being written, which is two functions and
+    /// not a clash — and a rename there is its own `ALTER … RENAME TO`, which
+    /// fails without destroying anything.
+    ///
+    /// `taken` is every routine name of this kind in this namespace, the
+    /// server's spelling. Case-insensitively compared and case-insensitively
+    /// self-excluding, because MySQL's routine names are.
+    pub fn name_clash(
+        &self,
+        current: Option<&RoutineInfo>,
+        taken: &[String],
+        dialect: SqlDialect,
+    ) -> Option<String> {
+        if overloads_routines(dialect) {
+            return None;
+        }
+        let want = self.info.name.trim();
+        if want.is_empty() {
+            return None;
+        }
+        // Editing a routine without renaming it is not landing on anything.
+        if current.is_some_and(|c| c.name.eq_ignore_ascii_case(want)) {
+            return None;
+        }
+        taken
+            .iter()
+            .any(|t| t.trim().eq_ignore_ascii_case(want))
+            .then(|| {
+                format!(
+                    "A {} called {want} is already here. On this engine a rename is a \
+                     drop and a create, so applying this would destroy {} and leave \
+                     {want} as it was.",
+                    self.info.kind.label(),
+                    current.map_or("the original", |c| c.name.as_str()),
+                )
+            })
+    }
+}
+
+/// What the lazy `SHOW CREATE` reply means for the draft the user is editing.
+///
+/// See [`routine_source_outcome`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceOutcome {
+    /// Nothing to correct: the read came back empty, or the catalogue's copy was
+    /// already the routine as written.
+    Unchanged,
+    /// The draft was still the body the editor opened with, so the true source
+    /// replaces it — in the draft *and* on screen.
+    Adopted,
+    /// The user had already typed, so the draft still rests on the body
+    /// `information_schema` resolved the escapes out of. **That text is not the
+    /// routine, and on MySQL it is usually not even valid SQL** — recreating
+    /// from it fails after the `DROP` has committed and takes the only faithful
+    /// copy with it.
+    Stale,
+}
+
+/// Decide what a landed [`crate::schema::RoutineSource`] does to the draft.
+///
+/// **The composition, not the pieces.** The editor used to spell this inline as
+/// a single `untouched` boolean and act on it in three places; the case it had
+/// no name for is the third one below, where the guard that protects the body
+/// from being overwritten is exactly what leaves the draft resting on a body the
+/// server will refuse. `RoutineSource`'s own doc names the outcome — *"a routine
+/// holding `'it''s'` comes back as `'it's'` — a syntax error on restate, after
+/// the `DROP` this engine's every edit begins with has committed and taken the
+/// only copy with it"* — and nothing computed it.
+///
+/// Live on MySQL 8.4.11, a function returning `'it''s'`:
+/// `information_schema.ROUTINES` gives `RETURN 'it's'` and `SHOW CREATE` gives
+/// the true text. (MariaDB 10.11 is faithful in both, so this is MySQL 8's
+/// alone.)
+pub fn routine_source_outcome(
+    opened_with: &str,
+    fetched: Option<&str>,
+    draft_body: &str,
+) -> SourceOutcome {
+    let Some(fetched) = fetched else {
+        return SourceOutcome::Unchanged;
+    };
+    if fetched == opened_with {
+        return SourceOutcome::Unchanged;
+    }
+    if draft_body == opened_with {
+        SourceOutcome::Adopted
+    } else {
+        SourceOutcome::Stale
+    }
 }
 
 // ── The desired state of a standalone object ─────────────────────────────────
@@ -5473,6 +5574,28 @@ pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
 /// performs — which is why [`diff_routine`] treats a bare rename there as a
 /// redefinition, exactly as [`diff_view`] does on SQLite.
 pub fn supports_routine_rename(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Can two routines in one namespace share a name, differing only in their
+/// parameters?
+///
+/// The question a name-collision check has to ask before it refuses anything.
+/// PostgreSQL overloads, so `f(int)` and `f(text)` are two functions and a name
+/// already in the list says nothing; MySQL identifies a routine by its bare
+/// name, so the same list *is* the answer — and there a rename is folded into
+/// the recreate, which means landing on a taken name costs the original.
+///
+/// The same fact [`crate::schema::RoutineInfo::signature_sql`] encodes for the
+/// emitter, asked as a capability so a caller doesn't have to read the emitter
+/// to learn it.
+///
+/// An exhaustive `match` rather than a `== Postgres`, so a fourth engine has to
+/// answer rather than inheriting whichever side it falls on.
+pub fn overloads_routines(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
         SqlDialect::MySql | SqlDialect::Sqlite => false,
@@ -10219,6 +10342,96 @@ mod tests {
                 at("SET SESSION sql_mode = @schemaic_sql_mode"),
                 sql.len() - 1,
                 "{sql:?}"
+            );
+        }
+
+        /// **Renaming a MySQL routine onto an existing name destroys the
+        /// original**, because a rename there is folded into the recreate:
+        /// `DROP p1` commits, `CREATE p2` answers 1304, `p1` is gone and `p2` is
+        /// untouched. Reproduced live on MariaDB 10.11.14 — `p1,p2` before,
+        /// `p2` after. Nothing between the editor and `run_ddl` looked.
+        #[test]
+        fn renaming_a_mysql_routine_onto_a_taken_name_is_refused() {
+            let mut cur = fnc();
+            cur.name = "p1".into();
+            cur.schema = None;
+            cur.kind = RoutineKind::Procedure;
+            cur.returns = String::new();
+            let taken = ["p1".to_string(), "p2".to_string()];
+
+            let mut onto_other = RoutineDraft::from_info(&cur);
+            onto_other.info.name = "p2".into();
+            let clash = onto_other
+                .name_clash(Some(&cur), &taken, MySql)
+                .expect("p2 is taken");
+            assert!(clash.contains("p2"), "{clash}");
+            assert!(clash.contains("p1"), "names what is destroyed: {clash}");
+
+            // Editing without renaming lands on itself, which is not a clash…
+            let same = RoutineDraft::from_info(&cur);
+            assert_eq!(same.name_clash(Some(&cur), &taken, MySql), None);
+            // …and neither is a case-different spelling of its own name.
+            let mut cased = RoutineDraft::from_info(&cur);
+            cased.info.name = "P1".into();
+            assert_eq!(cased.name_clash(Some(&cur), &taken, MySql), None);
+            // A *new* routine onto an existing name is a clash, case-blind.
+            let mut fresh = RoutineDraft::from_info(&cur);
+            fresh.info.name = "P2".into();
+            assert!(fresh.name_clash(None, &taken, MySql).is_some());
+            // An untaken name is fine, and so is an empty one — `validate` owns
+            // that message and two for one input is noise.
+            let mut free = RoutineDraft::from_info(&cur);
+            free.info.name = "p3".into();
+            assert_eq!(free.name_clash(Some(&cur), &taken, MySql), None);
+            free.info.name = "  ".into();
+            assert_eq!(free.name_clash(Some(&cur), &taken, MySql), None);
+
+            // **PostgreSQL overloads**, so a name in the list is another
+            // signature and not a collision — and a rename there is its own
+            // statement, which fails without destroying anything.
+            assert_eq!(onto_other.name_clash(Some(&cur), &taken, Postgres), None);
+        }
+
+        /// **The `SHOW CREATE` reply has three outcomes and the editor named
+        /// two.** The third is the one that destroys a routine: the user typed
+        /// before the reply landed, so the body guard skipped the correction and
+        /// the draft still rests on `information_schema`'s escape-resolved copy
+        /// — which is not the routine, and on MySQL 8 is not valid SQL.
+        ///
+        /// Live on MySQL 8.4.11: a function returning `'it''s'` reads back from
+        /// the catalogue as `RETURN 'it's'`.
+        #[test]
+        fn a_keystroke_before_the_source_lands_leaves_the_draft_stale() {
+            let resolved = "BEGIN RETURN 'it's'; END";
+            let written = "BEGIN RETURN 'it''s'; END";
+
+            // Nobody typed: the true source is adopted.
+            assert_eq!(
+                routine_source_outcome(resolved, Some(written), resolved),
+                SourceOutcome::Adopted
+            );
+            // Somebody typed first: the draft is built on a body the server will
+            // refuse, and the `DROP` commits before it finds out.
+            assert_eq!(
+                routine_source_outcome(resolved, Some(&format!("{resolved} -- x")), resolved),
+                SourceOutcome::Adopted,
+                "a fetch that only differs from what we opened with still lands"
+            );
+            assert_eq!(
+                routine_source_outcome(resolved, Some(written), &format!("{resolved} -- x")),
+                SourceOutcome::Stale
+            );
+            // Nothing to correct — the catalogue was already right (every
+            // MariaDB routine, and every MySQL one with no escapes in it).
+            assert_eq!(
+                routine_source_outcome(written, Some(written), &format!("{written} -- x")),
+                SourceOutcome::Unchanged
+            );
+            // …and a read that came back empty leaves the draft alone rather
+            // than blanking it.
+            assert_eq!(
+                routine_source_outcome(resolved, None, resolved),
+                SourceOutcome::Unchanged
             );
         }
 
