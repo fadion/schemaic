@@ -52,8 +52,9 @@ production data, or any data you care about.
   many statements are in it. MySQL/MariaDB and PostgreSQL; on SQLite the control
   isn't shown, because there is no manual mode there yet.
 - **Schema editing** — a visual table designer (columns, indexes, foreign keys,
-  CHECK constraints) plus editors for views, triggers, and PostgreSQL functions,
-  types, domains and sequences. Every change is shown as the SQL it will run,
+  CHECK constraints) plus editors for views and triggers, for stored functions
+  and procedures on MySQL/MariaDB and PostgreSQL, and for PostgreSQL types,
+  domains and sequences. Every change is shown as the SQL it will run,
   with anything destructive spelled out in plain language, before it runs. Tables,
   views and triggers on all three engines — including SQLite, where a column
   change is a table rebuild and the app generates, verifies and runs the whole
