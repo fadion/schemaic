@@ -1302,50 +1302,30 @@ fn nav_target(
     }
 }
 
-/// The clipboard text for one cell of a pending new row: the staged value, the
-/// literal `NULL` for a staged SQL NULL (matching how the cell renders it), and
-/// empty for a cell still unset — that one has no value yet, only the server
-/// default the cell previews as `<auto>`/`<default>`.
-fn pending_cell_text(row: Option<&HashMap<usize, Option<String>>>, ci: usize) -> &str {
-    match row.and_then(|r| r.get(&ci)) {
-        Some(Some(t)) => t,
-        Some(None) => "NULL",
-        None => "",
-    }
-}
-
-/// The text one cell **shows**, resolving the three sources in the order the
-/// painter resolves them: a staged edit, then a pending new row's value, then
-/// the stored cell.
+/// The grid's cell values, read out of the signals once, for the surfaces that
+/// resolve a cell in [`schemaic_core::edit::GridCells`] rather than paint it.
 ///
-/// **One function, because three surfaces have to agree.** The painted cell, the
-/// clipboard and an AI attachment are all answering "what is in this cell", and
-/// they read it out of the same grid — so a fourth spelling of the resolution is
-/// a fourth chance to disagree. `attached_rows` had one: it read `rs.cell` and
-/// never `gs.dirty`, so a green, uncommitted edit was on screen while the
-/// **pre-edit** value went to the model, and the `sent_attachment` card the user
-/// opens to check what they sent agreed with the wrong copy.
+/// Everything here is an `Arc` clone or a small map clone, and both callers are
+/// one-shot user gestures (Ctrl+C, Attach to chat) — never a frame.
 ///
-/// `i` is a **display** row and `di` its data row; the caller has already
-/// resolved the mapping (it differs by sort) and knows the pending boundary.
-fn displayed_cell_text(
-    gs: GridState,
-    rs: &ResultSet,
-    di: usize,
-    ci: usize,
-    pending: Option<Option<&HashMap<usize, Option<String>>>>,
-) -> String {
-    if let Some(row) = pending {
-        return pending_cell_text(row, ci).to_string();
-    }
-    match gs.dirty.with_untracked(|d| d.get(&(di, ci)).cloned()) {
-        Some(Some(t)) => t,
-        // A staged SQL NULL, spelled the way the cell paints it.
-        Some(None) => "NULL".to_string(),
-        None => rs
-            .cell(di, ci)
-            .map(|c| c.display().to_string())
-            .unwrap_or_default(),
+/// The rule itself lives in core because it kept going out one source short in
+/// the view: first without `gs.dirty`, so an uncommitted edit was on screen
+/// while the pre-edit value went to the model, and then without the column's
+/// formatter, so a `Timestamp` column sent the epoch integer the cell does not
+/// show. Nothing in `schemaic-ui` can construct a `GridState` to test either.
+fn grid_cells<'a>(
+    rs: &'a ResultSet,
+    order: &'a [usize],
+    formats: &'a [ColumnFormat],
+    dirty: &'a HashMap<(usize, usize), Option<String>>,
+    new_rows: &'a [HashMap<usize, Option<String>>],
+) -> schemaic_core::edit::GridCells<'a> {
+    schemaic_core::edit::GridCells {
+        rs,
+        order,
+        formats,
+        dirty,
+        new_rows,
     }
 }
 
@@ -1463,31 +1443,14 @@ fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
 
 /// Copy the current selection to the clipboard as TSV (a lone cell → raw value).
 fn copy_selection(gs: GridState) {
-    let Some((r0, c0, r1, c1)) = gs.bounds_untracked() else {
+    let Some(rect) = gs.bounds_untracked() else {
         return;
     };
-    let rs = gs.rs.get_untracked();
-    let order = gs.order.get_untracked();
-    // Display rows past the real ones are the pending new rows, whose values live
-    // in `new_rows` — resolving them through `order` would fall back to the display
-    // index and copy a row of blanks.
-    let nreal = rs.row_count();
-    let new_rows = gs.new_rows.get_untracked();
-    let mut out = String::new();
-    for i in r0..=r1 {
-        if i > r0 {
-            out.push('\n');
-        }
-        let pending = (i >= nreal).then(|| new_rows.get(i - nreal));
-        let di = order.get(i).copied().unwrap_or(i);
-        for ci in c0..=c1 {
-            if ci > c0 {
-                out.push('\t');
-            }
-            out.push_str(&displayed_cell_text(gs, &rs, di, ci, pending));
-        }
-    }
-    let _ = floem::Clipboard::set_contents(out);
+    let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let formats = gs.formats.get_untracked();
+    let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
+    let _ = floem::Clipboard::set_contents(cells.tsv(rect));
 }
 
 /// Rows of the grid as the user sees them — display order, staged edits and
@@ -1500,37 +1463,13 @@ fn copy_selection(gs: GridState) {
 /// though it were the grid.
 fn attached_rows(
     gs: GridState,
-    (r0, c0, r1, c1): (usize, usize, usize, usize),
+    rect: (usize, usize, usize, usize),
 ) -> (Vec<String>, Vec<Vec<String>>, usize) {
-    let rs = gs.rs.get_untracked();
-    let order = gs.order.get_untracked();
-    let nreal = rs.row_count();
-    let new_rows = gs.new_rows.get_untracked();
-    let columns: Vec<String> = (c0..=c1)
-        .map(|ci| {
-            rs.columns
-                .get(ci)
-                .map(|c| c.name.clone())
-                .unwrap_or_default()
-        })
-        .collect();
-    // Two figures, and the header says the second: the cap is about the context
-    // window, not about consent, so going over it is *reported*.
-    let (send, total) =
-        schemaic_core::edit::attach_span(r0, r1, schemaic_core::prompt::ATTACH_ROW_CAP);
-    let rows: Vec<Vec<String>> = (r0..=r1)
-        .take(send)
-        .map(|i| {
-            // Display rows past the real ones are pending new rows, whose values
-            // live in `new_rows` — see `copy_selection`.
-            let pending = (i >= nreal).then(|| new_rows.get(i - nreal));
-            let di = order.get(i).copied().unwrap_or(i);
-            (c0..=c1)
-                .map(|ci| displayed_cell_text(gs, &rs, di, ci, pending))
-                .collect()
-        })
-        .collect();
-    (columns, rows, total)
+    let (rs, order) = (gs.rs.get_untracked(), gs.order.get_untracked());
+    let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
+    let formats = gs.formats.get_untracked();
+    let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
+    cells.attached(rect, schemaic_core::prompt::ATTACH_ROW_CAP)
 }
 
 /// How much of **this result's** connection the assistant may see.
@@ -6891,7 +6830,7 @@ fn data_cell(
                     .with_untracked(|rows| rows.get(p).and_then(|r| r.get(&ci).cloned())),
                 None => gs.dirty.with_untracked(|d| d.get(&dkey).cloned()),
             };
-            // The painter's own three-way resolution; `displayed_cell_text` is
+            // The painter's own three-way resolution; `edit::GridCells::text` is
             // the same rule for the clipboard and the AI attachment, which read
             // the grid rather than paint it.
             let val = match staged_here_val {
@@ -7644,19 +7583,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pending_cell_text_reads_staged_values() {
-        let mut row: HashMap<usize, Option<String>> = HashMap::new();
-        row.insert(0, Some("hello".to_string()));
-        row.insert(1, None);
-        // Staged text, staged SQL NULL (rendered as the cell does), and an unset
-        // cell — which has no value yet, only the server default.
-        assert_eq!(pending_cell_text(Some(&row), 0), "hello");
-        assert_eq!(pending_cell_text(Some(&row), 1), "NULL");
-        assert_eq!(pending_cell_text(Some(&row), 2), "");
-        // A pending row that no longer exists copies blank rather than panicking.
-        assert_eq!(pending_cell_text(None, 0), "");
-    }
+    // `pending_cell_text_reads_staged_values` moved with the rule it pinned:
+    // `core::edit::tests::a_pending_new_row_reads_only_what_was_typed`.
 
     #[test]
     fn compute_order_none_is_identity() {
