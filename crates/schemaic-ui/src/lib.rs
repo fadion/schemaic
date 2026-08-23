@@ -2633,6 +2633,15 @@ pub struct Ui {
     /// [`UpdateState::is_actionable`] holds — the header chip is inert otherwise
     /// — because Velopack exits the process to hand over to the updater.
     pub apply_update: Rc<dyn Fn()>,
+    /// Reveal the app's config directory in the OS file manager — the folder
+    /// holding `schemaic.log` alongside `tabs.json` and the rest of the state.
+    ///
+    /// The log is written and rotated and, until this existed, **finding it was
+    /// the user's problem**: the one artefact a crash report needs lived at a
+    /// path nothing in the app ever said out loud. Spawning a file manager is a
+    /// process launch, which is the app boundary's job and not a view's — hence
+    /// a callback rather than a `Command` in `settings.rs`.
+    pub open_config_dir: Rc<dyn Fn()>,
 }
 
 /// Which panel occupies the right column. AI and Terminal are mutually

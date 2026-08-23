@@ -7846,6 +7846,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         resources,
         update_state,
         apply_update,
+        open_config_dir: Rc::new(open_config_dir),
     };
     // Every config file has been loaded by now. If any of them was unreadable it
     // was preserved as `.corrupt` and recovered from the backup or defaults —
@@ -8213,6 +8214,35 @@ fn start_resource_monitor(sample: RwSignal<schemaic_core::resource::ResourceSamp
             f();
         }
     });
+}
+
+/// Reveal the app's config directory — `schemaic.log` and the rest of the state
+/// — in the OS file manager.
+///
+/// Best-effort and silent on failure, the same contract [`open_url`] has: the
+/// worst case is a button that appears to do nothing, and the Settings row still
+/// shows the path in text for the user to copy. `create_dir_all` first because
+/// the directory is created lazily by the first save, and a fresh install that
+/// has written nothing yet would otherwise open a file manager on a path that
+/// does not exist.
+fn open_config_dir() {
+    let Some(dir) = schemaic_core::persist::config_dir() else {
+        tracing::warn!("no config directory to open");
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&dir).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    }
 }
 
 /// Open an http(s) URL in the OS default browser (clicked terminal link).
