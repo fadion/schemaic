@@ -31,7 +31,7 @@ use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
     ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep,
-    one_row_verdict,
+    binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, RoutineInfo, TableInfo,
@@ -2980,18 +2980,12 @@ fn map_column(c: &MyColumn) -> Column {
 /// "binary charset"? Numeric / temporal columns also report charset 63, so this
 /// keys off the resolved type name. Such values can't round-trip through the
 /// text protocol losslessly, so the editing system treats them as read-only.
+///
+/// The list itself lives in `core::model::type_is_binary`, which is the same
+/// question the export path asks of a column with no wire provenance to consult
+/// — a second copy here is how the two would come to disagree.
 fn is_binary_data_type(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "VARBINARY"
-            | "BINARY"
-            | "TINYBLOB"
-            | "BLOB"
-            | "MEDIUMBLOB"
-            | "LONGBLOB"
-            | "BIT"
-            | "GEOMETRY"
-    )
+    schemaic_core::model::type_is_binary(type_name)
 }
 
 /// Build a column's [`ColumnOrigin`] from its wire provenance, or `None` when
@@ -3125,10 +3119,21 @@ fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
 /// non-NULL value arrives as `Bytes` (its textual form), so we parse it with the
 /// column's type exactly as the old code did; the typed arms cover the binary
 /// protocol defensively.
+///
+/// **A raw-bytes column is the exception, and it used to be a data bug.** A
+/// BLOB/BINARY/BIT value arrives as its literal bytes, and
+/// `from_utf8_lossy`-ing those produced mojibake that *looks like data* — so a
+/// CSV or `INSERT` export wrote the replacement characters as the value and
+/// re-imported as the wrong bytes. It renders as `binary_display` now, the same
+/// `<n bytes>` SQLite and PostgreSQL show, which says what it is and cannot be
+/// mistaken for the value.
 fn convert_row(row: &Row, columns: &[Column]) -> Vec<Value> {
     (0..columns.len())
         .map(|i| match row.as_ref(i) {
             None | Some(MyValue::NULL) => Value::Null,
+            Some(MyValue::Bytes(b)) if columns[i].is_binary() => {
+                Value::Str(binary_display(b.len()))
+            }
             Some(MyValue::Bytes(b)) => parse_typed(
                 String::from_utf8_lossy(b).into_owned(),
                 &columns[i].type_name,

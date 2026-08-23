@@ -623,6 +623,33 @@ pub fn qualified_table(
     }
 }
 
+/// Columns whose exported cells stand in for bytes this result never carried.
+///
+/// A raw-bytes cell renders as [`crate::model::binary_display`]'s `<n bytes>`,
+/// because a `Value` has no bytes variant to hold the real thing — so writing
+/// that text into an `INSERT` produces a script that *silently stores the
+/// placeholder* as the column's data on re-import. This is the pre-pass that
+/// finds it, and it deliberately requires **both** signals to agree: the
+/// column's type says bytes, and the cell's text is one this codebase
+/// generated. Either alone is wrong in a way that loses data — a SQLite `BLOB`
+/// column is only an affinity and may hold ordinary text, and a user's prose
+/// can spell `<12 bytes>` without being a blob.
+/// Returns column *indices*, not names: two result columns can share a name
+/// (`SELECT a.data, b.data`) and only one of them may be the blob.
+fn dropped_binary_columns(rs: &ResultSet, order: &[usize]) -> Vec<usize> {
+    (0..rs.columns.len())
+        .filter(|&ci| {
+            rs.columns[ci].is_binary()
+                && order.iter().any(|&di| {
+                    di < rs.row_count()
+                        && rs
+                            .cell(di, ci)
+                            .is_some_and(|c| crate::model::is_binary_display(c.text()))
+                })
+        })
+        .collect()
+}
+
 /// [`export_inserts`], streamed. One statement per row and no batching, so a row
 /// carries no state into the next — the table and column lists are computed once
 /// and repeated verbatim.
@@ -644,6 +671,22 @@ pub fn export_inserts_to<W: Write>(
         .map(|c| q(&c.name))
         .collect::<Vec<_>>()
         .join(", ");
+    // A comment, not a refusal: the script still runs, and the one thing it
+    // must not do is pretend the placeholder was the data. Emitted only when a
+    // cell was actually dropped, so an export with nothing to say says nothing.
+    let dropped = dropped_binary_columns(rs, order);
+    if !dropped.is_empty() {
+        writeln!(
+            w,
+            "-- NOTE: binary column{} {} exported as NULL — a text export cannot carry raw bytes.",
+            if dropped.len() == 1 { "" } else { "s" },
+            dropped
+                .iter()
+                .map(|&ci| q(&rs.columns[ci].name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+    }
     for &di in order {
         if di >= rs.row_count() {
             continue;
@@ -655,7 +698,13 @@ pub fn export_inserts_to<W: Write>(
             }
             let lit = rs
                 .cell(di, ci)
-                .map(|c| sql_literal(&c.to_value(), dialect))
+                .map(|c| {
+                    if dropped.contains(&ci) && crate::model::is_binary_display(c.text()) {
+                        "NULL".to_string()
+                    } else {
+                        sql_literal(&c.to_value(), dialect)
+                    }
+                })
                 .unwrap_or_else(|| "NULL".to_string());
             w.write_all(lit.as_bytes())?;
         }
@@ -1078,6 +1127,75 @@ mod tests {
         let ph = export_inserts(&rs(), &[0], None, Postgres);
         assert!(ph.contains("INSERT INTO \"table\" ("), "{ph}");
         assert!(!ph.contains("`table`"), "{ph}");
+    }
+
+    /// A BLOB has no text form, so the grid shows `<n bytes>` — and an INSERT
+    /// export that copies that placeholder through as a string literal produces
+    /// a script which *silently writes the wrong bytes* into the column on
+    /// re-import. `NULL` is wrong too, but visibly so, and the header comment
+    /// says which columns it happened to.
+    #[test]
+    fn inserts_never_write_a_binary_placeholder_as_the_data() {
+        let mut blob = col("thumb");
+        blob.type_name = "BLOB".to_string();
+        let rs = ResultSet::from_rows(
+            vec![col("id"), blob],
+            vec![vec![
+                Value::Int(1),
+                Value::Str(crate::model::binary_display(4096)),
+            ]],
+        );
+        let out = export_inserts(&rs, &[0], Some(("shop", None, "img")), MySql);
+        assert!(
+            !out.contains("4096 bytes"),
+            "placeholder exported as data: {out}"
+        );
+        assert!(out.contains("(1, NULL)"), "{out}");
+        assert!(
+            out.contains("thumb"),
+            "the note should name the column: {out}"
+        );
+    }
+
+    /// The note is a *comment*, so a script with a nulled BLOB still runs. And
+    /// it must not appear for a result with no binary column at all — a note on
+    /// every export is a note nobody reads.
+    #[test]
+    fn the_binary_note_is_a_comment_and_only_when_there_is_one() {
+        let mut blob = col("thumb");
+        blob.type_name = "BLOB".to_string();
+        let with_blob = ResultSet::from_rows(
+            vec![blob],
+            vec![vec![Value::Str(crate::model::binary_display(1))]],
+        );
+        let out = export_inserts(&with_blob, &[0], None, MySql);
+        assert!(out.starts_with("--"), "{out}");
+        assert!(!export_inserts(&rs(), &[0], None, MySql).contains("--"));
+    }
+
+    /// A text column whose value happens to read like the placeholder is not a
+    /// blob, and nulling it would delete real data. Both signals must agree.
+    #[test]
+    fn a_text_column_that_merely_looks_like_a_placeholder_is_left_alone() {
+        let rs = ResultSet::from_rows(
+            vec![col("note")],
+            vec![vec![Value::Str("<12 bytes>".to_string())]],
+        );
+        let out = export_inserts(&rs, &[0], None, MySql);
+        assert!(out.contains("'<12 bytes>'"), "{out}");
+    }
+
+    /// The inverse: a genuinely binary column holding a value that is *not* the
+    /// placeholder (PostgreSQL's `bytea_output = escape`, say) still carries its
+    /// own text, and replacing that with NULL would be the data loss this test
+    /// exists to prevent.
+    #[test]
+    fn a_binary_column_with_real_text_is_not_nulled() {
+        let mut b = col("payload");
+        b.type_name = "BYTEA".to_string();
+        let rs = ResultSet::from_rows(vec![b], vec![vec![Value::Str("\\x4869".to_string())]]);
+        let out = export_inserts(&rs, &[0], None, Postgres);
+        assert!(out.contains("4869"), "{out}");
     }
 
     // ── export formats + save-file naming ─────────────────────────────────

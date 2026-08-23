@@ -247,7 +247,84 @@ const NUMERIC_TYPES: &[&str] = &[
     "BIT",
 ];
 
+/// Leading type tokens that mean **raw bytes**, in all three engines'
+/// spellings. Compared as the leading token so `VARBINARY(255)` and `BIT(1)`
+/// are covered.
+///
+/// This is the *type-name* half of the question only. MySQL asks it of a
+/// resolved wire type, PostgreSQL of `BYTEA`, SQLite of a *declared* type —
+/// which is an affinity rather than a promise, so a SQLite `BLOB` column can
+/// still hold text. Nothing here may therefore be used to discard a value on
+/// its own; [`is_binary_display`] is the second signal every such decision
+/// pairs it with.
+const BINARY_TYPES: &[&str] = &[
+    "BINARY",
+    "VARBINARY",
+    "TINYBLOB",
+    "BLOB",
+    "MEDIUMBLOB",
+    "LONGBLOB",
+    "BYTEA",
+    "BIT",
+    "GEOMETRY",
+];
+
+/// Does this SQL type name name a raw-bytes column, in any of the three engines?
+///
+/// Matches the **leading type token** for the same reason [`Column::is_numeric`]
+/// does: a parameter list or a trailing modifier is not part of the name.
+pub fn type_is_binary(type_name: &str) -> bool {
+    let head = type_name
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    BINARY_TYPES.iter().any(|k| head.eq_ignore_ascii_case(k))
+}
+
+/// **The one rendering of a raw-bytes cell**, for every backend.
+///
+/// A BLOB has no lossless text form and [`Value`] has no bytes variant, so the
+/// three engines each invented their own answer and all three were different:
+/// SQLite showed the size, MySQL `from_utf8_lossy`'d the bytes into mojibake,
+/// PostgreSQL handed over the text protocol's `\x…`. The mojibake was the
+/// dangerous one — it looks like data, so a CSV or `INSERT` export wrote it
+/// *as* the data and re-imported as wrong bytes.
+///
+/// SQLite's was the honest answer and is now everyone's: it says what it is,
+/// it costs one short string for a 40 MB blob rather than a hex dump long
+/// enough to hang the grid, and the editing system independently refuses to
+/// write a binary column, so nothing round-trips it back into the database.
+pub fn binary_display(len: usize) -> String {
+    format!("<{len} bytes>")
+}
+
+/// Is this cell text one that [`binary_display`] produced?
+///
+/// The recognizer exists because the placeholder is the only signal that a
+/// cell's real bytes were *dropped* rather than rendered — the export paths
+/// need to tell "this text is the value" from "this text stands in for a value
+/// I do not have". Deliberately exact: a leading `<`, decimal digits, ` bytes>`
+/// and nothing else, so a user's prose about byte counts is not mistaken for
+/// one.
+pub fn is_binary_display(s: &str) -> bool {
+    let Some(inner) = s.strip_prefix('<').and_then(|s| s.strip_suffix(" bytes>")) else {
+        return false;
+    };
+    !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl Column {
+    /// Does this column hold raw bytes?
+    ///
+    /// Two inputs, because neither alone covers the result sets that exist.
+    /// [`ColumnOrigin::binary`] is the authoritative wire answer but is only
+    /// present for a *table-backed* column, so a `SELECT some_bytea_expr` — or
+    /// any PostgreSQL result whose catalog lookup found no provenance — reached
+    /// it as `None` and was treated as text. The type name covers those.
+    pub fn is_binary(&self) -> bool {
+        self.origin.as_ref().is_some_and(|o| o.binary) || type_is_binary(&self.type_name)
+    }
+
     /// Is this a numeric column? Display-only — it decides right alignment.
     ///
     /// Matches the **leading type token** (the name up to the first `(` or space)
@@ -1129,6 +1206,107 @@ mod tests {
             type_name: type_name.to_string(),
             origin: None,
         }
+    }
+
+    // ── Raw-bytes columns ──
+
+    #[test]
+    fn type_is_binary_covers_all_three_engines_spellings() {
+        for t in [
+            "BLOB",
+            "TINYBLOB",
+            "MEDIUMBLOB",
+            "LONGBLOB",
+            "BINARY",
+            "VARBINARY",
+            "BYTEA",
+            "BIT",
+            "GEOMETRY",
+        ] {
+            assert!(type_is_binary(t), "{t} should be binary");
+        }
+    }
+
+    /// The leading-token rule, for the same reason `is_numeric` has it: a
+    /// parameter list is not part of the type's name, and a substring match
+    /// would make `BLOB` out of nothing at all.
+    #[test]
+    fn type_is_binary_reads_the_leading_token_and_ignores_case() {
+        assert!(type_is_binary("varbinary(255)"));
+        assert!(type_is_binary("BIT(1)"));
+        assert!(type_is_binary("blob"));
+    }
+
+    #[test]
+    fn type_is_binary_rejects_text_and_numeric_columns() {
+        for t in [
+            "VARCHAR(255)",
+            "TEXT",
+            "LONGTEXT",
+            "INT",
+            "JSON",
+            "",
+            "BITS",
+        ] {
+            assert!(!type_is_binary(t), "{t} should not be binary");
+        }
+    }
+
+    /// The placeholder and its recognizer are a pair — a change to one that
+    /// does not change the other silently stops every export from noticing a
+    /// dropped blob.
+    #[test]
+    fn a_binary_display_is_recognised_as_one() {
+        for len in [0usize, 1, 4096, 40_000_000] {
+            let text = binary_display(len);
+            assert!(is_binary_display(&text), "{text}");
+        }
+    }
+
+    /// The recognizer decides whether an export replaces a cell with NULL, so
+    /// a false positive is data loss. Nothing but the exact shape passes.
+    #[test]
+    fn text_that_merely_resembles_the_placeholder_is_not_one() {
+        for s in [
+            "",
+            "<bytes>",
+            "< bytes>",
+            "<4096 bytes",
+            "4096 bytes>",
+            "<4 kb>",
+            "<4096 bytes> and more",
+            "about <4096 bytes>",
+            "<-1 bytes>",
+            "<4 096 bytes>",
+        ] {
+            assert!(
+                !is_binary_display(s),
+                "{s:?} should not read as a placeholder"
+            );
+        }
+    }
+
+    /// The gap this closed: `ColumnOrigin::binary` is the authoritative answer
+    /// but only exists for a table-backed column, so a PostgreSQL `bytea` whose
+    /// catalog lookup found no provenance reached every caller as ordinary text.
+    #[test]
+    fn a_binary_column_without_provenance_is_still_binary() {
+        assert!(col("BYTEA").is_binary());
+        assert!(col("BLOB").is_binary());
+        assert!(!col("TEXT").is_binary());
+    }
+
+    /// And the other direction: the wire flag wins even where the type name is
+    /// one this crate does not recognise (a MySQL `VECTOR`, a custom domain).
+    #[test]
+    fn the_wire_flag_alone_makes_a_column_binary() {
+        let mut c = sourced("v", "db", None, "t", "v");
+        c.type_name = "SOMETHING_NEW".to_string();
+        assert!(!c.is_binary());
+        if let Some(o) = c.origin.as_mut() {
+            o.binary = true;
+        }
+        assert!(c.is_binary());
     }
 
     // ── Result-column provenance (`origin_columns`) ──

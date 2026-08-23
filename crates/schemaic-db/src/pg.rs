@@ -51,7 +51,8 @@ use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
-    ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
+    ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, binary_display,
+    one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, RoutineInfo, RoutineKind,
@@ -519,7 +520,7 @@ pub(crate) async fn run_statement(
                 let cells: Vec<Value> = (0..type_names.len())
                     .map(|i| match r.get(i) {
                         None => Value::Null,
-                        Some(s) => parse_typed(s.to_string(), &type_names[i]),
+                        Some(s) => pg_cell(s, &type_names[i]),
                     })
                     .collect();
                 builder.push_row(&cells);
@@ -542,6 +543,43 @@ pub(crate) async fn run_statement(
 /// The per-column type names the text-cell parser keys on, in column order.
 fn type_names_of(columns: &[Column]) -> Vec<String> {
     columns.iter().map(|c| c.type_name.clone()).collect()
+}
+
+/// One text-protocol cell → the `Value` the grid stores.
+///
+/// The simple-query protocol hands every value over as text, and for `bytea`
+/// that text is the server's `hex` output — `\x48656c6c6f`. That is lossless,
+/// but it is a *third* rendering of a raw-bytes cell (SQLite showed the size,
+/// MySQL showed mojibake), and a hex dump of a 40 MB blob is a cell no grid
+/// survives. So it renders as `binary_display` like the other two, and the
+/// length is read off the hex rather than guessed.
+/// Both signals are required: the column's type says bytes *and* the text
+/// parses as hex. A `text` column can legitimately hold the characters
+/// `\x4869`, and turning that into `<2 bytes>` would be the same lie in the
+/// other direction. The type name comes from the prepared statement rather than
+/// the catalog, so this reaches a `bytea` expression with no table provenance —
+/// which the wire `ColumnOrigin::binary` flag never did.
+fn pg_cell(text: &str, type_name: &str) -> Value {
+    if schemaic_core::model::type_is_binary(type_name)
+        && let Some(len) = bytea_hex_len(text)
+    {
+        return Value::Str(binary_display(len));
+    }
+    parse_typed(text.to_string(), type_name)
+}
+
+/// Byte length of a `bytea` in PostgreSQL's default `hex` output, or `None`
+/// when the text is not one.
+///
+/// `None` is the important half and covers two real cases rather than being a
+/// defensive shrug: a server set to the legacy `bytea_output = escape` sends a
+/// different encoding entirely, and every non-`bytea` column is text that
+/// merely starts with a backslash. Both must fall through to the ordinary
+/// parser with their text intact — replacing a value we *can* still read with
+/// a placeholder would be the data loss this rendering exists to prevent.
+fn bytea_hex_len(text: &str) -> Option<usize> {
+    let hex = text.strip_prefix("\\x")?;
+    (hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex.len() / 2)
 }
 
 /// SQL predicate selecting the *user* schemas of a database — everything except
@@ -2734,7 +2772,7 @@ pub(crate) async fn refetch_on(
                     let cells: Vec<Value> = (0..template.columns.len())
                         .map(|i| match r.get(i) {
                             None => Value::Null,
-                            Some(s) => parse_typed(s.to_string(), &type_names[i]),
+                            Some(s) => pg_cell(s, &type_names[i]),
                         })
                         .collect();
                     out.push((row.data_row, cells));
@@ -3123,6 +3161,47 @@ mod tests {
             pg_type_name(&Type::TIMESTAMP),
             pg_type_name_str("timestamp")
         );
+    }
+
+    /// `pg_type_name(&Type::BYTEA)` is what the cell renderer gates on, so if
+    /// it ever stopped being a name `core::model::type_is_binary` recognises,
+    /// every bytea would silently go back to dumping hex into the grid.
+    #[test]
+    fn the_bytea_type_name_is_one_core_reads_as_binary() {
+        assert!(schemaic_core::model::type_is_binary(&pg_type_name(
+            &Type::BYTEA
+        )));
+    }
+
+    #[test]
+    fn a_hex_bytea_renders_as_its_size() {
+        let t = pg_type_name(&Type::BYTEA);
+        assert_eq!(pg_cell("\\x48656c6c6f", &t), Value::Str("<5 bytes>".into()));
+        // An empty bytea is `\x` and has a size like any other.
+        assert_eq!(pg_cell("\\x", &t), Value::Str("<0 bytes>".into()));
+    }
+
+    /// The `escape` output format (`bytea_output = escape`) is a different
+    /// encoding this cannot measure. Its text is still the value, so it must
+    /// survive — replacing it with a placeholder would lose data the user can
+    /// currently read.
+    #[test]
+    fn an_escape_format_bytea_keeps_its_text() {
+        let t = pg_type_name(&Type::BYTEA);
+        assert_eq!(pg_cell("Hello\\000", &t), Value::Str("Hello\\000".into()));
+        // Odd-length and non-hex payloads are not hex output either.
+        assert_eq!(bytea_hex_len("\\x4"), None);
+        assert_eq!(bytea_hex_len("\\xzz"), None);
+        assert_eq!(bytea_hex_len("48656c"), None);
+    }
+
+    /// A `text` column may legitimately hold the characters `\x4869`, and the
+    /// type gate is the only thing standing between that and a cell replaced by
+    /// a byte count.
+    #[test]
+    fn a_text_cell_that_looks_like_hex_output_is_left_alone() {
+        let t = pg_type_name(&Type::TEXT);
+        assert_eq!(pg_cell("\\x4869", &t), Value::Str("\\x4869".into()));
     }
 
     #[test]
