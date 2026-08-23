@@ -234,13 +234,30 @@ macro_rules! disabled {
 /// eye reads is the composite against the surface, not the colour named in the
 /// style. The counterpart of `wash!` below, which fades the background instead.
 ///
-/// **Unused, deliberately kept.** Its one caller was the history band's count,
-/// and the alpha there turned out to be how a number the reader is meant to read
-/// came to be painted at 2.32:1 — the fix was a colour, not a different fade. It
-/// stays because the *next* faded foreground has to be measured composited, and
-/// re-deriving that is how one gets measured against the colour it was named
-/// with instead.
-#[allow(unused_macros)]
+/// **No live row, deliberately kept.** Its one caller was the history band's
+/// count, and the alpha there turned out to be how a number the reader is meant
+/// to read came to be painted at 2.32:1 — the fix was a colour, not a different
+/// fade. It stays because the *next* faded foreground has to be measured
+/// composited, and re-deriving that is how one gets measured against the colour
+/// it was named with instead.
+///
+/// **It is expanded by
+/// [`a_faded_foreground_is_measured_against_what_the_eye_sees`], and that is
+/// what keeps it from rotting.** A `macro_rules!` body is only checked when it
+/// is expanded, so under a bare `#[allow(unused_macros)]` this one sat outside
+/// the compiler entirely: `Pairing` gained `role` as a key field in an earlier
+/// round and `UI_SHORTFALL`'s tuple changed with it, and the next such change
+/// would compile clean while leaving this broken — so the person reaching for
+/// it, the exact "next faded foreground" the paragraph above is written for,
+/// would meet the error instead of the tool. The test expands it and asserts
+/// the one property that is the reason it exists, which is cheaper than a live
+/// `UI_PAIRINGS` row and does not put a floor under a site nobody asked to
+/// gate.
+///
+/// The `allow` is scoped to the **non-test** build for that reason: in the test
+/// build there is no exemption, so the day the test stops expanding it,
+/// `unused_macros` says so instead of the macro quietly going unchecked again.
+#[cfg_attr(not(test), allow(unused_macros))]
 macro_rules! faded {
     ($fg:ident($alpha:expr) on $bg:ident, $role:ident, $site:expr) => {
         Pairing {
@@ -301,7 +318,8 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(tx_rollback_hover on bg_deepest, Body, "footer: hovering Rollback"),
     pair!(chip_active on bg_deepest, Body, "footer: hovering a status segment"),
     pair!(text on bg_deepest, Body, "AI chat code block, completion doc popup"),
-    pair!(text_dim on bg_deepest, Body, "completion popup: the doc line"),
+    pair!(text_dim on bg_deepest, Body,
+        "completion popup: the doc line; AI panel: a sent attachment's summary and table"),
     pair!(text_muted on bg_deepest, Icon, "completion popup: the kind label"),
     pair!(placeholder on bg_deepest, Recessive, "AI panel: the message field"),
     // ── Header / tab strip / dropdown menus (`bg_chrome`).
@@ -317,7 +335,8 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(text on tab_active, Body, "tab strip: the active tab's label"),
     // ── Side panels, modals and popup menus (`bg_panel`).
     pair!(text on bg_panel, Body, "schema tree, modals, menu rows"),
-    pair!(text_dim on bg_panel, Body, "panel labels + every form caption"),
+    pair!(text_dim on bg_panel, Body,
+        "panel labels + every form caption; AI panel: the staged attachment chip"),
     pair!(text_muted on bg_panel, Icon, "section titles, secondary metadata"),
     pair!(text_faint on bg_panel, Recessive, "form hints, count capsules, empty states"),
     pair!(search_hint on bg_panel, Recessive, "schema tree: the search box hint"),
@@ -432,8 +451,15 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // reuse-at-a-harder-role hole this table's unit is the *pairing* to avoid.
     // The chip is the app's last consent surface, so it is the last place a
     // sentence about rows leaving the machine may sit below a reading floor.
-    pair!(text_dim on bg_deepest, Body, "AI panel: a sent attachment's summary and table"),
-    pair!(text_dim on bg_panel, Body, "AI panel: the staged attachment chip"),
+    //
+    // Two of those three sites are named in the `text_dim on bg_deepest` and
+    // `text_dim on bg_panel` rows above rather than repeated here. **The unit is
+    // the pairing**, and `audit`/`check` key `baselined()` on
+    // `(theme, fg, bg, role)` — so a second row for a pairing the table already
+    // holds measures the same two colours twice and reports the same failure
+    // twice. What actually closed the hole this comment describes was the views
+    // moving from `text_muted` to `text_dim`; the rows recorded it and did not
+    // cause it.
     pair!(text_muted on group_header_bg, Recessive, "AI panel: a code block's language label"),
     pair!(text_dim on group_header_bg, Body, "AI panel: a code block's Copy/Insert/Run"),
     pair!(accent on group_header_bg, Body, "AI panel: one of them, hovered"),
@@ -681,6 +707,34 @@ mod tests {
         // The same colour was never the problem — it was fine on the footer it
         // had been picked against.
         assert!(contrast_ratio(tx_open, dark_footer) > 8.0);
+    }
+
+    /// **The whole reason `faded!` is kept**, asserted rather than described:
+    /// what the eye reads is the composite, not the colour the style names. A
+    /// foreground at 40% of `text` on `bg_panel` is measured against the mix,
+    /// which is a *lower* ratio than the opaque colour would give — and getting
+    /// that backwards is how the history band's count came to be painted at
+    /// 2.32:1 while being named with a colour that measured fine.
+    ///
+    /// It is also what type-checks the macro. `macro_rules!` bodies are only
+    /// checked when expanded, and this one has no live `UI_PAIRINGS` row; under
+    /// a bare `#[allow(unused_macros)]` it sat outside the compiler entirely,
+    /// rotting quietly for whoever reached for it next.
+    #[test]
+    fn a_faded_foreground_is_measured_against_what_the_eye_sees() {
+        let t = UiThemeKind::Dark.build();
+        let p: Pairing<crate::themes::UiTheme> =
+            faded!(text(0.4) on bg_panel, Recessive, "the next faded foreground");
+        assert_eq!(p.fg, "text@0.4");
+        assert_eq!(p.bg, "bg_panel");
+        assert_eq!(p.role, Legibility::Recessive);
+        // The background is the surface itself: only the foreground is faded.
+        assert_eq!((p.bg_of)(&t), t.bg_panel);
+        // And the foreground is the composite, not `text`.
+        assert_eq!((p.fg_of)(&t), over(t.text.multiply_alpha(0.4), t.bg_panel));
+        assert_ne!((p.fg_of)(&t), t.text);
+        // Which is the point: measuring the named colour would flatter it.
+        assert!(p.ratio(&t) < contrast_ratio(t.text, t.bg_panel));
     }
 
     #[test]
