@@ -2167,8 +2167,26 @@ impl Change {
                 } else {
                     column_clauses(to)
                 };
+                // **A rename does not excuse the list from naming the type.**
+                // `ColumnDraft::original` keeps rename+retype as one
+                // `Change::AlterColumn`, so there is no second line to carry it,
+                // and this arm used to return before the type was ever printed.
+                // A proposal drove `DROP COLUMN` in through the `type` field
+                // under a change list that read only "Rename column qty to
+                // qty2" — the payload was in the statement and in no sentence
+                // the user was shown. `check_free_sql` is what refuses that
+                // payload now; this is what stops the *next* free-SQL field
+                // being invisible for the same reason.
+                let retype = if from.type_name == to.type_name {
+                    String::new()
+                } else {
+                    format!(", and its type from {} to {}", from.type_name, to.type_name)
+                };
                 if from.name != to.name {
-                    format!("Rename column {} to {}{clauses}", from.name, to.name)
+                    format!(
+                        "Rename column {} to {}{retype}{clauses}",
+                        from.name, to.name
+                    )
                 } else if from.as_ref() == to.as_ref() && position.is_some() {
                     match position {
                         Some(Position::First) => format!("Move column {} first", to.name),
@@ -7987,6 +8005,40 @@ mod tests {
         let risk = diff(&t, &draft, MySql).destructive();
         assert_eq!(risk.len(), 1);
         assert!(risk[0].contains("NOT NULL"), "{risk:?}");
+    }
+
+    /// **A rename and a retype are one `Change`, and the list has to say both.**
+    ///
+    /// `ColumnDraft::original` keeps rename+retype as a single
+    /// `Change::AlterColumn`, so there is no second line to carry the type — and
+    /// the summary's rename arm returned before the type was ever printed. That
+    /// is how a live proposal executed `DROP COLUMN placed_at` under a change
+    /// list reading only *Rename column qty to qty2*: the payload rode in on the
+    /// `type` field, and the one line the user read never mentioned a type at
+    /// all. The gate that refuses that payload is `check_free_sql`'s; this is
+    /// the half that makes the preview honest for the *next* free-SQL field.
+    #[test]
+    fn renaming_and_retyping_a_column_names_both_in_the_change_list() {
+        let t = users();
+        let mut draft = TableDraft::from_table(&t);
+        draft.rename_column(1, "login_email");
+        draft.columns[1].info.type_name = "text".into();
+        let cs = diff(&t, &draft, MySql);
+        assert_eq!(cs.len(), 1, "one change carries both: {:?}", cs.changes);
+        let summary = cs.changes[0].summary();
+        assert!(summary.contains("login_email"), "{summary}");
+        assert!(
+            summary.contains("varchar(255)") && summary.contains("text"),
+            "the list must name the type it is changing: {summary}"
+        );
+        // A rename that leaves the type alone still reads as a plain rename —
+        // a line that names a type nobody changed is noise.
+        let mut plain = TableDraft::from_table(&t);
+        plain.rename_column(1, "login_email");
+        assert_eq!(
+            diff(&t, &plain, MySql).changes[0].summary(),
+            "Rename column email to login_email"
+        );
     }
 
     #[test]
