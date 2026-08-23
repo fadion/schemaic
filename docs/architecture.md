@@ -3801,6 +3801,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `an_installed_hook_writes_the_panic_through_tracing` guards the *seam* rather than the pieces —
     a thread-local subscriber over a capture buffer, a real `catch_unwind` panic — since a
     well-formed `panic_report` proves nothing if the hook never reaches a subscriber.
+    **That test puts the hook back**, and the reason is this module's own subject: tests share one
+    process, so a replacement left standing is one every later panic goes through — including a
+    genuine failure in another test, which then prints nothing to stderr and reports as an
+    undiagnosable blank. It restores **before its assertions, not in a `Drop` guard**, because
+    `std::panic::set_hook` panics if called from a panicking thread and a guard restoring during an
+    assertion's unwind would abort the run.
+    `the_hook_test_puts_the_process_back_as_it_found_it` is the pin: it installs a hook it can
+    recognise, calls the test above directly (ordering is not left to libtest), fires a swallowed
+    panic and checks the recognisable one is what the process still holds.
   - `update.rs` — the Velopack half of `core::update`: a background check at startup and every three
     hours after (`RECHECK_INTERVAL`), and the "Restart to update" action `start` hands back for the
     header chip. **Velopack's API is synchronous and does network + file I/O**, so every call into it
