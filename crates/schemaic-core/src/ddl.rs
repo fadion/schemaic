@@ -2509,8 +2509,15 @@ impl Change {
                 // old signature is dropped and a differently-shaped routine
                 // takes its place. Anything calling the old shape stops
                 // resolving, and that has to be said before consent, not after.
+                //
+                // Compared through `routine_identity_args` for the same reason
+                // the route is chosen through it: a changed default leaves every
+                // existing call resolving exactly as it did, so claiming
+                // otherwise would be a false alarm in the one block the user is
+                // asked to read.
                 if !server.arguments.trim().is_empty()
-                    && server.arguments.trim() != f.arguments.trim()
+                    && routine_identity_args(&server.arguments, dialect)
+                        != routine_identity_args(&f.arguments, dialect)
                 {
                     out.push(format!(
                         "Changes {}'s parameter list. Callers that pass the old \
@@ -2529,6 +2536,22 @@ impl Change {
                          {} at all.",
                         f.name,
                         f.kind.label()
+                    ));
+                    // **What is lost here is invisible in the SQL box by
+                    // construction**: the plan is a `DROP` and a `CREATE`, and
+                    // privileges and the comment are not in either statement
+                    // because the model does not carry them. `pg_create_sql`
+                    // restates everything a replace would otherwise reset —
+                    // language, volatility, strictness, `SECURITY DEFINER`, every
+                    // `SET` — precisely so a redefinition keeps them; there is
+                    // nothing equivalent it can restate for an ACL. So the
+                    // sentence is the only place the loss can appear at all, and
+                    // the change list is the consent gesture.
+                    out.push(format!(
+                        "Privileges granted on {} and its comment do not survive \
+                         being dropped, and this plan does not restore them — \
+                         re-apply any GRANT and COMMENT afterwards.",
+                        f.name
                     ));
                 }
                 out
@@ -7188,6 +7211,115 @@ pub fn drop_trigger(t: &TriggerInfo, dialect: SqlDialect) -> ChangeSet {
     }
 }
 
+/// A routine's parameter list reduced to what the engine identifies it by.
+///
+/// **A default is not part of a routine's identity, and neither is whitespace.**
+/// [`RoutineInfo::arguments`] is what the server prints for a *declaration* —
+/// on PostgreSQL that is `pg_get_function_arguments`, which includes `DEFAULT`
+/// expressions — while the routine is addressed by
+/// `pg_get_function_identity_arguments`, which does not. Comparing the
+/// declaration forms made `a integer, b boolean DEFAULT false` →
+/// `… DEFAULT true` look like a new signature, so the plan dropped the function
+/// and re-created it. PostgreSQL keeps neither the routine's `GRANT`s nor its
+/// `COMMENT` across that, and the model carries neither, so both were gone with
+/// nothing on screen naming the loss. `trim()` only trims the ends, so a re-flow
+/// of the list counted too.
+///
+/// This cannot simply read [`RoutineInfo::identity_arguments`] instead: the form
+/// edits `arguments`, so a draft's `identity_arguments` is the server's copy
+/// verbatim and comparing those would never see a *real* signature change
+/// either. The normalisation has to be derived from the text the user edited.
+///
+/// The cut is top level only — a `DEFAULT` inside a parenthesised expression, a
+/// string literal or a quoted identifier is part of the default's own text, not
+/// a second tail — and quoted regions pass through verbatim, since whitespace
+/// inside them is data.
+pub fn routine_identity_args(arguments: &str, dialect: SqlDialect) -> String {
+    let b = arguments.as_bytes();
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    // Everything after a top-level `DEFAULT` or `=` belongs to the default
+    // expression, and is dropped until the next top-level comma.
+    let mut cutting = false;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = sql::skip_noncode(b, i, dialect) {
+            if !cutting {
+                cur.push_str(&arguments[i..j]);
+            }
+            i = j;
+            continue;
+        }
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            if !cutting && !cur.is_empty() && !cur.ends_with(' ') {
+                cur.push(' ');
+            }
+            i += 1;
+            continue;
+        }
+        if sql::is_word_start(c) {
+            let mut j = i + 1;
+            while j < b.len() && sql::is_word_byte(b[j]) {
+                j += 1;
+            }
+            if !cutting {
+                if depth == 0 && arguments[i..j].eq_ignore_ascii_case("DEFAULT") {
+                    cutting = true;
+                } else {
+                    cur.push_str(&arguments[i..j]);
+                }
+            }
+            i = j;
+            continue;
+        }
+        match c {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(cur.trim().to_string());
+                cur.clear();
+                cutting = false;
+                i += 1;
+                continue;
+            }
+            b'=' if depth == 0 => {
+                cutting = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !cutting {
+            cur.push_str(&arguments[i..i + 1]);
+        }
+        i += 1;
+    }
+    parts.push(cur.trim().to_string());
+    parts.retain(|p| !p.is_empty());
+    parts.join(", ")
+}
+
+/// Does this edit change the routine's identity, rather than only its
+/// definition?
+///
+/// The question `CREATE OR REPLACE` turns on: it can replace a body, a
+/// volatility, a default — anything that is not the name and the argument
+/// types — and is refused (or creates a *second* overload) for anything that is.
+/// See [`routine_identity_args`] for why the declaration forms cannot be
+/// compared directly.
+pub fn routine_signature_changed(
+    current: &RoutineInfo,
+    draft: &RoutineInfo,
+    dialect: SqlDialect,
+) -> bool {
+    routine_identity_args(&draft.arguments, dialect)
+        != routine_identity_args(&current.arguments, dialect)
+        || routine_identity_args(&draft.returns, dialect)
+            != routine_identity_args(&current.returns, dialect)
+}
+
 /// Everything that has to happen to turn the routine `current` into `draft`.
 ///
 /// Same round-trip gate as [`diff`]: a routine diffed against its own draft must
@@ -7213,8 +7345,7 @@ pub fn diff_routine(current: &RoutineInfo, draft: &RoutineDraft, dialect: SqlDia
     // (`cannot change return type of existing function`). So the edit has to
     // drop the old signature first — which is what `recreate` means, and what
     // earns `destructive()`'s "drops it first" sentence.
-    let signature_changed = draft.info.arguments.trim() != current.arguments.trim()
-        || draft.info.returns.trim() != current.returns.trim();
+    let signature_changed = routine_signature_changed(current, &draft.info, dialect);
     let recreate = !supports_or_replace_routine(dialect) || signature_changed;
     // A rename is its own statement only where the routine *survives* the
     // replace. Once the plan drops the old signature there is nothing left for
@@ -9767,6 +9898,149 @@ mod tests {
                 "{risks:?}"
             );
             assert_eq!(cs.changes[0].summary(), "Re-create function tally");
+        }
+
+        /// **A default is not part of the identity, and changing one must not
+        /// cost the function its grants.**
+        ///
+        /// `RoutineInfo::arguments` is `pg_get_function_arguments`, which prints
+        /// `DEFAULT` expressions; the routine's identity is
+        /// `pg_get_function_identity_arguments`, which does not. Comparing the
+        /// declaration forms sent a default-only edit down the `DROP` + `CREATE`
+        /// route, and PostgreSQL keeps neither `proacl` nor `obj_description`
+        /// across one — verified live on 16.15: both NULL afterwards, from an
+        /// edit that changed `DEFAULT false` to `DEFAULT true`.
+        #[test]
+        fn changing_only_a_default_replaces_the_postgres_function_in_place() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.arguments = "a integer, b boolean DEFAULT false".into();
+            f.identity_arguments = "a integer, b boolean".into();
+            f.returns = "integer".into();
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.arguments = "a integer, b boolean DEFAULT true".into();
+
+            let sql = diff_routine(&f, &d, Postgres).emit();
+            assert_eq!(sql.len(), 1, "nothing is dropped: {sql:?}");
+            assert!(sql[0].contains("CREATE OR REPLACE FUNCTION"), "{sql:?}");
+            assert!(sql[0].contains("DEFAULT true"), "{sql:?}");
+        }
+
+        /// `trim()` only trims the ends, so re-flowing the parameter list — a
+        /// second space after a comma, a newline — read as a signature change
+        /// and took the same destructive route as a real one, for an edit that
+        /// changed nothing at all.
+        #[test]
+        fn reflowing_a_postgres_parameter_list_is_not_a_signature_change() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.arguments = "a integer, b boolean DEFAULT false".into();
+            f.identity_arguments = "a integer, b boolean".into();
+            f.returns = "integer".into();
+            for reflow in [
+                "a integer,  b boolean DEFAULT false",
+                "a integer,\n    b boolean DEFAULT false",
+                "  a   integer , b boolean DEFAULT false ",
+            ] {
+                let mut d = RoutineDraft::from_info(&f);
+                d.info.arguments = reflow.into();
+                let sql = diff_routine(&f, &d, Postgres).emit();
+                assert!(
+                    sql.iter().all(|s| !s.contains("DROP FUNCTION")),
+                    "{reflow:?} is not a signature change: {sql:?}"
+                );
+            }
+            // The same for the return type, which is compared the same way.
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.returns = "  integer ".into();
+            d.info.arguments = "a integer, b boolean DEFAULT false".into();
+            assert!(
+                diff_routine(&f, &d, Postgres)
+                    .emit()
+                    .iter()
+                    .all(|s| !s.contains("DROP FUNCTION"))
+            );
+        }
+
+        /// **A re-create loses the routine's grants and its comment, and the
+        /// risk block is the only place that can appear.** The plan is a `DROP`
+        /// and a `CREATE`; what is missing from it is invisible by construction,
+        /// and the model carries neither an ACL nor a comment to restate. Live
+        /// on PostgreSQL 16.15, `proacl` and `obj_description` were both NULL
+        /// after a plan the user consented to as "Re-create function tally".
+        ///
+        /// A *replace* keeps both, so it must not carry the sentence — a warning
+        /// that fires on every edit is a warning nobody reads.
+        #[test]
+        fn re_creating_a_routine_says_the_grants_and_the_comment_do_not_survive() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.arguments = "a integer".into();
+            f.identity_arguments = "a integer".into();
+            f.returns = "integer".into();
+
+            let mut changed = RoutineDraft::from_info(&f);
+            changed.info.arguments = "a integer, b integer".into();
+            let risks = diff_routine(&f, &changed, Postgres).destructive();
+            assert!(
+                risks
+                    .iter()
+                    .any(|r| r.contains("Privileges") && r.contains("comment")),
+                "{risks:?}"
+            );
+
+            // A body-only edit replaces in place on PostgreSQL and keeps both.
+            let mut body_only = RoutineDraft::from_info(&f);
+            body_only.info.body = "SELECT 2".into();
+            let risks = diff_routine(&f, &body_only, Postgres).destructive();
+            assert!(
+                !risks.iter().any(|r| r.contains("Privileges")),
+                "a replace keeps them: {risks:?}"
+            );
+
+            // MySQL has no replace, so every routine edit there is a re-create —
+            // and MySQL grants on a routine do not survive one either.
+            let risks = diff_routine(&f, &body_only, MySql).destructive();
+            assert!(risks.iter().any(|r| r.contains("Privileges")), "{risks:?}");
+        }
+
+        /// The line the normalisation must not cross: a `DEFAULT` *inside* a
+        /// parameter's own type — an array literal, a parenthesised expression,
+        /// a quoted default containing the word — is not a top-level tail, and
+        /// a real type change behind an unchanged default is still a real
+        /// signature change.
+        #[test]
+        fn the_identity_normalisation_still_sees_a_real_signature_change() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.arguments = "a integer, b text DEFAULT 'x DEFAULT y'".into();
+            f.identity_arguments = "a integer, b text".into();
+            f.returns = "integer".into();
+
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.arguments = "a bigint, b text DEFAULT 'x DEFAULT y'".into();
+            assert!(
+                diff_routine(&f, &d, Postgres)
+                    .emit()
+                    .iter()
+                    .any(|s| s.contains("DROP FUNCTION")),
+                "a changed type is a changed identity"
+            );
+
+            // A default whose expression is a call with its own comma stays one
+            // parameter, and dropping the parameter is still a signature change.
+            let mut g = f.clone();
+            g.arguments = "a integer, b numeric DEFAULT round(1.5, 2)".into();
+            g.identity_arguments = "a integer, b numeric".into();
+            let mut d = RoutineDraft::from_info(&g);
+            d.info.arguments = "a integer".into();
+            assert!(
+                diff_routine(&g, &d, Postgres)
+                    .emit()
+                    .iter()
+                    .any(|s| s.contains("DROP FUNCTION")),
+                "a dropped parameter is a changed identity"
+            );
         }
 
         /// A rename *and* a signature change: the drop has to name what the
