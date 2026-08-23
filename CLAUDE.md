@@ -109,6 +109,19 @@ start with a failing test, then the code that makes it pass.
 - **Red → green → refactor.** For any new pure-logic behavior or bug fix, write the test first (it
   fails), then implement until it passes, then clean up with the test still green. When a bug is
   reported, first add a test that reproduces it (red), then fix it.
+- **Watch the new test fail against the *unfixed* tree, and say so in the commit.** Not a
+  formality — it is the one check that separates a test from a decoration. A pre-release review of
+  a whole fix campaign found **thirteen** tests that were green against the very bug they were
+  written to guard, three of them guarding fixes in that same range. The shared defect was always
+  the same: the test was written against the fix's *description* rather than its *effect*, by the
+  author who already knew the property held, while the bug sat at the seam they had not written
+  down — nearly always **a pure function's composition with its caller**. `overlay_open_key`'s pin
+  tested the memo in isolation and never a call site, so the High regression the memo introduced
+  passed it; `a_superseded_check_still_answers_the_action_that_asked` tested two predicates
+  separately while the revert sat between them. If the test cannot be made to fail — because the
+  fix is a deletion, or the decision lives in a view — say *that* in the commit instead of implying
+  coverage. Stage the fix, `git stash` it, run the test, unstash: three commands, and it would have
+  caught all thirteen.
 - **Where tests live.** Pure logic belongs in `schemaic-core` (or the owning crate's `src`) with an
   inline `#[cfg(test)] mod tests`; regression tests for a bug live next to the code they guard. The
   UI/app keep thin wrappers over `schemaic-core`, so push logic *down* into a testable core function

@@ -149,6 +149,15 @@ mechanically checkable, and the plan states the check:
   the file count. A file in no slice is the failure this catches, and prose like "the PG object
   work" is not coverage. A file in several slices is expected, not a defect — but each of its
   appearances states which hunks it brings, so "covered" never means "somebody looked at the file".
+- **…and the file check alone is not enough — check the *hunks*.** For every file that appears in
+  more than one slice, the hunks its rows claim must together cover the file's whole diff. This
+  check is here because the `6ca4f85` run passed the file-level check green while four hunks went
+  unread by any pass: a shared file's rows each named the theme they owned and **nothing owned the
+  remainder**. The one that mattered was `ui/overlays.rs`, where `follow_menu`'s correctness
+  depends on a reactive `popup_anchor` read that no pass looked at. Mechanically:
+  `git diff --numstat <base>..HEAD -- <path>` per shared file, against the sum its rows claim; a
+  shortfall means a slice needs widening or a row needs adding. Say the result in the plan — a
+  file-count line alone is the failure mode this replaces.
 - **State the invocation count** (passes + P0 + sweeps + triage) at the top.
 - Flag any slice needing a **live engine** (MariaDB on 3306, MySQL 8 in Docker on 3307, PostgreSQL
   on 5432) or the GUI. It still delegates; its report must name what it exercised, or say the check
