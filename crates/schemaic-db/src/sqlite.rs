@@ -64,7 +64,7 @@ use rusqlite::{Connection as SqliteConn, OpenFlags};
 use schemaic_core::model::CellTag;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
-    ResultSet, Rollback, Value, WriteStep, one_row_verdict,
+    ResultSet, Rollback, Value, WriteStep, binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
@@ -279,7 +279,8 @@ fn probe_permit(file: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
 /// variant, so one is rendered as its size rather than as mojibake or as a hex
 /// string long enough to hang the grid. The editing system independently refuses
 /// to write a binary column, so nothing round-trips this text back into the
-/// database; it is a display, and it says what it is.
+/// database; it is a display, and it says what it is. `core::model::binary_display`
+/// is that rendering, and the other two backends now share it.
 fn value_of(raw: ValueRef<'_>) -> Value {
     match raw {
         ValueRef::Null => Value::Null,
@@ -288,7 +289,7 @@ fn value_of(raw: ValueRef<'_>) -> Value {
         // Invalid UTF-8 in a TEXT cell is possible (SQLite doesn't validate), and
         // losing the row to it would be worse than showing the replacement chars.
         ValueRef::Text(b) => Value::Str(String::from_utf8_lossy(b).into_owned()),
-        ValueRef::Blob(b) => Value::Str(format!("<{} bytes>", b.len())),
+        ValueRef::Blob(b) => Value::Str(binary_display(b.len())),
     }
 }
 
@@ -2613,6 +2614,34 @@ mod tests {
             .unwrap();
         let rs = run_query(&conn, "SELECT b FROM t", 10).unwrap();
         assert_eq!(rs.cell(0, 0).expect("cell").display(), "<3 bytes>");
+    }
+
+    /// The seam, end to end on the one engine that can be driven for real: a
+    /// blob goes into a table, comes back as a placeholder, and the SQL export
+    /// must not write that placeholder in as the column's data. Asserting the
+    /// display alone (the test above) passed happily while `export_inserts`
+    /// turned `<3 bytes>` into a string literal that re-imports as five wrong
+    /// bytes — the bug was in the composition, not in either half.
+    #[test]
+    fn a_blob_never_leaves_through_a_sql_export_as_its_placeholder() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, b BLOB); INSERT INTO t VALUES (1, x'00ff10');",
+        )
+        .unwrap();
+        let rs = run_query(&conn, "SELECT id, b FROM t", 10).unwrap();
+        let sql = schemaic_core::export::export_inserts(
+            &rs,
+            &[0],
+            Some(("main", None, "t")),
+            schemaic_core::intel::SqlDialect::Sqlite,
+        );
+        assert!(
+            !sql.contains("3 bytes"),
+            "placeholder written as data: {sql}"
+        );
+        assert!(sql.contains("(1, NULL)"), "{sql}");
+        assert!(sql.contains("-- NOTE:"), "{sql}");
     }
 
     /// **`auto_increment` means "the engine fills this in", and only a rowid

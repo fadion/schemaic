@@ -51,7 +51,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     only the column `Arc`s whose values actually changed, so an untouched column is never copied
     (29.6 ms → 1.8 ms at 200k×50, measured). `Column`/`ColumnOrigin`/`ColumnFlags` carry the
     write-back provenance the wire reports per column, and a binary column is unconditionally
-    read-only (it can't round-trip through text). `ColumnOrigin::implicit_key` is the one field no
+    read-only (it can't round-trip through text). **A raw-bytes cell has exactly one rendering, and
+    it lives here:** `binary_display(len)` → `<n bytes>`, with `is_binary_display` as its
+    recognizer and `type_is_binary` / `Column::is_binary` as the question "is this column bytes at
+    all". The three engines each used to answer differently — SQLite showed the size, MySQL
+    `from_utf8_lossy`'d the bytes into mojibake, PostgreSQL handed over the text protocol's `\x…` —
+    and the mojibake was a data bug rather than a cosmetic one: it *looks* like data, so a CSV or
+    `INSERT` export wrote the replacement characters as the value and re-imported as the wrong
+    bytes. SQLite's was the honest answer and is now everyone's. `Column::is_binary` reads **two**
+    inputs because neither covers every result: `ColumnOrigin::binary` is the authoritative wire
+    flag but exists only for a table-backed column, so a `bytea` expression with no catalog
+    provenance reached every caller as ordinary text until the type name was consulted too.
+    Conversely nothing may act on the type name *alone* — a SQLite `BLOB` column is an affinity,
+    not a promise, and may hold ordinary text — which is why every decision that discards a value
+    (`export::dropped_binary_columns`, `pg::pg_cell`) requires the type and the value to agree.
+    `ColumnOrigin::implicit_key` is the one field no
     wire reports: it marks a result column that identifies a row but is no column of the table —
     SQLite's explicitly projected `rowid` — asserted by the backend on the same trust
     `ColumnFlags::primary_key` already carries, and `false` on MySQL and PostgreSQL. It is a key
@@ -377,7 +391,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `*_to<W: io::Write>` form (`ExportFormat::render_to`) — what file export uses, so a large
     result is never rendered into a second full copy in memory — with the `String` versions kept
     as thin wrappers for the clipboard. A test asserts the two agree byte-for-byte per format;
-    add new formats to both by adding the `*_to` and wrapping it.
+    add new formats to both by adding the `*_to` and wrapping it. **The SQL export is the one
+    renderer that must not pass a cell straight through.** A raw-bytes cell is
+    `model::binary_display`'s `<n bytes>` (a `Value` has no bytes variant to hold the real thing),
+    and quoting that into an `INSERT` produces a script which silently stores the *placeholder* as
+    the column's data on re-import. `dropped_binary_columns` finds those cells in a pre-pass —
+    requiring the column's type **and** the cell's text to agree, since either signal alone is
+    wrong in a way that loses data — writes `NULL` in their place, and heads the script with a
+    `-- NOTE:` naming the columns. A comment rather than a refusal: the script still runs, and the
+    one thing it may not do is pretend the placeholder was the data. The note is emitted only when
+    a cell was actually dropped. The human-readable formats (CSV/JSON/Markdown/HTML) keep the
+    placeholder — it is what the grid shows, and it cannot be mistaken for a value.
   - `import.rs` — the inverse of `export.rs`: CSV/TSV + JSON (array *or* NDJSON) → table. Format
     inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
     a header, positional without), per-column `coerce` (only the families a wrong answer would
