@@ -1686,25 +1686,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     // lands first must not be able to strip the wrapper off a `CREATE` whose
     // `DROP` has already committed.
     let routine_rows: Vec<MyRoutineRow> = conn
-        .exec_map(
-            "SELECT CAST(ROUTINE_NAME AS CHAR) AS n, CAST(ROUTINE_TYPE AS CHAR) AS ty, \
-                    CAST(COALESCE(DTD_IDENTIFIER, '') AS CHAR) AS rt, \
-                    CAST(CHARACTER_SET_NAME AS CHAR) AS rtcs, \
-                    CAST(COLLATION_NAME AS CHAR) AS rtcoll, \
-                    CAST(ROUTINE_DEFINITION AS CHAR) AS body, \
-                    CAST(IS_DETERMINISTIC AS CHAR) AS det, \
-                    CAST(SQL_DATA_ACCESS AS CHAR) AS acc, \
-                    CAST(SECURITY_TYPE AS CHAR) AS sec, \
-                    CAST(DEFINER AS CHAR) AS df, \
-                    CAST(COALESCE(ROUTINE_COMMENT, '') AS CHAR) AS cmt, \
-                    CAST(SQL_MODE AS CHAR) AS sqlmode, \
-                    CAST(CHARACTER_SET_CLIENT AS CHAR) AS cscl, \
-                    CAST(COLLATION_CONNECTION AS CHAR) AS collconn \
-             FROM information_schema.ROUTINES \
-             WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_TYPE, ROUTINE_NAME",
-            (database,),
-            |r: Row| my_routine_row(&r),
-        )
+        .exec_map(MY_ROUTINES_SQL, (database,), |r: Row| my_routine_row(&r))
         .await
         .map_err(qerr)?;
     let param_rows: Vec<MyParamRow> = conn
@@ -2260,8 +2242,7 @@ fn apply_triggers(schema: &mut DbSchema, triggers: Vec<TriggerInfo>) {
     }
 }
 
-/// One `information_schema.ROUTINES` row, in the order `collect_schema` selects
-/// the columns.
+/// One [`MY_ROUTINES_SQL`] row.
 ///
 /// A struct rather than the tuple its siblings here are, for two reasons: the
 /// query selects fourteen columns, past `mysql_common`'s twelve-element
@@ -2296,30 +2277,84 @@ struct MyRoutineRow {
     collation_connection: Option<String>,
 }
 
-/// Read one `information_schema.ROUTINES` row positionally.
+/// The aliases [`MY_ROUTINES_SQL`] gives its columns, in the order it selects
+/// them.
+///
+/// **A third statement of the list, deliberately.** The two that matter are the
+/// query and [`my_routine_row_from`]'s reads, and a test that checked one
+/// against the other would only be checking whether they were written by the
+/// same hand. This is the oracle both are compared against, which is why it is
+/// test-only and why it is written out rather than derived from either.
+#[cfg(test)]
+const MY_ROUTINE_COLUMNS: [&str; 14] = [
+    "n", "ty", "rt", "rtcs", "rtcoll", "body", "det", "acc", "sec", "df", "cmt", "sqlmode", "cscl",
+    "collconn",
+];
+
+/// The routine catalogue read, aliased column by column.
+///
+/// A `const` rather than a literal at the call so a test can read it: the
+/// aliases are what [`my_routine_row`] binds to, and nothing else holds the
+/// two in step.
+const MY_ROUTINES_SQL: &str = "SELECT CAST(ROUTINE_NAME AS CHAR) AS n, \
+     CAST(ROUTINE_TYPE AS CHAR) AS ty, \
+     CAST(COALESCE(DTD_IDENTIFIER, '') AS CHAR) AS rt, \
+     CAST(CHARACTER_SET_NAME AS CHAR) AS rtcs, \
+     CAST(COLLATION_NAME AS CHAR) AS rtcoll, \
+     CAST(ROUTINE_DEFINITION AS CHAR) AS body, \
+     CAST(IS_DETERMINISTIC AS CHAR) AS det, \
+     CAST(SQL_DATA_ACCESS AS CHAR) AS acc, \
+     CAST(SECURITY_TYPE AS CHAR) AS sec, \
+     CAST(DEFINER AS CHAR) AS df, \
+     CAST(COALESCE(ROUTINE_COMMENT, '') AS CHAR) AS cmt, \
+     CAST(SQL_MODE AS CHAR) AS sqlmode, \
+     CAST(CHARACTER_SET_CLIENT AS CHAR) AS cscl, \
+     CAST(COLLATION_CONNECTION AS CHAR) AS collconn \
+     FROM information_schema.ROUTINES \
+     WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_TYPE, ROUTINE_NAME";
+
+/// Read one [`MY_ROUTINES_SQL`] row, by the aliases it gives its columns.
+fn my_routine_row(r: &Row) -> MyRoutineRow {
+    my_routine_row_from(|c| r.get::<Option<String>, &str>(c).flatten())
+}
+
+/// The name→field half of [`my_routine_row`], over any reader.
+///
+/// **By alias, not by position.** The struct replaced a tuple precisely because
+/// fourteen columns is past `mysql_common`'s twelve-element `FromRow` ceiling —
+/// which is the same thing as saying the compiler stopped checking the arity.
+/// The reader that replaced it indexed the row `0..=13` against a `SELECT`
+/// fifteen hundred lines away, with nothing but a doc comment holding the two
+/// in step: insert a column at position 3 and `body` starts reading
+/// `CHARACTER_SET_NAME`, `sql_mode` starts reading `ROUTINE_COMMENT`, the suite
+/// stays green, and what ships is a routine whose Body field shows `utf8mb3`
+/// and a recreate that `DROP`s the routine and re-`CREATE`s it from that — on
+/// the engine whose `DROP` commits on its own.
+///
+/// Split from the `Row` so a test can supply the reader; `mysql_common`'s row
+/// constructor isn't re-exported by `mysql_async`, and the decision here is the
+/// mapping, not the driver.
 ///
 /// Every column is `CAST(… AS CHAR)`, so a value that fails to convert is a
 /// server this app can't read at all; it degrades to the empty string (or
 /// `None`) here for the same reason the neighbouring queries `COALESCE` — a
 /// missing characteristic must not cost the whole schema.
-fn my_routine_row(r: &Row) -> MyRoutineRow {
-    let opt = |i: usize| r.get::<Option<String>, usize>(i).flatten();
-    let text = |i: usize| opt(i).unwrap_or_default();
+fn my_routine_row_from(mut opt: impl FnMut(&str) -> Option<String>) -> MyRoutineRow {
     MyRoutineRow {
-        name: text(0),
-        kind: text(1),
-        returns: text(2),
-        returns_charset: opt(3),
-        returns_collation: opt(4),
-        body: opt(5),
-        deterministic: text(6),
-        data_access: text(7),
-        security: text(8),
-        definer: text(9),
-        comment: text(10),
-        sql_mode: opt(11),
-        charset_client: opt(12),
-        collation_connection: opt(13),
+        name: opt("n").unwrap_or_default(),
+        kind: opt("ty").unwrap_or_default(),
+        returns: opt("rt").unwrap_or_default(),
+        returns_charset: opt("rtcs"),
+        returns_collation: opt("rtcoll"),
+        body: opt("body"),
+        deterministic: opt("det").unwrap_or_default(),
+        data_access: opt("acc").unwrap_or_default(),
+        security: opt("sec").unwrap_or_default(),
+        definer: opt("df").unwrap_or_default(),
+        comment: opt("cmt").unwrap_or_default(),
+        sql_mode: opt("sqlmode"),
+        charset_client: opt("cscl"),
+        collation_connection: opt("collconn"),
     }
 }
 
@@ -4895,6 +4930,60 @@ mod tests {
         // byte 0 of an empty slice and take the process down rather than
         // degrade to the body it already had.
         assert_eq!(routine_body_of("CREATE PROCEDURE `p`() COMMENT"), None);
+    }
+
+    /// **Every field reads the column the query aliases, and it reads all of
+    /// them.** The reader used to index the row `0..=13` against a `SELECT`
+    /// fifteen hundred lines away — the struct replaced a tuple exactly because
+    /// fourteen columns is past `mysql_common`'s `FromRow` ceiling, which is
+    /// the same thing as saying the compiler stopped checking. Insert a column
+    /// at position 3 and `body` read `CHARACTER_SET_NAME` and `sql_mode` read
+    /// `ROUTINE_COMMENT`, with nothing failing; the three tests that exercise
+    /// `mysql_routines` build a `MyRoutineRow` literal and never come through
+    /// here.
+    ///
+    /// The reader now asks by name, so this is the pin on the two remaining
+    /// ways it can drift: a field bound to the wrong alias, and an alias the
+    /// query does not actually declare (which reads as NULL — silently empty,
+    /// not loud).
+    #[test]
+    fn every_routine_field_reads_the_column_the_query_aliases() {
+        // Hand each read back its own column name, and record what was asked.
+        let mut asked: Vec<String> = Vec::new();
+        let r = my_routine_row_from(|c| {
+            asked.push(c.to_string());
+            Some(c.to_string())
+        });
+        assert_eq!(r.name, "n");
+        assert_eq!(r.kind, "ty");
+        assert_eq!(r.returns, "rt");
+        assert_eq!(r.returns_charset.as_deref(), Some("rtcs"));
+        assert_eq!(r.returns_collation.as_deref(), Some("rtcoll"));
+        assert_eq!(r.body.as_deref(), Some("body"));
+        assert_eq!(r.deterministic, "det");
+        assert_eq!(r.data_access, "acc");
+        assert_eq!(r.security, "sec");
+        assert_eq!(r.definer, "df");
+        assert_eq!(r.comment, "cmt");
+        assert_eq!(r.sql_mode.as_deref(), Some("sqlmode"));
+        assert_eq!(r.charset_client.as_deref(), Some("cscl"));
+        assert_eq!(r.collation_connection.as_deref(), Some("collconn"));
+        assert_eq!(asked, MY_ROUTINE_COLUMNS, "one read per declared column");
+
+        // …and the query really declares each of them, as a whole token, in
+        // this order.
+        let mut rest = MY_ROUTINES_SQL;
+        for c in MY_ROUTINE_COLUMNS {
+            let needle = format!(" AS {c}");
+            let at = rest
+                .find(&needle)
+                .unwrap_or_else(|| panic!("the routine query aliases no column `{c}`"));
+            rest = &rest[at + needle.len()..];
+            assert!(
+                matches!(rest.chars().next(), Some(',') | Some(' ')),
+                "`{c}` is only the prefix of the alias the query declares"
+            );
+        }
     }
 
     fn rr(name: &str, ty: &str, returns: &str) -> MyRoutineRow {

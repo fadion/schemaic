@@ -880,8 +880,15 @@ pub(crate) async fn count_rows(
 /// ones cut were its own running statements. `NULLS LAST` and an explicit `state
 /// IS NOT NULL` demote an unreadable row below a readable working one, which is
 /// where `pg_state` and `activity::rank` put it once it arrives.
-const PG_ACTIVITY_SQL: &str = "SELECT s.pid, s.usename, s.client_host, s.datname, s.state, \
-     s.query, s.age, s.blockers FROM ( \
+///
+/// **The outer projection is not written here.** It is built from
+/// [`activity::PG_ACTIVITY_COLUMNS`], which is the same list
+/// [`activity::PgActivityRow::from_slots`] destructures a row in — so a column
+/// added, dropped or moved changes both ends at once. Written out twice, the
+/// fold indexed the row with bare literals against this string in another
+/// crate, and `array::from_fn` padded a short row with `None`s rather than
+/// refusing it.
+const PG_ACTIVITY_SQL: &str = "FROM ( \
      SELECT pid, usename, host(client_addr) AS client_host, datname, state, query, \
      EXTRACT(EPOCH FROM (now() - COALESCE(state_change, query_start, backend_start)))::float8 \
      AS age, \
@@ -901,15 +908,29 @@ const PG_ACTIVITY_SQL: &str = "SELECT s.pid, s.usename, s.client_host, s.datname
 /// the panel has no active database to speak of.
 pub(crate) async fn fetch_sessions(db: &Db) -> Result<Vec<SessionInfo>, DbError> {
     let client = connect_maintenance(db).await?;
-    let sql = format!("{PG_ACTIVITY_SQL}{}", activity::MAX_SESSIONS + 1);
-    let rows = query_all(&client, &sql).await?;
+    let rows = query_all(&client, &pg_activity_sql(activity::MAX_SESSIONS + 1)).await?;
     // The fold is `activity::from_pg_rows` — where every decision about what a
     // `SessionInfo` says lives, reachable from a test with a literal row vector.
+    // A row that isn't the projection's arity is refused there, not padded.
     let rows: Vec<activity::PgActivityRow> = rows
         .iter()
-        .map(|r| std::array::from_fn(|i| opt(r, i)))
+        .filter_map(|r| {
+            let slots: Vec<Option<String>> = (0..activity::PG_ACTIVITY_COLUMNS.len())
+                .map(|i| opt(r, i))
+                .collect();
+            activity::PgActivityRow::from_slots(&slots)
+        })
         .collect();
     Ok(activity::from_pg_rows(&rows))
+}
+
+/// The activity query, projecting [`activity::PG_ACTIVITY_COLUMNS`] in order.
+fn pg_activity_sql(limit: usize) -> String {
+    let projection: Vec<String> = activity::PG_ACTIVITY_COLUMNS
+        .iter()
+        .map(|c| format!("s.{c}"))
+        .collect();
+    format!("SELECT {} {PG_ACTIVITY_SQL}{limit}", projection.join(", "))
 }
 
 /// This connection's backend pid, or `None` if the server didn't answer.
@@ -2752,6 +2773,26 @@ mod tests {
         assert!(
             PG_ACTIVITY_SQL.contains("s.state IS DISTINCT FROM 'idle' AND s.state IS NOT NULL"),
             "a NULL state is not evidence of work"
+        );
+    }
+
+    /// The projection is the one thing that has to agree with
+    /// `activity::PgActivityRow`'s field order, and it is now generated from
+    /// the same list — so this pins the *whole* statement the server sees,
+    /// including that the inner subquery still supplies every projected name.
+    /// Run verbatim against PostgreSQL 16.15.
+    #[test]
+    fn the_activity_query_projects_the_columns_the_fold_reads() {
+        assert_eq!(
+            pg_activity_sql(51),
+            "SELECT s.pid, s.usename, s.client_host, s.datname, s.state, s.query, s.age, \
+             s.blockers FROM ( SELECT pid, usename, host(client_addr) AS client_host, datname, \
+             state, query, EXTRACT(EPOCH FROM (now() - COALESCE(state_change, query_start, \
+             backend_start)))::float8 AS age, pg_blocking_pids(pid)::text AS blockers FROM \
+             pg_stat_activity WHERE (backend_type = 'client backend' OR (backend_type IS NULL \
+             AND usename IS NOT NULL AND datname IS NOT NULL)) AND pid <> pg_backend_pid() ) s \
+             ORDER BY (s.blockers <> '{}') DESC, (s.state IS DISTINCT FROM 'idle' AND s.state \
+             IS NOT NULL) DESC, s.age DESC NULLS LAST LIMIT 51"
         );
     }
 
