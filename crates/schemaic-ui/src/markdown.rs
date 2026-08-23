@@ -724,3 +724,123 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
 /// Corner radius of a code block, shared by the block and its header so the two
 /// arcs agree — see the note in [`code_block`].
 const CODE_RADIUS: f64 = 5.0;
+
+#[cfg(test)]
+mod tests {
+    use super::{code_is_sql, sql_leading_keyword};
+
+    /// The decision this pair encodes is *which code blocks get a Run button*,
+    /// and it is the only place in the chat where a model's output becomes
+    /// something the user can execute against their database in one click. A
+    /// false positive puts Run on a shell command; a false negative hides it
+    /// from the SQL the whole conversation was about.
+
+    #[test]
+    fn every_sql_dialect_tag_is_authoritative() {
+        for lang in [
+            "sql",
+            "mysql",
+            "mariadb",
+            "postgres",
+            "postgresql",
+            "psql",
+            "sqlite",
+            "tsql",
+        ] {
+            assert!(code_is_sql(lang, "anything at all"), "{lang}");
+        }
+    }
+
+    /// Claude writes the fence tag, and it is not consistent about case or a
+    /// stray space after the backticks.
+    #[test]
+    fn a_tag_is_matched_case_insensitively_and_trimmed() {
+        assert!(code_is_sql("SQL", "x"));
+        assert!(code_is_sql("  PostgreSQL  ", "x"));
+    }
+
+    /// **The tag wins over the body.** A block tagged `bash` holding something
+    /// that reads like SQL is still not SQL — `DROP TABLE` inside a heredoc in
+    /// a shell script is exactly the case where offering Run would be worst.
+    #[test]
+    fn a_non_sql_tag_beats_a_sql_looking_body() {
+        assert!(!code_is_sql("bash", "SELECT 1"));
+        assert!(!code_is_sql("json", "SELECT 1"));
+        assert!(!code_is_sql("python", "DROP TABLE t"));
+    }
+
+    #[test]
+    fn an_untagged_block_falls_back_to_its_first_word() {
+        assert!(code_is_sql("", "SELECT 1"));
+        assert!(!code_is_sql("", "npm install"));
+    }
+
+    /// Every statement kind the fallback claims to know, in the case Claude
+    /// actually writes them in. A keyword quietly dropped from the list is a
+    /// Run button that stops appearing, with nothing else to notice it.
+    #[test]
+    fn the_fallback_knows_each_statement_kind_it_lists() {
+        for code in [
+            "SELECT 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "REPLACE INTO t VALUES (1)",
+            "CREATE TABLE t (a int)",
+            "ALTER TABLE t ADD b int",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "SHOW TABLES",
+            "DESCRIBE t",
+            "DESC t",
+            "EXPLAIN SELECT 1",
+            "USE shop",
+            "SET @x = 1",
+            "CALL p()",
+            "GRANT ALL ON *.* TO u",
+            "REVOKE ALL ON *.* FROM u",
+            "RENAME TABLE a TO b",
+            "ANALYZE TABLE t",
+            "OPTIMIZE TABLE t",
+            "START TRANSACTION",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+        ] {
+            assert!(sql_leading_keyword(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_ignores_case_and_leading_whitespace() {
+        assert!(sql_leading_keyword("select 1"));
+        assert!(sql_leading_keyword("\n\n   update t set a = 1"));
+    }
+
+    /// A whole-word match, not a prefix one: the keyword is read by taking
+    /// letters until the first non-letter, so `SELECTED` is its own word and
+    /// not a `SELECT`.
+    #[test]
+    fn the_fallback_matches_a_whole_word_rather_than_a_prefix() {
+        assert!(!sql_leading_keyword("SELECTED rows are shown below"));
+        assert!(!sql_leading_keyword("CREATED_AT is the column"));
+        // …and the word still ends at a non-letter that is not a space.
+        assert!(sql_leading_keyword("SELECT(1)"));
+    }
+
+    /// The known limits, pinned so a change to them is a decision rather than a
+    /// surprise: the fallback reads the *first* word of the block, so a leading
+    /// comment, an opening parenthesis or an empty block all read as not-SQL.
+    /// An untagged block is the uncommon case and a missing Run button is the
+    /// safe way to be wrong.
+    #[test]
+    fn the_fallback_declines_what_does_not_start_with_a_keyword() {
+        assert!(!sql_leading_keyword(""));
+        assert!(!sql_leading_keyword("   "));
+        assert!(!sql_leading_keyword("-- a comment\nSELECT 1"));
+        assert!(!sql_leading_keyword("/* note */ SELECT 1"));
+        assert!(!sql_leading_keyword("(SELECT 1)"));
+        assert!(!sql_leading_keyword("1 + 1"));
+    }
+}

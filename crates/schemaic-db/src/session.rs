@@ -406,10 +406,7 @@ impl Session {
     /// one for an engine we never opened would tell a user their transaction had
     /// died when there was no transaction at all.
     fn tx_engine(&self) -> tx::TxEngine {
-        match self.db.engine() {
-            Engine::Postgres => tx::TxEngine::Postgres,
-            Engine::MySql | Engine::Sqlite => tx::TxEngine::MySql,
-        }
+        tx_engine_of(self.db.engine())
     }
 
     // There's deliberately no `run_batch` here. The fresh-connection one collapses
@@ -493,5 +490,101 @@ impl Session {
             }
         };
         Session::classify(&mut guard, result).await
+    }
+}
+
+/// An engine, in the vocabulary [`schemaic_core::tx`] speaks.
+///
+/// Free rather than a method so the mapping can be asserted without a live
+/// connection — a `Session` cannot be constructed without one, and this is the
+/// only decision in this module that does not need one.
+fn tx_engine_of(engine: Engine) -> tx::TxEngine {
+    match engine {
+        Engine::Postgres => tx::TxEngine::Postgres,
+        Engine::MySql | Engine::Sqlite => tx::TxEngine::MySql,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Almost everything in this module runs on a pinned MySQL or PostgreSQL
+    // connection, which the suite's no-live-DB rule puts out of reach — and
+    // SQLite, the one engine that *can* be driven here, is precisely the engine
+    // `Session::open` refuses. What is testable is that refusal and the engine
+    // mapping, and both are decisions a wrong answer would ship silently.
+
+    fn sqlite_db() -> Db {
+        Db::from_parts(
+            Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "file:session_test?mode=memory&cache=shared".to_string(),
+        )
+    }
+
+    /// **Manual mode's promise is that nothing commits until the user says so.**
+    /// The UI does not offer the mode for a SQLite connection, but a mode that
+    /// quietly ran the tab's statements on auto-committing fresh connections
+    /// would break that promise without a single error — so the backstop is
+    /// here, and an `Ok` from this call is the bug.
+    #[tokio::test]
+    async fn a_sqlite_connection_is_refused_a_pinned_session() {
+        let err = Session::open(&sqlite_db(), None)
+            .await
+            .err()
+            .expect("SQLite must not get a pinned session");
+        let DbError::Connect(msg) = err else {
+            panic!("expected a Connect error, got {err:?}");
+        };
+        // The message is the user's whole explanation — the mode's control is
+        // simply absent, so this string is the only place the reason appears.
+        assert!(msg.to_lowercase().contains("sqlite"), "{msg}");
+        assert!(msg.contains("manual transaction mode"), "{msg}");
+    }
+
+    /// Refused *before* anything is opened. The `file:` target above names a
+    /// database that does not exist, so a refusal that arrived after a connect
+    /// attempt would surface as a file error instead of the explanation — and
+    /// on a real path it would create the file.
+    #[tokio::test]
+    async fn the_sqlite_refusal_does_not_touch_the_file_first() {
+        let db = Db::from_parts(
+            Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "C:/definitely/not/a/real/path/nope.db".to_string(),
+        );
+        let err = Session::open(&db, None).await.err().expect("refused");
+        assert!(
+            matches!(&err, DbError::Connect(m) if m.contains("manual transaction mode")),
+            "a connect attempt leaked through instead of the refusal: {err:?}"
+        );
+    }
+
+    /// PostgreSQL poisons a transaction on any error and only a rollback
+    /// escapes; MySQL's may have implicitly committed. Reading one as the other
+    /// is the difference between "Tx aborted, discard everything" and a
+    /// transaction the user can still commit.
+    #[test]
+    fn each_engine_maps_to_the_transaction_model_it_actually_has() {
+        assert_eq!(tx_engine_of(Engine::Postgres), tx::TxEngine::Postgres);
+        assert_eq!(tx_engine_of(Engine::MySql), tx::TxEngine::MySql);
+    }
+
+    /// SQLite never reaches [`Session::tx_engine`] — `open` refused it — but the
+    /// arm still has to answer, and MySQL's is the safe reading: it assumes a
+    /// statement may have implicitly committed, where Postgres' assumes the
+    /// transaction is poisoned. Claiming the stricter one for an engine that
+    /// never opened a transaction would tell the user theirs had died when
+    /// there was none.
+    #[test]
+    fn the_unreachable_sqlite_arm_answers_with_the_forgiving_model() {
+        assert_eq!(tx_engine_of(Engine::Sqlite), tx::TxEngine::MySql);
     }
 }

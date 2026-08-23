@@ -2215,7 +2215,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (`Session::open`): a pinned `rusqlite::Connection` is blocking and `!Sync`, so holding one across
   awaits means a dedicated thread and a channel, which is worth building deliberately rather than as
   a side effect — and silently running the tab's statements on fresh connections would break exactly
-  the promise the mode makes.
+  the promise the mode makes. That refusal is the one thing in `session.rs` a test can reach, and it
+  is now tested twice: that a SQLite `Db` gets `DbError::Connect` rather than a session, and that it
+  gets it **before** anything is opened (a refusal arriving after a connect attempt would surface as
+  a file error instead of the explanation, and on a real path would create the file). The engine →
+  `tx::TxEngine` mapping moved out of the `Session` method into a free `tx_engine_of` for the same
+  reason — a `Session` cannot exist without a live connection, and reading MySQL's forgiving model
+  as PostgreSQL's poisoned one is the difference between "still committable" and "discard
+  everything".
   SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
   `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
@@ -2279,6 +2286,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     flickering "couldn't read this" on every chunk — until then it is an ordinary code block. A
     block that doesn't parse is neither dropped nor hidden: the user is told it couldn't be read
     *and* still sees what the model wrote, which is what they need to tell it what went wrong.
+    **Which blocks get a Run button is `code_is_sql`, and it is the only place a model's output
+    becomes one click from the user's database** — so the tag is authoritative (a ```bash block
+    holding `DROP TABLE` is not SQL, however it reads) and only an *untagged* block falls back to
+    `sql_leading_keyword`, a whole-word match on the block's first word. The fallback is
+    deliberately narrow: a leading comment, an opening parenthesis or an empty block all read as
+    not-SQL, because an untagged block is the uncommon case and a missing Run button is the safe
+    way to be wrong. Both are unit-tested, including every keyword the list claims — one quietly
+    dropped is a Run button that stops appearing with nothing else to notice it.
   - `settings.rs` — the three settings modals **and the four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
     floem's), `focusable_dropdown` and the picker-agnostic `in_ring_dropdown` under it (which owns
@@ -3580,6 +3595,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     unsaved tab text — the same reasoning the caption bar's close button carries in
     `ui::window_chrome`. Closing the window runs the normal shutdown, and the updater we just handed
     off to is already sitting there waiting for this process to go away.
+    **`FORCE_UPDATE_BADGE` is a development switch and shipping it `true` is a real hazard**, which
+    is why a test now holds it down. It pins the state at `UpdateState::Ready` and skips the real
+    check — the only way to look at the "Restart to update" chip while working on it, since every
+    other route there needs two tagged releases and an update genuinely in flight. Left `true` in a
+    commit it would show every user a permanent restart offer that does nothing (nothing is staged,
+    so `apply_action` returns early), and nothing else in the tree reads it, so the build would be
+    perfectly green. `the_forced_update_badge_is_off_in_a_committed_tree` is the part that notices;
+    a `const _: () = assert!(…)` would catch it a step earlier but refuse to compile exactly when a
+    developer has flipped it on purpose. The module's own *decisions* live in `core::update`
+    (`check_gate`, `should_recheck`, `UpdateState::with_progress`) and are tested there — what is
+    left here is orchestration that needs a real install and a real feed, plus the constants, so
+    the constants are what the local tests pin: the switch, the published `OPT_OUT_VAR` name, the
+    feed URL, and `RECHECK_INTERVAL` against the anonymous rate limit.
     **Every leg packs on an explicit, non-default Velopack channel — `win-x64`, `linux-x64`,
     `osx-arm64` — and those three strings are effectively permanent.** Left to default the channel
     would be plain `win` and `linux`, and a *default* channel reaches only the manifest name: both

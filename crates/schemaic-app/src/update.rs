@@ -318,3 +318,63 @@ fn apply_action(
         });
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FORCE_UPDATE_BADGE, OPT_OUT_VAR, RECHECK_INTERVAL, RELEASE_REPO};
+
+    // The rest of this module is orchestration over Velopack and Floem scopes —
+    // a worker thread, two `create_ext_action` hops, a self-holding re-arm
+    // closure — and none of it can be driven without a real install and a real
+    // feed. Its *decisions* were pushed down into `core::update` (`check_gate`,
+    // `should_recheck`, `UpdateState::with_progress`) and are tested there. What
+    // is left here is the constants, and one of them is a live hazard.
+
+    /// **The dev switch, shipped.** `FORCE_UPDATE_BADGE` pins the header at
+    /// "Restart to update" and skips the real check — the only way to look at
+    /// that chip while working on it. Left `true` in a commit it would show
+    /// every user a permanent restart offer that does nothing at all, and the
+    /// build would be perfectly green: nothing else in the tree reads it, and a
+    /// dev build looks correct precisely because that is what it was flipped
+    /// for. Its own doc comment says it must stay `false`; this is the part
+    /// that notices.
+    ///
+    /// A `const _: () = assert!(…)` would catch it a step earlier but at the
+    /// wrong cost: it would refuse to *compile* while the switch is flipped,
+    /// which is exactly when a developer needs the build to work.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_forced_update_badge_is_off_in_a_committed_tree() {
+        assert!(
+            !FORCE_UPDATE_BADGE,
+            "FORCE_UPDATE_BADGE is a local development switch — flip it back before committing"
+        );
+    }
+
+    /// The opt-out is a documented promise in the README and the privacy
+    /// section: renaming the variable silently breaks it for everyone who set
+    /// it, and nothing about the app would look different.
+    #[test]
+    fn the_opt_out_variable_keeps_the_name_that_was_published() {
+        assert_eq!(OPT_OUT_VAR, "SCHEMAIC_NO_UPDATE_CHECK");
+    }
+
+    /// Two requests per round against GitHub's 60/hour anonymous limit. The
+    /// interval could be far shorter without trouble; it must not be so short
+    /// that a long session starts approaching it, and it must not be zero,
+    /// which would turn the re-arm into a spin.
+    #[test]
+    fn the_recheck_interval_stays_clear_of_the_anonymous_rate_limit() {
+        let per_hour = 2.0 * 3600.0 / RECHECK_INTERVAL.as_secs_f64();
+        assert!(RECHECK_INTERVAL.as_secs() > 0);
+        assert!(per_hour < 6.0, "{per_hour} requests/hour");
+    }
+
+    /// The feed's identity. A wrong owner or repo here checks someone else's
+    /// releases, which is the one failure mode of this module that could hand
+    /// a user a binary that is not ours.
+    #[test]
+    fn the_release_feed_points_at_this_repository() {
+        assert_eq!(RELEASE_REPO, "https://github.com/fadion/schemaic");
+    }
+}
