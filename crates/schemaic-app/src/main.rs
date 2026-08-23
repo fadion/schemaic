@@ -764,6 +764,46 @@ fn check_continues(started: (u64, u64), current: (u64, u64)) -> bool {
     started.0 == current.0
 }
 
+/// What a landed health check is allowed to do.
+///
+/// The two predicates above answer half a question each, and the *composition*
+/// is the whole decision — which is why it lives here rather than inline at the
+/// call site. A review found a `return` inserted between the two calls that
+/// reproduced the bug [`check_continues`] exists to prevent, with both
+/// predicates still tested and still green: the seam had no subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CheckOutcome {
+    /// Repaint the header (and count the result toward the backoff)?
+    write_status: bool,
+    /// Answer the `with_conn` continuation waiting on this check, and with what.
+    ///
+    /// `None` means there is nobody to answer *about this server* — the user has
+    /// switched connections. It never means "the answer wasn't good enough":
+    /// dropping the reply is what makes a clicked button do nothing at all.
+    answer: Option<bool>,
+}
+
+/// Decide what a health check that has just landed may do.
+///
+/// The two rules are independent, and the asymmetry between them is the point:
+/// a superseded result may not *write* (an old failure repainting "Disconnected"
+/// over a server that is answering), but it must still *answer*, including when
+/// the answer is `false`. Refusing to answer a superseded failure is the same
+/// dropped continuation under a different name — and since `with_conn` only
+/// pings when the connection is already down, `!ok` is the common case there,
+/// not the corner one.
+///
+/// The spurious-modal case that motivates suppressing a stale `false` is
+/// answered by the *caller* instead: `with_conn` re-reads `conn_status` before
+/// it refuses, so a newer check that landed `Connected` in the meantime runs the
+/// action rather than raising "Not connected" over it.
+fn check_outcome(started: (u64, u64), current: (u64, u64), ok: bool) -> CheckOutcome {
+    CheckOutcome {
+        write_status: check_landing(started, current),
+        answer: check_continues(started, current).then_some(ok),
+    }
+}
+
 /// What one database of a landed connection load becomes: an existing node kept,
 /// or a fresh node at this id. Both carry the node id, because the schema tree's
 /// `dyn_stack` is keyed on it.
@@ -2985,7 +3025,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 // in-flight reply (it would be describing a
                                 // server state that no longer holds) and frees
                                 // the guard for this one.
-                                activity_gen.update(|g| *g = g.wrapping_add(1));
+                                //
+                                // **And re-arms.** The bump strands the poll
+                                // loop as surely as it strands the fetch, and
+                                // for a while nothing here started a new one:
+                                // auto-refresh died permanently at the first
+                                // successful kill, on the panel whose subject is
+                                // a live server, immediately after the one
+                                // action that changes it.
+                                rearm_activity(
+                                    activity_gen,
+                                    activity_interval,
+                                    refresh.clone(),
+                                    true,
+                                );
                                 (refresh)();
                             }
                         }
@@ -2999,9 +3052,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     };
 
     // Open / close / repoint the panel. One effect rather than three, because the
-    // generation bump, the snapshot reset and the re-arm have to happen in that
+    // generation bump, the snapshot reset and the refresh have to happen in that
     // order and a second effect firing between them is what leaves a stale list on
-    // screen under a new connection's heading.
+    // screen under a new connection's heading. (The re-arm rides with the bump in
+    // `rearm_activity` and only schedules a timer, so where it falls among the
+    // three is not observable — that it happens at all is.)
     //
     // The panel is polled only while it is *open* **and the window has focus**: a
     // two-second query against `information_schema` that nobody can see is pure
@@ -3038,18 +3093,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // server that prompted the change.
             let woke = prev.is_none_or(|(_, was_open, _)| !was_open);
             // Bumping first is what strands every timer and every in-flight fetch
-            // armed under the old state.
-            let generation = activity_gen.get_untracked().wrapping_add(1);
-            activity_gen.set(generation);
+            // armed under the old state — and the re-arm rides with it, so the
+            // panel cannot be left bumped-but-unarmed.
+            rearm_activity(activity_gen, activity_interval, refresh.clone(), open);
             if conn_changed {
                 activity_state.set(ActivityState::Idle);
                 activity_kill_error.set(None);
             }
-            if open {
-                if conn_changed || woke {
-                    (refresh)();
-                }
-                activity_poll(generation, activity_gen, activity_interval, refresh.clone());
+            if open && (conn_changed || woke) {
+                (refresh)();
             }
             (conn, open, secs)
         });
@@ -4670,7 +4722,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             health_gen.set(stamp.1);
             let send = create_ext_action(cx, move |ok: bool| {
                 let now = (active_conn.get_untracked(), health_gen.get_untracked());
-                if check_landing(stamp, now) {
+                // The whole decision is `check_outcome`; this closure is a
+                // `match` on it and holds no rule of its own. Anything inserted
+                // between the two halves below belongs in that function, where a
+                // test can see it.
+                let outcome = check_outcome(stamp, now, ok);
+                if outcome.write_status {
                     conn_status.set(if ok {
                         ConnStatus::Connected
                     } else {
@@ -4681,28 +4738,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // reset the timer's patience either.
                     health_failures.set(health::record(health_failures.get_untracked(), ok));
                 }
-                // Answered on the looser rule, because this is somebody's click
-                // waiting on a reply rather than a repaint of the header — see
-                // `check_continues`. A poll ticking inside the five seconds this
-                // ping takes used to supersede it and drop the action on the
-                // floor, with nothing shown either way.
-                //
-                // **The looser rule is asymmetric, and it has to be.** A
-                // superseded result is good enough to *proceed* on — it is an
-                // answer about the same server, seconds old. It is not good
-                // enough to *refuse* on: the very interleaving the generation
-                // exists for is "the server came back mid-ping", and a stale
-                // `false` then raised "Not connected" over a header a newer check
-                // had just set to Connected, on a connection that was up. A
-                // superseded failure defers to whatever the newer check said.
-                let superseded = !check_landing(stamp, now);
-                if superseded && !ok {
-                    return;
-                }
-                if check_continues(stamp, now)
+                if let Some(answer) = outcome.answer
                     && let Some(f) = &done
                 {
-                    f(ok);
+                    f(answer);
                 }
             });
             handle.spawn(async move {
@@ -4742,7 +4781,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 })
                 .unwrap_or_else(|| "this connection".to_string());
             (check_conn_then)(Some(Rc::new(move |ok: bool| {
-                if ok {
+                // A *superseded* failure still lands here — dropping it upstream
+                // is what makes Run do nothing at all. What it must not do is
+                // raise "Not connected" over a header a newer check has since
+                // set to Connected, so the refusal re-reads the status: if
+                // something more recent than our own ping says the server is up,
+                // that is the better answer and the action proceeds.
+                if ok || !conn_status.get_untracked().is_down() {
                     action();
                 } else {
                     // Still unreachable — say so, rather than letting the action
@@ -7822,6 +7867,36 @@ fn monitor_reschedule(ctx: MonitorCtx, my_gen: u64) {
     });
 }
 
+/// Bump the Server Activity generation and arm the poll loop under the new one.
+///
+/// **The two halves are one operation.** A bump strands every timer and every
+/// in-flight fetch armed under the old generation — that is what it is for — but
+/// [`activity_poll`]'s loop is one of the things it strands, so a bump that
+/// nothing re-arms doesn't pause the auto-refresh, it ends it until something
+/// else re-runs the panel effect. The kill handler bumped without arming and
+/// froze the panel permanently after any successful kill.
+///
+/// `poll` is the caller's answer to "should this panel be polling at all" —
+/// false bumps only, which is how closing the panel or losing focus stops the
+/// loop without starting another. `activity_poll` still refuses an interval of
+/// `0` (auto-refresh off) on its own.
+///
+/// Returns the new generation, which the caller needs for anything else it
+/// stamps against this one.
+fn rearm_activity(
+    gen_sig: RwSignal<u64>,
+    interval: floem::reactive::Memo<u64>,
+    refresh: Rc<dyn Fn()>,
+    poll: bool,
+) -> u64 {
+    let generation = gen_sig.get_untracked().wrapping_add(1);
+    gen_sig.set(generation);
+    if poll {
+        activity_poll(generation, gen_sig, interval, refresh);
+    }
+    generation
+}
+
 /// Arm the Server Activity panel's next poll, and keep arming after each one.
 ///
 /// `generation` is the value `activity_gen` held when this loop was started. Every
@@ -7948,6 +8023,34 @@ mod app_tests {
     use schemaic_core::connection::Connection;
     use schemaic_ui::InlineAiState;
 
+    /// Every bump of `activity_gen` must arm the poll loop in the same breath.
+    ///
+    /// `activity_poll` carries the generation it was armed under and returns the
+    /// moment the signal differs — so a bump that nothing re-arms doesn't *pause*
+    /// Server Activity's auto-refresh, it **ends** it. That is what the kill
+    /// handler did: bump, `(refresh)()`, and the panel froze permanently after
+    /// any successful kill while the clock's tooltip still read "every 5s".
+    ///
+    /// The pairing has no runtime subject — `exec_after` and `main.rs`'s signal
+    /// graph are not reachable from a test — so the subject is the source text,
+    /// the way `core/tests/doc_coverage.rs` takes a file as its subject: the
+    /// signal has no direct writer left, because `rearm_activity` — which cannot
+    /// be spelled without the arm — is the only thing that writes it.
+    #[test]
+    fn every_activity_generation_bump_arms_the_poll_loop() {
+        let writes: Vec<&str> = include_str!("main.rs")
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("activity_gen.set(") || l.starts_with("activity_gen.update("))
+            .collect();
+        assert_eq!(
+            writes,
+            [] as [&str; 0],
+            "activity_gen is bumped outside `rearm_activity`, so this caller can \
+             strand the poll loop without arming a new one"
+        );
+    }
+
     #[test]
     fn returns_base_when_unused() {
         assert_eq!(unique_name("Query", &[]), "Query");
@@ -8029,28 +8132,49 @@ mod app_tests {
     /// seconds against a dead host, the health poll ticks inside that window and
     /// bumps the generation — and the user's action vanished with no error, which
     /// is exactly what `with_conn` exists to prevent.
+    ///
+    /// **Asserted on `check_outcome`, not on the two predicates.** The earlier
+    /// spelling of this test called `check_landing` and `check_continues`
+    /// separately and stayed green while a `return` sat between them at the one
+    /// call site, reproducing the exact sequence this docstring describes. The
+    /// subject has to be the composition.
     #[test]
     fn a_superseded_check_still_answers_the_action_that_asked() {
-        use super::{check_continues, check_landing};
+        use super::check_outcome;
+        // The failing ping the user is waiting on, landing after a poll has
+        // bumped the generation. It may not repaint the header — but it is the
+        // only reply the Run button is ever going to get.
+        let superseded_failure = check_outcome((7, 3), (7, 4), false);
         assert!(
-            !check_landing((7, 3), (7, 4)),
+            !superseded_failure.write_status,
             "no longer writes the status"
         );
-        assert!(
-            check_continues((7, 3), (7, 4)),
-            "but it is still an answer about connection 7"
+        assert_eq!(
+            superseded_failure.answer,
+            Some(false),
+            "but it still answers the action about connection 7"
         );
-        assert!(check_continues((7, 3), (7, 3)), "the ordinary case");
+        // The same interleaving with a server that answered.
+        assert_eq!(check_outcome((7, 3), (7, 4), true).answer, Some(true));
+        // The ordinary case: nothing superseded it, so it does both.
+        let ordinary = check_outcome((7, 3), (7, 3), false);
+        assert!(ordinary.write_status);
+        assert_eq!(ordinary.answer, Some(false));
     }
 
     #[test]
     fn a_check_of_a_connection_the_user_left_answers_nothing() {
-        use super::check_continues;
+        use super::check_outcome;
         // The line the looser rule still holds: running an action gated on a
         // server the user has walked away from, or reporting the old connection
         // unreachable in a modal sitting over the new one.
-        assert!(!check_continues((7, 3), (8, 4)));
-        assert!(!check_continues((7, 3), (8, 3)));
+        for ok in [true, false] {
+            for now in [(8, 4), (8, 3)] {
+                let outcome = check_outcome((7, 3), now, ok);
+                assert_eq!(outcome.answer, None, "{now:?} is a different connection");
+                assert!(!outcome.write_status);
+            }
+        }
     }
 
     /// The level `load_landing` doesn't reach. `try_update` guards a *disposed*
