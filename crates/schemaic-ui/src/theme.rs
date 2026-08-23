@@ -219,6 +219,12 @@ pub fn tab_close() -> Color {
 pub fn accent() -> Color {
     ui().accent
 }
+// Hover brighten for an accent-coloured control with no fill behind it — the
+// results strip's read-more offer. Moves away from the surface, which is not
+// the same direction in both themes; see `UiTheme::accent_hover`.
+pub fn accent_hover() -> Color {
+    ui().accent_hover
+}
 
 // ── Inline (Ctrl+K) AI prompt + diff overlay ─────────────────────────────────
 pub fn cmdk_placeholder() -> Color {

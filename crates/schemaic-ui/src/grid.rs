@@ -5600,7 +5600,6 @@ fn grid_toolbar(
             focus_icon(tabindex, ring);
         }
     };
-    let cap = if truncated { " (capped)" } else { "" };
     // The database leads the line, because it is the fact that says what the rest
     // of the line is *about*. Taken from the result rather than the tab: the tab's
     // selection moves on, and a result that outlived it must not claim the new one
@@ -5609,18 +5608,29 @@ fn grid_toolbar(
     let scope = database.map(|d| format!("{d} · ")).unwrap_or_default();
     // A `label` rather than `text`, for the one part of this line that isn't
     // settled at build time: a capped result's total arrives from a catalogue
-    // query, and the line reads `1,000 of ~4.2m rows (capped)` once it does.
-    // `plural` still follows the rows actually **read** — it is the subject of
-    // the sentence, and `1 of ~4.2m row` would be the wrong noun on a 1-row page.
+    // query, and the line reads `1,000 of ~4.2m rows` once it does. The row
+    // segment — figure, noun, and the `(capped)` notice when the figure hasn't
+    // already made it — is `stats::rows_read_clause`'s whole job, because it is
+    // the composition of those three that has to read well, not each alone.
+    //
+    // **This is the segment that gives way when the strip runs out of room**
+    // (`min_width(0)` + `text_ellipsis` below, against a `flex_shrink(0)` icon
+    // cluster): it is the only part of the line that is pure description, so a
+    // narrow panel eats the database name and the timing before it touches an
+    // action or a warning.
     let stats = label(move || {
         format!(
-            "{scope}{} {}{cap} · {ncols} {} · {elapsed_ms} ms",
-            schemaic_core::stats::rows_read_of(nrows, row_total.get()),
-            plural(nrows, "row", "rows"),
+            "{scope}{} · {ncols} {} · {elapsed_ms} ms",
+            schemaic_core::stats::rows_read_clause(nrows, row_total.get(), truncated),
             plural(ncols, "col", "cols"),
         )
     })
-    .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL));
+    .style(|s| {
+        s.color(theme::text_dim())
+            .font_size(theme::FONT_LABEL)
+            .min_width(0.0)
+            .text_ellipsis()
+    });
     // A column whose 512 MiB text arena filled up renders blank from that row
     // on. Said out loud, because the alternative is the user discovering empty
     // cells partway down a result with nothing to attribute them to — and unlike
@@ -5628,11 +5638,20 @@ fn grid_toolbar(
     let arena_note = if capped_columns.is_empty() {
         empty().into_any()
     } else {
+        // Ellipsizable like `stats`, and for the opposite reason: the column
+        // list can be long enough to push the whole strip on its own, and a
+        // warning nobody can read because it shoved the buttons off the edge is
+        // worse than one that ends in `…`.
         text(format!(
             "· {} too large to hold in full — later rows show blank",
             capped_columns.join(", ")
         ))
-        .style(|s| s.color(theme::error()).font_size(theme::FONT_LABEL))
+        .style(|s| {
+            s.color(theme::error())
+                .font_size(theme::FONT_LABEL)
+                .min_width(0.0)
+                .text_ellipsis()
+        })
         .into_any()
     };
     // Sorting a capped result reorders only the fetched subset — flag it.
@@ -5641,13 +5660,22 @@ fn grid_toolbar(
         move |show| {
             if show {
                 text("· sorted subset (capped) — not the full order")
-                    .style(|s| s.color(theme::error()).font_size(theme::FONT_LABEL))
+                    .style(|s| {
+                        s.color(theme::error())
+                            .font_size(theme::FONT_LABEL)
+                            .min_width(0.0)
+                            .text_ellipsis()
+                    })
                     .into_any()
             } else {
                 empty().into_any()
             }
         },
-    );
+    )
+    // The `dyn_container` is what the strip lays out, so the squeeze has to be
+    // allowed through here as well — a wrapper at its min-content width would
+    // hold the text at full size however the child is styled.
+    .style(|s| s.min_width(0.0));
     // **Getting past the cap, for this result only.**
     //
     // The cap is a client-side cutoff of the result stream (`db::collect_rows`),
@@ -5666,17 +5694,45 @@ fn grid_toolbar(
             if !show {
                 return empty().into_any();
             }
+            // **Accent-coloured, because it is the only thing on this line that
+            // does something.** It used to be `text_dim` like the description
+            // beside it and reached the accent only under the pointer, which
+            // put the whole affordance behind a hover: a user who never swept
+            // that word never learned the cap could be lifted at all. The
+            // separator stays dim — it belongs to the line, not to the offer,
+            // and a blue `·` reads as part of the link.
+            //
+            // Two views rather than one string, and the colour is driven off an
+            // explicit hovered signal rather than `.hover()`: a parent's hover
+            // colour does not cascade to a child (the same reason the commit
+            // control keeps `commit_hov`), and the click target is the pair, so
+            // the dot has to brighten the words with it.
+            let offer_hov = RwSignal::new(false);
             // A `label`, and for the same reason `stats` beside it is one: the
             // total arrives from a catalogue query after the strip is built, and
             // it is what decides whether the offer is a step ("read 5k rows") or
-            // the whole thing ("read all ~292.02k rows"). Built once, the offer
-            // named a million rows for a table with 292 thousand.
-            label(move || {
-                format!(
-                    "· {}",
-                    schemaic_core::stats::read_more_offer(nrows, row_total.get()).1
-                )
-            })
+            // the whole thing ("read all rows"). Built once, the offer named a
+            // million rows for a table with 292 thousand.
+            h_stack((
+                text("·").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+                label(move || schemaic_core::stats::read_more_offer(nrows, row_total.get()).1)
+                    .style(move |s| {
+                        // Stays blue on hover and steps *away from the surface*
+                        // (`accent_hover`) rather than going white: the accent is
+                        // what says the words are pressable, and a hover that
+                        // trades it for the same colour as ordinary text reads as
+                        // the link switching off at the moment it is aimed at.
+                        let c = if offer_hov.get() {
+                            theme::accent_hover()
+                        } else {
+                            theme::accent()
+                        };
+                        s.color(c).font_size(theme::FONT_LABEL)
+                    }),
+            ))
+            .style(|s| s.flex_row().items_center().gap(4.0))
+            .on_event_cont(EventListener::PointerEnter, move |_| offer_hov.set(true))
+            .on_event_cont(EventListener::PointerLeave, move |_| offer_hov.set(false))
             .on_click_stop(move |_| {
                 let Some(sql) = gs.current_statement() else {
                     return;
@@ -5694,14 +5750,13 @@ fn grid_toolbar(
                     run(sql);
                 }
             })
-            .style(|s| {
-                s.color(theme::text_dim())
-                    .font_size(theme::FONT_LABEL)
-                    .hover(|s| s.color(theme::accent()))
-            })
             .into_any()
         },
-    );
+    )
+    // The one piece of prose on this line that is a *control*: it keeps its full
+    // width while `stats` gives way, because a half-word offer is not one, and
+    // clipping the click target is worse than clipping the description.
+    .style(|s| s.flex_shrink(0.0_f32));
 
     // Commit / discard, shown only when there are staged changes (cell edits +
     // pending new rows + pending deletes). Sits first in the icon cluster, followed
@@ -6191,14 +6246,21 @@ fn grid_toolbar(
             (open_save)()
         }),
     ))
-    .style(|s| s.items_center().flex_row().gap(3.0));
+    // **The half of the strip that never gives way.** Everything to its left is
+    // words and can be ellipsized; these are the only way to commit, export or
+    // add a row, and a flex row shrinks its children before it overflows — so
+    // without this the description won the fight and pushed the buttons off the
+    // right edge of a narrow panel.
+    .style(|s| s.items_center().flex_row().gap(3.0).flex_shrink(0.0_f32));
 
     h_stack((
         stats,
         read_more,
         arena_note,
         caveat,
-        empty().style(|s| s.flex_grow(1.0_f32)),
+        // Shrinks to nothing before anything else does — it is only here to
+        // push the icons right when the line is short.
+        empty().style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
         icons_cluster,
     ))
     .style(|s| {

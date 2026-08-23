@@ -704,12 +704,43 @@ pub fn catalogue_key(
 /// all that is decided here is whether the figure adds anything. A total at or
 /// below what was already read says nothing the line doesn't — and would print
 /// `1,000 of ~400`, which reads as a bug rather than as the stale estimate it is.
-pub fn rows_read_of(loaded: usize, total: Option<RowCount>) -> String {
+fn rows_read_of(loaded: usize, total: Option<RowCount>) -> String {
     let read = human_count(loaded);
     match total {
         Some(t) if t.value() > loaded as u64 => format!("{read} of {}", t.label()),
         _ => read,
     }
+}
+
+/// The whole row segment of the results toolbar — the figure, its noun, and the
+/// capped notice if one is still needed: `42 rows`, `200k rows (capped)`,
+/// `200k of ~292.02k rows`.
+///
+/// **The notice and the comparison say the same thing, so only one of them
+/// speaks.** A total is in hand *only* for a capped read — `grid_view`'s
+/// `scanned` is gated on `truncated` before the catalogue is ever asked — so
+/// `200k of ~292.02k rows` cannot mean anything but a read that stopped short,
+/// and `(capped)` after it spends nine characters restating it. On a line that
+/// already crowds the toolbar buttons off a narrow panel that is nine characters
+/// too many. The word stays for the case with no comparison to make: no total,
+/// or one too stale to print (`rows_read_of`'s rule), where it is the only
+/// thing that says the result is partial.
+///
+/// The noun follows the last figure named, which is the total when there is one:
+/// `1 of ~4.2m row` is the wrong noun, and so is `0 of 1 rows`.
+pub fn rows_read_clause(loaded: usize, total: Option<RowCount>, truncated: bool) -> String {
+    let figure = rows_read_of(loaded, total);
+    // Whether the total was *named* is what decides both the noun and the
+    // notice, and only `rows_read_of` knows it — asking `total.is_some()` here
+    // would count a stale figure it dropped.
+    let named = total.filter(|t| t.value() > loaded as u64);
+    let noun = crate::text::plural(named.map_or(loaded, |t| t.value() as usize), "row", "rows");
+    let cap = if truncated && named.is_none() {
+        " (capped)"
+    } else {
+        ""
+    };
+    format!("{figure} {noun}{cap}")
 }
 
 /// How much bigger the next read of a capped result should be.
@@ -763,14 +794,18 @@ fn round_up_2sf(n: usize) -> usize {
 /// exist.** A 200k read of a ~292k table stepped to a million and the toolbar
 /// said "read 1m rows" — a number nothing would ever reach, on a table the same
 /// line had just described as ~292.02k. Where the whole statement is within one
-/// click, the offer says *that* instead, in the figure the line already shows.
+/// click, the offer says *that* instead — and says it in words, because the
+/// figure it would name is [`rows_read_clause`]'s, three words to the left on
+/// the same line. `read all ~292.02k rows` printed the total twice and helped
+/// crowd the toolbar's buttons off a narrow panel; `read all rows` is the same
+/// offer, and the only one it could be.
 ///
 /// The total is only ever consulted, never trusted as a limit. It is usually the
 /// engine's own sampled estimate, so the cap that goes with "read all" is the
 /// total rounded up rather than the total exactly — and if the estimate was low,
 /// the re-run simply comes back capped again and offers again, which is the
 /// self-correcting answer. A total at or below what was already read is stale
-/// and says nothing, exactly as it does for [`rows_read_of`].
+/// and says nothing, exactly as it does for [`rows_read_clause`].
 pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, String) {
     let step = next_row_cap(rows_read);
     match total {
@@ -779,7 +814,7 @@ pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, Str
             // Rounded up, and never below what the step would have to clear to
             // be an improvement at all.
             let cap = round_up_2sf(t.value() as usize).max(rows_read + 1);
-            (cap, format!("read all {} rows", t.label()))
+            (cap, "read all rows".to_string())
         }
         _ => (
             step,
@@ -1569,6 +1604,59 @@ mod tests {
         assert_eq!(rows_read_of(1_000, Some(RowCount::Exact(1_000))), "1k");
     }
 
+    /// **The line said "capped" twice.** `200k of ~292.02k rows (capped)` spends
+    /// nine characters restating what the `of` clause has already said — a total
+    /// is only ever in hand for a capped read — and the strip it sits in pushes
+    /// the toolbar buttons off the right edge of a narrow panel.
+    #[test]
+    fn the_capped_word_is_left_out_when_the_comparison_already_says_it() {
+        assert_eq!(
+            rows_read_clause(200_000, Some(RowCount::Estimate(292_020)), true),
+            "200k of ~292.02k rows"
+        );
+        assert_eq!(
+            rows_read_clause(1_000, Some(RowCount::Exact(4_213_551)), true),
+            "1k of 4,213,551 rows"
+        );
+    }
+
+    /// With no comparison to make, the word is the only thing on the line that
+    /// says the result is partial — a figure that says nothing (none in hand, or
+    /// one too stale to print) leaves the notice carrying it alone.
+    #[test]
+    fn the_capped_word_stays_when_no_total_is_named() {
+        assert_eq!(rows_read_clause(200_000, None, true), "200k rows (capped)");
+        assert_eq!(
+            rows_read_clause(1_000, Some(RowCount::Estimate(400)), true),
+            "1k rows (capped)"
+        );
+        assert_eq!(
+            rows_read_clause(1_000, Some(RowCount::Exact(1_000)), true),
+            "1k rows (capped)"
+        );
+    }
+
+    #[test]
+    fn an_uncapped_result_just_counts_what_it_holds() {
+        assert_eq!(rows_read_clause(42, None, false), "42 rows");
+        assert_eq!(rows_read_clause(0, None, false), "0 rows");
+    }
+
+    /// The noun belongs to the figure it follows, and the total is the last one
+    /// named: `1 of ~4.2m row` and `0 of 1 rows` are both the wrong word.
+    #[test]
+    fn the_noun_follows_the_last_figure_named() {
+        assert_eq!(rows_read_clause(1, None, false), "1 row");
+        assert_eq!(
+            rows_read_clause(1, Some(RowCount::Estimate(4_200_000)), true),
+            "1 of ~4.2m rows"
+        );
+        assert_eq!(
+            rows_read_clause(0, Some(RowCount::Exact(1)), true),
+            "0 of 1 row"
+        );
+    }
+
     // ── Reading more of a capped result ──────────────────────────────────────
 
     /// The offer is a concrete number, so it has to be a *round* one — an
@@ -1630,18 +1718,55 @@ mod tests {
     #[test]
     fn a_total_within_reach_is_offered_as_all_of_it() {
         let (cap, label) = read_more_offer(200_000, Some(RowCount::Estimate(292_020)));
-        assert_eq!(label, "read all ~292.02k rows");
-        assert!(!label.contains('1'), "{label}"); // no "1m" anywhere
+        assert_eq!(label, "read all rows");
+        // No figure at all, so certainly not the wrong one: the total is three
+        // words to the left on the same line, and naming it twice is what made
+        // the strip too wide to hold its buttons.
+        assert!(!label.contains(char::is_numeric), "{label}");
         // Rounded up past the estimate, so a slightly low one doesn't re-cap.
         assert!(cap >= 292_020, "{cap}");
         assert_eq!(cap, 300_000);
     }
 
     #[test]
-    fn an_exact_total_within_reach_is_named_exactly() {
+    fn an_exact_total_within_reach_is_still_just_all_of_it() {
         let (cap, label) = read_more_offer(1_000, Some(RowCount::Exact(4_213)));
-        assert_eq!(label, "read all 4,213 rows");
+        assert_eq!(label, "read all rows");
         assert!(cap >= 4_213, "{cap}");
+    }
+
+    /// **The seam the two halves meet at.** Each was honest on its own and the
+    /// pair printed `~292.02k` twice and *capped* twice, because nothing tested
+    /// the sentence the toolbar actually assembles (`grid::results_strip`). The
+    /// line is the unit that has to read well, so the line is what is asserted.
+    #[test]
+    fn the_toolbar_line_names_the_total_once() {
+        let total = Some(RowCount::Estimate(292_020));
+        let line = format!(
+            "employees · {} · 6 cols · 588 ms · {}",
+            rows_read_clause(200_000, total, true),
+            read_more_offer(200_000, total).1
+        );
+        assert_eq!(
+            line,
+            "employees · 200k of ~292.02k rows · 6 cols · 588 ms · read all rows"
+        );
+        assert_eq!(line.matches("~292.02k").count(), 1);
+        assert_eq!(line.matches("capped").count(), 0);
+    }
+
+    /// The other branch keeps its figure: the step is a number that appears
+    /// nowhere else on the line, and dropping it would leave the offer implying
+    /// a cursor ("read more") that the row cap has none of.
+    #[test]
+    fn the_step_offer_still_names_the_number_it_asks_for() {
+        let total = Some(RowCount::Estimate(4_200_000));
+        let line = format!(
+            "{} · {}",
+            rows_read_clause(200_000, total, true),
+            read_more_offer(200_000, total).1
+        );
+        assert_eq!(line, "200k of ~4.2m rows · read 1m rows");
     }
 
     /// Out of reach, or unknown, and the offer is the step — the case the
