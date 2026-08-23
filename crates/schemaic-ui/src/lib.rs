@@ -3310,6 +3310,7 @@ fn switcher_chrome(s: floem::style::Style) -> floem::style::Style {
 fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
+    let menus = widgets::MenuFlags::of(&ui);
     let conn_menu_open = ui.conn.conn_menu_open;
     let conn_status = ui.conn.conn_status;
     let find_open = ui.overlay.find_open;
@@ -3335,7 +3336,25 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
             ))
             .style(|s| s.flex_row().items_center().gap(6.0)),
         )
-        .on_click_stop(move |_| conn_menu_open.update(|o| *o = !*o))
+        .on_click_stop(move |_| {
+            // Mutual exclusivity is the trigger's own job once it absorbs the
+            // press: the root's `close_except(None)` no longer runs for it, so
+            // opening this one has to close the others itself — the shape the
+            // schema eye, the gear and the activity clock already have.
+            menus.close_except(Some(widgets::MenuId::Connection));
+            conn_menu_open.update(|o| *o = !*o);
+        })
+        // **A menu trigger absorbs its own pointer-down**, which is the premise
+        // `MenuFlags::close_except(None)` at the workspace root rests on:
+        // `on_click_stop` registers a `Click` handler and nothing else, so the
+        // root's dismissal ran first, closed this menu, and the `Click` above
+        // reopened it — the switcher could not be shut from the control that
+        // opened it. It was one of two triggers on the shared list without this
+        // decorator, and the only two.
+        .on_event_stop(
+            EventListener::PointerDown,
+            crate::widgets::menu_trigger_press,
+        )
         .style(move |s| {
             switcher_chrome(s).border_color(active_conn_color(connections, active_conn))
         })
@@ -4504,6 +4523,7 @@ fn center(ui: Ui) -> impl IntoView {
                     dialect,
                     active_db_menu_open,
                     active_db_anchor,
+                    menus: all_menus,
                     read_only,
                     live_validate,
                     validate_stmt: validate_stmt.clone(),
