@@ -3168,6 +3168,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     terminal panel. The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
+    **The panel dividers light up on a *rest*, not on a pass** (`DelayedHover`, shared by
+    `h_resize_handle` and `v_resize_handle`). The bar is an affordance — this edge drags — and the
+    dividers run the full height and width of the workspace, so answering on `PointerEnter` lit one
+    every time the pointer crossed from the schema tree to the editor or from the editor to the
+    results. `RESIZE_HOVER_DELAY` (200ms) is how long the pointer must settle first — 500 was
+    tried and is too long: it outlasts the gesture, so a pointer that has already stopped on the
+    divider reads as one the app has not noticed. Dragging is
+    not delayed and the hit band is never gated on the highlight: the delay is on the hint, never
+    on the control. There is no cancelling a floem timer, so the arm carries a **sequence number**
+    and checks it with `try_get_untracked` when it fires — one comparison that retires both the
+    pointer having left (`Some(newer)`) and the divider having been disposed inside the delay
+    (`None`, since `exec_after` timers outlive the scope that armed them; closing a tab is enough).
     **A first launch saves nothing and selects nothing.** `app_view` used to seed a "Local
     MariaDB" connection (127.0.0.1:3306, this repo's development credentials) whenever the loaded
     list came back empty, and write it to disk on the spot — so a fresh install opened onto a

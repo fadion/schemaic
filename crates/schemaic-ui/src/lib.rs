@@ -4105,6 +4105,59 @@ pub(crate) fn reveal_panel(right_panel: RwSignal<RightPanel>, which: RightPanel)
     }
 }
 
+/// A divider's hover highlight, which arrives `RESIZE_HOVER_DELAY` after the
+/// pointer settles rather than the moment it arrives.
+///
+/// Two signals that have to move together — the flag the style reads, and a
+/// sequence number that tells a fired timer whether it is still the one in
+/// charge — so they are one value rather than two the two handles each wire up
+/// their own way.
+///
+/// **The sequence is what makes leaving instant.** There is no cancelling a
+/// floem timer, so `leave` bumps the number and the pending arm, when it fires,
+/// finds itself superseded and does nothing. The same comparison covers the
+/// harder case: `exec_after` timers are **not** cancelled on scope teardown
+/// either, so a divider disposed inside the delay — closing the tab that owns
+/// the editor/results splitter is enough — would otherwise have the arm write to
+/// a dead signal. `try_get_untracked` answers `None` there, and `None` is not
+/// `Some(mine)`, so one check retires both.
+#[derive(Clone, Copy)]
+struct DelayedHover {
+    lit: RwSignal<bool>,
+    seq: RwSignal<u64>,
+}
+
+impl DelayedHover {
+    fn new() -> Self {
+        Self {
+            lit: RwSignal::new(false),
+            seq: RwSignal::new(0),
+        }
+    }
+
+    /// Reactive: whether the bar should be painted.
+    fn lit(self) -> bool {
+        self.lit.get()
+    }
+
+    /// The pointer arrived — start the clock.
+    fn enter(self) {
+        let mine = self.seq.get_untracked().wrapping_add(1);
+        self.seq.set(mine);
+        floem::action::exec_after(RESIZE_HOVER_DELAY, move |_| {
+            if self.seq.try_get_untracked() == Some(mine) {
+                self.lit.set(true);
+            }
+        });
+    }
+
+    /// The pointer left — dark immediately, and any pending arm is void.
+    fn leave(self) {
+        self.seq.update(|n| *n = n.wrapping_add(1));
+        self.lit.set(false);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn h_resize_handle(
     from_right: bool,
@@ -4127,10 +4180,12 @@ fn h_resize_handle(
     // we don't write on every pixel).
     on_commit: Rc<dyn Fn()>,
 ) -> impl IntoView {
-    let hovered = RwSignal::new(false);
+    // Dragging lights the bar with no delay: the press has already found the
+    // divider, so there is nothing left to hint at.
+    let hovered = DelayedHover::new();
     let bar = empty().style(move |s| {
         let s = s.width(RESIZE_BAR).height_full();
-        if hovered.get() || dragging.get() {
+        if hovered.lit() || dragging.get() {
             s.background(theme::resize_handle())
         } else {
             s
@@ -4155,11 +4210,11 @@ fn h_resize_handle(
             }
         })
         .on_event(EventListener::PointerEnter, move |_| {
-            hovered.set(true);
+            hovered.enter();
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerLeave, move |_| {
-            hovered.set(false);
+            hovered.leave();
             EventPropagation::Continue
         })
         .on_event_stop(EventListener::PointerDown, move |_| {
@@ -4217,11 +4272,11 @@ fn v_resize_handle(
     default: f64,
     on_commit: Rc<dyn Fn()>,
 ) -> impl IntoView {
-    let hovered = RwSignal::new(false);
+    let hovered = DelayedHover::new();
     let dragging = RwSignal::new(false);
     let bar = empty().style(move |s| {
         let s = s.height(RESIZE_BAR).width_full();
-        if hovered.get() || dragging.get() {
+        if hovered.lit() || dragging.get() {
             s.background(theme::resize_handle())
         } else {
             s
@@ -4240,11 +4295,11 @@ fn v_resize_handle(
                 .inset_top(base_top + dim.get() - RESIZE_HIT / 2.0)
         })
         .on_event(EventListener::PointerEnter, move |_| {
-            hovered.set(true);
+            hovered.enter();
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerLeave, move |_| {
-            hovered.set(false);
+            hovered.leave();
             EventPropagation::Continue
         })
         .on_event_stop(EventListener::PointerDown, move |_| {
