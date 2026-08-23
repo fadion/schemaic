@@ -80,8 +80,11 @@ pub(crate) fn open_designer(ui: &Ui, target: DesignerTarget) {
     d.rev.update(|r| *r += 1);
     d.error.set(None);
     d.preview.set(None);
-    // See `view_editor::open_editor`: each overlay knows only its own flag.
-    d.view.set(None);
+    // Each overlay knows only its own flag, so two open would paint two panels.
+    // This used to clear the view editor **and nothing else**, which was true
+    // when those were the only two; it is one list now
+    // (`ddl_preview::close_peers`), because the set had grown to six.
+    crate::ddl_preview::close_peers(d, false);
     d.designer.set(Some(target));
 }
 

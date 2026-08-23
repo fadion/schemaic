@@ -59,14 +59,35 @@ const SQL_ROWS: usize = 16;
 /// The routine editor being open *is* the signal that the plan came from it: it
 /// renders over the trigger modal, so nothing else can reach Preview while it is.
 pub(crate) fn close_editors(d: crate::DdlUi) {
-    let from_routine = d.routine.get_untracked().is_some();
+    close_peers(d, d.routine.get_untracked().is_some());
+}
+
+/// Clear every editor target — **the one list**, called both by
+/// [`close_editors`] above and by each editor's own `open`, which clears its
+/// peers before setting itself.
+///
+/// Those `open`s used to keep their own hand-written lists, and they had
+/// **drifted**: the table designer cleared only the view editor and the view
+/// editor only the designer, while `object_editor`, `routine_editor` and
+/// `trigger_editor` cleared four apiece. Each of those `set(None)` lines carries
+/// the same comment — "each overlay knows only its own flag, so two open would
+/// paint two panels" — and a partial list is exactly that bug with the comment
+/// still attached. Adding the event editor made it six flags maintained by hand
+/// in five places, which is the point at which one list is the only version that
+/// stays true.
+///
+/// `keep_trigger` is the single exception, and it belongs to the caller rather
+/// than to this list: see [`close_editors`] for why a function plan leaves the
+/// trigger form it was opened from standing.
+pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
     d.designer.set(None);
     d.view.set(None);
-    if !from_routine {
+    if !keep_trigger {
         d.trigger.set(None);
     }
     d.routine.set(None);
     d.object.set(None);
+    d.event.set(None);
 }
 
 /// Open the preview on a change set. `from_designer` decides where Cancel goes.
@@ -678,6 +699,11 @@ mod tests {
             routine_body: scope.create_rw_signal(String::new()),
             routine_source_pending: scope.create_rw_signal(false),
             routine_body_stale: scope.create_rw_signal(false),
+            event: scope.create_rw_signal(None),
+            event_draft: scope.create_rw_signal(Default::default()),
+            event_body: scope.create_rw_signal(String::new()),
+            event_source_pending: scope.create_rw_signal(false),
+            event_body_stale: scope.create_rw_signal(false),
             functions: scope.create_rw_signal(Vec::new()),
             object: scope.create_rw_signal(None),
             object_draft: scope.create_rw_signal(Default::default()),
@@ -745,6 +771,13 @@ mod tests {
             dependents: Vec::new(),
             read_only: false,
         }));
+        d.event.set(Some(crate::EventTarget {
+            conn_id: 1,
+            database: "db".into(),
+            dialect: SqlDialect::MySql,
+            current: None,
+            read_only: false,
+        }));
 
         close_editors(d);
 
@@ -752,6 +785,7 @@ mod tests {
         assert!(d.view.get_untracked().is_none(), "view");
         assert!(d.trigger.get_untracked().is_none(), "trigger");
         assert!(d.object.get_untracked().is_none(), "object");
+        assert!(d.event.get_untracked().is_none(), "event");
 
         scope.dispose();
     }
@@ -793,6 +827,108 @@ mod tests {
             d.trigger.get_untracked().is_some(),
             "the trigger form it was opened from is what the function is for"
         );
+        scope.dispose();
+    }
+
+    /// **The same invariant read from the other end.** `close_editors` must
+    /// clear every editor; `ddl_editors_up` must *see* every editor — it is what
+    /// gives the whole DDL overlay group its box, and a modal missing from it
+    /// opens into zero by zero and paints nothing.
+    ///
+    /// The event editor shipped absent from it, which is why this test exists
+    /// beside the one above rather than being folded into it: two lists, one
+    /// rule, and a new editor has to be added to both.
+    ///
+    /// Each target is raised **alone**, so a list that happens to contain some
+    /// other signal can't carry a missing one.
+    #[test]
+    fn every_editor_raises_the_group_that_gives_it_a_box() {
+        let scope = Scope::new();
+        let d = ddl_ui(scope);
+        let up = crate::ddl_editors_up(d);
+        assert!(!up(), "nothing open");
+
+        // Plain `fn` pointers over the `Copy` bundle rather than boxed closures:
+        // none of these captures anything, and the array is the list of editors
+        // the test is about.
+        type Raise = (&'static str, fn(crate::DdlUi));
+        let raise: [Raise; 6] = [
+            ("designer", |d| {
+                d.designer.set(Some(crate::DesignerTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    flavour: Default::default(),
+                    schema: None,
+                    dialect: SqlDialect::MySql,
+                    current: None,
+                    tables: Vec::new(),
+                    read_only: false,
+                }))
+            }),
+            ("view", |d| {
+                d.view.set(Some(crate::ViewTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    schema: None,
+                    dialect: SqlDialect::MySql,
+                    current: None,
+                    read_only: false,
+                }))
+            }),
+            ("trigger", |d| {
+                d.trigger.set(Some(crate::TriggerTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    schema: None,
+                    table: "t".into(),
+                    dialect: SqlDialect::MySql,
+                    is_view: false,
+                    current: Vec::new(),
+                    read_only: false,
+                }))
+            }),
+            ("routine", |d| {
+                d.routine.set(Some(crate::RoutineTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    dialect: SqlDialect::MySql,
+                    current: None,
+                    read_only: false,
+                }))
+            }),
+            ("object", |d| {
+                d.object.set(Some(crate::ObjectTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    schema: None,
+                    dialect: SqlDialect::Postgres,
+                    current: None,
+                    dependents: Vec::new(),
+                    read_only: false,
+                }))
+            }),
+            ("event", |d| {
+                d.event.set(Some(crate::EventTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    dialect: SqlDialect::MySql,
+                    current: None,
+                    read_only: false,
+                }))
+            }),
+        ];
+
+        for (name, set) in raise {
+            set(d);
+            assert!(up(), "{name} is open and the group says nothing is");
+            close_editors(d);
+            // `close_editors` deliberately leaves the trigger form standing when
+            // the plan came from the routine editor above it, which is not the
+            // case here — nothing raised a routine.
+            d.trigger.set(None);
+            assert!(!up(), "{name} closed and the group still says something is");
+        }
+
         scope.dispose();
     }
 }

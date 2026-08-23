@@ -218,6 +218,7 @@ fn object_group_label(kind: ObjectKind) -> &'static str {
         ObjectKind::Sequence => "Sequences",
         ObjectKind::Function => "Functions",
         ObjectKind::Procedure => "Procedures",
+        ObjectKind::Event => "Events",
     }
 }
 
@@ -233,6 +234,9 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
         // exactly that reason.
         ObjectKind::Function => icons::SQUARE_FUNCTION,
         ObjectKind::Procedure => icons::SQUARE_PLAY,
+        // A clock, because the only thing that distinguishes an event from a
+        // procedure is that something runs it on a schedule.
+        ObjectKind::Event => icons::CLOCK,
     }
 }
 

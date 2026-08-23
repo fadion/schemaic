@@ -18,6 +18,7 @@ mod diff_view;
 mod editor_pane;
 pub mod erd_raster;
 mod erd_view;
+mod event_editor;
 pub mod fonts;
 mod grid;
 mod history_panel;
@@ -428,6 +429,41 @@ pub type RoutineSrcDoneFn = Rc<dyn Fn(String, Option<schemaic_core::schema::Rout
 /// See `schemaic_core::schema::RoutineSource`.
 pub type RoutineSrcFn = Rc<dyn Fn(RoutineSrcRequest, RoutineSrcDoneFn)>;
 
+/// What the event editor is editing. Doubles as its open flag.
+///
+/// The same shape as [`RoutineTarget`] and a separate type for the same reason
+/// the routine's is separate from the trigger's: an event is its own object,
+/// reached from the schema tree, from Find-Anywhere and from the Create menu.
+///
+/// No `dialect` fork inside the form — unlike a routine, an event exists on one
+/// engine only ([`schemaic_core::ddl::supports_event_editing`]) — but the field
+/// is carried all the same, because every plan this modal builds is emitted in a
+/// dialect and reading it off the connection here is what keeps a change set
+/// from having to guess.
+#[derive(Clone, Debug)]
+pub struct EventTarget {
+    pub conn_id: u64,
+    pub database: String,
+    pub dialect: SqlDialect,
+    pub current: Option<schemaic_core::schema::EventInfo>,
+    pub read_only: bool,
+}
+
+/// Which event to read the real body and session state for.
+pub struct EventSrcRequest {
+    pub conn_id: u64,
+    pub database: String,
+    /// The event's name **on the server** — the identity a `SHOW CREATE`
+    /// addresses, not whatever the draft has been renamed to.
+    pub name: String,
+}
+/// Reports one event's source on the UI thread, keyed by the name asked for so a
+/// late reply can be matched back to the event it belongs to.
+pub type EventSrcDoneFn = Rc<dyn Fn(String, Option<schemaic_core::schema::EventSource>)>;
+/// Read one MySQL event's body **as written** off-thread — the counterpart of
+/// [`RoutineSrcFn`]. See `schemaic_core::schema::EventSource`.
+pub type EventSrcFn = Rc<dyn Fn(EventSrcRequest, EventSrcDoneFn)>;
+
 /// What the object editor is editing — an enum type, a domain or a sequence.
 /// Doubles as its open flag.
 ///
@@ -674,6 +710,26 @@ pub struct DdlUi {
     /// footer says why — a refusal is enough here, a three-way merge is not
     /// needed.
     pub routine_body_stale: RwSignal<bool>,
+    /// The event editor's target; doubles as its open flag.
+    pub event: RwSignal<Option<EventTarget>>,
+    pub event_draft: RwSignal<schemaic_core::ddl::EventDraft>,
+    /// **The event Body field's text, owned outside the form** — the same
+    /// arrangement `routine_body` is, and for the same reason: MySQL's
+    /// `SHOW CREATE` reply lands after the form is up and has to correct the
+    /// field without tearing the modal down and taking the caret with it.
+    pub event_body: RwSignal<String>,
+    /// Whether the event editor is still waiting for its `SHOW CREATE`.
+    ///
+    /// Preview waits on it for the reason `routine_source_pending` explains,
+    /// with one difference worth knowing: an event is altered in place, so a
+    /// body restated from the catalogue's escape-resolved copy is *refused*
+    /// rather than lost. The wait is still right — a refusal after Apply is a
+    /// worse way to learn this than a footer that says so.
+    pub event_source_pending: RwSignal<bool>,
+    /// The `SHOW CREATE` landed, it **did** correct the body, and the draft had
+    /// already moved — the third outcome of the same reply
+    /// ([`schemaic_core::ddl::SourceOutcome`]). See `routine_body_stale`.
+    pub event_body_stale: RwSignal<bool>,
     /// The object editor's target; doubles as its open flag.
     pub object: RwSignal<Option<ObjectTarget>>,
     /// The enum / domain / sequence being edited. Same rule as `draft`: one
@@ -2067,6 +2123,8 @@ pub struct SchemaActions {
     /// The same for a MySQL routine's body, and for the same reason — see
     /// [`RoutineSrcFn`].
     pub routine_source: RoutineSrcFn,
+    /// The same for a MySQL event's body — see [`EventSrcFn`].
+    pub event_source: EventSrcFn,
     /// Fetch table statistics for the properties modal (whole database, one
     /// round trip) and drop the result into `overlay.properties_state`.
     pub table_stats: Rc<dyn Fn(PropertiesTarget)>,
@@ -2988,22 +3046,29 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             {
                 let trigger_open = ui.ddl.trigger;
                 let routine_open = ui.ddl.routine;
+                let event_open = ui.ddl.event;
                 stack((
                     error_modal_overlay(ui.clone()),
                     confirm_overlay(ui.clone()),
                     import_view::import_overlay(ui.clone()),
                     table_designer::table_designer_overlay(ui.clone()),
                     view_editor::view_editor_overlay(ui.clone()),
-                    // The trigger and routine editors share one tuple element —
-                    // this stack is at Floem's 16-arity `ViewTuple` limit, and only
-                    // one of the pair is ever painted (the trigger editor renders
-                    // nothing while the routine editor it opened is up).
+                    // The trigger, routine and event editors share one tuple
+                    // element — this stack is at Floem's 16-arity `ViewTuple`
+                    // limit, and only one of the three is ever painted: the
+                    // trigger editor renders nothing while the routine editor it
+                    // opened is up, and every `open` here clears the other two
+                    // targets.
                     stack((
                         trigger_editor::trigger_editor_overlay(ui.clone()),
                         routine_editor::routine_editor_overlay(ui.clone()),
+                        event_editor::event_editor_overlay(ui.clone()),
                     ))
                     .style(move |s| {
-                        if trigger_open.get().is_some() || routine_open.get().is_some() {
+                        if trigger_open.get().is_some()
+                            || routine_open.get().is_some()
+                            || event_open.get().is_some()
+                        {
                             s.absolute().inset(0.0)
                         } else {
                             s
@@ -3347,23 +3412,35 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let tx_prompt = ui.overlay.tx_prompt;
     let confirm = ui.overlay.confirm;
     let import_open = ui.import.target;
-    let designer_open = ui.ddl.designer;
-    let view_open = ui.ddl.view;
-    let trigger_open = ui.ddl.trigger;
-    let routine_open = ui.ddl.routine;
-    let object_open = ui.ddl.object;
-    let ddl_preview_open = ui.ddl.preview;
+    let editors = ddl_editors_up(ui.ddl);
     move || {
         err_open.get()
             || tx_prompt.get().is_some()
             || confirm.get().is_some()
             || import_open.get().is_some()
-            || designer_open.get().is_some()
-            || view_open.get().is_some()
-            || trigger_open.get().is_some()
-            || routine_open.get().is_some()
-            || object_open.get().is_some()
-            || ddl_preview_open.get().is_some()
+            || editors()
+    }
+}
+
+/// The schema-editing half of that list — **is any editor target set?**
+///
+/// Split out of [`ddl_modals_up`] so it can be *tested*: the aggregate itself
+/// needs a whole [`Ui`], while this needs only the [`DdlUi`] bundle, which is
+/// the same fixture `ddl_preview`'s tests already build for
+/// `close_editors_clears_every_editor`. The two are one invariant read from
+/// opposite ends — every editor must be in this list, and every editor must be
+/// cleared by that one — and the event editor shipped absent from *this* half:
+/// its overlay's `inset(0)` resolved against a box the aggregate was keeping at
+/// zero by zero, so the modal painted nothing at all.
+pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
+    move || {
+        d.designer.get().is_some()
+            || d.view.get().is_some()
+            || d.trigger.get().is_some()
+            || d.routine.get().is_some()
+            || d.object.get().is_some()
+            || d.event.get().is_some()
+            || d.preview.get().is_some()
     }
 }
 

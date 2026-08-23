@@ -93,10 +93,10 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
     // Each overlay knows only its own flag, so two open would paint two panels.
     // The **trigger** editor's target is deliberately not cleared: its overlay
     // renders nothing while this one is up, and leaving it set means closing
-    // this one puts a half-filled trigger form back exactly as it was.
-    d.designer.set(None);
-    d.view.set(None);
-    d.object.set(None);
+    // this one puts a half-filled trigger form back exactly as it was — which is
+    // what the `keep_trigger` argument says, and the one exception to the shared
+    // list in `ddl_preview`.
+    ddl_preview::close_peers(d, true);
     d.routine.set(Some(target));
     fetch_source(ui);
 }

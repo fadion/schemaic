@@ -37,6 +37,7 @@ pub enum ObjectTag {
     Sequence,
     Function,
     Procedure,
+    Event,
     /// A kind this build doesn't know, preserved exactly as it was read.
     Unknown(String),
 }
@@ -50,6 +51,7 @@ impl ObjectTag {
             ObjectTag::Sequence => Some(crate::ddl::ObjectKind::Sequence),
             ObjectTag::Function => Some(crate::ddl::ObjectKind::Function),
             ObjectTag::Procedure => Some(crate::ddl::ObjectKind::Procedure),
+            ObjectTag::Event => Some(crate::ddl::ObjectKind::Event),
             ObjectTag::Unknown(_) => None,
         }
     }
@@ -62,6 +64,7 @@ impl ObjectTag {
             crate::ddl::ObjectKind::Sequence => ObjectTag::Sequence,
             crate::ddl::ObjectKind::Function => ObjectTag::Function,
             crate::ddl::ObjectKind::Procedure => ObjectTag::Procedure,
+            crate::ddl::ObjectKind::Event => ObjectTag::Event,
         }
     }
 
@@ -74,6 +77,7 @@ impl ObjectTag {
             ObjectTag::Sequence => "sequence",
             ObjectTag::Function => "function",
             ObjectTag::Procedure => "procedure",
+            ObjectTag::Event => "event",
             ObjectTag::Unknown(s) => s,
         }
     }
@@ -94,6 +98,7 @@ impl<'de> Deserialize<'de> for ObjectTag {
             "sequence" => ObjectTag::Sequence,
             "function" => ObjectTag::Function,
             "procedure" => ObjectTag::Procedure,
+            "event" => ObjectTag::Event,
             _ => ObjectTag::Unknown(s),
         })
     }

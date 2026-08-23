@@ -371,6 +371,16 @@ pub(crate) fn create_children(
             }),
         );
     }
+    // Scheduled events, on the one engine that has them. A **capability**, not
+    // an engine test, and absent rather than dimmed where the engine has no
+    // `CREATE EVENT` at all — the same call the view and routine entries make.
+    if schemaic_core::ddl::supports_event_editing(dialect) {
+        out.push(CreateEntry {
+            label: "Event",
+            kind: CreateKind::Object(ObjectKind::Event),
+            disabled: read_only,
+        });
+    }
     out
 }
 
@@ -1231,11 +1241,20 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         // whole `RoutineInfo` is already on the row,
                                         // so `drop_routine` gets it without a second
                                         // lookup that could disagree.
-                                        let cs = match obj.routine() {
-                                            Some(r) => {
+                                        // …and an **event** is refused by
+                                        // `drop_object` too, for its own reason
+                                        // (`ObjectKind::uses_shared_changes`).
+                                        // The whole `EventInfo` is on the row,
+                                        // so `drop_event` gets it without a
+                                        // second lookup that could disagree.
+                                        let cs = match (obj.routine(), obj.event()) {
+                                            (Some(r), _) => {
                                                 schemaic_core::ddl::drop_routine(r, ctx.dialect)
                                             }
-                                            None => schemaic_core::ddl::drop_object(
+                                            (_, Some(e)) => {
+                                                schemaic_core::ddl::drop_event(e, ctx.dialect)
+                                            }
+                                            _ => schemaic_core::ddl::drop_object(
                                                 kind,
                                                 obj.name(),
                                                 obj.schema(),
@@ -4479,13 +4498,13 @@ mod create_menu_tests {
     /// MySQL has none of the three PostgreSQL standalone objects, so they are
     /// **absent** rather than dimmed: a missing entry reads as "not supported",
     /// a dimmed one as "not here", and offering an entry that fails at apply is
-    /// the thing this gate exists to prevent. It *does* have stored routines,
-    /// and gets those.
+    /// the thing this gate exists to prevent. It *does* have stored routines
+    /// and scheduled events, and gets those.
     #[test]
     fn mysql_offers_only_what_it_has() {
         assert_eq!(
             labels(SqlDialect::MySql),
-            vec!["Table", "View", "Function", "Procedure"]
+            vec!["Table", "View", "Function", "Procedure", "Event"]
         );
     }
 
@@ -4497,6 +4516,18 @@ mod create_menu_tests {
         let labels = labels(SqlDialect::Sqlite);
         assert!(!labels.contains(&"Function"), "{labels:?}");
         assert!(!labels.contains(&"Procedure"), "{labels:?}");
+    }
+
+    /// **The event entry is MySQL's alone.** PostgreSQL's nearest equivalent is
+    /// an extension with no `CREATE EVENT` grammar and SQLite has no scheduler,
+    /// so the entry is absent there rather than dimmed — the same call the
+    /// routine entries make one test up.
+    #[test]
+    fn only_mysql_is_offered_an_event() {
+        assert!(labels(SqlDialect::MySql).contains(&"Event"));
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(!labels(d).contains(&"Event"), "{d:?}");
+        }
     }
 
     #[test]

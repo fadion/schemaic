@@ -34,9 +34,9 @@ use schemaic_core::model::{
     binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
-    CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, RoutineInfo, TableInfo,
-    TriggerAction, TriggerEvent, TriggerInfo, TriggerOrder, TriggerSource, TriggerTiming,
-    ViewOptions,
+    CheckInfo, ColumnInfo, DbSchema, EventInfo, EventSchedule, EventSource, EventStatus,
+    ForeignKeyInfo, IndexInfo, RoutineInfo, TableInfo, TriggerAction, TriggerEvent, TriggerInfo,
+    TriggerOrder, TriggerSource, TriggerTiming, ViewOptions, event_interval_expr, event_time_expr,
 };
 use schemaic_core::sql;
 use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats, count_rows_sql};
@@ -567,6 +567,48 @@ impl Db {
                 aggregate: create.as_deref().is_some_and(routine_is_aggregate),
             },
         ))
+    }
+
+    /// A MySQL event's body **as written**, plus the session state and the time
+    /// zone it was written under — read lazily, when the event editor opens.
+    ///
+    /// The same shape [`Db::routine_source`] uses and for the same reason:
+    /// `information_schema.EVENTS.EVENT_DEFINITION` resolves the body's escapes,
+    /// so an edit restated from it can be refused over a quote the user never
+    /// typed. Milder than the routine case — `ALTER EVENT` edits in place, so a
+    /// refusal leaves the event standing rather than gone — and still the only
+    /// faithful source.
+    ///
+    /// `Ok(None)` on the two engines that have no events, and for an event the
+    /// connected account may not read the definition of.
+    pub async fn event_source(
+        &self,
+        database: Option<&str>,
+        name: &str,
+    ) -> Result<Option<EventSource>, DbError> {
+        if self.engine != Engine::MySql {
+            return Ok(None);
+        }
+        let mut conn = self.open(database, false).await?;
+        // (Event, sql_mode, time_zone, Create Event, character_set_client,
+        //  collation_connection, Database Collation)
+        let sql = format!("SHOW CREATE EVENT {}", ident(name.trim()));
+        let row: Option<MyShowCreateEventRow> = conn
+            .query_first(sql.as_str())
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let _ = conn.disconnect().await;
+        let some = |s: String| Some(s).filter(|s| !s.is_empty());
+        // **The session state survives a body this can't read**, exactly as it
+        // does for a routine: all five values come from one row and only the
+        // body needs parsing.
+        Ok(row.map(|(_, mode, tz, create, cs, coll, ..)| EventSource {
+            body: create.as_deref().and_then(event_body_of),
+            time_zone: some(tz),
+            sql_mode: some(mode),
+            charset_client: some(cs),
+            collation_connection: some(coll),
+        }))
     }
 
     /// A MySQL trigger's body **as written**, plus the session state it was
@@ -1737,6 +1779,24 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         .map_err(qerr)?;
     let params = mysql_parameters(&param_rows);
 
+    // Scheduled events. `information_schema.EVENTS` has been there since MySQL
+    // 5.1 and MariaDB 5.1, but unlike `TRIGGERS` this **degrades** rather than
+    // failing the whole read: the MySQL-protocol servers that aren't MySQL
+    // (TiDB, Vitess and friends) are exactly the ones that may not implement the
+    // scheduler, and a database whose tables can't be browsed because it has no
+    // events table is a far worse outcome than one whose Events folder is empty.
+    // The same call `CHECK_CONSTRAINTS` above makes, and the same two codes.
+    let event_rows: Vec<MyEventRow> = match conn
+        .exec_map(MY_EVENTS_SQL, (database,), |r: Row| my_event_row(&r))
+        .await
+    {
+        Ok(rows) => rows,
+        // 1109 `ER_UNKNOWN_TABLE` / 1146 `ER_NO_SUCH_TABLE`: no such catalogue,
+        // so there are no events to report.
+        Err(mysql_async::Error::Server(e)) if e.code == 1109 || e.code == 1146 => Vec::new(),
+        Err(e) => return Err(qerr(e)),
+    };
+
     let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
         None,
@@ -1747,6 +1807,10 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         &view_rows,
     );
     schema.routines = mysql_routines(&routine_rows, &params)
+        .into_iter()
+        .map(std::sync::Arc::new)
+        .collect();
+    schema.events = mysql_events(&event_rows)
         .into_iter()
         .map(std::sync::Arc::new)
         .collect();
@@ -1872,6 +1936,22 @@ fn trigger_body_of(create_sql: &str) -> Option<String> {
 /// definition of (it needs `SHOW_ROUTINE`, or to be the definer). A `None`
 /// leaves the editor on what the schema fetch already carried.
 type MyShowCreateRoutineRow = (String, String, Option<String>, String, String, String);
+
+/// One `SHOW CREATE EVENT` row: `(name, sql_mode, time_zone, Create Event,
+/// character_set_client, collation_connection, Database Collation)`.
+///
+/// Seven columns rather than a routine's six, and the extra one is `time_zone` —
+/// which is why an event needs its own row type rather than reusing that alias.
+/// The `Create Event` column is **nullable** for the same reason a routine's is.
+type MyShowCreateEventRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+);
 
 /// The **body** of a `SHOW CREATE {PROCEDURE|FUNCTION}` statement — everything
 /// after the parameter list and the characteristics that follow it.
@@ -2524,6 +2604,216 @@ fn mysql_routines(
             }
         })
         .collect()
+}
+
+/// One [`MY_EVENTS_SQL`] row.
+///
+/// A struct rather than a tuple, on the same two grounds [`MyRoutineRow`] is
+/// one: sixteen columns is past `mysql_common`'s twelve-element `FromRow`
+/// ceiling, and a positional `.9` would say nothing about which column it means.
+///
+/// The body is **nullable** for the same reason a routine's is, and carries the
+/// same warning: `EVENT_DEFINITION` has had its escapes resolved, so it is what
+/// the tree *reads* and never what an edit is emitted from. See
+/// [`Db::event_source`].
+#[derive(Clone, Debug, Default)]
+struct MyEventRow {
+    name: String,
+    definer: String,
+    /// `EVENT_TYPE` — `ONE TIME` or `RECURRING`, as the server spells it. The
+    /// tag that decides which [`EventSchedule`] arm the other five columns are
+    /// read into; the alternative, "is `EXECUTE_AT` NULL", is the same question
+    /// asked of a column that is also NULL for a recurring event whose
+    /// `INTERVAL_VALUE` failed to convert.
+    kind: String,
+    execute_at: Option<String>,
+    interval_value: Option<String>,
+    interval_field: Option<String>,
+    starts: Option<String>,
+    ends: Option<String>,
+    status: String,
+    on_completion: String,
+    comment: String,
+    body: Option<String>,
+    /// The session state the event was created under, plus the time zone its
+    /// schedule is read in. See [`schemaic_core::schema::EventInfo`] for why the
+    /// fourth one is not optional decoration.
+    time_zone: Option<String>,
+    sql_mode: Option<String>,
+    charset_client: Option<String>,
+    collation_connection: Option<String>,
+}
+
+/// The aliases [`MY_EVENTS_SQL`] gives its columns, in the order it selects
+/// them. A third statement of the list, for the reason
+/// [`MY_ROUTINE_COLUMNS`] is one.
+#[cfg(test)]
+const MY_EVENT_COLUMNS: [&str; 16] = [
+    "n", "df", "ty", "at", "iv", "if_", "st", "en", "stat", "oc", "cmt", "body", "tz", "sqlmode",
+    "cscl", "collconn",
+];
+
+/// The scheduled-event catalogue read, aliased column by column.
+const MY_EVENTS_SQL: &str = "SELECT CAST(EVENT_NAME AS CHAR) AS n, \
+     CAST(DEFINER AS CHAR) AS df, \
+     CAST(EVENT_TYPE AS CHAR) AS ty, \
+     CAST(EXECUTE_AT AS CHAR) AS at, \
+     CAST(INTERVAL_VALUE AS CHAR) AS iv, \
+     CAST(INTERVAL_FIELD AS CHAR) AS if_, \
+     CAST(STARTS AS CHAR) AS st, \
+     CAST(ENDS AS CHAR) AS en, \
+     CAST(STATUS AS CHAR) AS stat, \
+     CAST(ON_COMPLETION AS CHAR) AS oc, \
+     CAST(COALESCE(EVENT_COMMENT, '') AS CHAR) AS cmt, \
+     CAST(EVENT_DEFINITION AS CHAR) AS body, \
+     CAST(TIME_ZONE AS CHAR) AS tz, \
+     CAST(SQL_MODE AS CHAR) AS sqlmode, \
+     CAST(CHARACTER_SET_CLIENT AS CHAR) AS cscl, \
+     CAST(COLLATION_CONNECTION AS CHAR) AS collconn \
+     FROM information_schema.EVENTS \
+     WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME";
+
+/// Read one [`MY_EVENTS_SQL`] row, by the aliases it gives its columns.
+fn my_event_row(r: &Row) -> MyEventRow {
+    my_event_row_from(|c| r.get::<Option<String>, &str>(c).flatten())
+}
+
+/// The name→field half of [`my_event_row`], over any reader. **By alias, not by
+/// position**, for the reason [`my_routine_row_from`] spells out at length.
+fn my_event_row_from(mut opt: impl FnMut(&str) -> Option<String>) -> MyEventRow {
+    MyEventRow {
+        name: opt("n").unwrap_or_default(),
+        definer: opt("df").unwrap_or_default(),
+        kind: opt("ty").unwrap_or_default(),
+        execute_at: opt("at"),
+        interval_value: opt("iv"),
+        interval_field: opt("if_"),
+        starts: opt("st"),
+        ends: opt("en"),
+        status: opt("stat").unwrap_or_default(),
+        on_completion: opt("oc").unwrap_or_default(),
+        comment: opt("cmt").unwrap_or_default(),
+        body: opt("body"),
+        time_zone: opt("tz"),
+        sql_mode: opt("sqlmode"),
+        charset_client: opt("cscl"),
+        collation_connection: opt("collconn"),
+    }
+}
+
+/// Fold `information_schema.EVENTS` rows into [`EventInfo`]s.
+///
+/// The one decision here is the schedule. `EVENT_TYPE` says which of the two
+/// shapes the row is carrying, and the timestamps and the interval quantity are
+/// quoted into SQL expressions on the way in — see [`event_time_expr`] for why
+/// the model holds expressions rather than values.
+///
+/// A `RECURRING` row with no readable interval is read as `EVERY 1 DAY` rather
+/// than dropped: an event Schemaic can't fully describe is still one the user
+/// must be able to see, rename, disable and drop, and the schedule is the field
+/// the editor shows them before anything is applied.
+fn mysql_events(rows: &[MyEventRow]) -> Vec<EventInfo> {
+    let d = SqlDialect::MySql;
+    let some = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+    rows.iter()
+        .map(|r| {
+            let one_shot = r.kind.trim().eq_ignore_ascii_case("ONE TIME");
+            let schedule = if one_shot {
+                EventSchedule::At(
+                    r.execute_at
+                        .as_deref()
+                        .and_then(|s| event_time_expr(s, d))
+                        // **Both arms fall back, and to something legal.** An
+                        // empty `AT` is what `EventDraft::validate` refuses, so
+                        // it wouldn't have been an event with an unknown time —
+                        // it would have been an event that cannot be renamed,
+                        // disabled or commented, because Preview stays disabled
+                        // while a draft is invalid.
+                        //
+                        // The fabricated value cannot reach the server on its
+                        // own: `event_alter_clauses` restates `ON SCHEDULE` only
+                        // when it *changed*, and it hasn't until the user edits
+                        // it — at which point they are looking at the field.
+                        // That is the same property that makes `EVERY 1 DAY`
+                        // below safe.
+                        .unwrap_or_else(|| "CURRENT_TIMESTAMP".to_string()),
+                )
+            } else {
+                EventSchedule::Every {
+                    value: r
+                        .interval_value
+                        .as_deref()
+                        .map(|s| event_interval_expr(s, d))
+                        .unwrap_or_else(|| "1".to_string()),
+                    unit: r
+                        .interval_field
+                        .as_deref()
+                        .map(|s| s.trim().to_ascii_uppercase())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "DAY".to_string()),
+                    starts: r.starts.as_deref().and_then(|s| event_time_expr(s, d)),
+                    ends: r.ends.as_deref().and_then(|s| event_time_expr(s, d)),
+                }
+            };
+            EventInfo {
+                name: r.name.clone(),
+                // MySQL is the only engine with events, and a database is the
+                // namespace there.
+                schema: None,
+                definer: some(&r.definer),
+                schedule,
+                // `ON_COMPLETION` reads `PRESERVE` or `NOT PRESERVE`; anything
+                // else is read as the server's default, which is not to keep it.
+                preserve: r.on_completion.trim().eq_ignore_ascii_case("PRESERVE"),
+                status: EventStatus::parse(&r.status),
+                comment: some(&r.comment),
+                // `information_schema`'s copy — good enough to read and to copy
+                // as DDL, and corrected by `Db::event_source` before an edit.
+                body: r.body.clone().unwrap_or_default(),
+                time_zone: r.time_zone.clone(),
+                sql_mode: r.sql_mode.clone(),
+                charset_client: r.charset_client.clone(),
+                collation_connection: r.collation_connection.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The body of a `SHOW CREATE EVENT` statement — everything after its top-level
+/// `DO`.
+///
+/// Simpler than [`routine_body_of`] because the keyword that opens the body is a
+/// keyword: there is no parameter list to walk past and no characteristic list
+/// to step over. What it still needs is [`sql::skip_noncode`], for the two ways
+/// a bare byte scan gets this wrong — an event named `` `do` `` (a quoted
+/// identifier) and a `COMMENT 'run this, do not touch'` (a string literal), both
+/// of which sit before the real `DO`.
+///
+/// `None` when there is no top-level `DO` at all, which is a statement this
+/// build doesn't understand; the caller keeps the body it already had rather
+/// than blanking it.
+fn event_body_of(create_sql: &str) -> Option<String> {
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = sql::skip_noncode(b, i, SqlDialect::MySql) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if sql::is_word_start(b[i]) {
+            let mut j = i + 1;
+            while j < b.len() && sql::is_word_byte(b[j]) {
+                j += 1;
+            }
+            if create_sql[i..j].eq_ignore_ascii_case("DO") {
+                return Some(create_sql.get(j..)?.trim().to_string());
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// One `information_schema.VIEWS` row: `(name, definition, check option, definer,
@@ -5030,6 +5320,204 @@ mod tests {
                 "`{c}` is only the prefix of the alias the query declares"
             );
         }
+    }
+
+    /// The same pin, for the event read: a field bound to the wrong alias, and
+    /// an alias the query does not actually declare (which reads as NULL —
+    /// silently empty, not loud). Sixteen columns is well past the point where
+    /// the compiler checks anything about this mapping.
+    #[test]
+    fn every_event_field_reads_the_column_the_query_aliases() {
+        let mut asked: Vec<String> = Vec::new();
+        let r = my_event_row_from(|c| {
+            asked.push(c.to_string());
+            Some(c.to_string())
+        });
+        assert_eq!(r.name, "n");
+        assert_eq!(r.definer, "df");
+        assert_eq!(r.kind, "ty");
+        assert_eq!(r.execute_at.as_deref(), Some("at"));
+        assert_eq!(r.interval_value.as_deref(), Some("iv"));
+        assert_eq!(r.interval_field.as_deref(), Some("if_"));
+        assert_eq!(r.starts.as_deref(), Some("st"));
+        assert_eq!(r.ends.as_deref(), Some("en"));
+        assert_eq!(r.status, "stat");
+        assert_eq!(r.on_completion, "oc");
+        assert_eq!(r.comment, "cmt");
+        assert_eq!(r.body.as_deref(), Some("body"));
+        assert_eq!(r.time_zone.as_deref(), Some("tz"));
+        assert_eq!(r.sql_mode.as_deref(), Some("sqlmode"));
+        assert_eq!(r.charset_client.as_deref(), Some("cscl"));
+        assert_eq!(r.collation_connection.as_deref(), Some("collconn"));
+        assert_eq!(asked, MY_EVENT_COLUMNS, "one read per declared column");
+
+        let mut rest = MY_EVENTS_SQL;
+        for c in MY_EVENT_COLUMNS {
+            let needle = format!(" AS {c}");
+            let at = rest
+                .find(&needle)
+                .unwrap_or_else(|| panic!("the event query aliases no column `{c}`"));
+            rest = &rest[at + needle.len()..];
+            assert!(
+                matches!(rest.chars().next(), Some(',') | Some(' ')),
+                "`{c}` is only the prefix of the alias the query declares"
+            );
+        }
+    }
+
+    fn er(name: &str, kind: &str) -> MyEventRow {
+        MyEventRow {
+            name: s(name),
+            definer: s("root@localhost"),
+            kind: s(kind),
+            status: s("ENABLED"),
+            on_completion: s("NOT PRESERVE"),
+            body: Some(s("DELETE FROM t")),
+            time_zone: Some(s("SYSTEM")),
+            ..Default::default()
+        }
+    }
+
+    /// A recurring row becomes an `EVERY` schedule, and the two catalogue
+    /// columns that make it are quoted into SQL on the way in — the quantity
+    /// bare because it is digits, the bounds as literals because they are
+    /// datetimes.
+    #[test]
+    fn mysql_events_read_a_recurring_schedule() {
+        let mut row = er("nightly", "RECURRING");
+        row.interval_value = Some(s("1"));
+        row.interval_field = Some(s("day"));
+        row.starts = Some(s("2026-01-01 03:00:00"));
+        let e = mysql_events(&[row]).remove(0);
+        assert_eq!(e.name, "nightly");
+        assert_eq!(e.schema, None);
+        assert_eq!(e.definer.as_deref(), Some("root@localhost"));
+        assert_eq!(
+            e.schedule,
+            EventSchedule::Every {
+                value: s("1"),
+                // Uppercased, so the emitted clause reads the way `SHOW CREATE`
+                // prints it whatever case the catalogue used.
+                unit: s("DAY"),
+                starts: Some(s("'2026-01-01 03:00:00'")),
+                ends: None,
+            }
+        );
+        assert!(!e.preserve);
+        assert_eq!(e.status, EventStatus::Enabled);
+        assert_eq!(e.time_zone.as_deref(), Some("SYSTEM"));
+    }
+
+    /// A one-time row becomes an `AT` schedule, read off `EXECUTE_AT` — and
+    /// `EVENT_TYPE` is what decides, not "is the interval NULL".
+    #[test]
+    fn mysql_events_read_a_one_time_schedule() {
+        let mut row = er("once", "ONE TIME");
+        row.execute_at = Some(s("2026-06-01 00:00:00"));
+        row.on_completion = s("PRESERVE");
+        row.status = s("SLAVESIDE_DISABLED");
+        let e = mysql_events(&[row]).remove(0);
+        assert_eq!(e.schedule, EventSchedule::At(s("'2026-06-01 00:00:00'")));
+        assert!(e.preserve);
+        assert_eq!(e.status, EventStatus::SlavesideDisabled);
+    }
+
+    /// A compound interval — `EVERY '1:30' HOUR_MINUTE` — keeps its quotes, and
+    /// a `RECURRING` row the server reported nothing readable for still becomes
+    /// a browsable event rather than being dropped from the list.
+    #[test]
+    fn mysql_events_survive_an_interval_they_cannot_read() {
+        let mut row = er("compound", "RECURRING");
+        row.interval_value = Some(s("1:30"));
+        row.interval_field = Some(s("HOUR_MINUTE"));
+        let e = mysql_events(&[row]).remove(0);
+        assert_eq!(
+            e.schedule,
+            EventSchedule::Every {
+                value: s("'1:30'"),
+                unit: s("HOUR_MINUTE"),
+                starts: None,
+                ends: None,
+            }
+        );
+
+        let e = mysql_events(&[er("mystery", "RECURRING")]).remove(0);
+        assert_eq!(e.name, "mystery");
+        assert_eq!(
+            e.schedule,
+            EventSchedule::Every {
+                value: s("1"),
+                unit: s("DAY"),
+                starts: None,
+                ends: None,
+            }
+        );
+    }
+
+    /// **The one-shot arm falls back too, and the fallback has to be legal.**
+    /// An empty `AT` is exactly what `EventDraft::validate` refuses, so a
+    /// `ONE TIME` row whose `EXECUTE_AT` came back empty would have opened an
+    /// editor with Preview permanently disabled — an event that cannot be
+    /// renamed, disabled or commented, which is the opposite of what the
+    /// recurring arm's fallback is for.
+    #[test]
+    fn a_one_time_event_with_no_readable_time_is_still_editable() {
+        let e = mysql_events(&[er("mystery_once", "ONE TIME")]).remove(0);
+        assert_eq!(e.schedule, EventSchedule::At(s("CURRENT_TIMESTAMP")));
+        assert!(
+            schemaic_core::ddl::EventDraft::from_info(&e)
+                .validate()
+                .is_empty(),
+            "the draft has to be one Preview will act on"
+        );
+        // And the fabricated value stays put: the schedule clause is restated
+        // only on a change, so an edit that touches something else emits no
+        // `ON SCHEDULE` at all.
+        let mut d = schemaic_core::ddl::EventDraft::from_info(&e);
+        d.info.comment = Some(s("paused"));
+        let sql = schemaic_core::ddl::diff_event(&e, &d, SqlDialect::MySql).emit();
+        assert!(!sql.iter().any(|s| s.contains("ON SCHEDULE")), "{sql:?}");
+    }
+
+    /// The body is everything after the **top-level** `DO`, and the two things
+    /// that sit before it and spell it are stepped over rather than matched: a
+    /// quoted identifier, and a string literal.
+    #[test]
+    fn the_show_create_event_body_starts_after_its_do() {
+        assert_eq!(
+            event_body_of(
+                "CREATE DEFINER=`root`@`localhost` EVENT `nightly` ON SCHEDULE EVERY 1 DAY \
+                 ON COMPLETION NOT PRESERVE ENABLE DO DELETE FROM sessions"
+            )
+            .as_deref(),
+            Some("DELETE FROM sessions")
+        );
+        // A compound body, kept whole — the `;` inside it are the body's own.
+        assert_eq!(
+            event_body_of("CREATE EVENT `e` ON SCHEDULE EVERY 1 DAY DO BEGIN SELECT 1; END")
+                .as_deref(),
+            Some("BEGIN SELECT 1; END")
+        );
+        // An event *named* `do`: a quoted identifier, which `skip_noncode`
+        // steps over rather than reading as the keyword.
+        assert_eq!(
+            event_body_of("CREATE EVENT `do` ON SCHEDULE EVERY 1 DAY DO SELECT 1").as_deref(),
+            Some("SELECT 1")
+        );
+        // …and a `COMMENT` whose text says `do`, which is a string literal.
+        assert_eq!(
+            event_body_of(
+                "CREATE EVENT `e` ON SCHEDULE EVERY 1 DAY COMMENT 'do not touch' DO SELECT 1"
+            )
+            .as_deref(),
+            Some("SELECT 1")
+        );
+        // Not a statement this build understands: the caller keeps the body it
+        // already had rather than blanking it.
+        assert_eq!(
+            event_body_of("CREATE EVENT `e` ON SCHEDULE EVERY 1 DAY"),
+            None
+        );
     }
 
     fn rr(name: &str, ty: &str, returns: &str) -> MyRoutineRow {

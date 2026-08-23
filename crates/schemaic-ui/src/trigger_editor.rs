@@ -110,9 +110,8 @@ fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
     d.error.set(None);
     d.preview.set(None);
     // Each overlay knows only its own flag, so two open would paint two panels.
-    d.designer.set(None);
-    d.view.set(None);
-    d.routine.set(None);
+    // `keep_trigger` is irrelevant here — this one sets its own target below.
+    crate::ddl_preview::close_peers(d, false);
     d.functions.set(Vec::new());
     let dialect = target.dialect;
     d.trigger.set(Some(target));

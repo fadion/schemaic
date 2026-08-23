@@ -2188,6 +2188,390 @@ pub fn dollar_tag(body: &str) -> String {
     "$schemaic$".to_string()
 }
 
+// ── Scheduled events (MySQL) ────────────────────────────────────────────────
+
+/// Whether a scheduled event fires once or on a repeating interval.
+///
+/// Two shapes rather than a nullable everything, because MySQL's grammar has
+/// two: `ON SCHEDULE AT …` takes one timestamp and nothing else, and
+/// `ON SCHEDULE EVERY …` takes an interval and optional bounds. A single struct
+/// holding all four would let a draft describe `AT` *and* `ENDS`, which is a
+/// syntax error the form would then have had to refuse separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventSchedule {
+    /// `AT <expr>` — a one-shot. Unless the event also says
+    /// `ON COMPLETION PRESERVE`, the server **drops it** once it has run; see
+    /// [`EventInfo::preserve`].
+    At(String),
+    /// `EVERY <value> <unit>`, optionally bounded by `STARTS`/`ENDS`.
+    Every {
+        /// The quantity, **as SQL** — see [`event_interval_expr`] for why every
+        /// timestamp and quantity here is an expression rather than a value.
+        /// `6` for `EVERY 6 HOUR`, `'1:30'` for the compound units whose
+        /// quantity MySQL takes as a string.
+        value: String,
+        /// The interval keyword, uppercased — `DAY`, `HOUR`, `HOUR_MINUTE`. A
+        /// raw string rather than an enum, on the rule
+        /// [`EVENT_INTERVAL_UNITS`] states.
+        unit: String,
+        starts: Option<String>,
+        ends: Option<String>,
+    },
+}
+
+impl Default for EventSchedule {
+    /// `EVERY 1 DAY`. A new event has to start from *something* legal, and a
+    /// recurring daily job is what the feature is overwhelmingly used for; the
+    /// one-shot form is one control away.
+    fn default() -> Self {
+        EventSchedule::Every {
+            value: "1".to_string(),
+            unit: "DAY".to_string(),
+            starts: None,
+            ends: None,
+        }
+    }
+}
+
+impl EventSchedule {
+    /// Is this the one-shot form? What the editor's schedule control reads, and
+    /// what [`EventInfo::preserve`]'s warning turns on.
+    pub fn is_one_shot(&self) -> bool {
+        matches!(self, EventSchedule::At(_))
+    }
+
+    /// The `ON SCHEDULE` clause's payload, without the two keywords that
+    /// introduce it — `AT '2026-01-01 03:00:00'`, or `EVERY 1 DAY STARTS …`.
+    ///
+    /// The bounds go on their own lines because a schedule carrying both is the
+    /// one that genuinely needs reading before it is applied.
+    pub fn sql(&self) -> String {
+        match self {
+            EventSchedule::At(at) => format!("AT {}", at.trim()),
+            EventSchedule::Every {
+                value,
+                unit,
+                starts,
+                ends,
+            } => {
+                let mut out = format!("EVERY {} {}", value.trim(), unit.trim());
+                if let Some(s) = starts.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    out.push_str(&format!("\n  STARTS {s}"));
+                }
+                if let Some(e) = ends.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+                    out.push_str(&format!("\n  ENDS {e}"));
+                }
+                out
+            }
+        }
+    }
+}
+
+/// The interval keywords `EVERY` accepts, in MySQL's own documented order.
+///
+/// A vocabulary for the editor's dropdown, **not** a parse: the unit stays a
+/// `String` on [`EventSchedule::Every`], so a server carrying a keyword this
+/// list doesn't know is still browsed, edited and re-emitted with the unit it
+/// really has. The same call [`RoutineInfo::language`]'s dropdown makes — offer
+/// what we know, and append whatever this object already is.
+pub const EVENT_INTERVAL_UNITS: [&str; 15] = [
+    "SECOND",
+    "MINUTE",
+    "HOUR",
+    "DAY",
+    "WEEK",
+    "MONTH",
+    "QUARTER",
+    "YEAR",
+    "MINUTE_SECOND",
+    "HOUR_MINUTE",
+    "HOUR_SECOND",
+    "DAY_MINUTE",
+    "DAY_HOUR",
+    "DAY_SECOND",
+    "YEAR_MONTH",
+];
+
+/// Whether the scheduler will run this event, as `information_schema` reports
+/// it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventStatus {
+    #[default]
+    Enabled,
+    Disabled,
+    /// `DISABLE ON SLAVE` — set by the server itself on a replica, so the event
+    /// runs on the source and the rows it writes arrive through replication
+    /// rather than being generated twice.
+    ///
+    /// Modelled rather than folded into `Disabled`, because the two are
+    /// different states and restating the wrong one is a real change: turning a
+    /// replica-disabled event into a plainly disabled one is the same edit as
+    /// enabling it on the source, applied backwards.
+    /// [`crate::ddl::diff_event`] restates the status **only when it changed**,
+    /// so an event in this state that nobody touched keeps it.
+    SlavesideDisabled,
+}
+
+impl EventStatus {
+    /// Read `information_schema.EVENTS.STATUS`.
+    ///
+    /// MySQL 8.0.26 renamed the replica state's *keyword* but not this column's
+    /// value; `REPLICA_SIDE_DISABLED` is accepted anyway, so a server that ever
+    /// does report it isn't read as `ENABLED`. An unrecognised answer is
+    /// `Enabled`, which is the state the scheduler treats an event as being in.
+    pub fn parse(s: &str) -> EventStatus {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "DISABLED" => EventStatus::Disabled,
+            "SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED" => EventStatus::SlavesideDisabled,
+            _ => EventStatus::Enabled,
+        }
+    }
+
+    /// The clause that sets this state on `CREATE`/`ALTER EVENT`.
+    ///
+    /// **`DISABLE ON SLAVE` is the spelling MySQL 8.0 and every MariaDB accept;
+    /// MySQL 8.4 removed it in favour of `DISABLE ON REPLICA`.** It is emitted
+    /// only when the status genuinely changed *to* it — which the editor offers
+    /// only for an event already in that state — so the removed keyword reaches
+    /// a server that rejects it just when somebody deliberately asks for it, and
+    /// fails visibly at Apply rather than quietly enabling the event.
+    pub fn sql_keyword(self) -> &'static str {
+        match self {
+            EventStatus::Enabled => "ENABLE",
+            EventStatus::Disabled => "DISABLE",
+            EventStatus::SlavesideDisabled => "DISABLE ON SLAVE",
+        }
+    }
+
+    /// What the state is called in a sentence a person reads.
+    pub fn label(self) -> &'static str {
+        match self {
+            EventStatus::Enabled => "Enabled",
+            EventStatus::Disabled => "Disabled",
+            EventStatus::SlavesideDisabled => "Disabled on replica",
+        }
+    }
+}
+
+/// A scheduled event — MySQL's `CREATE EVENT`, a statement the server runs on a
+/// clock.
+///
+/// **MySQL and MariaDB have these and no other engine here does.** PostgreSQL's
+/// nearest equivalent is `pg_cron`, an extension with its own catalogue and no
+/// `CREATE EVENT` grammar, and SQLite has no scheduler at all — so this is the
+/// one object modelled for a single engine's sake, and
+/// [`crate::ddl::supports_event_editing`] is what every surface asks before
+/// offering it.
+///
+/// The fields are what `CREATE EVENT` states, with one addition: `time_zone`.
+/// An event's schedule is interpreted in the time zone the session held when it
+/// was created, the server records it, and the statement has **no clause** for
+/// it — so it rides in the session wrapper the body's `sql_mode` already needs,
+/// exactly as [`RoutineInfo`]'s three session values do. Dropping it moves every
+/// future firing of a nightly job by the offset between the creator's zone and
+/// the applier's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventInfo {
+    pub name: String,
+    /// Always `None`: MySQL is the only engine with events, and there a database
+    /// *is* the namespace. Carried so an event is the same shape as every other
+    /// [`ObjectItem`], whose tree folder, search predicate and palette row all
+    /// ask for one.
+    pub schema: Option<String>,
+    /// `DEFINER`, as the catalogue reports it — `root@localhost`, unquoted.
+    ///
+    /// Load-bearing for the reason [`RoutineInfo::definer`] is, and more so: an
+    /// event has no caller, so the definer's rights are the **only** rights its
+    /// body ever runs with.
+    pub definer: Option<String>,
+    pub schedule: EventSchedule,
+    /// `ON COMPLETION PRESERVE`. False — MySQL's default — means the server
+    /// **drops the event** once its last firing is past, which for a one-shot is
+    /// after the first one.
+    pub preserve: bool,
+    pub status: EventStatus,
+    pub comment: Option<String>,
+    /// The statement the event runs, as it follows `DO`. One statement, or a
+    /// `BEGIN … END` compound.
+    ///
+    /// **From `information_schema` this is not trustworthy for an edit** — the
+    /// same escape-resolving column family [`RoutineSource`] exists for.
+    /// [`EventSource`] is the correct source, and is read lazily when the editor
+    /// opens.
+    pub body: String,
+    /// The session `time_zone` the schedule is interpreted in — `SYSTEM`, or an
+    /// offset like `+00:00`. See this struct's own note for why it is modelled.
+    pub time_zone: Option<String>,
+    /// The session state the body was written under, as [`RoutineInfo`] carries
+    /// it and for the same reason. `None` means "not known", and nothing is
+    /// emitted for it.
+    pub sql_mode: Option<String>,
+    pub charset_client: Option<String>,
+    pub collation_connection: Option<String>,
+}
+
+impl EventInfo {
+    /// `CREATE EVENT`, with every clause restated — the single event emitter, on
+    /// the same rule as [`RoutineInfo::create_sql`].
+    ///
+    /// **No trailing semicolon**, for the reason the routine emitter gives: the
+    /// body is a statement (or a compound of several, each ending in `;`) and
+    /// this is one statement that contains it.
+    /// The `ALTER EVENT` [`crate::ddl::diff_event`] builds follows the same rule
+    /// whenever it restates the body.
+    ///
+    /// The clause order is MySQL's grammar rather than a preference: `ALTER
+    /// EVENT` accepts these in exactly one sequence, and writing `CREATE` in the
+    /// same order keeps the two readable against each other.
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let mut out = String::from("CREATE ");
+        if let Some(def) = self.definer.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(&definer_sql(def));
+            out.push(' ');
+        }
+        out.push_str(&format!(
+            "EVENT {}\n",
+            qualified_ident(&self.name, self.schema.as_deref(), dialect)
+        ));
+        out.push_str(&format!("ON SCHEDULE {}\n", self.schedule.sql()));
+        // Stated either way. MySQL's default is `NOT PRESERVE`, which for a
+        // one-shot means the event deletes itself once it has run — silence here
+        // is the difference between an event that survives and one that does
+        // not, left to whatever the server assumes.
+        out.push_str(if self.preserve {
+            "ON COMPLETION PRESERVE\n"
+        } else {
+            "ON COMPLETION NOT PRESERVE\n"
+        });
+        out.push_str(self.status.sql_keyword());
+        out.push('\n');
+        if let Some(c) = self.comment.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("COMMENT {}\n", ddl_string(c, dialect)));
+        }
+        out.push_str("DO\n");
+        out.push_str(self.body.trim_matches('\n'));
+        out
+    }
+
+    /// The one-line summary the tree shows beside the name: the schedule, and
+    /// the fact that it is switched off when it is.
+    ///
+    /// The schedule is what tells two events apart at a glance; the body is too
+    /// long for a row and the definer says nothing about what it does. A
+    /// disabled event is called out because it is otherwise indistinguishable
+    /// from one that runs, which is the single most confusing thing about
+    /// browsing these.
+    pub fn detail(&self) -> String {
+        let sched = self
+            .schedule
+            .sql()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        match self.status {
+            EventStatus::Enabled => sched,
+            s => format!("{sched} — {}", s.label().to_lowercase()),
+        }
+    }
+}
+
+/// What one `SHOW CREATE EVENT` round trip yields: the body **as written**, and
+/// the session state it was written under.
+///
+/// It exists for the reason [`RoutineSource`] does and against the same column
+/// family — `information_schema.EVENTS.EVENT_DEFINITION` resolves the body's
+/// escapes, so an event holding `'it''s'` comes back as `'it's'`. The
+/// consequence is milder here than for a routine, because `ALTER EVENT` edits in
+/// place and a body the server refuses leaves the event standing; it is still
+/// wrong, and the failure is the user's edit rejected over a quote they never
+/// typed.
+///
+/// Fetched **lazily**, when the editor opens, exactly as [`RoutineSource`] is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventSource {
+    /// The body as written, or `None` when the `CREATE` text couldn't be
+    /// understood (or the account may not read it).
+    ///
+    /// Optional so a body this can't parse doesn't take the session state with
+    /// it — [`RoutineSource::body`] records the bug that rule comes from.
+    pub body: Option<String>,
+    pub time_zone: Option<String>,
+    pub sql_mode: Option<String>,
+    pub charset_client: Option<String>,
+    pub collation_connection: Option<String>,
+}
+
+impl EventSource {
+    /// Copy this onto an [`EventInfo`] — the body **and** the session state.
+    ///
+    /// One method because both sides of the diff have to be patched with it, as
+    /// [`RoutineSource::apply_to`] is: patching only the draft would make every
+    /// event open already-changed against a `current` that still held the
+    /// resolved body.
+    pub fn apply_to(&self, e: &mut EventInfo) {
+        self.apply_body_to(e);
+        self.apply_session_to(e);
+    }
+
+    /// The body alone — the half the user may already have overwritten before
+    /// this reply landed.
+    pub fn apply_body_to(&self, e: &mut EventInfo) {
+        if let Some(body) = &self.body {
+            e.body = body.clone();
+        }
+    }
+
+    /// The session state alone, and **only where this read has a value**: a
+    /// `SHOW CREATE` that came back short must not blank what the catalogue read
+    /// already filled in.
+    pub fn apply_session_to(&self, e: &mut EventInfo) {
+        if self.time_zone.is_some() {
+            e.time_zone = self.time_zone.clone();
+        }
+        if self.sql_mode.is_some() {
+            e.sql_mode = self.sql_mode.clone();
+        }
+        if self.charset_client.is_some() {
+            e.charset_client = self.charset_client.clone();
+        }
+        if self.collation_connection.is_some() {
+            e.collation_connection = self.collation_connection.clone();
+        }
+    }
+}
+
+/// Quote a catalogue timestamp into the expression [`EventSchedule`] holds.
+///
+/// `information_schema.EVENTS` reports `EXECUTE_AT`, `STARTS` and `ENDS` as bare
+/// datetimes — `2026-01-01 03:00:00` — and the model holds **SQL**, because a
+/// schedule field that can only hold a literal cannot express
+/// `CURRENT_TIMESTAMP + INTERVAL 1 HOUR`, which is how most events are started.
+/// So the reader is what quotes, once, here; everything downstream emits the
+/// string verbatim, the same contract a column default already has.
+///
+/// An empty column is `None`: the schedule simply has no such bound.
+pub fn event_time_expr(raw: &str, dialect: crate::intel::SqlDialect) -> Option<String> {
+    let raw = raw.trim();
+    (!raw.is_empty()).then(|| ddl_string(raw, dialect))
+}
+
+/// Quote a catalogue interval quantity into the expression
+/// [`EventSchedule::Every`] holds.
+///
+/// `INTERVAL_VALUE` is a plain number for the single-part units (`EVERY 6
+/// HOUR`) and a punctuated string for the compound ones (`EVERY '1:30'
+/// HOUR_MINUTE`), and MySQL's grammar wants the second quoted. The test is what
+/// the value *is*, not which unit it arrived with: a digits-only quantity stays
+/// bare, anything else becomes a literal — so a compound unit is quoted whether
+/// or not [`EVENT_INTERVAL_UNITS`] has heard of it.
+pub fn event_interval_expr(raw: &str, dialect: crate::intel::SqlDialect) -> String {
+    let raw = raw.trim();
+    if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+        return raw.to_string();
+    }
+    ddl_string(raw, dialect)
+}
+
 // ── Standalone objects (PostgreSQL) ─────────────────────────────────────────
 
 /// A user-defined enum type — `CREATE TYPE mood AS ENUM ('sad', 'ok')`.
@@ -2520,6 +2904,9 @@ pub enum ObjectItem {
     Domain(DomainInfo),
     Sequence(SequenceInfo),
     Routine(std::sync::Arc<RoutineInfo>),
+    /// Behind an [`Arc`](std::sync::Arc) for the reason `Routine` is: it carries
+    /// a body, and the keyboard walk rebuilds this list on every arrow key.
+    Event(std::sync::Arc<EventInfo>),
 }
 
 impl ObjectItem {
@@ -2529,6 +2916,7 @@ impl ObjectItem {
             ObjectItem::Domain(_) => crate::ddl::ObjectKind::Domain,
             ObjectItem::Sequence(_) => crate::ddl::ObjectKind::Sequence,
             ObjectItem::Routine(r) => crate::ddl::ObjectKind::of_routine(r.kind),
+            ObjectItem::Event(_) => crate::ddl::ObjectKind::Event,
         }
     }
 
@@ -2541,12 +2929,23 @@ impl ObjectItem {
         }
     }
 
+    /// The event behind this item, when it is one — the counterpart of
+    /// [`ObjectItem::routine`], and what the tree's menu and the editor both
+    /// need so neither has to look it up by name.
+    pub fn event(&self) -> Option<&EventInfo> {
+        match self {
+            ObjectItem::Event(e) => Some(e),
+            _ => None,
+        }
+    }
+
     pub fn name(&self) -> &str {
         match self {
             ObjectItem::Enum(e) => &e.name,
             ObjectItem::Domain(d) => &d.name,
             ObjectItem::Sequence(s) => &s.name,
             ObjectItem::Routine(r) => &r.name,
+            ObjectItem::Event(e) => &e.name,
         }
     }
 
@@ -2556,6 +2955,7 @@ impl ObjectItem {
             ObjectItem::Domain(d) => d.schema.as_deref(),
             ObjectItem::Sequence(s) => s.schema.as_deref(),
             ObjectItem::Routine(r) => r.schema.as_deref(),
+            ObjectItem::Event(e) => e.schema.as_deref(),
         }
     }
 
@@ -2631,6 +3031,10 @@ impl ObjectItem {
                     format!("({args})")
                 }
             }
+            // The schedule, which is what tells two events apart in a list —
+            // and, when it is switched off, that it is. See
+            // [`EventInfo::detail`].
+            ObjectItem::Event(e) => e.detail(),
         }
     }
 
@@ -2681,6 +3085,10 @@ impl ObjectItem {
             ObjectItem::Routine(r) => {
                 crate::ddl::client_script(&[r.create_sql(dialect, false)], dialect)
             }
+            // Through `client_script` for the same reason a routine is: this
+            // `CREATE` carries no terminator of its own (the apply path sends it
+            // whole) and its body may be a `BEGIN … END` full of `;`.
+            ObjectItem::Event(e) => crate::ddl::client_script(&[e.create_sql(dialect)], dialect),
         }
     }
 }
@@ -2969,6 +3377,12 @@ pub struct DbSchema {
     /// gives: the schema-tree walk turns these into `ObjectItem`s on every arrow
     /// key, and a body copied per keypress is the cost that buys nothing.
     pub routines: Vec<std::sync::Arc<RoutineInfo>>,
+    /// Scheduled events. **MySQL and MariaDB only** — the other two engines have
+    /// no such object and leave this empty; see [`EventInfo`].
+    ///
+    /// `Arc` for the reason `routines` is: an event carries a body, and the
+    /// schema-tree walk turns these into [`ObjectItem`]s on every arrow key.
+    pub events: Vec<std::sync::Arc<EventInfo>>,
     /// Which MySQL-family server this came from, when it came from one.
     ///
     /// `SqlDialect` deliberately has no MariaDB arm — the two speak one dialect
@@ -3124,7 +3538,24 @@ impl DbSchema {
                 .and_then(|rk| self.find_routine(schema, rk, name))
                 .cloned()
                 .map(ObjectItem::Routine),
+            crate::ddl::ObjectKind::Event => self
+                .find_event(schema, name)
+                .cloned()
+                .map(ObjectItem::Event),
         }
+    }
+
+    /// One scheduled event by name. The namespace argument is carried for the
+    /// shape every other `find_*` has and is always `None` in practice — MySQL
+    /// is the only engine with events, and a database *is* the namespace there.
+    pub fn find_event(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Option<&std::sync::Arc<EventInfo>> {
+        find_by_ns(&self.events, schema, name, |e| {
+            (e.schema.as_deref(), e.name.as_str())
+        })
     }
 
     /// The objects of one kind whose **name** matches, in any namespace —
@@ -3177,6 +3608,13 @@ impl DbSchema {
                 .cloned()
                 .map(ObjectItem::Routine)
                 .collect(),
+            crate::ddl::ObjectKind::Event => self
+                .events
+                .iter()
+                .filter(|e| object_name_matches(&e.name, needle_lower))
+                .cloned()
+                .map(ObjectItem::Event)
+                .collect(),
         }
     }
 
@@ -3205,6 +3643,9 @@ impl DbSchema {
                 .cloned()
                 .map(ObjectItem::Routine)
                 .collect(),
+            crate::ddl::ObjectKind::Event => {
+                self.events.iter().cloned().map(ObjectItem::Event).collect()
+            }
         }
     }
 
@@ -3313,12 +3754,20 @@ impl DbSchema {
             .collect();
         // **Last**, because a routine body names the tables and views above it.
         // The order is what makes the script runnable end to end rather than a
-        // set of statements that happen to be here.
-        let routines: Vec<String> = [ObjectKind::Function, ObjectKind::Procedure]
-            .into_iter()
-            .flat_map(|k| self.objects_in(schema, k))
-            .map(|o| o.create_sql(dialect))
-            .collect();
+        // set of statements that happen to be here. Events come after the
+        // routines within that group, on the same rule: an event's body may call
+        // one. They are MySQL's alone, so they contribute nothing on the other
+        // two engines — and leaving them off this list was a script that
+        // restored every table and silently dropped every scheduled job.
+        let routines: Vec<String> = [
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Event,
+        ]
+        .into_iter()
+        .flat_map(|k| self.objects_in(schema, k))
+        .map(|o| o.create_sql(dialect))
+        .collect();
         types
             .into_iter()
             .chain(tables.into_iter().map(|t| t.create_ddl(dialect)))
@@ -6037,5 +6486,242 @@ mod tests {
             s.find_object(Some("archive"), ObjectKind::Enum, "mood")
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use crate::intel::SqlDialect::MySql;
+
+    fn ev() -> EventInfo {
+        EventInfo {
+            name: "nightly".into(),
+            definer: Some("root@localhost".into()),
+            body: "DELETE FROM sessions WHERE expires_at < NOW()".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The catalogue hands back a bare datetime and the model holds **SQL**, so
+    /// the reader is where the quoting happens — once, and not again downstream.
+    #[test]
+    fn a_catalogue_timestamp_becomes_a_literal() {
+        assert_eq!(
+            event_time_expr("2026-01-01 03:00:00", MySql).as_deref(),
+            Some("'2026-01-01 03:00:00'")
+        );
+        // An empty column is no bound at all, not an empty expression that
+        // would emit `STARTS ''`.
+        assert_eq!(event_time_expr("", MySql), None);
+        assert_eq!(event_time_expr("   ", MySql), None);
+    }
+
+    /// A single-part unit's quantity is a number and stays bare; a compound
+    /// unit's is punctuated and MySQL's grammar wants it quoted. The test is on
+    /// the **value**, so a compound unit this build has never heard of is still
+    /// quoted correctly.
+    #[test]
+    fn an_interval_quantity_is_quoted_only_when_it_is_not_a_number() {
+        assert_eq!(event_interval_expr("6", MySql), "6");
+        assert_eq!(event_interval_expr(" 1 ", MySql), "1");
+        assert_eq!(event_interval_expr("1:30", MySql), "'1:30'");
+        assert_eq!(event_interval_expr("2 3:04", MySql), "'2 3:04'");
+        // Not a number and not empty either — quoted, so the statement fails
+        // visibly rather than becoming `EVERY  DAY`.
+        assert_eq!(event_interval_expr("", MySql), "''");
+    }
+
+    /// Every spelling `information_schema.EVENTS.STATUS` reports, including the
+    /// one MySQL 8.0.26 renamed the keyword for. An unknown answer is `Enabled`,
+    /// which is how the scheduler treats it.
+    #[test]
+    fn the_status_column_reads_every_spelling() {
+        assert_eq!(EventStatus::parse("ENABLED"), EventStatus::Enabled);
+        assert_eq!(EventStatus::parse("disabled"), EventStatus::Disabled);
+        assert_eq!(
+            EventStatus::parse("SLAVESIDE_DISABLED"),
+            EventStatus::SlavesideDisabled
+        );
+        assert_eq!(
+            EventStatus::parse("REPLICA_SIDE_DISABLED"),
+            EventStatus::SlavesideDisabled
+        );
+        assert_eq!(EventStatus::parse("something new"), EventStatus::Enabled);
+    }
+
+    /// The two schedule shapes, and the bounds that only one of them has.
+    #[test]
+    fn a_schedule_renders_both_of_its_shapes() {
+        assert_eq!(
+            EventSchedule::At("'2026-06-01 00:00:00'".into()).sql(),
+            "AT '2026-06-01 00:00:00'"
+        );
+        assert_eq!(EventSchedule::default().sql(), "EVERY 1 DAY");
+        assert_eq!(
+            EventSchedule::Every {
+                value: "1".into(),
+                unit: "DAY".into(),
+                starts: Some("'2026-01-01 03:00:00'".into()),
+                ends: Some("'2027-01-01 03:00:00'".into()),
+            }
+            .sql(),
+            "EVERY 1 DAY\n  STARTS '2026-01-01 03:00:00'\n  ENDS '2027-01-01 03:00:00'"
+        );
+        // An empty bound emits no clause: `STARTS ''` is a value MySQL refuses.
+        assert_eq!(
+            EventSchedule::Every {
+                value: "1".into(),
+                unit: "DAY".into(),
+                starts: Some("  ".into()),
+                ends: None,
+            }
+            .sql(),
+            "EVERY 1 DAY"
+        );
+    }
+
+    /// The whole `CREATE EVENT`, in MySQL's clause order — and the two clauses
+    /// that are stated **even at their default**, because silence there means
+    /// something different from what the model holds.
+    #[test]
+    fn create_event_restates_every_clause() {
+        let mut e = ev();
+        e.schedule = EventSchedule::Every {
+            value: "1".into(),
+            unit: "DAY".into(),
+            starts: Some("'2026-01-01 03:00:00'".into()),
+            ends: None,
+        };
+        e.comment = Some("nightly purge".into());
+        let sql = e.create_sql(MySql);
+        assert_eq!(
+            sql,
+            "CREATE DEFINER = `root`@`localhost` EVENT `nightly`\n\
+             ON SCHEDULE EVERY 1 DAY\n  STARTS '2026-01-01 03:00:00'\n\
+             ON COMPLETION NOT PRESERVE\n\
+             ENABLE\n\
+             COMMENT 'nightly purge'\n\
+             DO\n\
+             DELETE FROM sessions WHERE expires_at < NOW()"
+        );
+        // **No trailing semicolon.** The body is a statement of its own — a
+        // compound one, here — and this is one statement that contains it.
+        assert!(!sql.ends_with(';'));
+    }
+
+    /// The comment is a literal, and a literal is quoted by the one quoter.
+    #[test]
+    fn a_comment_with_a_quote_in_it_is_escaped() {
+        let mut e = ev();
+        e.comment = Some("it's nightly".into());
+        assert!(e.create_sql(MySql).contains("COMMENT 'it''s nightly'"));
+    }
+
+    /// `DISABLE ON SLAVE` is the state a replica sets for itself, and it round
+    /// -trips: an event read in it and re-emitted says so rather than coming
+    /// back enabled.
+    #[test]
+    fn a_replica_disabled_event_keeps_saying_so() {
+        let mut e = ev();
+        e.status = EventStatus::SlavesideDisabled;
+        assert!(e.create_sql(MySql).contains("\nDISABLE ON SLAVE\n"));
+    }
+
+    /// The tree row: the schedule on one line, and the fact that it is switched
+    /// off when it is.
+    #[test]
+    fn the_detail_line_is_the_schedule_and_whether_it_runs() {
+        let mut e = ev();
+        e.schedule = EventSchedule::Every {
+            value: "1".into(),
+            unit: "DAY".into(),
+            starts: Some("'2026-01-01 03:00:00'".into()),
+            ends: None,
+        };
+        // The clause is multi-line SQL and a tree row is one line, so the
+        // newline and its indent collapse to a single space.
+        assert_eq!(e.detail(), "EVERY 1 DAY STARTS '2026-01-01 03:00:00'");
+        e.status = EventStatus::Disabled;
+        assert_eq!(
+            e.detail(),
+            "EVERY 1 DAY STARTS '2026-01-01 03:00:00' — disabled"
+        );
+    }
+
+    /// **Generate DDL must carry the events.** The kinds in `create_ddl_script`
+    /// are enumerated by hand, and an object kind missing from that list is a
+    /// script that restores every table and silently drops every scheduled job —
+    /// the worst shape a backup can take, because nothing on screen says so.
+    ///
+    /// They come **after** the routines, on the rule that group already follows:
+    /// an event's body may call one.
+    #[test]
+    fn the_generated_script_carries_the_events_after_the_routines() {
+        let mut s = DbSchema {
+            tables: vec![TableInfo {
+                name: "sessions".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        s.events.push(std::sync::Arc::new(ev()));
+        s.routines.push(std::sync::Arc::new(RoutineInfo {
+            name: "purge".into(),
+            kind: RoutineKind::Procedure,
+            body: "BEGIN DELETE FROM sessions; END".into(),
+            ..Default::default()
+        }));
+
+        let script = s.create_ddl_script(None, MySql);
+        let event_at = script
+            .find("CREATE DEFINER = `root`@`localhost` EVENT `nightly`")
+            .expect("the script names the event");
+        let routine_at = script.find("PROCEDURE `purge`").expect("…and the routine");
+        let table_at = script.find("`sessions`").expect("…and the table");
+        assert!(table_at < routine_at, "tables before routines");
+        assert!(routine_at < event_at, "routines before events");
+
+        // Through `client_script`, so a body full of `;` is pasteable — the same
+        // treatment a MySQL routine's `CREATE` gets.
+        assert!(script.contains("DO\nDELETE FROM sessions WHERE expires_at < NOW()"));
+
+        // And the whole-database walk goes through the same builder.
+        assert!(s.create_ddl_script_all(MySql).contains("EVENT `nightly`"));
+    }
+
+    /// The lazy read's two halves are applied separately, because the caller has
+    /// to gate them differently — the body is the user's to overwrite, the
+    /// session state is not editable anywhere.
+    #[test]
+    fn the_source_patches_the_body_and_the_session_apart() {
+        let src = EventSource {
+            body: Some("SELECT 'it''s'".into()),
+            time_zone: Some("+00:00".into()),
+            sql_mode: Some("STRICT_TRANS_TABLES".into()),
+            charset_client: Some("utf8mb4".into()),
+            collation_connection: None,
+        };
+
+        let mut only_session = ev();
+        only_session.collation_connection = Some("utf8mb4_general_ci".into());
+        src.apply_session_to(&mut only_session);
+        assert_eq!(only_session.body, ev().body, "the body is left alone");
+        assert_eq!(only_session.time_zone.as_deref(), Some("+00:00"));
+        assert_eq!(
+            only_session.sql_mode.as_deref(),
+            Some("STRICT_TRANS_TABLES")
+        );
+        // A read that came back short must not blank what the catalogue read
+        // already filled in.
+        assert_eq!(
+            only_session.collation_connection.as_deref(),
+            Some("utf8mb4_general_ci")
+        );
+
+        let mut both = ev();
+        src.apply_to(&mut both);
+        assert_eq!(both.body, "SELECT 'it''s'");
+        assert_eq!(both.time_zone.as_deref(), Some("+00:00"));
     }
 }
