@@ -3662,7 +3662,7 @@ impl ChangeSet {
             match c {
                 Change::CreateRoutine(draft) => {
                     let f = &draft.info;
-                    out.extend(session_wrapped(f.create_sql(d, false), f, d));
+                    out.extend(session_wrapped(None, f.create_sql(d, false), f, d));
                 }
                 Change::ReplaceRoutine {
                     draft,
@@ -3676,6 +3676,7 @@ impl ChangeSet {
                     // list is a different routine. Taking either from the draft
                     // was that engine's edit silently doing nothing: the rename,
                     // and then the drop.
+                    let mut drop = None;
                     if *recreate {
                         let mut held = (**server).clone();
                         if held.name.is_empty() {
@@ -3688,14 +3689,26 @@ impl ChangeSet {
                         // applies against a routine someone else already removed,
                         // rather than failing on step one and leaving the create
                         // unrun.
-                        out.push(format!(
+                        drop = Some(format!(
                             "DROP {} IF EXISTS {};",
                             held.kind.sql_keyword(),
                             held.signature_sql(d)
                         ));
                     }
                     let f = &draft.info;
-                    out.extend(session_wrapped(f.create_sql(d, !*recreate), f, d));
+                    // **The `DROP` goes *inside* the session wrapper.** It used
+                    // to be pushed first, which left the wrapper's two `SET`s in
+                    // the gap between a `DROP` that had committed and the
+                    // `CREATE` that would restore the object — and `run_ddl`
+                    // breaks on the first error. A routine carried across a
+                    // major-version upgrade whose `SQL_MODE` names a mode the
+                    // running server has removed is the realistic input:
+                    // verified live, MySQL 8.4.11 answers 1231 to
+                    // `SET SESSION sql_mode = 'NO_AUTO_CREATE_USER'`, which
+                    // MariaDB 10.11 still accepts. Ordering it this way costs
+                    // nothing — the `CREATE` runs under the same session either
+                    // way — and removes two ways to lose the routine.
+                    out.extend(session_wrapped(drop, f.create_sql(d, !*recreate), f, d));
                 }
                 Change::RenameRoutine { from, to } => out.push(format!(
                     "ALTER {} {} RENAME TO {};",
@@ -4866,6 +4879,7 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
 /// the connection as it was found, whatever it was.
 fn session_wrapped_create(t: &TriggerInfo, d: SqlDialect) -> Vec<String> {
     session_wrapped_with(
+        None,
         t.create_sql(d),
         t.sql_mode.as_deref(),
         t.charset_client.as_deref(),
@@ -4882,8 +4896,18 @@ fn session_wrapped_create(t: &TriggerInfo, d: SqlDialect) -> Vec<String> {
 ///
 /// One helper for both rather than two, because the failure it prevents is the
 /// same failure and the two had already been written once.
-fn session_wrapped(create: String, r: &RoutineInfo, d: SqlDialect) -> Vec<String> {
+/// `lead` is a statement that must run under the same session state as the
+/// `CREATE` **and inside the wrapper** — the recreate's `DROP`. It is not merely
+/// cosmetic ordering: anything left outside the wrapper but after the `DROP`
+/// sits in a gap where a refused statement costs the routine outright.
+fn session_wrapped(
+    lead: Option<String>,
+    create: String,
+    r: &RoutineInfo,
+    d: SqlDialect,
+) -> Vec<String> {
     session_wrapped_with(
+        lead,
         create,
         r.sql_mode.as_deref(),
         r.charset_client.as_deref(),
@@ -4893,6 +4917,7 @@ fn session_wrapped(create: String, r: &RoutineInfo, d: SqlDialect) -> Vec<String
 }
 
 fn session_wrapped_with(
+    lead: Option<String>,
     create: String,
     sql_mode: Option<&str>,
     charset_client: Option<&str>,
@@ -4903,7 +4928,7 @@ fn session_wrapped_with(
     // SQLite has no `SET SESSION` to carry it with — asked as `!= MySql` so a
     // third engine can't inherit `SET SESSION sql_mode = …` by falling through.
     if d != SqlDialect::MySql {
-        return vec![create];
+        return lead.into_iter().chain([create]).collect();
     }
     let settings: Vec<(&str, &str)> = [
         ("sql_mode", sql_mode),
@@ -4914,7 +4939,7 @@ fn session_wrapped_with(
     .filter_map(|(k, v)| v.map(|v| (k, v)))
     .collect();
     if settings.is_empty() {
-        return vec![create];
+        return lead.into_iter().chain([create]).collect();
     }
     let save = settings
         .iter()
@@ -4931,12 +4956,11 @@ fn session_wrapped_with(
         .map(|(k, _)| format!("SESSION {k} = @schemaic_{k}"))
         .collect::<Vec<_>>()
         .join(", ");
-    vec![
-        format!("SET {save};"),
-        format!("SET {set};"),
-        create,
-        format!("SET {restore};"),
-    ]
+    [format!("SET {save};"), format!("SET {set};")]
+        .into_iter()
+        .chain(lead)
+        .chain([create, format!("SET {restore};")])
+        .collect()
 }
 
 /// Peel the parentheses that wrap a *whole* expression, leaving the predicate
@@ -10147,6 +10171,103 @@ mod tests {
             assert!(sql[0].contains("CREATE OR REPLACE FUNCTION"), "{sql:?}");
         }
 
+        /// **The session `SET`s must wrap the `DROP` too, not sit between it
+        /// and the `CREATE`.**
+        ///
+        /// `Db::run_ddl` runs a plan's statements in order on one connection
+        /// and breaks on the first error, so two statements the server can
+        /// refuse used to sit in the gap between a `DROP` that had committed
+        /// and the `CREATE` that would have restored the object. The realistic
+        /// input is a routine carried across a major-version upgrade whose
+        /// `SQL_MODE` still names a mode the running server has removed —
+        /// confirmed live: MySQL 8.4.11 answers `ERROR 1231` to
+        /// `SET SESSION sql_mode = 'NO_AUTO_CREATE_USER'`, which MariaDB 10.11
+        /// still accepts. Moving the `DROP` inside costs nothing: the `CREATE`
+        /// runs under exactly the same session either way.
+        #[test]
+        fn a_mysql_recreate_saves_the_session_state_before_it_drops_anything() {
+            let mut f = fnc();
+            f.name = "p".into();
+            f.schema = None;
+            f.kind = RoutineKind::Procedure;
+            f.returns = String::new();
+            f.language = "SQL".into();
+            f.sql_mode = Some("NO_AUTO_CREATE_USER,STRICT_TRANS_TABLES".into());
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.body = "BEGIN SELECT 2; END".into();
+
+            let sql = diff_routine(&f, &d, MySql).emit();
+            let at = |needle: &str| {
+                sql.iter()
+                    .position(|s| s.contains(needle))
+                    .unwrap_or_else(|| panic!("no {needle} in {sql:?}"))
+            };
+            let (save, set, drop, create) = (
+                at("@schemaic_sql_mode = @@SESSION.sql_mode"),
+                at("SET SESSION sql_mode = "),
+                at("DROP PROCEDURE IF EXISTS"),
+                at("CREATE PROCEDURE"),
+            );
+            assert!(save < set, "{sql:?}");
+            assert!(
+                set < drop,
+                "a refused SET must not cost the routine: {sql:?}"
+            );
+            assert!(drop < create, "{sql:?}");
+            // …and the restore still comes last.
+            assert_eq!(
+                at("SET SESSION sql_mode = @schemaic_sql_mode"),
+                sql.len() - 1,
+                "{sql:?}"
+            );
+        }
+
+        /// **A MariaDB aggregate function is restated as one.**
+        ///
+        /// `information_schema.ROUTINES` has no column that says so — verified
+        /// live, zero columns matching `%AGG%` — so the eager read that fills
+        /// the tree cannot know. `SHOW CREATE` does print it, and the editor
+        /// already makes that round trip. Without the keyword the recreate is
+        /// `ERROR 4105 (Aggregate specific instruction … used in a wrong
+        /// context)` *after* the `DROP` has committed: reproduced live on
+        /// MariaDB 10.11.14, and `information_schema.ROUTINES` was empty for
+        /// the name afterwards. With it, the round trip restores a working
+        /// aggregate — also verified live.
+        #[test]
+        fn a_mariadb_aggregate_function_keeps_its_keyword_through_a_recreate() {
+            let mut f = fnc();
+            f.name = "f_agg".into();
+            f.schema = None;
+            f.arguments = "x int(11)".into();
+            f.returns = "int(11)".into();
+            f.language = "SQL".into();
+            f.aggregate = true;
+            f.body = "BEGIN LOOP FETCH GROUP NEXT ROW; END LOOP; END".into();
+
+            let create = f.create_sql(MySql, false);
+            assert!(
+                create.contains("AGGREGATE FUNCTION"),
+                "the keyword the catalogue never published: {create}"
+            );
+            // An ordinary function is untouched — the keyword is MariaDB's and
+            // appears only where the server printed it.
+            let mut plain = f.clone();
+            plain.aggregate = false;
+            assert!(!plain.create_sql(MySql, false).contains("AGGREGATE"));
+
+            // And the round trip: an untouched aggregate is not a change, and a
+            // body edit re-creates it as an aggregate.
+            let d = RoutineDraft::from_info(&f);
+            assert!(diff_routine(&f, &d, MySql).changes.is_empty());
+            let mut edited = RoutineDraft::from_info(&f);
+            edited.info.body = "BEGIN LOOP FETCH GROUP NEXT ROW; END LOOP; END;".into();
+            let sql = diff_routine(&f, &edited, MySql).emit();
+            assert!(
+                sql.iter().any(|s| s.contains("AGGREGATE FUNCTION")),
+                "{sql:?}"
+            );
+        }
+
         /// **`DROP`/`ALTER … RENAME` take the identity form, which omits
         /// defaults; `CREATE` takes the declaration form, which needs them.**
         /// Splicing one into the other's place is a syntax error either way
@@ -10431,6 +10552,11 @@ mod tests {
         /// A MySQL routine carries the session state it was created under, and
         /// `CREATE PROCEDURE` has no clause for any of it — so the values are set
         /// around the statement and restored after, exactly as a trigger's are.
+        ///
+        /// The two `SET`s open the plan and the restore closes it, with the
+        /// recreate's `DROP` *inside* — see
+        /// `a_mysql_recreate_saves_the_session_state_before_it_drops_anything`
+        /// for why the drop cannot sit outside the wrapper.
         #[test]
         fn a_mysql_routine_is_created_under_its_own_session_state() {
             let mut cur = my_proc();
@@ -10443,17 +10569,19 @@ mod tests {
                 .position(|s| s.contains("CREATE DEFINER"))
                 .expect("a create");
             assert!(
-                sql[create - 2].starts_with("SET @schemaic_sql_mode = @@SESSION.sql_mode"),
+                sql[0].starts_with("SET @schemaic_sql_mode = @@SESSION.sql_mode"),
                 "{sql:?}"
             );
             assert!(
-                sql[create - 1].contains("SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'"),
+                sql[1].contains("SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'"),
                 "{sql:?}"
             );
+            assert!(1 < create, "the SETs come first: {sql:?}");
             assert!(
                 sql[create + 1].contains("SESSION sql_mode = @schemaic_sql_mode"),
                 "{sql:?}"
             );
+            assert_eq!(create + 1, sql.len() - 1, "the restore is last: {sql:?}");
         }
 
         /// MySQL names a routine without its parameters and PostgreSQL cannot;

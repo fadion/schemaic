@@ -26,6 +26,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params};
 use schemaic_core::activity::{self, KillKind, SessionInfo};
+use schemaic_core::export;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
@@ -560,6 +561,10 @@ impl Db {
                 sql_mode: some(mode),
                 charset_client: some(cs),
                 collation_connection: some(coll),
+                // Read off the *header*, so it survives a body this can't parse
+                // for the same reason the session state does — and the header
+                // is the only place it exists at all.
+                aggregate: create.as_deref().is_some_and(routine_is_aggregate),
             },
         ))
     }
@@ -1881,6 +1886,49 @@ type MyShowCreateRoutineRow = (String, String, Option<String>, String, String, S
 /// `None` when there is no parameter list to anchor on, or nothing after the
 /// characteristics — both of which mean this didn't understand the text, and a
 /// caller that gets `None` keeps the body it already had rather than blanking it.
+/// Does this `SHOW CREATE` text declare a MariaDB **aggregate** function?
+///
+/// The one fact about a routine that `information_schema.ROUTINES` does not
+/// publish — verified live on MariaDB 10.11.14, no column in that table names
+/// it — while `SHOW CREATE FUNCTION` prints
+/// ``CREATE DEFINER=`a`@`b` AGGREGATE FUNCTION `f`(…)``. Losing it destroyed the
+/// function: the recreate's `CREATE` came back `ERROR 4105 (Aggregate specific
+/// instruction (FETCH GROUP NEXT ROW) used in a wrong context)` after the
+/// `DROP` had committed, and the catalogue was then empty for the name.
+///
+/// Only the **header** is read — everything before the parameter list — so a
+/// body that mentions aggregates says nothing, and the scan goes through
+/// [`sql::skip_noncode`] so a routine *named* `` `aggregate` `` is a quoted
+/// identifier the scan steps over rather than the keyword. This is the same
+/// span [`routine_body_of`] walks to find the parameter list and discards.
+fn routine_is_aggregate(create_sql: &str) -> bool {
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = sql::skip_noncode(b, i, SqlDialect::MySql) {
+            i = j.max(i + 1);
+            continue;
+        }
+        // The parameter list: past here is the routine, not its header.
+        if b[i] == b'(' {
+            return false;
+        }
+        if sql::is_word_start(b[i]) {
+            let mut j = i + 1;
+            while j < b.len() && sql::is_word_byte(b[j]) {
+                j += 1;
+            }
+            if create_sql[i..j].eq_ignore_ascii_case("AGGREGATE") {
+                return true;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn routine_body_of(create_sql: &str) -> Option<String> {
     const CHARACTERISTIC: &[&str] = &[
         "NOT",
@@ -2323,13 +2371,24 @@ fn mysql_type_with_charset(dtd: &str, charset: Option<&str>, collation: Option<&
 /// valid only for a PROCEDURE". Joining the mode in for a function emitted a
 /// `CREATE` the server answers 1064 to, *after* the recreate's `DROP` had
 /// committed on its own: the function was destroyed and nothing replaced it.
+///
+/// **And the name is quoted, which is the same failure by the other half of the
+/// same line.** `PARAMETER_NAME` is the *bare* name — a procedure declared
+/// ``p(`order` INT)`` reports `order` — so joining it raw emitted
+/// `CREATE PROCEDURE p(IN order INT)` and cost the routine in exactly the way
+/// the paragraph above describes. Reproduced live on MariaDB 10.11.14 and MySQL
+/// 8.4.11. Through [`export::ident_if_needed`], the project's one quoter for
+/// SQL a user also reads — this string is what the editor's Parameters field
+/// shows — so an ordinary lower-case name stays bare and no rendered list a
+/// user is already looking at changes.
 fn mysql_parameters(rows: &[MyParamRow]) -> HashMap<(String, String), Vec<String>> {
     let mut params: HashMap<(String, String), Vec<String>> = HashMap::new();
     for (name, ty, mode, pname, dtd, charset, collation) in rows {
         let kind = ty.to_ascii_uppercase();
         let mode = if kind == "PROCEDURE" { mode.trim() } else { "" };
         let dtd = mysql_type_with_charset(dtd, charset.as_deref(), collation.as_deref());
-        let rendered = [mode, pname.trim(), dtd.as_str()]
+        let pname = export::ident_if_needed(pname.trim(), SqlDialect::MySql);
+        let rendered = [mode, pname.as_str(), dtd.as_str()]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
@@ -4898,6 +4957,74 @@ mod tests {
             params[&(s("p"), s("PROCEDURE"))],
             vec![s("IN n INT"), s("INOUT acc DECIMAL(9,2)")]
         );
+    }
+
+    /// **`PARAMETER_NAME` is the bare name, and the rebuilt list has to quote
+    /// it.**
+    ///
+    /// A procedure declared ``p(`order` INT)`` comes back from
+    /// `information_schema.PARAMETERS` as `order`, and the list was joined raw
+    /// — so the recreate emitted `CREATE PROCEDURE p(IN order INT)` and the
+    /// server answered 1064 **after** the `DROP` had committed on its own.
+    /// Reproduced live on MariaDB 10.11.14 and MySQL 8.4.11: the procedure was
+    /// gone and nothing replaced it, and the backticked form restores it.
+    ///
+    /// This is the same statement, the same commit and the same stated failure
+    /// as the parameter-mode fix beside it, which fixed the mode half and left
+    /// the quoting half.
+    #[test]
+    fn mysql_parameters_quote_a_name_that_needs_quoting() {
+        let params = mysql_parameters(&[
+            pr("p", "PROCEDURE", "IN", "order", "INT"),
+            pr("p", "PROCEDURE", "IN", "first name", "INT"),
+            pr("p", "PROCEDURE", "IN", "amount", "DECIMAL(9,2)"),
+            pr("f", "FUNCTION", "IN", "rank", "INT"),
+        ]);
+        assert_eq!(
+            params[&(s("p"), s("PROCEDURE"))],
+            vec![
+                s("IN `order` INT"),
+                s("IN `first name` INT"),
+                // An ordinary name stays bare, so no rendered list a user is
+                // already reading changes.
+                s("IN amount DECIMAL(9,2)"),
+            ]
+        );
+        assert_eq!(params[&(s("f"), s("FUNCTION"))], vec![s("`rank` INT")]);
+    }
+
+    /// **`AGGREGATE` is printed by `SHOW CREATE` and by nothing else.**
+    ///
+    /// MariaDB's `information_schema.ROUTINES` has no column that distinguishes
+    /// an aggregate function — verified live, zero columns matching `%AGG%` —
+    /// so the header of the `SHOW CREATE` text is the only place it can be
+    /// learned. Dropping it cost the function: the recreate came back
+    /// `ERROR 4105` after the `DROP` committed.
+    #[test]
+    fn the_show_create_header_reports_an_aggregate_function() {
+        assert!(routine_is_aggregate(
+            "CREATE DEFINER=`schemaic`@`%` AGGREGATE FUNCTION `f_agg`(x int(11)) RETURNS int(11) \
+             BEGIN LOOP FETCH GROUP NEXT ROW; END LOOP; END"
+        ));
+        assert!(routine_is_aggregate(
+            "create aggregate function f(x int) returns int RETURN 1"
+        ));
+        assert!(!routine_is_aggregate(
+            "CREATE DEFINER=`schemaic`@`%` FUNCTION `f`(x int(11)) RETURNS int(11) RETURN 1"
+        ));
+        assert!(!routine_is_aggregate(
+            "CREATE DEFINER=`a`@`b` PROCEDURE `p`(IN `n` INT) BEGIN SELECT 1; END"
+        ));
+        // The scan stops at the parameter list, so a body that talks about
+        // aggregates says nothing about the header…
+        assert!(!routine_is_aggregate(
+            "CREATE FUNCTION `f`() RETURNS int BEGIN /* aggregate */ RETURN 1; END"
+        ));
+        // …and a routine *named* `aggregate` is a quoted identifier, which
+        // `skip_noncode` steps over rather than reading as the keyword.
+        assert!(!routine_is_aggregate(
+            "CREATE DEFINER=`a`@`b` FUNCTION `aggregate`(x int) RETURNS int RETURN 1"
+        ));
     }
 
     /// `DTD_IDENTIFIER` renders `longtext`, never the character set the
