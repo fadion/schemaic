@@ -163,6 +163,25 @@ pub(crate) const MONO_FAMILY: &str = "IBM Plex Mono";
 pub(crate) const RESIZE_HIT: f64 = 10.0;
 pub(crate) const RESIZE_BAR: f64 = 3.0;
 
+/// How long the pointer must **rest** on a divider before its bar lights up.
+///
+/// The highlight is an affordance — *this edge can be dragged* — and an
+/// affordance that answers instantly answers far too often: the dividers run the
+/// full height and width of the workspace, so crossing from the schema tree to
+/// the editor, or from the editor to the results, lit one on the way past.
+///
+/// **200ms, and it was 500 first.** Half a second does stop the flashing, but it
+/// also outlasts the gesture it is meant to serve: a pointer that has arrived on
+/// the divider and stopped is already waiting, and half a second of nothing
+/// reads as the app failing to notice. A fifth of a second is past the speed
+/// anything crosses the workspace at while still landing inside the pause a hand
+/// makes when it arrives somewhere on purpose.
+///
+/// Dragging is not delayed — it lights the bar the moment the press lands, and
+/// the press works from the first pixel of the hit band whatever the bar is
+/// doing. The delay is on the hint, never on the control.
+pub(crate) const RESIZE_HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 // ── Panel minimum dimensions + responsive breakpoints ───────────────────────
 
 /// Minimum panel widths so a dragged — or auto-shrunk — panel stays legible
