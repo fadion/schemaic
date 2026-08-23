@@ -463,6 +463,21 @@ struct EdgeShapes {
     poly: Vec<Pt>,
 }
 
+/// A **stub** card's width: its name at the header size, plus the horizontal
+/// padding, and nothing else.
+///
+/// Deliberately not [`node_width`], which adds an icon box, a title gap and 6 px
+/// of measurer-drift slack a stub has none of — and measures the title *bold*,
+/// which is exactly the mismatch the export's stub arm exists to avoid. A
+/// function rather than an expression inside `build_placed` because the export
+/// test has to size its card the way the layout does: sizing it with
+/// `node_width` gave the title 26 px of room it does not have, so the
+/// truncation the test is named for could not happen either way and reverting
+/// the fix left it green.
+fn stub_width(id: &str) -> f64 {
+    (measure_text_px_at(id, 13.0) + 20.0).clamp(NODE_MIN_W, NODE_MAX_W)
+}
+
 /// Card width sized to its widest content row over *all* columns (so width stays
 /// stable across expand/collapse), clamped to `[NODE_MIN_W, NODE_MAX_W]`.
 fn node_width(node: &DiagramNode) -> f64 {
@@ -516,10 +531,7 @@ fn build_placed(graph: &DiagramGraph) -> (Vec<Placed>, HashMap<String, bool>) {
     let mut collapsed: HashMap<String, bool> = HashMap::new();
     for n in &graph.nodes {
         let (w, h) = if n.kind == NodeKind::Stub {
-            (
-                (measure_text_px_at(&n.id, 13.0) + 20.0).clamp(NODE_MIN_W, NODE_MAX_W),
-                HEADER_H,
-            )
+            (stub_width(&n.id), HEADER_H)
         } else {
             let default_collapsed = erd::should_collapse(n.columns.len(), total, opts);
             collapsed.insert(n.id.clone(), default_collapsed);
@@ -2705,7 +2717,12 @@ mod tests {
             hidden_islands: vec![],
             total_tables: 1,
         };
-        let w = node_width(&graph.nodes[0]);
+        // **Sized the way `build_placed` sizes a stub**, which is the whole
+        // point: `node_width` adds an icon box, a title gap and 6 px of slack a
+        // stub has none of, so the title had 26 px of room it does not really
+        // have and the ellipsizer could not truncate either way. Reverting the
+        // fix left this test green.
+        let w = stub_width(id);
         let positions: HashMap<String, (f64, f64)> =
             [(id.to_string(), (0.0, 0.0))].into_iter().collect();
         let sizes: HashMap<String, (f64, f64)> =
