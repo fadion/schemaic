@@ -834,6 +834,34 @@ mod tests {
         );
     }
 
+    /// **Ineligibility is about the base, not about the filter**, and the grid
+    /// depends on knowing that. A join with *nothing* to splice in is still
+    /// `None` — so the results toolbar's "read N rows" cannot re-run through
+    /// here, or a user with no filter at all would be told their filter was the
+    /// problem. `GridState::current_statement` reaches for the base directly
+    /// when the grid query is empty, and this is the reason.
+    #[test]
+    fn an_ineligible_base_is_still_ineligible_with_nothing_to_splice() {
+        assert_eq!(
+            build(
+                "SELECT * FROM a JOIN b ON a.id = b.id",
+                "",
+                &[],
+                SqlDialect::MySql
+            ),
+            None
+        );
+        assert_eq!(
+            build(
+                "WITH c AS (SELECT 1) SELECT * FROM c",
+                "",
+                &[],
+                SqlDialect::MySql
+            ),
+            None
+        );
+    }
+
     #[test]
     fn not_eligible_derived_table() {
         assert_eq!(

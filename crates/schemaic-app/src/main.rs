@@ -1723,7 +1723,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 },
             );
             // Read the row cap on the UI thread (signals are single-threaded).
-            let cap = row_limit.get_untracked();
+            //
+            // The tab's own override wins where the capped notice set one. It is
+            // read here, per run, for the same reason the global cap is: there is
+            // no fetch mode to switch, only a bigger ceiling on the next read.
+            let cap = tab
+                .row_cap_override
+                .get_untracked()
+                .unwrap_or_else(|| row_limit.get_untracked());
             let timeout_secs = statement_timeout.get_untracked();
             handle.spawn(async move {
                 // Wall-clock, and around everything: connecting, the statement,
@@ -1800,6 +1807,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 tab.base_sql.set(Some(sql.clone()));
                 tab.grid_query
                     .set(schemaic_core::filter::GridQuery::default());
+                // A raised cap belongs to the result it was raised for. A fresh
+                // manual run is a different question, and silently fetching a
+                // million rows for it — because the last statement's notice was
+                // clicked once — is the global setting the user didn't change.
+                tab.row_cap_override.set(None);
                 tab.view_err.set(None);
             }
             core(sql, false);
