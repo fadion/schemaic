@@ -4635,7 +4635,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   outside can see a key there. It registers the **inner** editor view — the id that actually takes
   focus — and withdraws it on unmount. Order is an explicit `tabindex`, spaced, **not** registration
   order: a section built later (the SSH block, once its toggle is on) would otherwise register after
-  the fields below it on screen. A dropdown joins through `settings::in_ring_dropdown`, which is the
+  the fields below it on screen.
+  **The number follows the layout, and the spacing is what keeps it able to.** Two ways it has gone
+  wrong, both invisible to whoever added the control and both found by review rather than by use.
+  A control *appended by number* rather than inserted at its place walks the user backwards: the
+  settings modal's statement-timeout dropdown was written last and numbered 230 while sitting
+  second in its group, so Tab ran row limit → confirm → validate → back up to timeout. And a block
+  that **grows into the next one** collides: the event editor's schedule sub-form reached
+  `TAB_SCHED + 30` = 60, which was also its `TAB_BODY`, and `FocusRing::register` inserts *after* an
+  equal index rather than erroring — so the order fell out of which control happened to build
+  first. A variable-length block therefore gets a decade of its own with nothing above it until the
+  next hundred (`event_editor`'s `TAB_SCHED` 30–99, `TAB_OPT` 200–999), and
+  `event_editor::tests::no_two_controls_claim_the_same_tab_stop` is the pin. A dropdown joins through `settings::in_ring_dropdown`, which is the
   whole four-work-around apparatus below in one place; `focusable_dropdown` (settings' `Copy`
   picker) and `table_designer::focusable_owned_dropdown` (the designer/editors', since a table name
   isn't `Copy`) are both thin wrappers over it, and neither has an un-focusable sibling left —
