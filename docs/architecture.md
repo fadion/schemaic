@@ -3153,10 +3153,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   place does not move it — so repointing the active connection from host X to host Y with the panel
   open left X's sessions on screen, live-looking, under a connection now pointing at Y, and a kill
   from that list would have sent X's thread ids to Y. `save_conn` calls `reset_activity` for **any**
-  save of the active connection, beside the tunnel it already drops for the same reason, without
-  asking whether the target actually moved: comparing would mean carrying the old host/port/socket
-  alongside the snapshot — a second copy of connection identity kept in step by hand — to save one
-  `PROCESSLIST` query when someone renames a connection. **`delete_conn_now` calls it too**, and for
+  save of the active connection, without asking whether the target actually moved: comparing would
+  mean carrying the old host/port/socket alongside the snapshot — a second copy of connection
+  identity kept in step by hand — to save one `PROCESSLIST` query when someone renames a connection.
+  **A snapshot is where that trade is right, and it is the only thing in `save_conn` for which it
+  is** — see *What an edit invalidates* below, where the same question is asked of a transaction and
+  answered the other way. **`delete_conn_now` calls it too**, and for
   the same reason rather than a related one: deleting the *last* connection sets `active_conn` to
   `startup_active_id(None, &[])`, which is `next_id(&[])`, which is `1` — the id the first connection
   ever created holds — so deleting that one leaves the signal on the value it already had and the
@@ -3184,6 +3186,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   tint, the menu's marked row and the timer's re-arm all repoint together on a switch. The panel
   writes through `ActivityActions::set_interval` rather than to a signal, so there is no effect
   reading out of the store and another writing back into it.
+  **What an edit invalidates, and how expensive the wrong answer is.** `save_conn` asks
+  `targets_same_server` — the predicate the schema tree already asks, not a second reading of the
+  same fields — and everything that belongs to the *old* server is torn down only when the answer is
+  no: the cached SSH tunnel, every pinned Manual `Session` on the connection, and the live AI
+  session. It used to ask nothing: the tunnel was dropped on **every** save, which is true of an edit
+  that moved something and quietly destructive of one that didn't, because tearing the listener down
+  takes the forwarded connections with it — so changing a connection's *colour* killed the socket
+  under a pinned Manual transaction and rolled back uncommitted work while the tab went on offering
+  Commit and Rollback. **Cheap-and-unconditional is right for a snapshot and wrong for a
+  transaction**, which is the whole distinction between this and `reset_activity` above. The orphaned
+  tabs get `delete_conn_now`'s treatment rather than `repair_killed_session`'s — drop to Auto-commit,
+  `TxState::closed()`, no prompt, since the server rolls back on disconnect — because a reopen would
+  put the tab back on a server that has just gone: `open_session` would fail on the spot, flip the
+  tab to Auto anyway and raise an error modal on top of it. The AI session is on the same list
+  because `needs_respawn` cannot see a repoint: it compares the conn id, which does not move, and the
+  `AiSettings`, none of which name a host, so the assistant's MCP subprocess went on reading the
+  previous server — or, tunnelled, a local port that no longer answers. Dropping it costs nothing,
+  since `ai_send` replays the conversation into the next session's prompt. `delete_conn_now` drops
+  the live AI session too, and not merely for symmetry: it already cleared the *saved* transcript,
+  but the running `claude` child survived, and while deleting the active connection usually moves
+  `active_conn` and so respawns by the side door, `next_id` is `max + 1` — deleting the
+  highest-numbered connection frees its id for the next one created, which becomes active under the
+  same id with settings unchanged, and nothing asks for a respawn.
   **A killed session may be one of ours, and the tab has to be told.** A Manual tab pins a
   `Session`, that connection is an ordinary row in the panel, and the idle-in-transaction holder
   blocking another tab is very often exactly it. Terminating it left the tab holding a dead socket:
