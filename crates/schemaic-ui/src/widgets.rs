@@ -5483,3 +5483,97 @@ mod popup_anchor_gate {
         );
     }
 }
+
+/// A second source gate, and it exists for the same reason the first does: the
+/// thing under test is a **set of call sites**, which no runtime test in a Floem
+/// crate can see.
+///
+/// What it pins is the bargain a click-opened menu trigger makes.
+/// `MenuFlags::close_except(None)` at the workspace root cannot enforce mutual
+/// exclusivity for a trigger that absorbs its own pointer-down — the root never
+/// runs for it — so such a trigger has to close the others itself. Every trigger
+/// on the shared list absorbs, so every one of them owes the call.
+///
+/// Nothing checked it, and the cost is on record twice. `MenuId`'s own doc
+/// records the first: the rule "was written out three times, in three files, and
+/// the third one added a flag the other two never learned about", leaving the
+/// activity clock's dropdown and the schema eye's menu both on screen. The
+/// second is this range's — the root was routed through `close_except(None)`,
+/// which closes all seven, while two triggers did **not** absorb their press, so
+/// down closed and up reopened and neither could be shut from the control that
+/// opened it. Fixing that meant giving those two the absorb, which is what put
+/// them on the hook for this call.
+#[cfg(test)]
+mod menu_trigger_gate {
+    use std::path::{Path, PathBuf};
+
+    /// The menus a **trigger** opens by click, and which therefore owe both the
+    /// pointer-down absorb and the `close_except`. `Popup` and `Context` are
+    /// not here: they are opened on `SecondaryClick`, where the root's dismissal
+    /// runs on the secondary *press* and the opener on the release — one
+    /// gesture, and the documented behaviour.
+    const CLICK_OPENED: &[&str] = &[
+        "SchemaEye",
+        "SchemaGear",
+        "Connection",
+        "ActiveDb",
+        "ActivityClock",
+    ];
+
+    fn crate_source() -> String {
+        let dir: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("the crate's own src")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .map(|p| {
+                let src = std::fs::read_to_string(p).expect("readable");
+                // Test data names every id; only production sites count.
+                match src.find("#[cfg(test)]") {
+                    Some(i) => src[..i].to_string(),
+                    None => src,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_click_opened_menu_closes_the_others_itself() {
+        let src = crate_source();
+        // `rustfmt` may break the call across lines, so the receiver path and
+        // the argument are matched separately rather than as one string.
+        let missing: Vec<&str> = CLICK_OPENED
+            .iter()
+            .copied()
+            .filter(|id| {
+                !src.contains(&format!("close_except(Some(crate::widgets::MenuId::{id}"))
+                    && !src.contains(&format!("close_except(Some(widgets::MenuId::{id}"))
+                    && !src.contains(&format!("close_except(Some(MenuId::{id}"))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these triggers absorb their own pointer-down and never close the \
+             others, so opening one leaves another on screen: {missing:?}"
+        );
+        // The scan has to still be finding the sites: a renamed method would
+        // otherwise make this pass by seeing nothing at all.
+        assert!(
+            src.matches("close_except(Some(").count() >= CLICK_OPENED.len(),
+            "has `close_except` been renamed?"
+        );
+        // And the absorb itself — one registration per click-opened trigger, at
+        // least. Which site is which is not checkable from here; that a trigger
+        // exists without one is what shipped, and the count is the cheapest
+        // thing that moves when it happens again.
+        assert!(
+            src.matches("menu_trigger_press").count() >= CLICK_OPENED.len(),
+            "fewer `menu_trigger_press` registrations than click-opened menus"
+        );
+    }
+}

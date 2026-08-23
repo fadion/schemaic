@@ -933,6 +933,12 @@ pub(crate) struct QueryPaneParams {
     pub dialect: Memo<SqlDialect>,
     pub active_db_menu_open: RwSignal<bool>,
     pub active_db_anchor: RwSignal<Point>,
+    /// Every menu-open flag in the app, so the database selector can close the
+    /// others when it opens. It has to do that itself: it absorbs its own
+    /// pointer-down, so the workspace root's `close_except(None)` never runs for
+    /// it — the same bargain the schema eye, the gear and the activity clock
+    /// take.
+    pub menus: crate::widgets::MenuFlags,
     /// The active tab's connection is marked read-only. The *write* guard reads
     /// this on the run action; the pane only uses it to hide "Create view".
     pub read_only: Memo<bool>,
@@ -988,6 +994,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         dialect,
         active_db_menu_open,
         active_db_anchor,
+        menus,
         read_only,
         live_validate,
         validate_stmt,
@@ -3780,8 +3787,30 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         if !any {
             return;
         }
+        // Mutual exclusivity is the trigger's own job once it absorbs the press
+        // (below): the root's `close_except(None)` no longer runs for it, so
+        // opening this one has to close the others itself — the shape the schema
+        // eye, the gear and the activity clock already have. **After** the guard,
+        // so an inert trigger closes nothing.
+        menus.close_except(Some(crate::widgets::MenuId::ActiveDb));
         active_db_menu_open.update(|o| *o = !*o)
     })
+    // **A menu trigger absorbs its own pointer-down** — the premise the
+    // workspace root's `MenuFlags::close_except(None)` rests on. `on_click_stop`
+    // registers a `Click` handler and nothing else, so the root's dismissal ran
+    // first and the `Click` above turned it straight back into an open: the
+    // selector could not be shut from the control that opened it. The other
+    // trigger missing this was the connection switcher, and they were the only
+    // two.
+    //
+    // Unconditional, unlike the `Click` above: the press is absorbed even when
+    // there is nothing offerable and the toggle returns early. That is the right
+    // way round — the root's dismissal is about *other* menus, and pressing an
+    // inert control should not close one somewhere else.
+    .on_event_stop(
+        EventListener::PointerDown,
+        crate::widgets::menu_trigger_press,
+    )
     .on_event_cont(EventListener::PointerEnter, move |_| db_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| db_hov.set(false))
     .style(move |s| {
