@@ -738,18 +738,54 @@ const CAP_STEP: usize = 5;
 pub fn next_row_cap(rows_read: usize) -> usize {
     // At least a thousand: five times a three-row result is fifteen, and
     // re-running a whole statement to read twelve more rows is not an offer.
-    let target = rows_read.saturating_mul(CAP_STEP).max(1_000);
-    // Round **up** to two significant figures — enough to tidy the tail without
-    // collapsing the figure. One would turn 20,480 into 30,000, handing the user
-    // half again as much as they asked for; none would print 20,480.
+    round_up_2sf(rows_read.saturating_mul(CAP_STEP).max(1_000))
+}
+
+/// Round **up** to two significant figures — enough to tidy a computed figure's
+/// tail without collapsing it. One significant figure would turn 20,480 into
+/// 30,000, handing the user half again as much as they asked for; none would
+/// print 20,480.
+fn round_up_2sf(n: usize) -> usize {
     let mut unit = 1usize;
-    while target / unit >= 100 {
+    while n / unit >= 100 {
         let Some(next) = unit.checked_mul(10) else {
             break;
         };
         unit = next;
     }
-    target.div_ceil(unit).saturating_mul(unit)
+    n.div_ceil(unit).saturating_mul(unit)
+}
+
+/// The offer a capped result's toolbar makes: the cap to re-run with, and the
+/// words to make it in.
+///
+/// **The step alone is not an offer, because it can name rows that do not
+/// exist.** A 200k read of a ~292k table stepped to a million and the toolbar
+/// said "read 1m rows" — a number nothing would ever reach, on a table the same
+/// line had just described as ~292.02k. Where the whole statement is within one
+/// click, the offer says *that* instead, in the figure the line already shows.
+///
+/// The total is only ever consulted, never trusted as a limit. It is usually the
+/// engine's own sampled estimate, so the cap that goes with "read all" is the
+/// total rounded up rather than the total exactly — and if the estimate was low,
+/// the re-run simply comes back capped again and offers again, which is the
+/// self-correcting answer. A total at or below what was already read is stale
+/// and says nothing, exactly as it does for [`rows_read_of`].
+pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, String) {
+    let step = next_row_cap(rows_read);
+    match total {
+        // Within one click, and worth more rows than are already on screen.
+        Some(t) if t.value() > rows_read as u64 && t.value() <= step as u64 => {
+            // Rounded up, and never below what the step would have to clear to
+            // be an improvement at all.
+            let cap = round_up_2sf(t.value() as usize).max(rows_read + 1);
+            (cap, format!("read all {} rows", t.label()))
+        }
+        _ => (
+            step,
+            format!("read {} rows", crate::text::human_count(step)),
+        ),
+    }
 }
 
 /// Below this many rows an **estimate** is not named in a destructive
@@ -1584,6 +1620,77 @@ mod tests {
     fn an_absurd_read_saturates_rather_than_wrapping() {
         assert!(next_row_cap(usize::MAX) >= usize::MAX / 2);
         assert!(next_row_cap(usize::MAX / 2) > usize::MAX / 2);
+    }
+
+    /// **The bug this pair was built wrong for.** A 200k read of MariaDB's
+    /// `employees` (~292.02k rows) stepped to a million and offered "read 1m
+    /// rows" — a number nothing would ever reach, on a table the same toolbar
+    /// line had already described as ~292.02k. When the whole statement is one
+    /// click away the offer has to say so, in the figure the line already shows.
+    #[test]
+    fn a_total_within_reach_is_offered_as_all_of_it() {
+        let (cap, label) = read_more_offer(200_000, Some(RowCount::Estimate(292_020)));
+        assert_eq!(label, "read all ~292.02k rows");
+        assert!(!label.contains('1'), "{label}"); // no "1m" anywhere
+        // Rounded up past the estimate, so a slightly low one doesn't re-cap.
+        assert!(cap >= 292_020, "{cap}");
+        assert_eq!(cap, 300_000);
+    }
+
+    #[test]
+    fn an_exact_total_within_reach_is_named_exactly() {
+        let (cap, label) = read_more_offer(1_000, Some(RowCount::Exact(4_213)));
+        assert_eq!(label, "read all 4,213 rows");
+        assert!(cap >= 4_213, "{cap}");
+    }
+
+    /// Out of reach, or unknown, and the offer is the step — the case the
+    /// feature started as, and still the only honest answer when nothing knows
+    /// how many rows there are.
+    #[test]
+    fn a_total_out_of_reach_or_unknown_offers_the_step() {
+        assert_eq!(read_more_offer(1_000, None), (5_000, "read 5k rows".into()));
+        // 4.2m is far past 5× of 200k, so the step stands.
+        let (cap, label) = read_more_offer(200_000, Some(RowCount::Estimate(4_200_000)));
+        assert_eq!(cap, 1_000_000);
+        assert_eq!(label, "read 1m rows");
+    }
+
+    /// A stale estimate below what was already read says nothing — the same
+    /// rule `rows_read_of` follows, and for the same reason: offering to "read
+    /// all ~400 rows" of a result already showing 1,000 reads as a bug.
+    #[test]
+    fn a_stale_total_is_ignored_rather_than_offered() {
+        let (cap, label) = read_more_offer(1_000, Some(RowCount::Estimate(400)));
+        assert_eq!(cap, 5_000);
+        assert_eq!(label, "read 5k rows");
+        // Equal is not more either: nothing left to read.
+        assert_eq!(
+            read_more_offer(1_000, Some(RowCount::Exact(1_000))).1,
+            "read 5k rows"
+        );
+    }
+
+    /// Whatever it says, the cap must exceed what was read — otherwise clicking
+    /// it re-runs the statement to land on exactly the same rows.
+    #[test]
+    fn every_offer_asks_for_more_than_is_already_on_screen() {
+        let totals = [
+            None,
+            Some(RowCount::Exact(0)),
+            Some(RowCount::Exact(1)),
+            Some(RowCount::Estimate(1_001)),
+            Some(RowCount::Exact(1_050)),
+            Some(RowCount::Estimate(4_999)),
+            Some(RowCount::Exact(5_000)),
+            Some(RowCount::Estimate(9_999_999)),
+        ];
+        for read in [0usize, 1, 999, 1_000, 1_001, 200_000] {
+            for total in totals {
+                let (cap, label) = read_more_offer(read, total);
+                assert!(cap > read, "read {read}, total {total:?} → {cap} ({label})");
+            }
+        }
     }
 
     // ── What a destructive confirmation asks ─────────────────────────────────
