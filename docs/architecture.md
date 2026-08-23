@@ -4793,6 +4793,24 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   every style closure reading it), the workspace root passes `None` so a pointer-down keeps nothing,
   and `closing_leaves_exactly_the_one_menu_that_asked_to_stay` walks every id. Add a new dropdown by
   adding a variant and a field here, not a fourth copy of the list.
+- **The panel owes an absorb too, and it is the same fact read from the other end.** The root closes
+  every menu on any pointer-down, and floem delivers `Click` on the way *up*, only to a view that
+  still exists — so a panel that does not stop its own `PointerDown` is torn down by the root on the
+  press and the row's click lands on nothing. The menu opens and choosing an item does nothing at
+  all, which is worse than the trigger bug above because the surface still looks alive.
+  `on_click_stop(|_| {})` on a panel is not this: it stops a different event, arriving too late.
+  Widening the root from five hand-written flags to `close_except(None)` put the last two panels on
+  this hook, and they were the same two as before — `conn_menu_overlay`'s and
+  `active_db_menu_overlay`'s, the only click-opened bodies that had never needed the absorb because
+  the root had never closed them. Both now carry the bare `|_| {}` form, which is deliberate and not
+  `menu_trigger_press`: a click on a menu row is a gesture within something the keyboard may still
+  legitimately own, so `keyboard_nav` must survive it. **`widgets::menu_panel_gate::`
+  `every_click_opened_menu_panel_absorbs_its_own_pointer_down` holds this half** — a third source
+  gate, for the third time because the thing under test is a set of call sites. It slices
+  `overlays.rs` at its column-0 `fn` headers and asserts each of the five click-opened menus'
+  overlay bodies mentions `EventListener::PointerDown`; `popup_menu_overlay` and
+  `context_menu_overlay` are out of scope for the reason they are out of `menu_trigger_gate`'s, and
+  because their body is `menu_panel`, which carries the absorb once for both.
 - **A trigger says it is open in the accent** — `widgets::menu_icon_color(open, hovered)`, one
   function for the schema panel's eye and gear, the Server Activity clock, and the results strip's
   copy, download and AI icons, each of which had spelled its own two-arm hover match. **Open

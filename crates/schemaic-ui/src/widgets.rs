@@ -1770,9 +1770,9 @@ pub(crate) fn keyboard_nav() -> RwSignal<bool> {
 /// every press would re-run the style closure of every view reading the flag.
 ///
 /// **For a trigger, not a panel.** The other views that swallow a pointer-down —
-/// [`menu_panel`], the schema tree's two menu bodies, the grid's column popover,
-/// the editor's — do it so a click *inside* them isn't read as a click away, and
-/// they keep the bare `|_| {}`: a click on a menu row is a gesture within
+/// [`menu_panel`], every dropdown body in `overlays.rs`, the grid's column
+/// popover, the editor's — do it so a click *inside* them isn't read as a click
+/// away, and they keep the bare `|_| {}`: a click on a menu row is a gesture within
 /// something the keyboard may legitimately still own, and where focus goes when
 /// it closes is already [`set_menu_return`]'s answer, decided when the menu
 /// opened rather than by the press that dismisses it.
@@ -5574,6 +5574,79 @@ mod menu_trigger_gate {
         assert!(
             src.matches("menu_trigger_press").count() >= CLICK_OPENED.len(),
             "fewer `menu_trigger_press` registrations than click-opened menus"
+        );
+    }
+}
+
+/// A third source gate, and the other half of [`menu_trigger_gate`]'s bargain.
+///
+/// That one pins what a **trigger** owes. This one pins what the **panel** owes,
+/// and the two are the same fact read from opposite ends: the workspace root
+/// closes every menu on any pointer-down, so a panel that does not absorb its
+/// own press is torn down on the way *down*, and the row's `Click` — which floem
+/// delivers on the way up, and only to a view that still exists — never fires.
+/// The menu opens, and clicking an item does nothing at all.
+///
+/// That is not hypothetical. Routing the root through `close_except(None)`
+/// widened its list from five hand-written flags to all seven, and the two it
+/// gained were exactly the two whose panels had never needed the absorb: the
+/// connection switcher's menu and the QUERY toolbar's database selector. Both
+/// went dead — they opened, and no row could be chosen.
+///
+/// `on_click_stop(|_| {})` on a panel is **not** this. It stops the `Click`,
+/// which is a different event arriving too late; only a `PointerDown`
+/// registration sits in front of the root's handler.
+#[cfg(test)]
+mod menu_panel_gate {
+    use std::path::Path;
+
+    /// The overlay that builds each click-opened menu's panel — the same five
+    /// menus [`super::menu_trigger_gate`] names from the trigger side, in the
+    /// same order. `popup_menu_overlay` and `context_menu_overlay` are absent
+    /// for the reason they are absent there, and because their panel is
+    /// [`menu_panel`], which carries the absorb once for both.
+    const PANEL_OVERLAYS: &[&str] = &[
+        "db_visibility_overlay",
+        "schema_settings_overlay",
+        "conn_menu_overlay",
+        "active_db_menu_overlay",
+        "activity_menu_overlay",
+    ];
+
+    fn overlays_src() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/overlays.rs");
+        std::fs::read_to_string(path).expect("the crate's own overlays.rs")
+    }
+
+    /// The body of a top-level `fn name(` — up to the next header at column 0,
+    /// which is the one shape every function in `overlays.rs` has.
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let head = format!("fn {name}(");
+        let start = src
+            .find(&head)
+            .unwrap_or_else(|| panic!("`{name}` is gone from overlays.rs — renamed?"));
+        let rest = &src[start + head.len()..];
+        let end = ["\nfn ", "\npub(crate) fn ", "\npub fn "]
+            .iter()
+            .filter_map(|h| rest.find(h))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_click_opened_menu_panel_absorbs_its_own_pointer_down() {
+        let src = overlays_src();
+        let missing: Vec<&str> = PANEL_OVERLAYS
+            .iter()
+            .copied()
+            .filter(|name| !body_of(&src, name).contains("EventListener::PointerDown"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these panels never absorb their own pointer-down, so the root's \
+             dismissal tears them down before the row's click can land — the \
+             menu opens and choosing an item does nothing: {missing:?}"
         );
     }
 }
