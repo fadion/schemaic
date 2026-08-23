@@ -1805,6 +1805,20 @@ pub struct RoutineInfo {
     pub sql_mode: Option<String>,
     pub charset_client: Option<String>,
     pub collation_connection: Option<String>,
+    /// **MariaDB.** `CREATE AGGREGATE FUNCTION` — a function called once per
+    /// group, whose body drives the rows with `FETCH GROUP NEXT ROW`.
+    ///
+    /// **Known only from `SHOW CREATE`.** MariaDB's
+    /// `information_schema.ROUTINES` has no column that distinguishes one
+    /// (verified live: no column of that table names it), so the eager read
+    /// that fills the schema tree always leaves this `false` and the lazy
+    /// [`RoutineSource`] fetch is what sets it. Dropping the keyword destroyed
+    /// the function — the recreate answered `ERROR 4105` after its `DROP` had
+    /// committed — which is why it is modelled rather than inferred.
+    ///
+    /// Not user-editable: it rides with the session state in
+    /// [`RoutineSource::apply_session_to`], not with the body.
+    pub aggregate: bool,
 }
 
 impl RoutineInfo {
@@ -1982,6 +1996,12 @@ impl RoutineInfo {
             out.push_str(&definer_sql(def));
             out.push(' ');
         }
+        // MariaDB's, and it appears only where the server printed it — see
+        // [`RoutineInfo::aggregate`]. Losing it is `ERROR 4105` after the
+        // recreate's `DROP` has already committed.
+        if self.aggregate {
+            out.push_str("AGGREGATE ");
+        }
         out.push_str(&format!(
             "{} {}({})\n",
             self.kind.sql_keyword(),
@@ -2044,6 +2064,9 @@ pub struct RoutineSource {
     pub sql_mode: Option<String>,
     pub charset_client: Option<String>,
     pub collation_connection: Option<String>,
+    /// **MariaDB.** The `AGGREGATE` keyword, read off this statement's header —
+    /// the only place it exists. See [`RoutineInfo::aggregate`].
+    pub aggregate: bool,
 }
 
 impl RoutineSource {
@@ -2093,6 +2116,14 @@ impl RoutineSource {
         }
         if self.collation_connection.is_some() {
             r.collation_connection = self.collation_connection.clone();
+        }
+        // **Only ever raised here, never lowered.** This read is the sole source
+        // of the flag ([`RoutineInfo::aggregate`]), so `false` means "this
+        // statement didn't say so", which for a failed or unparsed `SHOW CREATE`
+        // is not the same as "it isn't one" — and clearing a flag that is
+        // already true would put the `ERROR 4105` back.
+        if self.aggregate {
+            r.aggregate = true;
         }
     }
 }
@@ -5646,6 +5677,7 @@ mod tests {
             sql_mode: Some("NO_ENGINE_SUBSTITUTION".into()),
             charset_client: Some("utf8mb4".into()),
             collation_connection: None,
+            aggregate: false,
         }
         .apply_to(&mut r);
         assert_eq!(r.body, "the resolved copy");
@@ -5682,6 +5714,7 @@ mod tests {
             sql_mode: Some("TRADITIONAL".into()),
             charset_client: Some("utf8mb3".into()),
             collation_connection: Some("utf8mb3_general_ci".into()),
+            aggregate: false,
         };
         src.apply_session_to(&mut r);
         assert_eq!(r.body, "what the user typed");
