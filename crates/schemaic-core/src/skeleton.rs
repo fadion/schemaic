@@ -66,6 +66,37 @@ fn placeholder(column: &str) -> String {
     format!(":{flat}")
 }
 
+/// One slot per column, for the columns of a **single statement**.
+///
+/// [`placeholder`] is per-column and has no way to see the rest of the list, so
+/// two columns whose names flatten alike collapsed onto one slot: `first name`
+/// and `first_name` — the spreadsheet-import shape the flattening exists for —
+/// both yielded `:first_name`, and every column with nothing word-like in its
+/// name at all yielded the one `:value`. Filling that draft in sets two columns
+/// from one typed value, with nothing in the text saying so.
+///
+/// The rule is [`crate::export::export_json`]'s for duplicate result columns:
+/// the first occurrence keeps the bare slot, the rest get `_2`, `_3`, … The
+/// suffix is bumped until it is free rather than assumed to be, since a table
+/// holding `first name`, `first_name` *and* `first_name_2` would otherwise
+/// collide on the fix.
+fn placeholders<'a>(columns: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    columns
+        .into_iter()
+        .map(|c| {
+            let base = placeholder(c);
+            let mut slot = base.clone();
+            let mut n = 1;
+            while !taken.insert(slot.clone()) {
+                n += 1;
+                slot = format!("{base}_{n}");
+            }
+            slot
+        })
+        .collect()
+}
+
 /// Server-authored text on its way into a `/* … */` the user reads.
 ///
 /// A comment is closed by `*/` and by nothing else, so a name carrying that
@@ -157,13 +188,8 @@ fn where_clause(t: &TableInfo, dialect: SqlDialect) -> String {
     }
     let conds: Vec<String> = key
         .iter()
-        .map(|c| {
-            format!(
-                "{} = {}",
-                crate::export::ident_if_needed(c, dialect),
-                placeholder(c)
-            )
-        })
+        .zip(placeholders(key.iter().map(String::as_str)))
+        .map(|(c, slot)| format!("{} = {slot}", crate::export::ident_if_needed(c, dialect)))
         .collect();
     format!("WHERE {}", conds.join(" AND "))
 }
@@ -176,7 +202,7 @@ pub fn insert_skeleton(dialect: SqlDialect, database: &str, t: &TableInfo) -> St
         .iter()
         .map(|c| crate::export::ident_if_needed(&c.name, dialect))
         .collect();
-    let values: Vec<String> = cols.iter().map(|c| placeholder(&c.name)).collect();
+    let values = placeholders(cols.iter().map(|c| c.name.as_str()));
     format!(
         "INSERT INTO {name} ({})\nVALUES ({});",
         names.join(", "),
@@ -194,20 +220,21 @@ pub fn update_skeleton(dialect: SqlDialect, database: &str, t: &TableInfo) -> St
     let key = browse_key_columns(t);
     let cols = skeleton_columns(t);
     let settable: Vec<&&ColumnInfo> = cols.iter().filter(|c| !key.contains(&c.name)).collect();
-    let sets: Vec<String> = if settable.is_empty() {
+    let listed: Vec<&&ColumnInfo> = if settable.is_empty() {
         cols.iter().collect()
     } else {
         settable
-    }
-    .iter()
-    .map(|c| {
-        format!(
-            "{} = {}",
-            crate::export::ident_if_needed(&c.name, dialect),
-            placeholder(&c.name)
-        )
-    })
-    .collect();
+    };
+    let sets: Vec<String> = listed
+        .iter()
+        .zip(placeholders(listed.iter().map(|c| c.name.as_str())))
+        .map(|(c, slot)| {
+            format!(
+                "{} = {slot}",
+                crate::export::ident_if_needed(&c.name, dialect)
+            )
+        })
+        .collect();
     format!(
         "UPDATE {name}\nSET {}\n{};",
         sets.join(",\n    "),
@@ -412,6 +439,53 @@ mod tests {
         assert_eq!(placeholder("naïve"), ":naïve");
         // Nothing word-like at all still needs a slot to fill in.
         assert_eq!(placeholder("*/"), ":value");
+    }
+
+    /// **One slot per column, or the draft is silently wrong.** Flattening is
+    /// per-column and has no cross-column state, so `first name` and
+    /// `first_name` — an ordinary shape after a spreadsheet import, which is
+    /// the case the flattening was written for — both landed on
+    /// `:first_name`, and every column with nothing word-like in it at all
+    /// landed on the single `:value`. Filling that draft in sets two columns
+    /// from one typed value with nothing on screen saying so.
+    #[test]
+    fn two_columns_that_flatten_alike_get_different_placeholders() {
+        let t = TableInfo {
+            name: "import".to_string(),
+            columns: vec![
+                col("first name", false, false),
+                col("first_name", false, false),
+                col("*/", false, false),
+                col("--", false, false),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            insert_skeleton(SqlDialect::MySql, "sakila", &t),
+            "INSERT INTO sakila.import (`first name`, first_name, `*/`, `--`)\nVALUES (:first_name, :first_name_2, :value, :value_2);"
+        );
+    }
+
+    /// The `WHERE` builds its own slots from the key columns, so it needs the
+    /// same rule: a composite key of two columns that flatten alike would
+    /// otherwise address one row by one value twice.
+    #[test]
+    fn a_composite_key_that_flattens_alike_gets_different_placeholders() {
+        let t = TableInfo {
+            name: "import".to_string(),
+            columns: vec![
+                col("first name", true, false),
+                col("first_name", true, false),
+                col("note", false, false),
+            ],
+            ..Default::default()
+        };
+        assert!(
+            delete_skeleton(SqlDialect::MySql, "sakila", &t)
+                .ends_with("WHERE `first name` = :first_name AND first_name = :first_name_2;"),
+            "{}",
+            delete_skeleton(SqlDialect::MySql, "sakila", &t)
+        );
     }
 
     /// SQLite's `rowid` is the third key source, and the grid beside this draft
