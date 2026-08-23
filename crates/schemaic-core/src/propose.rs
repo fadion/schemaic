@@ -196,6 +196,15 @@ pub enum ProposeError {
     NoSuchTable(String),
     #[error("the {what} `{text}` isn't a single SQL expression")]
     NotAnExpression { what: String, text: String },
+    /// A `type` field that is not a bare column type.
+    ///
+    /// Separate from [`ProposeError::NotAnExpression`] because a type is not an
+    /// expression and the two are checked by different gates — and because the
+    /// message a model gets back has to name what it actually did wrong.
+    #[error(
+        "`{text}` isn't a column type — give the type alone, with no default, no NOT NULL, and nothing after it"
+    )]
+    NotAType { text: String },
     #[error("`{0}` isn't a foreign-key action")]
     UnknownAction(String),
 }
@@ -225,10 +234,18 @@ const FK_ACTIONS: [&str; 5] = [
 /// somebody else may control, so `'x', DROP COLUMN placed_at` is a shape this
 /// path has to refuse rather than merely describe.
 ///
-/// The check is structural — [`crate::intel::is_single_expression`], the
-/// project's AST authority — not a search for suspicious characters, so a
-/// legitimate default with a comma inside a call (`concat('a', 'b')`) passes and
-/// a trailing clause does not.
+/// The check is structural — [`crate::intel::is_single_expression`] and
+/// [`crate::intel::is_column_type`], the project's AST authority — not a search
+/// for suspicious characters, so a legitimate default with a comma inside a call
+/// (`concat('a', 'b')`) passes and a trailing clause does not.
+///
+/// **`type` is on this list, and for a long time it wasn't.** A column type is
+/// spliced by [`crate::schema::ColumnInfo::definition_sql`] exactly as verbatim
+/// as a default is — twice, on PostgreSQL — and it is the field a live
+/// proposal used to drop a column under a change list that read only
+/// *Rename column qty to qty2*. Every field this function does not name is a
+/// hole of the same shape, so a new one on `NewColumn` or `ColumnPatch` belongs
+/// here before it belongs in the emitter.
 fn check_free_sql(op: &ProposedOp, dialect: SqlDialect) -> Result<(), ProposeError> {
     let expr = |what: &str, text: &Option<String>| -> Result<(), ProposeError> {
         match text {
@@ -241,6 +258,15 @@ fn check_free_sql(op: &ProposedOp, dialect: SqlDialect) -> Result<(), ProposeErr
             _ => Ok(()),
         }
     };
+    let column_type = |text: &str| -> Result<(), ProposeError> {
+        if crate::intel::is_column_type(text, dialect) {
+            Ok(())
+        } else {
+            Err(ProposeError::NotAType {
+                text: text.to_string(),
+            })
+        }
+    };
     let action = |a: &Option<String>| -> Result<(), ProposeError> {
         match a {
             Some(a) if !FK_ACTIONS.iter().any(|k| k.eq_ignore_ascii_case(a.trim())) => {
@@ -251,10 +277,16 @@ fn check_free_sql(op: &ProposedOp, dialect: SqlDialect) -> Result<(), ProposeErr
     };
     match op {
         ProposedOp::AddColumn(c) => {
+            column_type(&c.type_name)?;
             expr("default", &c.default)?;
             expr("generated expression", &c.generated)?;
         }
-        ProposedOp::AlterColumn(p) => expr("default", &p.default)?,
+        ProposedOp::AlterColumn(p) => {
+            if let Some(t) = &p.type_name {
+                column_type(t)?;
+            }
+            expr("default", &p.default)?;
+        }
         ProposedOp::AddCheck(ck) => {
             expr("check expression", &Some(ck.expression.clone()))?;
         }
@@ -1041,32 +1073,223 @@ mod tests {
         }
     }
 
+    /// **A column's `type` is free SQL too, and nothing checked it.**
+    ///
+    /// Reproduced live on MariaDB 10.11.14: this exact two-op proposal was
+    /// applied under a change list reading only `Rename column qty to qty2`,
+    /// with an empty destructive block and a `Primary`-coloured Apply, and
+    /// `orders` afterwards was `id`, `qty2`, `pad` — `placed_at` gone. The
+    /// `/*M!…*/` wrapper is what makes the payload balance; see
+    /// [`crate::intel::is_single_expression`] for why the client reads a comment
+    /// where MariaDB reads code.
+    #[test]
+    fn a_type_that_closes_the_clause_is_refused() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let smuggle = |op| {
+                assert!(
+                    matches!(
+                        apply(&orders(), &proposal(vec![op]), dialect),
+                        Err(ProposeError::NotAType { .. })
+                    ),
+                    "{dialect:?}"
+                );
+            };
+            // The payload that was executed, verbatim.
+            smuggle(ProposedOp::AlterColumn(ColumnPatch {
+                name: "qty".into(),
+                type_name: Some(
+                    "int(11 /*M!100000 ), DROP COLUMN placed_at, ADD COLUMN pad int(1 */)".into(),
+                ),
+                ..Default::default()
+            }));
+            // …and the plainer shapes the same field admits.
+            smuggle(ProposedOp::AlterColumn(ColumnPatch {
+                name: "qty".into(),
+                type_name: Some("int, DROP COLUMN placed_at".into()),
+                ..Default::default()
+            }));
+            smuggle(ProposedOp::AddColumn(NewColumn {
+                name: "note".into(),
+                type_name: "text) , DROP COLUMN placed_at, ADD COLUMN z int".into(),
+                nullable: true,
+                ..Default::default()
+            }));
+            // A type is not a place to put a column constraint either: the field
+            // is spliced where only a type belongs.
+            smuggle(ProposedOp::AddColumn(NewColumn {
+                name: "note".into(),
+                type_name: "int DEFAULT 0".into(),
+                nullable: true,
+                ..Default::default()
+            }));
+            smuggle(ProposedOp::AddColumn(NewColumn {
+                name: "note".into(),
+                type_name: String::new(),
+                nullable: true,
+                ..Default::default()
+            }));
+        }
+    }
+
+    /// **MariaDB's executable comment is the one form where the client sees a
+    /// comment and the server sees code.** sqlparser 0.62's `MySqlDialect`
+    /// special-cases `/*!` and not `/*M!`, so `Parser::peek_token` skipped the
+    /// whole run as whitespace and `is_single_expression` said yes.
+    ///
+    /// Live: the `default` below dropped `placed_at` on MariaDB 10.11.14 and was
+    /// inert on MySQL 8.4.11. MariaDB expands `/*M!nnnnnn …*/` whenever its
+    /// version is at least `nnnnnn`, so `/*M!010000` fires on every MariaDB the
+    /// app supports.
+    #[test]
+    fn an_executable_comment_in_a_models_free_sql_is_refused() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let smuggle = |op| {
+                assert!(
+                    matches!(
+                        apply(&orders(), &proposal(vec![op]), dialect),
+                        Err(ProposeError::NotAnExpression { .. })
+                    ),
+                    "{dialect:?}"
+                );
+            };
+            smuggle(ProposedOp::AddColumn(NewColumn {
+                name: "note".into(),
+                type_name: "int".into(),
+                nullable: true,
+                default: Some("1 /*M!100000 , DROP COLUMN placed_at */".into()),
+                ..Default::default()
+            }));
+            smuggle(ProposedOp::AddColumn(NewColumn {
+                name: "note".into(),
+                type_name: "int".into(),
+                nullable: true,
+                default: Some("1 /*!50000 , DROP COLUMN placed_at */".into()),
+                ..Default::default()
+            }));
+            // The `CHECK` arm the same wrapper reaches.
+            smuggle(ProposedOp::AddCheck(NewCheck {
+                name: None,
+                expression: "1 /*M!100000 ) , DROP COLUMN placed_at, ADD CHECK (1 */".into(),
+            }));
+            // A block comment in a *type* is refused by the type gate.
+            assert!(
+                matches!(
+                    apply(
+                        &orders(),
+                        &proposal(vec![ProposedOp::AlterColumn(ColumnPatch {
+                            name: "qty".into(),
+                            type_name: Some("int /*M!100000 , DROP COLUMN placed_at */".into()),
+                            ..Default::default()
+                        })]),
+                        dialect
+                    ),
+                    Err(ProposeError::NotAType { .. })
+                ),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// …and the happy path of the **type** gate. An over-strict one refuses
+    /// `enum('a','b')`, `numeric(10,2)` and every PostgreSQL array, which is a
+    /// worse failure than the hole: it breaks proposals that were never
+    /// hostile, silently, on engines nobody was testing.
+    #[test]
+    fn an_ordinary_type_is_still_accepted() {
+        let shared = [
+            "int",
+            "text",
+            "varchar(255)",
+            "numeric(10,2)",
+            "numeric(10, 2)",
+            "char(1)",
+            "blob",
+            "double precision",
+            "timestamp",
+            "  int  ",
+        ];
+        let per_dialect: [(SqlDialect, &[&str]); 3] = [
+            (
+                SqlDialect::MySql,
+                &[
+                    "int(11)",
+                    "enum('a','b')",
+                    "set('a','b')",
+                    "tinyint(1)",
+                    "datetime(6)",
+                    "longtext",
+                    "decimal(10, 2) unsigned",
+                    "bit(3)",
+                ],
+            ),
+            (
+                SqlDialect::Postgres,
+                &[
+                    "text[]",
+                    "varchar(255)[]",
+                    "numeric(10,2)[]",
+                    "jsonb",
+                    "uuid",
+                    "interval",
+                    "timestamp with time zone",
+                    "time without time zone",
+                    "character varying(10)",
+                    "citext",
+                ],
+            ),
+            (
+                SqlDialect::Sqlite,
+                &["integer", "real", "blob", "varchar(20)", "numeric"],
+            ),
+        ];
+        for (dialect, extra) in per_dialect {
+            for t in shared.iter().chain(extra.iter()) {
+                let p = proposal(vec![ProposedOp::AddColumn(NewColumn {
+                    name: "note".into(),
+                    type_name: (*t).into(),
+                    nullable: true,
+                    ..Default::default()
+                })]);
+                assert!(
+                    apply(&orders(), &p, dialect).is_ok(),
+                    "refused a legitimate {dialect:?} type: {t}"
+                );
+            }
+        }
+    }
+
     /// …and the happy path is untouched. A default is genuinely arbitrary SQL,
     /// so a guard that refused these would be worse than the hole.
+    ///
+    /// **All three dialects**, because the guard is dialect-parameterised and
+    /// pinning its accept side on PostgreSQL alone is what let the MySQL-family
+    /// bypass through.
     #[test]
     fn an_ordinary_default_is_still_accepted() {
-        for text in [
-            "CURRENT_TIMESTAMP",
-            "0",
-            "'draft'",
-            "nextval('s')",
-            "concat('a', 'b')",
-            "-1",
-            "(1 + 2)",
-            "NULL",
-            "true",
-        ] {
-            let p = proposal(vec![ProposedOp::AddColumn(NewColumn {
-                name: "note".into(),
-                type_name: "text".into(),
-                nullable: true,
-                default: Some(text.into()),
-                ..Default::default()
-            })]);
-            assert!(
-                apply(&orders(), &p, SqlDialect::Postgres).is_ok(),
-                "refused a legitimate default: {text}"
-            );
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for text in [
+                "CURRENT_TIMESTAMP",
+                "0",
+                "'draft'",
+                "nextval('s')",
+                "concat('a', 'b')",
+                "-1",
+                "(1 + 2)",
+                "NULL",
+                "true",
+            ] {
+                let p = proposal(vec![ProposedOp::AddColumn(NewColumn {
+                    name: "note".into(),
+                    type_name: "text".into(),
+                    nullable: true,
+                    default: Some(text.into()),
+                    ..Default::default()
+                })]);
+                assert!(
+                    apply(&orders(), &p, dialect).is_ok(),
+                    "{dialect:?} refused a legitimate default: {text}"
+                );
+            }
         }
     }
 

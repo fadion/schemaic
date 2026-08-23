@@ -4653,10 +4653,29 @@ pub fn parses(stmt: &str, dialect: SqlDialect) -> bool {
 ///
 /// **This is for text from an untrusted author** — a model's proposal — not for
 /// the designer, where the user typing the string is the one consenting to it.
+///
+/// **A block comment is refused outright, before the parser sees it.** The
+/// structural check cannot survive one: `Parser::peek_token` skips comment runs
+/// as whitespace, so `1 /*M!100000 , DROP COLUMN placed_at */` parsed as the
+/// single expression `1` with nothing after it — while MariaDB expands
+/// `/*M!nnnnnn …*/` as **code** whenever its version is at least `nnnnnn`, and
+/// `/*M!010000` fires on every MariaDB this app supports. Verified live: that
+/// default dropped a column on MariaDB 10.11.14 and was inert on MySQL 8.4.11.
+/// sqlparser 0.62 special-cases MySQL's `/*!` and not MariaDB's `/*M!`, so the
+/// AST authority cannot answer this for the flavour the emitter already knows it
+/// is targeting.
+///
+/// The refusal is every `/*`, not the two executable markers, because a comment
+/// has no legitimate place in a default, a generated expression or a `CHECK` a
+/// *model* authored — and a rule with no version numbers in it cannot go stale
+/// when the next flavour invents a third marker. `--` and `#` need no special
+/// handling: the server reads those as comments too, so the client and the
+/// engine agree about them. One inside a string literal is data, and
+/// [`skip_noncode`] is what tells the two apart.
 pub fn is_single_expression(text: &str, dialect: SqlDialect) -> bool {
     use sqlparser::tokenizer::Token;
     let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || has_block_comment(trimmed, dialect) {
         return false;
     }
     let d = dialect.parser();
@@ -4667,6 +4686,64 @@ pub fn is_single_expression(text: &str, dialect: SqlDialect) -> bool {
         return false;
     }
     parser.peek_token().token == Token::EOF
+}
+
+/// Does `text` open a block comment anywhere outside a string literal?
+///
+/// The `/*` is looked for **before** [`skip_noncode`] is consulted at each
+/// position, because `skip_noncode`'s job is to step over a comment and this
+/// one's is to notice it. Inside a quoted run it is data — a `DEFAULT '/*'` is
+/// a legitimate, if odd, default — so the scan hands quoted regions to
+/// `skip_noncode` and only ever reports an opener it reaches as code.
+fn has_block_comment(text: &str, dialect: SqlDialect) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            return true;
+        }
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Is `text` a bare column **type** in `dialect`, and nothing else?
+///
+/// The counterpart to [`is_single_expression`] for the one free-SQL field that
+/// is not an expression. A proposal's `type` reaches
+/// [`crate::schema::ColumnInfo::definition_sql`] verbatim — twice, on
+/// PostgreSQL — and for a long time nothing checked it at all: a live proposal
+/// executed `DROP COLUMN placed_at` through this field under a change list that
+/// read only *Rename column qty to qty2*.
+///
+/// **Parsing is not enough on its own, which is why this reads the AST.**
+/// `CREATE TABLE t (c int DEFAULT 0)` parses perfectly well, and would let a
+/// `type` carry a column constraint into a position where only a type belongs;
+/// so the shape gate is *one* column, named as given, with **no options**. The
+/// per-dialect parser is what keeps the accept-set honest in the other
+/// direction — `enum('a','b')` is a MySQL type and `text[]` is a PostgreSQL one,
+/// and each is refused by the other engine's parser, which is correct.
+pub fn is_column_type(text: &str, dialect: SqlDialect) -> bool {
+    use sqlparser::ast::Statement;
+    let trimmed = text.trim();
+    if trimmed.is_empty() || has_block_comment(trimmed, dialect) {
+        return false;
+    }
+    let stmt = format!("CREATE TABLE schemaic_type_probe (schemaic_c {trimmed})");
+    let Ok(parsed) = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), &stmt) else {
+        return false;
+    };
+    let [Statement::CreateTable(create)] = parsed.as_slice() else {
+        return false;
+    };
+    let [column] = create.columns.as_slice() else {
+        return false;
+    };
+    column.name.value == "schemaic_c" && column.options.is_empty()
 }
 
 /// A table a statement reads from, as written: the bare name plus whatever
@@ -5129,6 +5206,98 @@ pub fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Di
 mod tests {
     use super::*;
     use sqlparser::parser::Parser;
+
+    const DIALECTS: [SqlDialect; 3] = [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+
+    /// The guard over a model's free SQL, tested directly and on **every**
+    /// dialect it is parameterised by — the review found it had no direct test
+    /// at all and its accept side pinned on PostgreSQL alone, which is how the
+    /// MySQL-family bypass below survived.
+    #[test]
+    fn a_single_expression_is_one_expression_and_all_of_it() {
+        for d in DIALECTS {
+            for text in [
+                "CURRENT_TIMESTAMP",
+                "0",
+                "'draft'",
+                "concat('a', 'b')",
+                "(1 + 2)",
+                "NULL",
+                // A `/*` that is *data* stays acceptable: the scan hands quoted
+                // runs to `skip_noncode` rather than searching the raw text.
+                "'/*'",
+            ] {
+                assert!(is_single_expression(text, d), "{d:?} refused {text}");
+            }
+            for text in [
+                "",
+                "   ",
+                "'x', DROP COLUMN placed_at",
+                "1) , DROP COLUMN placed_at, ADD COLUMN z int",
+                "now(); DROP TABLE customers; --",
+            ] {
+                assert!(!is_single_expression(text, d), "{d:?} accepted {text}");
+            }
+        }
+    }
+
+    /// **The bypass.** sqlparser's tokenizer classifies a `/* … */` run as
+    /// whitespace unless it opens exactly `/*!`, which `MySqlDialect`
+    /// special-cases and MariaDB's `/*M!` is not — so `peek_token` reached EOF
+    /// and the guard said yes. Live: this default dropped a column on MariaDB
+    /// 10.11.14 and was inert on MySQL 8.4.11.
+    ///
+    /// Refused on all three dialects, because the field is a model's and a
+    /// comment has no business in one — and because a rule that named the two
+    /// markers would go stale the moment a flavour invents a third.
+    #[test]
+    fn an_executable_comment_is_not_part_of_an_expression() {
+        for d in DIALECTS {
+            for text in [
+                "1 /*M!100000 , DROP COLUMN placed_at */",
+                "1 /*m!100000 , DROP COLUMN placed_at */",
+                "1 /*!50000 , DROP COLUMN placed_at */",
+                "1 /* an ordinary comment */",
+                "1 /*M!100000 ) , DROP COLUMN placed_at, ADD CHECK (1 */",
+            ] {
+                assert!(!is_single_expression(text, d), "{d:?} accepted {text}");
+            }
+        }
+    }
+
+    /// A type is not an expression, so it has its own gate — and parsing alone
+    /// is not the gate: `CREATE TABLE t (c int DEFAULT 0)` parses, and would let
+    /// a `type` field carry a column constraint into a position where only a
+    /// type belongs.
+    #[test]
+    fn a_column_type_is_a_type_and_nothing_else() {
+        for d in DIALECTS {
+            for t in ["int", "text", "varchar(255)", "numeric(10,2)", "  int "] {
+                assert!(is_column_type(t, d), "{d:?} refused {t}");
+            }
+            for t in [
+                "",
+                "   ",
+                "int DEFAULT 0",
+                "int NOT NULL",
+                "int, DROP COLUMN placed_at",
+                "text) , DROP COLUMN placed_at, ADD COLUMN z int",
+                "int; DROP TABLE customers; --",
+                "int(11 /*M!100000 ), DROP COLUMN placed_at, ADD COLUMN pad int(1 */)",
+                "int /*M!100000 , DROP COLUMN placed_at */",
+            ] {
+                assert!(!is_column_type(t, d), "{d:?} accepted {t}");
+            }
+        }
+        // Each engine's own vocabulary passes, and the other's does not — which
+        // is the per-dialect parser doing exactly what it is there for.
+        assert!(is_column_type("enum('a','b')", SqlDialect::MySql));
+        assert!(is_column_type("text[]", SqlDialect::Postgres));
+        assert!(is_column_type(
+            "timestamp with time zone",
+            SqlDialect::Postgres
+        ));
+    }
 
     #[test]
     fn sql_dialect_from_db_type_maps_engines() {
