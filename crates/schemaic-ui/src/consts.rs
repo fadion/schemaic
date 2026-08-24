@@ -124,9 +124,9 @@ pub(crate) const EDITOR_PAD_TOP: f64 = 5.0;
 /// **Scaled, unlike the [`EDITOR_H`] seed the editor's height starts at.** Every
 /// element it accounts for is scaled now — the toolbar row is `scaled(42)`, the
 /// option rows `scaled(35)`, the buttons `action_height()` — so a fixed 135 stopped
-/// describing the chrome it stands for, and at 200% roughly 270px of chrome was
-/// being subtracted as 135. `EDITOR_H` stays unscaled because it is a persisted
-/// drag seed; this is a *composition of scaled parts*, which is the distinction the
+/// describing the chrome it stands for, and at the top scale roughly 216px of
+/// chrome was being subtracted as 135. `EDITOR_H` stays unscaled because it is a
+/// persisted drag seed; this is a *composition of scaled parts*, which is the distinction the
 /// module doc draws.
 pub(crate) fn cmdk_diff_chrome() -> f64 {
     scaled(135.0)
@@ -285,9 +285,9 @@ pub(crate) const MONO_FAMILY: &str = "IBM Plex Mono";
 /// Grab width of a panel-resize divider and the visible bar. Per-panel min/max
 /// drag limits live below (`schema_min_w`/`right_min_w`/`center_min_w`/…).
 ///
-/// Scaled: the hit band is a pointer target, and at 200% the rest of the window
-/// has grown around it — a 10px band on a display where everything else doubled
-/// is the thing the scale exists to fix.
+/// Scaled: the hit band is a pointer target, and at 160% the rest of the window
+/// has grown around it — a 10px band on a display where everything else grew by
+/// half again is the thing the scale exists to fix.
 pub(crate) fn resize_hit() -> f64 {
     scaled(10.0)
 }
@@ -342,7 +342,7 @@ pub(crate) fn results_min_h() -> f64 {
 /// there's genuinely no room for it beside the center.
 ///
 /// Summed from the scaled minimums, which is what makes the breakpoints move
-/// with the scale: at 200% three panels genuinely don't fit a 900px window, and
+/// with the scale: at 160% three panels genuinely don't fit a 900px window, and
 /// a breakpoint that stayed at 900 would keep them there, overlapping.
 pub(crate) fn panels_min_full_w() -> f64 {
     schema_min_w() + center_min_w() + right_min_w() // 900 at Normal
@@ -680,7 +680,7 @@ mod scale_tests {
     ///
     /// **What this can and can't catch.** It pins that the box reserves exactly
     /// one scaling — and, second assertion, that a second one would be a
-    /// *visible* amount (26 → 39 at 150%), which is what the popup got when the
+    /// *visible* amount (17 → 22 at 130%), which is what the popup got when the
     /// call site read `icons::icon(icon, completion_icon_size() as f32)`, the
     /// obvious spelling. It cannot see the call site itself: the argument to a
     /// view constructor isn't observable from a unit test, so that half of the
@@ -710,7 +710,7 @@ mod scale_tests {
     }
 
     /// The responsive breakpoints are summed from the *scaled* minimums, so they
-    /// move with the scale. This is the composition that matters: at 200% three
+    /// move with the scale. This is the composition that matters: at 160% three
     /// panels genuinely do not fit a 900px window, and a breakpoint frozen at
     /// 900 would keep them all on screen, overlapping.
     #[test]
@@ -720,7 +720,7 @@ mod scale_tests {
             assert!(schema_panel_fits(650.0));
         });
         at(UiScale::Huge, || {
-            assert!(!right_panel_fits(900.0), "1800 of minimums fit in 900");
+            assert!(!right_panel_fits(900.0), "1440 of minimums fit in 900");
             assert!(!schema_panel_fits(650.0));
             assert!(right_panel_fits(1800.0));
         });
@@ -736,13 +736,16 @@ mod scale_tests {
     ///
     /// The two numbers this pins are the two the old spelling got wrong: it read
     /// the unscaled `EDITOR_H` (so a pane dragged to 600 still sized a 113px diff
-    /// at Normal) and it floored at `scaled(60)` (so at Huge, where 270 of chrome
-    /// already overflows a 248 box, it asked for 120 more).
+    /// at Normal) and it floored at `scaled(60)` (so at the 200% scale then
+    /// offered, where 270 of chrome already overflowed a 248 box, it asked for
+    /// 120 more). The 150px area is what keeps that second arm live now that the
+    /// top scale is 160%: 216 of chrome fits the 248 seed, but not a pane
+    /// dragged short.
     #[test]
     fn the_cmdk_diff_takes_what_is_left_and_never_more() {
         for scale in UiScale::ALL {
             at(scale, || {
-                for area in [EDITOR_H, 300.0, 600.0, 1000.0] {
+                for area in [150.0, EDITOR_H, 300.0, 600.0, 1000.0] {
                     let (diff, chrome) = (cmdk_diff_h(area), cmdk_diff_chrome());
                     if chrome < area {
                         assert_eq!(
@@ -764,8 +767,9 @@ mod scale_tests {
             });
         }
         at(UiScale::Huge, || {
-            assert_eq!(cmdk_diff_h(EDITOR_H), 0.0, "270 of chrome in a 248 pane");
-            assert_eq!(cmdk_diff_h(600.0), 600.0 - 270.0);
+            assert_eq!(cmdk_diff_h(EDITOR_H), EDITOR_H - 216.0, "216 of chrome");
+            assert_eq!(cmdk_diff_h(600.0), 600.0 - 216.0);
+            assert_eq!(cmdk_diff_h(150.0), 0.0, "216 of chrome in a 150px pane");
         });
     }
 
@@ -809,7 +813,7 @@ mod scale_tests {
         at(UiScale::Huge, || {
             assert_eq!(
                 effective_schema_w(1800.0, 260.0, 0.0, true),
-                500.0,
+                400.0,
                 "the stored 260 is under the scaled minimum"
             );
         });
@@ -852,17 +856,17 @@ mod width_tests {
     /// **The stored editor height survives a scale it doesn't fit.**
     ///
     /// `body` used to lift the signal to the floor on build, and the layout-persist
-    /// effect saved it: at Huge a dragged 200 became 320 and stayed 320 after
+    /// effect saved it: at Huge a dragged 200 became 256 and stayed 256 after
     /// switching back, with the 200 gone. Flooring at render keeps the intent, so
     /// the round trip returns it.
     #[test]
     fn a_stored_editor_height_is_floored_for_render_not_rewritten() {
         let stored = 200.0;
         crate::theme::set_ui_scale(crate::theme::UiScale::Huge);
-        assert_eq!(query_min_h(), 320.0);
+        assert_eq!(query_min_h(), 256.0);
         assert_eq!(
             effective_editor_h(stored, false),
-            320.0,
+            256.0,
             "rendered at the scaled floor"
         );
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);

@@ -4460,7 +4460,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **Live-switch caveat**: a colour read *inside* a reactive `.style` closure updates instantly; one
     captured *by value* freezes at build time. Prefer `fn() -> Color` for anything themable (see
     `FieldCfg::background`).
-- **Interface scale (`UiScale`: Small 80% / Normal 100% / Large 150% / Huge 200%)** multiplies the
+- **Interface scale (`UiScale`: 80% / 100% / 130% / 160%)** multiplies the
   *design tokens*, not the window. Floem 0.2 has no user-settable render scale, and a paint
   transform over the whole tree would take hit-testing and the editor's own coordinate arithmetic
   with it — so instead the type scale (`theme::font_*()`), the layout metrics (`consts::*`), the
@@ -4476,14 +4476,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **A modal's size scales, then caps against the window** — `widgets::modal_w` for the width,
     `modal_h` for a fixed-height panel, `modal_body_h` for a scrolling body inside one. All three
     read `window_size()` inside the caller's style closure, so a resize re-runs them, and all three
-    clamp their own floor to the window (a *scaled* floor passes 600px, and one wider than the
+    clamp their own floor to the window (a *scaled* floor passes 500px, and one wider than the
     screen would clip through the guard meant to keep the panel usable).
     - Heights were left unscaled at first, on the grounds that 620px is already most of a laptop
-      screen — but the type inside them grew, so at 200% an editor was three fields and a scrollbar.
+      screen — but the type inside them grew, so at the 200% then offered an editor was three
+      fields and a scrollbar.
     - **Width is the one that must fit first.** A modal is centred in a full-window backdrop: one
       taller than the window loses its footer (where Apply lives) off the bottom, but one *wider*
       than the window loses its left half — the designer's list pane and every field label with it.
-      The 900px editors came to 1800 at 200%, which is wider than a 1440p screen's window.
+      The 900px editors came to 1800 at the 200% then offered, wider than a 1440p screen's window; at
+      today's 160% top scale they come to 1440, which a 1366px laptop still cannot hold.
   - **A size the scale has to reach cannot be a plain `f32` parameter.** Three carry a `fn() -> f32`
     for exactly the reason the colours do:
     - `FieldCfg::font_size` — `edit_field` derives its box height, padding, placeholder position
@@ -4517,7 +4519,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **The interface scale is a segmented control, not a dropdown** (`settings::scale_picker`),
     because floem nudges an overflowing overlay in paint only — see *Floem 0.2 gotchas*, where the
     finding is written up in full. Four short segments, one Tab stop with Left/Right inside it
-    (`nav_group`), arrows applying as they move.
+    (`nav_group`), arrows applying as they move. The segments are labelled with the **percentage
+    itself** (`UiScale::label`) rather than Small/Normal/Large/Huge: the number is what the control
+    is asked about, four of them fit the row at every scale where four names didn't, and a label
+    computed against `factor()` can't go stale when a factor is retuned — which is why the variant
+    names (internal only) and the persisted `key()`s (semantic, so a retune carries a stored choice
+    rather than resetting it) are deliberately *not* the same vocabulary.
   - **The AI panel's height floor is held only while a turn streams** (`next_floor(…, !busy)`).
     `ai_panel`'s `floor` exists for the measurement dip a rebuilt `RichText` reports mid-stream; an
     idle panel has no dip to hide, so it takes what it just measured. It *also* releases early,
@@ -4575,9 +4582,9 @@ Re-introducing the anti-patterns these guard against is a regression:
     opened at `box_origin + box_height`: a dropdown low enough that its list runs past the window's
     bottom paints its rows shifted up while the pointer still lands on the row *below* the one you
     see. Every dropdown in the app can hit it; the interface-scale picker did, because it was the
-    last row of the last group of the tallest modal — and only at 150%, the one scale where that
-    modal grows enough to push the popup off the bottom but not enough for its body to scroll
-    instead. Two rounds of plausible fixes (rebuilding the control, chasing a stale `window_origin`)
+    last row of the last group of the tallest modal — and only at 150% (130% now), the one scale
+    where that modal grows enough to push the popup off the bottom but not enough for its body to
+    scroll instead. Two rounds of plausible fixes (rebuilding the control, chasing a stale `window_origin`)
     changed nothing, because nothing on our side was wrong.
   - **So a control that can sit near the window's bottom edge should not be a `Dropdown`**, and the
     interface scale is now a segmented control (`settings::scale_picker`) — no overlay, nothing to
