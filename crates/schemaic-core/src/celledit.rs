@@ -357,17 +357,40 @@ pub fn set_date(editor: &CellEditor, current: &str, date: Date) -> String {
     }
 }
 
-/// The text to write when a time of day is set on a cell currently holding
-/// `current` — the [`set_date`] pair, and only meaningful for a
-/// [`CellEditor::DateTime`] column. The date is whatever was there, or today when
-/// the cell was empty: a time with no day is not a value that column can hold.
-pub fn set_time(editor: &CellEditor, current: &str, time: Time, today: Date) -> String {
-    if *editor != CellEditor::DateTime {
-        return current.to_string();
-    }
-    match Stamp::parse(current) {
-        Some(s) => s.with_time(time).render(),
-        None => Stamp::from_date(today).with_time(time).render(),
+/// The text to write for **now** — the calendar's `Now` / `Today` footer, and the
+/// [`set_date`] pair.
+///
+/// The instant arrives as one reading of the clock ([`crate::date::local_now`]),
+/// because two readings are two instants and local midnight lies between them: a
+/// date from before it beside a time from after it is a stamp a day in the past,
+/// from the one control whose whole job is the current instant.
+///
+/// A [`CellEditor::Date`] column takes the day and nothing else. A
+/// [`CellEditor::DateTime`] column takes the whole instant *in the shape the value
+/// already had* — and the two parts of "the shape" that a new instant invalidates
+/// are dropped rather than kept:
+///
+/// * **the fraction**, which was the old value's microseconds, not this one's;
+/// * **the offset**, which is *replaced* where the value had one at all. Keeping
+///   it wrote a local wall-clock time under the old value's zone — on a
+///   `timestamptz` read as `+00` from a UTC+2 machine, an instant two hours from
+///   the one the button names. A value with no offset is not given one: MySQL's
+///   `DATETIME` has nowhere to put it.
+pub fn set_now(editor: &CellEditor, current: &str, now: (Date, Time, &str)) -> String {
+    let (date, time, offset) = now;
+    match editor {
+        CellEditor::Date => date.iso(),
+        CellEditor::DateTime => {
+            let stamp = Stamp::parse(current).unwrap_or_else(|| Stamp::from_date(date));
+            let stamp = stamp.with_date(date).with_time(time).without_frac();
+            let stamp = if stamp.has_offset() {
+                stamp.with_offset(offset)
+            } else {
+                stamp
+            };
+            stamp.render()
+        }
+        _ => current.to_string(),
     }
 }
 
@@ -803,6 +826,13 @@ mod tests {
         Date::new(y, m, d).expect("valid")
     }
 
+    /// A fixed reading of the clock — the shape `date::local_now` returns, with
+    /// its three parts taken **together** so a test can't accidentally state an
+    /// instant that never existed.
+    fn now_at(h: u32, m: u32, s: u32, offset: &str) -> (Date, Time, &str) {
+        (day(2024, 1, 15), Time::new(h, m, s).expect("valid"), offset)
+    }
+
     #[test]
     fn picking_a_day_on_a_date_column_writes_the_bare_date() {
         assert_eq!(
@@ -861,37 +891,60 @@ mod tests {
             "whatever"
         );
         assert_eq!(
-            set_time(
-                &CellEditor::Date,
-                "2024-01-15",
-                Time::new(1, 2, 3).unwrap(),
-                day(2024, 1, 15)
+            set_now(&CellEditor::Text, "whatever", now_at(1, 2, 3, "+02:00")),
+            "whatever"
+        );
+    }
+
+    /// One instant, read once: a `DATE` column takes its day and a `DATETIME`
+    /// column takes all of it. The date is **not** whatever the cell held — the
+    /// button says *now*.
+    #[test]
+    fn stamping_now_writes_the_whole_instant() {
+        assert_eq!(
+            set_now(
+                &CellEditor::DateTime,
+                "2020-05-05 10:00:00",
+                now_at(23, 5, 9, "+02:00")
             ),
+            "2024-01-15 23:05:09"
+        );
+        assert_eq!(
+            set_now(&CellEditor::Date, "2020-05-05", now_at(23, 5, 9, "+02:00")),
             "2024-01-15"
         );
     }
 
+    /// **The offset is replaced, and the fraction dropped.** A `timestamptz` read
+    /// as `+00` from a machine at UTC+2 kept that `+00` while the time written
+    /// under it was local — an instant two hours from the one the button names —
+    /// and carried the old value's microseconds along with it.
     #[test]
-    fn setting_a_time_keeps_the_day_it_was_on() {
+    fn stamping_now_states_the_instant_in_the_local_zone() {
         assert_eq!(
-            set_time(
+            set_now(
                 &CellEditor::DateTime,
-                "2020-05-05 10:00:00+02",
-                Time::new(23, 5, 9).unwrap(),
-                day(2024, 1, 15)
+                "2020-05-05 10:00:00.123456+00",
+                now_at(23, 5, 9, "+02:00")
             ),
-            "2020-05-05 23:05:09+02"
+            "2024-01-15 23:05:09+02:00"
         );
     }
 
+    /// A column with nowhere to put an offset is not given one: MySQL's
+    /// `DATETIME` rejects the statement, and it is the same rule the rest of
+    /// `Stamp` follows — keep the shape the value came in.
     #[test]
-    fn setting_a_time_on_an_empty_cell_dates_it_today() {
+    fn stamping_now_does_not_invent_an_offset() {
         assert_eq!(
-            set_time(
+            set_now(&CellEditor::DateTime, "", now_at(9, 0, 0, "+02:00")),
+            "2024-01-15 09:00:00"
+        );
+        assert_eq!(
+            set_now(
                 &CellEditor::DateTime,
-                "",
-                Time::new(9, 0, 0).unwrap(),
-                day(2024, 1, 15)
+                "2020-05-05 10:00:00",
+                now_at(9, 0, 0, "+02:00")
             ),
             "2024-01-15 09:00:00"
         );
