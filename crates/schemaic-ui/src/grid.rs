@@ -3812,7 +3812,10 @@ fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
 /// `edit_row_open` (the caller owns opening).
 fn load_edit_row(gs: GridState, di: usize) {
     gs.edit_row_di.set(Some(di));
-    gs.commit_err.set(None);
+    // Through `clear_bar`, not a bare `commit_err.set(None)`: the bar grew a
+    // second surface, and a note about a paste three edits ago is exactly what
+    // the copies this replaced left standing.
+    gs.clear_bar();
 }
 
 fn open_edit_row(gs: GridState, di: usize) {
@@ -5480,9 +5483,7 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                     let doomed: std::collections::HashSet<usize> = rows.into_iter().collect();
                     gs.dirty.update(|m| m.retain(|(di, _), _| !doomed.contains(di)));
                 }
-                if gs.commit_err.get_untracked().is_some() {
-                    gs.commit_err.set(None);
-                }
+                gs.clear_bar();
             }
         _ => return EventPropagation::Continue,
     }
