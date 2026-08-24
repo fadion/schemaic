@@ -26,6 +26,7 @@ use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
 use floem::action::save_as;
 use floem::file::{FileDialogOptions, FileSpec};
 
+use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_key, refetch_template, row_key};
 use schemaic_core::export::{ExportFormat, suggested_filename};
@@ -49,7 +50,7 @@ use crate::widgets::{
     MenuEntry, autohide, autohide_state, centered_msg, in_strip_button, loading_dots,
     measure_text_px, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
 };
-use crate::{ConnNode, FieldCfg, PopupAnchor, edit_field, icons, theme};
+use crate::{ConnNode, FieldCfg, PopupAnchor, cell_editors, edit_field, icons, theme};
 
 // ===== moved from lib.rs (results grid) =====
 /// The lifecycle phase of a [`QueryState`], without its payload — a deduped key
@@ -308,6 +309,12 @@ struct GridState {
     /// Which columns are editable + each base table's WHERE key (from the
     /// result's per-column provenance). Computed once per result set.
     edit_model: RwSignal<Arc<EditModel>>,
+    /// Which **control** each result column's values are edited with — a boolean
+    /// track, an enum menu, a `SET`'s chips, a calendar, or plain text. Resolved
+    /// from the column's *declared* type (see `column_editors`) and kept in a
+    /// signal because that type comes from the schema, which may land after the
+    /// grid is already on screen.
+    editors: RwSignal<Rc<Vec<CellEditor>>>,
     /// True while a commit is executing (disables re-entry).
     commit_busy: RwSignal<bool>,
     /// Bumped per commit, so a wait-note timer armed for an earlier one is
@@ -333,6 +340,12 @@ struct GridState {
     /// `min_width` of the next popup panel; the Copy dropdown sets it so a stale
     /// width from a prior (narrower) menu can't shrink it.
     popup_width: RwSignal<f64>,
+    /// Every menu flag in the app — the channel a picker fills (`menus.popup`),
+    /// the calendar's (`menus.date_pick`), and the rest, which a trigger that
+    /// swallows its own press has to close itself.
+    menus: crate::widgets::MenuFlags,
+    /// The pointer in window coords — read only by [`reclaim_keyboard`].
+    last_mouse: RwSignal<(f64, f64)>,
     /// The result's source `(database, table)` — for the cell "AI Summary" context.
     source: RwSignal<Option<TableSource>>,
     /// Callbacks wrapped in signals so `GridState` stays `Copy`. `summarize`
@@ -498,6 +511,8 @@ impl GridState {
             selecting: RwSignal::new(false),
             row_selecting: RwSignal::new(false),
             edit_model: RwSignal::new(Arc::new(EditModel::default())),
+            // Text everywhere until `grid_view`'s effect resolves the columns.
+            editors: RwSignal::new(Rc::new(Vec::new())),
             commit_busy: RwSignal::new(false),
             commit_seq: RwSignal::new(0),
             // Shared with the panel-level error bar (rendered in `results_section`).
@@ -508,6 +523,8 @@ impl GridState {
             popup: gctx.popup,
             popup_anchor: gctx.popup_anchor,
             popup_width: gctx.popup_width,
+            menus: gctx.menus,
+            last_mouse: gctx.last_mouse,
             source: gctx.source,
             summarize: RwSignal::new(Some(gctx.summarize.clone())),
             attach: RwSignal::new(Some(gctx.attach.clone())),
@@ -1991,6 +2008,58 @@ fn column_key_map(
     )
 }
 
+/// Which editor control each result column's cells get, by result-column index.
+///
+/// **The declared type, not the wire type**, wherever the catalogue has one:
+/// MySQL hands an `ENUM` over the wire as a string and a `BOOLEAN` as `TINYINT`,
+/// so the member list and the `tinyint(1)` width only exist in the schema (see
+/// [`schemaic_core::celledit`]). A column whose base table isn't loaded — a
+/// schema still fetching, an expression column, a database that isn't in this
+/// connection's tree — falls back to the wire type, where the date family still
+/// resolves and everything else is text.
+///
+/// Every read here is **tracked**: a schema arriving after the grid was built
+/// re-runs the effect that calls this, and the controls appear.
+fn column_editors(
+    rs: &ResultSet,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    dialect: SqlDialect,
+) -> Vec<CellEditor> {
+    rs.columns
+        .iter()
+        .map(|c| {
+            let declared = c.origin.as_ref().and_then(|o| {
+                db_nodes.with(|nodes| {
+                    let node = nodes.iter().find(|n| n.database == o.database)?;
+                    let SchemaState::Loaded(schema) = node.schema.get() else {
+                        return None;
+                    };
+                    // The namespace is part of the table's identity — two
+                    // PostgreSQL schemas may hold same-named tables, and the
+                    // wrong one's column would answer with the wrong type.
+                    let t = schema.tables.iter().find(|t| {
+                        t.name == o.table && t.schema.as_deref() == o.schema.as_deref()
+                    })?;
+                    let col = t.columns.iter().find(|cc| cc.name == o.column)?;
+                    Some((col.type_name.clone(), schema.clone()))
+                })
+            });
+            match declared {
+                Some((ty, schema)) => celledit::editor_for_column(&ty, dialect, Some(&schema)),
+                None => celledit::editor_for_type(&c.type_name, dialect),
+            }
+        })
+        .collect()
+}
+
+/// The control column `ci`'s cells get, or [`CellEditor::Text`] before the
+/// resolver has run (and for a column index the result doesn't have).
+fn cell_editor(gs: GridState, ci: usize) -> CellEditor {
+    gs.editors
+        .with_untracked(|e| e.get(ci).cloned())
+        .unwrap_or(CellEditor::Text)
+}
+
 /// The role precedence, over a table's own columns and the result columns they
 /// landed in (`real name → result index`). Pure half of [`column_key_map`].
 fn key_roles(t: &TableInfo, by_name: &HashMap<&str, usize>) -> HashMap<usize, ColKey> {
@@ -2151,6 +2220,13 @@ pub(crate) struct GridCtx {
     pub(crate) popup_anchor: RwSignal<Option<PopupAnchor>>,
     /// `min_width` of the next popup panel (the Copy dropdown sets its own).
     pub(crate) popup_width: RwSignal<f64>,
+    /// Every menu flag in the app, including the date picker's channel — what a
+    /// control that opens one needs in order to close the others (see
+    /// [`crate::widgets::MenuId`]).
+    pub(crate) menus: crate::widgets::MenuFlags,
+    /// The pointer in window coords, for the one question the grid cannot ask
+    /// floem: where the keyboard went — see [`reclaim_keyboard`].
+    pub(crate) last_mouse: RwSignal<(f64, f64)>,
     /// Reveal the AI panel + send a message (used for the cell "AI Summary").
     pub(crate) summarize: Rc<dyn Fn(String)>,
     /// Stage result rows as an attachment on the AI panel's next question.
@@ -2788,6 +2864,23 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             })
         };
         gs.edit_model.set(Arc::new(model));
+    });
+    // Which control each column's cells edit with. Its own effect, tracking the
+    // schema signals `column_editors` reads: a database whose introspection lands
+    // *after* the grid was built upgrades a text field into a dropdown or a
+    // calendar in place, rather than leaving the result it arrived too late for
+    // editing as text until the next run.
+    let rs_editors = rs.clone();
+    create_effect(move |_| {
+        let next = column_editors(&rs_editors, db_nodes, gs.dialect);
+        // **Only when it actually changed.** A signal never dedups, and this
+        // effect re-runs on any schema movement at all — a refresh that comes
+        // back identical included. The row panel is keyed on this value, so an
+        // unchanged re-set would rebuild it under the user and take the fields
+        // they were typing into with it.
+        if gs.editors.with_untracked(|cur| cur.as_slice() != next) {
+            gs.editors.set(Rc::new(next));
+        }
     });
 
     // ── What the capped notice compares against ──────────────────────────────
@@ -3576,6 +3669,32 @@ fn refocus_grid(gs: GridState) {
             f.request_focus();
         }
     });
+}
+
+/// Should a blurred inline editor hand the keyboard back to the grid?
+///
+/// **floem's `text_input` answers Escape itself** — `handle_key_down` calls
+/// `clear_focus()` and reports the key as handled, so the grid's own Escape
+/// handler is never reached (a view's `event_before_children` runs before its
+/// listeners, and a processed event stops there). All the grid hears is
+/// `FocusLost`, and the keyboard is left on **nothing**: no arrows, no Enter, no
+/// Ctrl+Enter, until the user clicks a cell. That is what this recovers.
+///
+/// But `FocusLost` is also what a click on anything else produces, and floem
+/// exposes no way to ask where the focus went (`AppState::focus` is private, and
+/// `focus_changed` has already assigned it by the time a listener runs). So the
+/// answer is taken from the **pointer**: a blur with the cursor over the grid is
+/// Escape, or a click on another cell, and both want the grid to keep the
+/// keyboard; a blur with the cursor elsewhere is a click on that elsewhere, which
+/// has just taken the keyboard and must keep it — the SQL editor above being the
+/// one that would smart.
+///
+/// The corner it gets wrong is Escape pressed with the pointer parked outside the
+/// grid, which leaves the keyboard where floem left it: a click away from
+/// recovery, and no worse than before this existed. The honest fix is upstream —
+/// a text input that lets its host answer Escape.
+fn reclaim_keyboard(pointer: (f64, f64), grid: Rect) -> bool {
+    grid.contains(Point::new(pointer.0, pointer.1))
 }
 
 /// Anything [`clear_if_any`] can ask whether it is already empty.
@@ -4551,27 +4670,20 @@ fn null_sentinel() -> AnyView {
         .into_any()
 }
 
-/// The editable value cell for a scalar field: a text input, plus (for a nullable
-/// column) a NULL toggle. NULL is an explicit state — clearing the text to empty is
-/// the empty string, not NULL. A `<null>` field re-enables on **double-click** (same
-/// as its "Set value" button).
-fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) -> AnyView {
-    let make_field = move || {
-        edit_field(
-            f.buf,
-            FieldCfg {
-                background: theme::bg_editor,
-                font_size: theme::font_body,
-                autofocus,
-                height: Some(field_input_h),
-                // Escape closes the panel even while a field is focused.
-                on_escape: Some(Rc::new(move || gs.edit_row_open.set(false))),
-                ..Default::default()
-            },
-        )
-    };
+/// A field's control wrapped in its NULL toggle: the control itself for a NOT
+/// NULL column, and for a nullable one either the `<null>` sentinel with a "Set
+/// value" affordance or the control with "Set NULL" beside it.
+///
+/// NULL is an explicit state — clearing the text to empty is the empty string,
+/// not NULL. A `<null>` field re-enables on **double-click** (same as its "Set
+/// value" button).
+///
+/// `control` is a builder rather than a view because the `dyn_container` rebuilds
+/// it every time the null flag flips, and a control holding signals of its own
+/// (the calendar's open month) must be rebuilt with them, not moved.
+fn nullable_field(nullable: bool, f: FieldSig, control: Rc<dyn Fn() -> AnyView>) -> AnyView {
     if !nullable {
-        return make_field().style(|s| s.width_full()).into_any();
+        return container((control)()).style(|s| s.width_full()).into_any();
     }
     dyn_container(
         move || f.is_null.get(),
@@ -4587,7 +4699,7 @@ fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) ->
                 .into_any()
             } else {
                 h_stack((
-                    make_field().style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+                    container((control)()).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
                     field_mini_btn("Set NULL", move || f.is_null.set(true)),
                 ))
                 .style(|s| s.items_center().width_full().gap(6.0))
@@ -4597,6 +4709,112 @@ fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) ->
     )
     .style(|s| s.width_full())
     .into_any()
+}
+
+/// The editable value cell for a scalar field: a text input in its NULL toggle.
+fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) -> AnyView {
+    let make_field: Rc<dyn Fn() -> AnyView> = Rc::new(move || {
+        edit_field(
+            f.buf,
+            FieldCfg {
+                background: theme::bg_editor,
+                font_size: theme::font_body,
+                autofocus,
+                height: Some(field_input_h),
+                // Escape closes the panel even while a field is focused.
+                on_escape: Some(Rc::new(move || gs.edit_row_open.set(false))),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full())
+        .into_any()
+    });
+    nullable_field(nullable, f, make_field)
+}
+
+/// The control this field may actually use: its column's, unless the value in
+/// hand can't be represented by it — in which case the plain text field, which
+/// can represent anything.
+///
+/// An empty buffer fits everything ([`celledit::fits`]), which is what hands a
+/// NULL field its dropdown the moment "Set value" turns it into one.
+fn fitting_editor(editor: CellEditor, f: &FieldSig) -> CellEditor {
+    if f.buf.with_untracked(|b| celledit::fits(&editor, b)) {
+        editor
+    } else {
+        CellEditor::Text
+    }
+}
+
+/// The picker this cell's **open editor** is, if it is one — its column's
+/// control, unless the value in hand can't be represented by it
+/// ([`fitting_editor`]'s rule, asked of the buffer `start_edit` seeded).
+///
+/// Asked twice per open editor: once by the cell's content, to build it, and once
+/// by the cell's own style, to drop the padding a text field wants and a control
+/// must not have. One function, because a cell padded like a text field around a
+/// control that fills it is a gap down one side and a clipped chevron on the
+/// other — and the two answers must agree keystroke for keystroke.
+fn open_cell_control(gs: GridState, ci: usize) -> Option<CellEditor> {
+    let e = cell_editor(gs, ci);
+    if !matches!(
+        e,
+        CellEditor::Bool(_) | CellEditor::Enum(_) | CellEditor::Set(_)
+    ) {
+        return None;
+    }
+    gs.edit_buf
+        .with_untracked(|b| celledit::fits(&e, b))
+        .then_some(e)
+}
+
+/// The editable value cell for a field whose column has a **type-aware** control
+/// ([`schemaic_core::celledit`]): the control, in the same NULL toggle a text
+/// field gets.
+///
+/// The caller has already established that the field's value
+/// [`celledit::fits`] the control — a value that doesn't keeps
+/// [`scalar_editor`], which is what stops a toggle from rewriting a `tinyint(1)`
+/// holding `7`.
+fn typed_editor(
+    gs: GridState,
+    editor: CellEditor,
+    nullable: bool,
+    autofocus: bool,
+    f: FieldSig,
+) -> AnyView {
+    let control: Rc<dyn Fn() -> AnyView> = match editor {
+        // A boolean is a two-row picker, the same control an enum gets: its
+        // values are as listed as an enum's, and one control for both is one
+        // thing to learn (and none to invent).
+        editor @ (CellEditor::Bool(_) | CellEditor::Enum(_)) => {
+            let ch = cell_editors::PopupChannel {
+                menus: gs.menus,
+                anchor: gs.popup_anchor,
+                width: gs.popup_width,
+            };
+            Rc::new(move || cell_editors::pick_field(f.buf, editor.clone(), ch))
+        }
+        editor @ CellEditor::Set(_) => {
+            Rc::new(move || cell_editors::set_control(f.buf, editor.clone()))
+        }
+        editor @ (CellEditor::Date | CellEditor::DateTime) => Rc::new(move || {
+            cell_editors::date_control(
+                f.buf,
+                editor.clone(),
+                autofocus,
+                // Escape closes the panel even while a field is focused — the
+                // same contract `scalar_editor` gives. (An open calendar takes
+                // the first Escape: it is on the shared popup registry, which the
+                // window root peels off before anything else — see
+                // `widgets::dismiss_open_popup`.)
+                Some(Rc::new(move || gs.edit_row_open.set(false))),
+                gs.menus,
+            )
+        }),
+        CellEditor::Text => return scalar_editor(gs, nullable, autofocus, f),
+    };
+    nullable_field(nullable, f, control)
 }
 
 /// True for a JSON/JSONB column type (MySQL `json`, Postgres `json`/`jsonb`).
@@ -4976,25 +5194,44 @@ fn readonly_value(f: FieldSig) -> AnyView {
 }
 
 /// One field row: the column label + its value editor (editable) or read-only cell.
+///
+/// `typed` is the column's type-aware control, already narrowed to what this
+/// field's **own value** fits (see [`typed_editor`]); [`CellEditor::Text`] is the
+/// plain input, and is what a value no control can represent comes back as.
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn field_row(
     gs: GridState,
     name: String,
     type_name: String,
+    typed: CellEditor,
     editable: bool,
     nullable: bool,
     autofocus: bool,
     f: FieldSig,
 ) -> AnyView {
     let is_json = is_json_type(&type_name);
+    // The one control that can outgrow a line: a `SET`'s chips wrap. (A date's
+    // calendar is an overlay, so its row stays a row.)
+    let grows = is_json || matches!(typed, CellEditor::Set(_));
     let editor = if !editable {
         readonly_value(f)
     } else if is_json {
         json_field(nullable, f, gs.commit_err)
     } else {
-        scalar_editor(gs, nullable, autofocus, f)
+        typed_editor(gs, typed, nullable, autofocus, f)
+    };
+    // A top-aligned row leaves the label's own box the height of its text, which
+    // is 13px against a 26px control — so in that case the label is given the
+    // control's height and centres its text inside it. Without this the name sits
+    // a few pixels above the value it names, on those rows only.
+    let label = field_label(name, type_name);
+    let label = if grows && !is_json {
+        label.style(|s| s.height(field_input_h())).into_any()
+    } else {
+        label.into_any()
     };
     h_stack((
-        field_label(name, type_name),
+        label,
         container(editor).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
     ))
     .style(move |s| {
@@ -5003,6 +5240,11 @@ fn field_row(
         // row keeps a *fixed* height so toggling `<null>` ↔ input (which are different
         // natural heights) never reflows the rows below.
         if is_json {
+            s.items_start().min_height(field_row_h())
+        } else if grows {
+            // The same floor, and the same height while closed — but the row may
+            // exceed it once the chips wrap or the calendar unfolds, and the label
+            // stays on the control's first line instead of centring against it.
             s.items_start().min_height(field_row_h())
         } else {
             s.items_center().height(field_row_h())
@@ -5022,8 +5264,22 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
         // Keyed on (open, current row) so walking to another row (prev/next) rebuilds
         // the panel — header number, chevron state, and the per-field editors refresh
         // together (and the old row's field signals dispose).
-        move || (gs.edit_row_open.get(), gs.edit_row_di.get()),
-        move |(open, di_opt)| {
+        //
+        // **And on the editors' identity**, because each field's control is
+        // resolved once here at build (`fitting_editor` below): a schema landing
+        // after the panel was opened would otherwise leave every column on the
+        // plain text editor until the user stepped away and back. The `Rc`'s
+        // address is the identity, and the effect that fills it only replaces the
+        // value when the resolution really moved — so this rebuilds when a column
+        // gains a control, and not on every schema refresh.
+        move || {
+            (
+                gs.edit_row_open.get(),
+                gs.edit_row_di.get(),
+                Rc::as_ptr(&gs.editors.get()) as usize,
+            )
+        },
+        move |(open, di_opt, _)| {
             let (true, Some(di)) = (open, di_opt) else {
                 return empty().into_any();
             };
@@ -5043,10 +5299,16 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     .map(|col| col.type_name.clone())
                     .unwrap_or_default();
                 let autofocus = first_editable == Some(ci);
+                // The column's control, narrowed to what *this row's* value fits:
+                // a value no control can represent (a `tinyint(1)` holding 7, an
+                // ENUM holding something MySQL rejected into it) keeps the text
+                // field, so opening the row can never rewrite it.
+                let typed = fitting_editor(cell_editor(gs, ci), &sigs[ci]);
                 rows.push(field_row(
                     gs,
                     c.name.clone(),
                     type_name,
+                    typed,
                     c.editable,
                     c.nullable,
                     autofocus,
@@ -6923,6 +7185,117 @@ fn header_cell(
         })
 }
 
+/// Stage the inline editor's buffer into the cell it is open on and close it —
+/// **Enter's contract**, called by the type-aware controls, which have no text to
+/// type and so commit on a choice instead.
+///
+/// In a pending new row Enter hops to the next editable cell (fast data entry),
+/// exactly as it does from the text input; in a real row it just closes.
+fn keep_cell_edit(gs: GridState, i: usize, data_idx: usize, ci: usize, pending: Option<usize>) {
+    if pending.is_some() {
+        advance_edit(gs, i, ci, pending, true);
+    } else {
+        gs.stage(data_idx, ci, Some(gs.edit_buf.get_untracked()));
+        gs.edit_cell.set(None);
+        refocus_grid(gs);
+    }
+}
+
+/// Close the inline editor **without** staging (Escape, focus lost) — but only if
+/// this cell is still the open one: a Tab/Enter hop has already repointed
+/// `edit_cell` at the next cell, and this cell's own teardown must not clobber it.
+fn drop_cell_edit(gs: GridState, i: usize, ci: usize, refocus: bool) {
+    // Reached from a focus-loss and from a menu dismissal, both of which can fire
+    // while the grid is being torn down — see `GridState::alive`.
+    if !gs.alive() || gs.edit_cell.get_untracked() != Some((i, ci)) {
+        return;
+    }
+    gs.edit_cell.set(None);
+    if refocus {
+        refocus_grid(gs);
+    }
+}
+
+/// The in-cell picker: the value with a chevron filling the cell, and the shared
+/// popup menu over it listing what the column may hold — a boolean's two words,
+/// an enum's members, a `SET`'s members.
+///
+/// **One control for all three**, because a cell has room for a value and a
+/// chevron and nothing else, and because a menu is the one list that can be drawn
+/// over a grid at all (the popup layer is outside the scroll that would clip it).
+/// The menu is opened against the cell's own rect, one tick after the face is
+/// built, since a view has no `layout_rect` until it has been laid out.
+///
+/// Choosing commits straight away (there is nothing else to type), so a `SET`
+/// toggles **one** member per opening — the row panel's chips are where a subset
+/// is assembled in one go. Dismissing the menu any way at all closes the editor,
+/// which is the `popup` effect below: the channel is written by the root's
+/// click-away handler too, so watching the flag is the only way to hear about
+/// every dismissal.
+///
+/// Dates are not here: their calendar is a panel, not a list, and it drops from
+/// the row panel's field where a text field can stand beside it.
+fn cell_pick_editor(
+    gs: GridState,
+    i: usize,
+    data_idx: usize,
+    ci: usize,
+    pending: Option<usize>,
+    editor: CellEditor,
+) -> AnyView {
+    let ch = cell_editors::PopupChannel {
+        menus: gs.menus,
+        anchor: gs.popup_anchor,
+        width: gs.popup_width,
+    };
+    let face = cell_editors::pick_cell_face(gs.edit_buf, editor.clone());
+    let anchor = face.id();
+    // Whether *we* put a menu up. Without it the closing effect below fires on
+    // its first run — before the deferred open — and shuts the editor instantly.
+    let opened = RwSignal::new(false);
+    let open = {
+        let editor = editor.clone();
+        move || {
+            // The option's *value*, which for a `SET` is the whole value with that
+            // member toggled and for a boolean the engine's own spelling — see
+            // `celledit::pick_options`.
+            let pick: Rc<dyn Fn(&str)> = Rc::new(move |v: &str| {
+                gs.edit_buf.set(v.to_string());
+                keep_cell_edit(gs, i, data_idx, ci, pending);
+            });
+            let entries = cell_editors::pick_entries(&editor, &gs.edit_buf.get_untracked(), pick);
+            let width = gs
+                .widths
+                .with_untracked(|w| w.get(ci).copied().unwrap_or(cell_w()));
+            cell_editors::open_picker(ch, Some(anchor), width, entries);
+        }
+    };
+    // One tick later: `layout_rect` is what the menu anchors to, and this view has
+    // none until the frame that built it has been laid out.
+    let first = open.clone();
+    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        if !gs.alive() || gs.edit_cell.get_untracked() != Some((i, ci)) {
+            return;
+        }
+        (first)();
+        opened.set(true);
+    });
+    create_effect(move |_| {
+        let up = gs.popup.get().is_some();
+        if opened.get() && !up {
+            drop_cell_edit(gs, i, ci, true);
+        }
+    });
+    face.on_event_stop(
+        EventListener::PointerDown,
+        crate::widgets::menu_trigger_press,
+    )
+    // Clicking the face toggles the menu it opened — `open_picker` recognises
+    // its own menu and closes it rather than reopening.
+    .on_click_stop(move |_| (open)())
+    .into_any()
+}
+
 fn data_cell(
     gs: GridState,
     i: usize,
@@ -6991,6 +7364,12 @@ fn data_cell(
                 bool,
             )| {
                 if is_editing {
+                    // A column whose values are already written down edits with
+                    // its own control rather than a text field. Everything else
+                    // falls through to the text input below.
+                    if let Some(e) = open_cell_control(gs, ci) {
+                        return cell_pick_editor(gs, i, data_idx, ci, pending, e);
+                    }
                     return floem::views::text_input(gs.edit_buf)
                         .on_event(EventListener::KeyDown, move |e| {
                             if let Event::KeyDown(ke) = e {
@@ -7019,12 +7398,12 @@ fn data_cell(
                                         advance_edit(gs, i, ci, pending, !ke.modifiers.shift());
                                         return EventPropagation::Stop;
                                     }
-                                    Key::Named(NamedKey::Escape) => {
-                                        // Discard: just close the editor.
-                                        gs.edit_cell.set(None);
-                                        refocus_grid(gs);
-                                        return EventPropagation::Stop;
-                                    }
+                                    // **Escape is not here**, and cannot be:
+                                    // floem's `text_input` handles it in
+                                    // `event_before_children` (clearing the
+                                    // window focus) and reports it processed, so
+                                    // no listener of ours runs. What that leaves
+                                    // behind is picked up by `FocusLost` below.
                                     _ => {}
                                 }
                             }
@@ -7038,6 +7417,20 @@ fn data_cell(
                         .on_event(EventListener::FocusLost, move |_| {
                             if gs.edit_cell.get_untracked() == Some((i, ci)) {
                                 gs.edit_cell.set(None);
+                                // Escape came through here rather than through a
+                                // key handler, and took the keyboard with it —
+                                // see `reclaim_keyboard` for why the pointer is
+                                // what decides whether to take it back.
+                                let over = gs
+                                    .focus_id
+                                    .get_untracked()
+                                    .map(|f| f.layout_rect())
+                                    .is_some_and(|r| {
+                                        reclaim_keyboard(gs.last_mouse.get_untracked(), r)
+                                    });
+                                if over {
+                                    refocus_grid(gs);
+                                }
                             }
                             EventPropagation::Continue
                         })
@@ -7465,7 +7858,15 @@ fn data_cell(
                 .items_center();
             // Right-aligned numeric cells get extra right padding (matching the
             // header) so the value clears the edge/border; text cells stay at 10px.
-            let s = if numeric {
+            //
+            // **A control open in the cell takes the whole cell**: it carries its
+            // own surface, and a padded cell around it leaves a strip of the row
+            // showing down each side — a box inside a box, which is what it read
+            // as. The control puts the text back on the same inset the display
+            // uses (`pick_cell_face`), so nothing moves as the editor opens.
+            let s = if is_editing && open_cell_control(gs, ci).is_some() {
+                s.padding(0.0).justify_start()
+            } else if numeric {
                 s.padding_left(grid_pad_h())
                     .padding_right(grid_num_pad_right())
                     .justify_end()
@@ -7580,6 +7981,191 @@ mod tests {
             vec![col("c", ty)],
             cells.into_iter().map(|v| vec![v]).collect(),
         )
+    }
+
+    use schemaic_core::celledit::BoolWire;
+
+    // ── Type-aware editors: which control a column's cells get ──
+    //
+    // `celledit` decides what a *type* means; these cover the two joins the grid
+    // makes around it — result column → its base column's **declared** type, and
+    // column control → this cell's value.
+
+    /// A result column carrying provenance, as a table-backed query produces.
+    fn origin_col(name: &str, wire_ty: &str, db: &str, ns: Option<&str>, table: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            type_name: wire_ty.to_string(),
+            origin: Some(schemaic_core::model::ColumnOrigin {
+                database: db.to_string(),
+                schema: ns.map(str::to_string),
+                table: table.to_string(),
+                column: name.to_string(),
+                flags: Default::default(),
+                binary: false,
+                implicit_key: false,
+            }),
+        }
+    }
+
+    /// One database node holding `tables`, in the state the tree keeps them.
+    fn node(database: &str, schema: Option<DbSchema>) -> ConnNode {
+        let state = match schema {
+            Some(s) => SchemaState::Loaded(Arc::new(s)),
+            None => SchemaState::Loading,
+        };
+        ConnNode {
+            id: 0,
+            name: "conn".into(),
+            database: database.to_string(),
+            schema: RwSignal::new(state),
+            refreshing: RwSignal::new(false),
+            stats: RwSignal::new(crate::DbStatsState::Idle),
+        }
+    }
+
+    fn schema_with(ns: Option<&str>, table: &str, cols: &[(&str, &str)]) -> DbSchema {
+        DbSchema {
+            tables: vec![TableInfo {
+                name: table.to_string(),
+                schema: ns.map(str::to_string),
+                columns: cols
+                    .iter()
+                    .map(|(n, ty)| ColumnInfo {
+                        name: n.to_string(),
+                        type_name: ty.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of resolving through the schema: MySQL hands an `ENUM`
+    /// over the wire as a string and a `BOOLEAN` as `TINYINT`, so the wire type
+    /// can answer neither question and the catalogue's `COLUMN_TYPE` must.
+    #[test]
+    fn a_columns_control_comes_from_its_declared_type_not_the_wire_one() {
+        let rs = ResultSet::from_rows(
+            vec![
+                origin_col("rating", "CHAR", "sakila", None, "film"),
+                origin_col("active", "TINYINT", "sakila", None, "film"),
+            ],
+            vec![vec![Value::Str("PG".into()), Value::Int(1)]],
+        );
+        let nodes = RwSignal::new(vec![node(
+            "sakila",
+            Some(schema_with(
+                None,
+                "film",
+                &[("rating", "enum('G','PG')"), ("active", "tinyint(1)")],
+            )),
+        )]);
+        let editors = column_editors(&rs, nodes, SqlDialect::MySql);
+        assert_eq!(
+            editors[0],
+            CellEditor::Enum(vec!["G".into(), "PG".into()]),
+            "the member list only exists in the catalogue"
+        );
+        assert_eq!(
+            editors[1],
+            CellEditor::Bool(BoolWire::OneZero),
+            "and so does the tinyint(1) width"
+        );
+    }
+
+    /// No provenance (an expression), an unloaded schema, or a table the node
+    /// doesn't hold: the wire type is what is left, and it still knows a date.
+    #[test]
+    fn a_column_with_nothing_to_resolve_against_falls_back_to_the_wire_type() {
+        let rs = ResultSet::from_rows(
+            vec![
+                col("now()", "DATETIME"),
+                origin_col("created", "DATETIME", "app", None, "orders"),
+                origin_col("name", "VARCHAR", "app", None, "orders"),
+            ],
+            vec![vec![Value::Null, Value::Null, Value::Null]],
+        );
+        // The database is in the tree but its introspection hasn't landed.
+        let nodes = RwSignal::new(vec![node("app", None)]);
+        let editors = column_editors(&rs, nodes, SqlDialect::MySql);
+        assert_eq!(editors[0], CellEditor::DateTime);
+        assert_eq!(editors[1], CellEditor::DateTime);
+        assert_eq!(editors[2], CellEditor::Text);
+    }
+
+    /// A namespace is part of a table's identity — `sales.orders` and
+    /// `public.orders` are different tables, and reading the wrong one's column
+    /// would offer a control over the wrong values.
+    #[test]
+    fn a_same_named_table_in_another_namespace_is_not_the_source() {
+        let rs = ResultSet::from_rows(
+            vec![origin_col("state", "TEXT", "app", Some("sales"), "orders")],
+            vec![vec![Value::Str("ok".into())]],
+        );
+        let nodes = RwSignal::new(vec![node(
+            "app",
+            Some(schema_with(Some("public"), "orders", &[("state", "mood")])),
+        )]);
+        assert_eq!(
+            column_editors(&rs, nodes, SqlDialect::Postgres),
+            vec![CellEditor::Text]
+        );
+    }
+
+    /// The keyboard recovery's rule, and the two cases it has to tell apart —
+    /// see [`reclaim_keyboard`] for why the pointer is what decides.
+    #[test]
+    fn a_blur_over_the_grid_takes_the_keyboard_back_and_one_elsewhere_does_not() {
+        let grid = Rect::new(0.0, 100.0, 800.0, 600.0);
+        // Escape, with the cursor still on the cell that was double-clicked.
+        assert!(reclaim_keyboard((400.0, 300.0), grid));
+        // A click in the SQL editor above the grid — it has just taken the
+        // keyboard, and yanking it back is the regression this guards.
+        assert!(!reclaim_keyboard((400.0, 40.0), grid));
+        // The results toolbar, below the editor and above the table body.
+        assert!(!reclaim_keyboard((400.0, 95.0), grid));
+        // A grid that has never been laid out claims nothing.
+        assert!(!reclaim_keyboard((400.0, 300.0), Rect::ZERO));
+    }
+
+    /// The other join: a column's control is only offered for a value it could
+    /// have produced. This is the seam — the classification is per *column*, and
+    /// one cell of it may hold something no control can represent.
+    #[test]
+    fn a_value_the_control_cannot_represent_keeps_the_text_field() {
+        let bool_ctl = CellEditor::Bool(BoolWire::OneZero);
+        let seven = FieldSig {
+            ci: 0,
+            buf: RwSignal::new("7".to_string()),
+            is_null: RwSignal::new(false),
+            flush: RwSignal::new(None),
+        };
+        assert_eq!(fitting_editor(bool_ctl.clone(), &seven), CellEditor::Text);
+
+        let one = FieldSig {
+            buf: RwSignal::new("1".to_string()),
+            ..seven
+        };
+        assert_eq!(fitting_editor(bool_ctl.clone(), &one), bool_ctl);
+    }
+
+    /// A NULL field's buffer is empty, and "nothing chosen yet" fits every
+    /// control — otherwise "Set value" would hand back a text box on a column
+    /// that has a dropdown.
+    #[test]
+    fn an_empty_field_still_gets_its_control() {
+        let empty = FieldSig {
+            ci: 0,
+            buf: RwSignal::new(String::new()),
+            is_null: RwSignal::new(true),
+            flush: RwSignal::new(None),
+        };
+        let enum_ctl = CellEditor::Enum(vec!["a".into()]);
+        assert_eq!(fitting_editor(enum_ctl.clone(), &empty), enum_ctl);
+        assert_eq!(fitting_editor(CellEditor::Date, &empty), CellEditor::Date);
     }
 
     // ── Header key icons (`key_roles`) ──

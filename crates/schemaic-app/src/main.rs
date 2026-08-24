@@ -7695,6 +7695,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             popup_anchor: RwSignal::new(None),
             popup_width: RwSignal::new(170.0),
             last_mouse,
+            date_pick: RwSignal::new(None),
             find_open,
             find_query,
             search_history,

@@ -1961,6 +1961,10 @@ pub(crate) enum MenuId {
     Connection,
     ActiveDb,
     ActivityClock,
+    /// The date picker's calendar. Not a menu — a grid of days, on its own
+    /// channel — but it is dismissed by the same gesture as one, and a trigger
+    /// that swallows its press owes the others the same close.
+    DatePick,
 }
 
 /// Every menu-open flag in the app, gathered once so a new one is added in a
@@ -1974,6 +1978,11 @@ pub(crate) struct MenuFlags {
     pub connection: RwSignal<bool>,
     pub active_db: RwSignal<bool>,
     pub activity_clock: RwSignal<bool>,
+    /// The open calendar (`crate::DatePick`). It carries a panel rather than a
+    /// flag, and it is *not* a menu — but every reason this list exists applies
+    /// to it: it is closed by a press anywhere else, and the presses that reach
+    /// the workspace root are only the ones nothing swallowed.
+    pub date_pick: RwSignal<Option<crate::DatePick>>,
 }
 
 impl MenuFlags {
@@ -1986,6 +1995,7 @@ impl MenuFlags {
             connection: ui.conn.conn_menu_open,
             active_db: ui.tabs_ui.active_db_menu_open,
             activity_clock: ui.activity.menu_open,
+            date_pick: ui.overlay.date_pick,
         }
     }
 
@@ -2000,6 +2010,9 @@ impl MenuFlags {
         }
         if live(MenuId::Context) && self.context.get_untracked().is_some() {
             self.context.set(None);
+        }
+        if live(MenuId::DatePick) && self.date_pick.get_untracked().is_some() {
+            self.date_pick.set(None);
         }
         for (id, flag) in [
             (MenuId::SchemaEye, self.schema_eye),
@@ -5805,6 +5818,11 @@ mod menu_exclusivity {
             connection: scope.create_rw_signal(true),
             active_db: scope.create_rw_signal(true),
             activity_clock: scope.create_rw_signal(true),
+            date_pick: scope.create_rw_signal(Some(crate::DatePick {
+                buf: scope.create_rw_signal(String::new()),
+                editor: schemaic_core::celledit::CellEditor::Date,
+                anchor: (0.0, 0.0, 0.0),
+            })),
         }
     }
 
@@ -5827,6 +5845,10 @@ mod menu_exclusivity {
                 (MenuId::Connection, f.connection.get_untracked()),
                 (MenuId::ActiveDb, f.active_db.get_untracked()),
                 (MenuId::ActivityClock, f.activity_clock.get_untracked()),
+                (
+                    MenuId::DatePick,
+                    f.date_pick.with_untracked(|p| p.is_some()),
+                ),
             ]
             .into_iter()
             .filter(|(_, on)| *on)
@@ -5841,6 +5863,7 @@ mod menu_exclusivity {
             MenuId::Connection,
             MenuId::ActiveDb,
             MenuId::ActivityClock,
+            MenuId::DatePick,
         ] {
             let f = flags(scope);
             f.close_except(Some(keep));
@@ -6011,6 +6034,9 @@ mod menu_trigger_gate {
         "Connection",
         "ActiveDb",
         "ActivityClock",
+        // The date field's calendar button: it absorbs its press like the rest,
+        // so it owes the rest the same close.
+        "DatePick",
     ];
 
     fn crate_source() -> String {

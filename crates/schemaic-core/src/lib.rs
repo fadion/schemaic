@@ -8,8 +8,10 @@
 
 pub mod activity;
 pub mod aggregate;
+pub mod celledit;
 pub mod chat;
 pub mod connection;
+pub mod date;
 pub mod db_color;
 pub mod db_hidden;
 pub mod ddl;
