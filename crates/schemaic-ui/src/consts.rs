@@ -112,33 +112,43 @@ pub(crate) const EDITOR_H: f64 = 248.0;
 /// move the content origin, so they need no compensation.)
 pub(crate) const EDITOR_PAD_TOP: f64 = 5.0;
 
-/// Height of the Ctrl+K diff scroll area. Flex/percentage heights don't resolve
-/// through the absolute overlay in Floem, so the diff can't "fill the remaining
-/// space" — we size it explicitly instead. DERIVED from `EDITOR_H` (minus the
-/// fixed chrome stacked around the diff) rather than a bare constant, so it
-/// tracks the editor if `EDITOR_H` changes — e.g. when the editor/results split
-/// becomes resizable. Subtraction (not a proportion) is correct: only the diff
-/// should absorb any extra height.
+/// Everything stacked around the Ctrl+K diff, which is what the diff's own height
+/// is the editor area minus. Flex/percentage heights don't resolve through the
+/// absolute overlay in Floem, so the diff can't "fill the remaining space" — it is
+/// sized explicitly, and something has to say how much is not it. Subtraction (not
+/// a proportion) is correct: only the diff should absorb any extra height.
 ///   ~30 toolbar + 20 editor_wrap pad + ~35 question row + ~45 buttons + 20 diff
 ///   pad ≈ 150 of chrome — trimmed to 135 so a long diff + buttons + spacing
 ///   reach the bottom of the overlay with no dead space.
 ///
-/// **Scaled, unlike [`EDITOR_H`] it is subtracted from.** Every element it
-/// accounts for is scaled now — the toolbar row is `scaled(42)`, the option rows
-/// `scaled(35)`, the buttons `action_height()` — so a fixed 135 stopped
-/// describing the chrome it stands for, and at 200% roughly 270px of it sat
-/// inside an overlay still bounded by the unscaled 248. The diff then held its
-/// own fixed height on top of that and pushed Accept/Discard out of the overlay.
-/// `EDITOR_H` stays unscaled because it is a persisted drag seed; this is a
-/// *composition of scaled parts*, which is the distinction the module doc draws.
+/// **Scaled, unlike the [`EDITOR_H`] seed the editor's height starts at.** Every
+/// element it accounts for is scaled now — the toolbar row is `scaled(42)`, the
+/// option rows `scaled(35)`, the buttons `action_height()` — so a fixed 135 stopped
+/// describing the chrome it stands for, and at 200% roughly 270px of chrome was
+/// being subtracted as 135. `EDITOR_H` stays unscaled because it is a persisted
+/// drag seed; this is a *composition of scaled parts*, which is the distinction the
+/// module doc draws.
 pub(crate) fn cmdk_diff_chrome() -> f64 {
     scaled(135.0)
 }
-/// The diff's own height: what is left of the editor once its chrome is taken
-/// out, floored so a scale the editor can't accommodate leaves something to read
-/// rather than a negative height.
-pub(crate) fn cmdk_diff_h() -> f64 {
-    (EDITOR_H - cmdk_diff_chrome()).max(scaled(60.0))
+/// The diff's own height: what is left of `area` — the editor area the overlay
+/// actually fills — once its chrome is taken out.
+///
+/// **`area`, not [`EDITOR_H`].** The constant is a *drag seed*: the editor pane is
+/// resizable and the expanded overlay is sized from the measured
+/// `editor_area` height (`cmdk_popup`'s `area_h`), so deriving from 248 sized the
+/// diff for a pane nobody had any more — short in a pane dragged taller, and, once
+/// the chrome became scaled while the constant did not, longer than the whole
+/// overlay at Large and Huge.
+///
+/// **And it floors at zero, which is the whole point of a floor here.** The old
+/// `.max(scaled(60))` was written to keep something readable, but when the chrome
+/// alone doesn't fit, adding 60 more *guarantees* the overflow instead of
+/// preventing it — and what overflows is the bottom of the column, which is
+/// Accept/Discard. A pane too short for the chrome shows no diff and keeps its
+/// buttons; enlarging the editor is the way back, and it is a gesture the user has.
+pub(crate) fn cmdk_diff_h(area: f64) -> f64 {
+    (area - cmdk_diff_chrome()).max(0.0)
 }
 
 /// Estimated width of the editor's line-number gutter (used to place the
@@ -449,6 +459,33 @@ pub(crate) const GRID_CELL_DIVIDER: f64 = 1.0;
 pub(crate) fn header_key_icon_w() -> f64 {
     scaled(22.0)
 }
+/// Height of the results grid's error/note strip (`grid::grid_error_bar`).
+pub(crate) fn grid_bar_h() -> f64 {
+    scaled(35.0)
+}
+/// The inset both floating bars keep from the panel edge. Not scaled — it is air,
+/// like every other `padding` still literal here (see the module doc), and both
+/// bars have to read it the *same* way or the gap between them is decided twice.
+pub(crate) const GRID_BAR_INSET: f64 = 5.0;
+/// How far off the bottom the selection summary sits: clear of the error bar when
+/// that one is up, at the edge otherwise.
+///
+/// **One function, because the two bars used to state the same geometry twice.**
+/// The error bar's own height became `scaled` and this lift stayed the literal 45
+/// it had been derived as (`35 + 5 + 5`), so from Large upward the summary painted
+/// *on top of* the bar it exists to sit above — the overlap the shared `any_up`
+/// predicate is there to prevent.
+pub(crate) fn grid_selection_lift(error_up: bool) -> f64 {
+    if error_up {
+        // The bar's top edge (its own inset + its height), plus this one's gap.
+        grid_bar_h() + GRID_BAR_INSET * 2.0
+    } else {
+        SELECTION_BAR_INSET
+    }
+}
+/// The selection summary's own inset at the panel edge — wider than
+/// [`GRID_BAR_INSET`] because it floats over the cells rather than spanning them.
+pub(crate) const SELECTION_BAR_INSET: f64 = 8.0;
 // Trailing-debounce delay for the schema-tree + query-history search boxes: the
 // input stays live, but the expensive re-filter/re-expand fires once the typing
 // pauses this long — so a single keystroke doesn't churn a large schema/history.
@@ -690,6 +727,75 @@ mod scale_tests {
         at(UiScale::Small, || {
             assert!(right_panel_fits(720.0), "0.8 × 900");
         });
+    }
+
+    /// **The diff never adds to an overflow.** It is the one child of the Ctrl+K
+    /// column with a fixed height, so what it takes is what the buttons below it
+    /// have left — and it is drawn in the *measured* editor area, which the user
+    /// can drag and the scale can grow.
+    ///
+    /// The two numbers this pins are the two the old spelling got wrong: it read
+    /// the unscaled `EDITOR_H` (so a pane dragged to 600 still sized a 113px diff
+    /// at Normal) and it floored at `scaled(60)` (so at Huge, where 270 of chrome
+    /// already overflows a 248 box, it asked for 120 more).
+    #[test]
+    fn the_cmdk_diff_takes_what_is_left_and_never_more() {
+        for scale in UiScale::ALL {
+            at(scale, || {
+                for area in [EDITOR_H, 300.0, 600.0, 1000.0] {
+                    let (diff, chrome) = (cmdk_diff_h(area), cmdk_diff_chrome());
+                    if chrome < area {
+                        assert_eq!(
+                            diff + chrome,
+                            area,
+                            "{}: a {area}px editor is filled exactly",
+                            scale.label()
+                        );
+                    } else {
+                        assert_eq!(
+                            diff,
+                            0.0,
+                            "{}: {chrome} of chrome doesn't fit {area} — the diff \
+                             must not ask for more on top of it",
+                            scale.label()
+                        );
+                    }
+                }
+            });
+        }
+        at(UiScale::Huge, || {
+            assert_eq!(cmdk_diff_h(EDITOR_H), 0.0, "270 of chrome in a 248 pane");
+            assert_eq!(cmdk_diff_h(600.0), 600.0 - 270.0);
+        });
+    }
+
+    /// The selection summary sits **above** the error bar, at every scale: past
+    /// the bar's own top edge, which is its inset plus its scaled height. A
+    /// literal lift cleared it at Normal and was inside it from Large up.
+    #[test]
+    fn the_selection_summary_clears_the_error_bar_at_every_scale() {
+        at(UiScale::Normal, || {
+            assert_eq!(
+                grid_selection_lift(true),
+                45.0,
+                "the number the app shipped with"
+            );
+        });
+        for scale in UiScale::ALL {
+            at(scale, || {
+                assert!(
+                    grid_selection_lift(true) > GRID_BAR_INSET + grid_bar_h(),
+                    "{}: the summary is inside the bar it sits above",
+                    scale.label()
+                );
+                assert_eq!(
+                    grid_selection_lift(false),
+                    SELECTION_BAR_INSET,
+                    "{}: with no bar up it sits at the edge",
+                    scale.label()
+                );
+            });
+        }
     }
 
     /// A dragged panel width is the user's own px and is *not* scaled — but the

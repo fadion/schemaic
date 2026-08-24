@@ -411,7 +411,15 @@ fn cmdk_popup(
                             // horizontal scroll. Buttons below always stay visible.
                             container(
                                 container(autohide(shift_hscroll(diff_view(rows, dialect))).style(
-                                    |s| s.height(cmdk_diff_h()).width_full().min_width(0.0),
+                                    // `area_h` **tracked**, so dragging the editor
+                                    // taller (or changing the interface scale)
+                                    // re-sizes the diff instead of leaving it sized
+                                    // for the pane the overlay opened in.
+                                    move |s| {
+                                        s.height(cmdk_diff_h(area_h.get()))
+                                            .width_full()
+                                            .min_width(0.0)
+                                    },
                                 ))
                                 .style(|s| s.width_full().border_radius(5.0))
                                 .clip(),

@@ -2442,11 +2442,13 @@ pub(crate) fn grid_error_bar(
     })
     .style(move |s| {
         if bars.any_up() {
+            // The height and the inset the selection summary lifts itself over —
+            // `consts::grid_selection_lift` reads the same two.
             s.absolute()
-                .inset_left(5.0)
-                .inset_right(5.0)
-                .inset_bottom(5.0)
-                .height(theme::scaled(35.0))
+                .inset_left(crate::consts::GRID_BAR_INSET)
+                .inset_right(crate::consts::GRID_BAR_INSET)
+                .inset_bottom(crate::consts::GRID_BAR_INSET)
+                .height(crate::consts::grid_bar_h())
         } else {
             s
         }
@@ -2724,11 +2726,12 @@ pub(crate) fn grid_selection_bar(
     .pointer_events(|| false)
     .style(move |s| {
         if sel_summary.with(Option::is_some) {
-            // Clears `grid_error_bar`'s 35px + its own 5px inset when that one is
-            // up; sits at the edge otherwise.
+            // Above `grid_error_bar` when that one is up, at the edge otherwise —
+            // and both halves of that geometry are stated once, in
+            // `consts::grid_selection_lift`, because the bar's height scales.
             s.absolute()
-                .inset_right(8.0)
-                .inset_bottom(if error_shown() { 45.0 } else { 8.0 })
+                .inset_right(crate::consts::SELECTION_BAR_INSET)
+                .inset_bottom(crate::consts::grid_selection_lift(error_shown()))
         } else {
             s
         }
