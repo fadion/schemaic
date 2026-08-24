@@ -323,8 +323,33 @@ mod tests {
     /// panic and abort the whole run. Asserting after the restore gets the same
     /// guarantee with none of that: the only code between take and restore is
     /// the `catch_unwind` this test is about.
+    /// **Both hook tests hold this while they run.** The panic hook is one
+    /// process-global slot and each test swaps it out and back, so libtest
+    /// running them on two threads interleaves two `take_hook`/`set_hook` pairs:
+    /// the second `take` captures the first's replacement and its `set` restores
+    /// that over the first's — which either fails the pin below or, worse, leaves
+    /// the *noop* hook installed for the rest of the run, the undiagnosable blank
+    /// this module exists to end.
+    ///
+    /// A plain `Mutex` and not a re-entrant one, which is why the body below is a
+    /// helper: the pin calls it directly, already holding the lock.
+    static HOOK_SLOT: Mutex<()> = Mutex::new(());
+
+    /// Take the lock, tolerating a poisoning — a test that panicked while
+    /// holding it has already restored the hook (that is what it asserts), and
+    /// refusing to run afterwards would turn one failure into two.
+    fn hook_slot() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_SLOT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn an_installed_hook_writes_the_panic_through_tracing() {
+        let _slot = hook_slot();
+        hook_writes_the_panic_through_tracing();
+    }
+
+    /// The body, callable while the lock is already held.
+    fn hook_writes_the_panic_through_tracing() {
         // The hook we chain onto is the default one, which prints to stderr and
         // would litter the test output with a crash that is on purpose.
         let real_hook = std::panic::take_hook();
@@ -364,19 +389,21 @@ mod tests {
     /// It works by identity rather than by behaviour, which is the only thing
     /// `set_hook`/`take_hook` expose: install a hook this test can recognise,
     /// run the one above, and check the recognisable one is what the process
-    /// still holds. Ordering is not left to libtest — the test above is called
-    /// directly, in this thread.
+    /// still holds. Ordering is not left to libtest — the body above is called
+    /// directly, in this thread, under the same [`HOOK_SLOT`] lock that keeps
+    /// libtest's own copy of it from running beside us.
     #[test]
     fn the_hook_test_puts_the_process_back_as_it_found_it() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static MARKER_RAN: AtomicBool = AtomicBool::new(false);
 
+        let _slot = hook_slot();
         let real_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {
             MARKER_RAN.store(true, Ordering::SeqCst);
         }));
 
-        an_installed_hook_writes_the_panic_through_tracing();
+        hook_writes_the_panic_through_tracing();
 
         // The marker has to be the hook the process still holds. Firing a panic
         // is the only way to ask, so fire one and swallow it.
