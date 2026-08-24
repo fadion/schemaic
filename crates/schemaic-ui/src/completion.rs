@@ -1381,7 +1381,7 @@ pub(crate) fn completion_popup(
                             .items_center()
                             .width_full()
                             .padding_horiz(completion_row_pad())
-                            .padding_vert(5.0)
+                            .padding_vert(theme::scaled(5.0))
                             .hover(|s| s.background(theme::completion_active()));
                         // Selection highlight, read reactively so keyboard nav
                         // repaints without rebuilding (and resetting the scroll).
@@ -1492,15 +1492,15 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
             // Same size as the signature — the dim colour alone distinguishes it.
             let summary = text(sig.summary.to_string()).style(|s| {
                 s.font_size(theme::scaled_font(13.0))
-                    .margin_top(2.0)
+                    .margin_top(theme::scaled(2.0))
                     .color(theme::text_dim())
             });
             container(v_stack((sig_line, summary)))
                 .style(|s| {
                     // Padding matches the autocomplete rows.
                     s.flex_col()
-                        .padding_horiz(10.0)
-                        .padding_vert(5.0)
+                        .padding_horiz(theme::scaled(10.0))
+                        .padding_vert(theme::scaled(5.0))
                         .background(theme::bg_deepest())
                         .border(1.0)
                         .border_color(theme::completion_border())

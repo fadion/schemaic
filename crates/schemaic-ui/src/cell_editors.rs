@@ -73,7 +73,7 @@ pub(crate) struct PopupChannel {
 fn field_box(s: floem::style::Style) -> floem::style::Style {
     s.items_center()
         .height(crate::consts::field_input_h())
-        .padding_horiz(8.0)
+        .padding_horiz(theme::scaled(8.0))
         .background(theme::bg_editor())
         .border(1.0)
         .border_color(theme::field_border())
@@ -246,7 +246,7 @@ pub(crate) fn pick_field(
     .style(|s| {
         crate::widgets::button_focus_ring(field_box(s), 6.0)
             .width(pick_field_w())
-            .gap(6.0)
+            .gap(theme::scaled(6.0))
     });
     anchor_id.set(Some(boxed.id()));
     focus_on_mount(autofocus, anchor_id);
@@ -336,7 +336,7 @@ pub(crate) fn pick_cell_face(buf: RwSignal<String>, editor: CellEditor) -> AnyVi
             .width_full()
             .height_full()
             .items_center()
-            .gap(4.0)
+            .gap(theme::scaled(4.0))
             .padding_horiz(crate::consts::grid_pad_h())
             .background(theme::control_bg())
     })
@@ -407,8 +407,8 @@ pub(crate) fn set_control(
                 .keyboard_navigable()
                 .style(move |s| {
                     let s = crate::widgets::button_focus_ring(s, CHIP_RADIUS)
-                        .padding_horiz(8.0)
-                        .padding_vert(3.0)
+                        .padding_horiz(theme::scaled(8.0))
+                        .padding_vert(theme::scaled(3.0))
                         .border(1.0)
                         .font_size(theme::font_body());
                     if held() {
@@ -437,8 +437,8 @@ pub(crate) fn set_control(
             s.flex_row()
                 .flex_wrap(FlexWrap::Wrap)
                 .width_full()
-                .gap(6.0)
-                .padding_vert(2.0)
+                .gap(theme::scaled(6.0))
+                .padding_vert(theme::scaled(2.0))
         })
         .into_any()
 }
@@ -540,7 +540,7 @@ pub(crate) fn date_control(
                 pick.set(None);
             }
         })
-        .style(|s| s.width_full().items_center().gap(6.0))
+        .style(|s| s.width_full().items_center().gap(theme::scaled(6.0)))
         .into_any()
 }
 
@@ -670,7 +670,7 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
         container(icons::icon(icon, 14.0))
             .on_click_stop(move |_| step(months))
             .style(|s| {
-                s.padding(3.0)
+                s.padding(theme::scaled(3.0))
                     .border_radius(4.0)
                     .color(theme::text_dim())
                     .hover(|s| s.color(theme::text()).background(theme::row_hover()))
@@ -746,8 +746,8 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
                 (done)();
             })
             .style(|s| {
-                s.padding_horiz(8.0)
-                    .padding_vert(2.0)
+                s.padding_horiz(theme::scaled(8.0))
+                    .padding_vert(theme::scaled(2.0))
                     .border_radius(4.0)
                     .font_size(theme::font_body())
                     .color(theme::accent())
@@ -768,8 +768,8 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
             CALENDAR_PRESS.set(true)
         })
         .style(move |s| {
-            s.gap(4.0)
-                .padding(8.0)
+            s.gap(theme::scaled(4.0))
+                .padding(theme::scaled(8.0))
                 .width(w)
                 .height(h)
                 .background(theme::bg_panel())

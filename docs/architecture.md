@@ -4464,15 +4464,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   *design tokens*, not the window. Floem 0.2 has no user-settable render scale, and a paint
   transform over the whole tree would take hit-testing and the editor's own coordinate arithmetic
   with it — so instead the type scale (`theme::font_*()`), the layout metrics (`consts::*`), the
-  per-module modal metrics and `icons::icon` all read the signal and round to whole pixels
-  (`themes::scale_at`, unit-tested: **`Normal` is the exact identity**, results are integral, and a
-  positive size never rounds to nothing).
+  per-module modal metrics, `icons::icon` and every `padding`/`gap`/`margin` in the views (~600 call
+  sites, each wrapped as `theme::scaled(…)` *inside* its style closure) all read the signal and round
+  to whole pixels (`themes::scale_at`, unit-tested: **`Normal` is the exact identity**, results are
+  integral, and a positive size never rounds to nothing). The air between things grows with the
+  things, which is what stops a 160% window reading as big type crammed into 100% boxes.
   - **What it deliberately doesn't touch**: the SQL editor's code font and the terminal font, both of
     which already have their own size setting (and the editor a per-tab Ctrl+scroll zoom whose
     override is an absolute px that a second multiplication would double-apply); persisted panel
     widths, which are px the user dragged — the *minimums* they clamp against scale, which is what
     keeps a panel from being narrower than its own text; and the ER diagram's canvas, which has its
     own zoom.
+  - **Shapes and hairlines stay literal**, which is the line the padding sweep stopped at. A
+    `border_radius` is a *shape*, not air — scaling a 5px corner to 8px reads as a different design
+    rather than a larger one — and a 1px rule or border is a hairline at every scale, so `.height(1)`,
+    the menu separator's rule, the menu panel's border and `edit_field`'s `+ 3.0` (two borders plus a
+    pixel of rounding slack) are all deliberately unwrapped. `menu_panel_height` is where the
+    distinction is visible in arithmetic: its boxes scale, its two borders don't.
   - **A modal's size scales, then caps against the window** — `widgets::modal_w` for the width,
     `modal_h` for a fixed-height panel, `modal_body_h` for a scrolling body inside one. All three
     read `window_size()` inside the caller's style closure, so a resize re-runs them, and all three
@@ -4513,9 +4521,11 @@ Re-introducing the anti-patterns these guard against is a regression:
     always worked this way; this is the same trick, and the reason that one never drifted.
     - Two earlier spellings both failed at scale, and both are worth not re-deriving: clamping the
       flipped arm at zero threw every context menu to the window's top-left corner once a menu was
-      600–750px tall, and scaling the whole 30.5px row estimate (padding included, though the
-      padding doesn't scale yet) over-predicted a long menu by ~190px and flipped menus that had
-      room below them.
+      600–750px tall, and scaling the whole 30.5px row estimate (padding included, back when the
+      paddings were still literal) over-predicted a long menu by ~190px and flipped menus that had
+      room below them. The estimate is still summed from its parts now that the paddings do scale,
+      for a smaller but live reason: each part rounds to its own whole pixel the way the style that
+      draws it does, and the panel's two 1px borders must *not* grow with the boxes.
   - **The interface scale is a segmented control, not a dropdown** (`settings::scale_picker`),
     because floem nudges an overflowing overlay in paint only — see *Floem 0.2 gotchas*, where the
     finding is written up in full. Four short segments, one Tab stop with Left/Right inside it

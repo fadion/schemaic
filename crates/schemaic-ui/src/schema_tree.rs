@@ -831,7 +831,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     )
     // Bottom padding so the last row can scroll clear of the (overlay) horizontal
     // scrollbar instead of sitting under it.
-    .style(|s| s.flex_col().padding_bottom(10.0));
+    .style(|s| s.flex_col().padding_bottom(theme::scaled(10.0)));
 
     // Keyboard navigation: arrow keys walk `visible_nav_rows` when the tree has
     // focus. Down/Up move the cursor (never expand); Right expands a collapsed
@@ -1121,10 +1121,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     .on_event_cont(EventListener::PointerLeave, move |_| eye_hov.set(false))
     .style(|s| {
         s.items_center()
-            .margin_top(4.0)
-            .margin_right(2.0)
-            .padding_horiz(5.0)
-            .padding_vert(3.0)
+            .margin_top(theme::scaled(4.0))
+            .margin_right(theme::scaled(2.0))
+            .padding_horiz(theme::scaled(5.0))
+            .padding_vert(theme::scaled(3.0))
     })
     // Tooltips, on the wrapper — `.tooltip()` wraps the view, so it goes *after*
     // the style, leaving `on_move`/`on_resize` on the padded container inside.
@@ -1153,10 +1153,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     .on_event_cont(EventListener::PointerLeave, move |_| gear_hov.set(false))
     .style(|s| {
         s.items_center()
-            .margin_top(4.0)
-            .margin_right(9.0)
-            .padding_horiz(5.0)
-            .padding_vert(3.0)
+            .margin_top(theme::scaled(4.0))
+            .margin_right(theme::scaled(9.0))
+            .padding_horiz(theme::scaled(5.0))
+            .padding_vert(theme::scaled(3.0))
     })
     .tooltip(|| text("Schema options").style(crate::widgets::tooltip_style));
     // Title left, icon group right. `justify_between` pins the group's right edge
@@ -1403,7 +1403,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 .style(|s| {
                     s.min_width(tree_row_min_w())
                         .padding_left(leaf_pad())
-                        .padding_vert(3.0)
+                        .padding_vert(theme::scaled(3.0))
                 })
                 .into_any(),
                 SchemaState::Failed(e) => info_row(e, theme::error).into_any(),
@@ -1590,7 +1590,7 @@ fn schema_node(
     .style({
         let hl = key.clone();
         move |s| {
-            let s = tree_row(s, row_pad() + level_indent()).gap(6.0);
+            let s = tree_row(s, row_pad() + level_indent()).gap(theme::scaled(6.0));
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -1788,7 +1788,7 @@ fn object_group_node(
             // level a table does: under the database when the tree is flat, and
             // one step under the namespace row when it isn't. `row_pad() + indent`
             // put it *level with* the namespace it belongs to.
-            let s = tree_row(s, row_pad() + level_indent() + indent).gap(6.0);
+            let s = tree_row(s, row_pad() + level_indent() + indent).gap(theme::scaled(6.0));
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -1918,7 +1918,7 @@ fn object_row(
         text(detail).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::font_label())
-                .margin_left(12.0)
+                .margin_left(theme::scaled(12.0))
         }),
     ))
     .style(|s| s.items_center())
@@ -2034,7 +2034,7 @@ fn size_badge(
             .height_full()
             .justify_end()
             .items_center()
-            .padding_right(18.0)
+            .padding_right(theme::scaled(18.0))
     })
 }
 
@@ -2270,10 +2270,10 @@ fn count_row(cols: usize, keys: usize, indent: f64) -> impl IntoView {
     ))
     .style(move |s| {
         s.flex_row()
-            .gap(5.0)
+            .gap(theme::scaled(5.0))
             .padding_left(leaf_pad() + indent)
-            .margin_top(6.0)
-            .margin_bottom(6.0)
+            .margin_top(theme::scaled(6.0))
+            .margin_bottom(theme::scaled(6.0))
     })
 }
 
@@ -2283,7 +2283,7 @@ fn capsule(label: String) -> impl IntoView {
             s.height(theme::scaled(18.0))
                 .items_center()
                 .justify_center()
-                .padding_horiz(7.0)
+                .padding_horiz(theme::scaled(7.0))
                 .background(theme::capsule_bg())
                 .border_radius(4.0)
         })
@@ -2385,7 +2385,7 @@ fn column_row(
         text(ty).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::font_label())
-                .margin_left(12.0)
+                .margin_left(theme::scaled(12.0))
         }),
     ))
     // The name inherits `kind.color()`; the icon overrides to 50% of it above and
@@ -2454,7 +2454,7 @@ fn key_row(
         text(tag).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::font_label())
-                .margin_left(12.0)
+                .margin_left(theme::scaled(12.0))
         }),
     ))
     // Label + key glyph both at 50% alpha (a quiet, non-actionable leaf); the
@@ -2569,7 +2569,7 @@ fn tree_row_static(s: floem::style::Style, pad_left: f64) -> floem::style::Style
         .items_center()
         .flex_row()
         .padding_left(pad_left)
-        .padding_right(8.0)
+        .padding_right(theme::scaled(8.0))
         .font_size(theme::font_body())
 }
 
@@ -2585,7 +2585,7 @@ fn info_row(
         move |s| {
             s.min_width(tree_row_min_w())
                 .padding_left(leaf_pad())
-                .padding_vert(3.0)
+                .padding_vert(theme::scaled(3.0))
         },
     )
 }
@@ -2602,7 +2602,11 @@ fn schema_search(filter: RwSignal<String>) -> impl IntoView {
             ..Default::default()
         },
     )
-    .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32))
+    .style(|s| {
+        s.margin_left(theme::scaled(12.0))
+            .margin_right(theme::scaled(12.0))
+            .flex_shrink(0.0_f32)
+    })
 }
 
 #[cfg(test)]

@@ -412,9 +412,14 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
                         rev.update(|r| *r += 1);
                     }),
                 ))
-                .style(|s| s.flex_row().items_center().gap(2.0).width_full())
+                .style(|s| {
+                    s.flex_row()
+                        .items_center()
+                        .gap(theme::scaled(2.0))
+                        .width_full()
+                })
             }))
-            .style(|s| s.flex_col().gap(6.0).width_full());
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
             // Last in the block, above every row — it is what you reach after
             // walking them.
@@ -433,9 +438,9 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
             );
             v_stack((
                 rows,
-                container(add).style(|s| s.width_full().margin_top(2.0)),
+                container(add).style(|s| s.width_full().margin_top(theme::scaled(2.0))),
             ))
-            .style(|s| s.flex_col().gap(6.0).width_full())
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
             .into_any()
         },
     )
@@ -484,7 +489,7 @@ fn enum_form(ui: &Ui, d: &EnumDraft, ring: FocusRing) -> AnyView {
         form_section("Type"),
         name,
         comment,
-        form_section("Values").style(|s| s.margin_top(4.0)),
+        form_section("Values").style(|s| s.margin_top(theme::scaled(4.0))),
         form_setting_owned(
             "In comparison order — this is the order ORDER BY uses".to_string(),
             enum_values(ui, ring),
@@ -574,9 +579,14 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
                         },
                     ),
                 ))
-                .style(|s| s.flex_row().items_center().gap(6.0).width_full())
+                .style(|s| {
+                    s.flex_row()
+                        .items_center()
+                        .gap(theme::scaled(6.0))
+                        .width_full()
+                })
             }))
-            .style(|s| s.flex_col().gap(6.0).width_full());
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
             let add = crate::widgets::control_button(
                 "Add constraint",
@@ -611,9 +621,9 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
             );
             v_stack((
                 rows,
-                container(add).style(|s| s.width_full().margin_top(2.0)),
+                container(add).style(|s| s.width_full().margin_top(theme::scaled(2.0))),
             ))
-            .style(|s| s.flex_col().gap(6.0).width_full())
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
             .into_any()
         },
     )
@@ -690,7 +700,7 @@ fn domain_form(
                     21,
                 ),
             ))
-            .style(|s| s.flex_row().items_center().gap(2.0)),
+            .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0))),
         )
     };
     let default = form_setting(
@@ -753,7 +763,7 @@ fn domain_form(
         default,
         not_null,
         comment,
-        form_section("Constraints").style(|s| s.margin_top(4.0)),
+        form_section("Constraints").style(|s| s.margin_top(theme::scaled(4.0))),
         domain_checks(ui, ring),
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -1035,7 +1045,7 @@ fn sequence_form(
         bounds,
         cycle,
         comment,
-        form_section("Position").style(|s| s.margin_top(4.0)),
+        form_section("Position").style(|s| s.margin_top(theme::scaled(4.0))),
         position,
         owner,
     ))
@@ -1119,7 +1129,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                 crate::widgets::autohide(scroll(form(&ui, &target, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
-                        .padding_vert(18.0)
+                        .padding_vert(theme::scaled(18.0))
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 

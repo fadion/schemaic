@@ -3413,7 +3413,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                     .border(1.0)
                     .border_color(theme::field_border())
                     .border_radius(6.0)
-                    .padding_horiz(6.0)
+                    .padding_horiz(theme::scaled(6.0))
                     .hover(|s| {
                         s.background(theme::bg_deepest())
                             .border_color(theme::field_border())
@@ -3591,11 +3591,11 @@ const LOGO_PNG: &[u8] = include_bytes!("../../../assets/icon-64.png");
 /// mirrored (glyph leading, label trailing) and those two numbers were tuned for
 /// the switcher's order.
 fn switcher_chrome(s: floem::style::Style) -> floem::style::Style {
-    s.padding_left(11.0)
-        .padding_right(7.0)
-        .padding_vert(3.0)
-        .margin_top(7.0)
-        .margin_bottom(7.0)
+    s.padding_left(theme::scaled(11.0))
+        .padding_right(theme::scaled(7.0))
+        .padding_vert(theme::scaled(3.0))
+        .margin_top(theme::scaled(7.0))
+        .margin_bottom(theme::scaled(7.0))
         .items_center()
         // Opaque fill (same color as the header) so the 1px border has a solid
         // backing and renders crisply — an outline over a transparent interior
@@ -3633,7 +3633,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 icons::icon(icons::CHEVRON_DOWN, 16.0)
                     .style(move |s| s.color(active_conn_color(connections, active_conn))),
             ))
-            .style(|s| s.flex_row().items_center().gap(6.0)),
+            .style(|s| s.flex_row().items_center().gap(theme::scaled(6.0))),
         )
         .on_click_stop(move |_| {
             // Mutual exclusivity is the trigger's own job once it absorbs the
@@ -3685,7 +3685,12 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                     // One colour on the row, inherited by the label and by the
                     // `currentColor` glyph — the update chip beside it is built the
                     // same way, and it is what makes the pair read as one object.
-                    .style(|s| s.flex_row().items_center().gap(6.0).color(theme::accent())),
+                    .style(|s| {
+                        s.flex_row()
+                            .items_center()
+                            .gap(theme::scaled(6.0))
+                            .color(theme::accent())
+                    }),
             )
             .on_click_stop(move |_| {
                 // Draft first, then open: the modal reads the draft as it builds,
@@ -3703,8 +3708,8 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
             // switcher's do, which is what keeps the header still.
             .style(|s| {
                 switcher_chrome(s)
-                    .padding_left(9.0)
-                    .padding_right(10.0)
+                    .padding_left(theme::scaled(9.0))
+                    .padding_right(theme::scaled(10.0))
                     .border_color(theme::accent())
             })
             .into_any()
@@ -3753,16 +3758,16 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                     // the string would wreck the metrics this is trying to fix.
                     text(caption.to_uppercase()).style(|s| s.font_size(theme::scaled_font(11.0))),
                 ))
-                .style(|s| s.flex_row().items_center().gap(6.0)),
+                .style(|s| s.flex_row().items_center().gap(theme::scaled(6.0))),
             )
             .style(|s| {
                 s.flex_shrink(0.0_f32)
-                    .padding_horiz(9.0)
-                    .padding_vert(3.0)
+                    .padding_horiz(theme::scaled(9.0))
+                    .padding_vert(theme::scaled(3.0))
                     // 10px more than the 16px the glyphs keep between themselves,
                     // so the chip reads as its own thing rather than as a fourth
                     // member of the search/help/settings run.
-                    .margin_right(26.0)
+                    .margin_right(theme::scaled(26.0))
                     .items_center()
                     .background(theme::bg_chrome())
                     .border(1.0)
@@ -3789,7 +3794,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
         .on_click_stop(move |_| find_open.set(true))
         .style(|s| {
             s.flex_shrink(0.0_f32)
-                .margin_right(16.0)
+                .margin_right(theme::scaled(16.0))
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
         });
@@ -3800,7 +3805,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
         .on_click_stop(move |_| help_open.set(true))
         .style(|s| {
             s.flex_shrink(0.0_f32)
-                .margin_right(16.0)
+                .margin_right(theme::scaled(16.0))
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
         });
@@ -3810,7 +3815,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
         .on_click_stop(move |_| theme_settings_open.set(true))
         .style(|s| {
             s.flex_shrink(0.0_f32)
-                .margin_right(20.0)
+                .margin_right(theme::scaled(20.0))
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
         });
@@ -3839,9 +3844,9 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                     .font_size(theme::font_body())
             }))
             .style(move |s| {
-                s.margin_left(12.0)
-                    .padding_vert(5.0)
-                    .padding_horiz(10.0)
+                s.margin_left(theme::scaled(12.0))
+                    .padding_vert(theme::scaled(5.0))
+                    .padding_horiz(theme::scaled(10.0))
                     .border_radius(5.0)
                     .background(active_conn_color(connections, active_conn))
             })
@@ -3863,7 +3868,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let logo = img(|| LOGO_PNG.to_vec()).style(|s| {
         s.width(theme::scaled(20.0))
             .height(theme::scaled(20.0))
-            .margin_left(12.0)
+            .margin_left(theme::scaled(12.0))
             .flex_shrink(0.0_f32)
     });
 
@@ -3879,7 +3884,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // column below now lines up with the mark instead.
     let left = h_stack((
         logo,
-        container(conn_trigger).style(|s| s.margin_left(12.0)),
+        container(conn_trigger).style(|s| s.margin_left(theme::scaled(12.0))),
         badge,
         disconnected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
     ))
@@ -3931,7 +3936,7 @@ fn disconnected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>)
     let label = text("Disconnected").style(|s| {
         s.font_size(toolbar_font())
             .color(theme::error())
-            .margin_left(15.0)
+            .margin_left(theme::scaled(15.0))
     });
     // Same chrome as the ER-diagram toolbar buttons (`control_surface`), so the
     // app has one button vocabulary rather than a bespoke one per surface.
@@ -3941,9 +3946,9 @@ fn disconnected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>)
             control_surface(s)
                 .font_size(toolbar_font())
                 .color(theme::text())
-                .margin_left(15.0)
-                .padding_horiz(10.0)
-                .padding_vert(5.0)
+                .margin_left(theme::scaled(15.0))
+                .padding_horiz(theme::scaled(10.0))
+                .padding_vert(theme::scaled(5.0))
                 .hover(|s| s.background(theme::control_hover()))
         });
     h_stack((label, retry)).style(move |s| {
@@ -5399,30 +5404,33 @@ fn result_tab_chip(
         result_tabs.with(|v| matches!(v.get(idx).map(|p| &p.state), Some(QueryState::Failed(_))))
     };
     // Colour is set on the tab container and cascades to the label.
-    container(text(label).style(|s| s.margin_horiz(10.0).font_size(theme::font_body())))
-        .on_click_stop(move |_| active_result.set(idx))
-        .style(move |s| {
-            let s = s
-                .flex_row()
-                .items_center()
-                .border_right(1.0)
-                .border_color(theme::tab_separator());
-            let s = if active_result.get() == idx {
-                s.background(theme::tab_active())
-            } else {
-                s.background(theme::bg_chrome())
-            };
-            // The chip's own background is `tab_active`/`bg_chrome`, never
-            // `reject_bg`, so a failed statement's label needs the free-standing
-            // error colour rather than the red pill's foreground.
-            if is_err() {
-                s.color(theme::error())
-            } else if active_result.get() == idx {
-                s.color(theme::text())
-            } else {
-                s.color(theme::tab_text()).hover(|s| s.color(theme::text()))
-            }
-        })
+    container(text(label).style(|s| {
+        s.margin_horiz(theme::scaled(10.0))
+            .font_size(theme::font_body())
+    }))
+    .on_click_stop(move |_| active_result.set(idx))
+    .style(move |s| {
+        let s = s
+            .flex_row()
+            .items_center()
+            .border_right(1.0)
+            .border_color(theme::tab_separator());
+        let s = if active_result.get() == idx {
+            s.background(theme::tab_active())
+        } else {
+            s.background(theme::bg_chrome())
+        };
+        // The chip's own background is `tab_active`/`bg_chrome`, never
+        // `reject_bg`, so a failed statement's label needs the free-standing
+        // error colour rather than the red pill's foreground.
+        if is_err() {
+            s.color(theme::error())
+        } else if active_result.get() == idx {
+            s.color(theme::text())
+        } else {
+            s.color(theme::tab_text()).hover(|s| s.color(theme::text()))
+        }
+    })
 }
 
 // ── Terminal panel ───────────────────────────────────────────────────────────
@@ -5655,7 +5663,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
                     s.font_size(theme::font_title())
                         .font_family("IBM Plex Sans".to_string())
                         .color(theme::text_faint())
-                        .padding_vert(8.0)
+                        .padding_vert(theme::scaled(8.0))
                 })
                 .into_any(),
             None => empty().into_any(),
@@ -5726,7 +5734,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
                 .width_full()
                 .min_height(0.0)
                 .min_width(0.0)
-                .padding(6.0)
+                .padding(theme::scaled(6.0))
                 .background(term_color(schemaic_term::DEFAULT_BG))
                 .cursor(CursorStyle::Text)
         })
@@ -6943,7 +6951,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                         .style(|s| {
                             s.flex_shrink(0.0_f32)
                                 .items_center()
-                                .margin_left(6.0)
+                                .margin_left(theme::scaled(6.0))
                                 .color(theme::text())
                                 // Override the field's text (I-beam) cursor — the ×
                                 // is a button, not editable text.
@@ -7030,6 +7038,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             // Fixed height when given; else derive from content. +3 (auto case): the
             // 1px top/bottom borders (border-box) plus a hair of slack so the editor's
             // viewport fully contains its content and no phantom scrollbar shows.
+            //
+            // **Deliberately not scaled**, unlike the `pad_v()` and `line_h()` it is
+            // added to. All three pixels are hairlines: two are borders, which stay 1px
+            // at every scale, and the third absorbs a rounding error that doesn't grow
+            // with the box — each part is already rounded to a whole pixel before it
+            // gets here. Scaling it would just add unexplained height at 130/160%.
             let h = match height {
                 Some(hf) => hf(),
                 None => {
@@ -7282,7 +7296,7 @@ fn footer(ui: Ui) -> impl IntoView {
             }
         },
     )
-    .style(|s| s.margin_left(5.0));
+    .style(|s| s.margin_left(theme::scaled(5.0)));
     // Does the *active connection's* engine have server sessions to show? The
     // Activity panel is a property of the connection, not of the focused tab, so
     // this reads `active_conn` rather than the tab's dialect the way `read_only`
@@ -7330,9 +7344,9 @@ fn footer(ui: Ui) -> impl IntoView {
             move || right_panel.get() == RightPanel::Terminal && right_panel_allowed(),
             move || set_right(RightPanel::Terminal),
         )
-        .style(|s| s.margin_right(5.0)),
+        .style(|s| s.margin_right(theme::scaled(5.0))),
     ))
-    .style(|s| s.flex_row().items_center().gap(10.0));
+    .style(|s| s.flex_row().items_center().gap(theme::scaled(10.0)));
 
     // ── Left status cluster (after the schema icon) ──
     // Gaps: 40px between the four groups (position | editor | status | AI), 15px
@@ -7357,7 +7371,7 @@ fn footer(ui: Ui) -> impl IntoView {
         });
     })
     .style(|s| {
-        s.margin_left(40.0)
+        s.margin_left(theme::scaled(40.0))
             .items_center()
             .color(theme::status_text())
             .hover(|s| s.color(theme::chip_active()))
@@ -7420,7 +7434,7 @@ fn footer(ui: Ui) -> impl IntoView {
     )
     .on_click_stop(move |_| word_wrap.update(|w| *w = !*w))
     .style(|s| {
-        s.margin_left(15.0)
+        s.margin_left(theme::scaled(15.0))
             .items_center()
             .color(theme::status_text())
             .hover(|s| s.color(theme::chip_active()))
@@ -7436,8 +7450,10 @@ fn footer(ui: Ui) -> impl IntoView {
             } else {
                 h_stack((
                     icons::icon(icons::TRIANGLE_ALERT, 16.0),
-                    text(n.to_string())
-                        .style(|s| s.margin_left(5.0).font_size(theme::font_status())),
+                    text(n.to_string()).style(|s| {
+                        s.margin_left(theme::scaled(5.0))
+                            .font_size(theme::font_status())
+                    }),
                 ))
                 .style(|s| s.flex_row().items_center())
                 .into_any()
@@ -7460,7 +7476,7 @@ fn footer(ui: Ui) -> impl IntoView {
         });
     })
     .style(move |s| {
-        let s = s.margin_left(40.0).items_center();
+        let s = s.margin_left(theme::scaled(40.0)).items_center();
         if warn_count.get() == 0 {
             s.color(theme::status_ok())
         } else {
@@ -7505,7 +7521,7 @@ fn footer(ui: Ui) -> impl IntoView {
         } else {
             theme::status_warn_hover()
         };
-        s.margin_left(15.0)
+        s.margin_left(theme::scaled(15.0))
             .items_center()
             .color(base)
             .hover(move |s| s.color(hover))
@@ -7587,7 +7603,7 @@ fn footer(ui: Ui) -> impl IntoView {
             theme::chip_active()
         };
         // 40px: opens the transaction section.
-        s.margin_left(40.0)
+        s.margin_left(theme::scaled(40.0))
             .items_center()
             .color(base)
             .hover(move |s| s.color(hover))
@@ -7604,10 +7620,13 @@ fn footer(ui: Ui) -> impl IntoView {
     )
     .style(move |s| {
         let st = tx_state.get();
-        let s = s.margin_left(15.0).items_center().color(match st {
-            TxState::Poisoned { .. } | TxState::Lost => theme::tx_danger(),
-            _ => theme::tx_open(),
-        });
+        let s = s
+            .margin_left(theme::scaled(15.0))
+            .items_center()
+            .color(match st {
+                TxState::Poisoned { .. } | TxState::Lost => theme::tx_danger(),
+                _ => theme::tx_open(),
+            });
         if st.is_open() || matches!(st, TxState::Lost) {
             s
         } else {
@@ -7630,7 +7649,7 @@ fn footer(ui: Ui) -> impl IntoView {
             .on_click_stop(move |_| (act)(active.get_untracked()))
             .style(move |s| {
                 let s = s
-                    .margin_left(15.0)
+                    .margin_left(theme::scaled(15.0))
                     .items_center()
                     .font_size(theme::font_status())
                     .color(color())
@@ -7704,12 +7723,12 @@ fn footer(ui: Ui) -> impl IntoView {
         move || resources.get().cpu_label(),
         move |c| footer_text(format!("CPU: {c}")),
     )
-    .style(|s| s.margin_left(40.0));
+    .style(|s| s.margin_left(theme::scaled(40.0)));
     let ram_seg = dyn_container(
         move || resources.get().ram_label(),
         move |r| footer_text(format!("RAM: {r}")),
     )
-    .style(|s| s.margin_left(15.0));
+    .style(|s| s.margin_left(theme::scaled(15.0)));
 
     // The schema toggle always stays (it's a control, and leftmost); every status
     // segment after it collapses right-to-left as the AI icon nears it.

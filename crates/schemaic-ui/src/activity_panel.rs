@@ -240,7 +240,11 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
                 ..Default::default()
             },
         )
-        .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32)),
+        .style(|s| {
+            s.margin_left(theme::scaled(12.0))
+                .margin_right(theme::scaled(12.0))
+                .flex_shrink(0.0_f32)
+        }),
         empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         header,
         kill_error_line,
@@ -278,8 +282,8 @@ fn list_message(
                 .color(color())
                 .width_full()
                 .line_height(1.4)
-                .padding_top(10.0)
-                .padding_horiz(12.0)
+                .padding_top(theme::scaled(10.0))
+                .padding_horiz(theme::scaled(12.0))
         })
         .into_any()
 }
@@ -353,10 +357,10 @@ fn interval_button(
     })
     .style(|s| {
         s.items_center()
-            .margin_top(5.0)
-            .margin_right(7.0)
-            .padding_horiz(5.0)
-            .padding_vert(3.0)
+            .margin_top(theme::scaled(5.0))
+            .margin_right(theme::scaled(7.0))
+            .padding_horiz(theme::scaled(5.0))
+            .padding_vert(theme::scaled(3.0))
             .cursor(floem::style::CursorStyle::Default)
     });
 
@@ -422,9 +426,9 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
         s.flex_row()
             .items_center()
             .width_full()
-            .gap(12.0)
-            .padding_horiz(12.0)
-            .padding_bottom(9.0)
+            .gap(theme::scaled(12.0))
+            .padding_horiz(theme::scaled(12.0))
+            .padding_bottom(theme::scaled(9.0))
     })
 }
 
@@ -453,7 +457,7 @@ fn banner(
                 .color(theme::status_warn())
         }),
     ))
-    .style(|s| s.flex_row().items_center().gap(7.0));
+    .style(|s| s.flex_row().items_center().gap(theme::scaled(7.0)));
 
     let body = text(sentence).style(|s| {
         s.font_size(font_body())
@@ -486,8 +490,8 @@ fn banner(
             let s = s
                 .font_size(font_body())
                 .color(theme::btn_danger_text())
-                .padding_horiz(10.0)
-                .padding_vert(4.0)
+                .padding_horiz(theme::scaled(10.0))
+                .padding_vert(theme::scaled(4.0))
                 .border_radius(5.0)
                 .flex_shrink(0.0_f32)
                 .cursor(floem::style::CursorStyle::Default);
@@ -520,11 +524,11 @@ fn banner(
     // cross axis on its own, and stretching does subtract the margins.
     .style(|s| {
         s.flex_col()
-            .gap(7.0)
-            .margin_horiz(12.0)
-            .margin_bottom(10.0)
-            .padding_horiz(10.0)
-            .padding_vert(9.0)
+            .gap(theme::scaled(7.0))
+            .margin_horiz(theme::scaled(12.0))
+            .margin_bottom(theme::scaled(10.0))
+            .padding_horiz(theme::scaled(10.0))
+            .padding_vert(theme::scaled(9.0))
             .background(theme::bg_editor())
             .border(1.0)
             .border_color(theme::status_warn())
@@ -558,14 +562,17 @@ fn session_row(
     // way you expect, and through two attempts the age sat ~20px short of the
     // padding while the statement beneath it clipped at exactly the right place.
     let identity = h_stack((
-        icons::icon(icons::DOT, 6.0)
-            .style(move |s| s.color(color()).flex_shrink(0.0_f32).margin_right(7.0)),
+        icons::icon(icons::DOT, 6.0).style(move |s| {
+            s.color(color())
+                .flex_shrink(0.0_f32)
+                .margin_right(theme::scaled(7.0))
+        }),
         text(s.id.to_string()).style(|s| {
             s.font_size(font_body())
                 .font_family(MONO_FAMILY.to_string())
                 .color(theme::text_dim())
                 .flex_shrink(0.0_f32)
-                .margin_right(7.0)
+                .margin_right(theme::scaled(7.0))
         }),
         // **Both of these grow**, and that is not cosmetic. Nesting the account
         // name one level deeper made taffy measure the group at min-content on
@@ -590,7 +597,12 @@ fn session_row(
                 .flex_shrink(0.0_f32)
         }),
     ))
-    .style(|s| s.items_center().width_full().justify_between().gap(8.0));
+    .style(|s| {
+        s.items_center()
+            .width_full()
+            .justify_between()
+            .gap(theme::scaled(8.0))
+    });
 
     // Two wrapped lines of the statement, then clipped. One line less than the
     // history panel's three: a history row is a query you are looking *for*, so
@@ -680,9 +692,9 @@ fn session_row(
         .style(|s| {
             s.flex_col()
                 .width_full()
-                .gap(4.0)
-                .padding_horiz(12.0)
-                .padding_vert(9.0)
+                .gap(theme::scaled(4.0))
+                .padding_horiz(theme::scaled(12.0))
+                .padding_vert(theme::scaled(9.0))
                 .border_bottom(1.0)
                 .border_color(theme::border())
                 .hover(|s| s.background(theme::row_hover_soft()))

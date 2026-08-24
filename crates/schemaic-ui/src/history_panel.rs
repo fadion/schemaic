@@ -76,8 +76,8 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
                     .style(|s| {
                         s.font_size(theme::scaled_font(14.0))
                             .color(theme::text_muted())
-                            .padding_top(10.0)
-                            .padding_left(12.0)
+                            .padding_top(theme::scaled(10.0))
+                            .padding_left(theme::scaled(12.0))
                     })
                     .into_any();
             }
@@ -193,7 +193,11 @@ fn history_search(filter: RwSignal<String>) -> impl IntoView {
             ..Default::default()
         },
     )
-    .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32))
+    .style(|s| {
+        s.margin_left(theme::scaled(12.0))
+            .margin_right(theme::scaled(12.0))
+            .flex_shrink(0.0_f32)
+    })
 }
 
 /// A recency group's header — `TODAY` and how many ran in it.
@@ -230,8 +234,8 @@ fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::An
             let s = s
                 .width_full()
                 .items_center()
-                .padding_horiz(12.0)
-                .padding_vert(8.0)
+                .padding_horiz(theme::scaled(12.0))
+                .padding_vert(theme::scaled(8.0))
                 // A band, so the group it opens is legible as a group: a shade of
                 // the panel rather than another colour, and not the hover — a
                 // header painted in it would read as a hovered row.
@@ -276,8 +280,8 @@ fn history_row(
                 // a captured height clips the preview at the old scale's three
                 // lines while the SQL inside it grows.
                 .max_height((font_body() as f64) * 1.4 * 3.0)
-                .margin_top(3.0)
-                .margin_bottom(3.0)
+                .margin_top(theme::scaled(3.0))
+                .margin_bottom(theme::scaled(3.0))
         })
         .clip();
 
@@ -309,7 +313,7 @@ fn history_row(
                 .flex_shrink(0.0_f32)
         }),
     ))
-    .style(|s| s.items_center().width_full().gap(8.0));
+    .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)));
 
     // What the run turned out to be, under the SQL: `5ms · 100 rows`, or
     // `4ms · Failed` in red. A success is not labelled — the row count *is* the
@@ -347,15 +351,15 @@ fn history_row(
     let name_row: Option<floem::AnyView> = named.map(|n| {
         let capsule =
             highlight_text(n, term.clone(), font_label, theme::text, false, 1.0).style(|s| {
-                s.padding_horiz(7.0)
-                    .padding_vert(3.0)
+                s.padding_horiz(theme::scaled(7.0))
+                    .padding_vert(theme::scaled(3.0))
                     .background(theme::capsule_bg())
                     .border_radius(4.0)
                     .flex_shrink(0.0_f32)
             });
         // +2px over the v_stack's 4px gap → 6px between the table and the name.
         h_stack((capsule,))
-            .style(|s| s.width_full().margin_top(2.0))
+            .style(|s| s.width_full().margin_top(theme::scaled(2.0)))
             .into_any()
     });
     // Both extra lines are optional and independent, so the stack is built from
@@ -363,14 +367,15 @@ fn history_row(
     let mut rows: Vec<floem::AnyView> = vec![heading.into_any(), preview_view.into_any()];
     rows.extend(outcome_row);
     rows.extend(name_row);
-    let inner = floem::views::stack_from_iter(rows).style(|s| s.flex_col().width_full().gap(4.0));
+    let inner = floem::views::stack_from_iter(rows)
+        .style(|s| s.flex_col().width_full().gap(theme::scaled(4.0)));
 
     container(inner)
         .on_click_stop(move |_| (open_history)(entry_click.clone()))
         .style(|s| {
             s.width_full()
-                .padding_horiz(12.0)
-                .padding_vert(9.0)
+                .padding_horiz(theme::scaled(12.0))
+                .padding_vert(theme::scaled(9.0))
                 .border_bottom(1.0)
                 .border_color(theme::border())
                 .hover(|s| s.background(theme::row_hover_soft()))

@@ -233,7 +233,12 @@ fn change_line(label: String) -> impl IntoView {
                 .min_width(0.0)
         }),
     ))
-    .style(|s| s.flex_row().items_start().width_full().margin_bottom(3.0))
+    .style(|s| {
+        s.flex_row()
+            .items_start()
+            .width_full()
+            .margin_bottom(theme::scaled(3.0))
+    })
 }
 
 /// The destructive block. Present ⇒ this plan takes something away, and the
@@ -250,13 +255,18 @@ fn risk_block(risks: Vec<String>) -> impl IntoView {
                     .font_bold()
             }),
         ))
-        .style(|s| s.flex_row().items_center().gap(7.0).margin_bottom(5.0)),
+        .style(|s| {
+            s.flex_row()
+                .items_center()
+                .gap(theme::scaled(7.0))
+                .margin_bottom(theme::scaled(5.0))
+        }),
         v_stack_from_iter(risks.into_iter().map(|r| {
             text(r).style(|s| {
                 s.color(theme::text())
                     .font_size(theme::font_body())
                     .width_full()
-                    .margin_bottom(2.0)
+                    .margin_bottom(theme::scaled(2.0))
             })
         })),
     ))
@@ -264,7 +274,7 @@ fn risk_block(risks: Vec<String>) -> impl IntoView {
         let s = s
             .flex_col()
             .width_full()
-            .padding(10.0)
+            .padding(theme::scaled(10.0))
             .border(1.0)
             .border_color(theme::error())
             .border_radius(6.0)
@@ -292,26 +302,31 @@ fn withheld_block(withheld: Vec<String>) -> impl IntoView {
                     .font_bold()
             }),
         ))
-        .style(|s| s.flex_row().items_center().gap(7.0).margin_bottom(5.0)),
+        .style(|s| {
+            s.flex_row()
+                .items_center()
+                .gap(theme::scaled(7.0))
+                .margin_bottom(theme::scaled(5.0))
+        }),
         v_stack_from_iter(withheld.into_iter().map(|w| {
             text(w).style(|s| {
                 s.color(theme::text())
                     .font_size(theme::font_body())
                     .width_full()
-                    .margin_bottom(2.0)
+                    .margin_bottom(theme::scaled(2.0))
             })
         })),
         text("Nothing is applied while this is listed.").style(|s| {
             s.color(theme::text_faint())
                 .font_size(theme::font_body())
-                .margin_top(4.0)
+                .margin_top(theme::scaled(4.0))
         }),
     ))
     .style(move |s| {
         let s = s
             .flex_col()
             .width_full()
-            .padding(10.0)
+            .padding(theme::scaled(10.0))
             .border(1.0)
             .border_color(theme::accent())
             .border_radius(6.0)
@@ -442,12 +457,12 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                         text("The schema has been refreshed.").style(|s| {
                             s.color(theme::text_dim())
                                 .font_size(theme::font_label())
-                                .margin_top(6.0)
+                                .margin_top(theme::scaled(6.0))
                         }),
                     ))
                     .style(|s| s.flex_col()),
                 )
-                .style(|s| s.padding_vert(10.0))
+                .style(|s| s.padding_vert(theme::scaled(10.0)))
                 .into_any()
             } else {
                 let n = p.changes.len();
@@ -458,9 +473,9 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     form_section_owned(format!("{n} {}", plural(n, "Change", "Changes"))),
                     v_stack_from_iter(p.changes.iter().cloned().map(change_line))
                         .style(|s| s.flex_col().width_full()),
-                    risk_block(p.destructive.clone()).style(|s| s.margin_top(14.0)),
-                    withheld_block(p.withheld.clone()).style(|s| s.margin_top(14.0)),
-                    form_section("SQL").style(|s| s.margin_top(18.0)),
+                    risk_block(p.destructive.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
+                    withheld_block(p.withheld.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
+                    form_section("SQL").style(|s| s.margin_top(theme::scaled(18.0))),
                     // Read-only, but a real editor field: the script is meant to
                     // be read and selected, and it's the same widget the rest of
                     // the app uses for text. Monospace, because this is the one
@@ -481,7 +496,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     )
                     .style(|s| s.width_full()),
                 ))
-                .style(|s| s.flex_col().gap(8.0).width_full())
+                .style(|s| s.flex_col().gap(theme::scaled(8.0)).width_full())
                 .into_any()
             };
 
@@ -494,7 +509,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             s.color(theme::error())
                                 .font_size(theme::font_body())
                                 .max_width(580.0)
-                                .margin_top(12.0)
+                                .margin_top(theme::scaled(12.0))
                         })
                         .into_any(),
                 },
@@ -624,7 +639,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 let s = s
                     .color(theme::plan_warn())
                     .font_size(theme::font_label())
-                    .margin_right(12.0);
+                    .margin_right(theme::scaled(12.0));
                 if d.preview.get().is_some_and(|p| p.read_only) && !d.applied.get() {
                     s
                 } else {
@@ -644,7 +659,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     s.flex_col()
                         .width_full()
                         .padding_horiz(modal_pad_h())
-                        .padding_vert(18.0)
+                        .padding_vert(theme::scaled(18.0))
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
                 modal_footer_split(

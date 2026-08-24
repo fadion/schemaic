@@ -464,7 +464,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                         open.set(false);
                     })
                     .style(menu_item_style)
-                    .style(|s| s.padding_vert(8.0))
+                    .style(|s| s.padding_vert(theme::scaled(8.0)))
                 },
             )
             .style(|s| s.flex_col());
@@ -480,7 +480,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                 open.set(false);
             })
             .style(menu_item_style)
-            .style(|s| s.padding_vert(8.0));
+            .style(|s| s.padding_vert(theme::scaled(8.0)));
 
             let panel = v_stack((
                 list,
@@ -508,8 +508,8 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     // Paired with the 15-char name limit above — see the note
                     // there. Neither number moves without the other.
                     .min_width(theme::scaled(350.0))
-                    .padding_vert(6.0)
-                    .margin_left(36.0)
+                    .padding_vert(theme::scaled(6.0))
+                    .margin_left(theme::scaled(36.0))
                     // 3px below the switcher button (which sits ~HEADER_H-7 down).
                     .margin_top(theme::header_h() - 4.0)
                     // Match the switcher button's size (the shell sets this, but
@@ -642,7 +642,7 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
                     panel_style(s)
                         .background(theme::bg_chrome())
                         .width(db_menu_w())
-                        .padding_vert(6.0)
+                        .padding_vert(theme::scaled(6.0))
                         // Right edge aligns to the trigger's right edge. `a.y` is the
                         // button *box* bottom, which sits 3px below the chevron (the
                         // trigger's `padding_vert(3)`) — so anchoring flush here puts the
@@ -734,7 +734,7 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
                             } else {
                                 theme::db_toggle_on()
                             };
-                            s.color(c).padding_vert(8.0)
+                            s.color(c).padding_vert(theme::scaled(8.0))
                         })
                 },
             )
@@ -755,7 +755,7 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
                     panel_style(s)
                         .background(theme::bg_chrome())
                         .min_width(theme::scaled(170.0))
-                        .padding_vert(6.0)
+                        .padding_vert(theme::scaled(6.0))
                         .font_size(theme::font_title())
                 })
                 .into_any()
@@ -828,7 +828,7 @@ pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
                             } else {
                                 theme::text()
                             };
-                            s.color(c).padding_vert(6.0)
+                            s.color(c).padding_vert(theme::scaled(6.0))
                         })
                         .into_any()
                 })
@@ -848,7 +848,7 @@ pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
                 panel_style(s)
                     .background(theme::bg_chrome())
                     .width(activity_menu_w())
-                    .padding_vert(6.0)
+                    .padding_vert(theme::scaled(6.0))
                     .font_size(theme::font_title())
             })
             .into_any()
@@ -902,14 +902,14 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                     open.set(false);
                 })
                 .style(menu_item_style)
-                .style(|s| s.padding_vert(8.0));
+                .style(|s| s.padding_vert(theme::scaled(8.0)));
             let collapse_item = container(text("Collapse all").style(|s| s.color(theme::text())))
                 .on_click_stop(move |_| {
                     (collapse_all)();
                     open.set(false);
                 })
                 .style(menu_item_style)
-                .style(|s| s.padding_vert(8.0));
+                .style(|s| s.padding_vert(theme::scaled(8.0)));
 
             // **The label carries the state, the way the eye menu's rows do** —
             // `db_toggle_on` when the column is showing. No check glyph: it would
@@ -946,7 +946,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                     }))
                     .on_click_stop(move |_| (toggle_sizes)())
                     .style(menu_item_style)
-                    .style(|s| s.padding_vert(8.0))
+                    .style(|s| s.padding_vert(theme::scaled(8.0)))
                     .into_any(),
                 );
             }
@@ -962,7 +962,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                     panel_style(s)
                         .background(theme::bg_chrome())
                         .min_width(theme::scaled(150.0))
-                        .padding_vert(6.0)
+                        .padding_vert(theme::scaled(6.0))
                         .font_size(theme::font_title())
                 })
                 .into_any()
@@ -3719,8 +3719,8 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                             .style(|s| {
                                 s.color(theme::text_muted())
                                     .font_size(theme::scaled_font(14.0))
-                                    .padding_horiz(12.0)
-                                    .padding_vert(9.0)
+                                    .padding_horiz(theme::scaled(12.0))
+                                    .padding_vert(theme::scaled(9.0))
                             })
                             .into_any();
                     }
@@ -3766,8 +3766,8 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                                             .font_size(theme::font_label())
                                             .font_family("IBM Plex Mono".to_string())
                                             .background(theme::bg_deepest())
-                                            .padding_horiz(6.0)
-                                            .padding_vert(1.0)
+                                            .padding_horiz(theme::scaled(6.0))
+                                            .padding_vert(theme::scaled(1.0))
                                             .border_radius(4.0)
                                             .flex_shrink(0.0_f32)
                                     })
@@ -3788,7 +3788,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                             })
                             .style(move |s| {
                                 // +3px over menu_item_style's 6px vertical padding.
-                                let s = menu_item_style(s).padding_vert(9.0);
+                                let s = menu_item_style(s).padding_vert(theme::scaled(9.0));
                                 if selected.get() == i {
                                     s.background(theme::row_selected())
                                 } else {
@@ -3820,7 +3820,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     // Right gutter clears the floating scrollbar (3px edge inset +
                     // 6px handle) so a row's highlight stops just before it rather
                     // than running underneath.
-                    .style(|s| s.flex_col().width_full().padding_right(10.0))
+                    .style(|s| s.flex_col().width_full().padding_right(theme::scaled(10.0)))
                     .into_any()
                 },
             )
@@ -3844,7 +3844,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         if items.with(|l| l.is_empty()) {
                             s
                         } else {
-                            s.margin_top(10.0)
+                            s.margin_top(theme::scaled(10.0))
                         }
                     }),
             ))
@@ -3852,7 +3852,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             .style(|s| {
                 panel_style(s)
                     .width(modal_w(580.0))
-                    .padding(15.0)
+                    .padding(theme::scaled(15.0))
                     // 80px from the top of the *window*, which is not the top of
                     // this margin's container: the modal layer every backdrop
                     // hangs in starts `HEADER_H` down, so the bar's height comes
@@ -3985,7 +3985,7 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                     s.font_size(theme::scaled_font(15.0))
                         .font_bold()
                         .color(theme::text())
-                        .margin_bottom(10.0)
+                        .margin_bottom(theme::scaled(10.0))
                 }),
                 text(body).style(|s| {
                     s.width(theme::scaled(420.0))
@@ -4003,15 +4003,15 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                     s.width_full()
                         .flex_row()
                         .items_center()
-                        .gap(6.0)
-                        .margin_top(18.0)
+                        .gap(theme::scaled(6.0))
+                        .margin_top(theme::scaled(18.0))
                 }),
             ))
             .on_click_stop(|_| {})
             .style(|s| {
                 panel_style(s)
                     .width(modal_w(470.0))
-                    .padding(20.0)
+                    .padding(theme::scaled(20.0))
                     .flex_col()
                     .border_color(theme::modal_border())
             });
@@ -4109,7 +4109,7 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
                     s.font_size(theme::scaled_font(15.0))
                         .font_bold()
                         .color(theme::text())
-                        .margin_bottom(10.0)
+                        .margin_bottom(theme::scaled(10.0))
                 }),
                 text(c.message).style(|s| {
                     s.width(theme::scaled(380.0))
@@ -4121,8 +4121,8 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
                     s.width_full()
                         .flex_row()
                         .items_center()
-                        .gap(6.0)
-                        .margin_top(18.0)
+                        .gap(theme::scaled(6.0))
+                        .margin_top(theme::scaled(18.0))
                 }),
             ))
             // Clicks inside the panel mustn't reach the backdrop's "No".
@@ -4130,7 +4130,7 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
             .style(|s| {
                 panel_style(s)
                     .width(modal_w(430.0))
-                    .padding(20.0)
+                    .padding(theme::scaled(20.0))
                     .flex_col()
                     .border_color(theme::modal_border())
             });
@@ -4227,7 +4227,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             .style(|s| {
                 panel_style(s)
                     .width(modal_w(500.0))
-                    .padding(20.0)
+                    .padding(theme::scaled(20.0))
                     .border_color(theme::modal_border())
             });
 

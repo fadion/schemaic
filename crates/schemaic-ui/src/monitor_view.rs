@@ -195,8 +195,8 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 s.width_full()
                     .flex_row()
                     .items_center()
-                    .padding_horiz(14.0)
-                    .padding_vert(10.0)
+                    .padding_horiz(theme::scaled(14.0))
+                    .padding_vert(theme::scaled(10.0))
                     .border_bottom(1.0)
                     .border_color(theme::border())
             });
@@ -400,11 +400,11 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 s.width_full()
                     .flex_row()
                     .items_center()
-                    .gap(10.0)
-                    .padding_horiz(14.0)
-                    .padding_top(10.0)
+                    .gap(theme::scaled(10.0))
+                    .padding_horiz(theme::scaled(14.0))
+                    .padding_top(theme::scaled(10.0))
                     // 20px gap down to the table (or the empty-state message).
-                    .padding_bottom(20.0)
+                    .padding_bottom(theme::scaled(20.0))
             });
 
             // **A memo, not the log.** `dyn_container` does not diff — it rebuilds
@@ -481,8 +481,8 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     .style(|s| {
                         s.flex_col()
                             .padding_horiz(row_pad_h())
-                            .padding_vert(8.0)
-                            .gap(2.0)
+                            .padding_vert(theme::scaled(8.0))
+                            .gap(theme::scaled(2.0))
                     });
                     let (list_scroll, by_user) = with_scroll_gesture(shift_hscroll(
                         list.on_resize(move |r| content_h.set(r.height())),
@@ -598,7 +598,7 @@ fn header_row() -> impl IntoView {
         s.items_center()
             .gap(col_gap())
             .padding_horiz(row_pad_h())
-            .padding_vert(6.0)
+            .padding_vert(theme::scaled(6.0))
     })
 }
 
@@ -634,7 +634,11 @@ fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView 
         }),
         data_view(&entry.change, &names),
     ))
-    .style(|s| s.items_center().gap(col_gap()).padding_vert(7.0))
+    .style(|s| {
+        s.items_center()
+            .gap(col_gap())
+            .padding_vert(theme::scaled(7.0))
+    })
 }
 
 /// The Data column, as one non-wrapping line of coloured spans: for an update,

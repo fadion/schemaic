@@ -100,7 +100,7 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
                         s.width(theme::scaled(46.0))
                             .flex_shrink(0.0_f32)
                             .justify_end()
-                            .padding_right(10.0)
+                            .padding_right(theme::scaled(10.0))
                     }),
                 text(marker.to_string()).style(move |s| {
                     mono(s)
@@ -118,7 +118,7 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
             // an h-scrollbar. (A `width_full`/`min_width_full` here instead caps the
             // row at the viewport, so a long line just clips with no scrollbar.)
             .style(move |s| {
-                let s = s.flex_row().items_center().padding_vert(1.0);
+                let s = s.flex_row().items_center().padding_vert(theme::scaled(1.0));
                 match bg {
                     Some(c) => s.background(c),
                     None => s,
@@ -139,8 +139,8 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
             .style(|s| {
                 s.width_full()
                     .items_center()
-                    .padding_left(60.0)
-                    .padding_vert(3.0)
+                    .padding_left(theme::scaled(60.0))
+                    .padding_vert(theme::scaled(3.0))
             })
             .into_any()
         }

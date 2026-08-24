@@ -433,8 +433,8 @@ fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
             .style(move |s| {
                 let s = s
                     .font_size(theme::font_body())
-                    .padding_horiz(12.0)
-                    .padding_vert(7.0)
+                    .padding_horiz(theme::scaled(12.0))
+                    .padding_vert(theme::scaled(7.0))
                     .border_radius(6.0);
                 if d.tab.get() == t {
                     s.background(theme::pill_active_bg())
@@ -448,10 +448,10 @@ fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
     .style(|s| {
         s.flex_row()
             .items_center()
-            .gap(4.0)
+            .gap(theme::scaled(4.0))
             .width_full()
             .padding_horiz(modal_pad_h())
-            .padding_vert(8.0)
+            .padding_vert(theme::scaled(8.0))
             .border_bottom(1.0)
             .border_color(theme::border())
     });
@@ -660,7 +660,7 @@ pub(crate) fn suggest_chevron(
                 crate::widgets::menu_trigger_press,
             )
             .style(|s| {
-                s.padding(6.0)
+                s.padding(theme::scaled(6.0))
                     .color(theme::text_dim())
                     .hover(|s| s.color(theme::text()))
             }),
@@ -694,7 +694,7 @@ fn bound_field_with_menu(
         field_view(sig, width, placeholder, mono, ring.clone(), tabindex),
         suggest_chevron(ui, sig, options, ring, tabindex + 1),
     ))
-    .style(|s| s.flex_row().items_center().gap(2.0))
+    .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
     .into_any()
 }
 
@@ -742,7 +742,7 @@ fn owned_dropdown_box(
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
         ))
-        .style(|s| s.items_center().width_full().gap(8.0))
+        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
         .into_any()
     };
     let row = move |item: String| {
@@ -751,8 +751,8 @@ fn owned_dropdown_box(
             .style(move |s| {
                 let s = s
                     .width_full()
-                    .padding_horiz(12.0)
-                    .padding_vert(6.0)
+                    .padding_horiz(theme::scaled(12.0))
+                    .padding_vert(theme::scaled(6.0))
                     .color(theme::text())
                     .font_size(theme::font_body())
                     .hover(|s| s.background(theme::dropdown_hover()));
@@ -815,7 +815,7 @@ pub(crate) fn list_actions(
             // Colour is the whole affordance, as it is for every icon button in
             // the app (`toolbar_icon`, the modal ✕, the grid's toolbar).
             .style(|s| {
-                s.padding(5.0)
+                s.padding(theme::scaled(5.0))
                     .color(theme::text_dim())
                     .hover(|s| s.color(theme::text()))
             })
@@ -840,14 +840,14 @@ pub(crate) fn list_actions(
     h_stack((
         btn(icons::PLUS, "Add", 0, Rc::new(add)),
         btn(icons::TRASH_2, "Remove", 1, Rc::new(remove)),
-        h_stack_from_iter(arrows).style(|s| s.flex_row().gap(2.0)),
+        h_stack_from_iter(arrows).style(|s| s.flex_row().gap(theme::scaled(2.0))),
     ))
     .style(|s| {
         s.flex_row()
             .items_center()
-            .gap(2.0)
+            .gap(theme::scaled(2.0))
             .width_full()
-            .padding(4.0)
+            .padding(theme::scaled(4.0))
             .border_top(1.0)
             .border_color(theme::border())
     })
@@ -926,10 +926,10 @@ fn list_row_inner(
         let s = s
             .flex_row()
             .items_center()
-            .gap(6.0)
+            .gap(theme::scaled(6.0))
             .width_full()
             .height(row_h())
-            .padding_horiz(8.0)
+            .padding_horiz(theme::scaled(8.0))
             .flex_shrink(0.0_f32);
         if selected.get() == idx {
             s.background(theme::row_selected())
@@ -1039,7 +1039,7 @@ fn detail_pane(tab: RwSignal<DesignerTab>, body: impl IntoView + 'static) -> imp
             // edge rather than insetting it. Now that the form really is as wide
             // as the pane, a toggle's switch is the rightmost thing in it and was
             // sitting under the bar.
-            .padding_right(10.0)
+            .padding_right(theme::scaled(10.0))
     })))
     .style(|s| {
         s.width_full()
@@ -1055,7 +1055,7 @@ fn hint(t: &'static str) -> impl IntoView {
 
 /// A field with a hint under it.
 fn field_with_hint(field: impl IntoView + 'static, h: &'static str) -> impl IntoView {
-    v_stack((field, hint(h))).style(|s| s.flex_col().gap(4.0))
+    v_stack((field, hint(h))).style(|s| s.flex_col().gap(theme::scaled(4.0)))
 }
 
 // ── the Table section ────────────────────────────────────────────────────────
@@ -1416,7 +1416,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         s.flex_col()
             .gap(form_gap())
             .width_full()
-            .padding_bottom(10.0)
+            .padding_bottom(theme::scaled(10.0))
     })
     .into_any()
 }
@@ -1609,7 +1609,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         s.flex_col()
             .gap(form_gap())
             .width_full()
-            .padding_bottom(10.0)
+            .padding_bottom(theme::scaled(10.0))
     })
     .into_any()
 }
@@ -1829,7 +1829,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         s.flex_col()
             .gap(form_gap())
             .width_full()
-            .padding_bottom(10.0)
+            .padding_bottom(theme::scaled(10.0))
     })
     .into_any()
 }
@@ -1980,7 +1980,7 @@ fn check_form(
             s.flex_col()
                 .gap(form_gap())
                 .width_full()
-                .padding_bottom(10.0)
+                .padding_bottom(theme::scaled(10.0))
         })
         .into_any()
 }
@@ -2190,7 +2190,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                     .flex_grow(1.0_f32)
                     .min_height(0.0)
                     .padding_horiz(modal_pad_h())
-                    .padding_vert(18.0)
+                    .padding_vert(theme::scaled(18.0))
                     .gap(0.0)
             });
 

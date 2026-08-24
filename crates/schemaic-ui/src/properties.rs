@@ -274,7 +274,8 @@ fn stats_body(
         .collect(),
     };
 
-    let content = v_stack_from_iter(sections).style(|s| s.flex_col().gap(16.0).width_full());
+    let content =
+        v_stack_from_iter(sections).style(|s| s.flex_col().gap(theme::scaled(16.0)).width_full());
     autohide(scroll(
         container(content).style(|s| s.width_full().padding(modal_pad_h())),
     ))
@@ -302,7 +303,7 @@ fn headline(stats: &TableStats) -> AnyView {
         "on disk".to_string(),
     );
     h_stack((row_tile, size_tile))
-        .style(|s| s.width_full().gap(28.0))
+        .style(|s| s.width_full().gap(theme::scaled(28.0)))
         .into_any()
 }
 
@@ -316,7 +317,7 @@ fn tile(value: String, caption: String) -> AnyView {
         }),
         text(caption).style(|s| s.font_size(font_hint()).color(theme::text_faint())),
     ))
-    .style(|s| s.flex_col().gap(2.0))
+    .style(|s| s.flex_col().gap(theme::scaled(2.0)))
     .into_any()
 }
 
@@ -357,15 +358,15 @@ fn count_row(
             text("Cancel").style(|s| {
                 s.font_size(font_label())
                     .color(theme::text_dim())
-                    .padding_horiz(8.0)
-                    .padding_vert(4.0)
+                    .padding_horiz(theme::scaled(8.0))
+                    .padding_vert(theme::scaled(4.0))
                     .border(1.0)
                     .border_color(theme::control_border())
                     .border_radius(6.0)
                     .hover(|s| s.color(theme::text()).background(theme::control_hover()))
             }),
         ))
-        .style(|s| s.items_center().gap(10.0))
+        .style(|s| s.items_center().gap(theme::scaled(10.0)))
         .on_click_stop(move |_| (stop)());
         Some(in_ring_button(
             face,
@@ -392,9 +393,9 @@ fn count_row(
         ))
         .style(|s| {
             s.items_center()
-                .gap(7.0)
-                .padding_horiz(8.0)
-                .padding_vert(4.0)
+                .gap(theme::scaled(7.0))
+                .padding_horiz(theme::scaled(8.0))
+                .padding_vert(theme::scaled(4.0))
                 .border(1.0)
                 .border_color(theme::control_border())
                 .border_radius(6.0)
@@ -436,7 +437,7 @@ fn count_row(
     }
     Some(
         h_stack_from_iter(parts)
-            .style(|s| s.items_center().gap(10.0).width_full())
+            .style(|s| s.items_center().gap(theme::scaled(10.0)).width_full())
             .into_any(),
     )
 }
@@ -475,17 +476,17 @@ fn storage_section(stats: &TableStats) -> Option<AnyView> {
     Some(
         v_stack((
             bar,
-            h_stack_from_iter(legend).style(|s| s.gap(18.0).items_center()),
+            h_stack_from_iter(legend).style(|s| s.gap(theme::scaled(18.0)).items_center()),
         ))
         // The bar is the one element with no text baseline to align to, so it
         // needs its own breathing room on top of the stack's gap; the swatches
         // stay tight under it, which is what makes them read as its legend.
         .style(|s| {
             s.flex_col()
-                .gap(9.0)
+                .gap(theme::scaled(9.0))
                 .width_full()
-                .margin_top(5.0)
-                .margin_bottom(5.0)
+                .margin_top(theme::scaled(5.0))
+                .margin_bottom(theme::scaled(5.0))
         })
         .into_any(),
     )
@@ -505,7 +506,7 @@ fn swatch(color: fn() -> Color, label: &'static str, bytes: Option<u64>) -> AnyV
         text(bytes.map(format_bytes).unwrap_or_else(|| "—".into()))
             .style(|s| s.font_size(font_hint()).color(theme::text_dim())),
     ))
-    .style(|s| s.items_center().gap(6.0))
+    .style(|s| s.items_center().gap(theme::scaled(6.0)))
     .into_any()
 }
 
@@ -628,7 +629,11 @@ fn index_row(idx: &IndexStats) -> AnyView {
         }),
         text(idx.name.clone()).style(|s| s.font_size(font_body()).color(theme::text())),
     ))
-    .style(|s| s.items_center().gap(6.0).flex_shrink(0.0_f32));
+    .style(|s| {
+        s.items_center()
+            .gap(theme::scaled(6.0))
+            .flex_shrink(0.0_f32)
+    });
 
     // **Not a column.** These sit right after the name they describe, because
     // the facts differ per index and lining them up down a fixed gutter left a
@@ -648,7 +653,7 @@ fn index_row(idx: &IndexStats) -> AnyView {
             text(stats::unused_note())
                 .style(|s| s.font_size(font_body()).color(theme::plan_warn())),
         ))
-        .style(|s| s.items_center().gap(5.0))
+        .style(|s| s.items_center().gap(theme::scaled(5.0)))
         .into_any()
     });
 
@@ -656,7 +661,7 @@ fn index_row(idx: &IndexStats) -> AnyView {
         .style(|s| s.items_center().gap(index_fact_gap()).width_full())
         .into_any();
     v_stack_from_iter(std::iter::once(row).chain(flag))
-        .style(|s| s.flex_col().gap(2.0).width_full())
+        .style(|s| s.flex_col().gap(theme::scaled(2.0)).width_full())
         .into_any()
 }
 
@@ -683,7 +688,7 @@ fn section_with_gap(title: &'static str, rows: Vec<AnyView>, gap: f64) -> AnyVie
         crate::widgets::form_section(title),
         v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap).width_full()),
     ))
-    .style(|s| s.flex_col().gap(7.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(7.0)).width_full())
     .into_any()
 }
 
@@ -701,18 +706,21 @@ fn detail(label: &'static str, value: String) -> AnyView {
         // read-only facts shout louder than the editable fields elsewhere.
         text(value).style(|s| s.font_size(font_body()).color(theme::text_dim())),
     ))
-    .style(|s| s.items_start().gap(10.0).width_full())
+    .style(|s| s.items_start().gap(theme::scaled(10.0)).width_full())
     .into_any()
 }
 
 /// An icon-led sentence — a caveat, a warning, or an engine's limitation.
 fn note_line(icon: &'static str, color: fn() -> Color, message: String) -> AnyView {
     h_stack((
-        icons::icon(icon, 14.0)
-            .style(move |s| s.flex_shrink(0.0_f32).color(color()).margin_top(1.0)),
+        icons::icon(icon, 14.0).style(move |s| {
+            s.flex_shrink(0.0_f32)
+                .color(color())
+                .margin_top(theme::scaled(1.0))
+        }),
         text(message).style(move |s| s.font_size(font_body()).color(color())),
     ))
-    .style(|s| s.items_start().gap(7.0).width_full())
+    .style(|s| s.items_start().gap(theme::scaled(7.0)).width_full())
     .into_any()
 }
 

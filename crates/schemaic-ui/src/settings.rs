@@ -58,7 +58,7 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
                 30,
             );
 
-            let group = |s: floem::style::Style| s.flex_col().gap(6.0);
+            let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
             let shell_section = v_stack((settings_group_label("Shell"), shell_dd)).style(group);
             let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(group);
             let cursor_section =
@@ -87,7 +87,12 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
                 copy_row,
                 blink_row,
             ))
-            .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
+            .style(|s| {
+                s.flex_col()
+                    .gap(theme::scaled(25.0))
+                    .padding(theme::scaled(14.0))
+                    .width_full()
+            });
 
             let panel = v_stack((
                 modal_title("Terminal", close.clone(), root_ring.clone()),
@@ -156,7 +161,7 @@ fn shell_dropdown(
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
         ))
-        .style(|s| s.items_center().width_full().gap(8.0))
+        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
         .into_any()
     };
     // Popup row: shell name + its program/args, with the active row highlighted.
@@ -180,10 +185,10 @@ fn shell_dropdown(
         .style(move |s| {
             let s = s
                 .width_full()
-                .padding_horiz(12.0)
-                .padding_vert(6.0)
+                .padding_horiz(theme::scaled(12.0))
+                .padding_vert(theme::scaled(6.0))
                 .flex_col()
-                .gap(2.0)
+                .gap(theme::scaled(2.0))
                 .hover(|s| s.background(theme::dropdown_hover()));
             if selected.get() == i {
                 s.background(theme::dropdown_active())
@@ -224,10 +229,15 @@ pub(crate) fn focusable_toggle_row(
             text(title).style(|s| s.color(theme::text()).font_size(theme::font_label())),
             form_hint(hint),
         ))
-        .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
+        .style(|s| {
+            s.flex_col()
+                .gap(theme::scaled(2.0))
+                .flex_grow(1.0_f32)
+                .min_width(0.0)
+        }),
         focusable_toggle(sig, ring, tabindex),
     ))
-    .style(|s| s.items_center().width_full().gap(10.0))
+    .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
 
 // A themed `<select>`-style dropdown for the settings modal. The closed box
@@ -267,7 +277,7 @@ where
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
         ))
-        .style(|s| s.items_center().width_full().gap(8.0))
+        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
         .into_any()
     };
 
@@ -281,8 +291,8 @@ where
             .style(move |s| {
                 let s = s
                     .width_full()
-                    .padding_horiz(12.0)
-                    .padding_vert(6.0)
+                    .padding_horiz(theme::scaled(12.0))
+                    .padding_vert(theme::scaled(6.0))
                     .color(theme::text())
                     .font_size(theme::font_body())
                     .hover(|s| s.background(theme::dropdown_hover()));
@@ -327,7 +337,7 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
                 .border(1.0)
                 .border_color(theme::border())
                 .border_radius(8.0)
-                .padding_vert(4.0)
+                .padding_vert(theme::scaled(4.0))
                 .min_width(theme::scaled(150.0))
                 // Override Floem's default list chrome. The item rule is nested
                 // under `ListClass` so it's inherited from the same nearest
@@ -907,7 +917,7 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
 
             // Each group is a label + its controls (6px gap); groups are spaced
             // 25px apart.
-            let group = |s: floem::style::Style| s.flex_col().gap(6.0);
+            let group = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
             let cli_section = v_stack((
                 settings_group_label("Claude Code CLI path"),
                 path_field,
@@ -994,7 +1004,12 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 data_section,
                 gutter_row,
             ))
-            .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
+            .style(|s| {
+                s.flex_col()
+                    .gap(theme::scaled(25.0))
+                    .padding(theme::scaled(14.0))
+                    .width_full()
+            });
 
             let panel = v_stack((
                 modal_title("AI Assistant — Settings", close.clone(), root_ring.clone()),
@@ -1045,12 +1060,17 @@ fn shortcut_row(keys: &'static str, desc: &'static str) -> impl IntoView {
                 .font_size(theme::font_label())
                 .font_family("IBM Plex Mono".to_string())
                 .background(theme::bg_deepest())
-                .padding_horiz(6.0)
-                .padding_vert(2.0)
+                .padding_horiz(theme::scaled(6.0))
+                .padding_vert(theme::scaled(2.0))
                 .border_radius(4.0)
         }),
     ))
-    .style(|s| s.width_full().flex_row().items_center().padding_vert(2.0))
+    .style(|s| {
+        s.width_full()
+            .flex_row()
+            .items_center()
+            .padding_vert(theme::scaled(2.0))
+    })
 }
 
 /// A titled group of shortcut rows (Global / Editor / Results grid).
@@ -1060,12 +1080,12 @@ fn shortcut_group(title: &'static str, rows: &[(&'static str, &'static str)]) ->
         text(title).style(|s| {
             s.font_size(theme::font_label())
                 .color(theme::text_dim())
-                .margin_bottom(2.0)
+                .margin_bottom(theme::scaled(2.0))
         }),
         v_stack_from_iter(rows.into_iter().map(|(k, d)| shortcut_row(k, d)))
             .style(|s| s.flex_col()),
     ))
-    .style(|s| s.flex_col().gap(2.0))
+    .style(|s| s.flex_col().gap(theme::scaled(2.0)))
 }
 
 // ── Settings modal ───────────────────────────────────────────────────────────
@@ -1150,7 +1170,12 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
             text("Log file").style(|s| s.color(theme::text()).font_size(theme::font_label())),
             form_hint(log_hint(dir.as_deref())),
         ))
-        .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
+        .style(|s| {
+            s.flex_col()
+                .gap(theme::scaled(2.0))
+                .flex_grow(1.0_f32)
+                .min_width(0.0)
+        }),
         action_button(
             "Open folder",
             ActionKind::Quiet,
@@ -1160,7 +1185,7 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
             move || open(),
         ),
     ))
-    .style(|s| s.items_center().width_full().gap(10.0))
+    .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
 
 fn settings_section_header(t: &'static str) -> impl IntoView {
@@ -1168,7 +1193,7 @@ fn settings_section_header(t: &'static str) -> impl IntoView {
         s.font_size(theme::font_body())
             .font_bold()
             .color(theme::text())
-            .margin_bottom(2.0)
+            .margin_bottom(theme::scaled(2.0))
     })
 }
 
@@ -1193,7 +1218,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             }
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
 
-            let ctrl = |s: floem::style::Style| s.flex_col().gap(6.0);
+            let ctrl = |s: floem::style::Style| s.flex_col().gap(theme::scaled(6.0));
 
             // The modal's Tab order: one group per section, spaced by 10 within
             // it and by 100 between them — see `FocusRing`.
@@ -1219,7 +1244,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 restore_row,
                 log_row(open_config_dir.clone(), ring.clone(), 20),
             ))
-            .style(|s| s.flex_col().gap(16.0));
+            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
             // Editor group. (Tab width, spaces-vs-tabs, and word wrap live in the
             // status bar.)
@@ -1232,7 +1257,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             );
             let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
             let editor_group = v_stack((settings_section_header("Editor"), font_section))
-                .style(|s| s.flex_col().gap(16.0));
+                .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
             // Query group.
             let row_dd =
@@ -1280,7 +1305,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 confirm_row,
                 validate_row,
             ))
-            .style(|s| s.flex_col().gap(16.0));
+            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
             // Theme group.
             let ui_dd = focusable_dropdown(
@@ -1315,10 +1340,15 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 editor_section,
                 scale_section,
             ))
-            .style(|s| s.flex_col().gap(16.0));
+            .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
-            let body = v_stack((general_group, editor_group, query_group, theme_group))
-                .style(|s| s.flex_col().gap(28.0).padding(14.0).width_full());
+            let body =
+                v_stack((general_group, editor_group, query_group, theme_group)).style(|s| {
+                    s.flex_col()
+                        .gap(theme::scaled(28.0))
+                        .padding(theme::scaled(14.0))
+                        .width_full()
+                });
             // Scroll so the taller grouped modal never overflows the window.
             let body = autohide(scroll(body)).style(|s| {
                 s.width_full()
@@ -1390,7 +1420,12 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
                     .iter()
                     .map(|(title, rows)| shortcut_group(title, rows)),
             )
-            .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
+            .style(|s| {
+                s.flex_col()
+                    .gap(theme::scaled(25.0))
+                    .padding(theme::scaled(14.0))
+                    .width_full()
+            });
             // Scroll the body so the modal never overflows the window.
             let body = autohide(scroll(body)).style(|s| {
                 s.width_full()

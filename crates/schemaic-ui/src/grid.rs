@@ -2413,7 +2413,7 @@ pub(crate) fn grid_error_bar(
                 .style(|s| {
                     s.color(theme::err_fix_btn())
                         .font_size(theme::font_body())
-                        .margin_right(8.0)
+                        .margin_right(theme::scaled(8.0))
                 })
                 .into_any()
         } else {
@@ -2425,7 +2425,7 @@ pub(crate) fn grid_error_bar(
                     .font_size(theme::font_body())
                     .max_width_pct(80.0)
                     .text_ellipsis()
-                    .margin_left(8.0)
+                    .margin_left(theme::scaled(8.0))
             }),
             empty().style(|s| s.flex_grow(1.0_f32)),
             view,
@@ -2508,7 +2508,7 @@ fn note_bar(msg: String) -> impl IntoView {
                 .font_size(theme::font_body())
                 .max_width_pct(90.0)
                 .text_ellipsis()
-                .margin_left(8.0)
+                .margin_left(theme::scaled(8.0))
         }),
         empty().style(|s| s.flex_grow(1.0_f32)),
     ))
@@ -2553,8 +2553,8 @@ fn wait_bar(note: WaitNote, rollback_tx: Rc<dyn Fn(usize)>) -> impl IntoView {
                 s.color(theme::tx_rollback())
                     .font_size(theme::font_body())
                     .flex_shrink(0.0_f32)
-                    .margin_left(12.0)
-                    .margin_right(8.0)
+                    .margin_left(theme::scaled(12.0))
+                    .margin_right(theme::scaled(8.0))
                     .hover(|s| s.color(theme::tx_rollback_hover()))
             })
             .into_any(),
@@ -2565,7 +2565,7 @@ fn wait_bar(note: WaitNote, rollback_tx: Rc<dyn Fn(usize)>) -> impl IntoView {
                 .font_size(theme::font_body())
                 .max_width_pct(80.0)
                 .text_ellipsis()
-                .margin_left(8.0)
+                .margin_left(theme::scaled(8.0))
         }),
         empty().style(|s| s.flex_grow(1.0_f32)),
         action,
@@ -2665,9 +2665,9 @@ pub(crate) fn grid_find_bar(
             h_stack((input, count, prev_btn, next_btn, close_btn))
                 .style(|s| {
                     s.items_center()
-                        .gap(8.0)
-                        .padding_horiz(8.0)
-                        .padding_vert(6.0)
+                        .gap(theme::scaled(8.0))
+                        .padding_horiz(theme::scaled(8.0))
+                        .padding_vert(theme::scaled(6.0))
                         .background(theme::bg_panel())
                         .border(1.0)
                         .border_color(theme::border())
@@ -2708,8 +2708,8 @@ pub(crate) fn grid_selection_bar(
                     // introduces no combination the contrast test hasn't judged.
                     s.color(theme::text_dim())
                         .font_size(theme::font_label())
-                        .padding_horiz(10.0)
-                        .padding_vert(4.0)
+                        .padding_horiz(theme::scaled(10.0))
+                        .padding_vert(theme::scaled(4.0))
                         .background(theme::bg_deepest())
                         .border(1.0)
                         .border_color(theme::border())
@@ -2799,9 +2799,9 @@ pub(crate) fn grid_goto_bar(
             ))
             .style(|s| {
                 s.items_center()
-                    .gap(8.0)
-                    .padding_horiz(8.0)
-                    .padding_vert(6.0)
+                    .gap(theme::scaled(8.0))
+                    .padding_horiz(theme::scaled(8.0))
+                    .padding_vert(theme::scaled(6.0))
                     .background(theme::bg_panel())
                     .border(1.0)
                     .border_color(theme::border())
@@ -3076,7 +3076,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     .flex_shrink(0.0_f32)
                     .items_center()
                     .justify_end()
-                    .padding_horiz(8.0)
+                    .padding_horiz(theme::scaled(8.0))
                     .border_right(1.0)
                     .border_color(theme::border())
                     .background(theme::bg_header_row())
@@ -4468,8 +4468,8 @@ fn seed_popover(gs: GridState) -> impl IntoView {
                         (go)();
                     })
                     .style(|s| {
-                        s.padding_horiz(10.0)
-                            .padding_vert(4.0)
+                        s.padding_horiz(theme::scaled(10.0))
+                            .padding_vert(theme::scaled(4.0))
                             .border(1.0)
                             .border_color(theme::border())
                             .border_radius(6.0)
@@ -4501,8 +4501,8 @@ fn seed_popover(gs: GridState) -> impl IntoView {
                     container(text("Generate").style(|s| s.font_size(theme::font_body())))
                         .on_click_stop(move |_| (go_btn)())
                         .style(|s| {
-                            s.padding_horiz(12.0)
-                                .padding_vert(6.0)
+                            s.padding_horiz(theme::scaled(12.0))
+                                .padding_vert(theme::scaled(6.0))
                                 .border_radius(6.0)
                                 .color(floem::peniko::Color::WHITE)
                                 .background(theme::seed_button())
@@ -4510,14 +4510,14 @@ fn seed_popover(gs: GridState) -> impl IntoView {
                                 .hover(|s| s.background(theme::seed_button().multiply_alpha(0.85)))
                         }),
                 ))
-                .style(|s| s.gap(6.0).items_center()),
+                .style(|s| s.gap(theme::scaled(6.0)).items_center()),
                 h_stack((
                     preset(5, go.clone(), gs),
                     preset(10, go.clone(), gs),
                     preset(25, go.clone(), gs),
                     preset(50, go.clone(), gs),
                 ))
-                .style(|s| s.gap(6.0)),
+                .style(|s| s.gap(theme::scaled(6.0))),
             ))
             .style(|s| {
                 crate::widgets::panel_style(s)
@@ -4525,8 +4525,8 @@ fn seed_popover(gs: GridState) -> impl IntoView {
                     .inset_top(30.0) // just below the 28px toolbar
                     .inset_right(8.0)
                     .background(theme::bg_chrome())
-                    .padding(12.0)
-                    .gap(8.0)
+                    .padding(theme::scaled(12.0))
+                    .gap(theme::scaled(8.0))
             })
             .on_event_stop(EventListener::PointerDown, |_| {});
             // Backdrop: an outside click closes the popover.
@@ -4637,7 +4637,7 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
         text(type_name).style(|s| {
             s.font_size(theme::scaled_font(13.0))
                 .color(theme::text_faint())
-                .margin_left(6.0)
+                .margin_left(theme::scaled(6.0))
                 .flex_shrink(0.0_f32)
         }),
     ))
@@ -4645,7 +4645,7 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
         s.items_center()
             .width(field_name_w())
             .flex_shrink(0.0_f32)
-            .padding_right(10.0)
+            .padding_right(theme::scaled(10.0))
     })
 }
 
@@ -4655,7 +4655,7 @@ fn field_mini_btn(label: &'static str, action: impl Fn() + 'static) -> AnyView {
     container(text(label).style(|s| s.font_size(theme::scaled_font(13.0))))
         .on_click_stop(move |_| action())
         .style(|s| {
-            s.padding_horiz(4.0)
+            s.padding_horiz(theme::scaled(4.0))
                 .flex_shrink(0.0_f32)
                 .color(theme::text_dim())
                 .hover(|s| s.color(theme::text()))
@@ -4697,7 +4697,7 @@ fn nullable_field(nullable: bool, f: FieldSig, control: Rc<dyn Fn() -> AnyView>)
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     field_mini_btn("Set value", move || f.is_null.set(false)),
                 ))
-                .style(|s| s.items_center().width_full().gap(8.0))
+                .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
                 .on_double_click_stop(move |_| f.is_null.set(false))
                 .into_any()
             } else {
@@ -4705,7 +4705,7 @@ fn nullable_field(nullable: bool, f: FieldSig, control: Rc<dyn Fn() -> AnyView>)
                     container((control)()).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
                     field_mini_btn("Set NULL", move || f.is_null.set(true)),
                 ))
-                .style(|s| s.items_center().width_full().gap(6.0))
+                .style(|s| s.items_center().width_full().gap(theme::scaled(6.0)))
                 .into_any()
             }
         },
@@ -4936,7 +4936,7 @@ fn json_row_view(
             text(":").style(|s| {
                 s.font_size(theme::scaled_font(13.0))
                     .color(theme::text_faint())
-                    .margin_right(6.0)
+                    .margin_right(theme::scaled(6.0))
             }),
         ))
         .style(|s| s.items_center().flex_shrink(0.0_f32))
@@ -4945,7 +4945,7 @@ fn json_row_view(
             .style(|s| {
                 s.font_size(theme::scaled_font(13.0))
                     .color(theme::text_faint())
-                    .margin_right(6.0)
+                    .margin_right(theme::scaled(6.0))
                     .flex_shrink(0.0_f32)
             })
             .into_any(),
@@ -4994,8 +4994,8 @@ fn json_row_view(
                 )
                 .on_click_stop(move |_| (start_edit)(p.clone(), vj2.clone()))
                 .style(|s| {
-                    s.padding_horiz(4.0)
-                        .padding_vert(1.0)
+                    s.padding_horiz(theme::scaled(4.0))
+                        .padding_vert(theme::scaled(1.0))
                         .border_radius(3.0)
                         .hover(|s| s.background(theme::bg_deepest()))
                 })
@@ -5169,7 +5169,7 @@ fn json_editor(f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
             };
             s.width_full()
                 .flex_col()
-                .padding(6.0)
+                .padding(theme::scaled(6.0))
                 .border(1.0)
                 .border_color(border)
                 .border_radius(6.0)
@@ -5204,7 +5204,7 @@ fn json_field(nullable: bool, f: FieldSig, sink: RwSignal<Option<String>>) -> An
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     field_mini_btn("Set value", enable),
                 ))
-                .style(|s| s.items_center().width_full().gap(8.0))
+                .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
                 .on_double_click_stop(move |_| enable())
                 .into_any()
             } else {
@@ -5274,7 +5274,10 @@ fn field_row(
         container(editor).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
     ))
     .style(move |s| {
-        let s = s.width_full().gap(8.0).padding_vert(3.0);
+        let s = s
+            .width_full()
+            .gap(theme::scaled(8.0))
+            .padding_vert(theme::scaled(3.0));
         // A JSON tree grows tall — top-align the label and let the row grow. A scalar
         // row keeps a *fixed* height so toggling `<null>` ↔ input (which are different
         // natural heights) never reflows the rows below.
@@ -5386,7 +5389,7 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             let close_btn = container(icons::icon(icons::X, 14.0))
                 .on_click_stop(move |_| (close_x)())
                 .style(|s| {
-                    s.padding(4.0)
+                    s.padding(theme::scaled(4.0))
                         .color(theme::text_dim())
                         .hover(|s| s.color(theme::text()))
                 });
@@ -5394,12 +5397,12 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 let save_btn = container(icons::icon(icons::CHECK, 14.0))
                     .on_click_stop(move |_| (save)())
                     .style(|s| {
-                        s.padding(4.0)
+                        s.padding(theme::scaled(4.0))
                             .color(theme::text_dim())
                             .hover(|s| s.color(theme::text()))
                     });
                 h_stack((save_btn, close_btn))
-                    .style(|s| s.flex_row().items_center().gap(4.0))
+                    .style(|s| s.flex_row().items_center().gap(theme::scaled(4.0)))
                     .into_any()
             } else {
                 close_btn.into_any()
@@ -5415,13 +5418,13 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 if enabled {
                     btn.on_click_stop(move |_| edit_row_step(gs, forward))
                         .style(|s| {
-                            s.padding(4.0)
+                            s.padding(theme::scaled(4.0))
                                 .color(theme::text_dim())
                                 .hover(|s| s.color(theme::text()))
                         })
                         .into_any()
                 } else {
-                    btn.style(|s| s.padding(4.0).color(theme::text_faint()))
+                    btn.style(|s| s.padding(theme::scaled(4.0)).color(theme::text_faint()))
                         .into_any()
                 }
             };
@@ -5429,7 +5432,12 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 nav_chevron(icons::CHEVRON_UP, can_prev, false),
                 nav_chevron(icons::CHEVRON_DOWN, can_next, true),
             ))
-            .style(|s| s.flex_row().items_center().gap(2.0).margin_left(8.0));
+            .style(|s| {
+                s.flex_row()
+                    .items_center()
+                    .gap(theme::scaled(2.0))
+                    .margin_left(theme::scaled(8.0))
+            });
 
             let head = h_stack((
                 text(title).style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
@@ -5440,10 +5448,10 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             .style(|s| {
                 s.width_full()
                     .items_center()
-                    .gap(4.0)
+                    .gap(theme::scaled(4.0))
                     .height(theme::scaled(24.0))
                     .flex_shrink(0.0_f32)
-                    .padding_horiz(10.0)
+                    .padding_horiz(theme::scaled(10.0))
             });
 
             // The field list scrolls (app-standard auto-hiding bars) once the panel
@@ -5455,10 +5463,11 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             // content-sized minimum, so a long field list refuses to shrink and the
             // panel grows past its own max — which is exactly the clipping this is
             // meant to prevent. With it, the list yields and scrolls instead.
-            let fields = autohide(scroll(
-                v_stack_from_iter(rows).style(|s| s.width_full().flex_col().padding_horiz(10.0)),
-            ))
-            .style(|s| s.width_full().min_height(0.0));
+            let fields =
+                autohide(scroll(v_stack_from_iter(rows).style(|s| {
+                    s.width_full().flex_col().padding_horiz(theme::scaled(10.0))
+                })))
+                .style(|s| s.width_full().min_height(0.0));
 
             // Status line: that a save is in flight. Save commits over the network
             // and can queue behind another session's lock, so without this the ✓
@@ -5482,7 +5491,7 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     }
                 },
             )
-            .style(|s| s.width_full().padding_horiz(10.0));
+            .style(|s| s.width_full().padding_horiz(theme::scaled(10.0)));
 
             // In-flow strip attached to the grid's bottom edge (border_top + panel
             // background), not a floating overlay. Horizontal padding lives on the
@@ -5505,8 +5514,8 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                         .flex_col()
                         .min_height(0.0)
                         .max_height(max_rows.get() as f64)
-                        .gap(8.0)
-                        .padding_vert(8.0)
+                        .gap(theme::scaled(8.0))
+                        .padding_vert(theme::scaled(8.0))
                         .border_top(1.0)
                         .border_color(theme::border())
                         .background(theme::bg_panel())
@@ -5802,7 +5811,7 @@ fn toolbar_sep() -> impl IntoView {
         s.width(1.0)
             .height(theme::scaled(14.0))
             .flex_shrink(0.0_f32)
-            .margin_horiz(8.0)
+            .margin_horiz(theme::scaled(8.0))
             .background(theme::border())
     })
 }
@@ -5863,7 +5872,7 @@ fn filter_bar(gs: GridState) -> impl IntoView {
                         .style(|s| {
                             s.flex_shrink(0.0_f32)
                                 .items_center()
-                                .margin_left(6.0)
+                                .margin_left(theme::scaled(6.0))
                                 .color(theme::text())
                                 .cursor(CursorStyle::Default)
                                 .hover(|s| s.color(theme::text_dim()))
@@ -5880,12 +5889,12 @@ fn filter_bar(gs: GridState) -> impl IntoView {
                 .style(|s| {
                     s.items_center()
                         .flex_row()
-                        .gap(4.0)
+                        .gap(theme::scaled(4.0))
                         .width_full()
                         .height(theme::scaled(34.0))
                         .flex_shrink(0.0_f32)
                         .background(theme::bg_deepest())
-                        .padding_right(10.0)
+                        .padding_right(theme::scaled(10.0))
                         .border_bottom(1.0)
                         .border_color(theme::border())
                 })
@@ -6145,7 +6154,7 @@ fn grid_toolbar(
                         s.color(c).font_size(theme::font_label())
                     }),
             ))
-            .style(|s| s.flex_row().items_center().gap(4.0))
+            .style(|s| s.flex_row().items_center().gap(theme::scaled(4.0)))
             .on_event_cont(EventListener::PointerEnter, move |_| offer_hov.set(true))
             .on_event_cont(EventListener::PointerLeave, move |_| offer_hov.set(false))
             .on_click_stop(move |_| {
@@ -6218,7 +6227,7 @@ fn grid_toolbar(
                 text(label).style(move |s| {
                     s.font_size(theme::font_label())
                         .color(commit_color())
-                        .margin_left(4.0)
+                        .margin_left(theme::scaled(4.0))
                 }),
             ))
             .on_click_stop(move |_| commit_grid(gs))
@@ -6226,8 +6235,8 @@ fn grid_toolbar(
             .on_event_cont(EventListener::PointerLeave, move |_| commit_hov.set(false))
             .style(|s| {
                 s.items_center()
-                    .padding_vert(3.0)
-                    .padding_horiz(5.0)
+                    .padding_vert(theme::scaled(3.0))
+                    .padding_horiz(theme::scaled(5.0))
                     .cursor(CursorStyle::Default)
             })
             // The count beside the glyph is the one label in the strip, and a bare
@@ -6259,8 +6268,8 @@ fn grid_toolbar(
             .on_event_cont(EventListener::PointerLeave, move |_| discard_hov.set(false))
             .style(|s| {
                 s.items_center()
-                    .padding_vert(3.0)
-                    .padding_horiz(5.0)
+                    .padding_vert(theme::scaled(3.0))
+                    .padding_horiz(theme::scaled(5.0))
                     .cursor(CursorStyle::Default)
             })
             // "all", because it throws away the pending deletes and new rows too,
@@ -6275,7 +6284,7 @@ fn grid_toolbar(
                 }),
                 toolbar_sep(),
             ))
-            .style(|s| s.items_center().flex_row().gap(3.0))
+            .style(|s| s.items_center().flex_row().gap(theme::scaled(3.0)))
             .into_any()
         },
     );
@@ -6369,7 +6378,7 @@ fn grid_toolbar(
                 ),
                 toolbar_sep(),
             ))
-            .style(|s| s.items_center().flex_row().gap(3.0))
+            .style(|s| s.items_center().flex_row().gap(theme::scaled(3.0)))
             .into_any()
         },
     );
@@ -6437,8 +6446,8 @@ fn grid_toolbar(
     )
     .style(|s| {
         s.items_center()
-            .padding_vert(3.0)
-            .padding_horiz(5.0)
+            .padding_vert(theme::scaled(3.0))
+            .padding_horiz(theme::scaled(5.0))
             .cursor(CursorStyle::Default)
     })
     // Trailing `…` because it raises the format menu rather than copying — the
@@ -6493,8 +6502,8 @@ fn grid_toolbar(
     )
     .style(|s| {
         s.items_center()
-            .padding_vert(3.0)
-            .padding_horiz(5.0)
+            .padding_vert(theme::scaled(3.0))
+            .padding_horiz(theme::scaled(5.0))
             .cursor(CursorStyle::Default)
     })
     // Named against its twin: the two icons are identical but for the glyph, and
@@ -6615,8 +6624,8 @@ fn grid_toolbar(
             )
             .style(|s| {
                 s.items_center()
-                    .padding_vert(3.0)
-                    .padding_horiz(5.0)
+                    .padding_vert(theme::scaled(3.0))
+                    .padding_horiz(theme::scaled(5.0))
                     .cursor(CursorStyle::Default)
             })
             // A bare sparkle is the least self-describing glyph in the strip, and
@@ -6666,7 +6675,12 @@ fn grid_toolbar(
     // add a row, and a flex row shrinks its children before it overflows — so
     // without this the description won the fight and pushed the buttons off the
     // right edge of a narrow panel.
-    .style(|s| s.items_center().flex_row().gap(3.0).flex_shrink(0.0_f32));
+    .style(|s| {
+        s.items_center()
+            .flex_row()
+            .gap(theme::scaled(3.0))
+            .flex_shrink(0.0_f32)
+    });
 
     h_stack((
         stats,
@@ -6684,14 +6698,14 @@ fn grid_toolbar(
         s.width_full()
             .flex_row()
             .items_center()
-            .gap(6.0)
+            .gap(theme::scaled(6.0))
             .height(theme::scaled(28.0))
             .flex_shrink(0.0_f32)
-            .padding_left(12.0)
+            .padding_left(theme::scaled(12.0))
             // Less right padding than left: the copy icon carries its own 5px hitbox
             // padding, so 7 + 5 lands its glyph ~12px from the edge (matching the
             // left inset) instead of too far in.
-            .padding_right(7.0)
+            .padding_right(theme::scaled(7.0))
             .border_bottom(1.0)
             .border_color(theme::border())
     })
@@ -6804,7 +6818,7 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
                 .flex_shrink(0.0_f32)
                 .items_center()
                 .justify_end()
-                .padding_horiz(8.0)
+                .padding_horiz(theme::scaled(8.0))
                 .border_right(1.0)
                 .border_color(theme::border());
             if in_sel {
@@ -7049,7 +7063,7 @@ fn header_cell(
         icons::icon(chev, 14.0)
             .style(|s| {
                 s.color(theme::chip_active())
-                    .margin_left(7.0)
+                    .margin_left(theme::scaled(7.0))
                     .flex_shrink(0.0_f32)
             })
             .into_any()
@@ -7067,13 +7081,13 @@ fn header_cell(
     let type_line = text(type_name).style(|s| {
         s.font_size(theme::scaled_font(11.0))
             .color(theme::text_faint())
-            .margin_top(2.0)
+            .margin_top(theme::scaled(2.0))
     });
     let label = v_stack((name_row, type_line)).style(move |s| {
         let s = s
             .flex_col()
             .justify_center()
-            .gap(1.0)
+            .gap(theme::scaled(1.0))
             .min_width(0.0)
             .height_full();
         if numeric && key.is_none() {
@@ -7094,9 +7108,9 @@ fn header_cell(
                 .items_center()
                 .height_full()
                 .width_full()
-                .gap(8.0)
-                .padding_left(8.0)
-                .padding_right(10.0)
+                .gap(theme::scaled(8.0))
+                .padding_left(theme::scaled(8.0))
+                .padding_right(theme::scaled(10.0))
         })
         .into_any()
     } else {
@@ -7107,11 +7121,11 @@ fn header_cell(
                     // Right-aligned: extra right padding so the value doesn't hug the
                     // edge/border. Kept in sync with `data_cell` so the header lines
                     // up over its column's values.
-                    s.padding_left(10.0)
+                    s.padding_left(theme::scaled(10.0))
                         .padding_right(grid_num_pad_right())
                         .justify_end()
                 } else {
-                    s.padding_horiz(10.0).justify_start()
+                    s.padding_horiz(theme::scaled(10.0)).justify_start()
                 }
             })
             .into_any()

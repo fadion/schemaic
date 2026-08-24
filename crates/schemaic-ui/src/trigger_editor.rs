@@ -515,9 +515,14 @@ pub(crate) fn value_rows(
                         },
                     ),
                 ))
-                .style(|s| s.flex_row().items_center().gap(2.0).width_full())
+                .style(|s| {
+                    s.flex_row()
+                        .items_center()
+                        .gap(theme::scaled(2.0))
+                        .width_full()
+                })
             }))
-            .style(|s| s.flex_col().gap(6.0).width_full());
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
             // Last in the block, above every row — what you reach after walking
             // them.
             let add = control_button(
@@ -533,9 +538,9 @@ pub(crate) fn value_rows(
             );
             v_stack((
                 rows,
-                container(add).style(|s| s.width_full().margin_top(2.0)),
+                container(add).style(|s| s.width_full().margin_top(theme::scaled(2.0))),
             ))
-            .style(|s| s.flex_col().gap(6.0).width_full())
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
             .into_any()
         },
     )
@@ -856,12 +861,12 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         events,
         level,
         form_section("Condition").style(move |s| {
-            let s = s.margin_top(4.0);
+            let s = s.margin_top(theme::scaled(4.0));
             if has_when { s } else { s.hide() }
         }),
         when,
         update_of,
-        form_section("Action").style(|s| s.margin_top(4.0)),
+        form_section("Action").style(|s| s.margin_top(theme::scaled(4.0))),
         action,
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -1058,7 +1063,8 @@ fn pg_action(
     v_stack((
         form_setting_owned(
             "Function".to_string(),
-            h_stack((picker, edit_btn, new_btn)).style(|s| s.flex_row().items_center().gap(10.0)),
+            h_stack((picker, edit_btn, new_btn))
+                .style(|s| s.flex_row().items_center().gap(theme::scaled(10.0))),
         ),
         form_setting(
             "Arguments",
@@ -1297,10 +1303,11 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     target.schema.clone(),
                     ring.clone(),
                 ),
-                crate::widgets::autohide(scroll(
-                    container(detail)
-                        .style(|s| s.width_full().padding_left(18.0).padding_right(4.0)),
-                ))
+                crate::widgets::autohide(scroll(container(detail).style(|s| {
+                    s.width_full()
+                        .padding_left(theme::scaled(18.0))
+                        .padding_right(theme::scaled(4.0))
+                })))
                 .style(|s| s.flex_grow(1.0_f32).min_width(0.0).height_full()),
             ))
             .style(|s| {
@@ -1309,7 +1316,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     .flex_grow(1.0_f32)
                     .min_height(0.0)
                     .padding_horiz(modal_pad_h())
-                    .padding_vert(18.0)
+                    .padding_vert(theme::scaled(18.0))
                     .gap(0.0)
             });
 

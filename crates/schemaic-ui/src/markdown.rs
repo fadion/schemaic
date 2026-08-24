@@ -151,7 +151,7 @@ fn md_item(
                 .color(theme::text_dim())
                 .font_size(md_font_size())
                 .line_height(MD_LINE_HEIGHT)
-                .margin_right(4.0)
+                .margin_right(theme::scaled(4.0))
         }),
         inline_text(runs, base, false, md_font_size())
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
@@ -187,8 +187,8 @@ fn md_table(
                             s.flex_grow(1.0_f32)
                                 .flex_basis(0.0)
                                 .min_width(0.0)
-                                .padding_horiz(8.0)
-                                .padding_vert(4.0)
+                                .padding_horiz(theme::scaled(8.0))
+                                .padding_vert(theme::scaled(4.0))
                         })
                         .into_any()
                 })
@@ -216,7 +216,7 @@ fn md_table(
                 .border(1.0)
                 .border_color(theme::border())
                 .border_radius(6.0)
-                .margin_vert(2.0)
+                .margin_vert(theme::scaled(2.0))
         })
         .into_any()
 }
@@ -324,7 +324,9 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                     if let Some(lvl) = heading.take() {
                         let fs = heading_size(lvl);
                         let block = inline_text(std::mem::take(&mut runs), base, true, fs)
-                            .style(move |s| md_quote_wrap(s.width_full().padding_top(2.0), quote))
+                            .style(move |s| {
+                                md_quote_wrap(s.width_full().padding_top(theme::scaled(2.0)), quote)
+                            })
                             .into_any();
                         out.push(block);
                     }
@@ -419,7 +421,7 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                             s.width_full()
                                 .height(1.0)
                                 .background(theme::border())
-                                .margin_vert(4.0)
+                                .margin_vert(theme::scaled(4.0))
                         })
                         .into_any(),
                 );
@@ -440,7 +442,7 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
             ));
         }
     }
-    v_stack_from_iter(out).style(|s| s.flex_col().gap(6.0).width_full())
+    v_stack_from_iter(out).style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
 /// Callbacks the code-block action bar needs: insert the code as a new query tab,
@@ -525,8 +527,8 @@ fn card_button(label: &'static str, on_click: impl Fn() + 'static) -> impl IntoV
     text(label).on_click_stop(move |_| on_click()).style(|s| {
         crate::widgets::control_surface(s)
             .font_size(crate::widgets::toolbar_font())
-            .padding_horiz(10.0)
-            .padding_vert(5.0)
+            .padding_horiz(theme::scaled(10.0))
+            .padding_vert(theme::scaled(5.0))
             .flex_shrink(0.0_f32)
             .color(theme::text())
             .hover(|s| s.background(theme::control_hover()))
@@ -557,7 +559,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
                 }),
                 code_block(json, actions, "json", false),
             ))
-            .style(|s| s.flex_col().width_full().gap(5.0))
+            .style(|s| s.flex_col().width_full().gap(theme::scaled(5.0)))
             .into_any();
         }
     };
@@ -583,7 +585,12 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
                 .flex_shrink(0.0_f32)
         }),
     ))
-    .style(|s| s.flex_row().items_center().width_full().gap(7.0));
+    .style(|s| {
+        s.flex_row()
+            .items_center()
+            .width_full()
+            .gap(theme::scaled(7.0))
+    });
 
     // The model's own line about what the change is for, when it wrote one. Not
     // load-bearing — the preview lists every change in the app's words — so it
@@ -630,8 +637,8 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
         .style(|s| {
             s.flex_col()
                 .width_full()
-                .gap(7.0)
-                .padding(10.0)
+                .gap(theme::scaled(7.0))
+                .padding(theme::scaled(10.0))
                 .background(theme::bg_deepest())
                 .border(1.0)
                 .border_color(theme::border())
@@ -646,8 +653,8 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
             .font_family("monospace".to_string())
             .font_size(theme::font_body())
             .color(theme::text())
-            .padding_horiz(9.0)
-            .padding_vert(7.0)
+            .padding_horiz(theme::scaled(9.0))
+            .padding_vert(theme::scaled(7.0))
     });
 
     // What the block *is*, said once on the left. `is_sql` is the authority
@@ -704,15 +711,15 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
                 .color(theme::text_muted())
         }),
         empty().style(|s| s.flex_grow(1.0_f32)),
-        h_stack_from_iter(links).style(|s| s.flex_row().items_center().gap(10.0)),
+        h_stack_from_iter(links).style(|s| s.flex_row().items_center().gap(theme::scaled(10.0))),
     ))
     .style(|s| {
         s.width_full()
             .flex_row()
             .items_center()
             .height(theme::scaled(24.0))
-            .padding_horiz(8.0)
-            .gap(10.0)
+            .padding_horiz(theme::scaled(8.0))
+            .gap(theme::scaled(10.0))
             .background(theme::group_header_bg())
             .border_radius(CODE_RADIUS)
             .border_bottom(1.0)

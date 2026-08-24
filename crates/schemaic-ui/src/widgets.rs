@@ -1000,7 +1000,7 @@ fn modal_title_impl(
                 .style(|s| {
                     s.flex_shrink(0.0_f32)
                         .items_center()
-                        .padding(6.0)
+                        .padding(theme::scaled(6.0))
                         .color(theme::text_dim())
                         .hover(|s| s.color(theme::text()))
                 }),
@@ -1016,7 +1016,7 @@ fn modal_title_impl(
             .flex_row()
             .items_center()
             .padding_horiz(modal_pad_h())
-            .padding_vert(10.0)
+            .padding_vert(theme::scaled(10.0))
             .border_bottom(if border { 1.0 } else { 0.0 })
             .border_color(theme::border())
     })
@@ -1083,7 +1083,7 @@ pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static
 /// [`form_setting`] for a caption that isn't known at compile time.
 pub(crate) fn form_setting_owned(label: String, control: impl IntoView + 'static) -> impl IntoView {
     v_stack((text(label).style(form_label_style), control))
-        .style(|s| s.flex_col().gap(6.0).width_full())
+        .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
 /// A small bold section heading.
@@ -1206,8 +1206,8 @@ pub(crate) fn control_button_enabled(
         .style(move |s| {
             let s = control_surface(s)
                 .font_size(theme::font_body())
-                .padding_horiz(10.0)
-                .padding_vert(5.0)
+                .padding_horiz(theme::scaled(10.0))
+                .padding_vert(theme::scaled(5.0))
                 .flex_shrink(0.0_f32);
             if enabled {
                 s.color(theme::text())
@@ -1560,7 +1560,7 @@ pub(crate) fn modal_footer_split(
             .flex_row()
             .items_center()
             .padding_horiz(modal_pad_h())
-            .padding_vert(10.0)
+            .padding_vert(theme::scaled(10.0))
             .border_top(1.0)
             .border_color(theme::border())
     })
@@ -1570,9 +1570,9 @@ pub(crate) fn menu_item_style(s: floem::style::Style) -> floem::style::Style {
     s.width_full()
         .flex_row()
         .items_center()
-        .gap(8.0)
-        .padding_horiz(12.0)
-        .padding_vert(6.0)
+        .gap(theme::scaled(8.0))
+        .padding_horiz(theme::scaled(12.0))
+        .padding_vert(theme::scaled(6.0))
         .color(theme::text())
         .hover(|s| s.background(theme::accent().multiply_alpha(0.15)))
 }
@@ -1627,8 +1627,8 @@ pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
         .border(1.0)
         .border_color(theme::border())
         .border_radius(6.0)
-        .padding_horiz(9.0)
-        .padding_vert(6.0)
+        .padding_horiz(theme::scaled(9.0))
+        .padding_vert(theme::scaled(6.0))
         .box_shadow_blur(12.0)
         .box_shadow_spread(0.0)
         .box_shadow_v_offset(3.0)
@@ -1671,8 +1671,8 @@ pub(crate) fn toolbar_icon(
         s.items_center()
             .margin_top(mt)
             .margin_right(mr)
-            .padding_horiz(5.0)
-            .padding_vert(3.0)
+            .padding_horiz(theme::scaled(5.0))
+            .padding_vert(theme::scaled(3.0))
             .cursor(floem::style::CursorStyle::Default)
     })
 }
@@ -2204,7 +2204,7 @@ fn menu_row(
     h_stack_from_iter(kids)
         .style(menu_item_style)
         .style(move |s| {
-            let s = s.padding_vert(8.0);
+            let s = s.padding_vert(theme::scaled(8.0));
             // A disabled row suppresses the hover highlight so it reads as inert.
             if disabled {
                 s.hover(|h| h.background(floem::peniko::Color::TRANSPARENT))
@@ -2245,7 +2245,7 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
                 s.width_full()
                     .height(1.0)
                     .background(theme::border())
-                    .margin_vert(4.0)
+                    .margin_vert(theme::scaled(4.0))
             })
             .into_any(),
         MenuEntry::Action {
@@ -2343,7 +2343,7 @@ fn menu_stack(
             panel_style(s)
                 .background(theme::bg_chrome())
                 .min_width(width)
-                .padding_vert(6.0)
+                .padding_vert(theme::scaled(6.0))
                 .font_size(theme::font_title())
         })
 }
@@ -2353,10 +2353,13 @@ pub(crate) const CURSOR_MENU_GAP: f64 = 3.0;
 
 /// Estimated height (px) of the panel [`menu_panel`] builds for `entries`.
 ///
-/// Summed per entry *kind*: an action row is ≈30.5px (14px line + 8px padding on
-/// both sides − sub-pixel), a separator ≈9px (a 1px rule + 4px margins), plus the
-/// panel's own 6px vertical padding and 1px border on both sides. Counting
-/// separators as full rows shoved an upward-flipped panel tens of px too high.
+/// Summed per entry *kind*, **at the active interface scale**: an action row is
+/// ≈30.5px at 100% (14px line + 8px padding on both sides − sub-pixel), a
+/// separator ≈9px (a 1px rule + 4px margins), plus the panel's own 6px vertical
+/// padding and 1px border on both sides. Everything but the two hairlines grows
+/// with the scale, because everything but the two hairlines is drawn scaled.
+/// Counting separators as full rows shoved an upward-flipped panel tens of px
+/// too high.
 ///
 /// It is an estimate on purpose: it decides *placement*, not whether to flip, and
 /// measuring for real would mean laying the panel out first — which is what
@@ -2371,30 +2374,39 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
         .zip(entries)
         .filter(|(keep, _)| *keep)
         .map(|(_, e)| match e {
-            MenuEntry::Separator => SEPARATOR_H,
-            _ => theme::scaled(MENU_LINE_H) + MENU_ROW_PAD * 2.0,
+            MenuEntry::Separator => SEPARATOR_RULE_H + theme::scaled(SEPARATOR_MARGIN) * 2.0,
+            _ => theme::scaled(MENU_LINE_H) + theme::scaled(MENU_ROW_PAD) * 2.0,
         })
         .sum::<f64>()
-        + MENU_PANEL_CHROME
+        + theme::scaled(MENU_PANEL_PAD) * 2.0
+        + MENU_PANEL_BORDER * 2.0
 }
 
-/// A menu row's text line box at 100% (`font_title`'s 14px × ≈1.32), which is the
-/// only part of a row that the interface scale currently moves…
+/// A menu row's text line box at 100% (`font_title`'s 14px × ≈1.32).
 const MENU_LINE_H: f64 = 18.5;
-/// …because these three are literal paddings, and literal paddings are the part
-/// of the scale that hasn't landed yet (see `TODO.md`).
+/// A row's vertical padding at 100%.
 ///
-/// **Composed rather than scaled whole**, and that matters here: `scaled(30.5)`
-/// grew the *padding* too, over-predicting a sixteen-entry menu by ~190px at
-/// 200% and flipping menus that had room to open downwards. Summing what actually
-/// scales keeps the estimate honest at every size — and gives exactly 30.5 at
-/// Normal, which is what it was measured as. When the paddings do scale, these
-/// three move with them.
+/// **Composed of scaled parts rather than scaled whole**, and that is still the
+/// point even now that every part of it scales: each piece rounds to its own
+/// whole pixel, the way the styles that draw them do, where `scaled(30.5)` rounds
+/// the sum once and drifts from what the panel actually measures. It also keeps
+/// the estimate honest about the pieces that *don't* move — the two hairlines
+/// below — and gives exactly 30.5 at 100%, which is what a row was measured as.
+///
+/// (Before the paddings scaled, this was load-bearing for a much larger reason:
+/// `scaled(30.5)` grew a padding that the styles were leaving literal, which
+/// over-predicted a sixteen-entry menu by ~190px at 200% and flipped menus that
+/// had room to open downwards.)
 const MENU_ROW_PAD: f64 = 6.0;
-/// A separator: a 1px rule with 4px margins.
-const SEPARATOR_H: f64 = 9.0;
-/// The panel's own `padding_vert(6)` and its 1px border, both sides.
-const MENU_PANEL_CHROME: f64 = 14.0;
+/// A separator's rule. A hairline stays 1px at every scale — it is a rule, not a
+/// box — so unlike the margin below it, this one does not move.
+const SEPARATOR_RULE_H: f64 = 1.0;
+/// The air above and below that rule, which does.
+const SEPARATOR_MARGIN: f64 = 4.0;
+/// The panel's own vertical padding at 100%, both sides.
+const MENU_PANEL_PAD: f64 = 6.0;
+/// Its border, both sides — a hairline again, so literal.
+const MENU_PANEL_BORDER: f64 = 1.0;
 
 /// `entries` with its separators tidied: leading and trailing ones dropped, runs
 /// of two or more collapsed to one, and the same applied inside every submenu.
@@ -3420,8 +3432,8 @@ pub(crate) fn section_title(t: &'static str) -> impl IntoView {
         s.font_size(theme::font_title())
             .font_bold()
             .color(theme::text_muted())
-            .padding_horiz(12.0)
-            .padding_vert(8.0)
+            .padding_horiz(theme::scaled(12.0))
+            .padding_vert(theme::scaled(8.0))
     })
 }
 
@@ -3443,7 +3455,7 @@ pub(crate) fn centered_msg(
             .width_full()
             .items_center()
             .justify_center()
-            .padding(16.0)
+            .padding(theme::scaled(16.0))
     })
 }
 
@@ -3879,8 +3891,8 @@ pub(crate) fn toggle_icon_view_gated(
             let s = s
                 .items_center()
                 .flex_shrink(0.0_f32)
-                .padding_vert(3.0)
-                .padding_horiz(5.0);
+                .padding_vert(theme::scaled(3.0))
+                .padding_horiz(theme::scaled(5.0));
             if !enabled() {
                 s.color(theme::chip_idle().multiply_alpha(0.3))
             } else if active() {
@@ -4958,23 +4970,33 @@ mod menu_placement_tests {
     }
 
     /// The estimate is measured in pixels of a *real* row, so it has to stay
-    /// exactly 30.5 + chrome at Normal — and it must grow by the text only, since
-    /// the row's padding doesn't scale yet. `scaled(30.5)` grew both and
-    /// over-predicted a long menu by enough (≈12px a row) to flip menus that had
-    /// room below them, which is half of why they ended up in the window's
-    /// corner.
+    /// exactly 30.5 + chrome at 100% — and it has to grow the way the row it
+    /// predicts actually grows.
+    ///
+    /// Now that the paddings scale, that means the text **and** the padding move.
+    /// What must not move is the panel's two 1px borders: they are hairlines, the
+    /// styles draw them literal at every scale, and the third assertion is what
+    /// pins them, since an empty panel is chrome and nothing else. Summing the
+    /// parts (rather than `scaled(44.5)`) is what lets the two behave
+    /// differently at all — and each part rounds to its own whole pixel, the way
+    /// the style that draws it does.
     #[test]
-    fn a_menu_row_grows_by_its_text_and_not_its_padding() {
+    fn the_menu_estimate_scales_its_boxes_but_not_its_hairlines() {
         let one = [MenuEntry::action("x", || {})];
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        // row (18.5 line + 6 padding both sides) + chrome (6 padding + 1 border,
+        // both sides).
         assert_eq!(menu_panel_height(&one), 30.5 + 14.0);
 
         crate::theme::set_ui_scale(crate::theme::UiScale::Huge);
-        let huge = menu_panel_height(&one);
-        assert_eq!(huge, 30.0 + 12.0 + 14.0);
-        assert!(
-            huge < crate::theme::scaled(30.5) + 14.0,
-            "{huge} is the whole row scaled, padding and all"
+        // 18.5 → 30 and 6 → 10, so the row is 50 and the panel's padding 20; the
+        // borders are still 1px each.
+        assert_eq!(menu_panel_height(&one), 50.0 + 22.0);
+        assert_eq!(
+            menu_panel_height(&[]),
+            22.0,
+            "an empty panel is 20 of scaled padding and 2 of border that must not \
+             have scaled with it"
         );
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
     }

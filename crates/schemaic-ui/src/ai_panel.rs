@@ -236,8 +236,8 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                             .style(|s| {
                                 s.font_size(theme::scaled_font(14.0))
                                     .color(theme::text_muted())
-                                    .padding_top(10.0)
-                                    .padding_left(12.0)
+                                    .padding_top(theme::scaled(10.0))
+                                    .padding_left(theme::scaled(12.0))
                             })
                             .into_any()
                     },
@@ -352,9 +352,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 s.flex_col()
                     .width(panel_w.get())
                     .min_height(floor.get())
-                    .gap(16.0)
-                    .padding_top(10.0)
-                    .padding_bottom(10.0)
+                    .gap(theme::scaled(16.0))
+                    .padding_top(theme::scaled(10.0))
+                    .padding_bottom(theme::scaled(10.0))
             })
             .into_any()
         },
@@ -685,7 +685,7 @@ fn ai_input_row(
     .style(|s| s.width_full());
     container(field).style(|s| {
         s.width_full()
-            .padding(8.0)
+            .padding(theme::scaled(8.0))
             .border_top(1.0)
             .border_color(theme::border())
     })
@@ -760,7 +760,7 @@ fn sent_attachment(
         s.width_full()
             .flex_row()
             .items_center()
-            .gap(6.0)
+            .gap(theme::scaled(6.0))
             .apply_if(retained, |s| s.cursor(CursorStyle::Default))
     });
     let rows = dyn_container(move || open.get() && retained, {
@@ -791,8 +791,8 @@ fn sent_attachment(
     v_stack((head, rows)).style(|s| {
         s.flex_col()
             .width_full()
-            .gap(6.0)
-            .padding(8.0)
+            .gap(theme::scaled(6.0))
+            .padding(theme::scaled(8.0))
             .background(theme::bg_deepest())
             .border(1.0)
             .border_color(theme::border())
@@ -846,9 +846,9 @@ fn attachment_chip(
                 s.width_full()
                     .flex_row()
                     .items_center()
-                    .gap(6.0)
-                    .padding_horiz(8.0)
-                    .padding_vert(5.0)
+                    .gap(theme::scaled(6.0))
+                    .padding_horiz(theme::scaled(8.0))
+                    .padding_vert(theme::scaled(5.0))
                     .border(1.0)
                     .border_radius(6.0)
                     .border_color(theme::border())
@@ -864,7 +864,9 @@ fn attachment_chip(
     .style(move |s| {
         let on = staged.with(|a| a.is_some());
         s.width_full().apply_if(on, |s| {
-            s.padding_horiz(8.0).padding_top(8.0).padding_bottom(4.0)
+            s.padding_horiz(theme::scaled(8.0))
+                .padding_top(theme::scaled(8.0))
+                .padding_bottom(theme::scaled(4.0))
         })
     })
 }
@@ -880,7 +882,7 @@ fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
     .style(|s| {
         s.width_full()
             .height(theme::scaled(34.0))
-            .padding_top(9.0)
+            .padding_top(theme::scaled(9.0))
             .padding_left(chat_pad_h())
             .background(theme::bg_deepest())
             .border(1.0)
@@ -890,7 +892,7 @@ fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
     container(box_)
         .style(|s| {
             s.width_full()
-                .padding(8.0)
+                .padding(theme::scaled(8.0))
                 .border_top(1.0)
                 .border_color(theme::border())
         })
@@ -932,7 +934,7 @@ fn message_bubble(
         });
         match m.attachment {
             Some(a) => v_stack((sent_attachment(a, attach_open), recap))
-                .style(|s| s.flex_col().width_full().gap(6.0))
+                .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
                 .into_any(),
             None => recap.into_any(),
         }
@@ -974,20 +976,20 @@ fn message_bubble(
         // label sits at the bubble's right edge (12px inset).
         v_stack((
             h_stack((empty().style(|s| s.flex_grow(1.0_f32)), label))
-                .style(|s| s.width_full().flex_row().padding_right(12.0)),
+                .style(|s| s.width_full().flex_row().padding_right(theme::scaled(12.0))),
             h_stack((
                 empty().style(|s| s.flex_grow(1.0_f32)),
                 container(body).style(|s| {
                     s.background(theme::bubble_user_bg())
                         .border_radius(7.0)
-                        .padding_horiz(10.0)
-                        .padding_vert(8.0)
+                        .padding_horiz(theme::scaled(10.0))
+                        .padding_vert(theme::scaled(8.0))
                         .max_width_pct(88.0)
                 }),
             ))
-            .style(|s| s.width_full().flex_row().padding_horiz(12.0)),
+            .style(|s| s.width_full().flex_row().padding_horiz(theme::scaled(12.0))),
         ))
-        .style(|s| s.flex_col().width_full().gap(5.0))
+        .style(|s| s.flex_col().width_full().gap(theme::scaled(5.0)))
     } else {
         // Claude's turn is **not** a bubble. It sits directly on the panel and is
         // marked only by a 2px accent rule down its *right* edge — the side the
@@ -1000,11 +1002,11 @@ fn message_bubble(
         // reply reclaims those 13px and its two insets match — a reply that kept
         // padding for a rule that isn't drawn would just sit off-centre.
         v_stack((
-            container(label).style(|s| s.padding_left(12.0)),
+            container(label).style(|s| s.padding_left(theme::scaled(12.0))),
             container(body).style(move |s| {
-                let s = s.margin_horiz(12.0);
+                let s = s.margin_horiz(theme::scaled(12.0));
                 if gutter.get() {
-                    s.padding_right(11.0)
+                    s.padding_right(theme::scaled(11.0))
                         .border_right(2.0)
                         .border_color(theme::accent())
                 } else {
@@ -1012,7 +1014,7 @@ fn message_bubble(
                 }
             }),
         ))
-        .style(|s| s.flex_col().width_full().gap(5.0))
+        .style(|s| s.flex_col().width_full().gap(theme::scaled(5.0)))
     };
 
     // Entrance pop (slide in from the bubble's side + a slight scale), only on a
@@ -1071,7 +1073,7 @@ fn render_segments(
         }
         Seg::Tool(tc) => tool_chip(tc).into_any(),
     }))
-    .style(|s| s.flex_col().gap(6.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
 /// A footer action icon (copy / regenerate): 16px, footer-text colour, brightens
@@ -1132,8 +1134,12 @@ fn assistant_footer(
         });
         // Nudged 2px up: the icons are optically low against the summary text
         // beside them, whose glyphs sit above their own line box's centre.
-        let icons_style =
-            |s: floem::style::Style| s.flex_row().items_center().gap(10.0).margin_top(-2.0);
+        let icons_style = |s: floem::style::Style| {
+            s.flex_row()
+                .items_center()
+                .gap(theme::scaled(10.0))
+                .margin_top(theme::scaled(-2.0))
+        };
         if is_last {
             h_stack((copy, footer_icon(icons::REFRESH_CW, move || (regenerate)())))
                 .style(icons_style)
@@ -1151,7 +1157,7 @@ fn assistant_footer(
     let row = h_stack((left, empty().style(|s| s.flex_grow(1.0_f32)), actions))
         .style(|s| s.width_full().flex_row().items_center());
     container(row)
-        .style(|s| s.width_full().margin_top(9.0))
+        .style(|s| s.width_full().margin_top(theme::scaled(9.0)))
         .into_any()
 }
 
@@ -1190,7 +1196,7 @@ fn tool_chip(tc: ToolCall) -> impl IntoView {
                 .color(theme::text_dim())
         }),
     ))
-    .style(|s| s.flex_row().items_center().gap(6.0));
+    .style(|s| s.flex_row().items_center().gap(theme::scaled(6.0)));
 
     let sql_view = match tc.sql.clone() {
         Some(sql) => text(sql.trim().to_string())
@@ -1217,10 +1223,10 @@ fn tool_chip(tc: ToolCall) -> impl IntoView {
                     .font_family("monospace".to_string())
                     .font_size(theme::font_label())
                     .color(c)
-                    .padding_top(4.0)
+                    .padding_top(theme::scaled(4.0))
                     .border_top(1.0)
                     .border_color(theme::border())
-                    .margin_top(4.0)
+                    .margin_top(theme::scaled(4.0))
             })
             .into_any(),
         None => empty().into_any(),
@@ -1228,9 +1234,9 @@ fn tool_chip(tc: ToolCall) -> impl IntoView {
 
     v_stack((header, sql_view, result_view)).style(|s| {
         s.flex_col()
-            .gap(4.0)
+            .gap(theme::scaled(4.0))
             .width_full()
-            .padding(8.0)
+            .padding(theme::scaled(8.0))
             .background(theme::bg_deepest())
             .border(1.0)
             .border_color(theme::border())

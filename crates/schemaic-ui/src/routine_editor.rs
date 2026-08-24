@@ -742,11 +742,15 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     rows.extend(arguments.map(IntoView::into_any));
     rows.extend(returns.map(IntoView::into_any));
     rows.extend(language.map(IntoView::into_any));
-    rows.push(form_section("Body").style(|s| s.margin_top(4.0)).into_any());
+    rows.push(
+        form_section("Body")
+            .style(|s| s.margin_top(theme::scaled(4.0)))
+            .into_any(),
+    );
     rows.push(body.into_any());
     rows.push(
         form_section("Options")
-            .style(|s| s.margin_top(4.0))
+            .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
     rows.extend(options);
@@ -827,7 +831,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                 routine_form(ui.clone(), &target, ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
-                        .padding_vert(18.0)
+                        .padding_vert(theme::scaled(18.0))
                 }),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
