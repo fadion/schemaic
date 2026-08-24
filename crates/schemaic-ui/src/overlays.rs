@@ -19,10 +19,11 @@ use schemaic_core::model::QueryState;
 use schemaic_core::schema::{SchemaState, TableSource, db_visible};
 use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton};
 
-use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
+use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
 use crate::widgets::{
-    ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, dialog_button, focus_root,
-    measure_text_px_at, menu_item_style, menu_panel, menu_panel_height, panel_style, window_size,
+    ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_insets, dialog_button,
+    focus_root, measure_text_px_at, menu_inset, menu_item_style, menu_panel, menu_panel_height,
+    modal_body_h, modal_w, panel_style, window_size,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
@@ -31,7 +32,9 @@ use crate::{
 
 /// Width of the schema tree's context menu (its panel's `min_width`), which is
 /// also what its placement flips against.
-const CTX_MENU_W: f64 = 170.0;
+fn ctx_menu_w() -> f64 {
+    theme::scaled(170.0)
+}
 
 /// How far left of its icon a SCHEMA dropdown opens, so the panel overlaps the
 /// glyph it belongs to rather than starting beside it.
@@ -40,7 +43,9 @@ const MENU_ICON_TUCK: f64 = 30.0;
 /// The activity panel's interval dropdown, at a fixed width so it can be
 /// right-aligned to its icon exactly (a content-sized panel would have to be
 /// measured first, and the four labels here are two characters each).
-const ACTIVITY_MENU_W: f64 = 96.0;
+fn activity_menu_w() -> f64 {
+    theme::scaled(96.0)
+}
 
 /// How close to a window edge an anchored menu may sit before it is pushed back.
 const MENU_EDGE_PAD: f64 = 4.0;
@@ -60,7 +65,7 @@ const MENU_ICON_DROP: f64 = 3.0;
 /// something you summoned rather than something that interrupted you.
 ///
 /// From the window's top edge, not its container's: `find_overlay` sits in the
-/// modal layer, which starts `theme::HEADER_H` down, and that is subtracted
+/// modal layer, which starts `theme::header_h()` down, and that is subtracted
 /// where the margin is set.
 const FIND_TOP: f64 = 80.0;
 
@@ -422,7 +427,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     let dot =
                         container(icons::icon(icons::DOT, 6.0).style(move |s| s.color(dot_color)))
                             .style(|s| {
-                                s.width(14.0)
+                                s.width(theme::scaled(14.0))
                                     .flex_shrink(0.0_f32)
                                     .items_center()
                                     .justify_center()
@@ -452,7 +457,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                         text(name).style(|s| s.color(theme::conn_list_text())),
                         empty().style(|s| s.flex_grow(1.0_f32).min_width(20.0)),
                         text(c.endpoint())
-                            .style(|s| s.color(theme::text_faint()).font_size(theme::FONT_LABEL)),
+                            .style(|s| s.color(theme::text_faint()).font_size(theme::font_label())),
                     ))
                     .on_click_stop(move |_| {
                         (switch)(id);
@@ -502,14 +507,14 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     .background(theme::bg_chrome())
                     // Paired with the 15-char name limit above — see the note
                     // there. Neither number moves without the other.
-                    .min_width(350.0)
+                    .min_width(theme::scaled(350.0))
                     .padding_vert(6.0)
                     .margin_left(36.0)
                     // 3px below the switcher button (which sits ~HEADER_H-7 down).
-                    .margin_top(theme::HEADER_H - 4.0)
+                    .margin_top(theme::header_h() - 4.0)
                     // Match the switcher button's size (the shell sets this, but
                     // overlays are siblings of the shell and don't inherit it).
-                    .font_size(theme::FONT_TITLE)
+                    .font_size(theme::font_title())
             });
 
             // Transparent full-window layer: click outside the panel or Escape closes.
@@ -636,15 +641,15 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
                     let a = anchor.get();
                     panel_style(s)
                         .background(theme::bg_chrome())
-                        .width(DB_MENU_W)
+                        .width(db_menu_w())
                         .padding_vert(6.0)
                         // Right edge aligns to the trigger's right edge. `a.y` is the
                         // button *box* bottom, which sits 3px below the chevron (the
                         // trigger's `padding_vert(3)`) — so anchoring flush here puts the
                         // popup ~3px under the glyph, matching the schema eye/settings menus.
-                        .margin_left((a.x - DB_MENU_W).max(0.0))
+                        .margin_left((a.x - db_menu_w()).max(0.0))
                         .margin_top(a.y)
-                        .font_size(theme::FONT_TITLE)
+                        .font_size(theme::font_title())
                 });
 
             focus_root(stack((
@@ -749,9 +754,9 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| {
                     panel_style(s)
                         .background(theme::bg_chrome())
-                        .min_width(170.0)
+                        .min_width(theme::scaled(170.0))
                         .padding_vert(6.0)
-                        .font_size(theme::FONT_TITLE)
+                        .font_size(theme::font_title())
                 })
                 .into_any()
         },
@@ -842,9 +847,9 @@ pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
             .style(|s| {
                 panel_style(s)
                     .background(theme::bg_chrome())
-                    .width(ACTIVITY_MENU_W)
+                    .width(activity_menu_w())
                     .padding_vert(6.0)
-                    .font_size(theme::FONT_TITLE)
+                    .font_size(theme::font_title())
             })
             .into_any()
         },
@@ -858,8 +863,8 @@ pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
         // Right edge against the icon's, tucked outward by the same amount the
         // schema menus tuck inward so the panel overlaps its own icon; then
         // clamped so neither edge leaves the window.
-        let left = (a.x + MENU_ICON_TUCK - ACTIVITY_MENU_W)
-            .min(win_w - ACTIVITY_MENU_W - MENU_EDGE_PAD)
+        let left = (a.x + MENU_ICON_TUCK - activity_menu_w())
+            .min(win_w - activity_menu_w() - MENU_EDGE_PAD)
             .max(MENU_EDGE_PAD);
         s.absolute()
             .inset_left(left)
@@ -956,9 +961,9 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| {
                     panel_style(s)
                         .background(theme::bg_chrome())
-                        .min_width(150.0)
+                        .min_width(theme::scaled(150.0))
                         .padding_vert(6.0)
-                        .font_size(theme::FONT_TITLE)
+                        .font_size(theme::font_title())
                 })
                 .into_any()
         },
@@ -2008,7 +2013,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
             };
             // Dismissal is a root-level pointer-down handler (see `workspace`); the
             // panel absorbs its own pointer-downs so it isn't closed mid-click.
-            menu_panel((render)(menu), Rc::new(move || ctx.set(None)), CTX_MENU_W).into_any()
+            menu_panel((render)(menu), Rc::new(move || ctx.set(None)), ctx_menu_w()).into_any()
         },
     )
     // Open at the cursor, flipping to the other side of it at a window edge — the
@@ -2025,8 +2030,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
         // however the menu was raised.
         let from = menu.at.unwrap_or_else(|| last_mouse.get_untracked());
         let h = menu_panel_height(&(build)(menu));
-        let (x, y) = cursor_menu_pos(from, (CTX_MENU_W, h), window_size().get(), CURSOR_MENU_GAP);
-        s.absolute().inset_left(x).inset_top(y)
+        let (x, y) = cursor_menu_insets(
+            from,
+            (ctx_menu_w(), h),
+            window_size().get(),
+            CURSOR_MENU_GAP,
+        );
+        y.apply_y(x.apply_x(s.absolute()))
     })
 }
 
@@ -2078,7 +2088,7 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
                 };
                 s.absolute()
                     .inset_left(x)
-                    .inset_bottom(theme::FOOTER_H + 5.0)
+                    .inset_bottom(theme::footer_h() + 5.0)
             }
             // Toolbar dropdown (grid Copy): drop 5px below the icon, tucked under it
             // (left edge 40px left of the icon's right edge, so it overlaps the icon
@@ -2092,24 +2102,25 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
                 } else {
                     open_x.max(0.0)
                 };
-                let y = if wh > 1.0 && bottom + 5.0 + ph > wh {
-                    (bottom - 5.0 - ph).max(0.0)
-                } else {
-                    bottom + 5.0
-                };
-                s.absolute().inset_left(x).inset_top(y)
+                // The vertical placement goes through the shared `menu_inset`:
+                // `ph` is only an estimate, so it may choose the edge and nothing
+                // more. Subtracting it from the anchor put the panel's real bottom
+                // wherever the estimate was wrong, and clamped a scaled menu to
+                // the top of the window.
+                let y = menu_inset(bottom, ph, wh, 5.0);
+                y.apply_y(s.absolute().inset_left(x))
             }
             // Cursor menus (right-click): open at the pointer, flipping to the
             // other side of it at either edge — the shared rule, which the schema
             // tree's menu now uses too.
             None => {
-                let (x, y) = cursor_menu_pos(
+                let (x, y) = cursor_menu_insets(
                     last_mouse.get_untracked(),
                     (pw, ph),
                     (ww, wh),
                     CURSOR_MENU_GAP,
                 );
-                s.absolute().inset_left(x).inset_top(y)
+                y.apply_y(x.apply_x(s.absolute()))
             }
         }
     })
@@ -2470,7 +2481,7 @@ fn search_result_item(
 fn highlighted_primary(primary: &str, term: &Option<String>) -> AnyView {
     let seg = |t: &str, hit: bool| {
         text(t.to_string()).style(move |s| {
-            let s = s.font_size(14.0);
+            let s = s.font_size(theme::scaled_font(14.0));
             if hit {
                 s.color(theme::match_highlight()).font_bold()
             } else {
@@ -3603,7 +3614,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         // with the typed text.
                         .style(|s| {
                             s.color(theme::placeholder())
-                                .font_size(16.0)
+                                .font_size(theme::scaled_font(16.0))
                                 .line_height(1.46)
                         })
                         .into_any(),
@@ -3612,9 +3623,13 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             )
             .style(move |s| {
                 // Right after the typed text: box border (1) + horizontal padding +
-                // the measured width of the query at the field's 16px font.
-                let x = 1.0 + CHAT_PAD_H + measure_text_px_at(&query.get(), 16.0);
-                s.absolute().inset_left(x).inset_top(1.0 + CHAT_PAD_V)
+                // the measured width of the query **at the size the field draws
+                // it**. `search_box` passes `|| theme::scaled_font(16.0)`, so a
+                // literal 16 here measured half the rendered width at 200% and
+                // laid the ghost suffix on top of the query instead of after it.
+                let x =
+                    1.0 + chat_pad_h() + measure_text_px_at(&query.get(), crate::palette_font());
+                s.absolute().inset_left(x).inset_top(1.0 + chat_pad_v())
             })
             .pointer_events(|| false);
             let input = stack((field, ghost)).style(|s| s.width_full());
@@ -3633,7 +3648,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         return text("Nothing found")
                             .style(|s| {
                                 s.color(theme::text_muted())
-                                    .font_size(14.0)
+                                    .font_size(theme::scaled_font(14.0))
                                     .padding_horiz(12.0)
                                     .padding_vert(9.0)
                             })
@@ -3658,7 +3673,10 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         cells.push(highlighted_primary(&item.primary, &item.match_term).into_any());
                         cells.push(
                             text(item.secondary.clone())
-                                .style(|s| s.color(theme::text_muted()).font_size(14.0))
+                                .style(|s| {
+                                    s.color(theme::text_muted())
+                                        .font_size(theme::scaled_font(14.0))
+                                })
                                 .into_any(),
                         );
                         // Trailing keycap and history marker, pushed to the far
@@ -3675,7 +3693,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                                 text(keys)
                                     .style(|s| {
                                         s.color(theme::text_muted())
-                                            .font_size(theme::FONT_LABEL)
+                                            .font_size(theme::font_label())
                                             .font_family("IBM Plex Mono".to_string())
                                             .background(theme::bg_deepest())
                                             .padding_horiz(6.0)
@@ -3752,7 +3770,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     // an empty list collapses the container, so the panel's padding
                     // stays even around the bare box.
                     .style(move |s| {
-                        let s = s.width_full().max_height(360.0);
+                        let s = s.width_full().max_height(modal_body_h(360.0));
                         if items.with(|l| l.is_empty()) {
                             s
                         } else {
@@ -3763,7 +3781,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| {
                 panel_style(s)
-                    .width(580.0)
+                    .width(modal_w(580.0))
                     .padding(15.0)
                     // 80px from the top of the *window*, which is not the top of
                     // this margin's container: the modal layer every backdrop
@@ -3771,7 +3789,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     // off the figure. Written as the subtraction rather than as
                     // the answer, because 40 next to a 40px-tall title bar reads
                     // like a coincidence.
-                    .margin_top(FIND_TOP - theme::HEADER_H)
+                    .margin_top(FIND_TOP - theme::header_h())
                     .border_color(theme::modal_border())
             });
 
@@ -3894,15 +3912,15 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
 
             let panel = v_stack((
                 text("Open transaction").style(|s| {
-                    s.font_size(15.0)
+                    s.font_size(theme::scaled_font(15.0))
                         .font_bold()
                         .color(theme::text())
                         .margin_bottom(10.0)
                 }),
                 text(body).style(|s| {
-                    s.width(420.0)
+                    s.width(theme::scaled(420.0))
                         .color(theme::text())
-                        .font_size(theme::FONT_BODY)
+                        .font_size(theme::font_body())
                         .line_height(1.4)
                 }),
                 h_stack((
@@ -3922,7 +3940,7 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| {
                 panel_style(s)
-                    .width(470.0)
+                    .width(modal_w(470.0))
                     .padding(20.0)
                     .flex_col()
                     .border_color(theme::modal_border())
@@ -4018,15 +4036,15 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
 
             let panel = v_stack((
                 text(c.title).style(|s| {
-                    s.font_size(15.0)
+                    s.font_size(theme::scaled_font(15.0))
                         .font_bold()
                         .color(theme::text())
                         .margin_bottom(10.0)
                 }),
                 text(c.message).style(|s| {
-                    s.width(380.0)
+                    s.width(theme::scaled(380.0))
                         .color(theme::text())
-                        .font_size(theme::FONT_BODY)
+                        .font_size(theme::font_body())
                         .line_height(1.4)
                 }),
                 h_stack((empty().style(|s| s.flex_grow(1.0_f32)), no, yes)).style(|s| {
@@ -4041,7 +4059,7 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| {
                 panel_style(s)
-                    .width(430.0)
+                    .width(modal_w(430.0))
                     .padding(20.0)
                     .flex_col()
                     .border_color(theme::modal_border())
@@ -4124,17 +4142,21 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // for short errors; it grows to `max_height` then scrolls if long.
             let panel = container(
                 autohide(scroll(text(msg).style(|s| {
-                    s.width(450.0)
+                    s.width(theme::scaled(450.0))
                         .color(theme::error())
-                        .font_size(theme::FONT_BODY)
+                        .font_size(theme::font_body())
                         .line_height(1.4)
                 })))
-                .style(|s| s.width_full().min_height(160.0).max_height(360.0)),
+                .style(|s| {
+                    s.width_full()
+                        .min_height(theme::scaled(160.0))
+                        .max_height(modal_body_h(360.0))
+                }),
             )
             .on_click_stop(|_| {})
             .style(|s| {
                 panel_style(s)
-                    .width(500.0)
+                    .width(modal_w(500.0))
                     .padding(20.0)
                     .border_color(theme::modal_border())
             });

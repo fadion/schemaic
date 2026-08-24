@@ -36,31 +36,50 @@ use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::monitor::{ChangeKind, LOG_FORMATS, RowChange, log_result_set};
 
 use crate::settings::focusable_dropdown;
-use crate::theme::{FONT_BODY, FONT_LABEL};
+use crate::theme::{font_body, font_label};
 use crate::widgets::{
-    autohide_state, follow_after_scroll, loading_dots, panel_style, shift_hscroll, thin_scroll,
-    with_scroll_gesture,
+    autohide_state, follow_after_scroll, loading_dots, modal_h, modal_w, panel_style,
+    shift_hscroll, thin_scroll, with_scroll_gesture,
 };
 use crate::{MenuEntry, PopupAnchor};
 
 /// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
-/// a little tighter than the AI panel's `FOLLOW_SLACK`.
-const MONITOR_FOLLOW_SLACK: f64 = 24.0;
+/// a little tighter than the AI panel's `follow_slack`. Scaled for the reason
+/// that one is: it is compared against offsets measured in line boxes.
+fn monitor_follow_slack() -> f64 {
+    theme::scaled(24.0)
+}
 use crate::{MonitorEntry, Ui, icons, theme};
 
 /// Modal size (fixed so the log scrolls within it). The width carries the
 /// sub-header's three icon buttons and the interval dropdown alongside a status
 /// line that has to stay readable — at 660 the partial-window warning wrapped
 /// into the controls.
-const MON_W: f64 = 760.0;
+fn mon_w() -> f64 {
+    modal_w(760.0)
+}
+/// The modal's height at 100% — passed through [`crate::widgets::modal_h`] at the
+/// call site, which scales it and caps it against the window. See
+/// `table_designer::PANEL_H` for why this comment used to claim the opposite.
 const MON_H: f64 = 510.0;
 
-// Column widths + shared row metrics (header and rows must agree so they align).
-const TIME_W: f64 = 54.0;
-const ACT_W: f64 = 66.0;
-const ID_W: f64 = 72.0;
-const COL_GAP: f64 = 10.0;
-const ROW_PAD_H: f64 = 14.0;
+// Column widths + shared row metrics (header and rows must agree so they align —
+// which is also why they scale together).
+fn time_w() -> f64 {
+    theme::scaled(54.0)
+}
+fn act_w() -> f64 {
+    theme::scaled(66.0)
+}
+fn id_w() -> f64 {
+    theme::scaled(72.0)
+}
+fn col_gap() -> f64 {
+    theme::scaled(10.0)
+}
+fn row_pad_h() -> f64 {
+    theme::scaled(14.0)
+}
 
 /// Old-value tint (removed) and new-value tint (added), shared by updates + inserts.
 fn old_color() -> Color {
@@ -157,7 +176,11 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 .unwrap_or_else(|| "Live Monitor".to_string());
             let close_x = close.clone();
             let modal_header = h_stack((
-                text(heading).style(|s| s.font_size(15.0).font_bold().color(theme::text())),
+                text(heading).style(|s| {
+                    s.font_size(theme::scaled_font(15.0))
+                        .font_bold()
+                        .color(theme::text())
+                }),
                 empty().style(|s| s.flex_grow(1.0_f32)),
                 container(icons::icon(icons::X, 16.0))
                     .on_click_stop(move |_| (close_x)())
@@ -194,7 +217,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     )
                 },
                 move |(msg, tone)| {
-                    text(msg).style(move |s| s.color(tone.color()()).font_size(FONT_LABEL))
+                    text(msg).style(move |s| s.color(tone.color()()).font_size(font_label()))
                 },
             )
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
@@ -372,7 +395,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 ring.clone(),
                 13,
             ))
-            .style(|s| s.width(84.0).flex_shrink(0.0_f32));
+            .style(|s| s.width(theme::scaled(84.0)).flex_shrink(0.0_f32));
             let status = h_stack((status_text, controls, interval_dd)).style(|s| {
                 s.width_full()
                     .flex_row()
@@ -414,10 +437,13 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                                     // "any moment now", and a paused monitor is not
                                     // waiting for anything.
                                     return text("Paused.")
-                                        .style(|s| s.color(theme::text_dim()).font_size(13.0))
+                                        .style(|s| {
+                                            s.color(theme::text_dim())
+                                                .font_size(theme::scaled_font(13.0))
+                                        })
                                         .into_any();
                                 }
-                                loading_dots("Waiting", theme::text_dim, 13.0).into_any()
+                                loading_dots("Waiting", theme::text_dim, font_body).into_any()
                             },
                         ))
                         .style(|s| s.size_full().items_center().justify_center())
@@ -454,7 +480,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     )
                     .style(|s| {
                         s.flex_col()
-                            .padding_horiz(ROW_PAD_H)
+                            .padding_horiz(row_pad_h())
                             .padding_vert(8.0)
                             .gap(2.0)
                     });
@@ -476,7 +502,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                                 (by_user)(),
                                 vp.y1,
                                 content_h.get_untracked(),
-                                MONITOR_FOLLOW_SLACK,
+                                monitor_follow_slack(),
                             );
                             if follow.get_untracked() != keep {
                                 follow.set(keep);
@@ -505,8 +531,8 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 .on_click_stop(|_| {})
                 .style(|s| {
                     panel_style(s)
-                        .width(MON_W)
-                        .height(MON_H)
+                        .width(mon_w())
+                        .height(modal_h(MON_H))
                         .background(theme::bg_panel())
                         .border_color(theme::modal_border())
                 });
@@ -544,28 +570,34 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
 /// The bold, left-aligned column header row (`Time · Action · ID · Data`), sized
 /// to match [`entry_row`]'s columns so they line up.
 fn header_row() -> impl IntoView {
-    let cell = |t: &'static str, w: Option<f64>| {
+    // The width arrives as a `fn`, resolved inside the closure — the rows below
+    // call `time_w()`/`act_w()`/`id_w()` in *their* style closures, so a header
+    // that captured the numbers at build stopped sitting over its own columns the
+    // moment the interface scale moved them. The comment on those three widths
+    // states the requirement: header and rows must agree, which is also why they
+    // scale together.
+    let cell = |t: &'static str, w: Option<fn() -> f64>| {
         text(t).style(move |s| {
             let s = s
                 .color(theme::text_muted())
-                .font_size(FONT_LABEL)
+                .font_size(font_label())
                 .font_bold();
             match w {
-                Some(w) => s.width(w).flex_shrink(0.0_f32),
+                Some(w) => s.width(w()).flex_shrink(0.0_f32),
                 None => s,
             }
         })
     };
     h_stack((
-        cell("Time", Some(TIME_W)),
-        cell("Action", Some(ACT_W)),
-        cell("ID", Some(ID_W)),
+        cell("Time", Some(time_w)),
+        cell("Action", Some(act_w)),
+        cell("ID", Some(id_w)),
         cell("Data", None),
     ))
     .style(|s| {
         s.items_center()
-            .gap(COL_GAP)
-            .padding_horiz(ROW_PAD_H)
+            .gap(col_gap())
+            .padding_horiz(row_pad_h())
             .padding_vert(6.0)
     })
 }
@@ -583,26 +615,26 @@ fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView 
     h_stack((
         text(entry.at).style(|s| {
             s.color(theme::text_dim())
-                .font_size(FONT_LABEL)
-                .width(TIME_W)
+                .font_size(font_label())
+                .width(time_w())
                 .flex_shrink(0.0_f32)
         }),
         text(label).style(move |s| {
             s.color(color)
-                .font_size(FONT_LABEL)
+                .font_size(font_label())
                 .font_bold()
-                .width(ACT_W)
+                .width(act_w())
                 .flex_shrink(0.0_f32)
         }),
         text(key_text).style(|s| {
             s.color(theme::text())
-                .font_size(FONT_BODY)
-                .width(ID_W)
+                .font_size(font_body())
+                .width(id_w())
                 .flex_shrink(0.0_f32)
         }),
         data_view(&entry.change, &names),
     ))
-    .style(|s| s.items_center().gap(COL_GAP).padding_vert(7.0))
+    .style(|s| s.items_center().gap(col_gap()).padding_vert(7.0))
 }
 
 /// The Data column, as one non-wrapping line of coloured spans: for an update,
@@ -623,7 +655,7 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
     // as fns too, so there is one shape rather than two.
     let dim: fn() -> Color = theme::text_dim;
     let span = move |t: String, c: fn() -> Color| {
-        text(t).style(move |s| s.color(c()).font_size(FONT_BODY))
+        text(t).style(move |s| s.color(c()).font_size(font_body()))
     };
     let mut spans: Vec<AnyView> = Vec::new();
     match change.kind {

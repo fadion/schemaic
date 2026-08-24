@@ -219,10 +219,24 @@ pub const EXPAND: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" h
 /// Lucide `shrink` (results panel → restore the editor to its previous height).
 pub const SHRINK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 15 6 6m-6-6v4.8m0-4.8h4.8"/><path d="M9 19.8V15m0 0H4.2M9 15l-6 6"/><path d="M15 4.2V9m0 0h4.8M15 9l6-6"/><path d="M9 4.2V9m0 0H4.2M9 9 3 3"/></svg>"#;
 
-/// A square icon view of the given SVG markup, sized `size`×`size` (logical px).
+/// A square icon view of the given SVG markup, sized `size`×`size`.
 /// Tint it by chaining `.style(|s| s.color(...))` at the call site.
+///
+/// **`size` is a *base* size in design px, and this scales it** by the interface
+/// scale ([`crate::theme::UiScale`]) — one place, so every icon use follows the
+/// type it sits beside without each call site knowing about it. The corollary:
+/// never pass an already-scaled value here (that double-applies). Where a caller
+/// also needs the *rendered* size for layout arithmetic, it scales the same base
+/// itself — see `consts::COMPLETION_ICON_BASE` / `consts::completion_icon_size`.
+///
+/// A call site that must opt out — an ER-diagram glyph, which is sized by the
+/// diagram's own zoom — overrides `width`/`height` in its own `.style(…)`, which
+/// wins over this one.
 pub fn icon(markup: &'static str, size: f32) -> Svg {
-    svg(markup.to_string()).style(move |s| s.width(size).height(size))
+    svg(markup.to_string()).style(move |s| {
+        let px = crate::theme::scaled_font(size);
+        s.width(px).height(px)
+    })
 }
 
 // ── Window controls ─────────────────────────────────────────────────────────
@@ -245,8 +259,12 @@ pub const WINDOW_RESTORE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" view
 /// Close — the caption cross (thinner and squarer than Lucide's [`X`]).
 pub const WINDOW_CLOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><path d="M0.5 0.5l9 9"/><path d="M9.5 0.5l-9 9"/></svg>"#;
 
-/// A non-square icon view sized `w`×`h` (logical px), for glyphs whose viewBox
-/// isn't 1:1 (e.g. the footer AI wordmark). Tint via `.style(|s| s.color(...))`.
+/// A non-square icon view sized `w`×`h`, for glyphs whose viewBox isn't 1:1
+/// (e.g. the footer AI wordmark). Tint via `.style(|s| s.color(...))`. Base
+/// sizes, scaled like [`icon`]'s.
 pub fn icon_wh(markup: &'static str, w: f32, h: f32) -> Svg {
-    svg(markup.to_string()).style(move |s| s.width(w).height(h))
+    svg(markup.to_string()).style(move |s| {
+        s.width(crate::theme::scaled_font(w))
+            .height(crate::theme::scaled_font(h))
+    })
 }

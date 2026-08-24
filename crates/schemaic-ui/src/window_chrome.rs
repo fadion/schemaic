@@ -34,7 +34,14 @@ use crate::{icons, theme};
 
 /// Width of one caption button. 46px is the Windows 11 caption metric; macOS
 /// never sees these (its traffic lights are the OS's own).
-const CONTROL_W: f64 = 46.0;
+///
+/// Scaled with the interface scale, which the header height it fills also is: a
+/// button that kept the platform's 46 while the bar grew to twice its height
+/// would read as a tall narrow sliver, and its glyph — sized through
+/// [`icons::icon`] — grows regardless.
+fn control_w() -> f64 {
+    theme::scaled(46.0)
+}
 
 /// The caption glyphs are drawn on a 10×10 box — see `icons::WINDOW_*`.
 const GLYPH: f32 = 10.0;
@@ -141,10 +148,10 @@ impl WindowChrome {
     /// draws them.
     ///
     /// The count is `Chrome::own_control_count`'s (a capability, per host); the
-    /// pixels are [`CONTROL_W`], which is this module's. Nothing multiplies
+    /// pixels are [`control_w`], which is this module's. Nothing multiplies
     /// those two anywhere else.
     fn controls_width(self) -> f64 {
-        self.chrome.own_control_count() as f64 * CONTROL_W
+        self.chrome.own_control_count() as f64 * control_w()
     }
 
     /// Minimize / maximize / close, for the platforms where the OS stopped
@@ -262,7 +269,7 @@ impl WindowChrome {
                     .inset_top(0.0)
                     .inset_left(this.leading_inset())
                     .inset_right(this.controls_width())
-                    .height(theme::HEADER_H)
+                    .height(theme::header_h())
             } else {
                 s
             }
@@ -303,7 +310,7 @@ impl WindowChrome {
         .style(move |s| {
             if up() {
                 s.absolute()
-                    .inset_top(theme::HEADER_H - theme::HEADER_BORDER)
+                    .inset_top(theme::header_h() - theme::HEADER_BORDER)
                     .inset_right(0.0)
                     .width(this.controls_width())
                     .height(theme::HEADER_BORDER)
@@ -368,7 +375,7 @@ fn control_button(
     container(glyph)
         .on_click_stop(move |_| on_press())
         .style(move |s| {
-            s.width(CONTROL_W)
+            s.width(control_w())
                 .height_full()
                 .items_center()
                 .justify_center()
@@ -536,7 +543,7 @@ mod tests {
     fn nothing_is_reserved_for_controls_the_os_draws() {
         for host in [Host::Windows, Host::Linux, Host::MacOs] {
             let chrome = Chrome::of(host);
-            let reserved = chrome.own_control_count() as f64 * CONTROL_W;
+            let reserved = chrome.own_control_count() as f64 * control_w();
             assert_eq!(
                 reserved > 0.0,
                 chrome.draws_own_controls(),

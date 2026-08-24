@@ -33,26 +33,43 @@ use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, Se
 
 use crate::settings::{dropdown_box_style, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, MenuEntry, action_button,
-    autohide, focus_root_with_ring, form_hint, form_setting, modal_footer_split, modal_title_owned,
-    panel_style,
+    ACTION_TAB, ActionKind, FocusRing, MenuEntry, action_button, action_gap, autohide,
+    focus_root_with_ring, form_gap, form_hint, form_setting, modal_footer_split, modal_h,
+    modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{
     DdlPreview, DesignerTab, DesignerTarget, FieldCfg, PopupAnchor, Ui, ddl_preview, edit_field,
     icons, object_location, theme,
 };
 
-const PANEL_W: f64 = 900.0;
+fn panel_w() -> f64 {
+    modal_w(900.0)
+}
+/// The modal's height at 100%. The call site passes it through
+/// [`crate::widgets::modal_h`], which scales it and then caps it against the
+/// window — so this is a base, not a fixed height.
+///
+/// (It said the opposite for a while: "**not** scaled … doubling it would take
+/// the panel off the display". That was true of the first attempt, and stopped
+/// being true when the cap made growing them safe. A comment that contradicts its
+/// own call site is worse than no comment: the next reader either adds a second
+/// scaling or removes the one that is there.)
 const PANEL_H: f64 = 550.0;
 /// The item list's width, shared by all three sections so switching between them
 /// doesn't shift the form. Wide enough that a long name and a long type
 /// (`timestamp without time zone`) can both be read — the detail pane has the
 /// slack to give.
-const LIST_W: f64 = 320.0;
+fn list_w() -> f64 {
+    theme::scaled(320.0)
+}
 /// One row of the item list.
-const ROW_H: f64 = 30.0;
+fn row_h() -> f64 {
+    theme::scaled(30.0)
+}
 /// Text-field width in the detail form, matching the connection form's fields.
-const FIELD_W: f64 = 260.0;
+fn field_w() -> f64 {
+    theme::scaled(260.0)
+}
 /// The item list's place in the Tab order: ahead of the form it feeds, because
 /// it sits to the left of it and choosing *what* to edit comes before editing it.
 /// Shared by all four sections — only one list is mounted at a time — and by the
@@ -415,7 +432,7 @@ fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
             })
             .style(move |s| {
                 let s = s
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .padding_horiz(12.0)
                     .padding_vert(7.0)
                     .border_radius(6.0);
@@ -433,7 +450,7 @@ fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
             .items_center()
             .gap(4.0)
             .width_full()
-            .padding_horiz(MODAL_PAD_H)
+            .padding_horiz(modal_pad_h())
             .padding_vert(8.0)
             .border_bottom(1.0)
             .border_color(theme::border())
@@ -720,7 +737,7 @@ fn owned_dropdown_box(
             } else {
                 cur
             })
-            .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+            .style(|s| s.color(theme::text()).font_size(theme::font_body())),
             empty().style(|s| s.flex_grow(1.0_f32)),
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
@@ -737,7 +754,7 @@ fn owned_dropdown_box(
                     .padding_horiz(12.0)
                     .padding_vert(6.0)
                     .color(theme::text())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .hover(|s| s.background(theme::dropdown_hover()));
                 if current() == this {
                     s.background(theme::dropdown_active())
@@ -872,7 +889,7 @@ fn list_row_inner(
             .style(move |s| s.color(color()).flex_shrink(0.0_f32))
             .into_any(),
         None if reserve_icon => empty()
-            .style(|s| s.width(13.0).flex_shrink(0.0_f32))
+            .style(|s| s.width(theme::scaled(13.0)).flex_shrink(0.0_f32))
             .into_any(),
         None => empty()
             .style(|s| s.width(0.0).flex_shrink(0.0_f32))
@@ -881,7 +898,7 @@ fn list_row_inner(
     h_stack((
         mark,
         text(label).style(|s| {
-            s.font_size(theme::FONT_BODY)
+            s.font_size(theme::font_body())
                 .color(theme::text())
                 .text_ellipsis()
                 .flex_shrink(1.0_f32)
@@ -893,7 +910,7 @@ fn list_row_inner(
         // other, and `timestamp without time zone` would otherwise squeeze the
         // name down to a couple of characters.
         text(detail).style(|s| {
-            s.font_size(theme::FONT_LABEL)
+            s.font_size(theme::font_label())
                 .color(theme::text_faint())
                 .text_ellipsis()
                 .flex_shrink(4.0_f32)
@@ -911,7 +928,7 @@ fn list_row_inner(
             .items_center()
             .gap(6.0)
             .width_full()
-            .height(ROW_H)
+            .height(row_h())
             .padding_horiz(8.0)
             .flex_shrink(0.0_f32);
         if selected.get() == idx {
@@ -936,7 +953,7 @@ fn list_row_inner(
 /// verbs, so unlike the list there is nothing for an arrow to mean between them.
 ///
 /// The selected row is kept on screen with `ensure_visible`, which scrolls only
-/// when the row isn't already showing: rows are a fixed [`ROW_H`] tall, so the
+/// when the row isn't already showing: rows are a fixed [`row_h()`] tall, so the
 /// rect is arithmetic rather than a measured view.
 pub(crate) fn list_pane(
     rows: impl IntoView + 'static,
@@ -955,15 +972,15 @@ pub(crate) fn list_pane(
     let pane = v_stack((
         autohide(scroll(rows))
             .ensure_visible(move || {
-                let top = selected.get() as f64 * ROW_H;
-                floem::kurbo::Rect::new(0.0, top, 1.0, top + ROW_H)
+                let top = selected.get() as f64 * row_h();
+                floem::kurbo::Rect::new(0.0, top, 1.0, top + row_h())
             })
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
         actions,
     ))
     .style(|s| {
         s.flex_col()
-            .width(LIST_W)
+            .width(list_w())
             .flex_shrink(0.0_f32)
             .height_full()
             .border(1.0)
@@ -1056,7 +1073,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         bound_field(
             &ui,
             draft.name.clone(),
-            FIELD_W,
+            field_w(),
             "table_name",
             ring.clone(),
             10,
@@ -1072,7 +1089,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 draft.comment.clone().unwrap_or_default(),
-                FIELD_W * 1.6,
+                field_w() * 1.6,
                 "What this table is for",
                 ring.clone(),
                 20,
@@ -1094,7 +1111,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field_with_menu(
                     &ui,
                     draft.engine.clone().unwrap_or_default(),
-                    FIELD_W,
+                    field_w(),
                     "InnoDB",
                     // A storage-engine name isn't SQL text the way a type is.
                     false,
@@ -1109,7 +1126,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field(
                     &ui,
                     draft.collation.clone().unwrap_or_default(),
-                    FIELD_W,
+                    field_w(),
                     "utf8mb4_general_ci",
                     ring,
                     40,
@@ -1117,7 +1134,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 ),
             ),
         ))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
     } else {
         crate::widgets::nothing()
@@ -1128,7 +1145,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // lives — neither engine moves one between databases from here, so that row
     // was a caption repeating the title.
     v_stack((name, comment, mysql_only))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
 }
 
@@ -1218,7 +1235,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         bound_field(
             &ui,
             c.name.clone(),
-            FIELD_W,
+            field_w(),
             "column_name",
             ring.clone(),
             10,
@@ -1231,7 +1248,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field_with_menu(
                 &ui,
                 c.type_name.clone(),
-                FIELD_W,
+                field_w(),
                 "varchar(255)",
                 true,
                 ddl::common_types(target.dialect)
@@ -1299,7 +1316,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             sql_field(
                 &ui,
                 c.default.clone().unwrap_or_default(),
-                FIELD_W,
+                field_w(),
                 "",
                 ring.clone(),
                 60,
@@ -1318,7 +1335,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             sql_field(
                 &ui,
                 c.generated.clone().unwrap_or_default(),
-                FIELD_W,
+                field_w(),
                 "",
                 ring.clone(),
                 70,
@@ -1337,7 +1354,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 c.comment.clone().unwrap_or_default(),
-                FIELD_W,
+                field_w(),
                 "",
                 ring.clone(),
                 100,
@@ -1357,7 +1374,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         bound_field(
             &ui,
             c.collation.clone().unwrap_or_default(),
-            FIELD_W,
+            field_w(),
             "",
             ring.clone(),
             80,
@@ -1378,7 +1395,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 c.on_update.clone().unwrap_or_default(),
-                FIELD_W,
+                field_w(),
                 "CURRENT_TIMESTAMP",
                 ring,
                 90,
@@ -1395,7 +1412,12 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     v_stack((
         name, ty, nullable, primary, auto, default, generated, collation, on_update, comment,
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full().padding_bottom(10.0))
+    .style(|s| {
+        s.flex_col()
+            .gap(form_gap())
+            .width_full()
+            .padding_bottom(10.0)
+    })
     .into_any()
 }
 
@@ -1511,7 +1533,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                     bound_field(
                         &ui,
                         ix.predicate.clone().unwrap_or_default(),
-                        FIELD_W * 1.4,
+                        field_w() * 1.4,
                         "",
                         ring.clone(),
                         50,
@@ -1526,7 +1548,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 ),
             ),
         ))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
     } else {
         crate::widgets::nothing()
@@ -1538,7 +1560,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 ix.name.clone(),
-                FIELD_W,
+                field_w(),
                 "index_name",
                 ring.clone(),
                 10,
@@ -1555,7 +1577,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field(
                     &ui,
                     key_list_text(&ix.columns),
-                    FIELD_W * 1.4,
+                    field_w() * 1.4,
                     "id, name",
                     ring.clone(),
                     20,
@@ -1583,7 +1605,12 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         ),
         pg_only,
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full().padding_bottom(10.0))
+    .style(|s| {
+        s.flex_col()
+            .gap(form_gap())
+            .width_full()
+            .padding_bottom(10.0)
+    })
     .into_any()
 }
 
@@ -1678,7 +1705,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 })
             },
             tables,
-            FIELD_W,
+            field_w(),
             ring.clone(),
             30,
             move |v| {
@@ -1748,7 +1775,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 fk.name.clone(),
-                FIELD_W,
+                field_w(),
                 "fk_name",
                 ring.clone(),
                 10,
@@ -1765,7 +1792,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field(
                     &ui,
                     fk.columns.join(", "),
-                    FIELD_W * 1.2,
+                    field_w() * 1.2,
                     "customer_id",
                     ring.clone(),
                     20,
@@ -1784,7 +1811,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 fk.ref_columns.join(", "),
-                FIELD_W * 1.2,
+                field_w() * 1.2,
                 "id",
                 ring,
                 40,
@@ -1798,7 +1825,12 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         on_delete,
         on_update,
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full().padding_bottom(10.0))
+    .style(|s| {
+        s.flex_col()
+            .gap(form_gap())
+            .width_full()
+            .padding_bottom(10.0)
+    })
     .into_any()
 }
 
@@ -1881,7 +1913,7 @@ fn check_form(
         bound_field(
             &ui,
             ck.name.clone(),
-            FIELD_W,
+            field_w(),
             "qty_positive",
             ring.clone(),
             10,
@@ -1898,7 +1930,7 @@ fn check_form(
             bound_field(
                 &ui,
                 ck.expression.clone(),
-                FIELD_W * 1.6,
+                field_w() * 1.6,
                 "qty > 0",
                 ring.clone(),
                 20,
@@ -1944,7 +1976,12 @@ fn check_form(
     };
 
     v_stack((name, expression, enforced))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full().padding_bottom(10.0))
+        .style(|s| {
+            s.flex_col()
+                .gap(form_gap())
+                .width_full()
+                .padding_bottom(10.0)
+        })
         .into_any()
 }
 
@@ -1961,7 +1998,7 @@ fn check_form(
 pub(crate) fn empty_hint(msg: &'static str) -> impl IntoView {
     text(msg).style(|s| {
         s.color(theme::text_faint())
-            .font_size(theme::FONT_BODY)
+            .font_size(theme::font_body())
             .width_full()
     })
 }
@@ -2152,7 +2189,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                     .width_full()
                     .flex_grow(1.0_f32)
                     .min_height(0.0)
-                    .padding_horiz(MODAL_PAD_H)
+                    .padding_horiz(modal_pad_h())
                     .padding_vert(18.0)
                     .gap(0.0)
             });
@@ -2167,7 +2204,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                         return text(first.clone())
                             .style(|s| {
                                 s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
+                                    .font_size(theme::font_label())
                                     .max_width(460.0)
                             })
                             .into_any();
@@ -2182,7 +2219,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                     // Preview button gives by lighting up, at the other end of
                     // the footer where the count lives.
                     .style(move |s| {
-                        s.font_size(theme::FONT_LABEL).color(if n == 0 {
+                        s.font_size(theme::font_label()).color(if n == 0 {
                             theme::text_faint()
                         } else {
                             theme::change_count()
@@ -2224,7 +2261,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                             },
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -2239,7 +2276,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
+            .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())

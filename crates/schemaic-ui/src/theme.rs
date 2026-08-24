@@ -15,10 +15,11 @@ use crate::themes::{editor, ui};
 
 // Re-export the switching API + kinds so callers use a single `theme::` surface.
 pub use crate::themes::{
-    EditorThemeKind, UiThemeKind, bump_editor_generation, editor_font_size, editor_generation,
-    editor_soft_tabs, editor_tab_width, editor_word_wrap, init, parse_hex, set_editor,
-    set_editor_font, set_editor_soft_tabs, set_editor_tab_width, set_editor_word_wrap, set_ui,
-    ui_generation,
+    EditorThemeKind, UiScale, UiThemeKind, bump_editor_generation, editor_font_size,
+    editor_generation, editor_soft_tabs, editor_tab_width, editor_word_wrap, init, parse_hex,
+    scale_at, scale_font_at, scaled, scaled_font, set_editor, set_editor_font,
+    set_editor_soft_tabs, set_editor_tab_width, set_editor_word_wrap, set_ui, set_ui_scale,
+    ui_generation, ui_scale,
 };
 
 /// The active editor theme struct (surface + token palette) — for the SQL editor
@@ -645,24 +646,58 @@ pub fn scrollbar_hover() -> Color {
     ui().scrollbar_hover
 }
 
-// Fixed chrome dimensions (logical px).
-pub const HEADER_H: f64 = 40.0;
-/// The rule under the header, and part of its [`HEADER_H`] (border-box), so it
+// Chrome dimensions (logical px). Functions, not constants, because the
+// interface scale multiplies them — see `UiScale`, and call them *inside* the
+// style closure exactly as you would a colour.
+
+/// Height of the window's header bar.
+pub fn header_h() -> f64 {
+    scaled(40.0)
+}
+/// The rule under the header, and part of its [`header_h`] (border-box), so it
 /// occupies the bar's last logical pixel. Named because a second view has to
 /// find it: the band `window_chrome::over_backdrop` lays over a modal stops
 /// short of the caption buttons, and the border running on under them has to be
 /// dimmed separately or the rule ends in a lit tail.
+///
+/// A `const`, and unscaled: it is a hairline, and a hairline is one physical
+/// rule at every size — 2px of it at 200% would read as a border rather than a
+/// seam.
 pub const HEADER_BORDER: f64 = 1.0;
-pub const FOOTER_H: f64 = 28.0;
+/// Height of the status-bar footer.
+pub fn footer_h() -> f64 {
+    scaled(28.0)
+}
+/// Default width of the schema sidebar.
+///
+/// Unscaled, deliberately: this is the seed for a **persisted, user-dragged**
+/// width (`persist::UiState::schema_w`), and the stored number is the user's own
+/// intent in px. Scaling a restored width would move a panel the user had placed
+/// by hand every time the scale changed. What does scale is
+/// [`crate::consts::schema_min_w`], so the panel can't be dragged narrower than
+/// its own text.
 pub const SCHEMA_W: f64 = 300.0;
-// AI and Terminal share this width (see `TERM_W` in lib.rs).
+/// Default width of the right column. AI and Terminal share it (see `TERM_W` in
+/// lib.rs). Unscaled, for the reason on [`SCHEMA_W`].
 pub const AI_W: f64 = 350.0;
 
-// Type scale (logical px). Design rule: nothing smaller than 13px anywhere
-// except the status-bar footer (`FONT_STATUS`).
-pub const FONT_TITLE: f32 = 14.0;
-pub const FONT_BODY: f32 = 13.0;
-pub const FONT_LABEL: f32 = 13.0;
+// Type scale (logical px), at the active interface scale. Design rule: nothing
+// smaller than `font_body()` anywhere except the status-bar footer
+// (`font_status()`).
+
+pub fn font_title() -> f32 {
+    scaled_font(14.0)
+}
+pub fn font_body() -> f32 {
+    scaled_font(13.0)
+}
+pub fn font_label() -> f32 {
+    scaled_font(13.0)
+}
 /// A form hint — one step under the label it explains.
-pub const FONT_HINT: f32 = 12.0;
-pub const FONT_STATUS: f32 = 12.0;
+pub fn font_hint() -> f32 {
+    scaled_font(12.0)
+}
+pub fn font_status() -> f32 {
+    scaled_font(12.0)
+}

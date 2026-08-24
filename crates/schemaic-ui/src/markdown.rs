@@ -33,7 +33,14 @@ const MD_LINE_HEIGHT: f32 = 1.4;
 
 /// Body font size for markdown prose — list items, paragraphs, table cells.
 /// Headings scale from `heading_size` instead.
-const MD_FONT_SIZE: f32 = 14.0;
+///
+/// Baked into a text `Attrs` list rather than read from a style closure, which is
+/// why this module's views are keyed on `theme::ui_generation` — the generation
+/// the interface scale bumps, so a scale change rebuilds them (see
+/// `theme::set_ui_scale`).
+fn md_font_size() -> f32 {
+    theme::scaled_font(14.0)
+}
 
 /// Inline run style flags — emphasis nests, so these compose (bold *and* italic,
 /// code inside a link, …). Built from the CommonMark event stream.
@@ -140,13 +147,14 @@ fn md_item(
         // baseline under `items_start` (see [`MD_LINE_HEIGHT`]).
         text(marker).style(|s| {
             s.flex_shrink(0.0_f32)
-                .min_width(16.0)
+                .min_width(theme::scaled(16.0))
                 .color(theme::text_dim())
-                .font_size(MD_FONT_SIZE)
+                .font_size(md_font_size())
                 .line_height(MD_LINE_HEIGHT)
                 .margin_right(4.0)
         }),
-        inline_text(runs, base, false, MD_FONT_SIZE).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+        inline_text(runs, base, false, md_font_size())
+            .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
     ))
     .style(move |s| {
         md_quote_wrap(
@@ -174,7 +182,7 @@ fn md_table(
             let cell_views: Vec<AnyView> = cells
                 .into_iter()
                 .map(|runs| {
-                    inline_text(runs, base, is_head, MD_FONT_SIZE)
+                    inline_text(runs, base, is_head, md_font_size())
                         .style(|s| {
                             s.flex_grow(1.0_f32)
                                 .flex_basis(0.0)
@@ -326,7 +334,7 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                     // before a nested list); a top-level paragraph flushes here.
                     if item_stack.is_empty() && !runs.is_empty() {
                         let block =
-                            inline_text(std::mem::take(&mut runs), base, false, MD_FONT_SIZE)
+                            inline_text(std::mem::take(&mut runs), base, false, md_font_size())
                                 .style(move |s| md_quote_wrap(s.width_full(), quote))
                                 .into_any();
                         out.push(block);
@@ -453,7 +461,7 @@ pub(crate) struct CodeActions {
 /// mistaken for "Insert".
 fn code_action_link(label: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
     text(label).on_click_stop(move |_| on_click()).style(|s| {
-        s.font_size(theme::FONT_LABEL)
+        s.font_size(theme::font_label())
             .color(theme::text_dim())
             .hover(|s| s.color(theme::accent()))
     })
@@ -516,7 +524,7 @@ fn sql_leading_keyword(code: &str) -> bool {
 fn card_button(label: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
     text(label).on_click_stop(move |_| on_click()).style(|s| {
         crate::widgets::control_surface(s)
-            .font_size(crate::widgets::TOOLBAR_FONT)
+            .font_size(crate::widgets::toolbar_font())
             .padding_horiz(10.0)
             .padding_vert(5.0)
             .flex_shrink(0.0_f32)
@@ -544,7 +552,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
                 ))
                 .style(|s| {
                     s.width_full()
-                        .font_size(theme::FONT_LABEL)
+                        .font_size(theme::font_label())
                         .color(theme::text_muted())
                 }),
                 code_block(json, actions, "json", false),
@@ -561,7 +569,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
         icons::icon(icons::TABLE_PROPERTIES, 15.0)
             .style(|s| s.color(theme::text_muted()).flex_shrink(0.0_f32)),
         text(format!("Proposed change to {}", proposal.table)).style(|s| {
-            s.font_size(theme::FONT_BODY)
+            s.font_size(theme::font_body())
                 .color(theme::text())
                 .flex_grow(1.0_f32)
         }),
@@ -570,7 +578,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
             schemaic_core::text::plural(ops, "change", "changes")
         ))
         .style(|s| {
-            s.font_size(theme::FONT_LABEL)
+            s.font_size(theme::font_label())
                 .color(theme::text_faint())
                 .flex_shrink(0.0_f32)
         }),
@@ -584,7 +592,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
         Some(s) if !s.trim().is_empty() => text(s)
             .style(|s| {
                 s.width_full()
-                    .font_size(theme::FONT_LABEL)
+                    .font_size(theme::font_label())
                     .color(theme::text_muted())
             })
             .into_any(),
@@ -609,7 +617,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
             Some(msg) => text(msg)
                 .style(|s| {
                     s.width_full()
-                        .font_size(theme::FONT_LABEL)
+                        .font_size(theme::font_label())
                         .color(theme::error())
                 })
                 .into_any(),
@@ -636,7 +644,7 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
     let body = text(code.trim_end().to_string()).style(|s| {
         s.width_full()
             .font_family("monospace".to_string())
-            .font_size(theme::FONT_BODY)
+            .font_size(theme::font_body())
             .color(theme::text())
             .padding_horiz(9.0)
             .padding_vert(7.0)
@@ -691,7 +699,7 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
     // would paint over the top of the wrapper's arc and square the block off.
     let header = h_stack((
         text(kind).style(|s| {
-            s.font_size(theme::FONT_LABEL)
+            s.font_size(theme::font_label())
                 .font_bold()
                 .color(theme::text_muted())
         }),
@@ -702,7 +710,7 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
         s.width_full()
             .flex_row()
             .items_center()
-            .height(24.0)
+            .height(theme::scaled(24.0))
             .padding_horiz(8.0)
             .gap(10.0)
             .background(theme::group_header_bg())

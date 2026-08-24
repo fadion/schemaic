@@ -18,7 +18,7 @@ use schemaic_core::db_color::DbColorRule;
 use schemaic_core::history::{self, HistoryEntry};
 
 use crate::consts::SEARCH_DEBOUNCE_MS;
-use crate::theme::{FONT_BODY, FONT_LABEL};
+use crate::theme::{font_body, font_label};
 use crate::widgets::{
     autohide, debounced, highlight_mono, highlight_text, section_title, toolbar_icon,
 };
@@ -35,7 +35,6 @@ fn now_millis() -> u64 {
 pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let entries = ui.history.entries;
     let active_conn = ui.conn.active_conn;
-    let right_w = ui.layout.right_w;
     let open_history = ui.history_actions.open.clone();
     let clear = ui.history_actions.clear.clone();
     let db_colors = ui.db_colors;
@@ -75,7 +74,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
                 };
                 return text(msg)
                     .style(|s| {
-                        s.font_size(14.0)
+                        s.font_size(theme::scaled_font(14.0))
                             .color(theme::text_muted())
                             .padding_top(10.0)
                             .padding_left(12.0)
@@ -166,13 +165,13 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
         // Same 5px above / 10px below the search box as the schema panel (≈15px
         // each visually); spacers (not margins) so the flex-grow scroll's height
         // stays exact (a sibling's vertical margin isn't subtracted → overflow).
-        empty().style(|s| s.height(5.0).flex_shrink(0.0_f32)),
+        empty().style(|s| s.height(theme::scaled(5.0)).flex_shrink(0.0_f32)),
         history_search(search_input),
-        empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
+        empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         scrolled,
     ))
     .style(move |s| {
-        s.width(right_w.get())
+        s.width(crate::widgets::right_panel_w().get())
             .flex_shrink(0.0_f32)
             .height_full()
             .flex_col()
@@ -212,8 +211,8 @@ fn history_search(filter: RwSignal<String>) -> impl IntoView {
 /// border, and two of them stacked is a 2px seam at every group boundary but the
 /// first — floem doesn't collapse adjacent borders.
 fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::AnyView {
-    let label =
-        text(bucket.label()).style(|s| s.font_size(FONT_LABEL).font_bold().color(theme::accent()));
+    let label = text(bucket.label())
+        .style(|s| s.font_size(font_label()).font_bold().color(theme::accent()));
     // **`text_dim`, not a faded accent.** The count has to recede from the bold
     // label beside it — two accents of equal weight compete across the row —
     // but it is also a number the reader is meant to read, and an alpha on the
@@ -222,7 +221,7 @@ fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::An
     // AI panel's code-block actions use on this exact surface, where the gate
     // already holds it to `Body`.
     let n = text(count.to_string()).style(|s| {
-        s.font_size(FONT_LABEL)
+        s.font_size(font_label())
             .color(theme::text_dim())
             .flex_shrink(0.0_f32)
     });
@@ -263,18 +262,20 @@ fn history_row(
     let dot_conn = entry.conn_id;
     let dot_db = entry.database.clone();
 
-    // ~3 lines: FONT_BODY (13) × 1.4 line-height × 3, clipped.
-    let max_h = (FONT_BODY as f64) * 1.4 * 3.0;
+    // ~3 lines: font_body() (13) × 1.4 line-height × 3, clipped.
 
     // Monospace: it is SQL, and it is the same face the editor it came from and
     // the diff view use. Still `highlight_*`, so a search term stays marked.
     // +3px above and below the code, on top of the stack's own 4px gap: the SQL
     // is the row's substance and was sitting tight against the two label lines,
     // which made consecutive rows read as one block.
-    let preview_view = highlight_mono(preview, term.clone(), FONT_BODY, theme::text, 1.4)
+    let preview_view = highlight_mono(preview, term.clone(), font_body, theme::text, 1.4)
         .style(move |s| {
             s.width_full()
-                .max_height(max_h)
+                // Three line boxes of `font_body()`, computed in the closure —
+                // a captured height clips the preview at the old scale's three
+                // lines while the SQL inside it grows.
+                .max_height((font_body() as f64) * 1.4 * 3.0)
                 .margin_top(3.0)
                 .margin_bottom(3.0)
         })
@@ -284,7 +285,7 @@ fn history_row(
     // applies only between this group and the timestamp — the dot's spacing from
     // the name is then purely its own `margin_left`.
     let db_group = h_stack((
-        highlight_text(db, term.clone(), FONT_LABEL, theme::text_dim, false, 1.0)
+        highlight_text(db, term.clone(), font_label, theme::text_dim, false, 1.0)
             .style(|s| s.min_width(0.0)),
         // Identity dot next to the database name (colour set in the schema tree).
         db_color_dot(
@@ -303,7 +304,7 @@ fn history_row(
         db_group,
         empty().style(|s| s.flex_grow(1.0_f32)),
         text(when).style(|s| {
-            s.font_size(FONT_LABEL)
+            s.font_size(font_label())
                 .color(theme::text_faint())
                 .flex_shrink(0.0_f32)
         }),
@@ -323,13 +324,13 @@ fn history_row(
         history::outcome_line(&entry).map(|lead| {
             let row = h_stack((
                 text(lead).style(|s| {
-                    s.font_size(FONT_LABEL)
+                    s.font_size(font_label())
                         .color(theme::text_faint())
                         .min_width(0.0)
                 }),
                 // Only a failure says anything, and it is the only colour here.
                 text(if failed { "Failed" } else { "" }).style(move |s| {
-                    s.font_size(FONT_LABEL)
+                    s.font_size(font_label())
                         .color(theme::error())
                         .flex_shrink(0.0_f32)
                 }),
@@ -345,7 +346,7 @@ fn history_row(
     let named = entry.tab_name.clone().filter(|n| !n.trim().is_empty());
     let name_row: Option<floem::AnyView> = named.map(|n| {
         let capsule =
-            highlight_text(n, term.clone(), FONT_LABEL, theme::text, false, 1.0).style(|s| {
+            highlight_text(n, term.clone(), font_label, theme::text, false, 1.0).style(|s| {
                 s.padding_horiz(7.0)
                     .padding_vert(3.0)
                     .background(theme::capsule_bg())

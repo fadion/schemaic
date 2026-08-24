@@ -90,7 +90,7 @@ use floem::views::editor::core::mode::Mode;
 use floem::views::editor::core::selection::Selection;
 use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
-use floem::views::editor::text::{SimpleStyling, WrapMethod, default_dark_color};
+use floem::views::editor::text::{WrapMethod, default_dark_color};
 use floem::views::scroll::{Handle, Rounded, Thickness, Track};
 use floem::views::{
     Decorators, Delay, LabelClass, TextInputClass, TooltipClass, TooltipContainerClass,
@@ -2411,6 +2411,10 @@ pub struct LayoutUi {
     pub ui_theme: RwSignal<theme::UiThemeKind>,
     /// Active SQL-editor theme; drives `theme::set_editor`.
     pub editor_theme: RwSignal<theme::EditorThemeKind>,
+    /// Interface scale (chrome type + layout metrics); drives
+    /// `theme::set_ui_scale`. Not the editor or terminal font — those have their
+    /// own size settings (see [`theme::UiScale`]).
+    pub ui_scale: RwSignal<theme::UiScale>,
     /// Editor font size (px); drives `theme::set_editor_font`.
     pub editor_font: RwSignal<f32>,
     /// Editor tab width (columns); drives `theme::set_editor_tab_width`.
@@ -2969,7 +2973,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             .flex_col()
             .background(theme::bg_editor())
             .color(theme::text())
-            .font_size(theme::FONT_TITLE)
+            .font_size(theme::font_title())
     });
 
     // The three grouped wrappers below and the modal layer around them all ask
@@ -3136,7 +3140,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         .style(move |s| {
             if modal_up() {
                 s.absolute()
-                    .inset_top(theme::HEADER_H)
+                    .inset_top(theme::header_h())
                     .inset_left(0.0)
                     .inset_right(0.0)
                     .inset_bottom(0.0)
@@ -3330,7 +3334,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             .class(TextInputClass, |s| {
                 s.background(theme::bg_deepest())
                     .color(theme::text())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .cursor(CursorStyle::Text)
                     .cursor_color(floem::peniko::Brush::Solid(theme::accent()))
                     .border(1.0)
@@ -3675,7 +3679,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                     // cannot do: neither its `Style` nor the cosmic-text `Attrs`
                     // beneath it exposes letter spacing, and faking it by padding
                     // the string would wreck the metrics this is trying to fix.
-                    text(caption.to_uppercase()).style(|s| s.font_size(11.0)),
+                    text(caption.to_uppercase()).style(|s| s.font_size(theme::scaled_font(11.0))),
                 ))
                 .style(|s| s.flex_row().items_center().gap(6.0)),
             )
@@ -3758,9 +3762,10 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let badge = dyn_container(
         move || active_conn_env(connections, active_conn),
         move |env| match env.badge_label() {
-            Some(lbl) => container(
-                text(lbl).style(|s| s.color(theme::env_badge_text()).font_size(theme::FONT_BODY)),
-            )
+            Some(lbl) => container(text(lbl).style(|s| {
+                s.color(theme::env_badge_text())
+                    .font_size(theme::font_body())
+            }))
             .style(move |s| {
                 s.margin_left(12.0)
                     .padding_vert(5.0)
@@ -3784,8 +3789,8 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // scaling, and its corners are fully transparent — it composites straight
     // onto `bg_chrome()` in either theme with no plate behind it.
     let logo = img(|| LOGO_PNG.to_vec()).style(|s| {
-        s.width(20.0)
-            .height(20.0)
+        s.width(theme::scaled(20.0))
+            .height(theme::scaled(20.0))
             .margin_left(12.0)
             .flex_shrink(0.0_f32)
     });
@@ -3823,8 +3828,8 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // clusters whatever the strip claims.
     h_stack((left, chrome.drag_strip(), right)).style(|s| {
         s.width_full()
-            .height(theme::HEADER_H)
-            .min_height(theme::HEADER_H)
+            .height(theme::header_h())
+            .min_height(theme::header_h())
             .flex_shrink(0.0_f32)
             .flex_row()
             .items_center()
@@ -3852,7 +3857,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
 /// space when healthy).
 fn disconnected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>) -> impl IntoView {
     let label = text("Disconnected").style(|s| {
-        s.font_size(TOOLBAR_FONT)
+        s.font_size(toolbar_font())
             .color(theme::error())
             .margin_left(15.0)
     });
@@ -3862,7 +3867,7 @@ fn disconnected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>)
         .on_click_stop(move |_| (recheck)())
         .style(|s| {
             control_surface(s)
-                .font_size(TOOLBAR_FONT)
+                .font_size(toolbar_font())
                 .color(theme::text())
                 .margin_left(15.0)
                 .padding_horiz(10.0)
@@ -4261,7 +4266,7 @@ fn h_resize_handle(
     // divider, so there is nothing left to hint at.
     let hovered = DelayedHover::new();
     let bar = empty().style(move |s| {
-        let s = s.width(RESIZE_BAR).height_full();
+        let s = s.width(resize_bar()).height_full();
         if hovered.lit() || dragging.get() {
             s.background(theme::resize_handle())
         } else {
@@ -4278,8 +4283,8 @@ fn h_resize_handle(
                 .items_center()
                 .justify_center()
                 .cursor(CursorStyle::ColResize)
-                .width(if visible() { RESIZE_HIT } else { 0.0 });
-            let inset = edge() - RESIZE_HIT / 2.0;
+                .width(if visible() { resize_hit() } else { 0.0 });
+            let inset = edge() - resize_hit() / 2.0;
             if from_right {
                 s.inset_right(inset)
             } else {
@@ -4305,7 +4310,7 @@ fn h_resize_handle(
                     // boundary; (pos - center) is the pointer's offset from it, so
                     // adding it snaps the boundary to the pointer (negated for the
                     // right column, which grows leftward).
-                    let d = pe.pos.x - RESIZE_HIT / 2.0;
+                    let d = pe.pos.x - resize_hit() / 2.0;
                     let d = if from_right { -d } else { d };
                     // Floor at `min_w`; ceiling `max_w()` keeps the center (and the
                     // opposite panel) at their minimums so a drag can't swallow them.
@@ -4342,6 +4347,11 @@ fn h_resize_handle(
 fn v_resize_handle(
     base_top: f64,
     dim: RwSignal<f64>,
+    // Effective (floored) editor height → where the handle sits. May be more than
+    // `dim` when a height persisted under a lower floor is being rendered against
+    // a higher one, which is why the handle can't position from `dim` itself: it
+    // would float inside the grid, away from the edge it drags.
+    edge: impl Fn() -> f64 + Copy + 'static,
     // Drag clamp: floor `min_h` (query editor min), ceiling `max_h()` (reactive —
     // leaves the results grid its minimum height).
     min_h: f64,
@@ -4352,7 +4362,7 @@ fn v_resize_handle(
     let hovered = DelayedHover::new();
     let dragging = RwSignal::new(false);
     let bar = empty().style(move |s| {
-        let s = s.height(RESIZE_BAR).width_full();
+        let s = s.height(resize_bar()).width_full();
         if hovered.lit() || dragging.get() {
             s.background(theme::resize_handle())
         } else {
@@ -4368,8 +4378,8 @@ fn v_resize_handle(
                 .items_center()
                 .justify_center()
                 .cursor(CursorStyle::RowResize)
-                .height(RESIZE_HIT)
-                .inset_top(base_top + dim.get() - RESIZE_HIT / 2.0)
+                .height(resize_hit())
+                .inset_top(base_top + edge() - resize_hit() / 2.0)
         })
         .on_event(EventListener::PointerEnter, move |_| {
             hovered.enter();
@@ -4386,7 +4396,7 @@ fn v_resize_handle(
         .on_event(EventListener::PointerMove, move |e| {
             if dragging.get_untracked() {
                 if let Event::PointerMove(pe) = e {
-                    let d = pe.pos.y - RESIZE_HIT / 2.0;
+                    let d = pe.pos.y - resize_hit() / 2.0;
                     dim.update(|h| *h = (*h + d).clamp(min_h, max_h().max(min_h)));
                 }
                 EventPropagation::Stop
@@ -4440,7 +4450,7 @@ fn body(
 
     // Effective panel widths: 0 when hidden or locked away by the responsive
     // breakpoints, else the intended width clamped so the center keeps
-    // `CENTER_MIN_W` (the right panel yields against the schema *minimum*; the
+    // `center_min_w()` (the right panel yields against the schema *minimum*; the
     // schema then yields against the right panel's *effective* width). The stored
     // `schema_w`/`right_w` are the user's intent and never mutated here, so a panel
     // restores to its full width when the window grows back.
@@ -4465,6 +4475,16 @@ fn body(
     // wider than the wrapper it is clipped by: the search box's clear button was
     // cut off and the tree kept a horizontal scrollbar it didn't need.
     create_effect(move |_| schema_panel_w().set(eff_schema_w()));
+    // The same for the right column — the AI / terminal / history panels size
+    // themselves to it, and the clamp is what they must follow (see
+    // `widgets::right_panel_w`). A closed panel publishes nothing: `eff` is 0
+    // then, and a panel that reopened at 0 would have to wait for a resize.
+    create_effect(move |_| {
+        let w = eff_right_w();
+        if w > 0.0 {
+            widgets::right_panel_w().set(w);
+        }
+    });
 
     // Left: the schema tree. Always mounted (it only reads signals; nothing is
     // spawned on build), so hiding is purely the width animation. `clip()` hides
@@ -4521,9 +4541,9 @@ fn body(
         eff_schema_w,
         move || schema_visible.get() && schema_panel_allowed(),
         schema_dragging,
-        SCHEMA_MIN_W,
+        schema_min_w(),
         // Leave the center + the right panel's effective width.
-        move || window_size().get().0 - CENTER_MIN_W - eff_right_w(),
+        move || window_size().get().0 - center_min_w() - eff_right_w(),
         theme::SCHEMA_W,
         commit,
     );
@@ -4534,9 +4554,9 @@ fn body(
         eff_right_w,
         move || right_panel.get() != RightPanel::None && right_panel_allowed(),
         right_dragging,
-        RIGHT_MIN_W,
+        right_min_w(),
         // Leave the center + the schema panel at its minimum (it yields as needed).
-        move || window_size().get().0 - CENTER_MIN_W - SCHEMA_MIN_W,
+        move || window_size().get().0 - center_min_w() - schema_min_w(),
         theme::AI_W,
         commit,
     );
@@ -4620,12 +4640,11 @@ fn center(ui: Ui) -> impl IntoView {
     let popup_width = ui.overlay.popup_width;
     let editor_h = ui.layout.editor_h;
     let editor_collapsed = ui.layout.editor_collapsed;
-    // A width persisted under an older, looser floor could be below the current
-    // query-editor minimum — lift it once on build (render clamps widths live, but
-    // the editor height has no such render-time clamp).
-    if editor_h.get_untracked() < QUERY_MIN_H {
-        editor_h.set(QUERY_MIN_H);
-    }
+    // No lift here. A height persisted under an older, looser floor — or under a
+    // smaller interface scale — is floored at render by
+    // `consts::effective_editor_h`, the way the panel widths are, so the stored
+    // intent survives and comes back when the floor lowers again. See that
+    // function for what mutating it here used to cost.
     // The active tab, resolved on demand (`Tab` is `Copy`).
     let active_tab = move || {
         let id = active.get_untracked();
@@ -4831,7 +4850,7 @@ fn center(ui: Ui) -> impl IntoView {
     .style(|s| {
         // No floor here — the child `query_pane` pins its own height (`editor_h`, or
         // 0 when collapsed) and is `flex_shrink(0)`, so this wrapper hugs it and can
-        // reach 0 on collapse. (The divider clamps `editor_h ≥ QUERY_MIN_H` when open.)
+        // reach 0 on collapse. (The divider clamps `editor_h ≥ query_min_h()` when open.)
         s.width_full()
             .flex_shrink(0.0_f32)
             .flex_col()
@@ -4943,24 +4962,25 @@ fn center(ui: Ui) -> impl IntoView {
         s.flex_grow(1.0_f32)
             .width_full()
             .flex_col()
-            .min_height(RESULTS_MIN_H)
+            .min_height(results_min_h())
             .min_width(0.0)
     });
 
     // Divider between editor and results, offset past the tab bar. Double-click
     // resets to the default editor height; drag-end/reset persists the layout.
-    // Ceiling leaves the results grid `RESULTS_MIN_H` within the editor+results
+    // Ceiling leaves the results grid `results_min_h()` within the editor+results
     // region (window minus header/footer/tab-bar).
     let split_handle = v_resize_handle(
-        TAB_BAR_H,
+        tab_bar_h(),
         editor_h,
-        QUERY_MIN_H,
+        move || effective_editor_h(editor_h.get(), editor_collapsed.get()),
+        query_min_h(),
         move || {
             let wh = window_size().get().1;
             if wh < 1.0 {
                 return f64::INFINITY;
             }
-            wh - theme::HEADER_H - theme::FOOTER_H - TAB_BAR_H - RESULTS_MIN_H
+            wh - theme::header_h() - theme::footer_h() - tab_bar_h() - results_min_h()
         },
         EDITOR_H,
         ui.persist_layout.clone(),
@@ -4985,7 +5005,7 @@ fn center(ui: Ui) -> impl IntoView {
             .height_full()
             .flex_col()
             .min_height(0.0)
-            .min_width(CENTER_MIN_W)
+            .min_width(center_min_w())
     })
 }
 
@@ -5283,8 +5303,8 @@ fn result_tab_strip(
     h_stack((scroller,)).style(|s| {
         s.width_full()
             .flex_row()
-            .height(TAB_BAR_H)
-            .min_height(TAB_BAR_H)
+            .height(tab_bar_h())
+            .min_height(tab_bar_h())
             .flex_shrink(0.0_f32)
             .background(theme::bg_chrome())
             .border_top(1.0)
@@ -5305,7 +5325,7 @@ fn result_tab_chip(
         result_tabs.with(|v| matches!(v.get(idx).map(|p| &p.state), Some(QueryState::Failed(_))))
     };
     // Colour is set on the tab container and cascades to the label.
-    container(text(label).style(|s| s.margin_horiz(10.0).font_size(theme::FONT_BODY)))
+    container(text(label).style(|s| s.margin_horiz(10.0).font_size(theme::font_body())))
         .on_click_stop(move |_| active_result.set(idx))
         .style(move |s| {
             let s = s
@@ -5558,7 +5578,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
         move |label| match label {
             Some(l) => text(l)
                 .style(|s| {
-                    s.font_size(theme::FONT_TITLE)
+                    s.font_size(theme::font_title())
                         .font_family("IBM Plex Sans".to_string())
                         .color(theme::text_faint())
                         .padding_vert(8.0)
@@ -5823,9 +5843,14 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
             .min_width(0.0)
     });
 
-    let right_w = ui.layout.right_w;
     v_stack((title_row, body)).style(move |s| {
-        s.width(right_w.get())
+        // The width the shell *renders* this column at, not `right_w` (the
+        // user's stored intent) — see `widgets::right_panel_w`. The terminal is
+        // the fourth panel in this column and the one that got left behind when
+        // the AI, history and activity panels were converted: at 200% the shell
+        // reserves the scaled minimum and the panel drew the intent, leaving a
+        // strip of the layer behind it showing through.
+        s.width(widgets::right_panel_w().get())
             .flex_shrink(0.0_f32)
             .height_full()
             .min_height(0.0)
@@ -5838,7 +5863,9 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
 
 /// Box size of [`FieldCfg::trailing`]'s action — the icon's own 16px, so pinning
 /// the box doesn't move it horizontally.
-const TRAILING_SIZE: f64 = 16.0;
+fn trailing_size() -> f64 {
+    theme::scaled(16.0)
+}
 
 /// The gaps either side of [`FieldCfg::trailing`]'s action. The right one is
 /// negative on purpose — it pulls the control 4px closer to the box edge, for a
@@ -5846,8 +5873,12 @@ const TRAILING_SIZE: f64 = 16.0;
 ///
 /// Named because two things read them: the control's own layout, and
 /// [`placeholder_right_inset`], which has to reserve exactly the width they take.
-const TRAILING_GAP_L: f64 = 6.0;
-const TRAILING_GAP_R: f64 = -4.0;
+fn trailing_gap_l() -> f64 {
+    theme::scaled(6.0)
+}
+fn trailing_gap_r() -> f64 {
+    -theme::scaled(4.0)
+}
 
 /// The right inset of [`edit_field`]'s placeholder overlay, measured from the
 /// box's padding edge the way its left one is.
@@ -5868,9 +5899,9 @@ const TRAILING_GAP_R: f64 = -4.0;
 /// the field has text, which is exactly when the placeholder is hidden.
 fn placeholder_right_inset(has_trailing: bool) -> f64 {
     if has_trailing {
-        CHAT_PAD_H + TRAILING_SIZE + TRAILING_GAP_L + TRAILING_GAP_R
+        chat_pad_h() + trailing_size() + trailing_gap_l() + trailing_gap_r()
     } else {
-        CHAT_PAD_H
+        chat_pad_h()
     }
 }
 
@@ -5878,6 +5909,54 @@ fn placeholder_right_inset(has_trailing: bool) -> f64 {
 /// Ctrl+K field, whose surface is owned by an animated outer container).
 pub(crate) fn bg_transparent() -> floem::peniko::Color {
     floem::peniko::Color::TRANSPARENT
+}
+
+/// The line height [`edit_field`] gives its editor, from the field's type size —
+/// ≈1.46× the app's body rhythm (13→19, 20→29).
+///
+/// One function because two places must agree to the pixel: the editor's own
+/// `Styling::line_height`, and the box-height/padding arithmetic in `edit_field`
+/// that has to match what the editor then renders.
+fn field_line_h(px: f32) -> f64 {
+    (px as f64 * 1.46).round()
+}
+
+/// [`edit_field`]'s editor styling.
+///
+/// A hand-written `Styling` rather than floem's `SimpleStyling` for one reason:
+/// the builder takes the font size **by value**, so the size a field was built
+/// at is the size it draws for ever. Reading it here — through the same
+/// `fn() -> f32` the rest of the field's geometry uses — is what lets a field
+/// follow the interface scale, and it is the trick `sql_highlight::SqlStyling`
+/// already plays for the SQL editor's own font.
+struct FieldStyling {
+    size: fn() -> f32,
+    family: Vec<floem::text::FamilyOwned>,
+}
+
+impl floem::views::editor::text::Styling for FieldStyling {
+    /// The editor caches its laid-out lines against this id, so the size has to
+    /// be *in* it: reporting a new `font_size` while the id stood still would
+    /// leave the old layout on screen. Same shape as `SqlStyling::id`.
+    fn id(&self) -> u64 {
+        (theme::ui_generation() << 8) | ((self.size)().round() as u64 & 0xFF)
+    }
+
+    fn font_size(&self, _edid: floem::views::editor::id::EditorId, _line: usize) -> usize {
+        (self.size)().round() as usize
+    }
+
+    fn line_height(&self, _edid: floem::views::editor::id::EditorId, _line: usize) -> f32 {
+        field_line_h((self.size)()) as f32
+    }
+
+    fn font_family(
+        &self,
+        _edid: floem::views::editor::id::EditorId,
+        _line: usize,
+    ) -> std::borrow::Cow<'_, [floem::text::FamilyOwned]> {
+        std::borrow::Cow::Borrowed(&self.family)
+    }
 }
 
 /// Config for [`edit_field`], the app's shared editor-backed input.
@@ -5895,7 +5974,13 @@ pub(crate) struct FieldCfg {
     pub clearable: bool,
     /// Grab focus on mount (e.g. the Find palette).
     pub autofocus: bool,
-    pub font_size: f32,
+    /// The field's type size. A `fn` (not an `f32`) for the reason
+    /// [`FieldCfg::background`] is one: the box height, the vertical padding, the
+    /// placeholder's position and the editor's own styling are all derived from
+    /// it, and a size resolved once at build freezes all four. It defaults to
+    /// [`theme::font_body`], so a field follows the interface scale without its
+    /// caller doing anything.
+    pub font_size: fn() -> f32,
     /// Render in the app's monospace face ([`MONO_FAMILY`]) instead of IBM Plex
     /// Sans — for a field whose content is *code* and wants column alignment
     /// (the DDL preview's generated SQL). Doesn't change the line height, so the
@@ -5905,7 +5990,13 @@ pub(crate) struct FieldCfg {
     /// Read-only: no text edits (still handles Enter/Escape). Suppresses autofocus.
     pub read_only: bool,
     /// Fixed box height. `None` = derive from content (auto-grow for multiline).
-    pub height: Option<f64>,
+    ///
+    /// A `fn`, like [`Self::font_size`] and for the same reason — the box has to
+    /// hold a line of type that follows the interface scale. A resolved `f64`
+    /// froze it: `Some(40.0)` beside `font_size: font_title` gave a 40px box a
+    /// 41px line box at 200% and clipped the text, and even a `Some(field_input_h())`
+    /// baked the scale in force when the field was built.
+    pub height: Option<fn() -> f64>,
     /// Reactive override for the multiline auto-grow cap (rows). `None` =
     /// `CHAT_MAX_ROWS`. A signal so the cap can follow a resizing container (the
     /// value viewer caps at the results-panel height).
@@ -6010,7 +6101,7 @@ impl Default for FieldCfg {
             multiline: false,
             clearable: false,
             autofocus: false,
-            font_size: 13.0,
+            font_size: theme::font_body,
             mono: false,
             border_radius: 6.0,
             read_only: false,
@@ -6176,7 +6267,13 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let has_side = clearable || trailing.is_some();
     // Line height derived from the font so the box height matches the rendered
     // text (≈1.46× the app's body rhythm: 13→19, 16→23).
-    let line_h = (font_size as f64 * 1.46).round();
+    //
+    // Closures, not values: every one of these is a *derived* size, and the font
+    // they derive from follows the interface scale. Resolved once here they would
+    // hold the size the field was built at — which is what left a 13px value
+    // inside a box grown for 20px type, with the trailing action (scaled through
+    // `icons::icon`) overhanging the field's own edge.
+    let line_h = move || field_line_h(font_size());
     // Keep as `fn`s (not resolved Colors) so the style closures below can call
     // them and follow a live theme switch (§7.4).
     let text_color: fn() -> floem::peniko::Color = text_color.unwrap_or(theme::text);
@@ -6184,9 +6281,9 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         placeholder_color.unwrap_or(theme::placeholder);
     // With a fixed height, centre the single line vertically; otherwise use the
     // standard vertical padding and let the height follow the content.
-    let pad_v = match height {
-        Some(hh) => ((hh - line_h) / 2.0 - 2.0).max(2.0),
-        None => CHAT_PAD_V,
+    let pad_v = move || match height {
+        Some(hf) => ((hf() - line_h()) / 2.0 - 2.0).max(2.0),
+        None => chat_pad_v(),
     };
     let cap = if multiline { CHAT_MAX_ROWS } else { 1 };
     let wrap = if multiline && !no_wrap {
@@ -6351,16 +6448,16 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
 
     // Plain styling in the app's body font, with an explicit line height so the
     // box-height math below matches the rendered lines.
-    let styling = {
-        // NB: `SimpleStyling`'s wrap is dropped in `build()` — wrapping is
-        // controlled by `wrap_method` on `editor_style` below, not here.
-        let mut b = SimpleStyling::builder();
-        b.font_size(font_size as usize)
-            .line_height(line_h as f32)
-            .font_family(vec![FamilyOwned::Name(
-                if mono { MONO_FAMILY } else { "IBM Plex Sans" }.to_string(),
-            )]);
-        b.build()
+    //
+    // `FieldStyling`, not a `SimpleStyling`: the builder takes the size *by
+    // value*, so a field built at 100% kept drawing 13px text after the interface
+    // scale moved. (Wrapping is controlled by `wrap_method` on `editor_style`
+    // below either way — `SimpleStyling` drops its own in `build()`.)
+    let styling = FieldStyling {
+        size: font_size,
+        family: vec![FamilyOwned::Name(
+            if mono { MONO_FAMILY } else { "IBM Plex Sans" }.to_string(),
+        )],
     };
 
     // A multiline field that doesn't wrap can overflow sideways, so it needs the
@@ -6699,15 +6796,15 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // where the first line of text renders — and bounded on *both* sides, so one
     // longer than the field ellipsizes at its edge instead of painting across the
     // border (see `placeholder_right_inset`).
-    let ph_top = pad_v + (line_h - font_size as f64) / 2.0;
-    let ph_right = placeholder_right_inset(trailing.is_some());
+    let ph_top = move || pad_v() + (line_h() - font_size() as f64) / 2.0;
+    let has_trailing = trailing.is_some();
     let placeholder = dyn_container(
         move || text_sig.with(|t| t.is_empty()) && !focused.get(),
         move |show| {
             if show {
                 text(placeholder)
                     .style(move |s| {
-                        s.font_size(font_size)
+                        s.font_size(font_size())
                             .font_family("IBM Plex Sans".to_string())
                             .color(placeholder_color())
                             // The trim itself. `width_full` is what makes it
@@ -6727,9 +6824,9 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     )
     .style(move |s| {
         s.absolute()
-            .inset_left(CHAT_PAD_H)
-            .inset_right(ph_right)
-            .inset_top(ph_top)
+            .inset_left(chat_pad_h())
+            .inset_right(placeholder_right_inset(has_trailing))
+            .inset_top(ph_top())
     })
     // Let clicks fall through to the editor beneath — otherwise clicking on the
     // placeholder text (which sits on top) fails to focus the field.
@@ -6751,13 +6848,13 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         // the common case changes.
         let side = container(trailing()).style(|s| {
             s.flex_shrink(0.0_f32)
-                .width(TRAILING_SIZE)
-                .height(TRAILING_SIZE)
+                .width(trailing_size())
+                .height(trailing_size())
                 .items_center()
                 .justify_center()
                 .align_self(Some(floem::taffy::style::AlignItems::FlexEnd))
-                .margin_left(TRAILING_GAP_L)
-                .margin_right(TRAILING_GAP_R)
+                .margin_left(trailing_gap_l())
+                .margin_right(trailing_gap_r())
         });
         h_stack((editor, side))
             .style(|s| s.width_full().height_full().min_width(0.0).items_center())
@@ -6832,7 +6929,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             let Event::PointerDown(pe) = e else { return };
             // The editor sits at the content origin (1px border + the box padding)
             // and is exactly as large as its own viewport; the rest is chrome.
-            let (left, top) = (1.0 + CHAT_PAD_H, 1.0 + pad_v);
+            let (left, top) = (1.0 + chat_pad_h(), 1.0 + pad_v());
             let vp = ed_click.viewport.get_untracked();
             if pe.pos.x >= left
                 && pe.pos.x <= left + vp.width()
@@ -6860,11 +6957,11 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             // 1px top/bottom borders (border-box) plus a hair of slack so the editor's
             // viewport fully contains its content and no phantom scrollbar shows.
             let h = match height {
-                Some(hh) => hh,
+                Some(hf) => hf(),
                 None => {
                     // Effective cap: a reactive `max_rows` (viewer) else the default.
                     let cap_n = max_rows.map(|m| m.get()).unwrap_or(cap).max(1);
-                    rows.get().clamp(1, cap_n) as f64 * line_h + pad_v * 2.0 + 3.0
+                    rows.get().clamp(1, cap_n) as f64 * line_h() + pad_v() * 2.0 + 3.0
                 }
             };
             // No flex_grow baked in: in a vertical stack that would stretch the box's
@@ -6873,8 +6970,8 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             let s = s
                 .min_width(0.0)
                 .height(h)
-                .padding_horiz(CHAT_PAD_H)
-                .padding_vert(pad_v)
+                .padding_horiz(chat_pad_h())
+                .padding_vert(pad_v())
                 .background(background())
                 .border(1.0)
                 .border_radius(border_radius)
@@ -6909,7 +7006,10 @@ pub(crate) fn thumb_len(desired: f64, track: f64) -> f64 {
 /// A status-bar text segment: 12px, muted grey (`status_text`).
 fn footer_text(s: String) -> AnyView {
     text(s)
-        .style(|st| st.color(theme::status_text()).font_size(theme::FONT_STATUS))
+        .style(|st| {
+            st.color(theme::status_text())
+                .font_size(theme::font_status())
+        })
         .into_any()
 }
 
@@ -6943,7 +7043,7 @@ fn status_menu_seg(
     };
     dyn_container(label, move |s| {
         text(s)
-            .style(|s| s.font_size(theme::FONT_STATUS))
+            .style(|s| s.font_size(theme::font_status()))
             .into_any()
     })
     .on_move(move |p| origin.set((p.x, p.y)))
@@ -6981,7 +7081,7 @@ fn status_menu_seg(
 }
 
 /// Wrap a left status-bar segment so it auto-hides once its right edge comes
-/// within `FOOTER_COLLAPSE_GAP` px of the right-hand icon group (`ai_x` = the AI
+/// within `footer_collapse_gap()` px of the right-hand icon group (`ai_x` = the AI
 /// icon's left edge, both in window coords). It tracks its own right edge, frozen
 /// while it's hidden (updates only while shown) so the show/hide test reads a
 /// stable full-layout position and can't oscillate. Segments hide right-to-left
@@ -6995,7 +7095,7 @@ fn collapsing_seg(view: impl IntoView + 'static, ai_x: RwSignal<f64>) -> impl In
     // handlers so a hidden segment freezes its `edge` (no reactive cycle).
     let is_shown = move || {
         let ax = ai_x.get_untracked();
-        ax < 1.0 || edge.get_untracked() + FOOTER_COLLAPSE_GAP <= ax
+        ax < 1.0 || edge.get_untracked() + footer_collapse_gap() <= ax
     };
     container(view)
         .on_move(move |p| {
@@ -7013,7 +7113,7 @@ fn collapsing_seg(view: impl IntoView + 'static, ai_x: RwSignal<f64>) -> impl In
         })
         .style(move |s| {
             let ax = ai_x.get();
-            if ax >= 1.0 && edge.get() + FOOTER_COLLAPSE_GAP > ax {
+            if ax >= 1.0 && edge.get() + footer_collapse_gap() > ax {
                 s.hide()
             } else {
                 s
@@ -7170,7 +7270,7 @@ fn footer(ui: Ui) -> impl IntoView {
         move || cursor_lc.get(),
         move |(l, c)| {
             text(format!("Ln {l}, Col {c}"))
-                .style(|s| s.font_size(theme::FONT_STATUS))
+                .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
     )
@@ -7240,7 +7340,7 @@ fn footer(ui: Ui) -> impl IntoView {
         move || word_wrap.get(),
         move |w| {
             text(if w { "Wrap" } else { "No wrap" })
-                .style(|s| s.font_size(theme::FONT_STATUS))
+                .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
     )
@@ -7262,7 +7362,8 @@ fn footer(ui: Ui) -> impl IntoView {
             } else {
                 h_stack((
                     icons::icon(icons::TRIANGLE_ALERT, 16.0),
-                    text(n.to_string()).style(|s| s.margin_left(5.0).font_size(theme::FONT_STATUS)),
+                    text(n.to_string())
+                        .style(|s| s.margin_left(5.0).font_size(theme::font_status())),
                 ))
                 .style(|s| s.flex_row().items_center())
                 .into_any()
@@ -7302,7 +7403,7 @@ fn footer(ui: Ui) -> impl IntoView {
         move || read_only.get(),
         move |ro| {
             text(if ro { "Read only" } else { "Write mode" })
-                .style(|s| s.font_size(theme::FONT_STATUS))
+                .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
     )
@@ -7376,7 +7477,7 @@ fn footer(ui: Ui) -> impl IntoView {
         move || tx_mode.get(),
         move |m| {
             text(m.label())
-                .style(|s| s.font_size(theme::FONT_STATUS))
+                .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
     )
@@ -7423,7 +7524,7 @@ fn footer(ui: Ui) -> impl IntoView {
         move || tx_state.get(),
         move |st| {
             text(schemaic_core::tx::pill_text(st).unwrap_or_default())
-                .style(|s| s.font_size(theme::FONT_STATUS))
+                .style(|s| s.font_size(theme::font_status()))
                 .into_any()
         },
     )
@@ -7457,7 +7558,7 @@ fn footer(ui: Ui) -> impl IntoView {
                 let s = s
                     .margin_left(15.0)
                     .items_center()
-                    .font_size(theme::FONT_STATUS)
+                    .font_size(theme::font_status())
                     .color(color())
                     .hover(move |s| s.color(hover()));
                 if visible() { s } else { s.hide() }
@@ -7558,8 +7659,8 @@ fn footer(ui: Ui) -> impl IntoView {
 
     let bar = h_stack((left_group, right_group)).style(|s| {
         s.width_full()
-            .height(theme::FOOTER_H)
-            .min_height(theme::FOOTER_H)
+            .height(theme::footer_h())
+            .min_height(theme::footer_h())
             .flex_shrink(0.0_f32)
             .flex_row()
             .items_center()
@@ -7570,7 +7671,7 @@ fn footer(ui: Ui) -> impl IntoView {
             // margin on each group because taffy's `height` here is the border
             // box: the bar's own height and the footer's edge don't move, only
             // what is inside it.
-            .padding_bottom(FOOTER_LIFT * 2.0)
+            .padding_bottom(footer_lift() * 2.0)
             .justify_between()
             .background(theme::bg_deepest())
             .border_top(1.0)
@@ -7580,6 +7681,17 @@ fn footer(ui: Ui) -> impl IntoView {
     // setting): a 2px no-layout overlay over the existing 1px border.
     stack((bar, conn_edge_border(connections, active_conn, true)))
         .style(|s| s.width_full().flex_shrink(0.0_f32))
+}
+
+/// The Find palette's type size — the palette's own step up from body text.
+///
+/// **One name because two views must agree to the pixel**: the field draws the
+/// query at it, and `overlays`' ghost-completion measures the query at it to place
+/// itself right after the last glyph. The ghost measured a literal `16.0` while
+/// the field drew `scaled_font(16.0)`, so at 200% it was placed at half the
+/// rendered width — on top of the query rather than after it.
+pub(crate) fn palette_font() -> f32 {
+    theme::scaled_font(16.0)
 }
 
 // The Find-palette search box: the shared field, autofocused on open, with a
@@ -7600,7 +7712,7 @@ pub(crate) fn search_box(
         FieldCfg {
             placeholder: "Search everywhere",
             autofocus: true,
-            font_size: 16.0,
+            font_size: palette_font,
             border_radius: 8.0,
             on_escape: Some(on_escape),
             on_arrow_up: Some(on_arrow_up),
@@ -7616,13 +7728,13 @@ pub(crate) fn search_box(
 
 #[cfg(test)]
 mod field_layout_tests {
-    use super::{CHAT_PAD_H, TRAILING_SIZE, placeholder_right_inset};
+    use super::{chat_pad_h, placeholder_right_inset, trailing_size};
 
     /// With nothing beside the editor the overlay spans the content box exactly —
     /// the same edges the text it stands in for starts and ends at.
     #[test]
     fn a_plain_field_bounds_the_placeholder_symmetrically() {
-        assert_eq!(placeholder_right_inset(false), CHAT_PAD_H);
+        assert_eq!(placeholder_right_inset(false), chat_pad_h());
     }
 
     /// With a trailing action it stops clear of it. Asserted as the **property**
@@ -7632,7 +7744,7 @@ mod field_layout_tests {
     fn a_trailing_action_is_never_painted_over() {
         let inset = placeholder_right_inset(true);
         assert!(
-            inset >= CHAT_PAD_H + TRAILING_SIZE,
+            inset >= chat_pad_h() + trailing_size(),
             "{inset} leaves the control uncovered by only part of its width"
         );
     }

@@ -12,7 +12,7 @@ use floem::reactive::create_effect;
 use floem::style::TextOverflow;
 use floem::views::TooltipExt;
 
-use crate::consts::{TAB_BAR_H, TAB_MAX_W};
+use crate::consts::{tab_bar_h, tab_max_w};
 use crate::widgets::{MenuEntry, measure_text_px, wheel_hscroll};
 use crate::{FieldCfg, Tab, Ui, bg_transparent, db_color_dot, edit_field, icons, theme};
 
@@ -81,8 +81,8 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
     h_stack((scroller, add)).style(|s| {
         s.width_full()
             .flex_row()
-            .height(TAB_BAR_H)
-            .min_height(TAB_BAR_H)
+            .height(tab_bar_h())
+            .min_height(tab_bar_h())
             .flex_shrink(0.0_f32)
             .background(theme::bg_chrome())
             .border_bottom(1.0)
@@ -93,18 +93,24 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
 // Width available to the title *text* inside a full-width (200px) tab: the tab
 // max minus the left margin (10), label→× gap (7), the × box (16) and its right
 // margin (7). A title wider than this ellipsizes and gains a tooltip.
-const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
+fn tab_title_avail() -> f64 {
+    tab_max_w() - theme::scaled(40.0)
+}
 
 // A present DB-identity dot leads the label with its own 12px footprint (the 6px
 // glyph + its 6px right margin — see `db_color_dot` below). It's *not* covered by
-// `TAB_TITLE_AVAIL`'s 40, so the label cap must shed it when a dot shows; else a
+// `tab_title_avail()`'s 40, so the label cap must shed it when a dot shows; else a
 // full-width truncated title pushes the × past the chip cap and clips it.
-const TAB_DOT_W: f64 = 12.0;
+fn tab_dot_w() -> f64 {
+    theme::scaled(12.0)
+}
 
 // And the same for the file glyph a `.sql`-backed tab leads its title with:
-// 14px plus a 5px right margin, neither of them in `TAB_TITLE_AVAIL`'s 40 either.
+// 14px plus a 5px right margin, neither of them in `tab_title_avail()`'s 40 either.
 // A tab can show both, and then the title sheds both.
-const TAB_FILE_W: f64 = 19.0;
+fn tab_file_w() -> f64 {
+    theme::scaled(19.0)
+}
 
 fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let active = ui.tabs_ui.active;
@@ -149,6 +155,13 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
         // from one file to another on a tab that also carries a user-assigned name
         // moves neither the title nor the icon — the tooltip would have gone on
         // naming the old file.
+        // The interface scale is in the key because `truncated` below is a
+        // *structural* decision, not a style one: it chooses whether to attach a
+        // tooltip at all, and a tooltip can't be added or removed from inside a
+        // `.style(…)` closure. Both sides of that comparison scale (the measured
+        // title, and `tab_title_avail()`), so without a rebuild a tab that starts
+        // ellipsizing at a larger scale ellipsizes with no tooltip — losing the
+        // one cue that says what the clipped title is.
         move || {
             (
                 tab.editing.get(),
@@ -157,9 +170,10 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 tab.modified(),
                 tab.path
                     .with(|p| p.as_ref().map(|p| p.to_string_lossy().into_owned())),
+                theme::ui_scale(),
             )
         },
-        move |(editing, title, pinned, modified, path)| -> AnyView {
+        move |(editing, title, pinned, modified, path, _scale)| -> AnyView {
             if editing {
                 // Inline rename field. `edit_field` (unlike floem's `text_input`,
                 // which swallows Escape into its own `clear_focus`) routes Escape
@@ -172,9 +186,9 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     background: bg_transparent,
                     border_color: Some(bg_transparent),
                     border_radius: 0.0,
-                    font_size: theme::FONT_BODY,
+                    font_size: theme::font_body,
                     autofocus: true,
-                    height: Some(TAB_BAR_H),
+                    height: Some(tab_bar_h),
                     on_submit: Some(commit_enter),
                     on_escape: Some(Rc::new(move || tab.editing.set(false))),
                     on_blur: Some(Rc::new(move || {
@@ -198,14 +212,14 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 return edit_field(tab.edit_buf, cfg)
                     .style(move |s| {
                         let w = (tab.edit_buf.with(|b| measure_text_px(b)) + 24.0)
-                            .clamp(60.0, TAB_MAX_W - 2.0);
+                            .clamp(60.0, tab_max_w() - 2.0);
                         s.width(w)
                     })
                     .into_any();
             }
 
             // Whether this tab currently shows a DB-identity dot (its footprint
-            // eats into the title width — see `TAB_DOT_W`). Read reactively so the
+            // eats into the title width — see `tab_dot_w()`). Read reactively so the
             // label cap follows a colour assigned/cleared while the tab is open.
             let has_dot = move || {
                 tab.database.get().is_some_and(|db| {
@@ -218,8 +232,9 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
             // Display: label (ellipsized past the tab width) + close ×. A title
             // that would be clipped gets a tooltip with its full text; a title
             // that fits gets none. Both leading glyphs eat into the title's width.
-            let file_w = if path.is_some() { TAB_FILE_W } else { 0.0 };
-            let avail = move || TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 } - file_w;
+            let file_w = if path.is_some() { tab_file_w() } else { 0.0 };
+            let avail =
+                move || tab_title_avail() - if has_dot() { tab_dot_w() } else { 0.0 } - file_w;
             let truncated = measure_text_px(&title) > avail();
             // Left inset moved to the row's `padding_left` so the (optional) DB
             // colour dot can lead the label without shifting the text when absent.
@@ -235,7 +250,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     .margin_right(7.0)
                     .max_width(avail())
                     .text_overflow(TextOverflow::Ellipsis)
-                    .font_size(theme::FONT_BODY);
+                    .font_size(theme::font_body());
                 if modified {
                     s.font_style(floem::text::Style::Italic)
                 } else {
@@ -447,7 +462,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
             overlay.popup_width.set(150.0);
             overlay.popup_menu.set(Some(entries));
         })
-        // Flat, full-height tab capped at `TAB_MAX_W`: chrome background (invisible
+        // Flat, full-height tab capped at `tab_max_w()`: chrome background (invisible
         // against the strip) when inactive, `tab_active` when active; a right
         // separator line divides it from the next tab. The container's `color`
         // cascades to the label + ×.
@@ -455,7 +470,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
             let s = s
                 .flex_row()
                 .items_center()
-                .max_width(TAB_MAX_W)
+                .max_width(tab_max_w())
                 .border_right(1.0)
                 .border_color(theme::tab_separator());
             if active.get() == tab.id {

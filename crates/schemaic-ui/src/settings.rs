@@ -5,10 +5,11 @@
 
 use std::rc::Rc;
 
+use floem::AnyView;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
-use crate::consts::{CHAT_PAD_H, TERM_FONT_SIZES};
+use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
     ActionKind, action_button, autohide, focus_root_with_ring, form_hint, form_label_style,
     modal_title, panel_style,
@@ -93,7 +94,11 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
                 body,
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_panel())
+                    .width(crate::widgets::modal_w(420.0))
+            });
 
             let esc = close.clone();
             // Click-to-dismiss on a sibling behind the panel, never on the focus
@@ -146,7 +151,7 @@ fn shell_dropdown(
             .map(|p| p.name.clone())
             .unwrap_or_default();
         h_stack((
-            text(name).style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+            text(name).style(|s| s.color(theme::text()).font_size(theme::font_body())),
             empty().style(|s| s.flex_grow(1.0_f32)),
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
@@ -169,8 +174,8 @@ fn shell_dropdown(
             })
             .unwrap_or_default();
         v_stack((
-            text(name).style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
-            text(sub).style(|s| s.color(theme::text_faint()).font_size(theme::FONT_LABEL)),
+            text(name).style(|s| s.color(theme::text()).font_size(theme::font_body())),
+            text(sub).style(|s| s.color(theme::text_faint()).font_size(theme::font_label())),
         ))
         .style(move |s| {
             let s = s
@@ -216,7 +221,7 @@ pub(crate) fn focusable_toggle_row(
         // The switch's primary label, so `theme::text()` rather than a caption's
         // colour: it is the thing being toggled, not a caption above it.
         v_stack((
-            text(title).style(|s| s.color(theme::text()).font_size(theme::FONT_LABEL)),
+            text(title).style(|s| s.color(theme::text()).font_size(theme::font_label())),
             form_hint(hint),
         ))
         .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
@@ -257,7 +262,7 @@ where
     // Closed box: selected label on the left, chevron on the right.
     let main = move |cur: T| {
         h_stack((
-            text(label(cur).into()).style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+            text(label(cur).into()).style(|s| s.color(theme::text()).font_size(theme::font_body())),
             empty().style(|s| s.flex_grow(1.0_f32)),
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
@@ -279,7 +284,7 @@ where
                     .padding_horiz(12.0)
                     .padding_vert(6.0)
                     .color(theme::text())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .hover(|s| s.background(theme::dropdown_hover()));
                 if active.get() == item {
                     s.background(theme::dropdown_active())
@@ -302,9 +307,9 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
     use floem::views::scroll::ScrollClass;
     use floem::views::{ListClass, ListItemClass};
     s.width_full()
-        .height(32.0)
+        .height(theme::scaled(32.0))
         .items_center()
-        .padding_horiz(CHAT_PAD_H)
+        .padding_horiz(chat_pad_h())
         .background(theme::bg_editor())
         .border(1.0)
         .border_color(theme::field_border())
@@ -323,7 +328,7 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
                 .border_color(theme::border())
                 .border_radius(8.0)
                 .padding_vert(4.0)
-                .min_width(150.0)
+                .min_width(theme::scaled(150.0))
                 // Override Floem's default list chrome. The item rule is nested
                 // under `ListClass` so it's inherited from the same nearest
                 // ancestor (the list) as the default's `ListClass > ListItemClass`
@@ -375,6 +380,107 @@ fn settings_group_label(t: &'static str) -> impl IntoView {
     text(t).style(form_label_style)
 }
 
+/// The interface-scale picker: four segments, no popup.
+///
+/// **Deliberately not a dropdown**, unlike the two theme pickers above it, and the
+/// reason is a floem bug rather than a taste. `OverlayView::paint` (floem 0.2,
+/// `window_handle.rs`) nudges an overlay back inside the window when it would
+/// overflow — `cx.offset((-x, -y))` — and that nudge is **paint only**: layout,
+/// and therefore hit-testing, stays where it was. So any `Dropdown` whose popup
+/// runs past the window's bottom edge paints its rows in one place and answers
+/// the pointer in another, and you have to hover the row *below* the one you
+/// want. Every dropdown in the app has that latent bug; this control hit it
+/// because it is the last row of the last group of the tallest modal — and it hit
+/// it *specifically at 150%*, where the modal grows enough to push the popup past
+/// the edge but not enough for the body to scroll instead.
+///
+/// A segmented control has no overlay, so it cannot be wrong. It is also the
+/// better control here: four short options, all visible, one click each — which
+/// is how somebody choosing a scale actually behaves, trying them in turn.
+///
+/// One Tab stop with Left/Right inside it ([`nav_group`], the rule the colour
+/// swatches and the designer's item list follow), and the arrows *apply* as they
+/// move: every option is visible instantly and reversible by the next press, so
+/// there is nothing to confirm. The step clamps rather than wraps — this is a
+/// selection, and rolling from Huge back to Small would only be a surprise.
+fn scale_picker(
+    scale: RwSignal<theme::UiScale>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+) -> AnyView {
+    use crate::widgets::{NavAxis, list_step, nav_group};
+
+    /// A segment's corner, inside the track's own [`CONTROL_RADIUS`](crate::widgets::CONTROL_RADIUS).
+    /// Not scaled: a radius is a shape, and the 3px inset it sits in isn't the
+    /// kind of measurement that grows with the type (the same call the hairlines
+    /// make).
+    const SEGMENT_RADIUS: f64 = 4.0;
+
+    // One segment. The four share the track's width equally (`flex_grow` with a
+    // zero basis — an `auto` basis would size each to its own label and leave
+    // "Normal" wider than "Huge").
+    //
+    // **Every segment carries the 1px border, transparent when it isn't the
+    // selected one.** A border is layout in floem (it comes out of the content
+    // box), so colouring one in on selection alone would shift that segment's
+    // label by a pixel as the selection moved along the row. This is the flat
+    // equivalent of the design's `box-shadow: inset 0 0 0 1px`.
+    let segments = theme::UiScale::ALL.map(|k| {
+        text(k.short())
+            .on_click_stop(move |_| scale.set(k))
+            .style(move |s| {
+                let on = scale.get() == k;
+                let s = s
+                    .flex_grow(1.0_f32)
+                    .flex_basis(0.0)
+                    .min_width(0.0)
+                    .height_full()
+                    .items_center()
+                    .justify_center()
+                    .border(1.0)
+                    .border_radius(SEGMENT_RADIUS)
+                    .font_size(theme::font_body());
+                if on {
+                    s.background(theme::control_bg())
+                        .border_color(theme::accent())
+                        .color(theme::accent())
+                } else {
+                    s.border_color(floem::peniko::Color::TRANSPARENT)
+                        .color(theme::text_dim())
+                        .hover(|s| s.color(theme::text()))
+                }
+            })
+            .into_any()
+    });
+
+    // The track wears the field chrome the dropdowns above it wear — same height,
+    // same surface, same border and radius — so the Appearance group reads as one
+    // set of controls rather than a picker and two dropdowns.
+    let row = h_stack_from_iter(segments).style(|s| {
+        s.flex_row()
+            .width_full()
+            .height(theme::scaled(32.0))
+            .items_center()
+            .gap(theme::scaled(2.0))
+            .padding(theme::scaled(3.0))
+            .background(theme::bg_editor())
+            .border(1.0)
+            .border_color(theme::field_border())
+            .border_radius(crate::widgets::CONTROL_RADIUS)
+    });
+
+    nav_group(row, ring, tabindex, NavAxis::Horizontal, move |delta| {
+        let all = theme::UiScale::ALL;
+        let cur = all
+            .iter()
+            .position(|k| *k == scale.get_untracked())
+            .unwrap_or(0);
+        if let Some(next) = list_step(all.len(), cur, delta) {
+            scale.set(all[next]);
+        }
+    })
+}
+
 // A dark-theme switch. Track + handle colours are driven by on/off state; the
 // track brightens on hover, and the press (active) state is neutralised to match
 // hover so there's no distracting flash on click.
@@ -400,8 +506,8 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                 )
             };
             let s = s
-                .width(36.0)
-                .height(18.0)
+                .width(theme::scaled(36.0))
+                .height(theme::scaled(18.0))
                 // Floem dresses every `ToggleButtonClass` in a 1px `#8c8c8c`
                 // border (`theme::default_theme`'s `border_style`), which reads
                 // as a grey outline around the dark off track and vanishes under
@@ -749,14 +855,15 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             let detected = detected.clone();
             let cli_ok = cli_ok.clone();
             let red =
-                |s: floem::style::Style| s.font_size(theme::FONT_LABEL).color(theme::reject_bg());
+                |s: floem::style::Style| s.font_size(theme::font_label()).color(theme::reject_bg());
             let hint = dyn_container(
                 move || cli_path.get(),
                 move |path| {
                     if path.trim().is_empty() {
                         match &detected {
-                            Some(p) => text(format!("Auto-detected: {}", p))
-                                .style(|s| s.font_size(theme::FONT_LABEL).color(theme::conn_ok())),
+                            Some(p) => text(format!("Auto-detected: {}", p)).style(|s| {
+                                s.font_size(theme::font_label()).color(theme::conn_ok())
+                            }),
                             None => text("Auto-detect failed. Claude CLI not found.").style(red),
                         }
                         .into_any()
@@ -822,7 +929,7 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 )
                 .style(|s| {
                     s.width_full()
-                        .font_size(theme::FONT_HINT)
+                        .font_size(theme::font_hint())
                         .color(theme::text_muted())
                 }),
             ))
@@ -846,12 +953,12 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 })
                 .style(|s| {
                     s.width_full()
-                        .font_size(theme::FONT_HINT)
+                        .font_size(theme::font_hint())
                         .color(theme::text_muted())
                 }),
                 text("Set per connection, in the connection's settings.").style(|s| {
                     s.width_full()
-                        .font_size(theme::FONT_HINT)
+                        .font_size(theme::font_hint())
                         .color(theme::text_muted())
                 }),
             ))
@@ -887,7 +994,11 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 body,
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).background(theme::bg_panel()).width(460.0));
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_panel())
+                    .width(crate::widgets::modal_w(460.0))
+            });
 
             let esc = close.clone();
             // Click-to-dismiss on a sibling behind the panel, never on the focus
@@ -920,11 +1031,11 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
 /// monospace pill.
 fn shortcut_row(keys: &'static str, desc: &'static str) -> impl IntoView {
     h_stack((
-        text(desc).style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+        text(desc).style(|s| s.color(theme::text()).font_size(theme::font_body())),
         empty().style(|s| s.flex_grow(1.0_f32).min_width(12.0)),
         text(keys).style(|s| {
             s.color(theme::text_muted())
-                .font_size(theme::FONT_LABEL)
+                .font_size(theme::font_label())
                 .font_family("IBM Plex Mono".to_string())
                 .background(theme::bg_deepest())
                 .padding_horiz(6.0)
@@ -940,7 +1051,7 @@ fn shortcut_group(title: &'static str, rows: &[(&'static str, &'static str)]) ->
     let rows: Vec<_> = rows.to_vec();
     v_stack((
         text(title).style(|s| {
-            s.font_size(theme::FONT_LABEL)
+            s.font_size(theme::font_label())
                 .color(theme::text_dim())
                 .margin_bottom(2.0)
         }),
@@ -1029,7 +1140,7 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
     let enabled = dir.is_some();
     h_stack((
         v_stack((
-            text("Log file").style(|s| s.color(theme::text()).font_size(theme::FONT_LABEL)),
+            text("Log file").style(|s| s.color(theme::text()).font_size(theme::font_label())),
             form_hint(log_hint(dir.as_deref())),
         ))
         .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
@@ -1047,7 +1158,7 @@ fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -
 
 fn settings_section_header(t: &'static str) -> impl IntoView {
     text(t).style(|s| {
-        s.font_size(theme::FONT_BODY)
+        s.font_size(theme::font_body())
             .font_bold()
             .color(theme::text())
             .margin_bottom(2.0)
@@ -1058,6 +1169,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
     let open = ui.layout.theme_settings_open;
     let ui_theme = ui.layout.ui_theme;
     let editor_theme = ui.layout.editor_theme;
+    let ui_scale = ui.layout.ui_scale;
     let editor_font = ui.layout.editor_font;
     let row_limit = ui.layout.row_limit;
     let statement_timeout = ui.layout.statement_timeout;
@@ -1178,26 +1290,44 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 ring.clone(),
                 310,
             );
+            let scale_dd = scale_picker(ui_scale, ring.clone(), 320);
             // Kept for the root, which answers Tab by entering the ring.
             let root_ring = ring;
             let ui_section = v_stack((settings_group_label("Interface theme"), ui_dd)).style(ctrl);
             let editor_section =
                 v_stack((settings_group_label("Editor theme"), editor_dd)).style(ctrl);
-            let theme_group =
-                v_stack((settings_section_header("Theme"), ui_section, editor_section))
-                    .style(|s| s.flex_col().gap(16.0));
+            // No hint under this one, unlike the settings that carry a
+            // consequence: four segments named Small → Huge, applying the instant
+            // they are pressed, explain themselves better than a line of prose
+            // restating them.
+            let scale_section =
+                v_stack((settings_group_label("Interface scale"), scale_dd)).style(ctrl);
+            let theme_group = v_stack((
+                settings_section_header("Appearance"),
+                ui_section,
+                editor_section,
+                scale_section,
+            ))
+            .style(|s| s.flex_col().gap(16.0));
 
             let body = v_stack((general_group, editor_group, query_group, theme_group))
                 .style(|s| s.flex_col().gap(28.0).padding(14.0).width_full());
             // Scroll so the taller grouped modal never overflows the window.
-            let body = autohide(scroll(body)).style(|s| s.width_full().max_height(560.0));
+            let body = autohide(scroll(body)).style(|s| {
+                s.width_full()
+                    .max_height(crate::widgets::modal_body_h(560.0))
+            });
 
             let panel = v_stack((
                 modal_title("Settings", close.clone(), root_ring.clone()),
                 body,
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_panel())
+                    .width(crate::widgets::modal_w(420.0))
+            });
 
             let esc = close.clone();
             // Click-to-dismiss on a sibling behind the panel, never on the focus
@@ -1255,7 +1385,10 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
             )
             .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
             // Scroll the body so the modal never overflows the window.
-            let body = autohide(scroll(body)).style(|s| s.width_full().max_height(560.0));
+            let body = autohide(scroll(body)).style(|s| {
+                s.width_full()
+                    .max_height(crate::widgets::modal_body_h(560.0))
+            });
 
             // A ring for one button — the ✕, this modal's only control. Without
             // one the root has no Tab handler and Tab falls through to floem's
@@ -1263,7 +1396,11 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
             let ring = crate::widgets::FocusRing::new();
             let panel = v_stack((modal_title("Shortcuts", close.clone(), ring.clone()), body))
                 .on_click_stop(|_| {})
-                .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
+                .style(|s| {
+                    panel_style(s)
+                        .background(theme::bg_panel())
+                        .width(crate::widgets::modal_w(420.0))
+                });
 
             let esc = close.clone();
             focus_root_with_ring(

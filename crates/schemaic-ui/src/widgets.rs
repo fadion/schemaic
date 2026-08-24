@@ -216,7 +216,7 @@ pub(crate) fn ring_step(len: usize, cur: Option<usize>, backwards: bool) -> Opti
 /// `display: none`, not a bare `empty()`. This is the one place `hide()` is
 /// still right: taffy excludes a `display:none` child from **gap** accounting
 /// but counts a zero-sized one, so a plain `empty()` arm leaves a whole
-/// [`FORM_GAP`] of dead space where the block would have been. The distinction
+/// [`form_gap()`] of dead space where the block would have been. The distinction
 /// the range drew still holds — a *control* must never be built-and-hidden,
 /// because a hidden view is still in the Tab ring — and nothing is hidden here:
 /// there is nothing inside to reach.
@@ -985,7 +985,11 @@ fn modal_title_impl(
     let title = title.into();
     let pressed = close.clone();
     h_stack((
-        text(title).style(|s| s.font_size(15.0).font_bold().color(theme::text())),
+        text(title).style(|s| {
+            s.font_size(theme::scaled_font(15.0))
+                .font_bold()
+                .color(theme::text())
+        }),
         empty().style(|s| s.flex_grow(1.0_f32)),
         // Lucide X, 16px, vertically centred; `padding(6)` enlarges the click
         // hitbox (same idiom as `toolbar_icon`) so it's not fiddly to hit. Same
@@ -1011,7 +1015,7 @@ fn modal_title_impl(
         s.width_full()
             .flex_row()
             .items_center()
-            .padding_horiz(MODAL_PAD_H)
+            .padding_horiz(modal_pad_h())
             .padding_vert(10.0)
             .border_bottom(if border { 1.0 } else { 0.0 })
             .border_color(theme::border())
@@ -1025,14 +1029,18 @@ fn modal_title_impl(
 // files stops being consistent the first time one of them is tweaked.
 
 /// Gap between form rows.
-pub(crate) const FORM_GAP: f64 = 18.0;
+pub(crate) fn form_gap() -> f64 {
+    theme::scaled(18.0)
+}
 
 /// The inset every part of a modal shares: the title, the designer's tab strip,
 /// the body, and the footer. One constant because the alignment is the point —
 /// the title sat at 14 and the bodies at 20, so a form's first label started six
 /// pixels right of the heading above it and of the buttons below it. A modal that
 /// insets its content by hand is the drift this exists to stop.
-pub(crate) const MODAL_PAD_H: f64 = 14.0;
+pub(crate) fn modal_pad_h() -> f64 {
+    theme::scaled(14.0)
+}
 
 /// The caption above a control, and the explanatory line under one.
 ///
@@ -1050,7 +1058,7 @@ pub(crate) const MODAL_PAD_H: f64 = 14.0;
 /// they were collected here — the collecting was right, the colour it landed on
 /// was not.
 pub(crate) fn form_label_style(s: floem::style::Style) -> floem::style::Style {
-    s.color(theme::text_dim()).font_size(theme::FONT_LABEL)
+    s.color(theme::text_dim()).font_size(theme::font_label())
 }
 
 /// The hint under a control: recessive, a size down. See [`form_label_style`].
@@ -1059,7 +1067,7 @@ pub(crate) fn form_label_style(s: floem::style::Style) -> floem::style::Style {
 /// under even the `Recessive` floor of 2.0, which no other foreground in
 /// `UI_PAIRINGS` misses.
 pub(crate) fn form_hint_style(s: floem::style::Style) -> floem::style::Style {
-    s.color(theme::text_faint()).font_size(theme::FONT_HINT)
+    s.color(theme::text_faint()).font_size(theme::font_hint())
 }
 
 /// A form hint as a view — the common case, where the text is a literal.
@@ -1087,7 +1095,7 @@ pub(crate) fn form_section(label: &'static str) -> impl IntoView {
 /// preview's "1 Change" / "3 Changes", where the count *is* the heading.
 pub(crate) fn form_section_owned(label: String) -> impl IntoView {
     text(label).style(|s| {
-        s.font_size(theme::FONT_BODY)
+        s.font_size(theme::font_body())
             .font_bold()
             .color(theme::text())
     })
@@ -1108,14 +1116,18 @@ pub(crate) fn form_separator(stack_gap: f64) -> impl IntoView {
     })
 }
 
-/// The glyph size a list row's icon buttons paint at.
-pub(crate) const ROW_ICON: f64 = 14.0;
+/// The glyph size a list row's icon buttons paint at — a **base** size, which
+/// [`crate::icons::icon`] scales. Anything that has to match the *rendered*
+/// glyph (the empty slot in [`row_gap`]) scales it itself.
+pub(crate) const ROW_ICON: f32 = 14.0;
 /// The padding around it — the other half of [`row_slot`]'s footprint.
-const ROW_ICON_PAD: f64 = 4.0;
+fn row_icon_pad() -> f64 {
+    theme::scaled(4.0)
+}
 
 /// One icon-button-shaped slot in a list row.
 pub(crate) fn row_slot(inner: impl IntoView + 'static) -> impl IntoView {
-    container(inner).style(|s| s.padding(ROW_ICON_PAD).flex_shrink(0.0_f32))
+    container(inner).style(|s| s.padding(row_icon_pad()).flex_shrink(0.0_f32))
 }
 
 /// The small icon button an editable list's rows use — the enum values, a
@@ -1133,7 +1145,7 @@ pub(crate) fn row_button(
 ) -> AnyView {
     let act = Rc::new(act);
     let pressed = act.clone();
-    let button = row_slot(crate::icons::icon(glyph, ROW_ICON as f32))
+    let button = row_slot(crate::icons::icon(glyph, ROW_ICON))
         .on_click_stop(move |_| act())
         // Colour-only hover, like every other icon button in the app. The focus
         // outline is `in_ring_button`'s, on the wrapper it registers — putting
@@ -1153,7 +1165,11 @@ pub(crate) fn row_button(
 /// first row, the last row, and the ones between. A one-value list, where *both*
 /// arrows are dead, is the case that made it obvious.
 pub(crate) fn row_gap() -> AnyView {
-    row_slot(empty().style(|s| s.size(ROW_ICON, ROW_ICON))).into_any()
+    row_slot(empty().style(|s| {
+        let px = theme::scaled(ROW_ICON as f64);
+        s.size(px, px)
+    }))
+    .into_any()
 }
 
 /// A bordered control button (Choose file…, + Column), wearing the same chrome as
@@ -1189,7 +1205,7 @@ pub(crate) fn control_button_enabled(
         })
         .style(move |s| {
             let s = control_surface(s)
-                .font_size(theme::FONT_BODY)
+                .font_size(theme::font_body())
                 .padding_horiz(10.0)
                 .padding_vert(5.0)
                 .flex_shrink(0.0_f32);
@@ -1228,16 +1244,24 @@ pub(crate) enum ActionKind {
 }
 
 /// The gap between a footer's actions.
-pub(crate) const ACTION_GAP: f64 = 10.0;
+pub(crate) fn action_gap() -> f64 {
+    theme::scaled(10.0)
+}
 
 /// Gap between an action's icon and its label.
-const ACTION_ICON_GAP: f64 = 7.0;
+fn action_icon_gap() -> f64 {
+    theme::scaled(7.0)
+}
 
 /// An action's horizontal padding. Named because [`action_face`] has to add it
 /// back when it computes a width from a label.
-const ACTION_PAD_H: f64 = 10.0;
+fn action_pad_h() -> f64 {
+    theme::scaled(10.0)
+}
 /// Its vertical padding — the other half of [`action_height`].
-const ACTION_PAD_V: f64 = 8.0;
+fn action_pad_v() -> f64 {
+    theme::scaled(8.0)
+}
 
 /// The height every filled action holds, whatever its face: a label, a label
 /// with a glyph beside it, or a glyph standing in for the label.
@@ -1245,17 +1269,40 @@ const ACTION_PAD_V: f64 = 8.0;
 /// Explicit, because those faces don't agree on a height — a 16px icon is taller
 /// than a 13px line box, so a button that flashed a confirmation *grew* while it
 /// showed it, and the footer's whole row of buttons shifted with it. Measured off
-/// the text rather than picked, so it stays right if `FONT_BODY` moves, and
-/// cached because the answer can't change within a run (the family is global and
-/// the size is a `const`). Thread-local: `TextLayout` goes through the global
-/// `FontSystem`, which is the UI thread's.
+/// the text rather than picked, so it stays right if `font_body()` moves.
+/// Thread-local: `TextLayout` goes through the global `FontSystem`, which is the
+/// UI thread's.
+///
+/// **Memoised against the interface scale, not once per run.** It used to be a
+/// `OnceCell`, on the stated grounds that "the answer can't change within a run
+/// (the family is global and the size is a `const`)" — true when it was written
+/// and false the moment the type scale became a function of `UiScale`. A cached
+/// 36px height under 26px type clips the label of every filled action in the app,
+/// starting with the footer of the Settings modal the scale was just changed in.
+///
+/// Reading the scale here is also what *subscribes* the caller: a style closure
+/// that only calls `.height(action_height())` reads no other signal, so with a
+/// plain cache it would never re-run at all.
 fn action_height() -> f64 {
     thread_local! {
-        static H: std::cell::OnceCell<f64> = const { std::cell::OnceCell::new() };
+        static H: std::cell::RefCell<Option<(theme::UiScale, f64)>> =
+            const { std::cell::RefCell::new(None) };
     }
-    // A string with both an ascender and a descender, so the line box is the full
-    // one a label gets rather than the one an x-height-only string reports.
-    H.with(|h| *h.get_or_init(|| measure_text_h_at("Xg", theme::FONT_BODY) + 2.0 * ACTION_PAD_V))
+    let scale = theme::ui_scale();
+    H.with(|h| {
+        let mut slot = h.borrow_mut();
+        if let Some((cached, v)) = *slot
+            && cached == scale
+        {
+            return v;
+        }
+        // A string with both an ascender and a descender, so the line box is the
+        // full one a label gets rather than the one an x-height-only string
+        // reports.
+        let v = measure_text_h_at("Xg", theme::font_body()) + 2.0 * action_pad_v();
+        *slot = Some((scale, v));
+        v
+    })
 }
 
 /// A filled modal action. **Every** modal footer in the app is built from these
@@ -1328,9 +1375,9 @@ fn action_style(s: floem::style::Style, kind: ActionKind, enabled: bool) -> floe
         .flex_row()
         .items_center()
         .justify_center()
-        .font_size(theme::FONT_BODY)
-        .padding_horiz(ACTION_PAD_H)
-        .padding_vert(ACTION_PAD_V)
+        .font_size(theme::font_body())
+        .padding_horiz(action_pad_h())
+        .padding_vert(action_pad_v())
         .height(action_height())
         .border_radius(ACTION_RADIUS)
         .flex_shrink(0.0_f32);
@@ -1360,7 +1407,7 @@ fn action_button_inner(
 ) -> AnyView {
     let glyph: AnyView = match icon {
         Some(markup) => icons::icon(markup, 15.0)
-            .style(|s| s.flex_shrink(0.0_f32).margin_right(ACTION_ICON_GAP))
+            .style(|s| s.flex_shrink(0.0_f32).margin_right(action_icon_gap()))
             .into_any(),
         None => empty().into_any(),
     };
@@ -1398,8 +1445,12 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
     face: V,
     on_click: F,
 ) -> AnyView {
-    // +2px against sub-pixel rounding, the same guard `loading_dots` uses.
-    let w = measure_text_px_at(width_for, theme::FONT_BODY) + 2.0 * ACTION_PAD_H + 2.0;
+    // Measured **inside** the style closure below, not here: the width is derived
+    // from `font_body()` and `action_pad_h()`, so one resolved at build froze the
+    // button at the scale it was created under — the same by-value capture that
+    // `FieldCfg::font_size`, `highlight_text` and `loading_dots` all had to shed.
+    // (+2px against sub-pixel rounding, the same guard `loading_dots` uses.)
+    let width_for = width_for.to_string();
     let on_click = Rc::new(on_click);
     let pressed = on_click.clone();
     let button = container(face)
@@ -1409,6 +1460,7 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
             }
         })
         .style(move |s| {
+            let w = measure_text_px_at(&width_for, theme::font_body()) + 2.0 * action_pad_h() + 2.0;
             action_style(s, kind, enabled)
                 .width(w)
                 .justify_center()
@@ -1471,7 +1523,7 @@ fn text_button(
         })
         .style(move |s| {
             let s = s
-                .font_size(theme::FONT_BODY)
+                .font_size(theme::font_body())
                 .padding_horiz(pad_h)
                 .padding_vert(pad_v)
                 .border_radius(CONTROL_RADIUS);
@@ -1507,7 +1559,7 @@ pub(crate) fn modal_footer_split(
         s.width_full()
             .flex_row()
             .items_center()
-            .padding_horiz(MODAL_PAD_H)
+            .padding_horiz(modal_pad_h())
             .padding_vert(10.0)
             .border_top(1.0)
             .border_color(theme::border())
@@ -1569,7 +1621,7 @@ pub(crate) fn menu_icon_color(open: bool, hovered: bool) -> Color {
 pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
     s.background(theme::bg_panel())
         .color(theme::text())
-        .font_size(theme::FONT_LABEL)
+        .font_size(theme::font_label())
         .selectable(false)
         .class(floem::views::LabelClass, |s| s.selectable(false))
         .border(1.0)
@@ -1631,6 +1683,32 @@ type WindowSizeSlot = (RwSignal<(f64, f64)>, Scope);
 thread_local! {
     static WINDOW_SIZE: std::cell::RefCell<Option<WindowSizeSlot>> =
         const { std::cell::RefCell::new(None) };
+    static RIGHT_PANEL_W: std::cell::RefCell<Option<(RwSignal<f64>, Scope)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Live right-column width — the width the shell *renders* the AI / terminal /
+/// history panel at, which is not the user's stored intent: `right_w` is clamped
+/// up to `consts::right_min_w()` and down to what the center can spare.
+///
+/// The exact counterpart of `schema_tree::schema_panel_w`, and it exists for the
+/// same bug on the other side of the window. The three panels that occupy this
+/// column sized themselves to the *intent*, which was invisible until the
+/// interface scale gave the minimum a reason to differ from it: at 200% the shell
+/// reserved 500px and the AI panel drew 350 of them, leaving the layer behind it
+/// showing through the gap and the panel looking cut off.
+///
+/// Published by `body` (where the clamp lives); detached scope, like
+/// [`window_size`].
+pub(crate) fn right_panel_w() -> RwSignal<f64> {
+    RIGHT_PANEL_W.with(|cell| {
+        if cell.borrow().is_none() {
+            let scope = Scope::new();
+            let sig = scope.create_rw_signal(theme::AI_W);
+            *cell.borrow_mut() = Some((sig, scope));
+        }
+        cell.borrow().as_ref().unwrap().0
+    })
 }
 
 /// Live window size (the root stack's size — root is window-sized), for overlays
@@ -1646,6 +1724,84 @@ pub(crate) fn window_size() -> RwSignal<(f64, f64)> {
         }
         cell.borrow().as_ref().unwrap().0
     })
+}
+
+/// A fixed-height modal's height: its base scaled, then capped so the panel
+/// always fits the window.
+///
+/// The scale grows a modal's *type* and its rows, so a panel that kept its 100%
+/// height simply showed less — at 200% the editors were three fields and a
+/// scrollbar. It grows with the scale instead, and the cap is what makes that
+/// safe: 620 × 2 is taller than most laptop screens, and a modal is centred in a
+/// full-window backdrop, so an over-tall panel loses its footer off the bottom
+/// where the Apply button lives.
+///
+/// Reads [`window_size`] **inside** the caller's style closure, so a resize
+/// re-runs it. An unmeasured window (0) means "not yet" and takes the uncapped
+/// size rather than guessing.
+pub(crate) fn modal_h(base: f64) -> f64 {
+    cap_to_window(
+        theme::scaled(base),
+        theme::scaled(40.0),
+        theme::scaled(220.0),
+    )
+}
+
+/// The same for a **scrolling body** inside a modal that has no fixed height of
+/// its own (Settings, Shortcuts, Query plan, Properties). The reserve is larger
+/// because the panel's title and footer are laid out around this box, and it is
+/// the box — not the panel — that would push them off screen.
+pub(crate) fn modal_body_h(base: f64) -> f64 {
+    cap_to_window(
+        theme::scaled(base),
+        theme::scaled(160.0),
+        theme::scaled(160.0),
+    )
+}
+
+/// A modal's width: its base scaled, capped against the **window's width**.
+///
+/// The height cap alone wasn't enough, and the failure was worse than a short
+/// panel: the wide editors (table designer, routines, triggers, events — 900px
+/// base) came to 1800 at 200%, and a modal centred in a backdrop narrower than
+/// itself has its *left* half off-screen, taking the list pane and every field
+/// label with it. Width has to fit before height is even interesting.
+///
+/// The reserve is smaller than the height's — horizontal room is what these
+/// modals are short of, and there is no bottom-anchored footer at stake.
+pub(crate) fn modal_w(base: f64) -> f64 {
+    cap_to_window_w(
+        theme::scaled(base),
+        theme::scaled(24.0),
+        theme::scaled(320.0),
+    )
+}
+
+/// `want`, but never larger than the window's own extent less `reserve` — and
+/// never smaller than `floor`, so a very small window yields a scrollable panel
+/// rather than a sliver (or, with the subtraction going negative, nothing at all).
+///
+/// Reads the axis its callers need: `modal_h`/`modal_body_h` pass the height and
+/// `modal_w` the width, and the caller picks by which of the pair it hands in.
+fn cap_to_window(want: f64, reserve: f64, floor: f64) -> f64 {
+    cap_to(want, window_size().get().1, reserve, floor)
+}
+
+/// [`cap_to_window`] against the window's width.
+fn cap_to_window_w(want: f64, reserve: f64, floor: f64) -> f64 {
+    cap_to(want, window_size().get().0, reserve, floor)
+}
+
+fn cap_to(want: f64, extent: f64, reserve: f64, floor: f64) -> f64 {
+    if extent <= 1.0 {
+        return want;
+    }
+    // The floor is there so the subtraction can't hand back a sliver (or, on a
+    // window smaller than the reserve, a negative). It is itself clamped to the
+    // window: a floor *wider than the screen* would clip the panel through the
+    // very guard meant to keep it usable — which at 200% is not hypothetical, its
+    // scaled value passes 600px.
+    want.min((extent - reserve).max(floor.min(extent)))
 }
 
 /// The stored pointer-release nonce plus the scope that owns it.
@@ -2174,7 +2330,7 @@ fn menu_stack(
                 .background(theme::bg_chrome())
                 .min_width(width)
                 .padding_vert(6.0)
-                .font_size(theme::FONT_TITLE)
+                .font_size(theme::font_title())
         })
 }
 
@@ -2201,12 +2357,30 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
         .zip(entries)
         .filter(|(keep, _)| *keep)
         .map(|(_, e)| match e {
-            MenuEntry::Separator => 9.0,
-            _ => 30.5,
+            MenuEntry::Separator => SEPARATOR_H,
+            _ => theme::scaled(MENU_LINE_H) + MENU_ROW_PAD * 2.0,
         })
         .sum::<f64>()
-        + 14.0
+        + MENU_PANEL_CHROME
 }
+
+/// A menu row's text line box at 100% (`font_title`'s 14px × ≈1.32), which is the
+/// only part of a row that the interface scale currently moves…
+const MENU_LINE_H: f64 = 18.5;
+/// …because these three are literal paddings, and literal paddings are the part
+/// of the scale that hasn't landed yet (see `TODO.md`).
+///
+/// **Composed rather than scaled whole**, and that matters here: `scaled(30.5)`
+/// grew the *padding* too, over-predicting a sixteen-entry menu by ~190px at
+/// 200% and flipping menus that had room to open downwards. Summing what actually
+/// scales keeps the estimate honest at every size — and gives exactly 30.5 at
+/// Normal, which is what it was measured as. When the paddings do scale, these
+/// three move with them.
+const MENU_ROW_PAD: f64 = 6.0;
+/// A separator: a 1px rule with 4px margins.
+const SEPARATOR_H: f64 = 9.0;
+/// The panel's own `padding_vert(6)` and its 1px border, both sides.
+const MENU_PANEL_CHROME: f64 = 14.0;
 
 /// `entries` with its separators tidied: leading and trailing ones dropped, runs
 /// of two or more collapsed to one, and the same applied inside every submenu.
@@ -2286,23 +2460,87 @@ fn separator_keep(entries: &[MenuEntry]) -> Vec<bool> {
 /// A `window` dimension of 0 (or less than 1) means "not measured yet" and
 /// suppresses the flip on that axis: guessing at an unknown edge is worse than
 /// opening down-right and being off by a frame.
-pub(crate) fn cursor_menu_pos(
+///
+/// **The flipped arm pins the trailing edge; it does not compute a leading one.**
+/// `panel` is an *estimate* ([`menu_panel_height`] counts rows), so subtracting it
+/// from the cursor put the panel's real edge wherever the estimate was wrong —
+/// visible as a gap between the menu's bottom and the pointer that flipped it,
+/// tens of pixels at 150% and up. An inset from the window's far edge is exact
+/// arithmetic: the panel's own size never enters it. This is the same trick
+/// [`submenu_insets`] plays, and it is why that one never drifted.
+///
+/// The estimate is left with the one job it can do safely: choosing **which**
+/// edge. Being wrong there costs a flip that wasn't needed — never a gap.
+///
+/// Four arms per axis, in order: after the cursor if it fits; before it if that
+/// fits; flush with the window's far edge when neither does (which is where a
+/// scaled 700px menu lands, and where it is at least wholly on screen); and the
+/// window origin for a panel bigger than the window, where showing the start of
+/// it is the only useful answer.
+pub(crate) fn cursor_menu_insets(
     cursor: (f64, f64),
     panel: (f64, f64),
     window: (f64, f64),
     gap: f64,
-) -> (f64, f64) {
-    let flip = |c: f64, size: f64, win: f64| {
-        if win > 1.0 && c + gap + size > win {
-            (c - size - gap).max(0.0)
-        } else {
-            c + gap
-        }
-    };
+) -> (MenuInset, MenuInset) {
     (
-        flip(cursor.0, panel.0, window.0),
-        flip(cursor.1, panel.1, window.1),
+        menu_inset(cursor.0, panel.0, window.0, gap),
+        menu_inset(cursor.1, panel.1, window.1, gap),
     )
+}
+
+/// One axis of [`cursor_menu_insets`], on its own because a menu anchored to a
+/// *rect* rather than a cursor needs the same four arms for one axis while
+/// keeping its own arithmetic for the other.
+///
+/// `popup_menu_overlay`'s toolbar-dropdown arm is that caller: its x is computed
+/// from the real, measured panel width (so it has no estimate to be wrong about)
+/// while its y has only `menu_panel_height`'s estimate — and it was still
+/// subtracting that estimate from the anchor and clamping at zero, which is the
+/// arithmetic this type exists to retire. At 200% the estimate roughly doubles,
+/// so the grid's Copy menu clamped to the top of the window, hundreds of pixels
+/// from the icon that opened it.
+pub(crate) fn menu_inset(anchor: f64, size: f64, win: f64, gap: f64) -> MenuInset {
+    if win <= 1.0 || anchor + gap + size <= win {
+        return MenuInset::Start(anchor + gap);
+    }
+    if anchor - gap - size >= 0.0 {
+        // Its trailing edge `gap` before the anchor, expressed from the window's
+        // trailing edge so the panel's real size decides its start.
+        return MenuInset::End(win - anchor + gap);
+    }
+    if size >= win {
+        MenuInset::Start(0.0)
+    } else {
+        MenuInset::End(0.0)
+    }
+}
+
+/// One axis of a cursor menu's placement: an inset from the window's leading edge
+/// (left / top) or from its trailing one (right / bottom). See
+/// [`cursor_menu_insets`] for why the flipped case is expressed as the latter.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MenuInset {
+    Start(f64),
+    End(f64),
+}
+
+impl MenuInset {
+    /// Apply as a horizontal inset.
+    pub(crate) fn apply_x(self, s: floem::style::Style) -> floem::style::Style {
+        match self {
+            MenuInset::Start(v) => s.inset_left(v),
+            MenuInset::End(v) => s.inset_right(v),
+        }
+    }
+
+    /// Apply as a vertical inset.
+    pub(crate) fn apply_y(self, s: floem::style::Style) -> floem::style::Style {
+        match self {
+            MenuInset::Start(v) => s.inset_top(v),
+            MenuInset::End(v) => s.inset_bottom(v),
+        }
+    }
 }
 
 /// One menu level's keyboard state: where the cursor is, which sibling's submenu
@@ -2429,14 +2667,18 @@ pub(crate) fn hoisted_submenu() -> RwSignal<Option<OpenSubmenu>> {
 
 /// A submenu panel's `min_width`. Submenus keep the standard menu width whatever
 /// the parent asked for — a wide root menu doesn't make its children wide.
-const SUBMENU_W: f64 = 170.0;
+fn submenu_w() -> f64 {
+    theme::scaled(170.0)
+}
 
 /// Conservative width estimate for the *decision* to flip a submenu left. Only the
 /// decision — the placement itself is exact (`inset_right` pins the real panel's
 /// right edge to the row's left edge whatever it measures), so an estimate here
 /// costs at worst a flip that wasn't needed, never a gap or an open-then-flip
 /// flicker.
-const SUBMENU_FLIP_W: f64 = 210.0;
+fn submenu_flip_w() -> f64 {
+    theme::scaled(210.0)
+}
 
 /// The window-level layer that draws the open submenu. **Last in the root stack**,
 /// so it is over every other surface including the popup menu it belongs to.
@@ -2463,7 +2705,7 @@ pub(crate) fn submenu_layer() -> impl IntoView {
             // `level.sub` is the child level — the cursor `menu_key` drives while
             // this submenu is open, which is what keeps the keyboard working
             // across the hoist.
-            menu_stack(s.entries, s.level.sub.into(), s.close, SUBMENU_W).into_any()
+            menu_stack(s.entries, s.level.sub.into(), s.close, submenu_w()).into_any()
         },
     )
     .style(move |st| {
@@ -2501,7 +2743,9 @@ enum SubY {
 
 /// Lift, so the submenu's first item lines up with the row it came from rather
 /// than starting below it.
-const SUBMENU_LIFT: f64 = 6.0;
+fn submenu_lift() -> f64 {
+    theme::scaled(6.0)
+}
 
 /// Where the hoisted submenu goes for a parent row at `row` (window coordinates),
 /// in a `win` window, given the panel's estimated height `h`.
@@ -2516,7 +2760,7 @@ const SUBMENU_LIFT: f64 = 6.0;
 /// a panel that won't fit below the row pins its bottom to the window's, no
 /// height arithmetic involved.
 ///
-/// [`SUBMENU_FLIP_W`] and `h` are *estimates*, and only ever decide **which** edge
+/// [`submenu_flip_w()`] and `h` are *estimates*, and only ever decide **which** edge
 /// to pin. The pin itself is exact, so an estimate that is off costs at worst a
 /// flip that wasn't needed — never a gap, and never an open-then-measure-then-move
 /// flicker.
@@ -2532,15 +2776,15 @@ fn submenu_insets(row: Rect, win: (f64, f64), h: f64) -> (SubX, SubY) {
     // *outside* the window, painting its left off-screen. The vertical lift is
     // deliberately not clamped — see
     // `a_row_at_the_window_origin_still_places_forward`.
-    let x = if win_w > 1.0 && row.x1 + SUBMENU_FLIP_W > win_w {
+    let x = if win_w > 1.0 && row.x1 + submenu_flip_w() > win_w {
         SubX::Right((win_w - row.x0).max(0.0))
     } else {
         SubX::Left(row.x1)
     };
-    let y = if win_h > 1.0 && row.y0 - SUBMENU_LIFT + h > win_h {
+    let y = if win_h > 1.0 && row.y0 - submenu_lift() + h > win_h {
         SubY::Bottom(0.0)
     } else {
-        SubY::Top(row.y0 - SUBMENU_LIFT)
+        SubY::Top(row.y0 - submenu_lift())
     };
     (x, y)
 }
@@ -2795,11 +3039,11 @@ fn open_submenu(
         .set(sub_stops.get(&row).and_then(|s| s.first()).map(|(i, _)| *i));
 }
 
-/// Measure a string's rendered width (px) at `FONT_BODY`, through the same global
+/// Measure a string's rendered width (px) at `font_body()`, through the same global
 /// `FontSystem` the views paint with, so the measurement matches to the pixel.
 /// Used to right-align the numeric grid editor and to size/ellipsize tab titles.
 pub(crate) fn measure_text_px(text: &str) -> f64 {
-    measure_text_px_at(text, theme::FONT_BODY)
+    measure_text_px_at(text, theme::font_body())
 }
 
 /// Like [`measure_text_px`] but at an explicit font size (e.g. the 16px Find box).
@@ -3022,9 +3266,15 @@ pub(crate) fn follow_after_scroll(
 /// wider re-wraps every bubble shorter, and a floor that only ever rises left
 /// ~300px of blank under the last message — which then measured as content, lit
 /// the jump-to-bottom button, and snapped the next follow to the bottom of the
-/// blank. It is false of a conversation *switch* too. So whatever legitimately
-/// changes the true height (the message count, the wrap width, which
-/// conversation) releases the floor, and only within one of those is it held.
+/// blank. It is false of a conversation *switch* too.
+///
+/// **So the caller passes `!busy`**: the floor is held only while a turn is
+/// actually streaming, which is the premise stated directly. It also releases
+/// early, inside a stream, on the things known to change the true height (message
+/// count, wrap width, which conversation) — but that list is now an optimisation
+/// rather than the guarantee. It had to be: it was incomplete twice, first
+/// missing the wrap width and then the interface scale, and each omission showed
+/// as a *permanent* band of blank rather than one frame of it.
 pub(crate) fn next_floor(prev: f64, measured: f64, invalidated: bool) -> f64 {
     if invalidated {
         measured
@@ -3132,7 +3382,14 @@ pub(crate) fn wheel_hscroll<V: IntoView + 'static>(child: V) -> Scroll {
 
 // ── Shared bits (section headers, centered messages, panel-toggle icon) ──
 /// Font size for small toolbar controls (ER-diagram toolbar, header Retry).
-pub(crate) const TOOLBAR_FONT: f32 = 13.0;
+///
+/// A `fn`, and the same base as [`theme::font_body`] — it was the last unscaled
+/// font size in the app, painting 13px next to chrome that had doubled. Kept as
+/// its own name rather than folded into `font_body()` because these controls are
+/// a distinct role that may want to diverge; it just doesn't today.
+pub(crate) fn toolbar_font() -> f32 {
+    theme::font_body()
+}
 
 /// The chrome shared by small toolbar controls: bordered, rounded surface.
 /// Callers add their own padding and hover — see `control_button` in the ERD
@@ -3146,7 +3403,7 @@ pub(crate) fn control_surface(s: floem::style::Style) -> floem::style::Style {
 
 pub(crate) fn section_title(t: &'static str) -> impl IntoView {
     text(t).style(|s| {
-        s.font_size(theme::FONT_TITLE)
+        s.font_size(theme::font_title())
             .font_bold()
             .color(theme::text_muted())
             .padding_horiz(12.0)
@@ -3373,7 +3630,10 @@ pub(crate) fn pick_spinner_verb() -> &'static str {
 /// (`loading_dots`). Shared by the AI panel, the Ctrl+K inline AI, and the query
 /// runner so they all read the same. The verb is fixed for the life of this
 /// loader instance; the dots cycle.
-pub(crate) fn verb_spinner(color: fn() -> floem::peniko::Color, font_size: f32) -> impl IntoView {
+pub(crate) fn verb_spinner(
+    color: fn() -> floem::peniko::Color,
+    font_size: fn() -> f32,
+) -> impl IntoView {
     loading_dots(pick_spinner_verb(), color, font_size)
 }
 
@@ -3410,7 +3670,7 @@ pub(crate) fn debounced(src: RwSignal<String>, delay: std::time::Duration) -> Rw
 pub(crate) fn highlight_text(
     full: String,
     term: Option<String>,
-    font_size: f32,
+    font_size: impl Fn() -> f32 + 'static,
     base: impl Fn() -> floem::peniko::Color + 'static,
     bold: bool,
     line_height: f32,
@@ -3431,7 +3691,7 @@ pub(crate) fn highlight_text(
 pub(crate) fn highlight_mono(
     full: String,
     term: Option<String>,
-    font_size: f32,
+    font_size: impl Fn() -> f32 + 'static,
     base: impl Fn() -> floem::peniko::Color + 'static,
     line_height: f32,
 ) -> floem::views::RichText {
@@ -3449,11 +3709,20 @@ pub(crate) fn highlight_mono(
 /// The shared body: the family is the only thing the two differ in, and a
 /// `rich_text` builds its own `Attrs`, so it can't be set from the outside with
 /// a `.style()` the way an ordinary label's font can.
+///
+/// **The size arrives as a `fn() -> f32`, and for the same reason the colour
+/// does.** `rich_text`'s closure *is* reactive — it is what makes these follow a
+/// theme switch — but only for what it reads inside itself. A size computed at
+/// the call site (`highlight_text(…, theme::font_body(), …)`) is captured, so
+/// every highlighted row in the schema tree, the history panel and the activity
+/// panel kept its old type size when the interface scale changed, until a filter
+/// or a refetch happened to rebuild it. Reading it here subscribes this closure
+/// to the scale.
 fn highlight_text_in(
     family: &'static str,
     full: String,
     term: Option<String>,
-    font_size: f32,
+    font_size: impl Fn() -> f32 + 'static,
     base: impl Fn() -> floem::peniko::Color + 'static,
     bold: bool,
     line_height: f32,
@@ -3463,9 +3732,10 @@ fn highlight_text_in(
     floem::views::rich_text(move || {
         let sans = [FamilyOwned::Name(family.to_string())];
         let lh = LineHeightValue::Normal(line_height);
+        let size = font_size();
         let base_attrs = Attrs::new()
             .family(&sans)
-            .font_size(font_size)
+            .font_size(size)
             .color(base())
             .weight(base_weight)
             .line_height(lh);
@@ -3473,7 +3743,7 @@ fn highlight_text_in(
         if let Some(t) = term.as_deref().filter(|t| !t.is_empty()) {
             let hit = Attrs::new()
                 .family(&sans)
-                .font_size(font_size)
+                .font_size(size)
                 .color(theme::match_highlight())
                 .weight(Weight::BOLD)
                 .line_height(lh);
@@ -3494,14 +3764,18 @@ fn highlight_text_in(
 pub(crate) fn loading_dots(
     prefix: &'static str,
     color: fn() -> floem::peniko::Color,
-    font_size: f32,
+    font_size: fn() -> f32,
 ) -> impl IntoView {
     let step = RwSignal::new(1usize);
     // Reserve the full `prefix...` width up front so the label keeps a fixed size
     // as the dots cycle (1→2→3) — otherwise it reflows, jittering when centred (the
     // query runner) or shoving a neighbour (Ctrl+K's Cancel). +2px guards sub-pixel
     // rounding so the 3-dot state never exceeds the reserved box.
-    let w = measure_text_px_at(&format!("{prefix}..."), font_size) + 2.0;
+    //
+    // Measured *inside* the style closure, from a `fn() -> f32`: this label lives
+    // for as long as the operation it reports, so a size (and a width measured
+    // from it) resolved at build froze the app's one moving indicator at whatever
+    // scale was active when the query started.
     fn tick(step: RwSignal<usize>) {
         floem::action::exec_after(std::time::Duration::from_millis(400), move |_| {
             if step
@@ -3517,7 +3791,12 @@ pub(crate) fn loading_dots(
         move || step.get(),
         move |n| {
             text(format!("{prefix}{}", ".".repeat(n)))
-                .style(move |s| s.color(color()).font_size(font_size).min_width(w))
+                .style(move |s| {
+                    let px = font_size();
+                    s.color(color())
+                        .font_size(px)
+                        .min_width(measure_text_px_at(&format!("{prefix}..."), px) + 2.0)
+                })
                 .into_any()
         },
     )
@@ -3636,12 +3915,16 @@ pub(crate) fn jump_to_bottom_button(
             } else {
                 theme::bg_deepest().multiply_alpha(0.0)
             };
+            let d = theme::scaled(22.0);
             s.absolute()
-                .inset_right(10.0)
-                .inset_bottom(10.0)
-                .width(22.0)
-                .height(22.0)
-                .border_radius(11.0)
+                .inset_right(theme::scaled(10.0))
+                .inset_bottom(theme::scaled(10.0))
+                // A circle: the radius is half the box, so it has to move with
+                // it. Not the `SEGMENT_RADIUS` case (a shape inside a box that
+                // scales) — a 44px box with an 11px radius is a rounded square.
+                .width(d)
+                .height(d)
+                .border_radius((d / 2.0) as f32)
                 .items_center()
                 .justify_center()
                 .background(bg)
@@ -4117,7 +4400,7 @@ mod submenu_place_tests {
     #[test]
     fn the_flip_is_by_a_hair_not_by_a_margin() {
         // Exactly enough room on the right is not a flip; one pixel less is.
-        let win = (570.0 + SUBMENU_FLIP_W, 900.0);
+        let win = (570.0 + submenu_flip_w(), 900.0);
         assert_eq!(submenu_insets(row(), win, 120.0).0, SubX::Left(570.0));
         assert_eq!(
             submenu_insets(row(), (win.0 - 1.0, win.1), 120.0).0,
@@ -4435,6 +4718,122 @@ mod menu_key_tests {
 }
 
 #[cfg(test)]
+mod modal_height_tests {
+    use super::*;
+    use crate::theme::UiScale;
+
+    /// Run `f` with the window measured at `(w, h)` and the interface at `scale`,
+    /// then put both back. Both are `thread_local` process state (see
+    /// `consts::scale_tests::at` for why restoring matters).
+    fn at<R>(scale: UiScale, win: (f64, f64), f: impl FnOnce() -> R) -> R {
+        crate::theme::set_ui_scale(scale);
+        window_size().set(win);
+        let out = f();
+        window_size().set((0.0, 0.0));
+        crate::theme::set_ui_scale(UiScale::Normal);
+        out
+    }
+
+    /// At Normal, on a window with room, a modal is exactly the height it always
+    /// was — the cap must not quietly reshape every existing install.
+    #[test]
+    fn a_modal_at_normal_on_a_roomy_window_is_untouched() {
+        at(UiScale::Normal, (1600.0, 1000.0), || {
+            assert_eq!(modal_h(620.0), 620.0);
+            assert_eq!(modal_body_h(560.0), 560.0);
+        });
+    }
+
+    /// The point of the change: it grows with the scale. The editors were three
+    /// fields and a scrollbar at 200%.
+    #[test]
+    fn a_modal_grows_with_the_scale_when_the_window_allows() {
+        at(UiScale::Large, (2560.0, 1440.0), || {
+            assert_eq!(modal_h(620.0), 930.0);
+        });
+        at(UiScale::Huge, (2560.0, 1440.0), || {
+            assert_eq!(modal_h(620.0), 1240.0);
+        });
+    }
+
+    /// And the cap is what makes growing safe: a modal is centred in a
+    /// full-window backdrop, so one taller than the window loses its footer —
+    /// where Apply lives — off the bottom.
+    #[test]
+    fn a_modal_never_outgrows_the_window() {
+        at(UiScale::Huge, (1920.0, 900.0), || {
+            let h = modal_h(620.0);
+            assert!(h < 900.0, "{h} does not fit a 900px window");
+            assert_eq!(h, 900.0 - 80.0, "window less the scaled reserve");
+        });
+        // A scrolling body reserves more, for the title and footer around it.
+        at(UiScale::Huge, (1920.0, 900.0), || {
+            assert_eq!(modal_body_h(560.0), 900.0 - 320.0);
+        });
+    }
+
+    /// A window too small for even the reserve yields a scrollable panel, not a
+    /// zero-height one (nor, with the subtraction the other way, something
+    /// enormous).
+    #[test]
+    fn a_tiny_window_still_leaves_a_usable_panel() {
+        at(UiScale::Normal, (400.0, 200.0), || {
+            assert_eq!(modal_h(620.0), 200.0, "the floor, clamped to the window");
+            assert_eq!(modal_body_h(560.0), 160.0);
+        });
+    }
+
+    /// **Width is capped against the window's width, and it is the cap that
+    /// matters most.** A modal centred in a backdrop narrower than itself loses
+    /// its *left* half — the designer's list pane and every field label with it —
+    /// which is what the 900px editors did at 200% (1800 in a 1631px window).
+    /// A short panel is awkward; a clipped one is unusable.
+    #[test]
+    fn a_modal_never_outgrows_the_windows_width() {
+        at(UiScale::Huge, (1631.0, 1370.0), || {
+            let w = modal_w(900.0);
+            assert!(w <= 1631.0, "{w} is wider than the window");
+            assert_eq!(w, 1631.0 - 48.0);
+        });
+        // With room, it scales in full.
+        at(UiScale::Huge, (3840.0, 2160.0), || {
+            assert_eq!(modal_w(900.0), 1800.0);
+        });
+        at(UiScale::Normal, (1631.0, 1370.0), || {
+            assert_eq!(modal_w(900.0), 900.0, "unchanged where it always fitted");
+        });
+    }
+
+    /// The two axes are capped independently — a tall narrow window must not
+    /// shrink the width, nor a wide short one the height. (They read different
+    /// members of the same measured pair, which is exactly the kind of thing a
+    /// copy-paste gets wrong.)
+    #[test]
+    fn the_two_axes_do_not_read_each_others_extent() {
+        at(UiScale::Huge, (600.0, 4000.0), || {
+            assert_eq!(modal_h(620.0), 1240.0, "height has all the room it needs");
+            // 600 is under the scaled floor, so the floor gives way to the window
+            // rather than the panel being clipped by it.
+            assert_eq!(modal_w(900.0), 600.0, "width is what is short");
+        });
+        at(UiScale::Huge, (4000.0, 600.0), || {
+            assert_eq!(modal_w(900.0), 1800.0);
+            assert_eq!(modal_h(620.0), 600.0 - 80.0);
+        });
+    }
+
+    /// Before the first resize the window is (0, 0). Capping against an unmeasured
+    /// edge would open every modal at its floor for a frame.
+    #[test]
+    fn an_unmeasured_window_does_not_cap() {
+        crate::theme::set_ui_scale(UiScale::Huge);
+        window_size().set((0.0, 0.0));
+        assert_eq!(modal_h(620.0), 1240.0);
+        crate::theme::set_ui_scale(UiScale::Normal);
+    }
+}
+
+#[cfg(test)]
 mod menu_placement_tests {
     use super::*;
 
@@ -4444,40 +4843,92 @@ mod menu_placement_tests {
     #[test]
     fn a_menu_with_room_opens_down_and_right_of_the_cursor() {
         assert_eq!(
-            cursor_menu_pos((100.0, 100.0), PANEL, WINDOW, 3.0),
-            (103.0, 103.0)
+            cursor_menu_insets((100.0, 100.0), PANEL, WINDOW, 3.0),
+            (MenuInset::Start(103.0), MenuInset::Start(103.0))
         );
     }
 
     /// The schema tree is a full-height left column, so its lower half is where
     /// most right-clicks land — and a table's menu is a dozen entries.
+    ///
+    /// **Asserted as an inset from the bottom**, which is the fix: 800 − 700 + 3
+    /// puts the panel's own bottom edge 3px above the cursor whatever it measures,
+    /// where `cursor − estimate` left it short by however much the estimate was
+    /// over (a visible gap at 150% and up).
     #[test]
     fn a_menu_near_the_bottom_flips_above_the_cursor() {
-        let (x, y) = cursor_menu_pos((100.0, 700.0), PANEL, WINDOW, 3.0);
-        assert_eq!(x, 103.0, "horizontal is unaffected");
-        assert_eq!(y, 347.0);
-        assert!(y + PANEL.1 <= 700.0, "the panel ends above the cursor");
+        let (x, y) = cursor_menu_insets((100.0, 700.0), PANEL, WINDOW, 3.0);
+        assert_eq!(x, MenuInset::Start(103.0), "horizontal is unaffected");
+        assert_eq!(y, MenuInset::End(103.0));
+    }
+
+    /// And the pin does not move when the estimate is wrong — the whole point.
+    #[test]
+    fn a_flipped_menu_pins_the_same_however_wrong_the_estimate_is() {
+        let thin = cursor_menu_insets((100.0, 700.0), (170.0, 350.0), WINDOW, 3.0).1;
+        let fat = cursor_menu_insets((100.0, 700.0), (170.0, 500.0), WINDOW, 3.0).1;
+        assert_eq!(thin, fat);
+        assert_eq!(thin, MenuInset::End(103.0));
     }
 
     #[test]
     fn a_menu_near_the_right_edge_flips_left_of_the_cursor() {
-        let (x, _) = cursor_menu_pos((1150.0, 100.0), PANEL, WINDOW, 3.0);
-        assert_eq!(x, 977.0);
-        assert!(x + PANEL.0 <= 1150.0);
+        let (x, _) = cursor_menu_insets((1150.0, 100.0), PANEL, WINDOW, 3.0);
+        assert_eq!(x, MenuInset::End(53.0));
     }
 
     #[test]
     fn a_menu_in_the_far_corner_flips_both_ways() {
-        let (x, y) = cursor_menu_pos((1150.0, 700.0), PANEL, WINDOW, 3.0);
-        assert_eq!((x, y), (977.0, 347.0));
+        let (x, y) = cursor_menu_insets((1150.0, 700.0), PANEL, WINDOW, 3.0);
+        assert_eq!((x, y), (MenuInset::End(53.0), MenuInset::End(103.0)));
     }
 
     /// A panel taller (or wider) than the space on either side clamps to the
     /// window edge rather than going negative, where it would be unreachable.
     #[test]
     fn a_panel_bigger_than_the_window_clamps_to_the_origin() {
-        let (x, y) = cursor_menu_pos((50.0, 60.0), (400.0, 900.0), WINDOW, 3.0);
-        assert_eq!((x, y), (53.0, 0.0));
+        let (x, y) = cursor_menu_insets((50.0, 60.0), (400.0, 900.0), WINDOW, 3.0);
+        assert_eq!((x, y), (MenuInset::Start(53.0), MenuInset::Start(0.0)));
+    }
+
+    /// **A panel that fits the window but not on either side of the cursor sits
+    /// against the far edge, not at the origin.**
+    ///
+    /// The old flip had two arms — below, or above — and clamped the second at
+    /// zero. That was invisible while menus were ~350px tall: something always
+    /// fitted. At 150% and 200% a table's context menu is 600–750px, so a click
+    /// in the middle of the schema tree fits neither way and every menu jumped to
+    /// the *top-left of the window*, hundreds of pixels from the row it belonged
+    /// to. Pinning the far edge instead keeps the whole panel reachable and as
+    /// close to the cursor as it can be.
+    #[test]
+    fn a_panel_that_fits_neither_side_pins_to_the_far_edge() {
+        // 600 tall in an 800 window, cursor half way down: 350 + 600 spills the
+        // bottom, 350 − 600 is off the top.
+        let (x, y) = cursor_menu_insets((100.0, 350.0), (170.0, 600.0), WINDOW, 3.0);
+        assert_eq!(x, MenuInset::Start(103.0), "horizontal still has room");
+        assert_eq!(
+            y,
+            MenuInset::End(0.0),
+            "flush with the window's bottom, whatever it measures"
+        );
+    }
+
+    /// The same on the horizontal, which the grid's cell menu meets first — it
+    /// opens mid-window, so a wide menu near the middle used to snap to x = 0.
+    #[test]
+    fn a_wide_panel_that_fits_neither_side_pins_to_the_right_edge() {
+        let (x, _) = cursor_menu_insets((600.0, 100.0), (900.0, 350.0), WINDOW, 3.0);
+        assert_eq!(x, MenuInset::End(0.0));
+    }
+
+    /// And the ordinary flip is still preferred when it fits: pinning the far
+    /// edge is the *fallback*, not the new behaviour. (A menu that can sit
+    /// entirely above the cursor should, so the pointer isn't left on top of it.)
+    #[test]
+    fn a_panel_that_fits_above_still_flips_above() {
+        let (_, y) = cursor_menu_insets((100.0, 700.0), PANEL, WINDOW, 3.0);
+        assert_eq!(y, MenuInset::End(103.0));
     }
 
     /// Before the root has measured itself the window is (0, 0). Flipping against
@@ -4485,9 +4936,31 @@ mod menu_placement_tests {
     #[test]
     fn an_unmeasured_window_never_flips() {
         assert_eq!(
-            cursor_menu_pos((900.0, 700.0), PANEL, (0.0, 0.0), 3.0),
-            (903.0, 703.0)
+            cursor_menu_insets((900.0, 700.0), PANEL, (0.0, 0.0), 3.0),
+            (MenuInset::Start(903.0), MenuInset::Start(703.0))
         );
+    }
+
+    /// The estimate is measured in pixels of a *real* row, so it has to stay
+    /// exactly 30.5 + chrome at Normal — and it must grow by the text only, since
+    /// the row's padding doesn't scale yet. `scaled(30.5)` grew both and
+    /// over-predicted a long menu by enough (≈12px a row) to flip menus that had
+    /// room below them, which is half of why they ended up in the window's
+    /// corner.
+    #[test]
+    fn a_menu_row_grows_by_its_text_and_not_its_padding() {
+        let one = [MenuEntry::action("x", || {})];
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        assert_eq!(menu_panel_height(&one), 30.5 + 14.0);
+
+        crate::theme::set_ui_scale(crate::theme::UiScale::Huge);
+        let huge = menu_panel_height(&one);
+        assert_eq!(huge, 37.0 + 12.0 + 14.0);
+        assert!(
+            huge < (30.5 + 14.0) * 2.0,
+            "{huge} is the whole row doubled, padding and all"
+        );
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
     }
 
     #[test]
@@ -5270,6 +5743,26 @@ mod follow_tests {
         assert_eq!(next_floor(1200.0, 900.0, true), 900.0);
         // Not a maximum in this arm: the point is that it may go *down*.
         assert_eq!(next_floor(1200.0, 1400.0, true), 1400.0);
+    }
+
+    /// **The same arm, asked the way the caller now asks it: `invalidated` is
+    /// `!busy`.**
+    ///
+    /// The floor's premise is a measurement dip *while a turn streams*. An idle
+    /// panel has no dip to hide, so it must take what it measured — which is what
+    /// makes a missed invalidator self-healing. The list of invalidators has been
+    /// incomplete twice (the wrap width, then the interface scale), and each time
+    /// the symptom was a permanent band of blank under the last message rather
+    /// than a frame of it.
+    #[test]
+    fn an_idle_list_never_holds_a_floor_above_what_it_measured() {
+        let (streaming, idle) = (false, true);
+        // The dip the floor exists for, mid-stream: absorbed.
+        assert_eq!(next_floor(1200.0, 600.0, streaming), 1200.0);
+        // The identical measurement with nothing streaming is simply the truth.
+        assert_eq!(next_floor(1200.0, 600.0, idle), 600.0);
+        // And an idle panel that grows is not held back either.
+        assert_eq!(next_floor(600.0, 1200.0, idle), 1200.0);
     }
 }
 

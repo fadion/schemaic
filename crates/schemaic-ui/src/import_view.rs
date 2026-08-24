@@ -22,13 +22,13 @@ use schemaic_core::import::{
 };
 use schemaic_core::model::engine_is_transactional;
 
-use crate::consts::ROW_H;
+use crate::consts::row_h;
 use crate::settings::{dropdown_box_style, focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, ExitAction, FORM_GAP, FocusRing, MODAL_PAD_H,
-    action_button, autohide, control_button, exit_action, focus_root_with_ring, form_hint,
-    form_section, form_separator, form_setting, modal_footer, modal_footer_split,
-    modal_title_owned, panel_style, shift_hscroll,
+    ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, action_gap, autohide,
+    control_button, exit_action, focus_root_with_ring, form_gap, form_hint, form_section,
+    form_separator, form_setting, modal_footer, modal_footer_split, modal_h, modal_pad_h,
+    modal_title_owned, modal_w, panel_style, shift_hscroll,
 };
 use crate::{
     FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
@@ -39,7 +39,9 @@ use crate::{
 /// an off-by-one mapping; not so many that the panel becomes a grid.
 const PREVIEW_ROWS: usize = 50;
 /// One width for every step, so the panel doesn't resize as you move through it.
-const PANEL_W: f64 = 620.0;
+fn panel_w() -> f64 {
+    modal_w(620.0)
+}
 /// The source step's height. Fixed rather than content-sized so the footer sits
 /// in the same place on both steps.
 const PANEL_H: f64 = 520.0;
@@ -50,9 +52,13 @@ const PANEL_H: f64 = 520.0;
 const PANEL_H_MAPPING: f64 = PANEL_H + 134.0;
 /// The column list's height before it scrolls. Deep enough that a typical table's
 /// columns are visible without scrolling at all.
-const MAPPING_LIST_H: f64 = 216.0;
+fn mapping_list_h() -> f64 {
+    theme::scaled(216.0)
+}
 /// Text-field width, matching the connection form's fixed-width fields.
-const FIELD_W: f64 = 220.0;
+fn field_w() -> f64 {
+    theme::scaled(220.0)
+}
 
 /// The settings the modal's controls describe, as the reader wants them.
 fn read_config(ui: ImportUi) -> ReadConfig {
@@ -251,7 +257,7 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         move || i.path.get(),
         move |p| match p {
             None => text("No file chosen")
-                .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY))
+                .style(|s| s.color(theme::text_dim()).font_size(theme::font_body()))
                 .into_any(),
             Some(p) => text(
                 p.file_name()
@@ -259,7 +265,7 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                     .unwrap_or("(file)")
                     .to_string(),
             )
-            .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY))
+            .style(|s| s.color(theme::text()).font_size(theme::font_body()))
             .into_any(),
         },
     );
@@ -315,20 +321,20 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                                 ..Default::default()
                             },
                         )
-                        .style(|s| s.width(FIELD_W)),
+                        .style(|s| s.width(field_w())),
                         form_hint("Comma-separated, e.g. NULL, \\N, NA."),
                     ))
                     .style(|s| s.flex_col().gap(4.0)),
                 ),
             ))
-            .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+            .style(|s| s.flex_col().gap(form_gap()).width_full())
             .into_any()
         },
     )
     // The *container* is the flex child, so hiding its inner view wouldn't be
     // enough: taffy counts a zero-sized child for the parent's gap and skips a
     // `display:none` one, so on JSON this whole node steps aside rather than
-    // leaving a `FORM_GAP` of dead space under the Format row. Nothing is
+    // leaving a `form_gap` of dead space under the Format row. Nothing is
     // hidden-but-reachable — the branch builds no controls at all (see
     // `widgets::nothing`).
     .style(move |s| {
@@ -356,11 +362,11 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                 ring,
                 10,
             ))
-            .style(|s| s.width(150.0)),
+            .style(|s| s.width(theme::scaled(150.0))),
         ),
         csv_settings,
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
 }
 
 /// How a target reads in the dropdown.
@@ -391,8 +397,8 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
     let table = info.table;
 
     let name = text(file_col).style(|s| {
-        s.width(150.0)
-            .font_size(theme::FONT_BODY)
+        s.width(theme::scaled(150.0))
+            .font_size(theme::font_body())
             .color(theme::text())
             .text_ellipsis()
             .flex_shrink(0.0_f32)
@@ -413,7 +419,7 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
         let label = target_label(&t, &main_table);
         h_stack((
             text(label).style(move |s| {
-                let s = s.font_size(theme::FONT_BODY);
+                let s = s.font_size(theme::font_body());
                 // A skipped column is dimmed, so a half-mapped file reads at a
                 // glance rather than needing every row read.
                 if skipped {
@@ -441,7 +447,7 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
                     .padding_horiz(12.0)
                     .padding_vert(6.0)
                     .color(theme::text())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .hover(|s| s.background(theme::dropdown_hover()));
                 if current() == this {
                     s.background(theme::dropdown_active())
@@ -452,8 +458,11 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
             .into_any()
     };
 
-    let picker = Dropdown::custom(current, main, options, row)
-        .style(|s| dropdown_box_style(s).width(300.0).flex_shrink(0.0_f32));
+    let picker = Dropdown::custom(current, main, options, row).style(|s| {
+        dropdown_box_style(s)
+            .width(theme::scaled(300.0))
+            .flex_shrink(0.0_f32)
+    });
     // One Tab stop per file column, in the order they appear, through the shared
     // constants rather than a hand-rolled base and stride.
     //
@@ -495,20 +504,24 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
 }
 
 /// Preview column width, matching the results grid's default feel.
-const PREVIEW_COL_W: f64 = 140.0;
+fn preview_col_w() -> f64 {
+    theme::scaled(140.0)
+}
 /// Preview body height — five grid rows, scrolling past that. Enough to see a
 /// pattern (and a wrong delimiter) while still fitting the step without the
 /// whole body needing to scroll.
-const PREVIEW_BODY_H: f64 = ROW_H * 5.0;
+fn preview_body_h() -> f64 {
+    row_h() * 5.0
+}
 /// One preview cell, wearing the results grid's cell metrics: 8px horizontal
 /// padding, the grid's row height, and faint italic for a NULL — so the preview
 /// looks like the table the rows are going into.
 fn preview_cell(label: String, is_null: bool) -> impl IntoView {
     text(label).style(move |s| {
         let s = s
-            .width(PREVIEW_COL_W)
+            .width(preview_col_w())
             .padding_horiz(8.0)
-            .font_size(theme::FONT_BODY)
+            .font_size(theme::font_body())
             .text_ellipsis()
             .flex_shrink(0.0_f32);
         if is_null {
@@ -542,7 +555,7 @@ fn preview_table(ui: Ui) -> impl IntoView {
             if shown.is_empty() {
                 return container(
                     text("Nothing is mapped, so there's nothing to import.")
-                        .style(|s| s.color(theme::plan_warn()).font_size(theme::FONT_BODY)),
+                        .style(|s| s.color(theme::plan_warn()).font_size(theme::font_body())),
                 )
                 .style(|s| s.padding(12.0))
                 .into_any();
@@ -552,9 +565,9 @@ fn preview_table(ui: Ui) -> impl IntoView {
             // the same bottom rule the results grid draws.
             let header = h_stack_from_iter(shown.iter().map(|&fi| {
                 text(sample.columns[fi].clone()).style(|s| {
-                    s.width(PREVIEW_COL_W)
+                    s.width(preview_col_w())
                         .padding_horiz(8.0)
-                        .font_size(theme::FONT_LABEL)
+                        .font_size(theme::font_label())
                         .font_bold()
                         .color(theme::text_dim())
                         .text_ellipsis()
@@ -564,7 +577,7 @@ fn preview_table(ui: Ui) -> impl IntoView {
             .style(|s| {
                 s.flex_row()
                     .items_center()
-                    .height(28.0)
+                    .height(theme::scaled(28.0))
                     .flex_shrink(0.0_f32)
                     .border_bottom(1.0)
                     .border_color(theme::border())
@@ -581,7 +594,7 @@ fn preview_table(ui: Ui) -> impl IntoView {
                         _ => preview_cell("NULL".to_string(), true),
                     }))
                     .style(move |s| {
-                        let s = s.flex_row().items_center().height(ROW_H);
+                        let s = s.flex_row().items_center().height(row_h());
                         if pos % 2 == 1 {
                             s.background(theme::bg_editor())
                         } else {
@@ -599,7 +612,7 @@ fn preview_table(ui: Ui) -> impl IntoView {
                 autohide(shift_hscroll(
                     v_stack((
                         header,
-                        autohide(scroll(body)).style(|s| s.height(PREVIEW_BODY_H).width_full()),
+                        autohide(scroll(body)).style(|s| s.height(preview_body_h()).width_full()),
                     ))
                     .style(|s| s.flex_col()),
                 ))
@@ -637,7 +650,7 @@ fn issue_list(ui: Ui) -> impl IntoView {
             ))
             .style(|s| {
                 s.color(theme::error())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .font_bold()
                     .margin_bottom(6.0)
             });
@@ -647,8 +660,11 @@ fn issue_list(ui: Ui) -> impl IntoView {
                 } else {
                     format!("line {}, {}", is.line, is.column)
                 };
-                text(format!("{where_}: {}", is.kind.message()))
-                    .style(|s| s.font_size(11.0).color(theme::text()).margin_bottom(2.0))
+                text(format!("{where_}: {}", is.kind.message())).style(|s| {
+                    s.font_size(theme::scaled_font(11.0))
+                        .color(theme::text())
+                        .margin_bottom(2.0)
+                })
             }));
             let tail = text(if more {
                 "…and more.".to_string()
@@ -657,7 +673,8 @@ fn issue_list(ui: Ui) -> impl IntoView {
             })
             .style(move |s| {
                 if more {
-                    s.font_size(11.0).color(theme::text_dim())
+                    s.font_size(theme::scaled_font(11.0))
+                        .color(theme::text_dim())
                 } else {
                     s.hide()
                 }
@@ -712,7 +729,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             ))
             .style(|s| {
                 s.color(theme::plan_warn())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .max_width(560.0)
                     .margin_top(20.0)
             })
@@ -734,7 +751,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             text(warning)
                 .style(|s| {
                     s.color(theme::plan_warn())
-                        .font_size(theme::FONT_BODY)
+                        .font_size(theme::font_body())
                         .max_width(560.0)
                         .margin_top(20.0)
                 })
@@ -766,7 +783,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             ))
             .style(|s| {
                 s.color(theme::plan_warn())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .max_width(560.0)
                     .margin_top(20.0)
             })
@@ -777,7 +794,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
     const GAP: f64 = 8.0;
     v_stack((
         form_section("Columns"),
-        autohide(scroll(rows)).style(|s| s.max_height(MAPPING_LIST_H).width_full()),
+        autohide(scroll(rows)).style(|s| s.max_height(mapping_list_h()).width_full()),
         missing,
         json_size_note,
         engine_note,
@@ -1003,7 +1020,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                         "s"
                     }
                 ))
-                .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY))
+                .style(|s| s.color(theme::text()).font_size(theme::font_body()))
                 .into_any(),
             };
 
@@ -1016,7 +1033,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     Some(e) => text(e)
                         .style(|s| {
                             s.color(theme::error())
-                                .font_size(theme::FONT_BODY)
+                                .font_size(theme::font_body())
                                 .max_width(520.0)
                                 .margin_top(10.0)
                         })
@@ -1067,7 +1084,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                     move || ui.import.step.set(ImportStep::Mapping),
                                 ),
                             ))
-                            .style(|s| s.flex_row().items_center().gap(ACTION_GAP)),
+                            .style(|s| s.flex_row().items_center().gap(action_gap())),
                         )
                         .into_any()
                     },
@@ -1116,7 +1133,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                     move || run_import(ui.clone()),
                                 ),
                             ))
-                            .style(|s| s.flex_row().items_center().gap(ACTION_GAP)),
+                            .style(|s| s.flex_row().items_center().gap(action_gap())),
                         )
                         .into_any()
                     },
@@ -1144,7 +1161,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 autohide(scroll(v_stack((body, err)).style(|s| {
                     s.flex_col()
                         .width_full()
-                        .padding_horiz(MODAL_PAD_H)
+                        .padding_horiz(modal_pad_h())
                         .padding_vert(18.0)
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
@@ -1152,10 +1169,10 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             ))
             .on_click_stop(|_| {})
             .style(move |s| {
-                panel_style(s).width(PANEL_W).height(match step {
+                panel_style(s).width(panel_w()).height(modal_h(match step {
                     ImportStep::Mapping => PANEL_H_MAPPING,
                     _ => PANEL_H,
-                })
+                }))
             });
 
             focus_root_with_ring(container(panel), root_ring)

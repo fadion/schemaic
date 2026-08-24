@@ -29,7 +29,7 @@ use schemaic_core::activity::{self, KillKind, SessionInfo, SessionState};
 use schemaic_core::text::plural;
 
 use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
-use crate::theme::{FONT_BODY, FONT_LABEL};
+use crate::theme::{font_body, font_label};
 use crate::widgets::{
     MenuEntry, autohide, debounced, highlight_mono, highlight_text, section_title, toolbar_icon,
     tooltip_style,
@@ -58,7 +58,6 @@ fn state_color(state: SessionState) -> fn() -> floem::peniko::Color {
 }
 
 pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
-    let right_w = ui.layout.right_w;
     let state = ui.activity.state;
     let interval = ui.activity.interval;
     let busy = ui.activity.busy;
@@ -231,7 +230,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
         // history panels; spacers rather than margins so the flex-grow scroll's
         // height stays exact (a sibling's vertical margin isn't subtracted → the
         // list overflows the panel).
-        empty().style(|s| s.height(5.0).flex_shrink(0.0_f32)),
+        empty().style(|s| s.height(theme::scaled(5.0)).flex_shrink(0.0_f32)),
         edit_field(
             search_input,
             FieldCfg {
@@ -242,13 +241,13 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
             },
         )
         .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32)),
-        empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
+        empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         header,
         kill_error_line,
         scrolled,
     ))
     .style(move |s| {
-        s.width(right_w.get())
+        s.width(crate::widgets::right_panel_w().get())
             .flex_shrink(0.0_f32)
             .height_full()
             .flex_col()
@@ -275,7 +274,7 @@ fn list_message(
             // to the text it measured, so with nothing to be 100% *of*, the
             // SQLite explanation would be one long line the panel scrolls
             // sideways for.
-            s.font_size(14.0)
+            s.font_size(theme::scaled_font(14.0))
                 .color(color())
                 .width_full()
                 .line_height(1.4)
@@ -382,7 +381,7 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
     let sum = activity::summarize(sessions);
     let mut parts: Vec<floem::AnyView> = vec![
         text(sum.total_label(truncated))
-            .style(|s| s.font_size(FONT_LABEL).color(theme::text_muted()))
+            .style(|s| s.font_size(font_label()).color(theme::text_muted()))
             .into_any(),
     ];
     /// One figure in the counts line: how many, what to call them, and the
@@ -399,7 +398,7 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
         }
         parts.push(
             text(format!("{n} {word}"))
-                .style(move |s| s.font_size(FONT_LABEL).color(color()))
+                .style(move |s| s.font_size(font_label()).color(color()))
                 .into_any(),
         );
     }
@@ -415,7 +414,7 @@ fn counts_line(sessions: &[SessionInfo], truncated: bool) -> impl IntoView {
     if truncated {
         parts.push(
             text("list capped")
-                .style(|s| s.font_size(FONT_LABEL).color(theme::text_faint()))
+                .style(|s| s.font_size(font_label()).color(theme::text_faint()))
                 .into_any(),
         );
     }
@@ -449,7 +448,7 @@ fn banner(
         icons::icon(icons::LOCK, 13.0)
             .style(|s| s.color(theme::status_warn()).flex_shrink(0.0_f32)),
         text("Lock wait").style(|s| {
-            s.font_size(FONT_LABEL)
+            s.font_size(font_label())
                 .font_bold()
                 .color(theme::status_warn())
         }),
@@ -457,7 +456,7 @@ fn banner(
     .style(|s| s.flex_row().items_center().gap(7.0));
 
     let body = text(sentence).style(|s| {
-        s.font_size(FONT_BODY)
+        s.font_size(font_body())
             .color(theme::text())
             .line_height(1.4)
             .width_full()
@@ -485,7 +484,7 @@ fn banner(
         })
         .style(move |s| {
             let s = s
-                .font_size(FONT_BODY)
+                .font_size(font_body())
                 .color(theme::btn_danger_text())
                 .padding_horiz(10.0)
                 .padding_vert(4.0)
@@ -562,7 +561,7 @@ fn session_row(
         icons::icon(icons::DOT, 6.0)
             .style(move |s| s.color(color()).flex_shrink(0.0_f32).margin_right(7.0)),
         text(s.id.to_string()).style(|s| {
-            s.font_size(FONT_BODY)
+            s.font_size(font_body())
                 .font_family(MONO_FAMILY.to_string())
                 .color(theme::text_dim())
                 .flex_shrink(0.0_f32)
@@ -578,7 +577,7 @@ fn session_row(
         // there, which clears the wrap; `min_width(0)` keeps the real case — a
         // name genuinely too long for the row — shrinking rather than shoving the
         // age off the edge.
-        highlight_text(s.who(), term.clone(), FONT_BODY, theme::text, false, 1.0)
+        highlight_text(s.who(), term.clone(), font_body, theme::text, false, 1.0)
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
     ))
     .style(|s| s.items_center().flex_grow(1.0_f32).min_width(0.0));
@@ -586,7 +585,7 @@ fn session_row(
     let heading = h_stack((
         identity,
         text(activity::format_age(s.seconds)).style(|s| {
-            s.font_size(FONT_LABEL)
+            s.font_size(font_label())
                 .color(theme::text_faint())
                 .flex_shrink(0.0_f32)
         }),
@@ -599,7 +598,7 @@ fn session_row(
     // deciding whether to kill — the verb, the table and roughly the shape are
     // the whole question, and a third line of `WHERE` clause pushes the next
     // session off screen.
-    let max_h = (FONT_BODY as f64) * 1.4 * 2.0;
+
     // `running_sql`, not `sql`: PostgreSQL keeps an idle backend's *last*
     // statement in `query` indefinitely, and drawing it here made a wall of pool
     // connections each look like it was running something.
@@ -607,7 +606,7 @@ fn session_row(
         highlight_mono(
             schemaic_core::history::preview(sql),
             term.clone(),
-            FONT_BODY,
+            font_body,
             theme::text_dim,
             1.4,
         )
@@ -615,7 +614,10 @@ fn session_row(
         // own node to the text it measured, so with nothing to be 100% *of* it
         // lays out as one long line and the clip below merely cuts it off. The
         // width is what gives it something to wrap against.
-        .style(move |s| s.width_full().max_height(max_h))
+        // The clip height, computed here rather than bound outside: it is two line
+        // boxes of `font_body()`, so a captured `f64` clipped the statement at the
+        // old scale's two lines while the text inside it grew.
+        .style(move |s| s.width_full().max_height((font_body() as f64) * 1.4 * 2.0))
         .clip()
         .into_any()
     });
@@ -628,9 +630,9 @@ fn session_row(
         _ => String::new(),
     };
     let footer = h_stack((
-        text(s.state.label()).style(move |s| s.font_size(FONT_LABEL).color(color())),
+        text(s.state.label()).style(move |s| s.font_size(font_label()).color(color())),
         text(where_).style(|s| {
-            s.font_size(FONT_LABEL)
+            s.font_size(font_label())
                 .color(theme::text_muted())
                 .min_width(0.0)
         }),
@@ -640,7 +642,7 @@ fn session_row(
     let note_view: Option<floem::AnyView> = s.note().map(|n| {
         text(n)
             .style(|s| {
-                s.font_size(FONT_LABEL)
+                s.font_size(font_label())
                     .color(theme::text_muted())
                     .width_full()
             })
