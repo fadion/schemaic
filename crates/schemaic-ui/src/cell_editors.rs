@@ -30,7 +30,11 @@
 //!   overlay layer so it is clipped by nothing and flips at the edges. The text
 //!   field *stays* beside it: typing a date is often faster, a `TIMESTAMP`'s time
 //!   of day has no calendar to come from, and a value the picker cannot represent
-//!   (`0000-00-00`) still has to be editable.
+//!   (`0000-00-00`) still has to be editable. The same panel serves a row-panel
+//!   field and an open grid cell — the overlay layer is the only place a panel can
+//!   stand over the grid at all — and [`DatePick::on_pick`] is the one thing they
+//!   ask of it differently: a cell has no Save button in reach, so a chosen day
+//!   stages the edit there, while the row panel's field is what commits.
 
 use std::rc::Rc;
 
@@ -436,30 +440,105 @@ pub(crate) fn toggle_calendar(
     buf: RwSignal<String>,
     editor: &CellEditor,
 ) {
-    let pick = menus.date_pick;
-    let Some(rect) = anchor.map(|id| id.layout_rect()) else {
-        return;
-    };
-    let here = (rect.x0, rect.x1, rect.y1);
-    if pick.with_untracked(|p| p.as_ref().is_some_and(|d| d.buf == buf)) {
-        pick.set(None);
+    if menus
+        .date_pick
+        .with_untracked(|p| p.as_ref().is_some_and(|d| d.buf == buf))
+    {
+        menus.date_pick.set(None);
         return;
     }
-    // This button absorbs its own press, so nothing else will close the menus
-    // it is opening over — see `open_picker` for the whole bargain.
+    // The row panel's field is what commits there, so a picked day only writes
+    // the buffer — see [`DatePick::on_pick`].
+    open_calendar(menus, anchor, buf, editor, None);
+}
+
+/// Fill the channel: the calendar for `buf`, dropped from `anchor`'s rect,
+/// replacing whatever was up. The one place a [`DatePick`] is built.
+///
+/// A no-op when `anchor` has **no laid-out rect**, which is not the same test as
+/// "no id": `ViewId::layout_rect` answers `Rect::ZERO` for a view that has never
+/// been through layout rather than answering nothing, so the emptiness has to be
+/// asked about explicitly — an unasked question here is a panel in the window's
+/// top-left corner, and a caller reading "did it open?" from the channel gets
+/// `true` for it. It is why the grid's cell editor opens this one tick late.
+pub(crate) fn open_calendar(
+    menus: MenuFlags,
+    anchor: Option<floem::ViewId>,
+    buf: RwSignal<String>,
+    editor: &CellEditor,
+    on_pick: Option<Rc<dyn Fn()>>,
+) {
+    let Some(rect) = anchor
+        .map(|id| id.layout_rect())
+        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+    else {
+        return;
+    };
+    // The opener absorbs its own press, so nothing else will close the menus
+    // this is opening over — see `open_picker` for the whole bargain.
     menus.close_except(Some(MenuId::DatePick));
-    pick.set(Some(DatePick {
+    // No panel is up, so no press of one is outstanding. Nothing should be able
+    // to leave a stale one behind ([`take_calendar_press`] takes it), but a flag
+    // read by a *different* view than the one that sets it is worth resetting at
+    // the one moment its answer is known.
+    take_calendar_press();
+    menus.date_pick.set(Some(DatePick {
         buf,
         editor: editor.clone(),
-        anchor: here,
+        anchor: (rect.x0, rect.x1, rect.y1),
+        on_pick,
     }));
+}
+
+thread_local! {
+    /// Set by [`calendar_panel`]'s own pointer-down swallow, taken by whoever
+    /// asks. See [`take_calendar_press`].
+    static CALENDAR_PRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// **Did the calendar just take a pointer press?** Taken, not read: the answer is
+/// about the event being dispatched right now, and it must not survive it.
+///
+/// This exists because floem takes the window focus on *every* pointer-down and
+/// hands it back only to a focusable view under the cursor — a day, a month arrow
+/// and the Now button are none of them. A field the panel drops from therefore
+/// sees a click in the panel and a press of Escape as the same thing, a
+/// `FocusLost`, and the two have to mean opposite things: the first must leave the
+/// editor alone (the pick is about to land in it), the second must close it. The
+/// panel says which one this is, because it is the only one that knows.
+///
+/// The panel's own press arrives *before* the focus change it causes — floem
+/// clears the focus, dispatches, and only then emits `FocusLost` — so a flag set
+/// during dispatch is readable by the handler that follows it, in that order and
+/// no other.
+pub(crate) fn take_calendar_press() -> bool {
+    CALENDAR_PRESS.replace(false)
 }
 
 /// The month grid itself: header (‹ month year ›), weekday initials, six weeks of
 /// days, and a footer that jumps to today. Rendered by the overlay, which owns
 /// the placement; this owns only what it looks like and what a click writes.
 pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
-    let DatePick { buf, editor, .. } = pick;
+    let DatePick {
+        buf,
+        editor,
+        on_pick,
+        ..
+    } = pick;
+    // **Closing after a value was written**, which is not the same thing as
+    // closing: Escape and a click away arrive at `close` too, and the opener's
+    // `on_pick` must not run for those. Every path that writes `buf` ends here
+    // instead — the day cells and the Now/Today footer — so the two cannot drift.
+    let done: Rc<dyn Fn()> = match on_pick {
+        Some(picked) => {
+            let close = close.clone();
+            Rc::new(move || {
+                (picked)();
+                (close)();
+            })
+        }
+        None => close,
+    };
     let today = Date::today();
     // The month on show, seeded from the value the field holds when it opened.
     let focus = celledit::picker_focus(&buf.get_untracked(), today);
@@ -512,7 +591,7 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
 
     // Rebuilt per month rather than per day-cell, so paging doesn't leave 42
     // reactive closures each re-deciding which month they are in.
-    let (ed, closer) = (editor.clone(), close.clone());
+    let (ed, closer) = (editor.clone(), done.clone());
     let grid = dyn_container(
         move || shown.get(),
         move |(y, m)| {
@@ -549,7 +628,7 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
                 } else {
                     dated
                 });
-                (close)();
+                (done)();
             })
             .style(|s| {
                 s.padding_horiz(8.0)
@@ -565,8 +644,14 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
     let (w, h) = calendar_size();
     v_stack((header, headings, grid, footer))
         // A click inside the panel is not a click away — the root's dismissal
-        // handler must not see it (the rule every menu panel follows).
-        .on_event_stop(floem::event::EventListener::PointerDown, |_| {})
+        // handler must not see it (the rule every menu panel follows). Nor is it
+        // the field it dropped from being left, which is the other thing that has
+        // to be told apart from a press here ([`take_calendar_press`]). Every
+        // press inside the panel arrives here: the days and the footer act on
+        // `Click`, which is a pointer-*up*, so the down still bubbles to this.
+        .on_event_stop(floem::event::EventListener::PointerDown, |_| {
+            CALENDAR_PRESS.set(true)
+        })
         .style(move |s| {
             s.gap(4.0)
                 .padding(8.0)
@@ -582,20 +667,22 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
 
 /// One day in the month grid: the number, dimmed when it belongs to a
 /// neighbouring month, ringed when it is today, filled when it is the value's own
-/// day. Clicking it writes through [`celledit::set_date`] and closes the panel.
+/// day. Clicking it writes through [`celledit::set_date`] and then runs `done` —
+/// the panel's *value was written* exit, which closes it and, for the grid's cell
+/// editor, stages the edit (see [`calendar_panel`]).
 fn day_cell(
     day: Date,
     month: u32,
     today: Date,
     buf: RwSignal<String>,
     editor: CellEditor,
-    close: Rc<dyn Fn()>,
+    done: Rc<dyn Fn()>,
 ) -> AnyView {
     let ed = editor.clone();
     text(day.day.to_string())
         .on_click_stop(move |_| {
             buf.set(celledit::set_date(&ed, &buf.get_untracked(), day));
-            (close)();
+            (done)();
         })
         .style(move |s| {
             // Tracked: typing in the field moves the selection with it.
@@ -666,6 +753,25 @@ mod tests {
 
     const SIZE: (f64, f64) = (230.0, 220.0);
     const WIN: (f64, f64) = (1000.0, 700.0);
+
+    /// The mechanism the grid's `FocusLost` rule rests on, not the rule itself
+    /// (that one lives in a view and no test here reaches it): a press is
+    /// **spent** by the first asker. A flag that lingered would be handed to the
+    /// next focus loss instead — which is Escape, the press already having been
+    /// answered — and Escape would go on closing nothing.
+    #[test]
+    fn a_calendar_press_is_spent_once() {
+        assert!(
+            !take_calendar_press(),
+            "no panel has been pressed in this thread"
+        );
+        CALENDAR_PRESS.set(true);
+        assert!(take_calendar_press(), "the press the panel reported");
+        assert!(
+            !take_calendar_press(),
+            "and it is gone — a second asker is a different event"
+        );
+    }
 
     #[test]
     fn a_calendar_drops_from_the_controls_left_edge() {

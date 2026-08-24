@@ -2507,6 +2507,16 @@ pub struct DatePick {
     /// The control's rect in window coords: `(left, right, bottom)`, the three
     /// numbers [`PopupAnchor::BelowBox`] carries and the panel's identity.
     pub anchor: (f64, f64, f64),
+    /// What to run once a day (or **Now**) has been written into `buf` — and
+    /// only then, which is why it is here rather than on the channel: the panel
+    /// is closed by a pick, by Escape and by a click away, and only the opener
+    /// knows what to make of the difference.
+    ///
+    /// `None` in the row panel, where the field beside the calendar is what
+    /// commits. The grid's inline cell editor fills it in: a cell has no Save
+    /// button in reach, so choosing a day stages the edit and closes the editor,
+    /// exactly as choosing from an in-cell picker does.
+    pub on_pick: Option<Rc<dyn Fn()>>,
 }
 
 /// Overlay signals (Copy bundle): the two menu channels, the cursor anchor, and

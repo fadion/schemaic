@@ -5822,6 +5822,7 @@ mod menu_exclusivity {
                 buf: scope.create_rw_signal(String::new()),
                 editor: schemaic_core::celledit::CellEditor::Date,
                 anchor: (0.0, 0.0, 0.0),
+                on_pick: None,
             })),
         }
     }
