@@ -247,6 +247,14 @@ impl WindowChrome {
     /// drew a lit 138px tail on an otherwise dimmed rule. They cannot be one
     /// view — a parent spanning both would be hit first and swallow every press
     /// meant for the buttons.
+    ///
+    /// **Where they are mounted is part of the fix and not a detail.** Unlike
+    /// [`Self::resize_zones`], these belong *inside* the workspace root — after
+    /// the modal layer, before the overlay menus (`lib::workspace`'s tuple says
+    /// which and why). Out at the window root they were above the whole app, and
+    /// a menu tall enough to pin at y=0 had its first rows dimmed by this scrim
+    /// and answering presses with a window drag. The band has to out-paint the
+    /// header and the backdrop; nothing else.
     pub fn over_backdrop(self, up: impl Fn() -> bool + Copy + 'static) -> [AnyView; 2] {
         let this = self;
         let band = dyn_container(up, move |showing| {
