@@ -355,6 +355,11 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // exists to stop.
     pair!(text on erd_canvas, Body, "in-form buttons: Choose file…, Add value"),
     pair!(text_faint on erd_canvas, Recessive, "an in-form button with nothing to act on"),
+    // The type-aware cell editors paint on the same surface: a held `SET` chip, a
+    // cell open on its picker. So does the scale picker's selected segment, which
+    // had no row until this one — the colour was already in use here, only
+    // unwatched.
+    pair!(accent on erd_canvas, Body, "cell editors: the value a control holds"),
     // [B16-L2-01] read these two as a fill under white text and set them aside
     // as "therefore fine". They aren't a fill: `footer_button` takes a colour
     // fn, so this is red *text* on the modal panel.
@@ -398,7 +403,7 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(text on row_selected, Body, "schema tree: the keyboard-nav cursor row"),
     pair!(text_dim on row_selected, Body, "designer list: a selected row's detail"),
     pair!(key_primary on row_selected, Icon, "schema tree: a key glyph under the cursor"),
-    pair!(pill_active_text on pill_active_bg, Body, "designer tabs: the active pill"),
+    pair!(pill_active_text on pill_active_bg, Body, "designer tabs: the active pill; calendar: the picked day"),
     // Modal footer actions. Each variant's own label on its own fill, resting and
     // hovered, since a hover is a state a label is read in, not a decoration.
     pair!(btn_neutral_text on btn_neutral, Body, "modal footer: Cancel / Back"),
@@ -643,6 +648,13 @@ pub const UI_SHORTFALL: &[Shortfall] = {
         ("light", "diff_add_marker", "diff_add_bg", Body, 3.6),
         ("light", "diff_del_marker", "diff_del_bg", Body, 4.0),
         ("light", "toggle_handle_off", "toggle_off", Icon, 1.5),
+        // The chosen half of a boolean track / a held SET chip, and the same
+        // accent-on-`control_bg` the interface-scale picker's selected segment
+        // has always painted. 0.02 under the floor, and the two ways to close it
+        // are re-tuning the app's accent or the in-form control surface — both
+        // far larger than the hundredth of a ratio point they'd buy, which is the
+        // reasoning `accent on group_header_bg` above is listed under.
+        ("light", "accent", "erd_canvas", Body, 4.48),
     ]
 };
 

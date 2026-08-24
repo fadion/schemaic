@@ -2040,6 +2040,62 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
+/// The **date picker** overlay: the calendar a date field's button drops, drawn
+/// at the window root so nothing clips it.
+///
+/// It is not a menu, so it does not go through `popup_menu` — but it lives up
+/// here for the menus' reason. The field that opens it is a row in a strip at the
+/// bottom of the results area, inside that strip's own scroll: a panel nested
+/// under the field is clipped by both, which is what the first version did (it
+/// expanded *in flow* and had to be scrolled to).
+///
+/// The placement is [`crate::cell_editors::calendar_insets`], and the panel's
+/// size is computed rather than measured, so the edge flips are exact.
+///
+/// **The buffer may outlive nothing at all**: it belongs to the field, and a tab
+/// switch or a closed row panel disposes it. The channel is cleared at every one
+/// of those points, and this reads through `try_get` as the backstop — a
+/// disposed signal closes the panel instead of panicking in a style closure.
+pub(crate) fn date_pick_overlay(ui: Ui) -> impl IntoView {
+    let pick = ui.overlay.date_pick;
+    let close: Rc<dyn Fn()> = Rc::new(move || pick.set(None));
+    let close_child = close.clone();
+    // Escape is answered at the window root, because a panel like this is not the
+    // focused view (the field it drops from still is) — so it joins the same
+    // one-slot registry every dropdown popup uses, and Escape peels it off first.
+    let token = crate::widgets::popup_token();
+    dyn_container(
+        // Keyed on the anchor: a second field's calendar rebuilds the panel (a
+        // new month, a new buffer), while a redraw of the same one does not.
+        move || pick.with(|p| p.as_ref().map(|d| d.anchor)),
+        move |anchor| {
+            let (Some(_), Some(d)) = (anchor, pick.get_untracked()) else {
+                crate::widgets::clear_open_popup(token);
+                return empty().into_any();
+            };
+            if d.buf.try_get_untracked().is_none() {
+                // The field that owns it is gone (a tab switch mid-pick).
+                crate::widgets::clear_open_popup(token);
+                (close_child)();
+                return empty().into_any();
+            }
+            crate::widgets::set_open_popup(token, close_child.clone());
+            crate::cell_editors::calendar_panel(d, close_child.clone())
+        },
+    )
+    .style(move |s| {
+        let Some(anchor) = pick.with(|p| p.as_ref().map(|d| d.anchor)) else {
+            return s;
+        };
+        let (x, y) = crate::cell_editors::calendar_insets(
+            anchor,
+            crate::cell_editors::calendar_size(),
+            window_size().get(),
+        );
+        y.apply_y(s.absolute().inset_left(x))
+    })
+}
+
 /// Generic popup-menu overlay (the results-grid header/cell menus). Renders a
 /// `menu_panel` from `ui.overlay.popup_menu` at the cursor, flipping the whole panel left
 /// / up if it would spill past the window edge (the grid sits mid-window, unlike
@@ -2108,6 +2164,20 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
                 // wherever the estimate was wrong, and clamped a scaled menu to
                 // the top of the window.
                 let y = menu_inset(bottom, ph, wh, 5.0);
+                y.apply_y(s.absolute().inset_left(x))
+            }
+            // A menu dropping from a box (an enum field, a cell open for editing):
+            // **left edges flush**, so the list lines up under the value it is
+            // replacing rather than under a glyph. Same two flips as the icon case
+            // — right-aligned at the window's right edge, upward at its bottom —
+            // and the same shared `menu_inset` for the vertical.
+            Some(PopupAnchor::BelowBox(left, right, bottom)) => {
+                let x = if ww > 1.0 && left + pw > ww {
+                    (right - pw).max(0.0)
+                } else {
+                    left.max(0.0)
+                };
+                let y = menu_inset(bottom, ph, wh, 2.0);
                 y.apply_y(s.absolute().inset_left(x))
             }
             // Cursor menus (right-click): open at the pointer, flipping to the

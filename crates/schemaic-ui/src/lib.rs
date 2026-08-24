@@ -9,6 +9,7 @@
 mod activity_panel;
 mod ai_panel;
 pub use ai_panel::mark_messages_seen;
+mod cell_editors;
 mod completion;
 mod connection_form;
 mod consts;
@@ -62,8 +63,8 @@ use history_panel::history_panel;
 use monitor_view::monitor_overlay;
 use overlays::{
     active_db_menu_overlay, activity_menu_overlay, confirm_overlay, conn_menu_overlay,
-    context_menu_overlay, db_visibility_overlay, error_modal_overlay, find_overlay,
-    popup_menu_overlay, schema_settings_overlay, tx_prompt_overlay,
+    context_menu_overlay, date_pick_overlay, db_visibility_overlay, error_modal_overlay,
+    find_overlay, popup_menu_overlay, schema_settings_overlay, tx_prompt_overlay,
 };
 use plan_view::plan_overlay;
 use schema_tree::{schema_panel, schema_panel_w};
@@ -2468,9 +2469,44 @@ pub enum PopupAnchor {
     /// past the window's bottom it flips to grow upward. `(icon_left, icon_right,
     /// icon_bottom)` in window coords; the width comes from `popup_width`.
     BelowIcon(f64, f64, f64),
+    /// A menu dropping from a **box** — an enum field, a grid cell open for
+    /// editing: left edge flush with the control's own, so the list lines up with
+    /// the value it replaces. Flips to right-aligned at the window's right edge
+    /// and upward at its bottom, like [`PopupAnchor::BelowIcon`]. `(box_left,
+    /// box_right, box_bottom)` in window coords.
+    ///
+    /// Distinct from `BelowIcon` because that one tucks the panel under a ~28px
+    /// glyph by opening 40px left of its **right** edge — which, measured from a
+    /// 200px cell, puts the menu most of the way across it.
+    BelowBox(f64, f64, f64),
     /// Status-bar segment menu: centered on the segment's x-range and sitting 5px
     /// above the footer, growing upward. `(seg_left, seg_right)` in window coords.
     AboveFooter(f64, f64),
+}
+
+/// An open calendar: the buffer it edits, what a picked day writes into it, and
+/// the control it dropped from.
+///
+/// The **anchor is its identity**, exactly as [`PopupAnchor`] is a menu's: one
+/// channel, no tag saying who filled it, so the control that opened it recognises
+/// its own panel by the rect it would anchor at and closes it instead of
+/// reopening (`cell_editors::toggle_calendar`).
+///
+/// `buf` belongs to the view that opened this — a row panel field, an inline cell
+/// editor — and outlives it only in the moment before something clears the
+/// channel. The overlay therefore reads it through `try_get`, and closes itself
+/// when the answer is "that signal is gone".
+#[derive(Clone)]
+pub struct DatePick {
+    /// The text the calendar edits, the same signal the field beside it binds to.
+    pub buf: RwSignal<String>,
+    /// Which of the two date editors this column is — it decides what a picked
+    /// day writes (`celledit::set_date` keeps a datetime's time of day) and
+    /// whether the footer offers **Now** or **Today**.
+    pub editor: schemaic_core::celledit::CellEditor,
+    /// The control's rect in window coords: `(left, right, bottom)`, the three
+    /// numbers [`PopupAnchor::BelowBox`] carries and the panel's identity.
+    pub anchor: (f64, f64, f64),
 }
 
 /// Overlay signals (Copy bundle): the two menu channels, the cursor anchor, and
@@ -2491,6 +2527,14 @@ pub struct OverlayUi {
     pub popup_width: RwSignal<f64>,
     /// Last pointer position in window coords (anchors the context menu).
     pub last_mouse: RwSignal<(f64, f64)>,
+    /// The open date picker, or `None`. Its own channel rather than a `MenuEntry`
+    /// list because a calendar is a *grid*, not a menu — but it lives at the
+    /// window root for the same reason the menus do: the field it drops from sits
+    /// in a scrolling strip at the bottom of the results area, and a panel nested
+    /// under it would be clipped by that scroll and by the area's own edge. It is
+    /// on `widgets::MenuFlags` for the same reason again: everything that
+    /// dismisses a menu dismisses this. See [`DatePick`].
+    pub date_pick: RwSignal<Option<DatePick>>,
     pub find_open: RwSignal<bool>,
     pub find_query: RwSignal<String>,
     /// Per-connection Find-Anywhere search history (recorded on activation, shown
@@ -3154,6 +3198,9 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         // being painted behind the panel and its backdrop made it invisible. Only
         // `submenu_layer` below sits above it, and that is this menu's own
         // submenu rather than a surface competing with it.
+        // Below the menus: a calendar is dismissed by the same press that opens
+        // one, and never draws over one.
+        date_pick_overlay(ui.clone()),
         popup_menu_overlay(ui),
         // **After even the popup menu**, because it draws that menu's own open
         // submenu. A submenu is hoisted out of the row it belongs to and drawn
@@ -4886,6 +4933,8 @@ fn center(ui: Ui) -> impl IntoView {
                     popup,
                     popup_anchor,
                     popup_width,
+                    menus: all_menus,
+                    last_mouse: ui.overlay.last_mouse,
                     summarize: summarize.clone(),
                     attach: attach.clone(),
                     follow_fk: follow_fk.clone(),

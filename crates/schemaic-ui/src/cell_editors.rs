@@ -1,0 +1,705 @@
+//! **Type-aware value controls** — the widgets a cell whose legal values are
+//! already written down is edited with, instead of a text field.
+//!
+//! Which control a column gets is [`schemaic_core::celledit`]'s decision, and
+//! every rule about what a control may write is over there too — including what
+//! each row of a picker *writes*, which is not always what it reads
+//! ([`celledit::pick_options`]). This module is the reactive shell. Each builder
+//! binds to the same `RwSignal<String>` buffer a text field would have bound to,
+//! so the write path, the NULL toggle and the staged-edit machinery around it are
+//! unchanged: a control is only ever a different way of typing the same string.
+//!
+//! Three shapes, each chosen for the failure it avoids:
+//!
+//! * **A picker** — booleans and enums alike: a box that opens the app's own
+//!   [`crate::widgets::menu_panel`], not a floem
+//!   [`Dropdown`](floem::views::dropdown::Dropdown). The reason is a floem 0.2 bug
+//!   documented in `settings::scale_picker`: an overlay that would overflow the
+//!   window bottom is nudged back in **at paint only**, so its rows answer the
+//!   pointer where they used to be. The row panel is a strip at the *bottom* of
+//!   the results area, which is exactly where that lands — and the shared menu
+//!   channel already flips at the edges, walks with the arrow keys and dismisses
+//!   on Escape. A boolean is a two-row picker rather than a switch or a segmented
+//!   track for the same reason it is not a checkbox: the value has a **third**
+//!   state here, "nothing chosen yet", which an empty cell in a pending row is in.
+//! * **Set chips** — one per member, toggled in place, in the row panel. A menu
+//!   closes on the first pick, and picking is the one thing a subset does
+//!   repeatedly. (In a cell, where there is no room for chips, a `SET` uses the
+//!   picker and toggles one member per opening.)
+//! * **A calendar** — a panel that drops from the field, in the window's own
+//!   overlay layer so it is clipped by nothing and flips at the edges. The text
+//!   field *stays* beside it: typing a date is often faster, a `TIMESTAMP`'s time
+//!   of day has no calendar to come from, and a value the picker cannot represent
+//!   (`0000-00-00`) still has to be editable.
+
+use std::rc::Rc;
+
+use floem::AnyView;
+use floem::prelude::*;
+use floem::style::FlexWrap;
+
+use schemaic_core::celledit::{self, CellEditor};
+use schemaic_core::date::{self, Date, Time};
+
+use crate::widgets::{MenuEntry, MenuFlags, MenuId, MenuInset, menu_inset};
+use crate::{DatePick, FieldCfg, PopupAnchor, edit_field, icons, theme};
+
+/// What a control needs to put a menu up: every menu flag in the app, where to
+/// anchor this one, and the panel's minimum width.
+///
+/// It carries the whole [`MenuFlags`] rather than just the channel it fills
+/// because a trigger owes two things, not one — fill `menus.popup`, and close
+/// everything else, since it swallows the press the workspace root would have
+/// closed them on (see [`MenuId`]). `Copy`, like the `GridState` it is built
+/// from.
+#[derive(Clone, Copy)]
+pub(crate) struct PopupChannel {
+    /// Reached as `menus.popup` — the field name is what
+    /// `widgets::popup_anchor_gate` scans for (`popup.set(Some(`), so this
+    /// opener is on its list too.
+    pub menus: MenuFlags,
+    pub anchor: RwSignal<Option<PopupAnchor>>,
+    pub width: RwSignal<f64>,
+}
+
+/// The field-like surface a picker box and the calendar toggle wear — the same
+/// chrome [`crate::edit_field`] draws, so a row of mixed controls reads as one
+/// set.
+fn field_box(s: floem::style::Style) -> floem::style::Style {
+    s.items_center()
+        .height(crate::consts::field_input_h())
+        .padding_horiz(8.0)
+        .background(theme::bg_editor())
+        .border(1.0)
+        .border_color(theme::field_border())
+        .border_radius(6.0)
+        .hover(|s| s.border_color(theme::field_border_active()))
+}
+
+// ── Pickers (boolean, enum, set) ────────────────────────────────────────────
+
+/// The menu rows for `editor`'s options, tinted where the value already holds
+/// one ([`MenuEntry::action_colored`]'s stated purpose — it needs no icon column,
+/// and for a `SET` *every* held member is tinted because every one of them is).
+///
+/// `pick` is handed the option's **value**, which is not its label: a boolean's
+/// row reads `true` and writes the engine's own spelling, and a `SET`'s row
+/// writes the whole value with that member toggled.
+pub(crate) fn pick_entries(
+    editor: &CellEditor,
+    current: &str,
+    pick: Rc<dyn Fn(&str)>,
+) -> Vec<MenuEntry> {
+    celledit::pick_options(editor, current)
+        .into_iter()
+        .map(|o| {
+            let pick = pick.clone();
+            let act = move || (pick)(&o.value);
+            if o.held {
+                MenuEntry::action_colored(o.label, theme::accent, act)
+            } else {
+                MenuEntry::action(o.label, act)
+            }
+        })
+        .collect()
+}
+
+/// Open (or close) a picker's menu under the control that raised it.
+///
+/// `anchor` is the control's **own** view id, whose `layout_rect` floem already
+/// keeps in window coordinates — the frame [`PopupAnchor`] is stated in. Reached
+/// by Tab, a control has no cursor to open at, and the shared channel's fallback
+/// is `last_mouse`: without this the menu opened wherever the pointer was left.
+///
+/// A second press closes what the first opened, and the "is that mine?" test is
+/// **recomputed** rather than remembered: these controls sit in a scrolling
+/// panel, so with a menu up the control may have moved, and then the press
+/// reopens at the new position — which is the better answer anyway.
+pub(crate) fn open_picker(
+    ch: PopupChannel,
+    anchor: Option<floem::ViewId>,
+    width: f64,
+    entries: Vec<MenuEntry>,
+) {
+    let here = anchor
+        .map(|id| id.layout_rect())
+        .map(|r| PopupAnchor::BelowBox(r.x0, r.x1, r.y1));
+    if here.is_some_and(|mine| {
+        crate::widgets::menu_anchored_at(
+            ch.menus.popup.get_untracked().is_some(),
+            ch.anchor.get_untracked(),
+            mine,
+        )
+    }) {
+        ch.menus.popup.set(None);
+        return;
+    }
+    // This trigger absorbs its own pointer-down, so the workspace root's
+    // `close_except(None)` never runs for it and every *other* menu — the schema
+    // tree's eye, a calendar, the connection switcher — would be left on screen
+    // beside this one. A stranded `menu_panel` keeps its `focus_root` registered,
+    // which is how a new query tab ends up declining the keyboard.
+    ch.menus.close_except(Some(MenuId::Popup));
+    ch.anchor.set(here);
+    // At least as wide as the control it drops from, so the menu doesn't read as
+    // a different control than the one that opened it.
+    ch.width.set(width.max(theme::scaled(150.0)));
+    ch.menus.popup.set(Some(entries));
+}
+
+/// Width of a picker box in the row panel — wide enough for an enum's longest
+/// member without stretching to the field column's whole width.
+///
+/// A `fn`, and *called inside* the style closure rather than resolved into one:
+/// a captured number cannot re-run when the interface scale changes, so the box
+/// kept its old width while the type inside it grew (`themes::UiScale`'s rule).
+fn pick_field_w() -> f64 {
+    theme::scaled(220.0)
+}
+
+/// A `<select>`-shaped box bound to `buf`, offering `editor`'s options through
+/// the shared popup menu (see the module doc for why it is a menu and not a
+/// `Dropdown`). Used by the row panel for booleans and enums alike.
+pub(crate) fn pick_field(buf: RwSignal<String>, editor: CellEditor, ch: PopupChannel) -> AnyView {
+    // The box's own id, so the menu opens under the box rather than at the
+    // pointer — which is where it was left when the control was reached by Tab.
+    // Filled once the view below exists.
+    let anchor_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+    let for_open = editor.clone();
+    let open = move || {
+        let entries = pick_entries(
+            &for_open,
+            &buf.get_untracked(),
+            Rc::new(move |v: &str| buf.set(v.to_string())),
+        );
+        open_picker(ch, anchor_id.get_untracked(), pick_field_w(), entries);
+    };
+    let boxed = h_stack((
+        dyn_container(
+            move || celledit::held_label(&editor, &buf.get()),
+            move |v| {
+                let unset = v.is_empty();
+                text(if unset { "Choose…".to_string() } else { v })
+                    .style(move |s| {
+                        s.font_size(theme::font_body())
+                            .text_ellipsis()
+                            .min_width(0.0)
+                            .color(if unset {
+                                theme::placeholder()
+                            } else {
+                                theme::text()
+                            })
+                    })
+                    .into_any()
+            },
+        )
+        .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+        icons::icon(icons::CHEVRON_DOWN, 14.0)
+            .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
+    ))
+    .on_click_stop(move |_| open())
+    // Without this the workspace root's close-on-pointer-down fires first and
+    // the click then reopens: down closes, up reopens, and the box never toggles.
+    .on_event_stop(
+        floem::event::EventListener::PointerDown,
+        crate::widgets::menu_trigger_press,
+    )
+    .style(|s| field_box(s).width(pick_field_w()).gap(6.0));
+    anchor_id.set(Some(boxed.id()));
+    boxed.into_any()
+}
+
+/// The **in-cell** face of a picker: the value and a chevron, filling the cell on
+/// the edit surface, while the menu it opened stands over the grid.
+///
+/// Edge to edge — no padding of its own beyond the text inset, and the cell drops
+/// its own while this is up (`grid::data_cell`), so the control reads as the cell
+/// rather than as a box sitting inside one.
+pub(crate) fn pick_cell_face(buf: RwSignal<String>, editor: CellEditor) -> AnyView {
+    h_stack((
+        dyn_container(
+            move || celledit::held_label(&editor, &buf.get()),
+            move |v| {
+                let unset = v.is_empty();
+                text(if unset { "Choose…".to_string() } else { v })
+                    .style(move |s| {
+                        s.font_size(theme::font_body())
+                            .text_ellipsis()
+                            .min_width(0.0)
+                            // `text_faint`, not the field `placeholder`: this one
+                            // sits on the edit surface, where the placeholder
+                            // colour manages 1.5:1 — see `contrast::UI_PAIRS`.
+                            .color(if unset {
+                                theme::text_faint()
+                            } else {
+                                theme::text()
+                            })
+                    })
+                    .into_any()
+            },
+        )
+        .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+        icons::icon(icons::CHEVRON_DOWN, 12.0)
+            .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
+    ))
+    .style(|s| {
+        s.flex_row()
+            .width_full()
+            .height_full()
+            .items_center()
+            .gap(4.0)
+            .padding_horiz(crate::consts::grid_pad_h())
+            .background(theme::control_bg())
+    })
+    .into_any()
+}
+
+// ── Set ─────────────────────────────────────────────────────────────────────
+
+/// One chip per member of a `SET`, lit when the value holds it. Clicking toggles
+/// through [`celledit::pick_options`], whose value for a member is the whole
+/// `SET` with that member flipped — which is what keeps the result in the
+/// engine's declaration order.
+pub(crate) fn set_control(buf: RwSignal<String>, editor: CellEditor) -> AnyView {
+    let chips: Vec<AnyView> = celledit::pick_options(&editor, "")
+        .into_iter()
+        .map(|o| {
+            let (name, ed) = (o.label, editor.clone());
+            let held = {
+                let name = name.clone();
+                move || {
+                    buf.with(|v| {
+                        celledit::pick_options(&ed, v)
+                            .into_iter()
+                            .any(|o| o.label == name && o.held)
+                    })
+                }
+            };
+            let toggle = {
+                let (name, ed) = (name.clone(), editor.clone());
+                move || {
+                    let next = celledit::pick_options(&ed, &buf.get_untracked())
+                        .into_iter()
+                        .find(|o| o.label == name)
+                        .map(|o| o.value);
+                    if let Some(v) = next {
+                        buf.set(v);
+                    }
+                }
+            };
+            text(name)
+                .on_click_stop(move |_| toggle())
+                .style(move |s| {
+                    let s = s
+                        .padding_horiz(8.0)
+                        .padding_vert(3.0)
+                        .border(1.0)
+                        .border_radius(10.0)
+                        .font_size(theme::font_body());
+                    if held() {
+                        s.background(theme::control_bg())
+                            .border_color(theme::accent())
+                            .color(theme::accent())
+                    } else {
+                        s.background(theme::bg_editor())
+                            .border_color(theme::field_border())
+                            .color(theme::text_dim())
+                            .hover(|s| {
+                                s.color(theme::text())
+                                    .border_color(theme::field_border_active())
+                            })
+                    }
+                })
+                .into_any()
+        })
+        .collect();
+    h_stack_from_iter(chips)
+        .style(|s| {
+            s.flex_row()
+                .flex_wrap(FlexWrap::Wrap)
+                .width_full()
+                .gap(6.0)
+                .padding_vert(2.0)
+        })
+        .into_any()
+}
+
+// ── Date / datetime ─────────────────────────────────────────────────────────
+
+/// Width of one day cell in the calendar — seven of them plus the panel's
+/// padding is the panel's width.
+fn day_w() -> f64 {
+    theme::scaled(30.0)
+}
+
+/// Height of one day cell.
+fn day_h() -> f64 {
+    theme::scaled(24.0)
+}
+
+/// The calendar panel's own size, computed rather than measured: the panel is a
+/// fixed grid, and [`crate::overlays::date_pick_overlay`] needs the real numbers
+/// to decide which way it flips at a window edge. An estimate there is a panel
+/// that lands a few pixels off, or off-screen entirely.
+pub(crate) fn calendar_size() -> (f64, f64) {
+    let pad = 8.0 * 2.0 + 2.0; // padding both sides + the 1px border both sides
+    let rows = day_h() * 6.0;
+    let chrome = theme::scaled(22.0) * 2.0 + theme::scaled(16.0); // header, footer, weekday row
+    let gaps = 4.0 * 3.0;
+    (day_w() * 7.0 + pad, rows + chrome + gaps + pad)
+}
+
+/// A text field bound to `buf` with a calendar toggle beside it. The calendar
+/// itself is an **overlay** ([`DatePick`] → `date_pick_overlay`), so it is
+/// clipped by neither the row panel's scroll nor the results area, and flips at
+/// the window's edges.
+///
+/// `editor` decides what a picked day *writes* — [`celledit::set_date`] keeps a
+/// datetime's time of day, its fraction and its offset — and whether the footer
+/// offers **Now** (a datetime) or **Today** (a date).
+pub(crate) fn date_control(
+    buf: RwSignal<String>,
+    editor: CellEditor,
+    autofocus: bool,
+    on_escape: Option<Rc<dyn Fn()>>,
+    menus: MenuFlags,
+) -> AnyView {
+    let pick = menus.date_pick;
+    // **Is the open calendar this field's?** One channel serves every date field
+    // in the panel, and asking only whether *a* calendar is open answered yes for
+    // all of them: `created_at`'s open panel lit `updated_at`'s button too, and
+    // `updated_at`'s teardown closed `created_at`'s panel. The buffer is the
+    // identity — the anchor moves when the panel scrolls, and a control being
+    // disposed no longer has a rect to compare.
+    let mine = move || pick.with_untracked(|p| p.as_ref().is_some_and(|d| d.buf == buf));
+    let field = edit_field(
+        buf,
+        FieldCfg {
+            background: theme::bg_editor,
+            font_size: theme::font_body,
+            autofocus,
+            height: Some(crate::consts::field_input_h),
+            on_escape,
+            ..Default::default()
+        },
+    )
+    .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
+
+    let anchor_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+    let toggle = container(icons::icon(icons::CALENDAR, 15.0))
+        .on_click_stop(move |_| toggle_calendar(menus, anchor_id.get_untracked(), buf, &editor))
+        // The same bargain a menu trigger makes: the root closes the calendar on
+        // any pointer-down, so an unswallowed press would close what this click
+        // is about to open.
+        .on_event_stop(
+            floem::event::EventListener::PointerDown,
+            crate::widgets::menu_trigger_press,
+        )
+        .style(move |s| {
+            let s = field_box(s)
+                .width(crate::consts::field_input_h())
+                .justify_center()
+                .padding(0.0);
+            // Tracked, so the button un-lights when the calendar closes.
+            if pick.with(|p| p.as_ref().is_some_and(|d| d.buf == buf)) {
+                s.color(theme::accent()).border_color(theme::accent())
+            } else {
+                s.color(theme::text_dim()).hover(|s| s.color(theme::text()))
+            }
+        });
+    anchor_id.set(Some(toggle.id()));
+
+    h_stack((field, toggle))
+        // **The calendar cannot outlive the field.** It edits `buf`, which belongs
+        // to this field's scope — a closed row panel, a stepped row, a switched
+        // tab all dispose it, and a panel still reading a disposed signal is a
+        // panic in a style closure rather than a stale value. The overlay checks
+        // too (`try_get`), but only when it rebuilds; this is what fires when
+        // nothing rebuilds it.
+        .on_cleanup(move || {
+            if mine() {
+                pick.set(None);
+            }
+        })
+        .style(|s| s.width_full().items_center().gap(6.0))
+        .into_any()
+}
+
+/// Open the calendar under `anchor`, or close it if it is already this control's.
+///
+/// Recomputed rather than remembered, for [`open_picker`]'s reason: the control
+/// may have moved under an open panel, and reopening at the new place is the
+/// better answer than refusing to close.
+pub(crate) fn toggle_calendar(
+    menus: MenuFlags,
+    anchor: Option<floem::ViewId>,
+    buf: RwSignal<String>,
+    editor: &CellEditor,
+) {
+    let pick = menus.date_pick;
+    let Some(rect) = anchor.map(|id| id.layout_rect()) else {
+        return;
+    };
+    let here = (rect.x0, rect.x1, rect.y1);
+    if pick.with_untracked(|p| p.as_ref().is_some_and(|d| d.buf == buf)) {
+        pick.set(None);
+        return;
+    }
+    // This button absorbs its own press, so nothing else will close the menus
+    // it is opening over — see `open_picker` for the whole bargain.
+    menus.close_except(Some(MenuId::DatePick));
+    pick.set(Some(DatePick {
+        buf,
+        editor: editor.clone(),
+        anchor: here,
+    }));
+}
+
+/// The month grid itself: header (‹ month year ›), weekday initials, six weeks of
+/// days, and a footer that jumps to today. Rendered by the overlay, which owns
+/// the placement; this owns only what it looks like and what a click writes.
+pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
+    let DatePick { buf, editor, .. } = pick;
+    let today = Date::today();
+    // The month on show, seeded from the value the field holds when it opened.
+    let focus = celledit::picker_focus(&buf.get_untracked(), today);
+    let shown: RwSignal<(i32, u32)> = RwSignal::new((focus.year, focus.month));
+    let step = move |months: i32| {
+        let (y, m) = shown.get_untracked();
+        let Some(first) = Date::new(y, m, 1) else {
+            return;
+        };
+        let moved = first.add_months(months);
+        shown.set((moved.year, moved.month));
+    };
+    let arrow = move |icon: &'static str, months: i32| {
+        container(icons::icon(icon, 14.0))
+            .on_click_stop(move |_| step(months))
+            .style(|s| {
+                s.padding(3.0)
+                    .border_radius(4.0)
+                    .color(theme::text_dim())
+                    .hover(|s| s.color(theme::text()).background(theme::row_hover()))
+            })
+            .into_any()
+    };
+    let header = h_stack((
+        arrow(icons::CHEVRON_LEFT, -1),
+        dyn_container(
+            move || shown.get(),
+            move |(y, m)| {
+                text(format!("{} {y}", date::month_name(m)))
+                    .style(|s| s.font_size(theme::font_body()).color(theme::text()))
+                    .into_any()
+            },
+        )
+        .style(|s| s.flex_grow(1.0_f32).items_center().justify_center()),
+        arrow(icons::CHEVRON_RIGHT, 1),
+    ))
+    .style(move |s| s.width_full().height(theme::scaled(22.0)).items_center());
+
+    let headings = h_stack_from_iter(date::WEEKDAY_INITIALS.iter().map(|d| {
+        text(*d)
+            .style(|s| {
+                s.width(day_w())
+                    .justify_center()
+                    .font_size(theme::font_hint())
+                    .color(theme::text_faint())
+            })
+            .into_any()
+    }))
+    .style(move |s| s.flex_row().height(theme::scaled(16.0)));
+
+    // Rebuilt per month rather than per day-cell, so paging doesn't leave 42
+    // reactive closures each re-deciding which month they are in.
+    let (ed, closer) = (editor.clone(), close.clone());
+    let grid = dyn_container(
+        move || shown.get(),
+        move |(y, m)| {
+            let (ed, closer) = (ed.clone(), closer.clone());
+            let rows: Vec<AnyView> = date::month_cells(y, m)
+                .chunks(7)
+                .map(|week| {
+                    let days: Vec<AnyView> = week
+                        .iter()
+                        .map(|d| day_cell(*d, m, today, buf, ed.clone(), closer.clone()))
+                        .collect();
+                    h_stack_from_iter(days).style(|s| s.flex_row()).into_any()
+                })
+                .collect();
+            v_stack_from_iter(rows).into_any()
+        },
+    );
+
+    let picks_time = editor == CellEditor::DateTime;
+    let now_label = if picks_time { "Now" } else { "Today" };
+    let footer = h_stack((
+        empty().style(|s| s.flex_grow(1.0_f32)),
+        text(now_label)
+            .on_click_stop(move |_| {
+                // Read **now**, not the `today` this panel was built with: a
+                // calendar left open across local midnight would otherwise write
+                // yesterday's date beside the current time — a stamp a day in the
+                // past, from the one button whose whole job is "the current
+                // instant".
+                let today = Date::today();
+                let dated = celledit::set_date(&editor, &buf.get_untracked(), today);
+                buf.set(if picks_time {
+                    celledit::set_time(&editor, &dated, Time::now(), today)
+                } else {
+                    dated
+                });
+                (close)();
+            })
+            .style(|s| {
+                s.padding_horiz(8.0)
+                    .padding_vert(2.0)
+                    .border_radius(4.0)
+                    .font_size(theme::font_body())
+                    .color(theme::accent())
+                    .hover(|s| s.background(theme::row_hover()))
+            }),
+    ))
+    .style(move |s| s.width_full().height(theme::scaled(22.0)).items_center());
+
+    let (w, h) = calendar_size();
+    v_stack((header, headings, grid, footer))
+        // A click inside the panel is not a click away — the root's dismissal
+        // handler must not see it (the rule every menu panel follows).
+        .on_event_stop(floem::event::EventListener::PointerDown, |_| {})
+        .style(move |s| {
+            s.gap(4.0)
+                .padding(8.0)
+                .width(w)
+                .height(h)
+                .background(theme::bg_panel())
+                .border(1.0)
+                .border_color(theme::border())
+                .border_radius(8.0)
+        })
+        .into_any()
+}
+
+/// One day in the month grid: the number, dimmed when it belongs to a
+/// neighbouring month, ringed when it is today, filled when it is the value's own
+/// day. Clicking it writes through [`celledit::set_date`] and closes the panel.
+fn day_cell(
+    day: Date,
+    month: u32,
+    today: Date,
+    buf: RwSignal<String>,
+    editor: CellEditor,
+    close: Rc<dyn Fn()>,
+) -> AnyView {
+    let ed = editor.clone();
+    text(day.day.to_string())
+        .on_click_stop(move |_| {
+            buf.set(celledit::set_date(&ed, &buf.get_untracked(), day));
+            (close)();
+        })
+        .style(move |s| {
+            // Tracked: typing in the field moves the selection with it.
+            let picked = buf.with(|v| celledit::value_date(v)) == Some(day);
+            let s = s
+                .width(day_w())
+                .height(day_h())
+                .items_center()
+                .justify_center()
+                .border(1.0)
+                .border_radius(4.0)
+                .font_size(theme::font_body());
+            let s = if day == today {
+                s.border_color(theme::accent())
+            } else {
+                s.border_color(floem::peniko::Color::TRANSPARENT)
+            };
+            // **The picked day has no hover state at all.** A hover fill is a
+            // *state* style in floem and wins over the base background, so the
+            // one day already filled with the accent turned grey under the
+            // pointer — the selection reading as un-selected on the only cell you
+            // are pointing at. Nothing is being offered by hovering it either: it
+            // is where the value already is.
+            if picked {
+                // The app's **active pill** — a saturated blue fill with text
+                // picked to be legible on it, in both themes, and already
+                // measured (`contrast::UI_PAIRS`, "designer tabs: the active
+                // pill"). An `accent` fill under `bg_deepest` text was the
+                // obvious spelling and lands at 3.87:1 in Light, under AA.
+                s.background(theme::pill_active_bg())
+                    .color(theme::pill_active_text())
+            } else if day.month == month {
+                s.color(theme::text())
+                    .hover(|s| s.background(theme::row_hover()))
+            } else {
+                s.color(theme::text_faint())
+                    .hover(|s| s.background(theme::row_hover()))
+            }
+        })
+        .into_any()
+}
+
+/// Where the calendar goes: left edge on the control's, dropping below it —
+/// flipped to right-aligned at the window's right edge and upward at its bottom,
+/// which is the placement rule [`PopupAnchor::BelowBox`] states for a menu.
+///
+/// Pure, and the panel's size is exact rather than estimated ([`calendar_size`]),
+/// so the flip is a fact rather than a guess: this is the whole reason a fixed
+/// grid was worth building instead of letting the panel size itself.
+pub(crate) fn calendar_insets(
+    anchor: (f64, f64, f64),
+    size: (f64, f64),
+    win: (f64, f64),
+) -> (f64, MenuInset) {
+    let (left, right, bottom) = anchor;
+    let ((w, h), (ww, wh)) = (size, win);
+    let x = if ww > 1.0 && left + w > ww {
+        (right - w).max(0.0)
+    } else {
+        left.max(0.0)
+    };
+    (x, menu_inset(bottom, h, wh, 4.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIZE: (f64, f64) = (230.0, 220.0);
+    const WIN: (f64, f64) = (1000.0, 700.0);
+
+    #[test]
+    fn a_calendar_drops_from_the_controls_left_edge() {
+        let (x, y) = calendar_insets((100.0, 130.0, 40.0), SIZE, WIN);
+        assert_eq!(x, 100.0);
+        assert_eq!(y, MenuInset::Start(44.0), "4px below the control");
+    }
+
+    #[test]
+    fn a_calendar_at_the_right_edge_is_right_aligned_on_the_control() {
+        let (x, _) = calendar_insets((900.0, 930.0, 40.0), SIZE, WIN);
+        assert_eq!(x, 700.0, "its right edge lands on the control's");
+    }
+
+    /// The row panel is a strip at the *bottom* of the results area, so this is
+    /// the common case there rather than an edge case.
+    #[test]
+    fn a_calendar_with_no_room_below_grows_upward() {
+        let (_, y) = calendar_insets((100.0, 130.0, 650.0), SIZE, WIN);
+        // Expressed from the window's bottom so the panel's own height decides
+        // where it starts — `menu_inset`'s rule.
+        assert_eq!(y, MenuInset::End(700.0 - 650.0 + 4.0));
+    }
+
+    #[test]
+    fn a_calendar_taller_than_the_window_pins_to_the_top() {
+        let (_, y) = calendar_insets((100.0, 130.0, 500.0), (230.0, 900.0), WIN);
+        assert_eq!(y, MenuInset::Start(0.0));
+    }
+
+    #[test]
+    fn an_unmeasured_window_never_flips() {
+        let (x, y) = calendar_insets((100.0, 130.0, 40.0), SIZE, (0.0, 0.0));
+        assert_eq!(x, 100.0);
+        assert_eq!(y, MenuInset::Start(44.0));
+    }
+}

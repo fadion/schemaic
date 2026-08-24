@@ -1535,6 +1535,43 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `PathSeg::{Member(i),Index(i)}` addresses by *position*, not key, so duplicate keys get distinct
     independently-editable rows; `set_leaf` reparses arbitrary JSON, so editing a leaf may change
     its type. `rows`/`TreeRow` is the flattened outline the UI renders.
+  - `celledit.rs` — **which editor a column's cells get**, and the value rules that editor
+    enforces. `editor_for_type` reads a *declared* type into a `CellEditor` (`Bool(BoolWire)`,
+    `Enum(members)`, `Set(members)`, `Date`, `DateTime`, else `Text`) and `editor_for_column` adds
+    the one thing the type text can't answer — a PostgreSQL enum type's members, which live in
+    `DbSchema::enums`. **Declared, never the wire type**: MySQL sends an `ENUM` as
+    `MYSQL_TYPE_STRING` and a `BOOLEAN` as `TINYINT`, so `Column::type_name` knows neither the
+    member list nor the `tinyint(1)` width, and a result whose schema hasn't loaded falls back to
+    the wire type (where the date family still resolves and the rest stay text). `fits` is the
+    other half and the safety one: a control may only be offered for a value it could itself have
+    produced, so a `tinyint(1)` holding `7`, an `ENUM` holding the empty string MySQL wrote for a
+    rejected insert, and a `DATE` holding `0000-00-00` all keep the plain text field — a toggle
+    rendered over `7` writes `0` the moment it is touched. An **empty** value fits everything (it
+    means "nothing chosen yet"), which is what hands a NULL field its dropdown. `BoolWire` is which
+    two literals a boolean writes, and it is **the engine's own spelling, not the readable one**
+    (`1`/`0` on MySQL and SQLite, `t`/`f` on PostgreSQL): every engine accepts several on the way
+    in, so the round trip decides — a toggle back to what the column already reads back is
+    recognised as a revert and un-stages, where `true` written over a `t` leaves a green cell whose
+    `UPDATE` writes a value already there. Writing back is
+    `set_date`/`set_time` (which keep a datetime's other parts — see `date.rs`) and
+    `toggle_set_member`, which re-emits a `SET` in **declaration order** because that is the order
+    MySQL stores and returns one in. The `ENUM`/`SET` member list is parsed off the type text
+    through `sql::skip_noncode` — the one boundary lexer — and unescaped as the exact inverse of
+    `export::sql_literal`, since splitting on commas loses a member containing one.
+  - `date.rs` — civil dates, clock times, and the month grid a picker draws. `Date`/`Time` are
+    checked constructions (`0000-00-00` and a `TIME` column's `838:59:59` duration are both
+    rejected, which is how `celledit::fits` knows a calendar can't represent them); `Stamp` splits a
+    timestamp's text into the parts a picker edits and the parts it must **preserve byte for byte** —
+    the fractional seconds, the timezone offset, and whether the source separated date from time
+    with a space or a `T`. Picking a day out of `2024-01-15 10:30:00.123456+02` must not quietly
+    drop the rest, which is the same silent-rewrite class `jsontree` keeps a number's source text
+    for. The arithmetic is Howard Hinnant's `days_from_civil`/`civil_from_days` pair — the
+    workspace's only date maths, `format.rs`'s epoch formatter included — and `month_cells` is
+    **always 42 dates** (six weeks, Monday-first) so the panel doesn't change height as you page
+    through the year. `Date::today`/`Time::now` are the module's only impure functions and the only
+    use of `chrono` in the workspace: they read the **local** clock, because `SystemTime` is UTC and
+    a picker that highlights yesterday between local midnight and the offset is wrong at exactly the
+    hours somebody is most likely to be looking at it.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
     warnings (full scan / filesort / temp table); `to_prompt_text` for the AI.
   - **AI prompt + reply plumbing** (all pure, all dialect-aware — a prompt that hardcodes
@@ -2855,7 +2892,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     check what was sent snapped shut the moment the answer landed. That scope outlives the rebuilds
     and dies with the message.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
-    menu, generic grid popup, Find-Anywhere, error modal. **What separates the two kinds here is
+    menu, generic grid popup, the date picker's calendar (`date_pick_overlay`, whose panel is
+    `cell_editors::calendar_panel` — up here because the field it drops from sits inside a scrolling
+    strip that would clip it), Find-Anywhere, error modal. **What separates the two kinds here is
     the backdrop, not the name.** The menus are shrink-wrapped to their panel; Find-Anywhere and
     the error/confirm/transaction prompts paint `modal_backdrop()` over the window, which puts
     them in `workspace`'s modal layer with the rest of the modals. Find-Anywhere is the one that
@@ -3007,6 +3046,33 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     too, since it falls through to Save as, which is the answer to "save this" there, while Reload is
     *dimmed* rather than hidden, the way "Reopen last tab" is on an empty ring, so the menu keeps
     one shape.
+  - `cell_editors.rs` — the **type-aware value controls** the grid edits with when a column's legal
+    values are already written down: the picker (a box, or the in-cell face), the `SET`'s chips and
+    the calendar. Every builder binds to the same `RwSignal<String>` a text field would have, so the
+    staging, NULL and write-back machinery around it is unchanged — a control is only ever a
+    different way of typing the same string, and *which* string is [`core::celledit`]'s to say
+    (including what each row **writes**, which is not what it reads: a boolean's row reads `true`
+    and writes `1`, a `SET`'s writes the whole value with that member toggled). Three shapes, each
+    avoiding a specific failure: **one picker for booleans and enums alike**, because a boolean's
+    values are as listed as an enum's and one control for both is one thing to learn — a two-row
+    menu rather than a switch or a checkbox, since the value has a third state ("nothing chosen
+    yet") neither has anywhere to stand for. It opens the app's own `menu_panel` rather than a floem
+    `Dropdown` because of the paint-only edge nudge documented in `settings::scale_picker`, and the
+    row panel sits at the window bottom where that bug lands. The **`SET`** gets chips in the row
+    panel because a menu closes on the first pick and a subset is picked repeatedly (in a cell,
+    where there is no room for chips, it uses the picker and toggles one member per opening). The
+    **calendar** is a panel in the window's own overlay layer (`DatePick` →
+    `overlays::date_pick_overlay`), placed by the pure `calendar_insets` against a `calendar_size`
+    that is *computed, not measured* — which is what makes its edge flips exact rather than
+    estimated. `open_picker` is the one menu opener: it anchors at the control's own
+    `ViewId::layout_rect` (already in window coordinates), so a menu reached by Tab doesn't open
+    wherever the pointer was left, recognises its own menu to toggle it closed, and closes every
+    other menu — which it can because `PopupChannel` carries the whole `MenuFlags` rather than the
+    single channel it fills. A trigger that swallows its own press owes both halves of that bargain
+    (see *the app's menus are mutually exclusive*), and the calendar's toggle owes it too. **Which
+    calendar belongs to which field is settled by the buffer, not the anchor**: one channel serves
+    every date field in the panel, so asking only "is a calendar open" lit every field's button at
+    once and let any one field's teardown close another's panel.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `results_view`/`loaded_view` are the
     entry points). `editor_pane.rs` — SQL editor pane
     (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
@@ -4451,6 +4517,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   class wins. Nest class overrides accordingly (dropdown popup restyle nests under `ListClass`).
 - **`DoubleClick` consumes the second `PointerUp`** — clear drag/press state in the double-click
   handler too, not only in `PointerUp`.
+- **A view's own `event_before_children` runs *before* its listeners, and a processed event stops
+  there** (`context.rs::unconditional_view_event`) — so `on_event(KeyDown, …)` on a built-in view
+  never sees a key that view handles itself. **`floem::views::text_input` handles Escape by calling
+  `app_state.clear_focus()`**, which is how the grid's inline cell editor came to leave the keyboard
+  on *nothing*: its own Escape arm was dead code, and after a press the arrows, Enter and Ctrl+Enter
+  all did nothing until a cell was clicked. There is no `disable_default_event` escape hatch worth
+  using either — it is per *listener kind*, so suppressing KeyDown suppresses typing.
+  What the host does hear is `FocusLost`, which is also what a click on anything else produces, and
+  floem exposes no way to ask where the focus went (`AppState::focus` is private, and by the time a
+  listener runs `focus_changed` has already assigned the new one). `grid::reclaim_keyboard` is the
+  compromise: the **pointer** decides, and it is over the grid for Escape and over the something-else
+  for a click on it. `edit_field` does not have the problem — it is a `text_editor` with a command
+  hook, so its `on_escape` is real.
 - **An overlay that would overflow the window is nudged back in *paint only*.**
   `OverlayView::paint` (`floem-0.2.0/src/window_handle.rs`) does
   `cx.offset((-x, -y))` when `window_origin + size` passes `parent_size - 5` on either axis — and
@@ -5269,10 +5348,17 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   The grid's toolbar dropdowns and the status-bar segments were always right: floem's `on_move`
   fires during **layout** with the view's window origin, not on pointer movement, so what they
   anchor to is the widget and not the cursor.
+  **Which placement it asks for is part of the same answer.** `BelowIcon` tucks the panel under a
+  ~28px glyph by opening 40px left of the icon's *right* edge; measured from a 220px enum field or
+  a grid cell that is most of the way across the control, so a menu dropping from a **box** uses
+  `BelowBox` instead — left edges flush, the same right-edge and bottom-edge flips. The two are
+  distinct variants rather than a flag because the anchor is also the menu's identity: a control
+  compares the placement it *would* set against the open one, and two controls that disagreed about
+  which variant they use would each fail to recognise the other's menu.
 - **`popup_anchor` carries the menu's *identity*, not only its placement — so an opener must write
-  it immediately before `popup_menu`.** One channel serves eleven openers across six modules
-  (`connection_form`, `editor_pane`, `grid` ×5, `lib`'s status bar, `monitor_view`,
-  `table_designer::suggest_chevron`, `tabs`) and nothing in it says who filled it, so the grid
+  it immediately before `popup_menu`.** One channel serves fifteen openers across ten files
+  (`activity_panel`, `cell_editors::open_picker`, `connection_form`, `editor_pane`, `erd_view`,
+  `grid` ×6, `lib`'s status bar, `monitor_view`, `table_designer::suggest_chevron`, `tabs`) and nothing in it says who filled it, so the grid
   toolbar's AI / Copy / Save icons ran "dismiss, then open" unconditionally and a second press
   rebuilt an identical panel instead of closing it. The menus that already toggled could only half
   lend their answer: the schema panel's eye and gear, the connection switcher and the tab selector
@@ -5315,9 +5401,14 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   cell, press the segment again, and it closed the cell's menu instead of opening its own. All three
   surfaces ask the anchor now.
 - **The app's menus are mutually exclusive, and the list of them is `widgets::MenuFlags`** — the
-  seven `MenuId`s (`Popup`, `Context`, and the five panel-owned flags: the schema eye and gear, the
-  connection switcher, the active-database selector, the Server Activity clock), gathered by
-  `MenuFlags::of(&ui)` and closed by `close_except(keep)`. A trigger has to enforce this *itself*,
+  eight `MenuId`s (`Popup`, `Context`, the five panel-owned flags — the schema eye and gear, the
+  connection switcher, the active-database selector, the Server Activity clock — and `DatePick`, the
+  date field's calendar, which is a *grid of days* rather than a menu but is dismissed by every
+  gesture that dismisses one), gathered by `MenuFlags::of(&ui)` and closed by `close_except(keep)`.
+  The calendar's membership is the whole reason the list is a list: it is opened from the row panel,
+  it is closed by the workspace root, **and** it has to be closed by `GridState::dismiss_overlays`
+  when a grid cell is clicked — a press the cell consumes, so the root never sees it. Reaching that
+  through the shared list is what stopped it needing a second spelling in the grid. A trigger has to enforce this *itself*,
   because it absorbs its own pointer-down — it must, or the root's dismissal would close the menu the
   click is about to open — so the root handler never runs for it. **Both halves of that bargain are
   the trigger's**, and until recently two of the five click-opened menus had neither: the connection
@@ -5340,14 +5431,19 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   **`widgets::menu_trigger_gate::every_click_opened_menu_closes_the_others_itself` is what holds it**,
   a sibling of `popup_anchor_gate` and a source scan for the same reason: the thing under test is a
   set of call sites. It reads every `src/*.rs` in the crate with the test modules cut off and asserts
-  each click-opened `MenuId` — `SchemaEye`, `SchemaGear`, `Connection`, `ActiveDb`, `ActivityClock`,
-  but not `Popup` or `Context`, which are opened on `SecondaryClick` where the root dismisses on the
-  press and the opener runs on the release, one gesture — appears in a `close_except(Some(…))`
-  somewhere, in any of the three spellings the crate uses for the path (`crate::widgets::MenuId::`,
+  each click-opened `MenuId` — `SchemaEye`, `SchemaGear`, `Connection`, `ActiveDb`, `ActivityClock`
+  and `DatePick`, but not `Popup` or `Context`, which are opened on `SecondaryClick` where the root
+  dismisses on the press and the opener runs on the release, one gesture — appears in a
+  `close_except(Some(…))` somewhere, in any of the three spellings the crate uses for the path (`crate::widgets::MenuId::`,
   `widgets::MenuId::`, bare `MenuId::`). Deliberately
   weak: it counts `close_except(Some(` and `menu_trigger_press` registrations against the number of
   click-opened menus so a rename can't make it pass by finding nothing, but which site is which is
-  not checkable from source. That list was written out three
+  not checkable from source. **`Popup` stays off the list even though several of its openers are
+  click-opened** — the grid's toolbar dropdowns, `table_designer::suggest_chevron`, the cell
+  editors' pickers — because that id names a *channel* many controls share, so one
+  `close_except(Some(MenuId::Popup))` anywhere would satisfy a check meant to hold each of them.
+  Each of those triggers still owes the call, and `cell_editors::open_picker` makes it for the
+  pickers; what is missing is a gate that can tell one from another. That list was written out three
   times in three files, and the third one added a flag the other two never learned about: opening the
   activity clock's interval dropdown and then clicking the schema tree's eye left **both** on screen.
   A stranded dropdown is not merely visible — its `focus_root` stays registered, and
@@ -5617,6 +5713,37 @@ for keyboard nav.
   `commit_grid` → a `GridWrite { updates, inserts }` → the app's `commit_edits`. On success the app
   re-runs the query; on failure the error shows in the toolbar and green edits stay. No global "Edit"
   toggle. A read-only cell's double-click opens the value viewer.
+- **A column whose legal values are written down doesn't edit as text.** Booleans, `ENUM`s, `SET`s
+  and dates get their own control, in the grid *and* in the row panel, over
+  `core::celledit` + `core::date` (the rules) and `ui::cell_editors` (the widgets) — both of which
+  say why each shape is what it is. What the grid adds is the plumbing:
+  - **`gs.editors`** holds one `CellEditor` per result column, resolved by `column_editors` from
+    the column's **declared** type — its base column in the loaded schema, falling back to the wire
+    type. It is a signal filled by its own effect, with **tracked** reads of `db_nodes` and each
+    node's `schema`, so a database whose introspection lands after the grid was built upgrades a
+    text field into a dropdown in place. (`edit_model`'s effect deliberately does not track those;
+    the two answer different questions and editability is settled at build.)
+  - **The column's control is narrowed to the value in hand** before it is used, by `fitting_editor`
+    (row panel) and the same `celledit::fits` call in `data_cell`'s editing branch. This is the seam
+    the whole feature's safety rests on: the classification is per *column*, and one cell of that
+    column may hold something the control cannot represent.
+  - **In a cell**: booleans, enums and sets all edit through one control
+    (`cell_pick_editor` — the value and a chevron, with the shared popup menu over it), opened
+    against the cell one tick after the face is built because a view has no `layout_rect` until it
+    has been laid out. A cell has room for a value and a chevron and nothing else, and a menu is the
+    only list that can be drawn over a grid at all. Choosing commits immediately through
+    `keep_cell_edit` — Enter's contract, including the pending-row hop — so a `SET` toggles one
+    member per opening. The editor closes on **any** dismissal of that menu, which is why it watches
+    the `popup` flag rather than only its own actions: the root's click-away handler writes that
+    channel directly. **The cell drops its own horizontal padding** while such a control is open
+    (`open_cell_control`, asked by both the content and the style so the two cannot disagree): the
+    control carries its own surface, and a padded cell around it reads as a box inside a box.
+  - **In the row panel**: `typed_editor` puts the control inside the same NULL toggle a text field
+    gets (`nullable_field`, extracted from `scalar_editor` for exactly this). Only the `SET`'s
+    wrapping chips can outgrow a line, so only that row grows.
+  - **Dates keep the text input** in both places, with the calendar beside it in the row panel:
+    typing a date is often faster, a `TIMESTAMP`'s time of day has no calendar to come from, and a
+    value no picker can represent still has to be editable.
 - **Range selection is back, and it feeds the aggregates bar.** The state (`active`/`anchor`), the
   rect (`bounds`), the paint and `copy_selection` were always multi-cell aware; only the *input*
   had been gated off ("the grid has no multi-cell actions"). Shift+click, Shift+arrow and

@@ -80,6 +80,16 @@ velopack = "1.2"
 # CPU/memory/process reader, no disk/network/component/user probes.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
+# The **local** wall clock, and nothing else. `core::date` does its own civil
+# arithmetic (Howard Hinnant's day↔date pair, unit-tested), but "which day is
+# today" cannot be answered from `std`: `SystemTime` is UTC, and a date picker
+# that highlights yesterday between local midnight and the UTC offset is wrong at
+# exactly the hours somebody is most likely to be looking at it. Already in the
+# tree via russh → russh-util, so it costs no compile; `default-features = false`
+# + `clock` is the timezone-aware `Local::now()` without chrono's serde,
+# formatting or `oldtime` surface.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 # SQL parsing. Pure-Rust, per-dialect AST (MySqlDialect now; Postgres/SQLite are
 # dialect swaps for the multi-DB future). Drives the editor's structure-aware
 # completion + catalog diagnostics; the hand-built `skip_noncode` lexer stays for
