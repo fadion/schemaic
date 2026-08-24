@@ -2844,6 +2844,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     shows the quotes. The Status dropdown offers Enabled and Disabled plus, for an event already in
     it, the replica state — offering `DISABLE ON SLAVE` freely would be offering a keyword MySQL
     8.4 has removed, while hiding it would show "Enabled" over an event that isn't.
+    **That state has two spellings and `EventStatus` keeps them apart** (`SlavesideDisabled` /
+    `ReplicaDisabled`), because the word the server reported in
+    `information_schema.EVENTS.STATUS` is the only signal for which keyword it will accept back:
+    8.4 renamed the column value *and* removed the old keyword. Folded together — as they were —
+    every statement used the pre-8.4 spelling, so Copy CREATE on 8.4 produced SQL it rejects and a
+    whole-database script stopped at that event. Two variants rather than one carrying a word, so
+    that equality still means "the same state" and the differ can't see an `ALTER` in an event
+    nobody edited.
     It shares one tuple element with the trigger and routine overlays (Floem's 16-arity
     `ViewTuple` limit) and clears both of their targets on open, as they clear its.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s

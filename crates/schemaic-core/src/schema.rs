@@ -2310,45 +2310,68 @@ pub enum EventStatus {
     /// [`crate::ddl::diff_event`] restates the status **only when it changed**,
     /// so an event in this state that nobody touched keeps it.
     SlavesideDisabled,
+    /// The same state on **MySQL 8.4**, which renamed both the column value
+    /// (`REPLICA_SIDE_DISABLED`) and the keyword (`DISABLE ON REPLICA`) and
+    /// removed the old spelling of the latter.
+    ///
+    /// Two variants for one state, because the *server's own answer is the only
+    /// version signal there is here*: an event read as `SLAVESIDE_DISABLED` came
+    /// from a server that takes `DISABLE ON SLAVE`, one read as
+    /// `REPLICA_SIDE_DISABLED` from a server that rejects it. Folding them
+    /// together — which this did — threw that away and left every generated
+    /// statement using the pre-8.4 keyword. They are separate variants rather
+    /// than one carrying a word so that equality still means "the same state":
+    /// the differ compares statuses, and a status that differed from itself in
+    /// spelling would emit an `ALTER` for an event nobody edited.
+    ReplicaDisabled,
 }
 
 impl EventStatus {
     /// Read `information_schema.EVENTS.STATUS`.
     ///
-    /// MySQL 8.0.26 renamed the replica state's *keyword* but not this column's
-    /// value; `REPLICA_SIDE_DISABLED` is accepted anyway, so a server that ever
-    /// does report it isn't read as `ENABLED`. An unrecognised answer is
+    /// MySQL 8.0.26 renamed the replica state's keyword and 8.4 renamed this
+    /// column's value with it, so the two spellings are kept **apart**: which one
+    /// the server used is the only thing that says which keyword it will accept
+    /// back (see [`EventStatus::ReplicaDisabled`]). An unrecognised answer is
     /// `Enabled`, which is the state the scheduler treats an event as being in.
     pub fn parse(s: &str) -> EventStatus {
         match s.trim().to_ascii_uppercase().as_str() {
             "DISABLED" => EventStatus::Disabled,
-            "SLAVESIDE_DISABLED" | "REPLICA_SIDE_DISABLED" => EventStatus::SlavesideDisabled,
+            "SLAVESIDE_DISABLED" => EventStatus::SlavesideDisabled,
+            "REPLICA_SIDE_DISABLED" => EventStatus::ReplicaDisabled,
             _ => EventStatus::Enabled,
         }
     }
 
     /// The clause that sets this state on `CREATE`/`ALTER EVENT`.
     ///
-    /// **`DISABLE ON SLAVE` is the spelling MySQL 8.0 and every MariaDB accept;
-    /// MySQL 8.4 removed it in favour of `DISABLE ON REPLICA`.** It is emitted
-    /// only when the status genuinely changed *to* it — which the editor offers
-    /// only for an event already in that state — so the removed keyword reaches
-    /// a server that rejects it just when somebody deliberately asks for it, and
-    /// fails visibly at Apply rather than quietly enabling the event.
+    /// **The replica state has two spellings and they are not interchangeable:**
+    /// `DISABLE ON SLAVE` is what MySQL 8.0 and every MariaDB accept, and MySQL
+    /// 8.4 removed it in favour of `DISABLE ON REPLICA`. Which one an event gets
+    /// is decided by the word its own server reported, which is why `parse` keeps
+    /// them apart — every statement here used the pre-8.4 keyword while it did
+    /// not, so `create_sql` handed an 8.4 server a Copy-CREATE it rejects, and a
+    /// whole-database script aborted at that event.
     pub fn sql_keyword(self) -> &'static str {
         match self {
             EventStatus::Enabled => "ENABLE",
             EventStatus::Disabled => "DISABLE",
             EventStatus::SlavesideDisabled => "DISABLE ON SLAVE",
+            EventStatus::ReplicaDisabled => "DISABLE ON REPLICA",
         }
     }
 
     /// What the state is called in a sentence a person reads.
+    ///
+    /// The two replica spellings read the same, deliberately: the *state* is one
+    /// thing, and which keyword sets it is the server's business, not the
+    /// reader's. (Nothing shows both at once — the editor's list carries whichever
+    /// one the event is in.)
     pub fn label(self) -> &'static str {
         match self {
             EventStatus::Enabled => "Enabled",
             EventStatus::Disabled => "Disabled",
-            EventStatus::SlavesideDisabled => "Disabled on replica",
+            EventStatus::SlavesideDisabled | EventStatus::ReplicaDisabled => "Disabled on replica",
         }
     }
 }
@@ -6545,9 +6568,16 @@ mod event_tests {
         );
         assert_eq!(
             EventStatus::parse("REPLICA_SIDE_DISABLED"),
-            EventStatus::SlavesideDisabled
+            EventStatus::ReplicaDisabled,
+            "8.4's own word, kept apart from 8.0's — it is the only thing that \
+             says which keyword this server takes back"
         );
         assert_eq!(EventStatus::parse("something new"), EventStatus::Enabled);
+        // One state, one sentence: the spelling is the server's business.
+        assert_eq!(
+            EventStatus::SlavesideDisabled.label(),
+            EventStatus::ReplicaDisabled.label()
+        );
     }
 
     /// The two schedule shapes, and the bounds that only one of them has.
@@ -6621,11 +6651,22 @@ mod event_tests {
     /// `DISABLE ON SLAVE` is the state a replica sets for itself, and it round
     /// -trips: an event read in it and re-emitted says so rather than coming
     /// back enabled.
+    ///
+    /// **In the server's own spelling**, which is the half that was wrong: an
+    /// event read from MySQL 8.4 got a keyword 8.4 has removed, so Copy CREATE
+    /// produced a statement it rejects and a whole-database script stopped there.
     #[test]
     fn a_replica_disabled_event_keeps_saying_so() {
         let mut e = ev();
         e.status = EventStatus::SlavesideDisabled;
         assert!(e.create_sql(MySql).contains("\nDISABLE ON SLAVE\n"));
+        e.status = EventStatus::ReplicaDisabled;
+        let sql = e.create_sql(MySql);
+        assert!(sql.contains("\nDISABLE ON REPLICA\n"), "{sql}");
+        assert!(
+            !sql.contains("ON SLAVE"),
+            "8.4 removed that keyword — emitting it is a statement that fails"
+        );
     }
 
     /// The tree row: the schedule on one line, and the fact that it is switched
