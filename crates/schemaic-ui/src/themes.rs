@@ -811,8 +811,8 @@ pub enum UiScale {
 }
 
 impl UiScale {
-    /// Dropdown order: ascending by size. (Unlike `EditorThemeKind::ALL`, which
-    /// leads with the default — a list of *sizes* that starts in the middle
+    /// Picker order: ascending by size. (Unlike `EditorThemeKind::ALL`, which
+    /// leads with the default — a row of *percentages* that starts in the middle
     /// reads as unordered.)
     pub const ALL: [UiScale; 4] = [
         UiScale::Small,
@@ -829,38 +829,34 @@ impl UiScale {
         match self {
             UiScale::Small => 0.8,
             UiScale::Normal => 1.0,
-            UiScale::Large => 1.5,
-            UiScale::Huge => 2.0,
+            UiScale::Large => 1.3,
+            UiScale::Huge => 1.6,
         }
     }
 
-    /// The canonical name of this scale, percentage included — for prose *about*
-    /// the setting (the README, release notes) and for the test diagnostics
-    /// below.
+    /// What this scale is called everywhere it is named: the picker's segments,
+    /// prose *about* the setting (the README, release notes), and the test
+    /// diagnostics below.
     ///
-    /// **Not what the picker shows.** Its segments wear [`Self::short`]: four of
-    /// these side by side don't fit the Settings modal at 200%, which is exactly
-    /// the size at which somebody is reading them. The picker used to carry one
-    /// of these as a hint line under the row; it doesn't, because four segments
-    /// named Small → Huge that apply on press say the same thing without a
-    /// sentence.
+    /// **The percentage alone, and not a word like "Large".** A name only ranks
+    /// the options; the number answers the question somebody actually has open
+    /// the control to ask, and it cannot go stale the way a word does — retune
+    /// [`Self::factor`] and the label follows, which is what
+    /// `every_ui_scale_label_states_its_own_percentage` pins. (The variants keep
+    /// their names because nothing user-facing reads them, and
+    /// [`Self::key`] stays semantic so a retune carries a persisted choice along
+    /// instead of resetting it.)
+    ///
+    /// It is also what makes one string do both jobs. The picker used to wear a
+    /// separate short form, because four *names* side by side don't fit the
+    /// Settings modal at the top scale — which is exactly the size at which
+    /// somebody is reading them. Four percentages do.
     pub fn label(self) -> &'static str {
         match self {
-            UiScale::Small => "Small (80%)",
-            UiScale::Normal => "Normal (100%)",
-            UiScale::Large => "Large (150%)",
-            UiScale::Huge => "Huge (200%)",
-        }
-    }
-
-    /// The name alone — the segmented picker's button text, and the only one of
-    /// the two the app actually renders.
-    pub fn short(self) -> &'static str {
-        match self {
-            UiScale::Small => "Small",
-            UiScale::Normal => "Normal",
-            UiScale::Large => "Large",
-            UiScale::Huge => "Huge",
+            UiScale::Small => "80%",
+            UiScale::Normal => "100%",
+            UiScale::Large => "130%",
+            UiScale::Huge => "160%",
         }
     }
 
@@ -1146,11 +1142,11 @@ mod scale_tests {
     fn a_scaled_size_lands_on_whole_pixels() {
         // The 13px body text, at each offered scale.
         assert_eq!(scale_at(13.0, UiScale::Small.factor()), 10.0); // 10.4
-        assert_eq!(scale_at(13.0, UiScale::Large.factor()), 20.0); // 19.5
-        assert_eq!(scale_at(13.0, UiScale::Huge.factor()), 26.0);
+        assert_eq!(scale_at(13.0, UiScale::Large.factor()), 17.0); // 16.9
+        assert_eq!(scale_at(13.0, UiScale::Huge.factor()), 21.0); // 20.8
         // A row height and a panel width, which have to stay integral too.
         assert_eq!(scale_at(26.0, UiScale::Small.factor()), 21.0); // 20.8
-        assert_eq!(scale_at(34.0, UiScale::Large.factor()), 51.0);
+        assert_eq!(scale_at(34.0, UiScale::Large.factor()), 44.0); // 44.2
         assert_eq!(scale_at(250.0, UiScale::Small.factor()), 200.0);
     }
 
@@ -1208,9 +1204,10 @@ mod scale_tests {
         assert_eq!(UiScale::from_key(&default_key).factor(), 1.0);
     }
 
-    /// The dropdown labels quote the percentage, and a label that disagrees with
-    /// the factor it selects is a lie the user can measure. Computed from
-    /// `factor()`, so the pair can't drift.
+    /// The picker's segments *are* the percentage, and a label that disagrees
+    /// with the factor it selects is a lie the user can measure — the whole
+    /// reason the segments dropped their Small/Normal/Large/Huge names. Computed
+    /// from `factor()`, so the pair can't drift.
     #[test]
     fn every_ui_scale_label_states_its_own_percentage() {
         for kind in UiScale::ALL {

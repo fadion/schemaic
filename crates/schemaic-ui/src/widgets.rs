@@ -1763,9 +1763,10 @@ pub(crate) fn modal_body_h(base: f64) -> f64 {
 ///
 /// The height cap alone wasn't enough, and the failure was worse than a short
 /// panel: the wide editors (table designer, routines, triggers, events — 900px
-/// base) came to 1800 at 200%, and a modal centred in a backdrop narrower than
-/// itself has its *left* half off-screen, taking the list pane and every field
-/// label with it. Width has to fit before height is even interesting.
+/// base) came to 1800 at the 200% then offered — 1440 at today's 160%, which a
+/// 1366px laptop still can't hold — and a modal centred in a backdrop narrower
+/// than itself has its *left* half off-screen, taking the list pane and every
+/// field label with it. Width has to fit before height is even interesting.
 ///
 /// The reserve is smaller than the height's — horizontal room is what these
 /// modals are short of, and there is no bottom-anchored footer at stake.
@@ -1799,8 +1800,8 @@ fn cap_to(want: f64, extent: f64, reserve: f64, floor: f64) -> f64 {
     // The floor is there so the subtraction can't hand back a sliver (or, on a
     // window smaller than the reserve, a negative). It is itself clamped to the
     // window: a floor *wider than the screen* would clip the panel through the
-    // very guard meant to keep it usable — which at 200% is not hypothetical, its
-    // scaled value passes 600px.
+    // very guard meant to keep it usable — which at 160% is not hypothetical, its
+    // scaled value passes 500px.
     want.min((extent - reserve).max(floor.min(extent)))
 }
 
@@ -2510,9 +2511,9 @@ pub(crate) fn cursor_menu_insets(
 /// from the real, measured panel width (so it has no estimate to be wrong about)
 /// while its y has only `menu_panel_height`'s estimate — and it was still
 /// subtracting that estimate from the anchor and clamping at zero, which is the
-/// arithmetic this type exists to retire. At 200% the estimate roughly doubles,
-/// so the grid's Copy menu clamped to the top of the window, hundreds of pixels
-/// from the icon that opened it.
+/// arithmetic this type exists to retire. At the top scale the estimate grows by
+/// half again, so the grid's Copy menu clamped to the top of the window, hundreds
+/// of pixels from the icon that opened it.
 pub(crate) fn menu_inset(anchor: f64, size: f64, win: f64, gap: f64) -> MenuInset {
     if win <= 1.0 || anchor + gap + size <= win {
         return MenuInset::Start(anchor + gap);
@@ -4758,14 +4759,14 @@ mod modal_height_tests {
     }
 
     /// The point of the change: it grows with the scale. The editors were three
-    /// fields and a scrollbar at 200%.
+    /// fields and a scrollbar at the top scale.
     #[test]
     fn a_modal_grows_with_the_scale_when_the_window_allows() {
         at(UiScale::Large, (2560.0, 1440.0), || {
-            assert_eq!(modal_h(620.0), 930.0);
+            assert_eq!(modal_h(620.0), 806.0);
         });
         at(UiScale::Huge, (2560.0, 1440.0), || {
-            assert_eq!(modal_h(620.0), 1240.0);
+            assert_eq!(modal_h(620.0), 992.0);
         });
     }
 
@@ -4777,11 +4778,11 @@ mod modal_height_tests {
         at(UiScale::Huge, (1920.0, 900.0), || {
             let h = modal_h(620.0);
             assert!(h < 900.0, "{h} does not fit a 900px window");
-            assert_eq!(h, 900.0 - 80.0, "window less the scaled reserve");
+            assert_eq!(h, 900.0 - 64.0, "window less the scaled reserve");
         });
         // A scrolling body reserves more, for the title and footer around it.
         at(UiScale::Huge, (1920.0, 900.0), || {
-            assert_eq!(modal_body_h(560.0), 900.0 - 320.0);
+            assert_eq!(modal_body_h(560.0), 900.0 - 256.0);
         });
     }
 
@@ -4799,18 +4800,20 @@ mod modal_height_tests {
     /// **Width is capped against the window's width, and it is the cap that
     /// matters most.** A modal centred in a backdrop narrower than itself loses
     /// its *left* half — the designer's list pane and every field label with it —
-    /// which is what the 900px editors did at 200% (1800 in a 1631px window).
-    /// A short panel is awkward; a clipped one is unusable.
+    /// which is what the 900px editors did at the 200% scale then offered (1800
+    /// in a 1631px window). At 160% the same modal is 1440, so the window that
+    /// meets the cap is a 1366px laptop rather than a 1631px one — the cap still
+    /// has to hold. A short panel is awkward; a clipped one is unusable.
     #[test]
     fn a_modal_never_outgrows_the_windows_width() {
-        at(UiScale::Huge, (1631.0, 1370.0), || {
+        at(UiScale::Huge, (1366.0, 1370.0), || {
             let w = modal_w(900.0);
-            assert!(w <= 1631.0, "{w} is wider than the window");
-            assert_eq!(w, 1631.0 - 48.0);
+            assert!(w <= 1366.0, "{w} is wider than the window");
+            assert_eq!(w, 1366.0 - 38.0);
         });
         // With room, it scales in full.
         at(UiScale::Huge, (3840.0, 2160.0), || {
-            assert_eq!(modal_w(900.0), 1800.0);
+            assert_eq!(modal_w(900.0), 1440.0);
         });
         at(UiScale::Normal, (1631.0, 1370.0), || {
             assert_eq!(modal_w(900.0), 900.0, "unchanged where it always fitted");
@@ -4823,15 +4826,15 @@ mod modal_height_tests {
     /// copy-paste gets wrong.)
     #[test]
     fn the_two_axes_do_not_read_each_others_extent() {
-        at(UiScale::Huge, (600.0, 4000.0), || {
-            assert_eq!(modal_h(620.0), 1240.0, "height has all the room it needs");
-            // 600 is under the scaled floor, so the floor gives way to the window
-            // rather than the panel being clipped by it.
-            assert_eq!(modal_w(900.0), 600.0, "width is what is short");
+        at(UiScale::Huge, (500.0, 4000.0), || {
+            assert_eq!(modal_h(620.0), 992.0, "height has all the room it needs");
+            // 500 is under the scaled floor (512), so the floor gives way to the
+            // window rather than the panel being clipped by it.
+            assert_eq!(modal_w(900.0), 500.0, "width is what is short");
         });
         at(UiScale::Huge, (4000.0, 600.0), || {
-            assert_eq!(modal_w(900.0), 1800.0);
-            assert_eq!(modal_h(620.0), 600.0 - 80.0);
+            assert_eq!(modal_w(900.0), 1440.0);
+            assert_eq!(modal_h(620.0), 600.0 - 64.0);
         });
     }
 
@@ -4841,7 +4844,7 @@ mod modal_height_tests {
     fn an_unmeasured_window_does_not_cap() {
         crate::theme::set_ui_scale(UiScale::Huge);
         window_size().set((0.0, 0.0));
-        assert_eq!(modal_h(620.0), 1240.0);
+        assert_eq!(modal_h(620.0), 992.0);
         crate::theme::set_ui_scale(UiScale::Normal);
     }
 }
@@ -4968,10 +4971,10 @@ mod menu_placement_tests {
 
         crate::theme::set_ui_scale(crate::theme::UiScale::Huge);
         let huge = menu_panel_height(&one);
-        assert_eq!(huge, 37.0 + 12.0 + 14.0);
+        assert_eq!(huge, 30.0 + 12.0 + 14.0);
         assert!(
-            huge < (30.5 + 14.0) * 2.0,
-            "{huge} is the whole row doubled, padding and all"
+            huge < crate::theme::scaled(30.5) + 14.0,
+            "{huge} is the whole row scaled, padding and all"
         );
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
     }

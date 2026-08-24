@@ -391,18 +391,25 @@ fn settings_group_label(t: &'static str) -> impl IntoView {
 /// the pointer in another, and you have to hover the row *below* the one you
 /// want. Every dropdown in the app has that latent bug; this control hit it
 /// because it is the last row of the last group of the tallest modal — and it hit
-/// it *specifically at 150%*, where the modal grows enough to push the popup past
-/// the edge but not enough for the body to scroll instead.
+/// it *at the middle of the range* (150% then, 130% now), where the modal grows
+/// enough to push the popup past the edge but not enough for the body to scroll
+/// instead.
 ///
 /// A segmented control has no overlay, so it cannot be wrong. It is also the
 /// better control here: four short options, all visible, one click each — which
 /// is how somebody choosing a scale actually behaves, trying them in turn.
 ///
+/// The segments wear the percentage itself (`UiScale::label`) rather than a name
+/// like "Large": it is the number somebody opens this control to ask about, it
+/// is short enough that four of them fit the row at every scale, and it cannot
+/// drift from the factor it selects.
+///
 /// One Tab stop with Left/Right inside it ([`nav_group`], the rule the colour
 /// swatches and the designer's item list follow), and the arrows *apply* as they
 /// move: every option is visible instantly and reversible by the next press, so
 /// there is nothing to confirm. The step clamps rather than wraps — this is a
-/// selection, and rolling from Huge back to Small would only be a surprise.
+/// selection, and rolling from the largest back to the smallest would only be a
+/// surprise.
 fn scale_picker(
     scale: RwSignal<theme::UiScale>,
     ring: crate::widgets::FocusRing,
@@ -426,7 +433,7 @@ fn scale_picker(
     // label by a pixel as the selection moved along the row. This is the flat
     // equivalent of the design's `box-shadow: inset 0 0 0 1px`.
     let segments = theme::UiScale::ALL.map(|k| {
-        text(k.short())
+        text(k.label())
             .on_click_stop(move |_| scale.set(k))
             .style(move |s| {
                 let on = scale.get() == k;
