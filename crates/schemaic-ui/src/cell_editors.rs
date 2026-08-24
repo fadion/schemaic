@@ -39,6 +39,7 @@
 use std::rc::Rc;
 
 use floem::AnyView;
+use floem::event::EventPropagation;
 use floem::prelude::*;
 use floem::style::FlexWrap;
 
@@ -164,7 +165,30 @@ fn pick_field_w() -> f64 {
 /// A `<select>`-shaped box bound to `buf`, offering `editor`'s options through
 /// the shared popup menu (see the module doc for why it is a menu and not a
 /// `Dropdown`). Used by the row panel for booleans and enums alike.
-pub(crate) fn pick_field(buf: RwSignal<String>, editor: CellEditor, ch: PopupChannel) -> AnyView {
+///
+/// **Reachable by keyboard, like the text field it stands in for.** A control the
+/// Tab order walks past is a column that cannot be set without a mouse — and this
+/// one *replaces* the field for its column, so there is nothing else to reach.
+/// Three parts to that, none of them optional:
+///
+/// * `keyboard_navigable`, which puts it in floem's own Tab walk **and** is what
+///   makes Enter/Space work: floem fires [`EventListener::Click`] on the focused
+///   view for either key (`context.rs`), so the same handler the pointer uses
+///   opens the menu. Once open, the menu takes the keyboard itself and walks with
+///   the arrows.
+/// * `autofocus`, because the row panel focuses its first editable field on open,
+///   and a panel whose first column is an `ENUM` opened with the keyboard
+///   *nowhere* — the arrows still driving the grid behind it.
+/// * `on_escape`, the same contract `edit_field` gives: Escape closes the row
+///   panel. With the menu up it never reaches here, the panel being the focused
+///   view then and Escape peeling one layer at a time.
+pub(crate) fn pick_field(
+    buf: RwSignal<String>,
+    editor: CellEditor,
+    ch: PopupChannel,
+    autofocus: bool,
+    on_escape: Option<Rc<dyn Fn()>>,
+) -> AnyView {
     // The box's own id, so the menu opens under the box rather than at the
     // pointer — which is where it was left when the control was reached by Tab.
     // Filled once the view below exists.
@@ -201,6 +225,9 @@ pub(crate) fn pick_field(buf: RwSignal<String>, editor: CellEditor, ch: PopupCha
         icons::icon(icons::CHEVRON_DOWN, 14.0)
             .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
     ))
+    // Enter and Space arrive here too — floem synthesises a `Click` on the
+    // focused view for both, which is the whole of this control's keyboard
+    // activation.
     .on_click_stop(move |_| open())
     // Without this the workspace root's close-on-pointer-down fires first and
     // the click then reopens: down closes, up reopens, and the box never toggles.
@@ -208,9 +235,67 @@ pub(crate) fn pick_field(buf: RwSignal<String>, editor: CellEditor, ch: PopupCha
         floem::event::EventListener::PointerDown,
         crate::widgets::menu_trigger_press,
     )
-    .style(|s| field_box(s).width(pick_field_w()).gap(6.0));
+    .on_event(floem::event::EventListener::KeyDown, move |e| {
+        escape(e, &on_escape)
+    })
+    .keyboard_navigable()
+    // The app's own ring, gated on `keyboard_nav` — so it marks a control the
+    // keyboard reached and stays dark on a click, which is the only time it says
+    // anything. The radius is `field_box`'s, or floem strokes a square ring
+    // around a rounded box.
+    .style(|s| {
+        crate::widgets::button_focus_ring(field_box(s), 6.0)
+            .width(pick_field_w())
+            .gap(6.0)
+    });
     anchor_id.set(Some(boxed.id()));
+    focus_on_mount(autofocus, anchor_id);
     boxed.into_any()
+}
+
+/// Answer Escape with `on_escape`, if there is one — the contract
+/// [`crate::edit_field`] gives, worn by the controls that stand in for it.
+///
+/// A `fn` rather than a closure per control: `EventPropagation::Stop` on the key
+/// is the load-bearing half (the row panel's own handler would otherwise close it
+/// twice over), and it is the half easiest to leave out.
+fn escape(e: &floem::event::Event, on_escape: &Option<Rc<dyn Fn()>>) -> EventPropagation {
+    let floem::event::Event::KeyDown(ke) = e else {
+        return EventPropagation::Continue;
+    };
+    if !matches!(
+        ke.key.logical_key,
+        floem::keyboard::Key::Named(floem::keyboard::NamedKey::Escape)
+    ) {
+        return EventPropagation::Continue;
+    }
+    match on_escape {
+        Some(esc) => {
+            (esc)();
+            EventPropagation::Stop
+        }
+        None => EventPropagation::Continue,
+    }
+}
+
+/// Take the keyboard on mount, one tick late, if this control is the row panel's
+/// first editable field.
+///
+/// Deferred for [`crate::edit_field`]'s reason (the view has to exist), and read
+/// through `try_get_untracked` for its other one: the control may be disposed
+/// before the timer fires — an overlay opened and closed in the same tick — and
+/// focusing a `ViewId` that is gone leaves the window's focus pointing at nothing,
+/// which is keyboard-dead rather than merely wrong. A disposed signal answers
+/// `None`, so the id is only ever asked for while its owner is alive.
+fn focus_on_mount(autofocus: bool, id: RwSignal<Option<floem::ViewId>>) {
+    if !autofocus {
+        return;
+    }
+    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        if let Some(Some(id)) = id.try_get_untracked() {
+            id.request_focus();
+        }
+    });
 }
 
 /// The **in-cell** face of a picker: the value and a chevron, filling the cell on
@@ -260,14 +345,37 @@ pub(crate) fn pick_cell_face(buf: RwSignal<String>, editor: CellEditor) -> AnyVi
 
 // ── Set ─────────────────────────────────────────────────────────────────────
 
+/// A chip's corner — a pill, and the radius the focus ring has to follow: floem
+/// strokes an outline at the *painting* view's radius, so a chip and its ring
+/// disagreeing is a square drawn around a pill.
+const CHIP_RADIUS: f64 = 10.0;
+
 /// One chip per member of a `SET`, lit when the value holds it. Clicking toggles
 /// through [`celledit::pick_options`], whose value for a member is the whole
 /// `SET` with that member flipped — which is what keeps the result in the
 /// engine's declaration order.
-pub(crate) fn set_control(buf: RwSignal<String>, editor: CellEditor) -> AnyView {
+///
+/// **Each chip is its own Tab stop**, and a stop per member is the right shape
+/// here rather than one stop with an inner cursor: a `SET` is a row of
+/// independent toggles, which is what a checkbox group is, and Enter/Space on the
+/// focused one flips it through the very handler the pointer uses (floem
+/// synthesises the `Click`). `autofocus` lands on the first member for the same
+/// reason [`pick_field`] takes it — the row panel focuses its first editable
+/// field, and a `SET` column that swallowed that focus request left the panel
+/// keyboard-dead.
+pub(crate) fn set_control(
+    buf: RwSignal<String>,
+    editor: CellEditor,
+    autofocus: bool,
+    on_escape: Option<Rc<dyn Fn()>>,
+) -> AnyView {
+    // The first chip's id, for `autofocus`. Filled below, read one tick later.
+    let first_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
     let chips: Vec<AnyView> = celledit::pick_options(&editor, "")
         .into_iter()
-        .map(|o| {
+        .enumerate()
+        .map(|(i, o)| {
+            let on_escape = on_escape.clone();
             let (name, ed) = (o.label, editor.clone());
             let held = {
                 let name = name.clone();
@@ -291,14 +399,17 @@ pub(crate) fn set_control(buf: RwSignal<String>, editor: CellEditor) -> AnyView 
                     }
                 }
             };
-            text(name)
+            let chip = text(name)
                 .on_click_stop(move |_| toggle())
+                .on_event(floem::event::EventListener::KeyDown, move |e| {
+                    escape(e, &on_escape)
+                })
+                .keyboard_navigable()
                 .style(move |s| {
-                    let s = s
+                    let s = crate::widgets::button_focus_ring(s, CHIP_RADIUS)
                         .padding_horiz(8.0)
                         .padding_vert(3.0)
                         .border(1.0)
-                        .border_radius(10.0)
                         .font_size(theme::font_body());
                     if held() {
                         s.background(theme::control_bg())
@@ -313,10 +424,14 @@ pub(crate) fn set_control(buf: RwSignal<String>, editor: CellEditor) -> AnyView 
                                     .border_color(theme::field_border_active())
                             })
                     }
-                })
-                .into_any()
+                });
+            if i == 0 {
+                first_id.set(Some(chip.id()));
+            }
+            chip.into_any()
         })
         .collect();
+    focus_on_mount(autofocus, first_id);
     h_stack_from_iter(chips)
         .style(|s| {
             s.flex_row()
@@ -745,6 +860,65 @@ pub(crate) fn calendar_insets(
         left.max(0.0)
     };
     (x, menu_inset(bottom, h, wh, 4.0))
+}
+
+/// **Every control that stands in for a text field owes the keyboard the same
+/// contract that field had.** A signature scan, in the style of
+/// `widgets::menu_trigger_gate`, because what went wrong was not a wrong
+/// calculation — it was two parameters that were never passed.
+///
+/// `typed_editor` hands the row panel's `autofocus` and its panel-closing Escape
+/// to whichever control the column's type asks for. Two of the four ignored both,
+/// and the result was a column that could not be set without a mouse: nothing
+/// took the keyboard when the panel opened on an `ENUM`, and Tab walked past the
+/// control as though it were a label.
+///
+/// **What it can and can't see.** It reads the parameter lists, so it catches a
+/// fifth control added without them and it catches either being dropped from an
+/// existing one — which is exactly how this arrived. It cannot see that the
+/// control *uses* them; that half is `focus_on_mount` and the `escape` helper,
+/// which exist so there is one implementation to read rather than four.
+#[cfg(test)]
+mod row_panel_focus_gate {
+    /// The controls `grid::typed_editor` can build. `CellEditor::Text` is not
+    /// here: that arm returns `scalar_editor`, the field itself.
+    const CONTROLS: &[&str] = &["pick_field", "set_control", "date_control"];
+
+    /// The source of this module, minus its own tests.
+    fn source() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cell_editors.rs");
+        let src = std::fs::read_to_string(path).expect("this module's own source");
+        match src.find("#[cfg(test)]") {
+            Some(i) => src[..i].to_string(),
+            None => src,
+        }
+    }
+
+    #[test]
+    fn every_row_panel_control_takes_the_focus_and_the_escape() {
+        let src = source();
+        for name in CONTROLS {
+            let at = src
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} is gone — the list above is stale"));
+            // The parameter list: from the name to the return type.
+            let sig = &src[at..];
+            let end = sig.find("-> AnyView").expect("a view builder");
+            let sig = &sig[..end];
+            assert!(
+                sig.contains("autofocus"),
+                "{name} ignores the row panel's autofocus — a column whose \
+                 control never takes the keyboard cannot be set without a mouse"
+            );
+            assert!(
+                sig.contains("on_escape"),
+                "{name} ignores the row panel's Escape — `edit_field` gives that \
+                 contract and a control standing in for one owes it too"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5753,6 +5753,15 @@ for keyboard nav.
   - **In the row panel**: `typed_editor` puts the control inside the same NULL toggle a text field
     gets (`nullable_field`, extracted from `scalar_editor` for exactly this). Only the `SET`'s
     wrapping chips can outgrow a line, so only that row grows.
+    **Every one of those controls owes the keyboard what the field it replaced gave it** — the
+    panel's `autofocus` and its panel-closing Escape — and two of them ignored both, which is a
+    column that cannot be set without a mouse: nothing took the keyboard when the panel opened on
+    an `ENUM`, and Tab walked past the control as though it were a label. They are
+    `keyboard_navigable` now, which is also their activation: floem fires `Click` on the focused
+    view for Enter and Space, so the pointer's handler is the keyboard's handler, and a `SET`'s
+    chips are a stop each because a row of independent toggles is what a checkbox group is. The
+    contract is gated by a signature scan (`row_panel_focus_gate`) rather than trusted, since what
+    went wrong was two parameters that were never passed.
   - **Dates keep the text input** in both places, with the calendar beside it: typing a date is
     often faster, a `TIMESTAMP`'s time of day has no calendar to come from, and a value no picker
     can represent still has to be editable (`0000-00-00` gets a plain field and no panel at all).

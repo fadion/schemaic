@@ -4819,6 +4819,14 @@ fn typed_editor(
     autofocus: bool,
     f: FieldSig,
 ) -> AnyView {
+    // Escape closes the panel even while a control has the keyboard — the same
+    // contract `scalar_editor` gives, and **every** control here owes it, not
+    // just the ones with a text field in them. (A control with its own popup up
+    // takes the first Escape: that one is on the shared popup registry, which the
+    // window root peels off before anything else — see
+    // `widgets::dismiss_open_popup`.)
+    let open = gs.edit_row_open;
+    let close_panel = move || -> Option<Rc<dyn Fn()>> { Some(Rc::new(move || open.set(false))) };
     let control: Rc<dyn Fn() -> AnyView> = match editor {
         // A boolean is a two-row picker, the same control an enum gets: its
         // values are as listed as an enum's, and one control for both is one
@@ -4829,24 +4837,19 @@ fn typed_editor(
                 anchor: gs.popup_anchor,
                 width: gs.popup_width,
             };
-            Rc::new(move || cell_editors::pick_field(f.buf, editor.clone(), ch))
+            // `autofocus` and the Escape contract reach a picker too. Dropping
+            // them here — as this match did for all three of these arms — is a
+            // column that cannot be set without a mouse: nothing takes the
+            // keyboard when the panel opens on it, and Tab walks straight past.
+            Rc::new(move || {
+                cell_editors::pick_field(f.buf, editor.clone(), ch, autofocus, close_panel())
+            })
         }
-        editor @ CellEditor::Set(_) => {
-            Rc::new(move || cell_editors::set_control(f.buf, editor.clone()))
-        }
+        editor @ CellEditor::Set(_) => Rc::new(move || {
+            cell_editors::set_control(f.buf, editor.clone(), autofocus, close_panel())
+        }),
         editor @ (CellEditor::Date | CellEditor::DateTime) => Rc::new(move || {
-            cell_editors::date_control(
-                f.buf,
-                editor.clone(),
-                autofocus,
-                // Escape closes the panel even while a field is focused — the
-                // same contract `scalar_editor` gives. (An open calendar takes
-                // the first Escape: it is on the shared popup registry, which the
-                // window root peels off before anything else — see
-                // `widgets::dismiss_open_popup`.)
-                Some(Rc::new(move || gs.edit_row_open.set(false))),
-                gs.menus,
-            )
+            cell_editors::date_control(f.buf, editor.clone(), autofocus, close_panel(), gs.menus)
         }),
         CellEditor::Text => return scalar_editor(gs, nullable, autofocus, f),
     };
