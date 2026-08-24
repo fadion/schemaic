@@ -649,6 +649,24 @@ pub fn parse_tsv_block(text: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// The most cells one paste may stage.
+///
+/// **A paste is not bounded by what was copied.** A single copied cell fills the
+/// whole selection by design (see [`plan_paste`]), and Ctrl+A selects every
+/// display cell — so on a result at the 200k-row cap, Ctrl+A then Ctrl+V of one
+/// cell asked for ~6M staged edits: a plan of 6M cloned strings, 6M entries in
+/// `dirty`, every derived view recomputing over them, and a commit of 200k
+/// `UPDATE`s behind one transaction. The window stops answering long before the
+/// user gets to the Discard button that would undo it.
+///
+/// 50k is chosen to be far above any paste somebody assembled by hand and far
+/// below the point where the grid stops being interactive. It is not a
+/// correctness boundary: what it refuses is *reported* ([`PasteReport`]), because
+/// a paste that quietly stopped two thirds of the way down a column is the
+/// failure this whole file's counters exist to prevent. Anyone who genuinely
+/// means "set this column for every row" wants one `UPDATE`, not 200k of them.
+pub const PASTE_CELL_CAP: usize = 50_000;
+
 /// Where a pasted block lands, and what of it doesn't.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PastePlan {
@@ -662,6 +680,10 @@ pub struct PastePlan {
     /// column, a generated column). Skipped in place rather than shifted, so
     /// the columns either side still line up with what was copied.
     pub read_only: usize,
+    /// Cells past [`PASTE_CELL_CAP`]. Counted whole and **not** classified: the
+    /// plan stops walking at the cap rather than visiting six million positions
+    /// to find out which of them would also have been off-grid.
+    pub capped: usize,
 }
 
 /// Lay a parsed clipboard block over the grid, anchored at the selection.
@@ -704,8 +726,24 @@ pub fn plan_paste(
             block.iter().map(Vec::len).max().unwrap_or_default(),
         )
     };
-    for dr in 0..span_r {
+    // Every position the block actually carries a value for — the ragged gaps of
+    // a short row are not in it. Known up front so the walk can stop at the cap
+    // and still say how much it left, without visiting the rest.
+    let carried: usize = if single {
+        span_r.saturating_mul(span_c)
+    } else {
+        block.iter().map(Vec::len).sum()
+    };
+    let mut seen = 0usize;
+    'block: for dr in 0..span_r {
         for dc in 0..span_c {
+            // Checked before the value is cloned, and against the *staged* count:
+            // a cell skipped as off-grid or read-only costs nothing to stage, so
+            // it must not consume the budget either.
+            if plan.cells.len() >= PASTE_CELL_CAP {
+                plan.capped = carried.saturating_sub(seen);
+                break 'block;
+            }
             let Some(value) = (if single {
                 Some(block[0][0].clone())
             } else {
@@ -715,6 +753,7 @@ pub fn plan_paste(
                 // to write and nothing lost — the cell already there stays.
                 continue;
             };
+            seen += 1;
             let (row, col) = (r0 + dr, c0 + dc);
             if row >= rows || col >= cols {
                 plan.dropped += 1;
@@ -765,6 +804,7 @@ pub struct PasteCounts {
     pub planned: usize,
     pub dropped: usize,
     pub read_only: usize,
+    pub capped: usize,
 }
 
 impl PastePlan {
@@ -774,6 +814,7 @@ impl PastePlan {
             planned: self.cells.len(),
             dropped: self.dropped,
             read_only: self.read_only,
+            capped: self.capped,
         }
     }
 }
@@ -791,6 +832,15 @@ pub fn paste_report(counts: PasteCounts, skipped_deleted: usize) -> PasteReport 
     }
     if counts.read_only > 0 {
         notes.push(format!("{} in read-only columns", counts.read_only));
+    }
+    if counts.capped > 0 {
+        // The limit is named, not just the overflow: "skipping 5,950,000" with no
+        // reason reads as a bug, and the number is what tells the user this was a
+        // ceiling rather than something about their data.
+        notes.push(format!(
+            "{} over the {PASTE_CELL_CAP}-cell paste limit",
+            counts.capped
+        ));
     }
     if skipped_deleted > 0 {
         notes.push(format!("{skipped_deleted} in rows marked for deletion"));
@@ -1901,6 +1951,40 @@ mod tests {
         assert!(!plan.cells.iter().any(|(r, c, _)| *r == 1 && *c == 1));
     }
 
+    /// **The selection, not the clipboard, is what can be enormous here.** One
+    /// copied cell fills whatever is selected, and Ctrl+A on a result at the
+    /// 200k-row cap selects every display cell — which asked for a plan of
+    /// millions of cloned values, as many entries in `dirty`, and a commit of
+    /// 200k `UPDATE`s, with the window unresponsive well before the Discard
+    /// button that would undo it.
+    ///
+    /// Two properties, and the second is the one that makes the first safe to
+    /// have: the walk **stops** at the cap (it does not visit the rest to
+    /// classify them), and everything it did not visit is still accounted for, so
+    /// the report can say so.
+    #[test]
+    fn a_selection_bigger_than_the_cap_stops_at_it_and_counts_the_rest() {
+        let block = parse_tsv_block("x");
+        let rows = PASTE_CELL_CAP + 10;
+        let plan = plan_paste(&block, (0, 0, rows - 1, 0), rows, 1, all_editable);
+        assert_eq!(plan.cells.len(), PASTE_CELL_CAP, "staged up to the cap");
+        assert_eq!(plan.capped, 10, "and the remainder is counted, not dropped");
+        assert_eq!(plan.cells.len() + plan.capped, rows, "nothing unaccounted");
+        // The cap is about volume, so it must not be reported as anything else.
+        assert_eq!((plan.dropped, plan.read_only), (0, 0));
+        assert_eq!(plan.counts().capped, 10, "and it survives into the report");
+    }
+
+    /// A paste that fits is untouched by the cap — the ordinary case has to stay
+    /// exactly what it was, including reporting nothing at all.
+    #[test]
+    fn a_paste_that_fits_is_not_capped() {
+        let block = parse_tsv_block("a\tb\nc\td");
+        let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, all_editable);
+        assert_eq!(plan.capped, 0);
+        assert_eq!(paste_report(plan.counts(), 0), PasteReport::Clean);
+    }
+
     #[test]
     fn an_empty_block_or_an_empty_grid_plans_nothing() {
         assert_eq!(
@@ -1927,6 +2011,18 @@ mod tests {
             cells: (0..cells).map(|i| (i, 0, String::new())).collect(),
             dropped,
             read_only,
+            capped: 0,
+        }
+        .counts()
+    }
+
+    /// As [`planned`], for the one count that is a *ceiling* rather than
+    /// something about the data.
+    fn planned_over(cells: usize, capped: usize) -> PasteCounts {
+        PastePlan {
+            cells: (0..cells).map(|i| (i, 0, String::new())).collect(),
+            capped,
+            ..PastePlan::default()
         }
         .counts()
     }
@@ -1951,6 +2047,22 @@ mod tests {
         assert!(
             !matches!(r, PasteReport::Failed(_)),
             "a paste that landed is not a failure"
+        );
+    }
+
+    /// **The limit names itself.** "skipping 5,950,000" with no reason reads as a
+    /// bug in the paste; the number is what says this was a ceiling, and it is
+    /// the difference between a user enlarging their selection again and a user
+    /// filing a report.
+    #[test]
+    fn a_capped_paste_says_what_the_ceiling_was() {
+        let r = paste_report(planned_over(PASTE_CELL_CAP, 12), 0);
+        assert_eq!(
+            r,
+            PasteReport::Notice(format!(
+                "Pasted {PASTE_CELL_CAP} cells, skipping 12 over the \
+                 {PASTE_CELL_CAP}-cell paste limit."
+            ))
         );
     }
 
