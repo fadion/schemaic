@@ -58,7 +58,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `from_utf8_lossy`'d the bytes into mojibake, PostgreSQL handed over the text protocol's `\x…` —
     and the mojibake was a data bug rather than a cosmetic one: it *looks* like data, so a CSV or
     `INSERT` export wrote the replacement characters as the value and re-imported as the wrong
-    bytes. SQLite's was the honest answer and is now everyone's. `Column::is_binary` reads **two**
+    bytes. SQLite's was the honest answer and is now everyone's.
+    **What the wire carries is not what a type is, and `BIT` is the case that proves it**: MySQL
+    hands a bit-field over as bytes, which put it on `type_is_binary`'s list, and a `BIT(8)` holding
+    10 then rendered as `<1 bytes>`, was *withheld* from the CSV and JSON exports — the two formats
+    this app reads back — and was read-only into the bargain. A bit-field has a lossless text form:
+    its number, which is also what MySQL accepts back. So it is off that list, `type_is_bit` names
+    it, and `bit_display` reads the bytes big-endian the way the server wrote them (`convert_row`
+    hoists that per column beside the binary mask, since only the column's type can say those bytes
+    are a number). PostgreSQL's `bit` never arrived as bytes at all — its text protocol sends
+    `00001010`, which was being reported as a byte count.
+    `Column::is_binary` reads **two**
     inputs because neither covers every result: `ColumnOrigin::binary` is the authoritative wire
     flag but exists only for a table-backed column, so a `bytea` expression with no catalog
     provenance reached every caller as ordinary text until the type name was consulted too.

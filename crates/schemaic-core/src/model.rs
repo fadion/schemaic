@@ -248,8 +248,18 @@ const NUMERIC_TYPES: &[&str] = &[
 ];
 
 /// Leading type tokens that mean **raw bytes**, in all three engines'
-/// spellings. Compared as the leading token so `VARBINARY(255)` and `BIT(1)`
+/// spellings. Compared as the leading token so `VARBINARY(255)` and `BLOB(16)`
 /// are covered.
+///
+/// **`BIT` is not here, and that is the point of the list.** MySQL hands a
+/// `BIT(M)` over as bytes, so it looked like one — but a bit-field *has* a
+/// lossless text form (its number, which is also what MySQL accepts back), and
+/// calling it binary meant the grid showed `<1 bytes>` for a `BIT(8)` holding 10
+/// and, worse, the CSV and JSON exports **withheld the column entirely**, in the
+/// two formats this app reads back. PostgreSQL's `bit` never even arrived as
+/// bytes: its text protocol sends `00001010`, which was then reported as a byte
+/// count. What the wire happens to carry is not what a type *is*; see
+/// [`bit_display`] for the conversion that made the difference visible.
 ///
 /// This is the *type-name* half of the question only. MySQL asks it of a
 /// resolved wire type, PostgreSQL of `BYTEA`, SQLite of a *declared* type —
@@ -265,9 +275,45 @@ const BINARY_TYPES: &[&str] = &[
     "MEDIUMBLOB",
     "LONGBLOB",
     "BYTEA",
-    "BIT",
     "GEOMETRY",
 ];
+
+/// Does this type name name a **bit-field** — MySQL's `BIT(M)`, PostgreSQL's
+/// `BIT`/`BIT VARYING`?
+///
+/// Leading token, like [`type_is_binary`]. It exists because MySQL sends a
+/// bit-field as raw bytes and there is nothing in the value itself to say those
+/// bytes are a number rather than a string: only the column's type knows.
+pub fn type_is_bit(type_name: &str) -> bool {
+    let head = type_name
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    head.eq_ignore_ascii_case("BIT") || head.eq_ignore_ascii_case("VARBIT")
+}
+
+/// A MySQL bit-field's bytes as the number they are: **big-endian, unsigned**,
+/// which is the byte order MySQL sends and the form it takes back
+/// (`b = 10` assigns a `BIT(8)`).
+///
+/// `BIT(M)` is 1–64 bits, so at most eight bytes arrive; anything longer than
+/// that is not a bit-field this can be sure about, and the *last* eight bytes are
+/// taken because that is the low half of a big-endian number — dropping the high
+/// bytes of a value too wide to represent, rather than dropping the value.
+///
+/// An empty run of bytes is `0`: MySQL has no zero-width bit-field, and a NULL is
+/// a NULL long before it reaches here, so the only caller of this with nothing to
+/// read is a server that sent nothing.
+pub fn bit_display(bytes: &[u8]) -> String {
+    let tail = if bytes.len() > 8 {
+        &bytes[bytes.len() - 8..]
+    } else {
+        bytes
+    };
+    tail.iter()
+        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+        .to_string()
+}
 
 /// Does this SQL type name name a raw-bytes column, in any of the three engines?
 ///
@@ -1220,7 +1266,6 @@ mod tests {
             "BINARY",
             "VARBINARY",
             "BYTEA",
-            "BIT",
             "GEOMETRY",
         ] {
             assert!(type_is_binary(t), "{t} should be binary");
@@ -1233,8 +1278,42 @@ mod tests {
     #[test]
     fn type_is_binary_reads_the_leading_token_and_ignores_case() {
         assert!(type_is_binary("varbinary(255)"));
-        assert!(type_is_binary("BIT(1)"));
         assert!(type_is_binary("blob"));
+    }
+
+    /// **A bit-field is not a blob**, however it arrives. MySQL sends `BIT(M)` as
+    /// raw bytes, which is what put it on the binary list — and being on it meant
+    /// a `BIT(8)` holding 10 rendered as `<1 bytes>` and was *withheld* from the
+    /// CSV and JSON exports, the two formats this app reads back. It has a
+    /// lossless text form, so it is carried like any other value.
+    #[test]
+    fn a_bit_field_is_not_a_binary_column() {
+        for t in ["BIT", "bit(1)", "BIT(64)", "bit varying(8)", "VARBIT"] {
+            assert!(!type_is_binary(t), "{t} is a bit-field, not raw bytes");
+            assert!(type_is_bit(t), "{t} should read as a bit-field");
+        }
+        // And the name is a leading token here too: nothing else starts with it.
+        assert!(!type_is_bit("BIGINT"));
+        assert!(!type_is_bit("bitcoin_balance"));
+    }
+
+    /// The number MySQL sent, in the byte order it sent it, which is the form it
+    /// takes back (`SET b = 10` assigns a `BIT(8)`).
+    #[test]
+    fn a_bit_fields_bytes_read_as_a_big_endian_number() {
+        assert_eq!(bit_display(&[0x0A]), "10");
+        assert_eq!(bit_display(&[0x01, 0x00]), "256", "big-endian, not little");
+        assert_eq!(bit_display(&[]), "0");
+        assert_eq!(bit_display(&[0x00]), "0");
+        // A full 64-bit field, the widest `BIT(M)` there is.
+        assert_eq!(bit_display(&[0xFF; 8]), u64::MAX.to_string());
+        // Wider than any bit-field: the **low** eight bytes, so a value too wide
+        // to represent loses its high end rather than the whole answer to an
+        // overflow. Nine bytes here, and the leading `0x01` is the one dropped.
+        assert_eq!(
+            bit_display(&[0x01, 0x02, 0, 0, 0, 0, 0, 0, 0x03]),
+            0x0200_0000_0000_0003_u64.to_string()
+        );
     }
 
     #[test]
