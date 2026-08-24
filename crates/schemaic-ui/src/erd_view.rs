@@ -335,9 +335,9 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
             h_stack((input, count, close_btn))
                 .style(|s| {
                     s.items_center()
-                        .gap(8.0)
-                        .padding_horiz(8.0)
-                        .padding_vert(6.0)
+                        .gap(theme::scaled(8.0))
+                        .padding_horiz(theme::scaled(8.0))
+                        .padding_vert(theme::scaled(6.0))
                         .background(theme::bg_panel())
                         .border(1.0)
                         .border_color(theme::border())
@@ -1520,8 +1520,8 @@ fn count_chip(label: String) -> AnyView {
             toolbar_surface(s)
                 .font_size(toolbar_font())
                 .color(theme::text())
-                .padding_horiz(10.0)
-                .padding_vert(5.0)
+                .padding_horiz(theme::scaled(10.0))
+                .padding_vert(theme::scaled(5.0))
         })
         .into_any()
 }
@@ -1534,8 +1534,8 @@ fn control_button(glyph: &'static str, action: Rc<dyn Fn()>) -> AnyView {
             toolbar_surface(s)
                 .items_center()
                 .justify_center()
-                .padding_horiz(10.0)
-                .padding_vert(5.0)
+                .padding_horiz(theme::scaled(10.0))
+                .padding_vert(theme::scaled(5.0))
                 .hover(|s| s.background(theme::erd_node_bg()))
         })
         .into_any()
@@ -1577,8 +1577,8 @@ fn menu_button(
             toolbar_surface(s)
                 .items_center()
                 .justify_center()
-                .padding_horiz(10.0)
-                .padding_vert(5.0)
+                .padding_horiz(theme::scaled(10.0))
+                .padding_vert(theme::scaled(5.0))
                 .hover(|s| s.background(theme::erd_node_bg()))
         })
         .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
@@ -1619,9 +1619,9 @@ fn notice_bar(notice: RwSignal<Option<(String, bool)>>) -> impl IntoView {
             .on_click_stop(move |_| notice.set(None))
             .style(|s| {
                 s.items_center()
-                    .gap(8.0)
-                    .padding_horiz(10.0)
-                    .padding_vert(6.0)
+                    .gap(theme::scaled(8.0))
+                    .padding_horiz(theme::scaled(10.0))
+                    .padding_vert(theme::scaled(6.0))
                     .background(theme::bg_panel())
                     .border(1.0)
                     .border_color(theme::border())
@@ -1655,8 +1655,8 @@ fn zoom_unit(zoom: RwSignal<f64>, zoom_out: Rc<dyn Fn()>, zoom_in: Rc<dyn Fn()>)
             .style(|s| {
                 s.items_center()
                     .justify_center()
-                    .padding_horiz(10.0)
-                    .padding_vert(5.0)
+                    .padding_horiz(theme::scaled(10.0))
+                    .padding_vert(theme::scaled(5.0))
                     .hover(|s| s.background(theme::erd_node_bg()))
             })
             .into_any()
@@ -2470,13 +2470,13 @@ fn modal_frame(
                 text("Scope").style(|s| s.font_size(toolbar_font()).color(theme::text_muted())),
                 text(scope).style(|s| s.font_size(toolbar_font()).color(theme::text())),
             ))
-            .style(|s| s.items_center().gap(6.0)),
-            h_stack_from_iter(counts).style(|s| s.items_center().gap(8.0)),
+            .style(|s| s.items_center().gap(theme::scaled(6.0))),
+            h_stack_from_iter(counts).style(|s| s.items_center().gap(theme::scaled(8.0))),
         ))
-        .style(|s| s.items_center().gap(10.0)),
+        .style(|s| s.items_center().gap(theme::scaled(10.0))),
         empty().style(|s| s.flex_grow(1.0_f32)),
         // Right: zoom unit / Fit / Reset, 10px apart; last is 10px from the edge.
-        h_stack_from_iter(controls).style(|s| s.items_center().gap(10.0)),
+        h_stack_from_iter(controls).style(|s| s.items_center().gap(theme::scaled(10.0))),
     ))
     .style(|s| {
         // `flex_shrink(0)`: keep the toolbar's fixed height in the panel's column
@@ -2484,12 +2484,12 @@ fn modal_frame(
         // the (zoomed) canvas content grows, and gets progressively compressed.
         // 1px top+bottom border in `erd_toolbar_border`.
         s.items_center()
-            .gap(10.0)
+            .gap(theme::scaled(10.0))
             .width_full()
             .height(theme::scaled(48.0))
             .flex_shrink(0.0_f32)
-            .padding_left(16.0)
-            .padding_right(10.0)
+            .padding_left(theme::scaled(16.0))
+            .padding_right(theme::scaled(10.0))
             .border_top(1.0)
             .border_bottom(1.0)
             .border_color(theme::erd_toolbar_border())

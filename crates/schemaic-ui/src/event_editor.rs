@@ -488,7 +488,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                         },
                     ),
                 ))
-                .style(|s| s.flex_row().items_center().gap(8.0)),
+                .style(|s| s.flex_row().items_center().gap(theme::scaled(8.0))),
             );
 
             let bound = |label: &'static str,
@@ -685,15 +685,19 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     let mut rows: Vec<AnyView> = vec![form_section("Event").into_any(), name.into_any()];
     rows.push(
         form_section("Schedule")
-            .style(|s| s.margin_top(4.0))
+            .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
     rows.push(schedule_form(ui.clone(), ring.clone()));
-    rows.push(form_section("Body").style(|s| s.margin_top(4.0)).into_any());
+    rows.push(
+        form_section("Body")
+            .style(|s| s.margin_top(theme::scaled(4.0)))
+            .into_any(),
+    );
     rows.push(body.into_any());
     rows.push(
         form_section("Options")
-            .style(|s| s.margin_top(4.0))
+            .style(|s| s.margin_top(theme::scaled(4.0)))
             .into_any(),
     );
     rows.extend(options);
@@ -763,7 +767,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                 crate::widgets::autohide(scroll(event_form(ui.clone(), ring.clone()).style(|s| {
                     s.width_full()
                         .padding_horiz(modal_pad_h())
-                        .padding_vert(18.0)
+                        .padding_vert(theme::scaled(18.0))
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 

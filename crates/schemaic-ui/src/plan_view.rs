@@ -104,9 +104,9 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                         text("Executes the statement to measure real timings")
                             .style(|s| s.font_size(font_label()).color(theme::text_faint())),
                     ))
-                    .style(|s| s.flex_col().gap(1.0)),
+                    .style(|s| s.flex_col().gap(theme::scaled(1.0))),
                 ))
-                .style(|s| s.items_center().gap(10.0))
+                .style(|s| s.items_center().gap(theme::scaled(10.0)))
                 .into_any()
             };
 
@@ -126,10 +126,10 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
             .style(|s| {
                 s.items_center()
                     .width_full()
-                    .gap(12.0)
-                    .margin_top(10.0)
-                    .padding_horiz(14.0)
-                    .padding_vert(8.0)
+                    .gap(theme::scaled(12.0))
+                    .margin_top(theme::scaled(10.0))
+                    .padding_horiz(theme::scaled(14.0))
+                    .padding_vert(theme::scaled(8.0))
             });
 
             // Keyed on the interface scale as well as the state: `plan_table`
@@ -138,29 +138,30 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
             // change can't reach. Rebuilding the body is what re-measures them —
             // the table is a few dozen rows and is already rebuilt on every state
             // change, so this costs nothing anybody can see.
-            let body =
-                dyn_container(
-                    move || (plan_state.get(), theme::ui_scale()),
-                    move |(st, _)| match st {
-                        PlanState::Idle | PlanState::Running => {
-                            container(loading_dots("Explaining", theme::text_dim, font_body))
-                                .style(|s| {
-                                    s.height(theme::scaled(180.0))
-                                        .width_full()
-                                        .items_center()
-                                        .justify_center()
-                                })
-                                .into_any()
-                        }
-                        PlanState::Failed(e) => autohide(scroll(text(e).style(|s| {
-                            s.color(theme::error()).font_size(font_body()).padding(16.0)
-                        })))
-                        .style(|s| s.width_full().max_height(modal_body_h(520.0)))
-                        .into_any(),
-                        PlanState::Loaded(plan) => loaded_body(&plan).into_any(),
-                    },
-                )
-                .style(|s| s.width_full().flex_col());
+            let body = dyn_container(
+                move || (plan_state.get(), theme::ui_scale()),
+                move |(st, _)| match st {
+                    PlanState::Idle | PlanState::Running => {
+                        container(loading_dots("Explaining", theme::text_dim, font_body))
+                            .style(|s| {
+                                s.height(theme::scaled(180.0))
+                                    .width_full()
+                                    .items_center()
+                                    .justify_center()
+                            })
+                            .into_any()
+                    }
+                    PlanState::Failed(e) => autohide(scroll(text(e).style(|s| {
+                        s.color(theme::error())
+                            .font_size(font_body())
+                            .padding(theme::scaled(16.0))
+                    })))
+                    .style(|s| s.width_full().max_height(modal_body_h(520.0)))
+                    .into_any(),
+                    PlanState::Loaded(plan) => loaded_body(&plan).into_any(),
+                },
+            )
+            .style(|s| s.width_full().flex_col());
 
             let panel = v_stack((
                 modal_title_borderless("Query plan", close.clone(), ring.clone()),
@@ -204,7 +205,8 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
 fn loaded_body(plan: &QueryPlan) -> AnyView {
     let warnings = plan_warnings(plan);
     let table = plan_table(plan);
-    let content = v_stack((warnings, table)).style(|s| s.flex_col().width_full().padding(14.0));
+    let content = v_stack((warnings, table))
+        .style(|s| s.flex_col().width_full().padding(theme::scaled(14.0)));
     autohide(scroll(content))
         .style(|s| s.width_full().max_height(modal_body_h(520.0)))
         .into_any()
@@ -228,7 +230,7 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
                     .style(move |s| s.color(kind_color()).flex_shrink(0.0_f32)),
                 text(w.message.clone()).style(|s| s.font_size(font_body()).color(theme::text())),
             ))
-            .style(|s| s.items_center().gap(8.0))
+            .style(|s| s.items_center().gap(theme::scaled(8.0)))
             .into_any()
         })
         .collect();
@@ -239,14 +241,14 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
                 .font_bold()
                 .color(theme::text_dim())
         }),
-        v_stack_from_iter(rows).style(|s| s.flex_col().gap(6.0)),
+        v_stack_from_iter(rows).style(|s| s.flex_col().gap(theme::scaled(6.0))),
     ))
     .style(|s| {
         s.flex_col()
-            .gap(8.0)
+            .gap(theme::scaled(8.0))
             .width_full()
-            .margin_bottom(14.0)
-            .padding(12.0)
+            .margin_bottom(theme::scaled(14.0))
+            .padding(theme::scaled(12.0))
             .border(1.0)
             .border_color(theme::border())
             .border_radius(8.0)
@@ -307,8 +309,8 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
                 .style(move |s| {
                     s.width(w)
                         .flex_shrink(0.0_f32)
-                        .padding_horiz(10.0)
-                        .padding_vert(6.0)
+                        .padding_horiz(theme::scaled(10.0))
+                        .padding_vert(theme::scaled(6.0))
                         .font_size(font_label())
                         .font_bold()
                         .color(theme::text_dim())
@@ -343,8 +345,8 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
                         .style(move |s| {
                             s.width(w)
                                 .flex_shrink(0.0_f32)
-                                .padding_horiz(10.0)
-                                .padding_vert(6.0)
+                                .padding_horiz(theme::scaled(10.0))
+                                .padding_vert(theme::scaled(6.0))
                                 .font_size(font_body())
                                 .color(theme::text())
                                 .border_right(if last_col { 0.0 } else { 1.0 })
@@ -414,10 +416,10 @@ fn ask_ai_button(
         let loaded = matches!(plan_state.get(), PlanState::Loaded(_));
         let s = s
             .items_center()
-            .gap(8.0)
+            .gap(theme::scaled(8.0))
             .flex_shrink(0.0_f32)
-            .padding_horiz(6.0)
-            .padding_vert(4.0)
+            .padding_horiz(theme::scaled(6.0))
+            .padding_vert(theme::scaled(4.0))
             .color(theme::key_foreign());
         if loaded {
             s.hover(|s| s.color(theme::text()))

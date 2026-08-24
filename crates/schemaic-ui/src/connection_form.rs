@@ -127,7 +127,7 @@ fn field(
         )
         .style(|s| s.width_full()),
     ))
-    .style(|s| s.flex_col().gap(6.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
 // Host (fills) + Port (fixed, ~8 chars) on one line, 25px apart. Shared by the
@@ -154,8 +154,13 @@ fn host_port_row(
         )
         .style(|s| s.width(theme::scaled(96.0))),
     ))
-    .style(|s| s.flex_col().gap(6.0).flex_shrink(0.0_f32));
-    h_stack((host_field, port_field)).style(|s| s.flex_row().items_start().gap(25.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).flex_shrink(0.0_f32));
+    h_stack((host_field, port_field)).style(|s| {
+        s.flex_row()
+            .items_start()
+            .gap(theme::scaled(25.0))
+            .width_full()
+    })
 }
 
 // Key-pair credentials: a private-key path (with a native "Browse…" picker) and
@@ -194,16 +199,21 @@ fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl 
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
             browse,
         ))
-        .style(|s| s.flex_row().items_center().gap(8.0).width_full()),
+        .style(|s| {
+            s.flex_row()
+                .items_center()
+                .gap(theme::scaled(8.0))
+                .width_full()
+        }),
     ))
-    .style(|s| s.flex_col().gap(6.0).width_full());
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
     v_stack((
         key_row,
         masked_field("Passphrase", draft.ssh_key_passphrase, ring, tabindex + 1)
             .style(|s| s.width(conn_field_w())),
     ))
-    .style(|s| s.flex_col().gap(20.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
 
 fn mask_of_len(n: usize) -> String {
@@ -314,7 +324,7 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
     let row = h_stack_from_iter(swatches).style(|s| {
         s.flex_row()
             .items_center()
-            .gap(8.0)
+            .gap(theme::scaled(8.0))
             .flex_shrink(0.0_f32)
             // Floem's own focus ring is a magenta outline belonging to no
             // palette here; the cursor halo above is this row's focus signal.
@@ -368,7 +378,7 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
         h_stack((row, empty().style(|s| s.flex_grow(1.0_f32))))
             .style(|s| s.flex_row().width_full()),
     ))
-    .style(|s| s.flex_col().gap(6.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
 /// Char-diff `old` → `new`: shared-prefix char count, shared-suffix char count,
@@ -475,7 +485,7 @@ fn masked_field(
         )
         .style(|s| s.width_full()),
     ))
-    .style(|s| s.flex_col().gap(6.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
 // Manage Connections: list + editable form (create / update / delete).
@@ -592,7 +602,12 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                                         .min_width(0.0)
                                 }),
                             ))
-                            .style(|s| s.flex_row().items_center().gap(8.0).width_full())
+                            .style(|s| {
+                                s.flex_row()
+                                    .items_center()
+                                    .gap(theme::scaled(8.0))
+                                    .width_full()
+                            })
                             .into_any()
                         },
                     )
@@ -638,7 +653,10 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                         // `conn_list_sel_bg`.
                         .style(move |s| {
                             let selected = draft.id.get() == Some(id);
-                            let s = s.width_full().padding_horiz(12.0).padding_vert(11.0);
+                            let s = s
+                                .width_full()
+                                .padding_horiz(theme::scaled(12.0))
+                                .padding_vert(theme::scaled(11.0));
                             if selected {
                                 s.color(theme::conn_list_sel_text())
                                     .background(theme::conn_list_sel_bg())
@@ -651,7 +669,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
             )
             // Full width so the selected row's background spans the pane; +5px gap
             // between rows.
-            .style(|s| s.flex_col().width_full().gap(5.0));
+            .style(|s| s.flex_col().width_full().gap(theme::scaled(5.0)));
 
             // One Tab stop for the whole list, Up/Down inside it — the rule the
             // colour swatches and the designer's item list already follow. Twenty
@@ -700,7 +718,12 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                         icons::icon(icons::CIRCLE_PLUS, 16.0),
                         text("New connection").style(|s| s.font_size(theme::font_body())),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(8.0).color(theme::accent())),
+                    .style(|s| {
+                        s.flex_row()
+                            .items_center()
+                            .gap(theme::scaled(8.0))
+                            .color(theme::accent())
+                    }),
                 )
                 .on_click_stop({
                     let new_c = new_c.clone();
@@ -721,7 +744,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                     .flex_col()
                     .border_right(1.0)
                     .border_color(theme::border())
-                    .padding_vert(6.0)
+                    .padding_vert(theme::scaled(6.0))
             });
 
             let right = conn_form(
@@ -827,7 +850,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 )
                 .style(|s| s.width(theme::scaled(150.0))),
             ))
-            .style(|s| s.flex_col().gap(6.0));
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)));
 
             // Method-specific credentials, swapped on the chosen auth.
             let ssh_auth = draft.ssh_auth;
@@ -873,9 +896,9 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             // header) everywhere else in the app, and this is only a grouping.
             .style(|s| {
                 s.flex_col()
-                    .gap(20.0)
+                    .gap(theme::scaled(20.0))
                     .width_full()
-                    .padding(10.0)
+                    .padding(theme::scaled(10.0))
                     .border(1.0)
                     .border_color(theme::border())
                     .border_radius(6.0)
@@ -893,7 +916,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         ssh_toggle,
         ssh_fields,
     ))
-    .style(|s| s.flex_col().gap(20.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
 
 /// The half of the form a **SQLite** connection has instead: one path, and a
@@ -939,9 +962,9 @@ fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 .style(|s| s.flex_grow(1.0_f32)),
                 browse,
             ))
-            .style(|s| s.gap(8.0).width_full().items_center()),
+            .style(|s| s.gap(theme::scaled(8.0)).width_full().items_center()),
         ))
-        .style(|s| s.flex_col().gap(6.0).width_full()),
+        .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full()),
         form_hint(
             "A SQLite database is a single file, so there is no server to reach — \
              no host, user, password or tunnel. Schema editing and manual \
@@ -949,7 +972,7 @@ fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         )
         .style(|s| s.width_full()),
     ))
-    .style(|s| s.flex_col().gap(20.0).width_full())
+    .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
 
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
@@ -1091,7 +1114,7 @@ fn conn_form(
         ))
         .style(|s| s.width(theme::scaled(150.0))),
     ))
-    .style(|s| s.flex_col().gap(6.0).width_full());
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
     // AI data access — the one switch over every path that can carry this
     // connection's rows off the machine. It lives beside Read-only because it is
@@ -1122,7 +1145,7 @@ fn conn_form(
                 .color(theme::text_muted())
         }),
     ))
-    .style(|s| s.flex_col().gap(6.0).width_full());
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
     // Environment picker → the top-bar badge. Defaults to None (no badge).
     let env_field = v_stack((
@@ -1136,7 +1159,7 @@ fn conn_form(
         ))
         .style(|s| s.width(theme::scaled(150.0))),
     ))
-    .style(|s| s.flex_col().gap(6.0).width_full());
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 
     // Name + Colour sit closer together (20px) than the rest of the form (25px).
     // The swatch row is one Tab stop, between Name and the toggles below it —
@@ -1145,7 +1168,7 @@ fn conn_form(
         field("Name", draft.name, ring.clone(), 10),
         color_picker(draft.color, ring.clone(), 15),
     ))
-    .style(|s| s.flex_col().gap(20.0).width_full());
+    .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full());
 
     let fields = v_stack((
         name_color,
@@ -1156,7 +1179,12 @@ fn conn_form(
         type_field,
         engine_block,
     ))
-    .style(|s| s.flex_col().gap(20.0).width_full().padding(14.0));
+    .style(|s| {
+        s.flex_col()
+            .gap(theme::scaled(20.0))
+            .width_full()
+            .padding(theme::scaled(14.0))
+    });
 
     // The three footer actions are the filled buttons every other modal ends
     // with: Save is the affirmative one, Test its own `Verify` hue (it does real
@@ -1275,8 +1303,8 @@ fn conn_form(
         s.width_full()
             .flex_row()
             .items_center()
-            .padding_horiz(14.0)
-            .padding_vert(10.0)
+            .padding_horiz(theme::scaled(14.0))
+            .padding_vert(theme::scaled(10.0))
             .border_top(1.0)
             .border_color(theme::border())
     });

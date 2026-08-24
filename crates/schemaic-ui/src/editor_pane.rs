@@ -162,8 +162,8 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
 // render its output.
 
 fn approve_button_style(s: floem::style::Style) -> floem::style::Style {
-    s.padding_horiz(14.0)
-        .padding_vert(5.0)
+    s.padding_horiz(theme::scaled(14.0))
+        .padding_vert(theme::scaled(5.0))
         .border_radius(5.0)
         .font_size(theme::font_body())
         .background(theme::approve_bg())
@@ -172,8 +172,8 @@ fn approve_button_style(s: floem::style::Style) -> floem::style::Style {
 }
 
 fn reject_button_style(s: floem::style::Style) -> floem::style::Style {
-    s.padding_horiz(14.0)
-        .padding_vert(5.0)
+    s.padding_horiz(theme::scaled(14.0))
+        .padding_vert(theme::scaled(5.0))
         .border_radius(5.0)
         .font_size(theme::font_body())
         .background(theme::reject_bg())
@@ -345,14 +345,14 @@ fn cmdk_popup(
                                 .on_click_stop(move |_| discard_c())
                                 .style(reject_button_style),
                         ))
-                        .style(|s| s.flex_row().items_center().gap(10.0)),
+                        .style(|s| s.flex_row().items_center().gap(theme::scaled(10.0))),
                     )
                     // 5px gap from the question field above (matches the diff).
                     .style(|s| {
                         s.width_full()
-                            .padding_horiz(10.0)
-                            .padding_top(5.0)
-                            .padding_bottom(10.0)
+                            .padding_horiz(theme::scaled(10.0))
+                            .padding_top(theme::scaled(5.0))
+                            .padding_bottom(theme::scaled(10.0))
                     })
                     .into_any()
                 }
@@ -361,9 +361,9 @@ fn cmdk_popup(
                 )
                 .style(|s| {
                     s.width_full()
-                        .padding_horiz(10.0)
-                        .padding_top(5.0)
-                        .padding_bottom(10.0)
+                        .padding_horiz(theme::scaled(10.0))
+                        .padding_top(theme::scaled(5.0))
+                        .padding_bottom(theme::scaled(10.0))
                 })
                 .into_any(),
                 InlineAiState::Ready(sql) => {
@@ -399,9 +399,9 @@ fn cmdk_popup(
                             .style(|s| {
                                 s.width_full()
                                     .flex_shrink(0.0_f32)
-                                    .padding_horiz(10.0)
-                                    .padding_top(5.0)
-                                    .padding_bottom(10.0)
+                                    .padding_horiz(theme::scaled(10.0))
+                                    .padding_top(theme::scaled(5.0))
+                                    .padding_bottom(theme::scaled(10.0))
                             })
                             .into_any()
                         } else {
@@ -431,9 +431,9 @@ fn cmdk_popup(
                                     .width_full()
                                     .min_width(0.0)
                                     .flex_shrink(0.0_f32)
-                                    .padding_horiz(5.0)
-                                    .padding_top(5.0)
-                                    .padding_bottom(10.0)
+                                    .padding_horiz(theme::scaled(5.0))
+                                    .padding_top(theme::scaled(5.0))
+                                    .padding_bottom(theme::scaled(10.0))
                             })
                             .into_any()
                         };
@@ -453,7 +453,7 @@ fn cmdk_popup(
                                     .color(theme::diff_del_marker())
                             }),
                         ))
-                        .style(|s| s.flex_row().items_center().gap(8.0))
+                        .style(|s| s.flex_row().items_center().gap(theme::scaled(8.0)))
                         .into_any()
                     };
 
@@ -475,7 +475,7 @@ fn cmdk_popup(
                                     .items_center()
                                     .width_full()
                                     .min_width(0.0)
-                                    .gap(10.0)
+                                    .gap(theme::scaled(10.0))
                             }),
                         )
                         // No top padding: the diff wrapper's 10px bottom padding
@@ -483,8 +483,8 @@ fn cmdk_popup(
                         .style(|s| {
                             s.width_full()
                                 .flex_shrink(0.0_f32)
-                                .padding_horiz(5.0)
-                                .padding_bottom(5.0)
+                                .padding_horiz(theme::scaled(5.0))
+                                .padding_bottom(theme::scaled(5.0))
                         }),
                     ))
                     .style(|s| s.flex_col().width_full().min_width(0.0))
@@ -2401,8 +2401,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .border_color(theme::border())
                 .border_radius(6.0)
                 .padding_top(EDITOR_PAD_TOP)
-                .padding_bottom(10.0)
-                .padding_right(5.0)
+                .padding_bottom(theme::scaled(10.0))
+                .padding_right(theme::scaled(5.0))
         });
 
     // Custom overlay scrollbars, replacing the editor's built-in bars (hidden
@@ -2683,24 +2683,26 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .font_size(theme::font_body())
                             .max_width_pct(60.0)
                             .text_ellipsis()
-                            .margin_left(8.0)
+                            .margin_left(theme::scaled(8.0))
                     }),
                     text("View")
                         .on_click_stop(move |_| error_modal_open.set(true))
                         .style(|s| {
                             s.color(theme::err_fix_btn())
                                 .font_size(theme::font_body())
-                                .margin_left(10.0)
+                                .margin_left(theme::scaled(10.0))
                         }),
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     h_stack((
-                        icons::icon(icons::SPARKLES, 16.0)
-                            .style(|s| s.color(theme::err_fix_btn()).margin_right(5.0)),
+                        icons::icon(icons::SPARKLES, 16.0).style(|s| {
+                            s.color(theme::err_fix_btn())
+                                .margin_right(theme::scaled(5.0))
+                        }),
                         text("AI fix")
                             .style(|s| s.color(theme::err_fix_btn()).font_size(theme::font_body())),
                     ))
                     .on_click_stop(move |_| (ai_fix)())
-                    .style(|s| s.flex_row().items_center().margin_right(8.0)),
+                    .style(|s| s.flex_row().items_center().margin_right(theme::scaled(8.0))),
                 ))
                 .style(|s| {
                     s.flex_row()
@@ -2747,7 +2749,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         .style(|s| {
                             s.color(theme::err_fix_btn())
                                 .font_size(theme::font_body())
-                                .margin_right(8.0)
+                                .margin_right(theme::scaled(8.0))
                         })
                         .into_any()
                 } else {
@@ -2759,7 +2761,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .font_size(theme::font_body())
                             .max_width_pct(70.0)
                             .text_ellipsis()
-                            .margin_left(8.0)
+                            .margin_left(theme::scaled(8.0))
                     }),
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     action,
@@ -2833,7 +2835,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         })
                         .style(menu_item_style)
                         .style(move |s| {
-                            let s = s.padding_vert(8.0);
+                            let s = s.padding_vert(theme::scaled(8.0));
                             if run_sel.get() == idx {
                                 s.background(theme::accent().multiply_alpha(0.15))
                             } else {
@@ -2930,7 +2932,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     panel_style(s)
                         .background(theme::bg_chrome())
                         .min_width(run_menu_w())
-                        .padding_vert(6.0)
+                        .padding_vert(theme::scaled(6.0))
                         .font_size(theme::font_title())
                 });
                 let positioned = container(panel).style(move |s| {
@@ -3215,9 +3217,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .inset_bottom(7.0)
                 .items_center()
                 .justify_center()
-                .padding_left(10.0)
-                .padding_right(8.0)
-                .padding_vert(8.0)
+                .padding_left(theme::scaled(10.0))
+                .padding_right(theme::scaled(8.0))
+                .padding_vert(theme::scaled(8.0))
                 .background(theme::bg_chrome())
                 .border_radius(5.0);
             // The overlay is anchored to the editor's bottom edge; when the editor is
@@ -3458,7 +3460,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .on_click_stop(move |_| find_replace_visible.update(|v| *v = !*v))
                 .style(|s| {
                     s.items_center()
-                        .margin_left(2.0)
+                        .margin_left(theme::scaled(2.0))
                         .color(theme::text_dim())
                         .hover(|s| s.color(theme::text()))
                 });
@@ -3526,7 +3528,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     next_btn,
                     close_btn,
                 ))
-                .style(|s| s.items_center().gap(8.0));
+                .style(|s| s.items_center().gap(theme::scaled(8.0)));
 
                 // ── Row 2: replace ──
                 // Text buttons: colour-only hover (no background). Fixed 26px height
@@ -3566,11 +3568,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // (input 170 + the row's 2×8px gaps), and `All` sits 15px after it.
                 let replace_row = h_stack((
                     rinput,
-                    text_btn("Replace", replace_one.clone()).style(|s| s.margin_left(16.0)),
-                    text_btn("All", replace_all_cb.clone()).style(|s| s.margin_left(15.0)),
+                    text_btn("Replace", replace_one.clone())
+                        .style(|s| s.margin_left(theme::scaled(16.0))),
+                    text_btn("All", replace_all_cb.clone())
+                        .style(|s| s.margin_left(theme::scaled(15.0))),
                 ))
                 .style(move |s| {
-                    let s = s.items_center().padding_top(6.0);
+                    let s = s.items_center().padding_top(theme::scaled(6.0));
                     if find_replace_visible.get() {
                         s.flex()
                     } else {
@@ -3587,9 +3591,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 h_stack((toggle, content))
                     .style(|s| {
                         s.items_center()
-                            .gap(8.0)
-                            .padding_horiz(8.0)
-                            .padding_vert(6.0)
+                            .gap(theme::scaled(8.0))
+                            .padding_horiz(theme::scaled(8.0))
+                            .padding_vert(theme::scaled(6.0))
                             .background(theme::bg_panel())
                             .border(1.0)
                             .border_color(theme::border())
@@ -3648,9 +3652,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 ))
                 .style(|s| {
                     s.items_center()
-                        .gap(8.0)
-                        .padding_horiz(8.0)
-                        .padding_vert(6.0)
+                        .gap(theme::scaled(8.0))
+                        .padding_horiz(theme::scaled(8.0))
+                        .padding_vert(theme::scaled(6.0))
                         .background(theme::bg_panel())
                         .border(1.0)
                         .border_color(theme::border())
@@ -3711,9 +3715,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             .min_width(0.0)
             // 3px top: nudges the editor up and grows it taller (the bottom inset
             // is unchanged), tightening the gap under the QUERY toolbar.
-            .padding_top(3.0)
-            .padding_horiz(13.0)
-            .padding_bottom(13.0)
+            .padding_top(theme::scaled(3.0))
+            .padding_horiz(theme::scaled(13.0))
+            .padding_bottom(theme::scaled(13.0))
     });
 
     // Active-database selector: a borderless menu trigger (like the header's
@@ -3773,7 +3777,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         }),
         icons::icon(icons::CHEVRON_DOWN, 16.0)
             // Nudge the chevron 1px down relative to its centered baseline.
-            .style(move |s| s.color(db_color()).flex_shrink(0.0_f32).margin_top(1.0)),
+            .style(move |s| {
+                s.color(db_color())
+                    .flex_shrink(0.0_f32)
+                    .margin_top(theme::scaled(1.0))
+            }),
     ))
     .on_move(move |p| trig_origin.set(p))
     .on_resize(move |r| trig_size.set((r.width(), r.height())))
@@ -3825,9 +3833,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         s.color(db_color())
             .flex_row()
             .items_center()
-            .gap(6.0)
-            .padding_horiz(6.0)
-            .padding_vert(3.0)
+            .gap(theme::scaled(6.0))
+            .padding_horiz(theme::scaled(6.0))
+            .padding_vert(theme::scaled(3.0))
             .border_radius(5.0)
             .cursor(CursorStyle::Default)
     });
@@ -3840,7 +3848,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         empty().style(|s| s.flex_grow(1.0_f32)),
         db_selector,
     ))
-    .style(|s| s.width_full().flex_row().items_center().padding_right(14.0));
+    .style(|s| {
+        s.width_full()
+            .flex_row()
+            .items_center()
+            .padding_right(theme::scaled(14.0))
+    });
 
     // Non-shrinking, resizable height (the `editor_h` divider): fixed so the
     // flexbox can't collapse the bar under the grid's huge intrinsic height, and

@@ -324,7 +324,7 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                         .style(|s| s.width(field_w())),
                         form_hint("Comma-separated, e.g. NULL, \\N, NA."),
                     ))
-                    .style(|s| s.flex_col().gap(4.0)),
+                    .style(|s| s.flex_col().gap(theme::scaled(4.0))),
                 ),
             ))
             .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -351,7 +351,7 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         form_setting(
             "File",
             h_stack((pick, chosen.style(|s| s.flex_grow(1.0_f32).min_width(0.0))))
-                .style(|s| s.items_center().gap(10.0).width_full()),
+                .style(|s| s.items_center().gap(theme::scaled(10.0)).width_full()),
         ),
         form_setting(
             "Format",
@@ -432,7 +432,7 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
         ))
-        .style(|s| s.items_center().width_full().gap(8.0))
+        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
         .into_any()
     };
 
@@ -444,8 +444,8 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
             .style(move |s| {
                 let s = s
                     .width_full()
-                    .padding_horiz(12.0)
-                    .padding_vert(6.0)
+                    .padding_horiz(theme::scaled(12.0))
+                    .padding_vert(theme::scaled(6.0))
                     .color(theme::text())
                     .font_size(theme::font_body())
                     .hover(|s| s.background(theme::dropdown_hover()));
@@ -495,11 +495,17 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
 
     h_stack((
         name,
-        icons::icon(icons::CHEVRON_RIGHT, 14.0)
-            .style(|s| s.color(theme::text_faint()).margin_horiz(10.0)),
+        icons::icon(icons::CHEVRON_RIGHT, 14.0).style(|s| {
+            s.color(theme::text_faint())
+                .margin_horiz(theme::scaled(10.0))
+        }),
         picker,
     ))
-    .style(|s| s.items_center().width_full().margin_bottom(6.0))
+    .style(|s| {
+        s.items_center()
+            .width_full()
+            .margin_bottom(theme::scaled(6.0))
+    })
     .into_any()
 }
 
@@ -520,7 +526,7 @@ fn preview_cell(label: String, is_null: bool) -> impl IntoView {
     text(label).style(move |s| {
         let s = s
             .width(preview_col_w())
-            .padding_horiz(8.0)
+            .padding_horiz(theme::scaled(8.0))
             .font_size(theme::font_body())
             .text_ellipsis()
             .flex_shrink(0.0_f32);
@@ -557,7 +563,7 @@ fn preview_table(ui: Ui) -> impl IntoView {
                     text("Nothing is mapped, so there's nothing to import.")
                         .style(|s| s.color(theme::plan_warn()).font_size(theme::font_body())),
                 )
-                .style(|s| s.padding(12.0))
+                .style(|s| s.padding(theme::scaled(12.0)))
                 .into_any();
             }
 
@@ -566,7 +572,7 @@ fn preview_table(ui: Ui) -> impl IntoView {
             let header = h_stack_from_iter(shown.iter().map(|&fi| {
                 text(sample.columns[fi].clone()).style(|s| {
                     s.width(preview_col_w())
-                        .padding_horiz(8.0)
+                        .padding_horiz(theme::scaled(8.0))
                         .font_size(theme::font_label())
                         .font_bold()
                         .color(theme::text_dim())
@@ -652,7 +658,7 @@ fn issue_list(ui: Ui) -> impl IntoView {
                 s.color(theme::error())
                     .font_size(theme::font_body())
                     .font_bold()
-                    .margin_bottom(6.0)
+                    .margin_bottom(theme::scaled(6.0))
             });
             let lines = v_stack_from_iter(issues.iter().take(20).map(|is: &Issue| {
                 let where_ = if is.column.is_empty() {
@@ -663,7 +669,7 @@ fn issue_list(ui: Ui) -> impl IntoView {
                 text(format!("{where_}: {}", is.kind.message())).style(|s| {
                     s.font_size(theme::scaled_font(11.0))
                         .color(theme::text())
-                        .margin_bottom(2.0)
+                        .margin_bottom(theme::scaled(2.0))
                 })
             }));
             let tail = text(if more {
@@ -731,7 +737,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                 s.color(theme::plan_warn())
                     .font_size(theme::font_body())
                     .max_width(560.0)
-                    .margin_top(20.0)
+                    .margin_top(theme::scaled(20.0))
             })
             .into_any()
         },
@@ -753,7 +759,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                     s.color(theme::plan_warn())
                         .font_size(theme::font_body())
                         .max_width(560.0)
-                        .margin_top(20.0)
+                        .margin_top(theme::scaled(20.0))
                 })
                 .into_any()
         },
@@ -785,7 +791,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                 s.color(theme::plan_warn())
                     .font_size(theme::font_body())
                     .max_width(560.0)
-                    .margin_top(20.0)
+                    .margin_top(theme::scaled(20.0))
             })
             .into_any()
         },
@@ -801,7 +807,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         form_separator(GAP),
         form_section("Preview"),
         preview_table(ui.clone()),
-        issue_list(ui).style(|s| s.margin_top(16.0)),
+        issue_list(ui).style(|s| s.margin_top(theme::scaled(16.0))),
     ))
     .style(|s| s.flex_col().gap(GAP).width_full())
 }
@@ -1035,7 +1041,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                             s.color(theme::error())
                                 .font_size(theme::font_body())
                                 .max_width(520.0)
-                                .margin_top(10.0)
+                                .margin_top(theme::scaled(10.0))
                         })
                         .into_any(),
                 },
@@ -1162,7 +1168,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     s.flex_col()
                         .width_full()
                         .padding_horiz(modal_pad_h())
-                        .padding_vert(18.0)
+                        .padding_vert(theme::scaled(18.0))
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
                 footer,

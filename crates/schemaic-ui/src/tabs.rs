@@ -72,7 +72,7 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
         s.flex_row()
             .items_center()
             .flex_shrink(0.0_f32)
-            .padding_horiz(10.0)
+            .padding_horiz(theme::scaled(10.0))
             .background(theme::bg_chrome())
             .color(theme::tab_text())
             .hover(|s| s.color(theme::text()))
@@ -247,7 +247,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
             // hair late to ellipsize is not worth a second text measurement.)
             let label = text(title.clone()).style(move |s| {
                 let s = s
-                    .margin_right(7.0)
+                    .margin_right(theme::scaled(7.0))
                     .max_width(avail())
                     .text_overflow(TextOverflow::Ellipsis)
                     .font_size(theme::font_body());
@@ -284,7 +284,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 icons::icon(icons::PIN, 16.0)
                     .style(|s| {
                         s.flex_shrink(0.0_f32)
-                            .margin_right(7.0)
+                            .margin_right(theme::scaled(7.0))
                             .color(theme::tab_close())
                     })
                     .into_any()
@@ -294,7 +294,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     .on_click_stop(move |_| (close_x)(tab.id))
                     .style(|s| {
                         s.flex_shrink(0.0_f32)
-                            .margin_right(7.0)
+                            .margin_right(theme::scaled(7.0))
                             .color(theme::tab_close())
                             // Brighten on hover to the tab's full-brightness text
                             // colour (same one the inactive-tab hover uses).
@@ -321,7 +321,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 icons::icon(icons::FILE, 14.0)
                     .style(|s| {
                         s.flex_shrink(0.0_f32)
-                            .margin_right(5.0)
+                            .margin_right(theme::scaled(5.0))
                             .color(theme::tab_close())
                     })
                     .into_any()
@@ -329,7 +329,11 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 empty().into_any()
             };
             h_stack((dot, file_icon, label, close))
-                .style(|s| s.flex_row().items_center().padding_left(10.0))
+                .style(|s| {
+                    s.flex_row()
+                        .items_center()
+                        .padding_left(theme::scaled(10.0))
+                })
                 .into_any()
         },
     );
