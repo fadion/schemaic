@@ -3039,6 +3039,9 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     let workspace_modals_up = workspace_modals_up(&ui);
     let settings_modals_up = settings_modals_up(&ui);
     let modal_up = modal_backdrop_up(&ui);
+    // Two views, placed **inside** `root` rather than out with the resize zones —
+    // see the tuple below for where and why.
+    let [band, band_border] = chrome.over_backdrop(modal_up);
 
     let root = stack((
         shell,
@@ -3202,6 +3205,19 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 s
             }
         }),
+        // **The title-bar band, above every modal and below every overlay that
+        // can open over one.** It dims the header a modal cannot reach (the layer
+        // above starts at `header_h()`) and makes it draggable while one is up, so
+        // it has to be painted after the modal layer — but it was mounted out with
+        // the resize zones, *above `root` entirely*, and a sibling that paints
+        // later is also hit first. The three overlays below are precisely the ones
+        // that open from inside a modal, and a tall one takes `menu_inset`'s
+        // "bigger than the window" arm and pins at y=0: its top `header_h()` px
+        // then rendered under the band's scrim and answered presses with an OS
+        // window drag instead of with the row the pointer was on. Here, the band
+        // covers the header and nothing that stands over it.
+        band,
+        band_border,
         // **After every modal, on purpose.** A sibling paints in tuple order, so
         // anything before this is covered by it — and the shared popup menu is
         // opened from *inside* modals too (the designer's type shortcut), where
@@ -3447,19 +3463,18 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     // An outer stack is the honest shape anyway — the frame is not one more
     // overlay in the app, it is the window around all of them.
     //
-    // **The title-bar band joins them, and for the same reason.** A modal's
-    // backdrop covered the header along with everything else, so the window
-    // could not be dragged, minimized, maximized or closed until it was
-    // dismissed — the resize edges were the only part of the frame that stayed
-    // reachable, precisely because they are mounted out here. The band sits
-    // *before* the zones so a press in the top corners still resizes rather
-    // than drags, which is the order the frame already reads in. It is two
-    // siblings for the same reason the zones are eight: the drag band, and the
-    // sliver of the header's rule that runs on under the caption buttons, which
-    // the band cannot dim without covering them.
+    // **The title-bar band is not out here, and that is deliberate.** It solves
+    // the same problem the zones do — a modal's backdrop covered the header, so
+    // the window could not be dragged, minimized, maximized or closed until the
+    // modal was dismissed — but it only ever has to be above *the header and the
+    // modal layer*, not above the app. Mounted here it was also above the menu
+    // overlays, and a menu tall enough to pin at the top of the window then had
+    // its first rows answering with a window drag. It sits inside `root` instead,
+    // between the modal layer and the overlays that open over one; the zones stay
+    // out here, so a press in the top corners still resizes rather than drags,
+    // which is the order the frame already reads in.
     let [n, s, w, e, nw, ne, sw, se] = chrome.resize_zones();
-    let [band, band_border] = chrome.over_backdrop(modal_up);
-    stack((root, band, band_border, n, s, w, e, nw, ne, sw, se)).style(|s| s.size_full())
+    stack((root, n, s, w, e, nw, ne, sw, se)).style(|s| s.size_full())
 }
 
 /// The DDL/editor group's modals — is any of them up?

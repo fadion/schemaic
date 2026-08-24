@@ -2720,19 +2720,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     never under a full-window parent, which would swallow every press in the app (see *Floem 0.2
     gotchas*, "a full-window sibling ends the pointer walk"); they wrap the root rather than
     joining its tuple because that one is at Floem's 16-arity limit.
-    `over_backdrop` joins them out there, and for the same reason: **a modal used to take the
+    `over_backdrop` answers the same class of problem — **a modal used to take the
     window frame with it.** Every backdrop covers the whole window, the title bar included, so with
     a modal up the window could not be dragged, minimized, maximized or closed until it was
     dismissed — the resize edges were the only part of the frame that stayed reachable, precisely
-    because they are mounted outside the root. `over_backdrop` is one draggable strip across the
+    because they are mounted outside the root. Its two views are **not** out there with them,
+    though, and the difference is exact: a resize zone has to be hit before the whole app, while
+    the band only has to out-paint *the header and the modal layer*. Mounted at the window root it
+    was also above the overlay menus — and a menu tall enough to take `menu_inset`'s
+    "bigger than the window" arm pins at y=0, so its first rows sat under this scrim and answered a
+    press with an OS window drag instead of with the row the pointer was on (hoisted submenus had
+    the same exposure). It lives inside the root's tuple now, after the modal layer and before
+    `date_pick_overlay` — which are precisely the three overlays that can open from *inside* a
+    modal. `over_backdrop` is one draggable strip across the
     bar, raised only while `modal_backdrop_up` says a backdrop is on screen, carrying the scrim
     colour itself (the modal layer no longer reaches the header) and stopping short of the caption
     buttons at `controls_width` so the *header's own* buttons stay the live ones — one set of
     close handlers, and the strip it leaves clear is exactly the strip that still works. It is
     deliberately not a copy of the header: a press anywhere along it moves the window, because
     nothing else up there does anything while a modal is up and a real title bar drags from
-    anywhere. It sits **before** the resize zones, so the top corners still resize rather than
-    drag. `controls_width` is the one place `CONTROL_W` meets `Chrome::own_control_count`, and a
+    anywhere. It stays **under** the resize zones, which are the layer outside the root, so the top
+    corners still resize rather than drag. `controls_width` is the one place `CONTROL_W` meets `Chrome::own_control_count`, and a
     source-scanning test pins that against the buttons `controls` actually builds — a fourth
     caption button added without touching the count would leave 46px of title bar dimmed and dead.
     It returns **two** siblings, not one, for the reason the zones are eight: the header's
@@ -4607,7 +4615,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `window_chrome::over_backdrop`'s drag band. The alternative, hoisting the band above a
   full-window layer, would have put it on top of whatever the modal had in that strip: a 620px
   panel centred in a 700px window reaches into the top 40px, and its close × would have been
-  answering to the window's caption buttons. The same lever has a matching trap — a wrapper that
+  answering to the window's caption buttons. **Which is the same trap the band then fell into one
+  layer up**: mounted outside the root it was above the *overlay* menus too, and the ones that open
+  from inside a modal reach into that strip whenever they are tall enough to pin at y=0. Painting
+  later is also being hit first, so "what must this out-paint?" and "what must this be hit before?"
+  are one question in Floem, and the band's answer to both is the header and the backdrop. The same lever has a matching trap — a wrapper that
   is *zero-sized* (the out-of-flow state every one of these overlays takes when closed) gives its
   absolute children a zero box, so a modal left out of the layer's `modal_backdrop_up` predicate
   does not open half-right, it does not open at all. That is deliberate: the loud failure is the
