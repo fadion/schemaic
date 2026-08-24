@@ -3064,7 +3064,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **calendar** is a panel in the window's own overlay layer (`DatePick` →
     `overlays::date_pick_overlay`), placed by the pure `calendar_insets` against a `calendar_size`
     that is *computed, not measured* — which is what makes its edge flips exact rather than
-    estimated. `open_picker` is the one menu opener: it anchors at the control's own
+    estimated. `open_calendar` is the one place a `DatePick` is built, and `toggle_calendar` is the
+    row panel's second-press-closes wrapper over it; a grid cell opens the panel directly, one tick
+    after its field is built. `DatePick::on_pick` is what the two openers do *not* share: it runs
+    when a day or **Now** has been written and only then, so the row panel (whose field is what
+    commits) leaves it `None` while the cell editor stages its edit there. Every path that writes the
+    buffer inside `calendar_panel` leaves through the same `done` closure, which is what keeps
+    "closed" and "chose something" from drifting into one answer. `open_picker` is the one menu
+    opener: it anchors at the control's own
     `ViewId::layout_rect` (already in window coordinates), so a menu reached by Tab doesn't open
     wherever the pointer was left, recognises its own menu to toggle it closed, and closes every
     other menu — which it can because `PopupChannel` carries the whole `MenuFlags` rather than the
@@ -3072,7 +3079,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (see *the app's menus are mutually exclusive*), and the calendar's toggle owes it too. **Which
     calendar belongs to which field is settled by the buffer, not the anchor**: one channel serves
     every date field in the panel, so asking only "is a calendar open" lit every field's button at
-    once and let any one field's teardown close another's panel.
+    once and let any one field's teardown close another's panel. That identity is what the grid's
+    `cell_calendar_up` asks too — a cell editor always binds `gs.edit_buf`, which no row-panel field
+    ever is.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `results_view`/`loaded_view` are the
     entry points). `editor_pane.rs` — SQL editor pane
     (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
@@ -5405,8 +5414,8 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   connection switcher, the active-database selector, the Server Activity clock — and `DatePick`, the
   date field's calendar, which is a *grid of days* rather than a menu but is dismissed by every
   gesture that dismisses one), gathered by `MenuFlags::of(&ui)` and closed by `close_except(keep)`.
-  The calendar's membership is the whole reason the list is a list: it is opened from the row panel,
-  it is closed by the workspace root, **and** it has to be closed by `GridState::dismiss_overlays`
+  The calendar's membership is the whole reason the list is a list: it is opened from the row panel
+  and from an open grid cell, it is closed by the workspace root, **and** it has to be closed by `GridState::dismiss_overlays`
   when a grid cell is clicked — a press the cell consumes, so the root never sees it. Reaching that
   through the shared list is what stopped it needing a second spelling in the grid. A trigger has to enforce this *itself*,
   because it absorbs its own pointer-down — it must, or the root's dismissal would close the menu the
@@ -5736,14 +5745,45 @@ for keyboard nav.
     member per opening. The editor closes on **any** dismissal of that menu, which is why it watches
     the `popup` flag rather than only its own actions: the root's click-away handler writes that
     channel directly. **The cell drops its own horizontal padding** while such a control is open
-    (`open_cell_control`, asked by both the content and the style so the two cannot disagree): the
-    control carries its own surface, and a padded cell around it reads as a box inside a box.
+    (`cell_fills(&open_cell_shape(..))`, asked by both the content and the style so the two cannot
+    disagree): the control carries its own surface, and a padded cell around it reads as a box
+    inside a box. What an open cell *is* — a plain field, a picker in place of one, or a field with
+    the calendar beside it — is the pure `cell_shape(editor, buf)`, three shapes rather than "a
+    control or not" because the two controls want opposite things from the cell around them.
   - **In the row panel**: `typed_editor` puts the control inside the same NULL toggle a text field
     gets (`nullable_field`, extracted from `scalar_editor` for exactly this). Only the `SET`'s
     wrapping chips can outgrow a line, so only that row grows.
-  - **Dates keep the text input** in both places, with the calendar beside it in the row panel:
-    typing a date is often faster, a `TIMESTAMP`'s time of day has no calendar to come from, and a
-    value no picker can represent still has to be editable.
+  - **Dates keep the text input** in both places, with the calendar beside it: typing a date is
+    often faster, a `TIMESTAMP`'s time of day has no calendar to come from, and a value no picker
+    can represent still has to be editable (`0000-00-00` gets a plain field and no panel at all).
+    In a cell the panel is dropped from the cell's own rect, one tick late for `cell_pick_editor`'s
+    reason, and `cell_calendar_editor` hands it the editor's **lifetime** rather than sharing it:
+    - **The keyboard cannot decide when the editor closes while the panel is up.** Floem takes the
+      window focus on *every* pointer-down and hands it back only to a focusable view under the
+      cursor — a day, a month arrow and the Now button are none — so the first click inside the
+      calendar reached the field's `FocusLost` as "the user left", closed the editor, and the pick
+      it was about to make landed on a cell that was no longer being edited. `data_cell`'s
+      `FocusLost` therefore stands down for a press the panel reports having taken, and the panel
+      closes the editor instead: a chosen day stages through `keep_cell_edit` (the in-cell picker's
+      commit, a cell having no Save button in reach) and every other way the panel goes away closes
+      the editor without staging, which is the effect on the channel.
+    - **The press is the question, not the panel.** `cell_editors::take_calendar_press` is a
+      one-shot flag set by the panel's own pointer-down swallow and *taken* by the first asker,
+      because floem clears the focus, dispatches the press, and only then emits the `FocusLost` it
+      caused — so a flag set during dispatch is readable by the handler that follows it. Standing
+      down for the whole time a panel was merely *open* was the first spelling, and it ate Escape:
+      `text_input` answers Escape by dropping the window focus and reporting the key handled, so
+      that key reaches this `FocusLost` and nothing else in the app, and swallowing it closed
+      neither the editor nor the panel and left the grid with no keyboard. The field also drops a
+      standing flag when it regains the caret, the one moment it is certainly stale.
+    - **Standing down is only half of it: the guard hands the caret back.** Nothing else will —
+      floem returns the focus only to a focusable view under the cursor, and a day is not one — so
+      a field that merely survived the press was mounted and deaf, with a `DATETIME`'s time of day
+      untypable and Enter/Tab going to the window root. The caret lands at the end of the value,
+      `text_input` dropping its selection and moving the cursor there on regaining focus.
+    - The field keeps working throughout — it still holds the value, Enter still stages it, Tab
+      still hops — and its teardown clears the channel, because `edit_buf` belongs to the *next*
+      cell to be edited as much as to this one.
 - **Range selection is back, and it feeds the aggregates bar.** The state (`active`/`anchor`), the
   rect (`bounds`), the paint and `copy_selection` were always multi-cell aware; only the *input*
   had been gated off ("the grid has no multi-cell actions"). Shift+click, Shift+arrow and

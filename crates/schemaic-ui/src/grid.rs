@@ -4746,26 +4746,59 @@ fn fitting_editor(editor: CellEditor, f: &FieldSig) -> CellEditor {
     }
 }
 
-/// The picker this cell's **open editor** is, if it is one — its column's
-/// control, unless the value in hand can't be represented by it
-/// ([`fitting_editor`]'s rule, asked of the buffer `start_edit` seeded).
+/// What an **open** cell is: a text field, a picker in place of one, or a text
+/// field with a calendar standing over the grid beside it.
+///
+/// Three shapes rather than "a control or not", because the two controls a cell
+/// can hold want opposite things from the cell around them — see [`cell_fills`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CellShape {
+    /// A plain text field, filling the cell on its own inset.
+    Text,
+    /// The in-cell picker ([`cell_pick_editor`]) — a boolean, an enum, a `SET`:
+    /// the value and a chevron, with the list drawn over the grid.
+    Pick(CellEditor),
+    /// A text field *and* the calendar ([`cell_calendar_editor`]): a date is
+    /// often faster typed, and a `DATETIME`'s time of day has no calendar to come
+    /// from, so the field stays and the panel drops from the cell.
+    Calendar(CellEditor),
+}
+
+/// The shape this cell's **open editor** takes: its column's control, unless the
+/// value in hand can't be represented by it ([`fitting_editor`]'s rule, asked of
+/// the buffer `start_edit` seeded).
 ///
 /// Asked twice per open editor: once by the cell's content, to build it, and once
-/// by the cell's own style, to drop the padding a text field wants and a control
+/// by the cell's own style, to drop the padding a text field wants and a picker
 /// must not have. One function, because a cell padded like a text field around a
 /// control that fills it is a gap down one side and a clipped chevron on the
 /// other — and the two answers must agree keystroke for keystroke.
-fn open_cell_control(gs: GridState, ci: usize) -> Option<CellEditor> {
+fn open_cell_shape(gs: GridState, ci: usize) -> CellShape {
     let e = cell_editor(gs, ci);
-    if !matches!(
-        e,
-        CellEditor::Bool(_) | CellEditor::Enum(_) | CellEditor::Set(_)
-    ) {
-        return None;
+    gs.edit_buf.with_untracked(|b| cell_shape(e, b))
+}
+
+/// [`open_cell_shape`] without the signals: which shape `editor` takes over a
+/// cell already holding `buf`.
+fn cell_shape(editor: CellEditor, buf: &str) -> CellShape {
+    if !celledit::fits(&editor, buf) {
+        return CellShape::Text;
     }
-    gs.edit_buf
-        .with_untracked(|b| celledit::fits(&e, b))
-        .then_some(e)
+    match editor {
+        CellEditor::Bool(_) | CellEditor::Enum(_) | CellEditor::Set(_) => CellShape::Pick(editor),
+        CellEditor::Date | CellEditor::DateTime => CellShape::Calendar(editor),
+        CellEditor::Text => CellShape::Text,
+    }
+}
+
+/// Does the control take the **whole cell**, padding and all?
+///
+/// Only a picker does: it carries its own surface and puts the text back on the
+/// display's inset itself, so a padded cell around it leaves a strip of the row
+/// showing down each side. A calendar's cell holds an ordinary text field, which
+/// wants the ordinary padding — the panel is not in the cell at all.
+fn cell_fills(shape: &CellShape) -> bool {
+    matches!(shape, CellShape::Pick(_))
 }
 
 /// The editable value cell for a field whose column has a **type-aware** control
@@ -7233,8 +7266,8 @@ fn drop_cell_edit(gs: GridState, i: usize, ci: usize, refocus: bool) {
 /// click-away handler too, so watching the flag is the only way to hear about
 /// every dismissal.
 ///
-/// Dates are not here: their calendar is a panel, not a list, and it drops from
-/// the row panel's field where a text field can stand beside it.
+/// Dates are not here: their calendar is a panel, not a list, and the field it
+/// drops from stays — see [`cell_calendar_editor`].
 fn cell_pick_editor(
     gs: GridState,
     i: usize,
@@ -7294,6 +7327,101 @@ fn cell_pick_editor(
     // its own menu and closes it rather than reopening.
     .on_click_stop(move |_| (open)())
     .into_any()
+}
+
+/// Is the **cell editor's own** calendar up?
+///
+/// One channel serves every date control in the app and it carries no tag saying
+/// who filled it, so the buffer is the identity ([`DatePick`]) — and the buffer a
+/// cell editor binds to is always `edit_buf`, which no row-panel field ever is.
+fn cell_calendar_up(gs: GridState) -> bool {
+    gs.menus
+        .date_pick
+        .with_untracked(|p| p.as_ref().is_some_and(|d| d.buf == gs.edit_buf))
+}
+
+/// The in-cell date editor: `field` (an ordinary text input over the cell) with
+/// the calendar standing over the grid, dropped from the cell's own rect.
+///
+/// **The panel, not the keyboard, owns this editor's lifetime.** Every click
+/// inside the calendar costs the field its focus (see the `FocusLost` guard in
+/// [`data_cell`]), so the usual "focus left → close, discarding" rule cannot
+/// apply while it is up. What replaces it is the channel: choosing a day stages
+/// the edit and closes ([`keep_cell_edit`], the same commit an in-cell picker
+/// makes — a cell has no Save button in reach), and *any* other way the panel
+/// goes away closes the editor without staging, which is what the effect below
+/// watches for.
+///
+/// **Which press cost the field its focus is the panel's to say**
+/// ([`cell_editors::take_calendar_press`]), and asking that rather than "is a
+/// panel open" is what keeps Escape working: floem's `text_input` answers Escape
+/// by dropping the window focus and reporting the key handled, so this editor
+/// hears about it as a `FocusLost` and nothing else hears about it at all.
+/// Standing down for the whole time a panel was up therefore ate Escape — no
+/// editor closed, no panel closed, and a grid with no keyboard.
+///
+/// The field keeps working throughout — it still has the value, Enter still
+/// stages it and Tab still hops — but only because the guard **hands the caret
+/// back** after the press it stood down for. Standing down alone left the field
+/// mounted and deaf, which is the state a `DATETIME`'s time of day cannot be
+/// typed in, and typing is half the reason the field is there beside the panel.
+fn cell_calendar_editor(
+    gs: GridState,
+    i: usize,
+    data_idx: usize,
+    ci: usize,
+    pending: Option<usize>,
+    editor: CellEditor,
+    field: AnyView,
+) -> AnyView {
+    // The cell's own rect is the anchor, so the panel drops from the cell rather
+    // than from wherever the pointer was — the field fills it.
+    let anchor = field.id();
+    // Whether *we* put a panel up. Without it the closing effect below fires on
+    // its first run — before the deferred open — and shuts the editor instantly.
+    let opened = RwSignal::new(false);
+    // One tick later, for `cell_pick_editor`'s reason: `layout_rect` is what the
+    // panel anchors to, and this view has none until the frame that built it has
+    // been laid out.
+    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        if !gs.alive() || gs.edit_cell.get_untracked() != Some((i, ci)) {
+            return;
+        }
+        let on_pick: Rc<dyn Fn()> = Rc::new(move || keep_cell_edit(gs, i, data_idx, ci, pending));
+        cell_editors::open_calendar(gs.menus, Some(anchor), gs.edit_buf, &editor, Some(on_pick));
+        // Asked, not assumed: a cell with no rect yet opens nothing, and an
+        // `opened` set anyway is an effect that closes the editor on sight.
+        opened.set(cell_calendar_up(gs));
+    });
+    create_effect(move |_| {
+        // Subscribed to the channel, then asked the one predicate that knows
+        // *whose* panel is up — the alternative was a second copy of the identity
+        // test, tracked, drifting from the two untracked callers.
+        gs.menus.date_pick.track();
+        if opened.get() && !cell_calendar_up(gs) {
+            drop_cell_edit(gs, i, ci, true);
+        }
+    });
+    field
+        // A press in the panel that cost the field nothing (it had no focus to
+        // lose) leaves its flag standing, and the `FocusLost` guard would spend it
+        // on the next thing that *is* a real focus loss. Getting the caret back is
+        // the moment that can't be true any more, so it is where the flag is
+        // dropped.
+        .on_event_cont(EventListener::FocusGained, |_| {
+            cell_editors::take_calendar_press();
+        })
+        // **The panel cannot outlive the cell that opened it.** It edits
+        // `edit_buf`, which the next cell to be edited takes over, so a panel left
+        // standing would write into a different cell than the one it dropped from.
+        // A commit clears it on the way past (the pick closes the panel itself),
+        // but a switched tab, a re-fetch and a scrolled-away row do not.
+        .on_cleanup(move || {
+            if cell_calendar_up(gs) {
+                gs.menus.date_pick.set(None);
+            }
+        })
+        .into_any()
 }
 
 fn data_cell(
@@ -7365,12 +7493,19 @@ fn data_cell(
             )| {
                 if is_editing {
                     // A column whose values are already written down edits with
-                    // its own control rather than a text field. Everything else
-                    // falls through to the text input below.
-                    if let Some(e) = open_cell_control(gs, ci) {
+                    // its own control rather than a text field. A picker replaces
+                    // the field outright; a date keeps it (typing a date is often
+                    // faster, and a `DATETIME`'s time of day has no calendar to
+                    // come from) and drops the calendar over the grid beside it.
+                    let shape = open_cell_shape(gs, ci);
+                    if let CellShape::Pick(e) = shape {
                         return cell_pick_editor(gs, i, data_idx, ci, pending, e);
                     }
-                    return floem::views::text_input(gs.edit_buf)
+                    // The field's own id, so the `FocusLost` guard below can hand
+                    // the caret back to it. Filled once the view exists — the
+                    // handler only ever reads it at event time.
+                    let field_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+                    let field = floem::views::text_input(gs.edit_buf)
                         .on_event(EventListener::KeyDown, move |e| {
                             if let Event::KeyDown(ke) = e {
                                 match &ke.key.logical_key {
@@ -7415,6 +7550,41 @@ fn data_cell(
                         // repointed `edit_cell` to the next cell, and this input's
                         // focus-loss must not clobber that.
                         .on_event(EventListener::FocusLost, move |_| {
+                            // **A press inside this cell's own calendar is not
+                            // the user leaving.** Floem takes the window focus on
+                            // *every* pointer-down and hands it back only to a
+                            // focusable view under the cursor — and a day, a month
+                            // arrow and the Now button are none of them. So the
+                            // first click in the panel arrived here as a focus
+                            // loss, closed the editor, and the pick it was about
+                            // to make landed on a cell that was no longer being
+                            // edited. What closes the editor in that case is the
+                            // panel itself (`cell_calendar_editor`).
+                            //
+                            // **The press, not the panel, is the question.**
+                            // Standing down whenever a panel was merely *open*
+                            // meant Escape — which reaches this handler and
+                            // nothing else, `text_input` having answered it by
+                            // dropping the window focus — closed neither the
+                            // editor nor the panel, and left the grid with no
+                            // keyboard and no way back but the mouse.
+                            if cell_calendar_up(gs) && cell_editors::take_calendar_press() {
+                                // **And hand the caret straight back**, or the
+                                // field survives the click without the keyboard:
+                                // paging a month would leave a `DATETIME`'s time
+                                // of day untypable and Enter/Tab going to the
+                                // window root, which is the one thing keeping the
+                                // field beside the panel was for. Floem gives the
+                                // focus back only to a focusable view under the
+                                // cursor, and a month arrow is not one — so it has
+                                // to be asked for here. (The caret lands at the end
+                                // of the value: `text_input` drops its selection
+                                // and moves the cursor there on regaining focus.)
+                                if let Some(id) = field_id.get_untracked() {
+                                    id.request_focus();
+                                }
+                                return EventPropagation::Continue;
+                            }
                             if gs.edit_cell.get_untracked() == Some((i, ci)) {
                                 gs.edit_cell.set(None);
                                 // Escape came through here rather than through a
@@ -7478,6 +7648,13 @@ fn data_cell(
                             }
                         })
                         .into_any();
+                    field_id.set(Some(field.id()));
+                    return match shape {
+                        CellShape::Calendar(e) => {
+                            cell_calendar_editor(gs, i, data_idx, ci, pending, e, field)
+                        }
+                        _ => field,
+                    };
                 }
                 let edited = staged.is_some();
                 // A pending new row's unset editable cell shows a placeholder for
@@ -7859,12 +8036,13 @@ fn data_cell(
             // Right-aligned numeric cells get extra right padding (matching the
             // header) so the value clears the edge/border; text cells stay at 10px.
             //
-            // **A control open in the cell takes the whole cell**: it carries its
-            // own surface, and a padded cell around it leaves a strip of the row
-            // showing down each side — a box inside a box, which is what it read
-            // as. The control puts the text back on the same inset the display
-            // uses (`pick_cell_face`), so nothing moves as the editor opens.
-            let s = if is_editing && open_cell_control(gs, ci).is_some() {
+            // **A picker open in the cell takes the whole cell** ([`cell_fills`]):
+            // it carries its own surface, and a padded cell around it leaves a
+            // strip of the row showing down each side — a box inside a box, which
+            // is what it read as. The control puts the text back on the same inset
+            // the display uses (`pick_cell_face`), so nothing moves as the editor
+            // opens.
+            let s = if is_editing && cell_fills(&open_cell_shape(gs, ci)) {
                 s.padding(0.0).justify_start()
             } else if numeric {
                 s.padding_left(grid_pad_h())
@@ -8166,6 +8344,60 @@ mod tests {
         let enum_ctl = CellEditor::Enum(vec!["a".into()]);
         assert_eq!(fitting_editor(enum_ctl.clone(), &empty), enum_ctl);
         assert_eq!(fitting_editor(CellEditor::Date, &empty), CellEditor::Date);
+    }
+
+    // ── What an open cell is (`cell_shape`) ──
+
+    /// A date cell is the third shape, not the second: the calendar drops from it
+    /// while the text field stays, because a `DATETIME`'s time of day has no
+    /// calendar to come from and a typed date is often faster than a paged one.
+    #[test]
+    fn a_date_cell_keeps_its_field_and_gets_a_calendar() {
+        assert_eq!(
+            cell_shape(CellEditor::Date, "2026-08-24"),
+            CellShape::Calendar(CellEditor::Date)
+        );
+        assert_eq!(
+            cell_shape(CellEditor::DateTime, "2026-08-24 19:16:07"),
+            CellShape::Calendar(CellEditor::DateTime)
+        );
+        // A pending row's blank cell: "nothing chosen yet" fits every control, so
+        // the calendar is there to enter the date *with*.
+        assert_eq!(
+            cell_shape(CellEditor::Date, ""),
+            CellShape::Calendar(CellEditor::Date)
+        );
+    }
+
+    /// The same seam [`fitting_editor`] guards, on the cell's side: MySQL's
+    /// zero date is a legal DATE value and no calendar can show it, so the cell
+    /// stays a plain field rather than one that rewrites itself on first touch.
+    #[test]
+    fn a_date_no_calendar_can_show_keeps_the_plain_field() {
+        assert_eq!(cell_shape(CellEditor::Date, "0000-00-00"), CellShape::Text);
+        assert_eq!(
+            cell_shape(CellEditor::DateTime, "0000-00-00 00:00:00"),
+            CellShape::Text
+        );
+    }
+
+    /// **The composition, which is where this can go wrong**: the cell's padding
+    /// is decided from the same shape its content is, and only a picker — which
+    /// carries its own surface — may have it dropped. A calendar's cell holds an
+    /// ordinary text field on the ordinary inset, so the value doesn't jump
+    /// sideways as the editor opens.
+    #[test]
+    fn only_a_picker_takes_the_whole_cell() {
+        let fills = |e: CellEditor, buf: &str| cell_fills(&cell_shape(e, buf));
+        assert!(fills(CellEditor::Bool(BoolWire::OneZero), "1"));
+        assert!(fills(CellEditor::Enum(vec!["G".into()]), "G"));
+        assert!(fills(CellEditor::Set(vec!["a".into()]), "a"));
+        assert!(!fills(CellEditor::Date, "2026-08-24"));
+        assert!(!fills(CellEditor::DateTime, "2026-08-24 19:16:07"));
+        assert!(!fills(CellEditor::Text, "anything"));
+        // And the fallback keeps the field's padding too — a `tinyint(1)` holding
+        // 7 edits as text, in a cell that still reads like the display.
+        assert!(!fills(CellEditor::Bool(BoolWire::OneZero), "7"));
     }
 
     // ── Header key icons (`key_roles`) ──
