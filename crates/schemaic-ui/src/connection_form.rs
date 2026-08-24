@@ -21,9 +21,10 @@ use schemaic_core::connection::SshAuth;
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button_icon,
-    action_face, autohide, control_button, focus_root_with_ring, form_hint, form_label_style,
-    in_ring_button, loading_dots, menu_item_style, modal_title, nav_group, panel_style,
+    ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button_icon,
+    action_face, action_gap, autohide, control_button, focus_root_with_ring, form_hint,
+    form_label_style, in_ring_button, loading_dots, menu_item_style, modal_h, modal_title, modal_w,
+    nav_group, panel_style,
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -38,7 +39,9 @@ const TEST_FLASH: std::time::Duration = std::time::Duration::from_millis(4000);
 /// Width of the connection list's right-click menu. Narrower than the shared
 /// 170px default because both its labels are one short word; the editor's
 /// right-click menu makes the same call at 120.
-const CONN_MENU_W: f64 = 130.0;
+fn conn_menu_w() -> f64 {
+    theme::scaled(130.0)
+}
 
 /// The engine choice in the connection form's **Type** picker. Backs a
 /// [`crate::settings::focusable_dropdown`]; the selection is persisted into `Connection::db_type`
@@ -96,7 +99,9 @@ impl DbKind {
 
 // Fixed width for credential inputs (user/password + SSH user/password/passphrase)
 // — narrower than the full-width host/name fields, since credentials are short.
-const CONN_FIELD_W: f64 = 200.0;
+fn conn_field_w() -> f64 {
+    theme::scaled(200.0)
+}
 
 // ===== moved from lib.rs (connection form + password masking) =====
 // One labelled text field for the connection form.
@@ -147,7 +152,7 @@ fn host_port_row(
                 ..Default::default()
             },
         )
-        .style(|s| s.width(96.0)),
+        .style(|s| s.width(theme::scaled(96.0))),
     ))
     .style(|s| s.flex_col().gap(6.0).flex_shrink(0.0_f32));
     h_stack((host_field, port_field)).style(|s| s.flex_row().items_start().gap(25.0).width_full())
@@ -196,7 +201,7 @@ fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl 
     v_stack((
         key_row,
         masked_field("Passphrase", draft.ssh_key_passphrase, ring, tabindex + 1)
-            .style(|s| s.width(CONN_FIELD_W)),
+            .style(|s| s.width(conn_field_w())),
     ))
     .style(|s| s.flex_col().gap(20.0).width_full())
 }
@@ -210,7 +215,14 @@ fn mask_of_len(n: usize) -> String {
 /// renders as a same-size transparent spacer so names stay aligned.
 fn conn_color_dot(color: Option<String>) -> impl IntoView {
     empty().style(move |s| {
-        let s = s.size(8.0, 8.0).flex_shrink(0.0_f32).border_radius(4.0);
+        // A circle, so the radius is half the box and scales with it — an 8px dot
+        // at 200% is a 16px *rounded square* with a fixed 4px radius, in a list
+        // where the dot is the only colour cue.
+        let dot = theme::scaled(8.0);
+        let s = s
+            .size(dot, dot)
+            .flex_shrink(0.0_f32)
+            .border_radius((dot / 2.0) as f32);
         match color.as_deref().and_then(theme::parse_hex) {
             Some(c) => s.background(c),
             None => s,
@@ -260,7 +272,7 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
             .style(move |s| {
                 let fill = theme::parse_hex(&hx).unwrap_or(floem::peniko::Color::TRANSPARENT);
                 let s = s
-                    .size(18.0, 18.0)
+                    .size(theme::scaled(18.0), theme::scaled(18.0))
                     .flex_shrink(0.0_f32)
                     .border_radius(9.0)
                     .background(fill);
@@ -574,7 +586,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                                 // The dot carries its own `flex_shrink(0)`, so
                                 // the name is the only thing that gives.
                                 text(name).style(|s| {
-                                    s.font_size(theme::FONT_BODY)
+                                    s.font_size(theme::font_body())
                                         .text_ellipsis()
                                         .flex_shrink(1.0_f32)
                                         .min_width(0.0)
@@ -604,7 +616,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                             let (dup, del, sel) = (dup.clone(), del.clone(), menu_select.clone());
                             let sel_del = sel.clone();
                             popup_anchor.set(None);
-                            popup_width.set(CONN_MENU_W);
+                            popup_width.set(conn_menu_w());
                             popup_menu.set(Some(vec![
                                 MenuEntry::action("Duplicate", move || {
                                     (sel)(id);
@@ -686,7 +698,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 container(
                     h_stack((
                         icons::icon(icons::CIRCLE_PLUS, 16.0),
-                        text("New connection").style(|s| s.font_size(theme::FONT_BODY)),
+                        text("New connection").style(|s| s.font_size(theme::font_body())),
                     ))
                     .style(|s| s.flex_row().items_center().gap(8.0).color(theme::accent())),
                 )
@@ -703,7 +715,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
             );
 
             let left = v_stack((list, add)).style(|s| {
-                s.width(210.0)
+                s.width(theme::scaled(210.0))
                     .flex_shrink(0.0_f32)
                     .height_full()
                     .flex_col()
@@ -733,7 +745,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 body,
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(720.0).height(500.0));
+            .style(|s| panel_style(s).width(modal_w(720.0)).height(modal_h(500.0)));
 
             // Dark backdrop, centered panel, click-away or Escape closes.
             //
@@ -813,7 +825,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                     ring.clone(),
                     130,
                 )
-                .style(|s| s.width(150.0)),
+                .style(|s| s.width(theme::scaled(150.0))),
             ))
             .style(|s| s.flex_col().gap(6.0));
 
@@ -825,7 +837,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 move |auth| match auth {
                     SshAuth::Password => {
                         masked_field("SSH password", draft.ssh_password, ring_creds.clone(), 140)
-                            .style(|s| s.width(CONN_FIELD_W))
+                            .style(|s| s.width(conn_field_w()))
                             .into_any()
                     }
                     SshAuth::KeyPair => key_pair_fields(draft, ring_creds.clone(), 140).into_any(),
@@ -849,7 +861,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                     100,
                 ),
                 field("SSH user", draft.ssh_user, ring.clone(), 120)
-                    .style(|s| s.width(CONN_FIELD_W)),
+                    .style(|s| s.width(conn_field_w())),
                 auth_field,
                 auth_creds,
             ))
@@ -875,8 +887,9 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
 
     v_stack((
         host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
-        field("User", draft.user, ring.clone(), 70).style(|s| s.width(CONN_FIELD_W)),
-        masked_field("Password", draft.password, ring.clone(), 80).style(|s| s.width(CONN_FIELD_W)),
+        field("User", draft.user, ring.clone(), 70).style(|s| s.width(conn_field_w())),
+        masked_field("Password", draft.password, ring.clone(), 80)
+            .style(|s| s.width(conn_field_w())),
         ssh_toggle,
         ssh_fields,
     ))
@@ -1076,7 +1089,7 @@ fn conn_form(
             ring.clone(),
             50,
         ))
-        .style(|s| s.width(150.0)),
+        .style(|s| s.width(theme::scaled(150.0))),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full());
 
@@ -1102,10 +1115,10 @@ fn conn_form(
             // makes the keyboard skip a control and come back to it.
             35,
         ))
-        .style(|s| s.width(200.0)),
+        .style(|s| s.width(theme::scaled(200.0))),
         label(move || draft.ai_data.get().hint().to_string()).style(|s| {
             s.width_full()
-                .font_size(theme::FONT_HINT)
+                .font_size(theme::font_hint())
                 .color(theme::text_muted())
         }),
     ))
@@ -1121,7 +1134,7 @@ fn conn_form(
             ring.clone(),
             40,
         ))
-        .style(|s| s.width(150.0)),
+        .style(|s| s.width(theme::scaled(150.0))),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full());
 
@@ -1189,7 +1202,7 @@ fn conn_form(
             move || (conn_test.get(), test_flash.get()),
             move |(st, flashing)| match st {
                 crate::TestState::Testing => {
-                    loading_dots("Test", theme::btn_neutral_text, theme::FONT_BODY).into_any()
+                    loading_dots("Test", theme::btn_neutral_text, theme::font_body).into_any()
                 }
                 crate::TestState::Ok if flashing => icons::icon(icons::CIRCLE_CHECK, 16.0)
                     .style(|s| s.color(theme::conn_test_ok()))
@@ -1203,7 +1216,7 @@ fn conn_form(
                 // showing, which is a permanently off-centre label bought to
                 // avoid a one-off shift as the test starts.
                 _ => text("Test")
-                    .style(move |s| s.font_size(theme::FONT_BODY))
+                    .style(move |s| s.font_size(theme::font_body()))
                     .into_any(),
             },
         ),
@@ -1228,7 +1241,7 @@ fn conn_form(
                     icons::icon(icons::CHECK, 16.0).into_any()
                 } else {
                     text("Save")
-                        .style(move |s| s.font_size(theme::FONT_BODY))
+                        .style(move |s| s.font_size(theme::font_body()))
                         .into_any()
                 }
             },
@@ -1252,7 +1265,7 @@ fn conn_form(
         },
     );
     let right_actions =
-        h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(ACTION_GAP));
+        h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(action_gap()));
     let buttons = h_stack((
         delete_btn,
         empty().style(|s| s.flex_grow(1.0_f32)),

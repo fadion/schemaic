@@ -20,7 +20,7 @@ use schemaic_core::transcript::{
     Recall, RecallDir, Seg, ToolCall, TurnStats, recall_apply, user_prompts,
 };
 
-use crate::consts::{CHAT_PAD_H, FOLLOW_SLACK};
+use crate::consts::{chat_pad_h, follow_slack};
 use crate::markdown::{CodeActions, render_markdown};
 use crate::widgets::{
     autohide, autohide_state, follow_after_scroll, jump_to_bottom_button, next_floor,
@@ -72,7 +72,6 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let cancel = ui.ai_actions.cancel.clone();
     let new_chat_cb = ui.ai_actions.new_chat.clone();
     let regenerate = ui.ai_actions.regenerate.clone();
-    let right_w = ui.layout.right_w;
     let settings_open = ui.ai.settings_open;
     let gutter = ui.ai.gutter;
     let cli_path = ui.ai.cli_path;
@@ -191,9 +190,16 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // reset never ran.
     //
     // So the floor is invalidated by everything that legitimately changes the
-    // content's true height — the message count, the wrap width, and which
-    // conversation this is — and only *raised* within one of those. The decision
-    // is `next_floor`, so the "release it" and "hold it" halves can't drift.
+    // content's true height — the message count, the wrap width, which
+    // conversation this is, and **the interface scale** — and only *raised*
+    // within one of those. The decision is `next_floor`, so the "release it" and
+    // "hold it" halves can't drift.
+    //
+    // The scale is the fourth entry and the newest: it re-lays out every bubble
+    // at a different type size, which is a re-wrap by another name. Left out, it
+    // reproduced the panel-resize bug exactly — 200% → 150% → 100% each shrank
+    // the real content while the floor held the tallest layout seen, leaving a
+    // screen of blank under the last message that grew with every step down.
     let floor = RwSignal::new(0.0_f64);
     let active_conn = ui.conn.active_conn;
     create_effect(move |_| {
@@ -203,6 +209,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             msg_count.get(),
             panel_w.get().round() as i64,
             active_conn.get(),
+            theme::ui_scale(),
         );
         if floor.get_untracked() != 0.0 {
             floor.set(0.0);
@@ -227,7 +234,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                         };
                         text(msg)
                             .style(|s| {
-                                s.font_size(14.0)
+                                s.font_size(theme::scaled_font(14.0))
                                     .color(theme::text_muted())
                                     .padding_top(10.0)
                                     .padding_left(12.0)
@@ -397,9 +404,19 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let (scrolled, by_user) = with_scroll_gesture(scroll(convo.on_resize(move |r| {
         let h = r.height();
         content_h.set(h);
-        // The raise half of `next_floor` — the effect above owns the release.
-        // `set` never dedups, so this is guarded rather than written every frame.
-        let next = next_floor(floor.get_untracked(), h, false);
+        // The raise half of `next_floor`; the effect above releases it early on
+        // the things that are *known* to change the true height.
+        //
+        // **But the floor only holds while a turn is streaming, and that is what
+        // makes a stale one impossible.** Its whole premise is the measurement dip
+        // a rebuilt `RichText` reports mid-stream — outside a stream there is no
+        // dip to hide, so holding anything there can only be wrong. Written as the
+        // premise rather than as a list of invalidators because the list has been
+        // incomplete twice: first the wrap width, then the interface scale, each
+        // leaving a band of blank under the last message. Whatever the next missed
+        // invalidator turns out to be, an idle panel now measures itself afresh
+        // and the gap closes on the next layout instead of persisting.
+        let next = next_floor(floor.get_untracked(), h, !busy.get_untracked());
         if next != floor.get_untracked() {
             floor.set(next);
         }
@@ -415,7 +432,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 (by_user)(),
                 vp.y1,
                 content_h.get_untracked(),
-                FOLLOW_SLACK,
+                follow_slack(),
             );
             if follow.get_untracked() != keep {
                 follow.set(keep);
@@ -520,7 +537,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         .style(|s| s.flex_col().width_full().flex_shrink(0.0_f32));
 
     v_stack((title_row, convo, staged)).style(move |s| {
-        s.width(right_w.get())
+        s.width(crate::widgets::right_panel_w().get())
             .flex_shrink(0.0_f32)
             .height_full()
             .flex_col()
@@ -709,7 +726,7 @@ fn sent_attachment(
         // pairing was written down at `Icon`. See `contrast::UI_PAIRINGS`, where
         // both of these now have `Body` rows of their own.
         text(a.summary).style(|s| {
-            s.font_size(theme::FONT_HINT)
+            s.font_size(theme::font_hint())
                 .font_family("IBM Plex Sans".to_string())
                 .color(theme::text_dim())
                 .flex_grow(1.0_f32)
@@ -758,11 +775,14 @@ fn sent_attachment(
                 autohide(shift_hscroll(text(body.trim_end().to_string()).style(
                     |s| {
                         s.font_family("monospace".to_string())
-                            .font_size(theme::FONT_HINT)
+                            .font_size(theme::font_hint())
                             .color(theme::text_dim())
                     },
                 )))
-                .style(|s| s.width_full().max_height(220.0))
+                .style(|s| {
+                    s.width_full()
+                        .max_height(crate::widgets::modal_body_h(220.0))
+                })
                 .into_any()
             }
         }
@@ -807,7 +827,7 @@ fn attachment_chip(
                 // of the user's rows are about to leave the machine — so it is
                 // the last place to paint prose below the icon floor.
                 text(summary).style(|s| {
-                    s.font_size(theme::FONT_HINT)
+                    s.font_size(theme::font_hint())
                         .font_family("IBM Plex Sans".to_string())
                         .color(theme::text_dim())
                         .flex_grow(1.0_f32)
@@ -853,15 +873,15 @@ fn attachment_chip(
 // box's metrics but is inert (dim placeholder, no send icon, no pointer events).
 fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
     let box_ = container(text(placeholder).style(|s| {
-        s.font_size(theme::FONT_BODY)
+        s.font_size(theme::font_body())
             .font_family("IBM Plex Sans".to_string())
             .color(theme::placeholder())
     }))
     .style(|s| {
         s.width_full()
-            .height(34.0)
+            .height(theme::scaled(34.0))
             .padding_top(9.0)
-            .padding_left(CHAT_PAD_H)
+            .padding_left(chat_pad_h())
             .background(theme::bg_deepest())
             .border(1.0)
             .border_color(theme::field_border())
@@ -905,7 +925,11 @@ fn message_bubble(
         // `bg_panel` to read as a bubble at all, and no mid-grey clears AA on a
         // surface that light, so the design's own answer (full text colour) is
         // also the only one that passes.
-        let recap = text(m.text).style(|s| s.width_full().font_size(14.0).color(theme::text()));
+        let recap = text(m.text).style(|s| {
+            s.width_full()
+                .font_size(theme::scaled_font(14.0))
+                .color(theme::text())
+        });
         match m.attachment {
             Some(a) => v_stack((sent_attachment(a, attach_open), recap))
                 .style(|s| s.flex_col().width_full().gap(6.0))
@@ -919,7 +943,7 @@ fn message_bubble(
         // Prose only — tool chips are the assistant *using* tools, not content.
         let copy_text = m.prose();
         let content: AnyView = if m.pending && m.segs.is_empty() {
-            verb_spinner(theme::text_muted, 14.0).into_any()
+            verb_spinner(theme::text_muted, || theme::scaled_font(14.0)).into_any()
         } else {
             render_segments(m.segs, m.role, actions, !m.pending).into_any()
         };
@@ -935,7 +959,7 @@ fn message_bubble(
     // at the label size, Claude's in the accent colour so the eye finds the start
     // of an answer without a box around it.
     let label = text(label_txt).style(move |s| {
-        let s = s.font_size(theme::FONT_LABEL).font_bold();
+        let s = s.font_size(theme::font_label()).font_bold();
         if is_user {
             s.color(theme::text_muted())
         } else {
@@ -1037,7 +1061,7 @@ fn render_segments(
                 text(t)
                     .style(|s| {
                         s.width_full()
-                            .font_size(theme::FONT_BODY)
+                            .font_size(theme::font_body())
                             .color(theme::error())
                     })
                     .into_any()
@@ -1074,7 +1098,8 @@ fn assistant_footer(
     is_last: bool,
     regenerate: Rc<dyn Fn()>,
 ) -> AnyView {
-    let style = |s: floem::style::Style| s.font_size(theme::FONT_LABEL).color(theme::text_muted());
+    let style =
+        |s: floem::style::Style| s.font_size(theme::font_label()).color(theme::text_muted());
     let has_stats = stats.as_ref().is_some_and(|s| !s.is_empty());
     let has_text = !copy_text.is_empty();
     if !pending && !has_stats && !has_text {
@@ -1157,9 +1182,9 @@ fn tool_chip(tc: ToolCall) -> impl IntoView {
     };
     let name = tc.short_name().to_string();
     let header = h_stack((
-        text(dot).style(move |s| s.font_size(9.0).color(dot_color)),
+        text(dot).style(move |s| s.font_size(theme::scaled_font(9.0)).color(dot_color)),
         text(name).style(|s| {
-            s.font_size(theme::FONT_LABEL)
+            s.font_size(theme::font_label())
                 .font_bold()
                 .font_family("monospace".to_string())
                 .color(theme::text_dim())
@@ -1172,7 +1197,7 @@ fn tool_chip(tc: ToolCall) -> impl IntoView {
             .style(|s| {
                 s.width_full()
                     .font_family("monospace".to_string())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .color(theme::text())
             })
             .into_any(),
@@ -1190,7 +1215,7 @@ fn tool_chip(tc: ToolCall) -> impl IntoView {
                 };
                 s.width_full()
                     .font_family("monospace".to_string())
-                    .font_size(theme::FONT_LABEL)
+                    .font_size(theme::font_label())
                     .color(c)
                     .padding_top(4.0)
                     .border_top(1.0)

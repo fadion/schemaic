@@ -125,7 +125,7 @@ pub(crate) fn results_view(
 pub(crate) fn running_view(_cancel: Rc<dyn Fn()>) -> impl IntoView {
     // Just the verb spinner now (the Cancel button was removed); `_cancel` is kept
     // in the signature so callers/plumbing are unchanged.
-    container(verb_spinner(theme::text_dim, theme::FONT_BODY)).style(|s| {
+    container(verb_spinner(theme::text_dim, theme::font_body)).style(|s| {
         s.flex_grow(1.0_f32)
             .width_full()
             .flex_col()
@@ -1276,7 +1276,7 @@ pub(crate) fn selection_kind(
 }
 
 /// Exact rendered pixel width of `text` in the grid's cell font (the app default
-/// sans — IBM Plex Sans — at `FONT_BODY`), via a throwaway `TextLayout`. Used to
+/// sans — IBM Plex Sans — at `font_body()`), via a throwaway `TextLayout`. Used to
 /// Estimate a column's initial width from its header + a sample of cell values.
 fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
     let sample = rs.row_count().min(200);
@@ -1294,11 +1294,11 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
             // A key column's header carries a leading key icon; budget for it so the
             // name/type line isn't squeezed (and clipped) by the icon + gap.
             let icon = if key_map.contains_key(&ci) {
-                HEADER_KEY_ICON_W
+                header_key_icon_w()
             } else {
                 0.0
             };
-            (chars as f64 * GRID_CHAR_W + 22.0 + icon).clamp(MIN_COL_W, MAX_COL_W_INIT)
+            (chars as f64 * grid_char_w() + 22.0 + icon).clamp(min_col_w(), max_col_w_init())
         })
         .collect()
 }
@@ -1320,8 +1320,8 @@ fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
             chars = chars.max(c.display().chars().count().min(140));
         }
     }
-    let icon = if has_key { HEADER_KEY_ICON_W } else { 0.0 };
-    (chars as f64 * GRID_CHAR_W + 22.0 + icon).clamp(MIN_COL_W, 900.0)
+    let icon = if has_key { header_key_icon_w() } else { 0.0 };
+    (chars as f64 * grid_char_w() + 22.0 + icon).clamp(min_col_w(), 900.0)
 }
 
 fn cell_in(bounds: Option<(usize, usize, usize, usize)>, i: usize, ci: usize) -> bool {
@@ -1431,7 +1431,7 @@ struct ColWindow {
 /// expose a blank edge before the window memo updates.
 fn compute_window(vp: Rect, widths: &[f64], data_cols: &[usize], overscan: usize) -> ColWindow {
     let n = data_cols.len();
-    let w = |k: usize| widths.get(data_cols[k]).copied().unwrap_or(CELL_W);
+    let w = |k: usize| widths.get(data_cols[k]).copied().unwrap_or(cell_w());
     // Pre-layout (viewport not measured yet) — render an initial slice so the first
     // frame isn't blank; the memo recomputes once `on_resize` seeds `gs.vp`.
     if vp.width() <= 1.0 {
@@ -1483,7 +1483,7 @@ fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
     if vp.width() <= 0.0 {
         return;
     }
-    let rh = ROW_H;
+    let rh = row_h();
     let (mut nx, mut ny) = (vp.x0, vp.y0);
     let y0 = i as f64 * rh;
     if y0 < vp.y0 {
@@ -1847,8 +1847,8 @@ fn col_resize_handle(gs: GridState, ci: usize, has_key: bool) -> impl IntoView {
         s.absolute()
             .inset_right(0.0)
             .inset_top(0.0)
-            .width(RESIZE_HIT_W)
-            .height(GRID_HEADER_H)
+            .width(resize_hit_w())
+            .height(grid_header_h())
             .cursor(CursorStyle::ColResize)
     })
     .on_event(EventListener::PointerDown, move |e| {
@@ -1868,10 +1868,10 @@ fn col_resize_handle(gs: GridState, ci: usize, has_key: bool) -> impl IntoView {
             // Same moving-handle trick as `v_resize_handle`: the divider
             // re-centres on the column edge each frame, so the offset from
             // centre is the incremental delta.
-            let d = pe.pos.x - RESIZE_HIT_W / 2.0;
+            let d = pe.pos.x - resize_hit_w() / 2.0;
             gs.widths.update(|w| {
                 if let Some(x) = w.get_mut(ci) {
-                    *x = (*x + d).clamp(MIN_COL_W, 1200.0);
+                    *x = (*x + d).clamp(min_col_w(), 1200.0);
                 }
             });
             return EventPropagation::Stop;
@@ -2336,7 +2336,7 @@ pub(crate) fn grid_error_bar(
                 })
                 .style(|s| {
                     s.color(theme::err_fix_btn())
-                        .font_size(theme::FONT_BODY)
+                        .font_size(theme::font_body())
                         .margin_right(8.0)
                 })
                 .into_any()
@@ -2346,7 +2346,7 @@ pub(crate) fn grid_error_bar(
         h_stack((
             text(one_line).style(|s| {
                 s.color(theme::reject_text())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .max_width_pct(80.0)
                     .text_ellipsis()
                     .margin_left(8.0)
@@ -2370,7 +2370,7 @@ pub(crate) fn grid_error_bar(
                 .inset_left(5.0)
                 .inset_right(5.0)
                 .inset_bottom(5.0)
-                .height(35.0)
+                .height(theme::scaled(35.0))
         } else {
             s
         }
@@ -2427,7 +2427,7 @@ fn note_bar(msg: String) -> impl IntoView {
     h_stack((
         text(msg).style(|s| {
             s.color(theme::text())
-                .font_size(theme::FONT_BODY)
+                .font_size(theme::font_body())
                 .max_width_pct(90.0)
                 .text_ellipsis()
                 .margin_left(8.0)
@@ -2473,7 +2473,7 @@ fn wait_bar(note: WaitNote, rollback_tx: Rc<dyn Fn(usize)>) -> impl IntoView {
                 // `margin_left` is a real gap even when the flex spacer between
                 // them has been squeezed to nothing.
                 s.color(theme::tx_rollback())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .flex_shrink(0.0_f32)
                     .margin_left(12.0)
                     .margin_right(8.0)
@@ -2484,7 +2484,7 @@ fn wait_bar(note: WaitNote, rollback_tx: Rc<dyn Fn(usize)>) -> impl IntoView {
     h_stack((
         text(note.text).style(|s| {
             s.color(theme::text())
-                .font_size(theme::FONT_BODY)
+                .font_size(theme::font_body())
                 .max_width_pct(80.0)
                 .text_ellipsis()
                 .margin_left(8.0)
@@ -2536,9 +2536,9 @@ pub(crate) fn grid_find_bar(
                 FieldCfg {
                     placeholder: "Find in results",
                     autofocus: true,
-                    font_size: 13.0,
+                    font_size: theme::font_body,
                     border_radius: 6.0,
-                    height: Some(FIELD_INPUT_H),
+                    height: Some(field_input_h),
                     on_submit: Some(Rc::new(move || step(true))),
                     on_escape: Some(Rc::new(move || (esc)())),
                     on_arrow_up: Some(Rc::new(move || step(false))),
@@ -2546,7 +2546,7 @@ pub(crate) fn grid_find_bar(
                     ..Default::default()
                 },
             )
-            .style(|s| s.width(180.0));
+            .style(|s| s.width(theme::scaled(180.0)));
             // `pos/total` readout (like the editor find bar). Blank until there's a
             // query; `find_more` adds a `+` when the scan hit its cell budget.
             let count = dyn_container(
@@ -2565,7 +2565,7 @@ pub(crate) fn grid_find_bar(
                     let label = format!("{pos}/{total}{}", if more { "+" } else { "" });
                     text(label)
                         .style(|s| {
-                            s.font_size(theme::FONT_LABEL)
+                            s.font_size(theme::font_label())
                                 .color(theme::text_dim())
                                 .min_width(30.0)
                         })
@@ -2629,7 +2629,7 @@ pub(crate) fn grid_selection_bar(
                     // `text_dim` (the completion popup's doc line), so this
                     // introduces no combination the contrast test hasn't judged.
                     s.color(theme::text_dim())
-                        .font_size(theme::FONT_LABEL)
+                        .font_size(theme::font_label())
                         .padding_horiz(10.0)
                         .padding_vert(4.0)
                         .background(theme::bg_deepest())
@@ -2693,9 +2693,9 @@ pub(crate) fn grid_goto_bar(
                 FieldCfg {
                     placeholder: "",
                     autofocus: true,
-                    font_size: 13.0,
+                    font_size: theme::font_body,
                     border_radius: 6.0,
-                    height: Some(FIELD_INPUT_H),
+                    height: Some(field_input_h),
                     on_submit: Some(submit),
                     on_escape: Some(Rc::new(move || (esc)())),
                     ..Default::default()
@@ -2703,7 +2703,7 @@ pub(crate) fn grid_goto_bar(
             )
             // Wider than the editor's: a row number runs to six figures where a
             // line number rarely leaves three.
-            .style(|s| s.width(78.0));
+            .style(|s| s.width(theme::scaled(78.0)));
             let close_x = close.clone();
             let close_btn = container(icons::icon(icons::X, 14.0))
                 .on_click_stop(move |_| (close_x)())
@@ -2714,7 +2714,7 @@ pub(crate) fn grid_goto_bar(
                 });
             h_stack((
                 text("Go to row:")
-                    .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
+                    .style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
                 input,
                 close_btn,
             ))
@@ -2970,12 +2970,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             });
 
             // ── Headers ──
-            let gutter_header = container(
-                text("#").style(|s| s.font_size(11.0).color(theme::text_faint())),
-            )
+            let gutter_header = container(text("#").style(|s| {
+                s.font_size(theme::scaled_font(11.0))
+                    .color(theme::text_faint())
+            }))
             .style(|s| {
-                s.width(GUTTER_W)
-                    .height(GRID_HEADER_H)
+                s.width(gutter_w())
+                    .height(grid_header_h())
                     .flex_shrink(0.0_f32)
                     .items_center()
                     .justify_end()
@@ -3002,13 +3003,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 move || win.get(),
                 move |w| {
                     let mut kids: Vec<AnyView> =
-                        vec![col_spacer(w.left_pad, GRID_HEADER_H).into_any()];
+                        vec![col_spacer(w.left_pad, grid_header_h()).into_any()];
                     for k in w.start..w.end {
                         kids.push(
                             header_cell(gs, hdr_cols[k], sort_val, sort, km.clone()).into_any(),
                         );
                     }
-                    kids.push(col_spacer(w.right_pad, GRID_HEADER_H).into_any());
+                    kids.push(col_spacer(w.right_pad, grid_header_h()).into_any());
                     h_stack_from_iter(kids)
                         .style(|s| s.flex_row().background(theme::bg_header_row()))
                         .into_any()
@@ -3039,7 +3040,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                                 .sum::<f64>()
                         });
                         let max_x = (content_w - vp.width()).max(0.0);
-                        let max_y = ((total as f64 * ROW_H) - vp.height()).max(0.0);
+                        let max_y = ((total as f64 * row_h()) - vp.height()).max(0.0);
                         gs.scroll_to.set(Some(Point::new(
                             (h_off.get_untracked() + pe.delta.x).clamp(0.0, max_x),
                             (vscroll.get_untracked() + pe.delta.y).clamp(0.0, max_y),
@@ -3050,12 +3051,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 .scroll_style(|s| s.hide_bars(true))
                 .style(|s| {
                     s.flex_grow(1.0_f32)
-                        .height(GRID_HEADER_H)
+                        .height(grid_header_h())
                         .min_width(0.0)
                         .background(theme::bg_header_row())
                 });
             let header = h_stack((frozen_header, data_header))
-                .style(|s| s.flex_row().width_full().height(GRID_HEADER_H));
+                .style(|s| s.flex_row().width_full().height(grid_header_h()));
 
             // ── Bodies ──
             let (grid_shown, grid_poke) = autohide_state();
@@ -3063,7 +3064,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             let frozen_body = scroll(
                 virtual_stack(
                     VirtualDirection::Vertical,
-                    VirtualItemSize::Fixed(Box::new(move || ROW_H)),
+                    VirtualItemSize::Fixed(Box::new(row_h)),
                     move || RowRange { len: total },
                     |i| *i,
                     move |i| {
@@ -3093,7 +3094,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     let dy = pe.delta.y;
                     if dy != 0.0 {
                         let vp = gs.vp.get_untracked();
-                        let max_y = ((total as f64 * ROW_H) - vp.height()).max(0.0);
+                        let max_y = ((total as f64 * row_h()) - vp.height()).max(0.0);
                         let new_y = (vscroll.get_untracked() + dy).clamp(0.0, max_y);
                         gs.scroll_to.set(Some(Point::new(vp.x0, new_y)));
                     }
@@ -3102,7 +3103,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             })
             .scroll_style(|s| s.hide_bars(true))
             .style(move |s| {
-                let w = GUTTER_W
+                let w = gutter_w()
                     + match frozen_col {
                         Some(fc) => gs.widths.with(|w| w.get(fc).copied().unwrap_or(0.0)),
                         None => 0.0,
@@ -3119,7 +3120,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             let data_body = shift_hscroll(
                 virtual_stack(
                     VirtualDirection::Vertical,
-                    VirtualItemSize::Fixed(Box::new(move || ROW_H)),
+                    VirtualItemSize::Fixed(Box::new(row_h)),
                     move || RowRange { len: total },
                     |i| *i,
                     move |i| {
@@ -3244,7 +3245,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             .flex_basis(0.0)
             .width_full()
             .flex_col()
-            .min_height(120.0)
+            .min_height(theme::scaled(120.0))
             .min_width(0.0)
     });
 
@@ -4336,7 +4337,7 @@ fn seed_popover(gs: GridState) -> impl IntoView {
             });
             // Preset chips generate immediately; the field is for a custom count.
             let preset = |n: usize, go: Rc<dyn Fn()>, gs: GridState| {
-                container(text(format!("{n}")).style(|s| s.font_size(theme::FONT_LABEL)))
+                container(text(format!("{n}")).style(|s| s.font_size(theme::font_label())))
                     .on_click_stop(move |_| {
                         gs.seed_buf.set(n.to_string());
                         (go)();
@@ -4358,21 +4359,21 @@ fn seed_popover(gs: GridState) -> impl IntoView {
                     gs.seed_buf,
                     FieldCfg {
                         autofocus: true,
-                        height: Some(30.0),
+                        height: Some(|| theme::scaled(30.0)),
                         on_submit: Some(go),
                         on_escape: Some(Rc::new(esc)),
                         ..FieldCfg::default()
                     },
                 )
-                .style(|s| s.width(70.0))
+                .style(|s| s.width(theme::scaled(70.0)))
             };
             let go_btn = go.clone();
             let panel = v_stack((
                 text("Seed rows")
-                    .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_muted())),
+                    .style(|s| s.font_size(theme::font_label()).color(theme::text_muted())),
                 h_stack((
                     field,
-                    container(text("Generate").style(|s| s.font_size(theme::FONT_BODY)))
+                    container(text("Generate").style(|s| s.font_size(theme::font_body())))
                         .on_click_stop(move |_| (go_btn)())
                         .style(|s| {
                             s.padding_horiz(12.0)
@@ -4428,10 +4429,14 @@ fn seed_popover(gs: GridState) -> impl IntoView {
 }
 
 /// Fixed width of a field row's left-hand column-name label.
-const FIELD_NAME_W: f64 = 150.0;
+fn field_name_w() -> f64 {
+    theme::scaled(150.0)
+}
 /// Fixed height of a scalar field row — so toggling sentinel/`<null>` ↔ input never
 /// reflows the rows below.
-const FIELD_ROW_H: f64 = 32.0;
+fn field_row_h() -> f64 {
+    theme::scaled(32.0)
+}
 
 /// Per-field editing state for the structured row panel: the raw text buffer, a
 /// NULL flag, and the field editor's own pre-write flush (see [`flush_fields`]).
@@ -4498,14 +4503,14 @@ fn field_state(sigs: &[FieldSig]) -> Vec<(usize, Option<String>)> {
 fn field_label(name: String, type_name: String) -> impl IntoView {
     h_stack((
         text(name).style(|s| {
-            s.font_size(13.0)
+            s.font_size(theme::scaled_font(13.0))
                 .color(theme::text())
                 .text_ellipsis()
                 .min_width(0.0)
                 .flex_grow(1.0_f32)
         }),
         text(type_name).style(|s| {
-            s.font_size(13.0)
+            s.font_size(theme::scaled_font(13.0))
                 .color(theme::text_faint())
                 .margin_left(6.0)
                 .flex_shrink(0.0_f32)
@@ -4513,7 +4518,7 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
     ))
     .style(|s| {
         s.items_center()
-            .width(FIELD_NAME_W)
+            .width(field_name_w())
             .flex_shrink(0.0_f32)
             .padding_right(10.0)
     })
@@ -4522,7 +4527,7 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
 /// A small borderless text button (the per-field Set-NULL / Set-value / Unset
 /// affordances): no background, just a text-colour hover.
 fn field_mini_btn(label: &'static str, action: impl Fn() + 'static) -> AnyView {
-    container(text(label).style(|s| s.font_size(13.0)))
+    container(text(label).style(|s| s.font_size(theme::scaled_font(13.0))))
         .on_click_stop(move |_| action())
         .style(|s| {
             s.padding_horiz(4.0)
@@ -4536,7 +4541,10 @@ fn field_mini_btn(label: &'static str, action: impl Fn() + 'static) -> AnyView {
 /// The dim `<null>` sentinel shown for a NULL field / value.
 fn null_sentinel() -> AnyView {
     text("<null>")
-        .style(|s| s.font_size(13.0).color(theme::text_faint()))
+        .style(|s| {
+            s.font_size(theme::scaled_font(13.0))
+                .color(theme::text_faint())
+        })
         .into_any()
 }
 
@@ -4550,9 +4558,9 @@ fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) ->
             f.buf,
             FieldCfg {
                 background: theme::bg_editor,
-                font_size: 13.0,
+                font_size: theme::font_body,
                 autofocus,
-                height: Some(FIELD_INPUT_H),
+                height: Some(field_input_h),
                 // Escape closes the panel even while a field is focused.
                 on_escape: Some(Rc::new(move || gs.edit_row_open.set(false))),
                 ..Default::default()
@@ -4595,7 +4603,9 @@ fn is_json_type(type_name: &str) -> bool {
 }
 
 /// Left indent (px) per JSON tree depth level.
-const JSON_INDENT: f64 = 15.0;
+fn json_indent() -> f64 {
+    theme::scaled(15.0)
+}
 
 /// Is `path` hidden because one of its ancestor container paths is collapsed?
 ///
@@ -4621,12 +4631,12 @@ fn json_row_view(
     start_edit: Rc<dyn Fn(Vec<PathSeg>, String)>,
     commit_current: Rc<dyn Fn()>,
 ) -> AnyView {
-    let indent = r.depth as f64 * JSON_INDENT;
+    let indent = r.depth as f64 * json_indent();
     let path = r.path.clone();
 
     let disclosure: AnyView = if matches!(r.kind, RowKind::Scalar) {
         empty()
-            .style(|s| s.width(15.0).flex_shrink(0.0_f32))
+            .style(|s| s.width(theme::scaled(15.0)).flex_shrink(0.0_f32))
             .into_any()
     } else {
         let is_collapsed = collapsed.get_untracked().contains(&path);
@@ -4647,7 +4657,7 @@ fn json_row_view(
             });
         })
         .style(|s| {
-            s.width(15.0)
+            s.width(theme::scaled(15.0))
                 .flex_shrink(0.0_f32)
                 .items_center()
                 .color(theme::text_dim())
@@ -4659,9 +4669,12 @@ fn json_row_view(
     // Label: `key:` for an object member, `[i]` for an array element, none at root.
     let label: AnyView = match (&r.label, r.path.last()) {
         (Some(k), _) => h_stack((
-            text(k.clone()).style(|s| s.font_size(13.0).color(theme::key_index())),
+            text(k.clone()).style(|s| {
+                s.font_size(theme::scaled_font(13.0))
+                    .color(theme::key_index())
+            }),
             text(":").style(|s| {
-                s.font_size(13.0)
+                s.font_size(theme::scaled_font(13.0))
                     .color(theme::text_faint())
                     .margin_right(6.0)
             }),
@@ -4670,7 +4683,7 @@ fn json_row_view(
         .into_any(),
         (None, Some(PathSeg::Index(i))) => text(format!("[{i}]"))
             .style(|s| {
-                s.font_size(13.0)
+                s.font_size(theme::scaled_font(13.0))
                     .color(theme::text_faint())
                     .margin_right(6.0)
                     .flex_shrink(0.0_f32)
@@ -4681,10 +4694,16 @@ fn json_row_view(
 
     let value: AnyView = match &r.kind {
         RowKind::Object(n) => text(format!("{{{n}}}"))
-            .style(|s| s.font_size(13.0).color(theme::text_faint()))
+            .style(|s| {
+                s.font_size(theme::scaled_font(13.0))
+                    .color(theme::text_faint())
+            })
             .into_any(),
         RowKind::Array(n) => text(format!("[{n}]"))
-            .style(|s| s.font_size(13.0).color(theme::text_faint()))
+            .style(|s| {
+                s.font_size(theme::scaled_font(13.0))
+                    .color(theme::text_faint())
+            })
             .into_any(),
         RowKind::Scalar => {
             if is_editing {
@@ -4692,9 +4711,9 @@ fn json_row_view(
                     edit_buf,
                     FieldCfg {
                         background: theme::bg_deepest,
-                        font_size: 13.0,
+                        font_size: theme::font_body,
                         autofocus: true,
-                        height: Some(FIELD_INPUT_H),
+                        height: Some(field_input_h),
                         on_submit: Some(commit_current.clone()),
                         on_blur: Some(commit_current.clone()),
                         on_escape: Some(Rc::new(move || {
@@ -4710,15 +4729,17 @@ fn json_row_view(
                 let vj = r.value_json.clone().unwrap_or_default();
                 let vj2 = vj.clone();
                 let p = path.clone();
-                container(text(vj).style(|s| s.font_size(13.0).color(theme::text())))
-                    .on_click_stop(move |_| (start_edit)(p.clone(), vj2.clone()))
-                    .style(|s| {
-                        s.padding_horiz(4.0)
-                            .padding_vert(1.0)
-                            .border_radius(3.0)
-                            .hover(|s| s.background(theme::bg_deepest()))
-                    })
-                    .into_any()
+                container(
+                    text(vj).style(|s| s.font_size(theme::scaled_font(13.0)).color(theme::text())),
+                )
+                .on_click_stop(move |_| (start_edit)(p.clone(), vj2.clone()))
+                .style(|s| {
+                    s.padding_horiz(4.0)
+                        .padding_vert(1.0)
+                        .border_radius(3.0)
+                        .hover(|s| s.background(theme::bg_deepest()))
+                })
+                .into_any()
             }
         }
     };
@@ -4729,7 +4750,7 @@ fn json_row_view(
         label,
         value,
     ))
-    .style(|s| s.items_center().width_full().min_height(FIELD_ROW_H))
+    .style(|s| s.items_center().width_full().min_height(field_row_h()))
     .into_any()
 }
 
@@ -4749,8 +4770,8 @@ fn json_editor(f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
             f.buf,
             FieldCfg {
                 background: theme::bg_editor,
-                font_size: 13.0,
-                height: Some(FIELD_INPUT_H),
+                font_size: theme::font_body,
+                height: Some(field_input_h),
                 ..Default::default()
             },
         )
@@ -4942,7 +4963,7 @@ fn readonly_value(f: FieldSig) -> AnyView {
     }
     text(f.buf.get_untracked())
         .style(|s| {
-            s.font_size(13.0)
+            s.font_size(theme::scaled_font(13.0))
                 .color(theme::text_dim())
                 .text_ellipsis()
                 .min_width(0.0)
@@ -4979,9 +5000,9 @@ fn field_row(
         // row keeps a *fixed* height so toggling `<null>` ↔ input (which are different
         // natural heights) never reflows the rows below.
         if is_json {
-            s.items_start().min_height(FIELD_ROW_H)
+            s.items_start().min_height(field_row_h())
         } else {
-            s.items_center().height(FIELD_ROW_H)
+            s.items_center().height(field_row_h())
         }
     })
     .into_any()
@@ -5107,7 +5128,7 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             .style(|s| s.flex_row().items_center().gap(2.0).margin_left(8.0));
 
             let head = h_stack((
-                text(title).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
+                text(title).style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
                 nav,
                 empty().style(|s| s.flex_grow(1.0_f32)),
                 trailing,
@@ -5116,7 +5137,7 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 s.width_full()
                     .items_center()
                     .gap(4.0)
-                    .height(24.0)
+                    .height(theme::scaled(24.0))
                     .flex_shrink(0.0_f32)
                     .padding_horiz(10.0)
             });
@@ -5151,7 +5172,7 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 move || gs.edit_row_saving.get(),
                 move |saving| {
                     if saving {
-                        loading_dots("Saving", theme::text_dim, theme::FONT_LABEL).into_any()
+                        loading_dots("Saving", theme::text_dim, theme::font_label).into_any()
                     } else {
                         empty().into_any()
                     }
@@ -5345,7 +5366,7 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     let (r, c) = active_opt.unwrap_or((0, 0));
     let last_r = rows - 1;
     let last_c = ncols - 1;
-    let page = ((gs.vp.get_untracked().height() / ROW_H).floor() as usize).max(1);
+    let page = ((gs.vp.get_untracked().height() / row_h()).floor() as usize).max(1);
     let go = |nav: Nav| {
         let (nr, nc) = nav_target(rows, ncols, page, (r, c), nav);
         set_active(gs, nr, nc, shift);
@@ -5477,7 +5498,7 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
 fn toolbar_sep() -> impl IntoView {
     empty().style(|s| {
         s.width(1.0)
-            .height(14.0)
+            .height(theme::scaled(14.0))
             .flex_shrink(0.0_f32)
             .margin_horiz(8.0)
             .background(theme::border())
@@ -5511,7 +5532,7 @@ fn filter_bar(gs: GridState) -> impl IntoView {
                 FieldCfg {
                     placeholder: "WHERE",
                     background: theme::bg_deepest,
-                    font_size: theme::FONT_LABEL,
+                    font_size: theme::font_label,
                     // Borderless + square: the field's background is the row's, so
                     // the whole row reads as one input.
                     border_color: Some(crate::bg_transparent),
@@ -5559,7 +5580,7 @@ fn filter_bar(gs: GridState) -> impl IntoView {
                         .flex_row()
                         .gap(4.0)
                         .width_full()
-                        .height(34.0)
+                        .height(theme::scaled(34.0))
                         .flex_shrink(0.0_f32)
                         .background(theme::bg_deepest())
                         .padding_right(10.0)
@@ -5719,7 +5740,7 @@ fn grid_toolbar(
     })
     .style(|s| {
         s.color(theme::text_dim())
-            .font_size(theme::FONT_LABEL)
+            .font_size(theme::font_label())
             .min_width(0.0)
             .text_ellipsis()
     });
@@ -5740,7 +5761,7 @@ fn grid_toolbar(
         ))
         .style(|s| {
             s.color(theme::error())
-                .font_size(theme::FONT_LABEL)
+                .font_size(theme::font_label())
                 .min_width(0.0)
                 .text_ellipsis()
         })
@@ -5754,7 +5775,7 @@ fn grid_toolbar(
                 text("· sorted subset (capped) — not the full order")
                     .style(|s| {
                         s.color(theme::error())
-                            .font_size(theme::FONT_LABEL)
+                            .font_size(theme::font_label())
                             .min_width(0.0)
                             .text_ellipsis()
                     })
@@ -5806,7 +5827,7 @@ fn grid_toolbar(
             // the whole thing ("read all rows"). Built once, the offer named a
             // million rows for a table with 292 thousand.
             h_stack((
-                text("·").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+                text("·").style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
                 label(move || schemaic_core::stats::read_more_offer(nrows, row_total.get()).1)
                     .style(move |s| {
                         // Stays blue on hover and steps *away from the surface*
@@ -5819,7 +5840,7 @@ fn grid_toolbar(
                         } else {
                             theme::accent()
                         };
-                        s.color(c).font_size(theme::FONT_LABEL)
+                        s.color(c).font_size(theme::font_label())
                     }),
             ))
             .style(|s| s.flex_row().items_center().gap(4.0))
@@ -5893,7 +5914,7 @@ fn grid_toolbar(
                 icons::icon(icons::CIRCLE_CHECK, 16.0)
                     .style(move |s| s.color(commit_color()).flex_shrink(0.0_f32)),
                 text(label).style(move |s| {
-                    s.font_size(theme::FONT_LABEL)
+                    s.font_size(theme::font_label())
                         .color(commit_color())
                         .margin_left(4.0)
                 }),
@@ -6079,7 +6100,7 @@ fn grid_toolbar(
         // `on_move` reports the *view's* window origin — floem fires it during
         // layout, not on pointer movement — so this is right however the menu was
         // raised.
-        gs.popup_width.set(GRID_COPY_MENU_W);
+        gs.popup_width.set(grid_copy_menu_w());
         gs.popup_anchor
             .set(Some(anchor_below(copy_origin.get_untracked())));
         gs.popup.set(Some(
@@ -6139,7 +6160,7 @@ fn grid_toolbar(
             (d)();
         }
         publish_return(TB_SAVE, &strip_save);
-        gs.popup_width.set(GRID_COPY_MENU_W);
+        gs.popup_width.set(grid_copy_menu_w());
         gs.popup_anchor
             .set(Some(anchor_below(save_origin.get_untracked())));
         gs.popup.set(Some(
@@ -6208,7 +6229,7 @@ fn grid_toolbar(
                     (d)();
                 }
                 publish_return(TB_AI, &strip_ai_open);
-                gs.popup_width.set(GRID_COPY_MENU_W);
+                gs.popup_width.set(grid_copy_menu_w());
                 gs.popup_anchor
                     .set(Some(anchor_below(ai_origin.get_untracked())));
                 // AI Fill Value targets the active cell — enabled only when an
@@ -6362,7 +6383,7 @@ fn grid_toolbar(
             .flex_row()
             .items_center()
             .gap(6.0)
-            .height(28.0)
+            .height(theme::scaled(28.0))
             .flex_shrink(0.0_f32)
             .padding_left(12.0)
             // Less right padding than left: the copy icon carries its own 5px hitbox
@@ -6407,7 +6428,7 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
     } else {
         format!("{}", pos + 1)
     };
-    container(text(label).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_faint())))
+    container(text(label).style(|s| s.font_size(theme::font_label()).color(theme::text_faint())))
         // Selection happens on **press**, not on click, because that is what arms
         // the drag — a click fires only after the release, by which time the
         // rows the pointer crossed are gone.
@@ -6476,8 +6497,8 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
         .style(move |s| {
             let in_sel = matches!(gs.bounds(), Some((r0, _, r1, _)) if pos >= r0 && pos <= r1);
             let s = s
-                .width(GUTTER_W)
-                .height(ROW_H)
+                .width(gutter_w())
+                .height(row_h())
                 .flex_shrink(0.0_f32)
                 .items_center()
                 .justify_end()
@@ -6599,7 +6620,7 @@ fn frozen_row(
     h_stack_from_iter(children).style(move |s| {
         zebra_bg(
             s.flex_row()
-                .height(ROW_H)
+                .height(row_h())
                 .items_center()
                 .flex_shrink(0.0_f32),
             pos,
@@ -6623,17 +6644,17 @@ fn data_row(
     dyn_container(
         move || win.get(),
         move |w| {
-            let mut kids: Vec<AnyView> = vec![col_spacer(w.left_pad, ROW_H).into_any()];
+            let mut kids: Vec<AnyView> = vec![col_spacer(w.left_pad, row_h()).into_any()];
             for k in w.start..w.end {
                 kids.push(cell_at(gs, pos, data_idx, cols[k], pending).into_any());
             }
-            kids.push(col_spacer(w.right_pad, ROW_H).into_any());
+            kids.push(col_spacer(w.right_pad, row_h()).into_any());
             h_stack_from_iter(kids)
-                .style(move |s| zebra_bg(s.flex_row().height(ROW_H).items_center(), pos))
+                .style(move |s| zebra_bg(s.flex_row().height(row_h()).items_center(), pos))
                 .into_any()
         },
     )
-    .style(|s| s.height(ROW_H))
+    .style(|s| s.height(row_h()))
 }
 
 /// Apply a display formatter to column `ci`: update the live per-column state (so
@@ -6707,7 +6728,7 @@ fn header_cell(
 
     // Name + (when sorted) a chevron 7px to its right, both in the sort colour.
     let name_line = text(name).style(move |s| {
-        let s = s.font_size(theme::FONT_LABEL).font_bold();
+        let s = s.font_size(theme::font_label()).font_bold();
         if sorted {
             s.color(theme::chip_active())
         } else {
@@ -6732,13 +6753,20 @@ fn header_cell(
             .into_any()
     } else {
         empty()
-            .style(|s| s.height(14.0).width(0.0).flex_shrink(0.0_f32))
+            .style(|s| {
+                s.height(theme::scaled(14.0))
+                    .width(0.0)
+                    .flex_shrink(0.0_f32)
+            })
             .into_any()
     };
     let name_row = h_stack((name_line, trailing)).style(|s| s.items_center());
     // SQL type, nudged 2px lower for a touch more breathing room under the name.
-    let type_line =
-        text(type_name).style(|s| s.font_size(11.0).color(theme::text_faint()).margin_top(2.0));
+    let type_line = text(type_name).style(|s| {
+        s.font_size(theme::scaled_font(11.0))
+            .color(theme::text_faint())
+            .margin_top(2.0)
+    });
     let label = v_stack((name_row, type_line)).style(move |s| {
         let s = s
             .flex_col()
@@ -6778,7 +6806,7 @@ fn header_cell(
                     // edge/border. Kept in sync with `data_cell` so the header lines
                     // up over its column's values.
                     s.padding_left(10.0)
-                        .padding_right(GRID_NUM_PAD_RIGHT)
+                        .padding_right(grid_num_pad_right())
                         .justify_end()
                 } else {
                     s.padding_horiz(10.0).justify_start()
@@ -6869,13 +6897,13 @@ fn header_cell(
             // `with`, not `get`: `get` clones the whole widths `Vec` to read one
             // slot, and this closure re-runs for every visible header on any
             // selection change.
-            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(CELL_W));
+            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
             // Highlight the header when its column is within the cell selection.
             let col_sel = matches!(gs.bounds(), Some((_, c0, _, c1)) if ci >= c0 && ci <= c1);
             let formatted = gs
                 .formats
                 .with(|f| f.get(ci).map(|x| *x != ColumnFormat::None).unwrap_or(false));
-            let s = s.width(w).height(GRID_HEADER_H).flex_shrink(0.0_f32);
+            let s = s.width(w).height(grid_header_h()).flex_shrink(0.0_f32);
             let s = if col_sel {
                 s.background(theme::grid_col_sel())
             } else if formatted {
@@ -7025,7 +7053,7 @@ fn data_cell(
                                 .width_full()
                                 .height_full()
                                 .items_center()
-                                .font_size(theme::FONT_BODY)
+                                .font_size(theme::font_body())
                                 .color(theme::text())
                                 .background(clear)
                                 .border(0.0)
@@ -7047,7 +7075,8 @@ fn data_cell(
                                 // changes, keeping it right-anchored while typing). A
                                 // value wider than the column clamps to `pad_left = 0`
                                 // (full width, left-aligned + clip) like the display.
-                                let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(CELL_W));
+                                let w =
+                                    gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
                                 let text_px = gs.edit_buf.with(|b| measure_text_px(b));
                                 s.padding_left(numeric_edit_pad_left(w, text_px))
                             } else {
@@ -7084,7 +7113,7 @@ fn data_cell(
                 let shown = truncate(&src, 200);
                 text(shown)
                     .style(move |s| {
-                        let s = s.font_size(theme::FONT_BODY);
+                        let s = s.font_size(theme::font_body());
                         if edited {
                             // Staged edit: white text over the green cell fill.
                             s.color(floem::peniko::Color::WHITE)
@@ -7409,7 +7438,7 @@ fn data_cell(
             // *cell* in the viewport on every selection change, so a drag-select
             // over a wide result cloned the widths `Vec` hundreds of times per
             // pointer move.
-            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(CELL_W));
+            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
             let sel = cell_in(gs.bounds(), i, ci);
             let is_active = gs.active.get() == Some((i, ci));
             let is_dirty = match pending {
@@ -7428,15 +7457,19 @@ fn data_cell(
                 Some(p) => gs.ai_gen_rows.with(|s| s.contains(&p)),
                 None => gs.ai_gen.with(|g| g.contains(&(data_idx, ci))),
             };
-            let s = s.width(w).height(ROW_H).flex_shrink(0.0_f32).items_center();
+            let s = s
+                .width(w)
+                .height(row_h())
+                .flex_shrink(0.0_f32)
+                .items_center();
             // Right-aligned numeric cells get extra right padding (matching the
             // header) so the value clears the edge/border; text cells stay at 10px.
             let s = if numeric {
-                s.padding_left(GRID_PAD_H)
-                    .padding_right(GRID_NUM_PAD_RIGHT)
+                s.padding_left(grid_pad_h())
+                    .padding_right(grid_num_pad_right())
                     .justify_end()
             } else {
-                s.padding_horiz(GRID_PAD_H).justify_start()
+                s.padding_horiz(grid_pad_h()).justify_start()
             };
             let formatted = gs
                 .formats
@@ -7512,7 +7545,7 @@ fn data_cell(
 /// a lost digit. Two pixels of slack is invisible against the value's right edge.
 fn numeric_edit_pad_left(w: f64, text_px: f64) -> f64 {
     const SLACK: f64 = 2.0;
-    let content = w - GRID_PAD_H - GRID_NUM_PAD_RIGHT - GRID_CELL_DIVIDER;
+    let content = w - grid_pad_h() - grid_num_pad_right() - GRID_CELL_DIVIDER;
     (content - text_px - SLACK).max(0.0)
 }
 
@@ -7703,7 +7736,7 @@ mod tests {
     /// less the padding we add. It clips the text — on a glyph boundary — the
     /// moment the text is wider than this, so the padding must always leave room.
     fn text_node_w(w: f64, pad_left: f64) -> f64 {
-        w - GRID_PAD_H - GRID_NUM_PAD_RIGHT - GRID_CELL_DIVIDER - pad_left
+        w - grid_pad_h() - grid_num_pad_right() - GRID_CELL_DIVIDER - pad_left
     }
 
     #[test]
@@ -7712,7 +7745,7 @@ mod tests {
         // really offers `w - 10 - 14 - 1`, so the text node came out 5px short of
         // the text every time. Clipping is glyph-quantised, so "99" showed "9" and
         // "1" showed nothing at all.
-        for w in [MIN_COL_W, 60.0, 100.0, CELL_W, 420.0] {
+        for w in [min_col_w(), 60.0, 100.0, cell_w(), 420.0] {
             for text_px in [0.0, 7.0, 14.0, 49.0, 120.0] {
                 let pad = numeric_edit_pad_left(w, text_px);
                 assert!(pad >= 0.0, "w={w} text={text_px}");
@@ -7730,15 +7763,15 @@ mod tests {
     fn a_value_wider_than_its_column_is_left_aligned_and_clipped() {
         // Same as the display: no room to right-align into, so start at the left
         // edge and let floem clip to the caret.
-        assert_eq!(numeric_edit_pad_left(CELL_W, 400.0), 0.0);
-        assert_eq!(numeric_edit_pad_left(MIN_COL_W, 60.0), 0.0);
+        assert_eq!(numeric_edit_pad_left(cell_w(), 400.0), 0.0);
+        assert_eq!(numeric_edit_pad_left(min_col_w(), 60.0), 0.0);
     }
 
     #[test]
     fn a_short_value_is_pushed_right_to_meet_the_display_alignment() {
         // 190 - 10 - 14 - 1 = 165 of content; a 14px value sits at the right edge
         // (less the 2px of slack that keeps floem's clip off the boundary).
-        assert_eq!(numeric_edit_pad_left(CELL_W, 14.0), 149.0);
+        assert_eq!(numeric_edit_pad_left(cell_w(), 14.0), 149.0);
     }
 
     #[test]

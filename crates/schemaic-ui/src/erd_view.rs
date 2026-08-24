@@ -286,9 +286,9 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
                 crate::FieldCfg {
                     placeholder: "Find table or column",
                     autofocus: true,
-                    font_size: 13.0,
+                    font_size: theme::font_body,
                     border_radius: 6.0,
-                    height: Some(crate::FIELD_INPUT_H),
+                    height: Some(crate::field_input_h),
                     // Escape inside the field closes the search and nothing else.
                     // The field consumes the key outright (floem registers the
                     // editor's KeyDown listener with `on_event_stop`), so it never
@@ -300,7 +300,7 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
                     ..Default::default()
                 },
             )
-            .style(|s| s.width(190.0));
+            .style(|s| s.width(theme::scaled(190.0)));
             // Its real width, for the press test below — the field is the leftmost
             // child, so anything to the right of it missed it.
             let input_id = input.id();
@@ -315,7 +315,7 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
                 move |label| match label {
                     Some(label) => text(label)
                         .style(|s| {
-                            s.font_size(theme::FONT_LABEL)
+                            s.font_size(theme::font_label())
                                 .color(theme::text_dim())
                                 .min_width(30.0)
                         })
@@ -424,7 +424,9 @@ const NOTICE_LINGER: std::time::Duration = std::time::Duration::from_secs(4);
 const EXPORT_PNG_SCALE: f32 = 2.0;
 /// Width of the export dropdown — wider than the grid's, because "PlantUML…" and
 /// the "Copy as" submenu chevron have to sit side by side without crowding.
-const EXPORT_MENU_W: f64 = 190.0;
+fn export_menu_w() -> f64 {
+    theme::scaled(190.0)
+}
 
 /// Resolve the active connection's loaded schema for `database`, if introspected.
 fn resolve_schema(
@@ -1509,14 +1511,14 @@ fn node_card(
 /// Lives in `widgets` now that the header's Retry wears the same chrome; text and
 /// icon colour is `theme::text()` (~#C6C8D6, the app's approximation of the
 /// spec's #C2C4D2), and everything in the toolbar is 13px.
-use crate::widgets::{TOOLBAR_FONT, control_surface as toolbar_surface};
+use crate::widgets::{control_surface as toolbar_surface, toolbar_font};
 
 /// A read-only count pill (e.g. "3 tables"), styled like the buttons.
 fn count_chip(label: String) -> AnyView {
     text(label)
         .style(|s| {
             toolbar_surface(s)
-                .font_size(TOOLBAR_FONT)
+                .font_size(toolbar_font())
                 .color(theme::text())
                 .padding_horiz(10.0)
                 .padding_vert(5.0)
@@ -1612,7 +1614,7 @@ fn notice_bar(notice: RwSignal<Option<(String, bool)>>) -> impl IntoView {
                         theme::status_ok()
                     })
                 }),
-                text(msg).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text())),
+                text(msg).style(|s| s.font_size(theme::font_label()).color(theme::text())),
             ))
             .on_click_stop(move |_| notice.set(None))
             .style(|s| {
@@ -1676,11 +1678,11 @@ fn zoom_unit(zoom: RwSignal<f64>, zoom_out: Rc<dyn Fn()>, zoom_in: Rc<dyn Fn()>)
         move || (zoom.get() * 100.0).round() as i32,
         move |pct| {
             text(format!("{pct}%"))
-                .style(|s| s.font_size(TOOLBAR_FONT).color(theme::text()))
+                .style(|s| s.font_size(toolbar_font()).color(theme::text()))
                 .into_any()
         },
     )
-    .style(|s| s.width(48.0).items_center().justify_center())
+    .style(|s| s.width(theme::scaled(48.0)).items_center().justify_center())
     .into_any();
     let plus = step(icons::PLUS, zoom_in);
     h_stack((minus, sep(), percent, sep(), plus))
@@ -2107,7 +2109,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     popup.set(None);
                     return;
                 }
-                popup_width.set(EXPORT_MENU_W);
+                popup_width.set(export_menu_w());
                 popup_anchor.set(Some(mine));
                 popup.set(Some(export_entries()));
             });
@@ -2465,8 +2467,8 @@ fn modal_frame(
         // to its right.
         h_stack((
             h_stack((
-                text("Scope").style(|s| s.font_size(TOOLBAR_FONT).color(theme::text_muted())),
-                text(scope).style(|s| s.font_size(TOOLBAR_FONT).color(theme::text())),
+                text("Scope").style(|s| s.font_size(toolbar_font()).color(theme::text_muted())),
+                text(scope).style(|s| s.font_size(toolbar_font()).color(theme::text())),
             ))
             .style(|s| s.items_center().gap(6.0)),
             h_stack_from_iter(counts).style(|s| s.items_center().gap(8.0)),
@@ -2484,7 +2486,7 @@ fn modal_frame(
         s.items_center()
             .gap(10.0)
             .width_full()
-            .height(48.0)
+            .height(theme::scaled(48.0))
             .flex_shrink(0.0_f32)
             .padding_left(16.0)
             .padding_right(10.0)

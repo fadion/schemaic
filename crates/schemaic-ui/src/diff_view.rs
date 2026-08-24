@@ -20,7 +20,7 @@ use crate::{sql_highlight, theme};
 fn diff_line(line: String, dialect: SqlDialect) -> impl IntoView {
     let mono = |st: floem::style::Style| {
         st.font_family(MONO_FAMILY.to_string())
-            .font_size(theme::FONT_TITLE)
+            .font_size(theme::font_title())
     };
     let spans = sql_highlight::highlight_spans(&line, dialect);
     let mut segs: Vec<AnyView> = Vec::new();
@@ -57,7 +57,7 @@ fn diff_line(line: String, dialect: SqlDialect) -> impl IntoView {
 pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoView {
     let mono = |s: floem::style::Style| {
         s.font_family(MONO_FAMILY.to_string())
-            .font_size(theme::FONT_TITLE)
+            .font_size(theme::font_title())
     };
     // Give the diff a DEFINITE content width so the scroll can detect horizontal
     // overflow: Floem's scroll measures its child's laid-out size (clamped to the
@@ -73,15 +73,16 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
     // at zero. Ctrl+K sends the editor buffer, so a CJK string literal in the
     // user's own SQL reaches this path and the scrollbar stopped short of the end
     // of the line. Two advances of slack replace the old `+ 2.0` columns.
-    const DIFF_GUTTER_W: f64 = 60.0; // line-number cell (46) + marker (14)
+    // Line-number cell (46) + marker (14), both of which scale — so this does.
+    let diff_gutter_w = theme::scaled(46.0) + theme::scaled(14.0);
     let widest = rows
         .iter()
         .map(|r| match r {
-            DiffRow::Line { text, .. } => measure_mono_px_at(text, theme::FONT_TITLE),
+            DiffRow::Line { text, .. } => measure_mono_px_at(text, theme::font_title()),
             DiffRow::Gap(_) => 0.0,
         })
         .fold(0.0f64, f64::max);
-    let content_w = DIFF_GUTTER_W + widest + 2.0 * measure_mono_px_at("0", theme::FONT_TITLE);
+    let content_w = diff_gutter_w + widest + 2.0 * measure_mono_px_at("0", theme::font_title());
     let views = rows.into_iter().map(move |row| match row {
         DiffRow::Line {
             tag,
@@ -96,13 +97,17 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
             h_stack((
                 container(text(num.to_string()).style(move |s| mono(s).color(theme::text_muted())))
                     .style(|s| {
-                        s.width(46.0)
+                        s.width(theme::scaled(46.0))
                             .flex_shrink(0.0_f32)
                             .justify_end()
                             .padding_right(10.0)
                     }),
-                text(marker.to_string())
-                    .style(move |s| mono(s).width(14.0).flex_shrink(0.0_f32).color(mcolor)),
+                text(marker.to_string()).style(move |s| {
+                    mono(s)
+                        .width(theme::scaled(14.0))
+                        .flex_shrink(0.0_f32)
+                        .color(mcolor)
+                }),
                 diff_line(line, dialect),
             ))
             // No explicit width: the row sizes to its content (gutter + marker +
@@ -129,7 +134,7 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
                 format!("⋯ {count} unchanged lines")
             };
             container(
-                text(label).style(|s| s.font_size(theme::FONT_BODY).color(theme::text_muted())),
+                text(label).style(|s| s.font_size(theme::font_body()).color(theme::text_muted())),
             )
             .style(|s| {
                 s.width_full()

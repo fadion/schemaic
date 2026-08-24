@@ -33,30 +33,40 @@ use schemaic_core::stats;
 use schemaic_core::stats::{IndexStats, RowCount, TableStats, format_bytes};
 use schemaic_core::text::plural;
 
-use crate::theme::{FONT_BODY, FONT_HINT, FONT_LABEL, FONT_TITLE};
+use crate::theme::{font_body, font_hint, font_label, font_title};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FocusRing, MODAL_PAD_H, action_button, autohide,
-    dismiss_layer, focus_root_with_ring, in_ring_button, loading_dots, modal_footer_split,
-    modal_title_owned, panel_style,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
+    focus_root_with_ring, in_ring_button, loading_dots, modal_body_h, modal_footer_split,
+    modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{PropertiesState, PropertiesTarget, Ui, icons, theme};
 
 /// Modal width. Wide enough that the index list's three columns (name,
 /// cardinality, usage) sit on one line for an ordinary index name without the
 /// row wrapping, which is what makes the list scannable at all.
-const PANEL_W: f64 = 640.0;
+fn panel_w() -> f64 {
+    modal_w(640.0)
+}
 /// The label column of the detail list. Fixed rather than measured so the values
 /// line up down the panel — a ragged left edge on a list of eight facts reads as
 /// eight unrelated lines.
-const LABEL_W: f64 = 132.0;
+fn label_w() -> f64 {
+    theme::scaled(132.0)
+}
 /// Height of the storage-breakdown bar.
-const BAR_H: f64 = 8.0;
+fn bar_h() -> f64 {
+    theme::scaled(8.0)
+}
 /// Gap between the rows of a section's list.
-const ROW_GAP: f64 = 4.0;
+fn row_gap() -> f64 {
+    theme::scaled(4.0)
+}
 /// Gap between an index's name and the facts about it. Wide enough to read as a
 /// separation rather than a run-on, without being the fixed gutter a column
 /// would impose — see [`index_row`].
-const INDEX_FACT_GAP: f64 = 20.0;
+fn index_fact_gap() -> f64 {
+    theme::scaled(20.0)
+}
 
 /// Open the properties modal for one object. The fetch is kicked off by the
 /// modal itself, so every entry point is this one call.
@@ -152,7 +162,11 @@ pub(crate) fn properties_overlay(ui: Ui) -> impl IntoView {
 
             let panel = v_stack((title, body, footer))
                 .on_click_stop(|_| {})
-                .style(|s| panel_style(s).background(theme::bg_panel()).width(PANEL_W));
+                .style(|s| {
+                    panel_style(s)
+                        .background(theme::bg_panel())
+                        .width(panel_w())
+                });
 
             let esc = close.clone();
             focus_root_with_ring(stack((dismiss_layer(move || close()), panel)), ring)
@@ -194,9 +208,14 @@ fn stats_body(
             return container(loading_dots(
                 "Reading statistics",
                 theme::text_dim,
-                FONT_BODY,
+                font_body,
             ))
-            .style(|s| s.height(200.0).width_full().items_center().justify_center())
+            .style(|s| {
+                s.height(theme::scaled(200.0))
+                    .width_full()
+                    .items_center()
+                    .justify_center()
+            })
             .into_any();
         }
         PropertiesState::Failed(e) => [
@@ -257,9 +276,9 @@ fn stats_body(
 
     let content = v_stack_from_iter(sections).style(|s| s.flex_col().gap(16.0).width_full());
     autohide(scroll(
-        container(content).style(|s| s.width_full().padding(MODAL_PAD_H)),
+        container(content).style(|s| s.width_full().padding(modal_pad_h())),
     ))
-    .style(|s| s.width_full().max_height(460.0))
+    .style(|s| s.width_full().max_height(modal_body_h(460.0)))
     .into_any()
 }
 
@@ -291,11 +310,11 @@ fn headline(stats: &TableStats) -> AnyView {
 fn tile(value: String, caption: String) -> AnyView {
     v_stack((
         text(value).style(|s| {
-            s.font_size(FONT_TITLE + 8.0)
+            s.font_size(font_title() + 8.0)
                 .font_bold()
                 .color(theme::text())
         }),
-        text(caption).style(|s| s.font_size(FONT_HINT).color(theme::text_faint())),
+        text(caption).style(|s| s.font_size(font_hint()).color(theme::text_faint())),
     ))
     .style(|s| s.flex_col().gap(2.0))
     .into_any()
@@ -334,9 +353,9 @@ fn count_row(
         let stop = ui.schema_actions.count_cancel.clone();
         let press = stop.clone();
         let face = h_stack((
-            loading_dots("Counting", theme::text_dim, FONT_LABEL),
+            loading_dots("Counting", theme::text_dim, font_label),
             text("Cancel").style(|s| {
-                s.font_size(FONT_LABEL)
+                s.font_size(font_label())
                     .color(theme::text_dim())
                     .padding_horiz(8.0)
                     .padding_vert(4.0)
@@ -369,7 +388,7 @@ fn count_row(
         let clicked = press.clone();
         let face = h_stack((
             icons::icon(icons::HASH, 14.0).style(|s| s.flex_shrink(0.0_f32)),
-            text("Count rows").style(|s| s.font_size(FONT_LABEL)),
+            text("Count rows").style(|s| s.font_size(font_label())),
         ))
         .style(|s| {
             s.items_center()
@@ -396,13 +415,13 @@ fn count_row(
     let hint: Option<AnyView> = match hint_kind {
         Some(stats::CountHint::Error) => Some(
             text(count_err.clone().unwrap_or_default())
-                .style(|s| s.font_size(FONT_BODY).color(theme::error()))
+                .style(|s| s.font_size(font_body()).color(theme::error()))
                 .into_any(),
         ),
         // The warning belongs *before* the press, not after.
         Some(stats::CountHint::Slow) => Some(
             text("A full scan of the table. Slow on a large one.")
-                .style(|s| s.font_size(FONT_BODY).color(theme::text_faint()))
+                .style(|s| s.font_size(font_body()).color(theme::text_faint()))
                 .into_any(),
         ),
         // Counted: nothing left to say. The caption under the headline already
@@ -426,14 +445,18 @@ fn count_row(
 fn storage_section(stats: &TableStats) -> Option<AnyView> {
     let (data, index, free) = stats.storage_split()?;
     let seg = |share: f64, color: fn() -> Color| {
-        empty().style(move |s| s.height(BAR_H).width_pct(share * 100.0).background(color()))
+        empty().style(move |s| {
+            s.height(bar_h())
+                .width_pct(share * 100.0)
+                .background(color())
+        })
     };
     let bar = h_stack((
         seg(data, theme::accent),
         seg(index, theme::key_index),
         seg(free, theme::border),
     ))
-    .style(|s| s.width_full().height(BAR_H).border_radius(BAR_H / 2.0))
+    .style(|s| s.width_full().height(bar_h()).border_radius(bar_h() / 2.0))
     // The segments are square; the container's radius is what rounds the two
     // outer ends, so it has to clip them.
     .clip();
@@ -472,15 +495,15 @@ fn storage_section(stats: &TableStats) -> Option<AnyView> {
 fn swatch(color: fn() -> Color, label: &'static str, bytes: Option<u64>) -> AnyView {
     h_stack((
         empty().style(move |s| {
-            s.width(9.0)
-                .height(9.0)
+            s.width(theme::scaled(9.0))
+                .height(theme::scaled(9.0))
                 .border_radius(2.0)
                 .flex_shrink(0.0_f32)
                 .background(color())
         }),
-        text(label).style(|s| s.font_size(FONT_HINT).color(theme::text_faint())),
+        text(label).style(|s| s.font_size(font_hint()).color(theme::text_faint())),
         text(bytes.map(format_bytes).unwrap_or_else(|| "—".into()))
-            .style(|s| s.font_size(FONT_HINT).color(theme::text_dim())),
+            .style(|s| s.font_size(font_hint()).color(theme::text_dim())),
     ))
     .style(|s| s.items_center().gap(6.0))
     .into_any()
@@ -575,7 +598,7 @@ fn index_section(stats: &TableStats) -> Option<AnyView> {
     // Looser than the detail lists above it: an index row is a name plus a run of
     // facts (and sometimes a second line under it), so at the shared 4px the rows
     // ran together into one block instead of reading as a list.
-    Some(section_with_gap("Indexes", rows, ROW_GAP + 3.0))
+    Some(section_with_gap("Indexes", rows, row_gap() + 3.0))
 }
 
 fn index_row(idx: &IndexStats) -> AnyView {
@@ -603,7 +626,7 @@ fn index_row(idx: &IndexStats) -> AnyView {
                 theme::key_index()
             })
         }),
-        text(idx.name.clone()).style(|s| s.font_size(FONT_BODY).color(theme::text())),
+        text(idx.name.clone()).style(|s| s.font_size(font_body()).color(theme::text())),
     ))
     .style(|s| s.items_center().gap(6.0).flex_shrink(0.0_f32));
 
@@ -612,7 +635,7 @@ fn index_row(idx: &IndexStats) -> AnyView {
     // ragged trench beside short names without buying any comparison — the
     // figures aren't commensurable the way the detail lists' values are.
     let detail =
-        text(facts.join(" · ")).style(|s| s.font_size(FONT_BODY).color(theme::text_faint()));
+        text(facts.join(" · ")).style(|s| s.font_size(font_body()).color(theme::text_faint()));
 
     let flag: Option<AnyView> = unused.then(|| {
         h_stack((
@@ -622,14 +645,15 @@ fn index_row(idx: &IndexStats) -> AnyView {
             // all the counter can support: it resets when the server does, and a
             // nightly job's index looks identical to a dead one. The sentence is
             // the model's, so the exported Markdown says it too.
-            text(stats::unused_note()).style(|s| s.font_size(FONT_BODY).color(theme::plan_warn())),
+            text(stats::unused_note())
+                .style(|s| s.font_size(font_body()).color(theme::plan_warn())),
         ))
         .style(|s| s.items_center().gap(5.0))
         .into_any()
     });
 
     let row = h_stack((name, detail))
-        .style(|s| s.items_center().gap(INDEX_FACT_GAP).width_full())
+        .style(|s| s.items_center().gap(index_fact_gap()).width_full())
         .into_any();
     v_stack_from_iter(std::iter::once(row).chain(flag))
         .style(|s| s.flex_col().gap(2.0).width_full())
@@ -649,10 +673,10 @@ fn freshness_note(stats: &TableStats) -> Option<AnyView> {
 /// heading (`widgets::form_section`), so a group here reads at the same weight as
 /// **General** in Settings rather than inventing a third heading style.
 fn section(title: &'static str, rows: Vec<AnyView>) -> AnyView {
-    section_with_gap(title, rows, ROW_GAP)
+    section_with_gap(title, rows, row_gap())
 }
 
-/// [`section`] for a group whose rows need more air than the shared [`ROW_GAP`]
+/// [`section`] for a group whose rows need more air than the shared [`row_gap()`]
 /// — the index list, whose rows are taller and less uniform than a detail list's.
 fn section_with_gap(title: &'static str, rows: Vec<AnyView>, gap: f64) -> AnyView {
     v_stack((
@@ -667,15 +691,15 @@ fn section_with_gap(title: &'static str, rows: Vec<AnyView>, gap: f64) -> AnyVie
 fn detail(label: &'static str, value: String) -> AnyView {
     h_stack((
         text(label).style(|s| {
-            s.width(LABEL_W)
+            s.width(label_w())
                 .flex_shrink(0.0_f32)
-                .font_size(FONT_BODY)
+                .font_size(font_body())
                 .color(theme::text_faint())
         }),
         // `text_dim` — the app's form-label colour (`widgets::form_label_style`,
         // what "Font size" wears in Settings). Full `text()` made a column of
         // read-only facts shout louder than the editable fields elsewhere.
-        text(value).style(|s| s.font_size(FONT_BODY).color(theme::text_dim())),
+        text(value).style(|s| s.font_size(font_body()).color(theme::text_dim())),
     ))
     .style(|s| s.items_start().gap(10.0).width_full())
     .into_any()
@@ -686,7 +710,7 @@ fn note_line(icon: &'static str, color: fn() -> Color, message: String) -> AnyVi
     h_stack((
         icons::icon(icon, 14.0)
             .style(move |s| s.flex_shrink(0.0_f32).color(color()).margin_top(1.0)),
-        text(message).style(move |s| s.font_size(FONT_BODY).color(color())),
+        text(message).style(move |s| s.font_size(font_body()).color(color())),
     ))
     .style(|s| s.items_start().gap(7.0).width_full())
     .into_any()
@@ -772,7 +796,7 @@ fn footer(
                 move || (done)(),
             ),
         ))
-        .style(|s| s.gap(ACTION_GAP)),
+        .style(|s| s.gap(action_gap())),
     )
     .into_any()
 }

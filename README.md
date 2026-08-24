@@ -90,15 +90,17 @@ production data, or any data you care about.
   for a table from the shape of the data already in it. A built-in MCP server
   lets it read your schema and query the database, so answers are about your data
   rather than a generic guess.
-- **Themeable** — dark / light UI themes and multiple editor color schemes.
+- **Themeable** — dark / light UI themes, multiple editor color schemes, and an
+  interface scale (80% / 100% / 150% / 200%) for the app's own text and rows.
 
 ### Accessibility
 
 Schemaic is **keyboard-operable but not screen-reader accessible**, and the
 second half is not a plan we haven't got to — it is a limit of what the app is
 built on. Every modal has a focus ring and a Tab order, every destructive action
-can be reached and confirmed from the keyboard, and the header's **?** opens a
-reference of every shortcut.
+can be reached and confirmed from the keyboard, the header's **?** opens a
+reference of every shortcut, and **Settings → Appearance → Interface scale**
+enlarges the whole interface (not just one font) up to 200%.
 But Floem 0.2 exposes no accessibility tree at all — there is no AccessKit
 integration in the toolkit, so there is nothing for Narrator, VoiceOver or Orca
 to read, and no amount of markup in this repository can add one. If you need a

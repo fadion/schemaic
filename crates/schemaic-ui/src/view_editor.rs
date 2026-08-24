@@ -35,19 +35,23 @@ use schemaic_core::intel::SqlDialect;
 use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, loaded_table};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
-    focus_root_with_ring, form_section, form_setting, form_setting_owned, modal_footer_split,
-    modal_title_owned, panel_style,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
+    form_section, form_setting, form_setting_owned, modal_footer_split, modal_h, modal_pad_h,
+    modal_title_owned, modal_w, panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview, edit_field,
     object_location, theme,
 };
 
-const PANEL_W: f64 = 760.0;
+fn panel_w() -> f64 {
+    modal_w(760.0)
+}
 const PANEL_H: f64 = 620.0;
 /// Text-field width, matching the designer's and the connection form's.
-const FIELD_W: f64 = 260.0;
+fn field_w() -> f64 {
+    theme::scaled(260.0)
+}
 /// The body box's height before it scrolls — deep enough for a join with a
 /// couple of conditions to be read whole.
 const BODY_ROWS: usize = 14;
@@ -237,7 +241,7 @@ fn bound_choice(
     focusable_owned_dropdown(
         move || sig.get(),
         options,
-        FIELD_W,
+        field_w(),
         ring,
         tabindex,
         move |v: String| {
@@ -272,7 +276,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
             },
             |d, v| d.name = v.trim().to_string(),
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
 
     // The body. A plain multi-line field rather than the SQL editor pane: that
@@ -289,7 +293,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
                 multiline: true,
                 no_wrap: true,
                 mono: true,
-                font_size: theme::FONT_BODY,
+                font_size: theme::font_body,
                 max_rows: Some(ui.ddl.view_rows),
                 placeholder: "SELECT …",
                 focus: Some((ring.clone(), 20)),
@@ -348,13 +352,13 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
                 |d, v| d.options.column_list = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
             )
             // Wider than the form's other single-line fields: the placeholder is
-            // a sentence, and at `FIELD_W` it now ellipsizes away the half that
+            // a sentence, and at `field_w()` it now ellipsizes away the half that
             // says what happens when the field is left empty. (It used to *paint
             // over* the border instead — that is fixed in `edit_field`, and this
             // width is no longer a workaround for it.) Same width the trigger
             // editor's `When` and `Of columns` fields take, so the two SQLite
             // forms line up.
-            .style(move |s| s.width(FIELD_W * 1.6)),
+            .style(move |s| s.width(field_w() * 1.6)),
         )
         .into_any()
     };
@@ -385,10 +389,10 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
         let definer = form_setting_owned(
             "Definer".to_string(),
             text(draft.options.definer.clone().unwrap_or_else(|| "—".into()))
-                .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
+                .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
         );
         v_stack((security, definer))
-            .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+            .style(|s| s.flex_col().gap(form_gap()).width_full())
             .into_any()
     };
 
@@ -428,7 +432,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
         mysql_only,
         recreate,
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
 }
 
@@ -504,8 +508,11 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                form(ui.clone(), &target, ring.clone())
-                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
+                form(ui.clone(), &target, ring.clone()).style(|s| {
+                    s.width_full()
+                        .padding_horiz(modal_pad_h())
+                        .padding_vert(18.0)
+                }),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
@@ -535,7 +542,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                         return text(first.clone())
                             .style(|s| {
                                 s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
+                                    .font_size(theme::font_label())
                                     .max_width(460.0)
                             })
                             .into_any();
@@ -547,7 +554,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                         n => format!("{n} changes"),
                     })
                     .style(move |s| {
-                        s.font_size(theme::FONT_LABEL).color(if n == 0 {
+                        s.font_size(theme::font_label()).color(if n == 0 {
                             theme::text_faint()
                         } else {
                             theme::change_count()
@@ -593,7 +600,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                             },
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -605,7 +612,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
+            .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())

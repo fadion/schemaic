@@ -70,7 +70,7 @@ pub(crate) fn editor_placeholder(
 ) -> impl IntoView {
     empty().style(move |s| {
         let collapsed = editor_collapsed.get();
-        let h = if collapsed { 0.0 } else { editor_h.get() };
+        let h = crate::consts::effective_editor_h(editor_h.get(), collapsed);
         let s = s
             .width_full()
             .height(h)
@@ -165,7 +165,7 @@ fn approve_button_style(s: floem::style::Style) -> floem::style::Style {
     s.padding_horiz(14.0)
         .padding_vert(5.0)
         .border_radius(5.0)
-        .font_size(theme::FONT_BODY)
+        .font_size(theme::font_body())
         .background(theme::approve_bg())
         .color(theme::approve_text())
         .hover(|s| s.background(theme::approve_bg().multiply_alpha(0.88)))
@@ -175,7 +175,7 @@ fn reject_button_style(s: floem::style::Style) -> floem::style::Style {
     s.padding_horiz(14.0)
         .padding_vert(5.0)
         .border_radius(5.0)
-        .font_size(theme::FONT_BODY)
+        .font_size(theme::font_body())
         .background(theme::reject_bg())
         .color(theme::reject_text())
         .hover(|s| s.background(theme::reject_bg().multiply_alpha(0.85)))
@@ -316,12 +316,12 @@ fn cmdk_popup(
                 FieldCfg {
                     placeholder: "Ask the AI Assistant for help.",
                     background: bg_transparent,
-                    font_size: theme::FONT_TITLE,
+                    font_size: theme::font_title,
                     read_only: expanded,
                     // Focus in both states: compact to type, expanded (read-only,
                     // no caret) so Enter=accept / Escape=discard still work.
                     autofocus: true,
-                    height: Some(40.0),
+                    height: Some(|| theme::scaled(40.0)),
                     text_color: Some(theme::cmdk_text),
                     placeholder_color: Some(theme::cmdk_placeholder),
                     border_color: Some(bg_transparent),
@@ -338,7 +338,7 @@ fn cmdk_popup(
                     let discard_c = discard.clone();
                     container(
                         h_stack((
-                            verb_spinner(theme::text_dim, theme::FONT_BODY),
+                            verb_spinner(theme::text_dim, theme::font_body),
                             // Same style as Reject; cancels the generation and
                             // closes the overlay (see `discard`).
                             container(text("Cancel"))
@@ -357,7 +357,7 @@ fn cmdk_popup(
                     .into_any()
                 }
                 InlineAiState::Failed(msg) => container(
-                    text(msg).style(|s| s.color(theme::error()).font_size(theme::FONT_BODY)),
+                    text(msg).style(|s| s.color(theme::error()).font_size(theme::font_body())),
                 )
                 .style(|s| {
                     s.width_full()
@@ -391,45 +391,44 @@ fn cmdk_popup(
                     // Body: the diff, or a "no changes" note if the suggestion is
                     // identical to the current text (else the diff would be a lone
                     // "⋯ N unchanged lines" gap, which reads as a bug).
-                    let diff_area = if no_changes {
-                        container(
-                            text("No changes suggested.")
-                                .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
-                        )
-                        .style(|s| {
-                            s.width_full()
-                                .flex_shrink(0.0_f32)
-                                .padding_horiz(10.0)
-                                .padding_top(5.0)
-                                .padding_bottom(10.0)
-                        })
-                        .into_any()
-                    } else {
-                        // Fixed-height scroll (CMDK_DIFF_H); inner clip wrapper
-                        // carries the 5px radius (the scroll's own border_radius
-                        // didn't round visibly); `shift_hscroll` = Shift+wheel
-                        // horizontal scroll. Buttons below always stay visible.
-                        container(
+                    let diff_area =
+                        if no_changes {
+                            container(text("No changes suggested.").style(|s| {
+                                s.color(theme::text_dim()).font_size(theme::font_body())
+                            }))
+                            .style(|s| {
+                                s.width_full()
+                                    .flex_shrink(0.0_f32)
+                                    .padding_horiz(10.0)
+                                    .padding_top(5.0)
+                                    .padding_bottom(10.0)
+                            })
+                            .into_any()
+                        } else {
+                            // Fixed-height scroll (`cmdk_diff_h()`); inner clip wrapper
+                            // carries the 5px radius (the scroll's own border_radius
+                            // didn't round visibly); `shift_hscroll` = Shift+wheel
+                            // horizontal scroll. Buttons below always stay visible.
                             container(
-                                autohide(shift_hscroll(diff_view(rows, dialect)))
-                                    .style(|s| s.height(CMDK_DIFF_H).width_full().min_width(0.0)),
+                                container(autohide(shift_hscroll(diff_view(rows, dialect))).style(
+                                    |s| s.height(cmdk_diff_h()).width_full().min_width(0.0),
+                                ))
+                                .style(|s| s.width_full().border_radius(5.0))
+                                .clip(),
                             )
-                            .style(|s| s.width_full().border_radius(5.0))
-                            .clip(),
-                        )
-                        .style(|s| {
-                            // 5px gap from the question field above; 10px gap to
-                            // the buttons below.
-                            s.flex_col()
-                                .width_full()
-                                .min_width(0.0)
-                                .flex_shrink(0.0_f32)
-                                .padding_horiz(5.0)
-                                .padding_top(5.0)
-                                .padding_bottom(10.0)
-                        })
-                        .into_any()
-                    };
+                            .style(|s| {
+                                // 5px gap from the question field above; 10px gap to
+                                // the buttons below.
+                                s.flex_col()
+                                    .width_full()
+                                    .min_width(0.0)
+                                    .flex_shrink(0.0_f32)
+                                    .padding_horiz(5.0)
+                                    .padding_top(5.0)
+                                    .padding_bottom(10.0)
+                            })
+                            .into_any()
+                        };
 
                     // `+N −M` change summary, left of the buttons (hidden when
                     // there's nothing to summarize).
@@ -438,11 +437,11 @@ fn cmdk_popup(
                     } else {
                         h_stack((
                             text(format!("+{added}")).style(|s| {
-                                s.font_size(theme::FONT_BODY)
+                                s.font_size(theme::font_body())
                                     .color(theme::diff_add_marker())
                             }),
                             text(format!("−{removed}")).style(|s| {
-                                s.font_size(theme::FONT_BODY)
+                                s.font_size(theme::font_body())
                                     .color(theme::diff_del_marker())
                             }),
                         ))
@@ -549,7 +548,7 @@ fn cmdk_popup(
             s.inset_left(10.0)
                 .inset_right(10.0)
                 .inset_top(p.y + 8.0)
-                .height(42.0)
+                .height(theme::scaled(42.0))
         }
     })
 }
@@ -2673,7 +2672,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 h_stack((
                     text(one_line).style(|s| {
                         s.color(theme::reject_text())
-                            .font_size(theme::FONT_BODY)
+                            .font_size(theme::font_body())
                             .max_width_pct(60.0)
                             .text_ellipsis()
                             .margin_left(8.0)
@@ -2682,7 +2681,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         .on_click_stop(move |_| error_modal_open.set(true))
                         .style(|s| {
                             s.color(theme::err_fix_btn())
-                                .font_size(theme::FONT_BODY)
+                                .font_size(theme::font_body())
                                 .margin_left(10.0)
                         }),
                     empty().style(|s| s.flex_grow(1.0_f32)),
@@ -2690,7 +2689,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         icons::icon(icons::SPARKLES, 16.0)
                             .style(|s| s.color(theme::err_fix_btn()).margin_right(5.0)),
                         text("AI fix")
-                            .style(|s| s.color(theme::err_fix_btn()).font_size(theme::FONT_BODY)),
+                            .style(|s| s.color(theme::err_fix_btn()).font_size(theme::font_body())),
                     ))
                     .on_click_stop(move |_| (ai_fix)())
                     .style(|s| s.flex_row().items_center().margin_right(8.0)),
@@ -2712,7 +2711,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     .inset_left(5.0)
                     .inset_right(5.0)
                     .inset_bottom(5.0)
-                    .height(35.0)
+                    .height(theme::scaled(35.0))
             } else {
                 s
             }
@@ -2739,7 +2738,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         .on_click_stop(move |_| (run_anyway)())
                         .style(|s| {
                             s.color(theme::err_fix_btn())
-                                .font_size(theme::FONT_BODY)
+                                .font_size(theme::font_body())
                                 .margin_right(8.0)
                         })
                         .into_any()
@@ -2749,7 +2748,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 h_stack((
                     text(g.message).style(|s| {
                         s.color(theme::reject_text())
-                            .font_size(theme::FONT_BODY)
+                            .font_size(theme::font_body())
                             .max_width_pct(70.0)
                             .text_ellipsis()
                             .margin_left(8.0)
@@ -2774,7 +2773,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     .inset_left(5.0)
                     .inset_right(5.0)
                     .inset_bottom(5.0)
-                    .height(35.0)
+                    .height(theme::scaled(35.0))
             } else {
                 s
             }
@@ -2922,9 +2921,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .style(|s| {
                     panel_style(s)
                         .background(theme::bg_chrome())
-                        .min_width(RUN_MENU_W)
+                        .min_width(run_menu_w())
                         .padding_vert(6.0)
-                        .font_size(theme::FONT_TITLE)
+                        .font_size(theme::font_title())
                 });
                 let positioned = container(panel).style(move |s| {
                     // `pos` is a *content* anchor, so the viewport comes off here —
@@ -2935,7 +2934,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // anchor against `area_w` and got cut off at that edge.
                     let p = run_menu_pos(
                         pos,
-                        (RUN_MENU_W, RUN_MENU_H),
+                        (run_menu_w(), run_menu_h()),
                         content_x_of(&query.get_untracked()),
                         ed_vp.get(),
                     );
@@ -3148,7 +3147,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         })
                         .pointer_events(|| true)
                         .tooltip(move || {
-                            text(msg.clone()).style(|s| s.font_size(12.0).max_width(360.0))
+                            text(msg.clone())
+                                .style(|s| s.font_size(theme::scaled_font(12.0)).max_width(360.0))
                         })
                 }))
                 .style(|s| s.absolute().inset(0.0))
@@ -3474,9 +3474,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     FieldCfg {
                         placeholder: "Find",
                         autofocus: true,
-                        font_size: 13.0,
+                        font_size: theme::font_body,
                         border_radius: 6.0,
-                        height: Some(FIELD_INPUT_H),
+                        height: Some(field_input_h),
                         on_submit: Some(on_submit),
                         on_escape: Some(Rc::new(move || (esc)())),
                         on_arrow_up: Some(on_up),
@@ -3484,7 +3484,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         ..Default::default()
                     },
                 )
-                .style(|s| s.width(170.0));
+                .style(|s| s.width(theme::scaled(170.0)));
                 let count = dyn_container(
                     // `with`, not `get` — reading a length shouldn't clone the hits.
                     move || (find_hits.with(|h| h.len()), find_idx.get()),
@@ -3492,7 +3492,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         let cur = if n == 0 { 0 } else { i + 1 };
                         text(format!("{cur}/{n}"))
                             .style(|s| {
-                                s.font_size(theme::FONT_LABEL)
+                                s.font_size(theme::font_label())
                                     .color(theme::text_dim())
                                     .min_width(30.0)
                             })
@@ -3526,11 +3526,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // is top-aligned (`items_start`, which keeps the reveal from spilling
                 // upward over the find row).
                 let text_btn = |label: &'static str, on: Rc<dyn Fn()>| {
-                    container(text(label).style(|s| s.font_size(theme::FONT_LABEL)))
+                    container(text(label).style(|s| s.font_size(theme::font_label())))
                         .on_click_stop(move |_| (on)())
                         .style(|s| {
                             s.items_center()
-                                .height(26.0)
+                                .height(theme::scaled(26.0))
                                 .color(theme::text_dim())
                                 .hover(|s| s.color(theme::text()))
                         })
@@ -3541,15 +3541,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     find_replace,
                     FieldCfg {
                         placeholder: "Replace",
-                        font_size: 13.0,
+                        font_size: theme::font_body,
                         border_radius: 6.0,
-                        height: Some(FIELD_INPUT_H),
+                        height: Some(field_input_h),
                         on_submit: Some(ro),
                         on_escape: Some(esc2),
                         ..Default::default()
                     },
                 )
-                .style(|s| s.width(170.0));
+                .style(|s| s.width(theme::scaled(170.0)));
                 // The replace row is always mounted but shown/hidden via `display`
                 // (no animation — an in-flow height transition through a clip was
                 // janky, and the reveal isn't worth it here). Hidden ⇒ `display:none`.
@@ -3575,7 +3575,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // collapses, leaving `All` hugging `Replace` instead of pinned under
                 // the ×. Sized just to the find row's packed width so the leftover
                 // spacer (hence the field→controls gap) is ~15px, not ~33px.
-                let content = v_stack((row1, replace_row)).style(|s| s.width(283.0));
+                let content = v_stack((row1, replace_row)).style(|s| s.width(theme::scaled(283.0)));
                 h_stack((toggle, content))
                     .style(|s| {
                         s.items_center()
@@ -3610,9 +3610,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     FieldCfg {
                         placeholder: "",
                         autofocus: true,
-                        font_size: 13.0,
+                        font_size: theme::font_body,
                         border_radius: 6.0,
-                        height: Some(FIELD_INPUT_H),
+                        height: Some(field_input_h),
                         on_submit: Some(submit.clone()),
                         on_escape: Some(Rc::new(move || (esc)())),
                         ..Default::default()
@@ -3621,7 +3621,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // Wide enough for a six-figure line number and the caret. 52px
                 // fit four digits, so a line number in a generated script — the
                 // case the popup exists for — scrolled inside its own field.
-                .style(|s| s.width(78.0));
+                .style(|s| s.width(theme::scaled(78.0)));
                 // Close ✕ — same glyph size, styling, and row gap as the
                 // find/replace bar's × (`icon_btn` there is a local closure).
                 let close_x = close.clone();
@@ -3634,7 +3634,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     });
                 h_stack((
                     text("Go to:")
-                        .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
+                        .style(|s| s.font_size(theme::font_label()).color(theme::text_dim())),
                     input,
                     close_btn,
                 ))
@@ -3760,7 +3760,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let name = db.unwrap_or_else(|| "No database".to_string());
             // No `.color(...)` — inherits the h_stack's (hover-reactive) colour.
             text(name)
-                .style(|s| s.font_size(theme::FONT_TITLE))
+                .style(|s| s.font_size(theme::font_title()))
                 .into_any()
         }),
         icons::icon(icons::CHEVRON_DOWN, 16.0)
@@ -3839,9 +3839,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // the results grid below flex-grows into the remaining space.
     v_stack((toolbar, editor_wrap)).style(move |s| {
         // Collapsed → height 0 so the RESULTS grid takes the whole region (instant,
-        // no animation). `editor_h` is unchanged — the restore height for un-collapse.
+        // no animation). `editor_h` is unchanged — the restore height for
+        // un-collapse — and the floor is applied here rather than written back to
+        // it (`effective_editor_h`).
         let collapsed = editor_collapsed.get();
-        let h = if collapsed { 0.0 } else { editor_h.get() };
+        let h = crate::consts::effective_editor_h(editor_h.get(), collapsed);
         let s = s
             .width_full()
             .height(h)

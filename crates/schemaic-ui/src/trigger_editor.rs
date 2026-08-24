@@ -69,9 +69,10 @@ use crate::table_designer::{
     list_row_plain, loaded_table,
 };
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
-    control_button, control_button_enabled, focus_root_with_ring, form_section, form_setting,
-    form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, control_button,
+    control_button_enabled, focus_root_with_ring, form_gap, form_section, form_setting,
+    form_setting_owned, modal_footer_split, modal_h, modal_pad_h, modal_title_owned, modal_w,
+    panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn, TriggerSrcRequest,
@@ -81,9 +82,16 @@ use crate::{
 /// Matches the table designer's, deliberately: this is the same list-plus-form
 /// layout over the same fixed-width list, so a different panel width squeezes
 /// the form pane and reads as the list being over-padded.
-const PANEL_W: f64 = 900.0;
+fn panel_w() -> f64 {
+    modal_w(900.0)
+}
+/// The modal's height at 100% — scaled and capped against the window by
+/// [`crate::widgets::modal_h`] at the call site. Not a fixed height, whatever an
+/// earlier version of this comment said.
 const PANEL_H: f64 = 620.0;
-const FIELD_W: f64 = 260.0;
+fn field_w() -> f64 {
+    theme::scaled(260.0)
+}
 /// The body box's height before it scrolls.
 const BODY_ROWS: usize = 12;
 /// What a new MySQL trigger starts from: valid, obviously a placeholder, and
@@ -402,7 +410,7 @@ fn bound_choice(
     focusable_owned_dropdown(
         move || sig.get(),
         options,
-        FIELD_W,
+        field_w(),
         ring,
         tabindex,
         move |v: String| {
@@ -563,7 +571,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
             form_setting_owned(
                 "Name".to_string(),
                 text(draft.info.name.clone())
-                    .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+                    .style(|s| s.color(theme::text()).font_size(theme::font_body())),
             ),
             text(
                 "This is a constraint trigger. Schemaic doesn't model the deferral \
@@ -572,11 +580,11 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
             )
             .style(|s| {
                 s.color(theme::text_dim())
-                    .font_size(theme::FONT_LABEL)
+                    .font_size(theme::font_label())
                     .max_width(420.0)
             }),
         ))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any();
     }
 
@@ -593,7 +601,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
             },
             |d, v| d.info.name = v.trim().to_string(),
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
 
     // `INSTEAD OF` is **a view's alone** on both engines that have it: on a table
@@ -685,7 +693,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
             );
         }
         v_stack_from_iter(rows)
-            .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+            .style(|s| s.flex_col().gap(form_gap()).width_full())
             .into_any()
     } else {
         form_setting(
@@ -765,7 +773,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
                     d.info.condition = Some(v.trim().to_string()).filter(|c| !c.is_empty());
                 },
             )
-            .style(move |s| s.width(FIELD_W * 1.6)),
+            .style(move |s| s.width(field_w() * 1.6)),
         )
         .into_any()
     };
@@ -799,7 +807,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
                         .collect();
                 },
             )
-            .style(move |s| s.width(FIELD_W * 1.6)),
+            .style(move |s| s.width(field_w() * 1.6)),
         )
         .into_any()
     };
@@ -856,7 +864,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         form_section("Action").style(|s| s.margin_top(4.0)),
         action,
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
 }
 
@@ -978,7 +986,7 @@ fn pg_action(
             focusable_owned_dropdown(
                 move || sel.get(),
                 options,
-                FIELD_W,
+                field_w(),
                 picker_ring.clone(),
                 60,
                 move |v: String| {
@@ -1079,10 +1087,10 @@ fn pg_action(
                     });
                 },
             )
-            .style(move |s| s.width(FIELD_W * 1.6)),
+            .style(move |s| s.width(field_w() * 1.6)),
         ),
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
 }
 
@@ -1300,7 +1308,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     .width_full()
                     .flex_grow(1.0_f32)
                     .min_height(0.0)
-                    .padding_horiz(MODAL_PAD_H)
+                    .padding_horiz(modal_pad_h())
                     .padding_vert(18.0)
                     .gap(0.0)
             });
@@ -1318,7 +1326,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                         return text(first.clone())
                             .style(|s| {
                                 s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
+                                    .font_size(theme::font_label())
                                     .max_width(460.0)
                             })
                             .into_any();
@@ -1330,7 +1338,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                         n => format!("{n} changes"),
                     })
                     .style(move |s| {
-                        s.font_size(theme::FONT_LABEL).color(if n == 0 {
+                        s.font_size(theme::font_label()).color(if n == 0 {
                             theme::text_faint()
                         } else {
                             theme::change_count()
@@ -1375,7 +1383,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                             },
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -1387,7 +1395,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
+            .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())

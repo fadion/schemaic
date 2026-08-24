@@ -43,9 +43,9 @@ use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown};
 use crate::trigger_editor::unique_name;
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
-    focus_root_with_ring, form_section, form_setting, modal_footer_split, modal_title_owned,
-    panel_style,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
+    form_section, form_setting, modal_footer_split, modal_h, modal_pad_h, modal_title_owned,
+    modal_w, panel_style,
 };
 use crate::{
     EventSrcDoneFn, EventSrcRequest, EventTarget, FieldCfg, Ui, ddl_preview, edit_field,
@@ -54,9 +54,13 @@ use crate::{
 
 /// Matches the routine editor's: the two are siblings in every way that shows,
 /// and a panel that changed size between them would read as a different app.
-const PANEL_W: f64 = 900.0;
+fn panel_w() -> f64 {
+    modal_w(900.0)
+}
 const PANEL_H: f64 = 620.0;
-const FIELD_W: f64 = 260.0;
+fn field_w() -> f64 {
+    theme::scaled(260.0)
+}
 /// The body box's height before it scrolls.
 const BODY_ROWS: usize = 12;
 
@@ -342,7 +346,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
             focusable_owned_dropdown(
                 move || sig.get(),
                 vec![SCHED_EVERY.to_string(), SCHED_AT.to_string()],
-                FIELD_W,
+                field_w(),
                 ring.clone(),
                 TAB_SHAPE,
                 move |label: String| {
@@ -408,7 +412,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                             d.info.schedule = EventSchedule::At(v);
                         },
                     )
-                    .style(move |s| s.width(FIELD_W * 1.6)),
+                    .style(move |s| s.width(field_w() * 1.6)),
                 )
                 .into_any();
             }
@@ -464,11 +468,11 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                             }
                         },
                     )
-                    .style(|s| s.width(80.0)),
+                    .style(|s| s.width(theme::scaled(80.0))),
                     focusable_owned_dropdown(
                         move || unit_sig.get(),
                         units,
-                        FIELD_W * 0.7,
+                        field_w() * 0.7,
                         ring.clone(),
                         TAB_SCHED + 10,
                         move |v: String| {
@@ -507,7 +511,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                             set(&mut d.info.schedule, (!v.is_empty()).then(|| v.to_string()));
                         },
                     )
-                    .style(move |s| s.width(FIELD_W * 1.6)),
+                    .style(move |s| s.width(field_w() * 1.6)),
                 )
             };
 
@@ -524,14 +528,14 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                     }
                 }),
             ))
-            .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+            .style(|s| s.flex_col().gap(form_gap()).width_full())
             .into_any()
         },
     )
     .style(|s| s.flex_col().width_full());
 
     v_stack((shape, fields))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
 }
 
@@ -551,7 +555,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
             },
             |d, v| d.info.name = v.trim().to_string(),
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
 
     let body = form_setting(
@@ -602,7 +606,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
                 focusable_owned_dropdown(
                     move || sig.get(),
                     labels,
-                    FIELD_W,
+                    field_w(),
                     ring.clone(),
                     TAB_OPT,
                     move |label: String| {
@@ -652,7 +656,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
                     d.info.definer = (!v.is_empty()).then(|| v.to_string());
                 },
             )
-            .style(move |s| s.width(FIELD_W)),
+            .style(move |s| s.width(field_w())),
         )
         .into_any(),
     );
@@ -673,7 +677,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
                     d.info.comment = (!v.is_empty()).then(|| v.to_string());
                 },
             )
-            .style(move |s| s.width(FIELD_W * 1.6)),
+            .style(move |s| s.width(field_w() * 1.6)),
         )
         .into_any(),
     );
@@ -694,7 +698,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     );
     rows.extend(options);
     v_stack_from_iter(rows)
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
 }
 
@@ -755,11 +759,13 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let body = crate::widgets::autohide(scroll(
-                event_form(ui.clone(), ring.clone())
-                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
-            ))
-            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
+            let body =
+                crate::widgets::autohide(scroll(event_form(ui.clone(), ring.clone()).style(|s| {
+                    s.width_full()
+                        .padding_horiz(modal_pad_h())
+                        .padding_vert(18.0)
+                })))
+                .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
             // Every event in this database, so the footer can see a rename
             // landing on one. Read once per open rather than per keystroke: it
@@ -798,7 +804,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                         text(m)
                             .style(|s| {
                                 s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
+                                    .font_size(theme::font_label())
                                     .max_width(460.0)
                             })
                             .into_any()
@@ -808,7 +814,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                     // body rather than the event as written.
                     if pending {
                         return text("Reading the event's source…")
-                            .style(|s| s.color(theme::text_faint()).font_size(theme::FONT_LABEL))
+                            .style(|s| s.color(theme::text_faint()).font_size(theme::font_label()))
                             .into_any();
                     }
                     if stale {
@@ -833,7 +839,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                         n => format!("{n} changes"),
                     })
                     .style(move |s| {
-                        s.font_size(theme::FONT_LABEL).color(if n == 0 {
+                        s.font_size(theme::font_label()).color(if n == 0 {
                             theme::text_faint()
                         } else {
                             theme::change_count()
@@ -903,7 +909,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                             },
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -915,7 +921,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
+            .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())

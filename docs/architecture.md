@@ -2344,15 +2344,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
   `Rc<…Actions>` callback bundles — so `ui.run` is `ui.tab_actions.run`, `ui.db_nodes` is
   `ui.schema.db_nodes`, the tabs signal is `ui.tabs_ui.tabs`. Modules:
-  - `consts.rs` — layout/dimension constants + `MONO_FAMILY` (glob-imported). Any SQL/code
+  - `consts.rs` — layout/dimension metrics + `MONO_FAMILY` (glob-imported). Any SQL/code
     surface reads that one name — the diff view, and `FieldCfg::mono` (the DDL preview's
-    script box, the view editor's definition). `FIELD_INPUT_H` is the same idea for the
+    script box, the view editor's definition). Most of the file is `fn() -> f64` rather than
+    `const`, because the interface scale multiplies anything that boxes text; the module doc lists
+    what stays a `const` and why (hairlines, editor-relative metrics, seeds for persisted widths).
+    `field_input_h()` is the same idea for the
     **compact single-line field** every transient bar wears (the editor's find/replace/goto, the
     grid's find/goto, the row panel's inputs): `FieldCfg::height` is an `Option`, and leaving it
     off is not a neutral default but a *different* control — `None` derives the box from content
-    at `line_h + CHAT_PAD_V * 2 + 3`, which is 34px against this 26. The grid's find bar shipped
+    at `line_h + chat_pad_v() * 2 + 3`, which is 34px against this 26. The grid's find bar shipped
     without it and stood 8px taller than the identical editor bar beside it, so a bar that means
-    to be compact says so with this constant and never with a literal.
+    to be compact says so with this metric and never with a literal.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
     `section_title`/`centered_msg`/`toggle_icon` (and `toggle_icon_gated`, whose panel may not be
@@ -2403,7 +2406,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     not-SQL, because an untagged block is the uncommon case and a missing Run button is the safe
     way to be wrong. Both are unit-tested, including every keyword the list claims — one quietly
     dropped is a Run button that stops appearing with nothing else to notice it.
-  - `settings.rs` — the three settings modals **and the four shared controls every modal's form is
+  - `settings.rs` — the three settings modals (the main one's groups are General / Editor / Query /
+    **Appearance**, the last holding the two theme pickers and the **interface scale**) **and the
+    four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
     floem's), `focusable_dropdown` and the picker-agnostic `in_ring_dropdown` under it (which owns
     the four floem work-arounds a keyboard-operable dropdown needs). `themed_toggle` and
@@ -3256,7 +3261,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     read "Export failed — Export failed: Access is denied". `Tone` resolves to a `fn() -> Color`, per the themable-colour invariant.
     It is pure and tested inline, which is what keeps the copy honest: the two caveats co-occurring
     is precisely the case a per-state `match` got wrong.
-  - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`.
+  - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
+    surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
+    `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
+    `scale_at`/`scale_font_at` rounding; `icons.rs` sizes every glyph, scaling the **base** size its
+    callers pass.
   - `contrast.rs` — the **legibility gate** over `themes.rs`: WCAG relative-luminance maths plus
     `UI_PAIRINGS`/`EDITOR_PAIRINGS`, one row per (foreground, background) combination the UI really
     paints, each with the floor its role earns. The unit is the **pairing**, not the literal — a
@@ -4119,6 +4128,19 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Themable colors reach reactive styles as `fn() -> Color`, never a captured `Color`.** A `Color`
   read once at build freezes and won't follow a live theme switch; pass the fn and call it inside
   the `.style(move |s| …)` closure (see `FieldCfg::background`).
+- **And so do sizes**: a design token that boxes, indents or spaces text is a `fn() -> f32`/`fn() ->
+  f64` reading the interface scale (`theme::font_body()`, `consts::row_h()`, `theme::scaled(…)`),
+  never a `const`. Same mechanism, same reason — the `.style` closure that *calls* the metric re-runs
+  when the scale changes, and a `const` can never re-evaluate. **This extends to a size passed as an
+  argument**: `FieldCfg::font_size` and `highlight_text`'s size are `fn() -> f32`, because a caller
+  that resolves `theme::font_body()` at build time freezes the value just as surely as a `const`
+  would. If a size ends up inside something that isn't a style closure (a text `Attrs` list, an
+  editor `Styling`), pass the fn and read it *there*. The exceptions are written down on
+  `consts.rs`'s module doc and are all one of three things: a hairline, an editor-relative metric
+  (the code font has its own size setting and the scale doesn't touch it), or the seed for a
+  persisted width the user dragged. `icons::icon(markup, size)` takes a **base** size and scales it
+  itself, so never hand it an already-scaled value — the two-way trap `consts::COMPLETION_ICON_BASE`
+  and `consts::SCHEMA_ICON_BASE` exist to spell out.
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
   export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
 - **Generated DDL is never run silently, and never emitted from a second differ.** Every
@@ -4327,25 +4349,95 @@ Re-introducing the anti-patterns these guard against is a regression:
     should always change together). Otherwise extract a separate named fn — even if it starts at the
     same hex — so each can be retuned independently (e.g. `seed_button()` alongside the identical
     `status_ok()`).
-- **Theming (`themes.rs`)**: two independent axes — `UiTheme` (chrome: dark/light) and `EditorTheme`
-  (editor surface + syntax tokens: One Dark Pro / Tokyo Night / Catppuccin Latte). A theme is a flat
-  struct of named colour roles (hex). Active themes live in `Scope`-owned global `RwSignal`s;
-  `theme::set_ui`/`set_editor` swap them. The choice is persisted (`ui_theme`/`editor_theme` in
-  `UiState`) and seeded via `theme::init` before the view builds. Editor tokens re-highlight on
-  switch because `SqlStyling::id()` returns `theme::editor_generation()`.
+- **Theming (`themes.rs`)**: three independent axes — `UiTheme` (chrome: dark/light), `EditorTheme`
+  (editor surface + syntax tokens: One Dark Pro / Tokyo Night / Catppuccin Latte) and `UiScale`
+  (how large the chrome is drawn). A theme is a flat struct of named colour roles (hex). All three
+  live in `Scope`-owned global `RwSignal`s; `theme::set_ui`/`set_editor`/`set_ui_scale` swap them.
+  The choices are persisted (`ui_theme`/`editor_theme`/`ui_scale` in `UiState`) and seeded via
+  `theme::init` before the view builds. Editor tokens re-highlight on switch because
+  `SqlStyling::id()` returns `theme::editor_generation()`.
   - **Live-switch caveat**: a colour read *inside* a reactive `.style` closure updates instantly; one
     captured *by value* freezes at build time. Prefer `fn() -> Color` for anything themable (see
     `FieldCfg::background`).
+- **Interface scale (`UiScale`: Small 80% / Normal 100% / Large 150% / Huge 200%)** multiplies the
+  *design tokens*, not the window. Floem 0.2 has no user-settable render scale, and a paint
+  transform over the whole tree would take hit-testing and the editor's own coordinate arithmetic
+  with it — so instead the type scale (`theme::font_*()`), the layout metrics (`consts::*`), the
+  per-module modal metrics and `icons::icon` all read the signal and round to whole pixels
+  (`themes::scale_at`, unit-tested: **`Normal` is the exact identity**, results are integral, and a
+  positive size never rounds to nothing).
+  - **What it deliberately doesn't touch**: the SQL editor's code font and the terminal font, both of
+    which already have their own size setting (and the editor a per-tab Ctrl+scroll zoom whose
+    override is an absolute px that a second multiplication would double-apply); persisted panel
+    widths, which are px the user dragged — the *minimums* they clamp against scale, which is what
+    keeps a panel from being narrower than its own text; and the ER diagram's canvas, which has its
+    own zoom.
+  - **A modal's size scales, then caps against the window** — `widgets::modal_w` for the width,
+    `modal_h` for a fixed-height panel, `modal_body_h` for a scrolling body inside one. All three
+    read `window_size()` inside the caller's style closure, so a resize re-runs them, and all three
+    clamp their own floor to the window (a *scaled* floor passes 600px, and one wider than the
+    screen would clip through the guard meant to keep the panel usable).
+    - Heights were left unscaled at first, on the grounds that 620px is already most of a laptop
+      screen — but the type inside them grew, so at 200% an editor was three fields and a scrollbar.
+    - **Width is the one that must fit first.** A modal is centred in a full-window backdrop: one
+      taller than the window loses its footer (where Apply lives) off the bottom, but one *wider*
+      than the window loses its left half — the designer's list pane and every field label with it.
+      The 900px editors came to 1800 at 200%, which is wider than a 1440p screen's window.
+  - **A size the scale has to reach cannot be a plain `f32` parameter.** Three carry a `fn() -> f32`
+    for exactly the reason the colours do:
+    - `FieldCfg::font_size` — `edit_field` derives its box height, padding, placeholder position
+      **and** its editor's `FieldStyling` from it (a hand-written `Styling`, because floem's
+      `SimpleStyling` takes the size by value);
+    - `widgets::highlight_text` / `highlight_mono` — their `rich_text` closure *is* reactive, but
+      only for what it reads inside itself;
+    - `widgets::loading_dots` / `verb_spinner` — which also *measure* from it (the reserved width
+      that stops the dots reflowing), and which live for as long as the operation they report.
+
+    All three shipped as `f32` and all three froze at the size their view was built at: every text
+    field kept 13px type in a box grown for 20px, every highlighted row in the tree / history /
+    activity panels kept its old size until a filter change rebuilt it, and the app's one moving
+    indicator stayed at whatever scale was active when the query started.
+  - **`set_ui_scale` bumps `ui_generation`** for the one place a size still can't be re-read: a text
+    `Attrs` list built outside a reactive closure (`markdown.rs`). Views keyed on the generation
+    rebuild.
+  - **A cursor menu's flipped arm pins a *trailing* inset; it never computes a leading one**
+    (`widgets::cursor_menu_insets` → `MenuInset::Start`/`End`). Four arms per axis: after the cursor
+    if it fits, before it if that fits, flush with the window's far edge when neither does, and the
+    window origin for a panel bigger than the window. The panel's size is an **estimate**
+    (`menu_panel_height` counts rows), so it is allowed to decide *which* edge and nothing else —
+    subtracting it from the cursor put the real edge wherever the estimate was wrong, which showed
+    as a gap between a flipped menu's bottom and the pointer that flipped it. `submenu_insets` has
+    always worked this way; this is the same trick, and the reason that one never drifted.
+    - Two earlier spellings both failed at scale, and both are worth not re-deriving: clamping the
+      flipped arm at zero threw every context menu to the window's top-left corner once a menu was
+      600–750px tall, and scaling the whole 30.5px row estimate (padding included, though the
+      padding doesn't scale yet) over-predicted a long menu by ~190px and flipped menus that had
+      room below them.
+  - **The interface scale is a segmented control, not a dropdown** (`settings::scale_picker`),
+    because floem nudges an overflowing overlay in paint only — see *Floem 0.2 gotchas*, where the
+    finding is written up in full. Four short segments, one Tab stop with Left/Right inside it
+    (`nav_group`), arrows applying as they move.
+  - **The AI panel's height floor is held only while a turn streams** (`next_floor(…, !busy)`).
+    `ai_panel`'s `floor` exists for the measurement dip a rebuilt `RichText` reports mid-stream; an
+    idle panel has no dip to hide, so it takes what it just measured. It *also* releases early,
+    inside a stream, on the things known to change the true height (message count, wrap width,
+    connection, interface scale) — but that list is an optimisation now, not the guarantee, because
+    it was incomplete twice: first the wrap width, then the scale, each leaving a **permanent** band
+    of blank under the last message rather than one frame of it. Written as the premise, a missed
+    invalidator closes itself on the next layout.
+  - Derived metrics sum the **scaled parts** rather than scaling the sum (`consts::leaf_pad`), so an
+    indent lands on the pixel the glyphs it aligns under actually occupy — at 80% those differ by one.
 - **Reactive text**: use `dyn_container` (no `floem::views::label`).
 - **There is no accessibility tree, and there is nothing in this repository that can add one.**
   Floem 0.2.0 ships no AccessKit integration and no a11y surface of any kind — grepping the crate
   for `accesskit`/`accessibility`/`a11y` turns up only the English word in two doc comments about
   platform config — so nothing the app builds is exposed to Narrator, VoiceOver or Orca, whatever
-  it is labelled. What the app *does* have is keyboard operability, and that is the axis worth
-  spending on: `FocusRing`, `focus_root_with_ring`, spaced tab indices, `widgets::accept_launch`,
-  and the `shortcuts.rs` table with the test that fails when a binding has no row. The README says
-  this out loud under *Accessibility* rather than leaving someone to discover it after the
-  download; revisit if a later Floem grows the layer.
+  it is labelled. What the app *does* have is keyboard operability and a legible size, and those are
+  the axes worth spending on: `FocusRing`, `focus_root_with_ring`, spaced tab indices,
+  `widgets::accept_launch`, the `shortcuts.rs` table with the test that fails when a binding has no
+  row — and the **interface scale** (`UiScale`), which is why the chrome's type is a set of
+  functions rather than a 13px constant. The README says this out loud under *Accessibility* rather
+  than leaving someone to discover it after the download; revisit if a later Floem grows the layer.
 
 ## Floem 0.2 gotchas (learned the hard way)
 
@@ -4359,6 +4451,25 @@ Re-introducing the anti-patterns these guard against is a regression:
   class wins. Nest class overrides accordingly (dropdown popup restyle nests under `ListClass`).
 - **`DoubleClick` consumes the second `PointerUp`** — clear drag/press state in the double-click
   handler too, not only in `PointerUp`.
+- **An overlay that would overflow the window is nudged back in *paint only*.**
+  `OverlayView::paint` (`floem-0.2.0/src/window_handle.rs`) does
+  `cx.offset((-x, -y))` when `window_origin + size` passes `parent_size - 5` on either axis — and
+  nothing corresponding happens to its layout, so hit-testing keeps answering at the *un-nudged*
+  position. Everything inside such an overlay is drawn in one place and clicked in another, by
+  however much it overflowed.
+  - This reaches the app through **`floem::views::dropdown::Dropdown`**, whose popup is an overlay
+    opened at `box_origin + box_height`: a dropdown low enough that its list runs past the window's
+    bottom paints its rows shifted up while the pointer still lands on the row *below* the one you
+    see. Every dropdown in the app can hit it; the interface-scale picker did, because it was the
+    last row of the last group of the tallest modal — and only at 150%, the one scale where that
+    modal grows enough to push the popup off the bottom but not enough for its body to scroll
+    instead. Two rounds of plausible fixes (rebuilding the control, chasing a stale `window_origin`)
+    changed nothing, because nothing on our side was wrong.
+  - **So a control that can sit near the window's bottom edge should not be a `Dropdown`**, and the
+    interface scale is now a segmented control (`settings::scale_picker`) — no overlay, nothing to
+    mis-hit, and better for four short options anyway. Where a dropdown is kept, keep its option
+    list short and its row high in the modal, and read this entry first if selection ever seems
+    off by a row.
 - **A child that overflows *left* or *up* of its parent is painted but never hit-tested.** Floem
   hit-tests a subtree through `EventCx::should_send` (`floem-0.2.0/src/context.rs`), which builds the
   rect it tests as `id.layout_rect().with_origin(layout.location)` — it takes the **size** of the
@@ -4516,7 +4627,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   fine — they never dispose.
 - **No `text-align` in Floem 0.2.** `text_input` paints at a fixed left origin, clips-to-cursor on
   overflow; `Style` only has `text_overflow`. To right-align an inline editor (numeric grid cells),
-  pad left by the free space — measure with a throwaway `TextLayout` at `FONT_BODY` (same global
+  pad left by the free space — measure with a throwaway `TextLayout` at `font_body()` (same global
   `FontSystem` → pixel-exact), recomputed reactively on the buffer (`grid::measure_text_px`).
   **"Free space" is the cell's real content box** (`grid::numeric_edit_pad_left`, tested): the column
   width less its padding *and* its 1px right divider, which is a border and so comes out of the

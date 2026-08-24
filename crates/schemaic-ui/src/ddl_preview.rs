@@ -20,13 +20,15 @@ use floem::prelude::*;
 use schemaic_core::text::plural;
 
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, ExitAction, FocusRing, MODAL_PAD_H, action_button,
-    action_button_icon, autohide, exit_action, focus_root_with_ring, form_section,
-    form_section_owned, modal_footer_split, modal_title_owned, panel_style,
+    ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, action_button_icon, action_gap,
+    autohide, exit_action, focus_root_with_ring, form_section, form_section_owned,
+    modal_footer_split, modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{DdlOutcome, DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
 
-const PANEL_W: f64 = 660.0;
+fn panel_w() -> f64 {
+    modal_w(660.0)
+}
 const PANEL_H: f64 = 560.0;
 /// The SQL box's height before it scrolls. Deep enough that a typical `ALTER`
 /// with a handful of clauses is visible whole.
@@ -220,13 +222,13 @@ fn change_line(label: String) -> impl IntoView {
     h_stack((
         text("•").style(|s| {
             s.color(theme::text_faint())
-                .font_size(theme::FONT_BODY)
-                .width(12.0)
+                .font_size(theme::font_body())
+                .width(theme::scaled(12.0))
                 .flex_shrink(0.0_f32)
         }),
         text(label).style(|s| {
             s.color(theme::text())
-                .font_size(theme::FONT_BODY)
+                .font_size(theme::font_body())
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
         }),
@@ -244,7 +246,7 @@ fn risk_block(risks: Vec<String>) -> impl IntoView {
                 .style(|s| s.color(theme::error()).flex_shrink(0.0_f32)),
             text("This can't be undone").style(|s| {
                 s.color(theme::error())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .font_bold()
             }),
         ))
@@ -252,7 +254,7 @@ fn risk_block(risks: Vec<String>) -> impl IntoView {
         v_stack_from_iter(risks.into_iter().map(|r| {
             text(r).style(|s| {
                 s.color(theme::text())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .width_full()
                     .margin_bottom(2.0)
             })
@@ -286,7 +288,7 @@ fn withheld_block(withheld: Vec<String>) -> impl IntoView {
                 .style(|s| s.color(theme::accent()).flex_shrink(0.0_f32)),
             text("This engine can't express part of this plan").style(|s| {
                 s.color(theme::accent())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .font_bold()
             }),
         ))
@@ -294,14 +296,14 @@ fn withheld_block(withheld: Vec<String>) -> impl IntoView {
         v_stack_from_iter(withheld.into_iter().map(|w| {
             text(w).style(|s| {
                 s.color(theme::text())
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::font_body())
                     .width_full()
                     .margin_bottom(2.0)
             })
         })),
         text("Nothing is applied while this is listed.").style(|s| {
             s.color(theme::text_faint())
-                .font_size(theme::FONT_BODY)
+                .font_size(theme::font_body())
                 .margin_top(4.0)
         }),
     ))
@@ -436,10 +438,10 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             if p.statements.len() == 1 { "" } else { "s" },
                             p.subject
                         ))
-                        .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+                        .style(|s| s.color(theme::text()).font_size(theme::font_body())),
                         text("The schema has been refreshed.").style(|s| {
                             s.color(theme::text_dim())
-                                .font_size(theme::FONT_LABEL)
+                                .font_size(theme::font_label())
                                 .margin_top(6.0)
                         }),
                     ))
@@ -471,7 +473,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             no_wrap: true,
                             read_only: true,
                             mono: true,
-                            font_size: theme::FONT_BODY,
+                            font_size: theme::font_body,
                             max_rows: Some(d.sql_rows),
                             focus: Some((ring.clone(), 10)),
                             ..Default::default()
@@ -490,7 +492,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     Some(e) => text(e)
                         .style(|s| {
                             s.color(theme::error())
-                                .font_size(theme::FONT_BODY)
+                                .font_size(theme::font_body())
                                 .max_width(580.0)
                                 .margin_top(12.0)
                         })
@@ -547,7 +549,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             },
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -611,7 +613,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             move || apply(ui.clone()),
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -621,7 +623,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             let read_only_note = text("This connection is read-only.").style(move |s| {
                 let s = s
                     .color(theme::plan_warn())
-                    .font_size(theme::FONT_LABEL)
+                    .font_size(theme::font_label())
                     .margin_right(12.0);
                 if d.preview.get().is_some_and(|p| p.read_only) && !d.applied.get() {
                     s
@@ -641,7 +643,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 autohide(scroll(v_stack((body, err)).style(|s| {
                     s.flex_col()
                         .width_full()
-                        .padding_horiz(MODAL_PAD_H)
+                        .padding_horiz(modal_pad_h())
                         .padding_vert(18.0)
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
@@ -651,7 +653,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 ),
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
+            .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| exit())

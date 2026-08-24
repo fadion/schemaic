@@ -23,10 +23,10 @@ use floem::reactive::create_effect;
 use schemaic_core::plan::{PlanWarningKind, QueryPlan};
 
 use crate::settings::focusable_toggle;
-use crate::theme::{FONT_BODY, FONT_LABEL};
+use crate::theme::{font_body, font_label};
 use crate::widgets::{
-    autohide, loading_dots, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
-    panel_style, shift_hscroll,
+    autohide, loading_dots, measure_text_px_at, measure_text_px_bold_at, modal_body_h,
+    modal_title_borderless, modal_w, panel_style, shift_hscroll,
 };
 use crate::{PlanState, RightPanel, Ui, icons, theme};
 
@@ -94,15 +94,15 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
 
             let analyze_control = if is_write {
                 text("Analyze unavailable (statement writes data)")
-                    .style(|s| s.font_size(FONT_LABEL).color(theme::text_faint()))
+                    .style(|s| s.font_size(font_label()).color(theme::text_faint()))
                     .into_any()
             } else {
                 h_stack((
                     focusable_toggle(plan_analyze, ring.clone(), 10),
                     v_stack((
-                        text("Analyze").style(|s| s.font_size(FONT_BODY).color(theme::text())),
+                        text("Analyze").style(|s| s.font_size(font_body()).color(theme::text())),
                         text("Executes the statement to measure real timings")
-                            .style(|s| s.font_size(FONT_LABEL).color(theme::text_faint())),
+                            .style(|s| s.font_size(font_label()).color(theme::text_faint())),
                     ))
                     .style(|s| s.flex_col().gap(1.0)),
                 ))
@@ -132,25 +132,35 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                     .padding_vert(8.0)
             });
 
-            let body = dyn_container(
-                move || plan_state.get(),
-                move |st| match st {
-                    PlanState::Idle | PlanState::Running => {
-                        container(loading_dots("Explaining", theme::text_dim, FONT_BODY))
-                            .style(|s| s.height(180.0).width_full().items_center().justify_center())
-                            .into_any()
-                    }
-                    PlanState::Failed(e) => {
-                        autohide(scroll(text(e).style(|s| {
-                            s.color(theme::error()).font_size(FONT_BODY).padding(16.0)
+            // Keyed on the interface scale as well as the state: `plan_table`
+            // measures its column widths from the plan's own text and hands each
+            // cell a `f64`, which is the one place in this modal that a live scale
+            // change can't reach. Rebuilding the body is what re-measures them —
+            // the table is a few dozen rows and is already rebuilt on every state
+            // change, so this costs nothing anybody can see.
+            let body =
+                dyn_container(
+                    move || (plan_state.get(), theme::ui_scale()),
+                    move |(st, _)| match st {
+                        PlanState::Idle | PlanState::Running => {
+                            container(loading_dots("Explaining", theme::text_dim, font_body))
+                                .style(|s| {
+                                    s.height(theme::scaled(180.0))
+                                        .width_full()
+                                        .items_center()
+                                        .justify_center()
+                                })
+                                .into_any()
+                        }
+                        PlanState::Failed(e) => autohide(scroll(text(e).style(|s| {
+                            s.color(theme::error()).font_size(font_body()).padding(16.0)
                         })))
-                        .style(|s| s.width_full().max_height(520.0))
-                        .into_any()
-                    }
-                    PlanState::Loaded(plan) => loaded_body(&plan).into_any(),
-                },
-            )
-            .style(|s| s.width_full().flex_col());
+                        .style(|s| s.width_full().max_height(modal_body_h(520.0)))
+                        .into_any(),
+                        PlanState::Loaded(plan) => loaded_body(&plan).into_any(),
+                    },
+                )
+                .style(|s| s.width_full().flex_col());
 
             let panel = v_stack((
                 modal_title_borderless("Query plan", close.clone(), ring.clone()),
@@ -158,7 +168,11 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                 toolbar,
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).background(theme::bg_panel()).width(760.0));
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_panel())
+                    .width(modal_w(760.0))
+            });
 
             let esc = close.clone();
             // The dismiss listener goes on a sibling behind the panel, never on
@@ -192,7 +206,7 @@ fn loaded_body(plan: &QueryPlan) -> AnyView {
     let table = plan_table(plan);
     let content = v_stack((warnings, table)).style(|s| s.flex_col().width_full().padding(14.0));
     autohide(scroll(content))
-        .style(|s| s.width_full().max_height(520.0))
+        .style(|s| s.width_full().max_height(modal_body_h(520.0)))
         .into_any()
 }
 
@@ -212,7 +226,7 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
             h_stack((
                 icons::icon(icons::TRIANGLE_ALERT, 15.0)
                     .style(move |s| s.color(kind_color()).flex_shrink(0.0_f32)),
-                text(w.message.clone()).style(|s| s.font_size(FONT_BODY).color(theme::text())),
+                text(w.message.clone()).style(|s| s.font_size(font_body()).color(theme::text())),
             ))
             .style(|s| s.items_center().gap(8.0))
             .into_any()
@@ -220,8 +234,11 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
         .collect();
 
     v_stack((
-        text("Potential issues")
-            .style(|s| s.font_size(FONT_LABEL).font_bold().color(theme::text_dim())),
+        text("Potential issues").style(|s| {
+            s.font_size(font_label())
+                .font_bold()
+                .color(theme::text_dim())
+        }),
         v_stack_from_iter(rows).style(|s| s.flex_col().gap(6.0)),
     ))
     .style(|s| {
@@ -241,33 +258,38 @@ fn plan_warnings(plan: &QueryPlan) -> AnyView {
 /// Render the plan as a table. Column widths are measured from content (capped)
 /// so cells align across rows; flagged rows get an amber tint.
 fn plan_table(plan: &QueryPlan) -> AnyView {
-    // `PAD` covers the 10px horizontal padding each side; `GUARD` adds a few px of
+    // `PAD` covers the horizontal padding each side; `GUARD` adds a few px of
     // slack over the pixel-exact text measurement so the last character never wraps
     // on a sub-pixel rounding (the columns "wrapping by one character" bug).
-    const PAD: f64 = 20.0;
-    const GUARD: f64 = 5.0;
-    const CAP: f64 = 360.0;
-    const MIN: f64 = 34.0;
+    //
+    // **All four scale, because what they bound is measured text.** An unscaled
+    // 360px cap against a measurement that has doubled truncates a header that fit
+    // at 100% — which is the very failure the bold measurement below exists to
+    // avoid — and an unscaled 20px pad no longer describes the cell's padding.
+    let pad = theme::scaled(20.0);
+    let guard = theme::scaled(5.0);
+    let cap = theme::scaled(360.0);
+    let min = theme::scaled(34.0);
 
     let ncols = plan.columns.len();
     let mut widths = vec![0.0f64; ncols];
     for (i, h) in plan.columns.iter().enumerate() {
-        // Measured the way it is *drawn*: bold, at `FONT_LABEL`. It used to be
-        // measured regular at `FONT_BODY` — two mismatches, one of them silent
+        // Measured the way it is *drawn*: bold, at `font_label()`. It used to be
+        // measured regular at `font_body()` — two mismatches, one of them silent
         // only because the two sizes happen to be equal today. Bold glyphs are
         // wider, so a header sized from the regular measurement ellipsizes its
         // own title, which is the bug the ER-diagram cards had.
-        widths[i] = measure_text_px_bold_at(h, FONT_LABEL);
+        widths[i] = measure_text_px_bold_at(h, font_label());
     }
     for row in &plan.rows {
         for (i, cell) in row.iter().enumerate() {
             if i < ncols {
-                widths[i] = widths[i].max(measure_text_px_at(cell, FONT_BODY));
+                widths[i] = widths[i].max(measure_text_px_at(cell, font_body()));
             }
         }
     }
     for w in widths.iter_mut() {
-        *w = (*w + PAD + GUARD).clamp(MIN, CAP);
+        *w = (*w + pad + guard).clamp(min, cap);
     }
 
     let flagged: HashSet<usize> = plan.warnings.iter().map(|w| w.row).collect();
@@ -287,7 +309,7 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
                         .flex_shrink(0.0_f32)
                         .padding_horiz(10.0)
                         .padding_vert(6.0)
-                        .font_size(FONT_LABEL)
+                        .font_size(font_label())
                         .font_bold()
                         .color(theme::text_dim())
                         .border_right(if last_col { 0.0 } else { 1.0 })
@@ -323,7 +345,7 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
                                 .flex_shrink(0.0_f32)
                                 .padding_horiz(10.0)
                                 .padding_vert(6.0)
-                                .font_size(FONT_BODY)
+                                .font_size(font_body())
                                 .color(theme::text())
                                 .border_right(if last_col { 0.0 } else { 1.0 })
                                 .border_color(theme::border())
@@ -386,7 +408,7 @@ fn ask_ai_button(
     let loaded_now = move || matches!(plan_state.get_untracked(), PlanState::Loaded(_));
     let face = h_stack((
         icons::icon(icons::SPARKLES, 15.0).style(|s| s.flex_shrink(0.0_f32)),
-        text("Ask AI").style(|s| s.font_size(FONT_BODY)),
+        text("Ask AI").style(|s| s.font_size(font_body())),
     ))
     .style(move |s| {
         let loaded = matches!(plan_state.get(), PlanState::Loaded(_));

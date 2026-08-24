@@ -144,7 +144,7 @@ use schemaic_core::tx::{
     StmtOutcome, TabTx, TxEngine, TxMode, TxState, ddl_blocking_tabs, session_still_wanted,
 };
 use schemaic_db::{Db, DbError, Session};
-use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
+use schemaic_ui::theme::{EditorThemeKind, UiScale, UiThemeKind};
 use schemaic_ui::{
     ActivityActions, ActivityState, ActivityUi, AiActions, AiEffort, AiModel, AiUi, ChatMessage,
     Confirm, ConnActions, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals, HistoryActions,
@@ -1322,9 +1322,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let help_open = RwSignal::new(false);
     let ui_theme = RwSignal::new(UiThemeKind::from_key(&ui_state.ui_theme));
     let editor_theme = RwSignal::new(EditorThemeKind::from_key(&ui_state.editor_theme));
-    schemaic_ui::theme::init(ui_theme.get_untracked(), editor_theme.get_untracked());
+    let ui_scale = RwSignal::new(UiScale::from_key(&ui_state.ui_scale));
+    schemaic_ui::theme::init(
+        ui_theme.get_untracked(),
+        editor_theme.get_untracked(),
+        ui_scale.get_untracked(),
+    );
     create_effect(move |_| schemaic_ui::theme::set_ui(ui_theme.get()));
     create_effect(move |_| schemaic_ui::theme::set_editor(editor_theme.get()));
+    create_effect(move |_| schemaic_ui::theme::set_ui_scale(ui_scale.get()));
     // Editor content settings (font / indentation) + query/behaviour settings.
     // Seed the global editor-config registry before the view builds, then mirror the
     // signals into it live (a change re-lays out the editor / re-applies indent).
@@ -4611,6 +4617,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ai_run_queries: legacy_ai_run_queries,
             ui_theme: ui_theme.get_untracked().key().to_string(),
             editor_theme: editor_theme.get_untracked().key().to_string(),
+            ui_scale: ui_scale.get_untracked().key().to_string(),
             editor_font_size: editor_font.get_untracked(),
             row_limit: row_limit.get_untracked(),
             statement_timeout_secs: statement_timeout.get_untracked(),
@@ -4644,6 +4651,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         create_effect(move |_| {
             ui_theme.get();
             editor_theme.get();
+            ui_scale.get();
             save_ui();
         });
     }
@@ -7925,6 +7933,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             help_open,
             ui_theme,
             editor_theme,
+            ui_scale,
             editor_font,
             tab_width,
             soft_tabs,

@@ -37,30 +37,38 @@ use schemaic_core::schema::{CheckInfo, ObjectItem, SchemaState, SequenceInfo, Se
 
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_chevron};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
-    focus_root_with_ring, form_section, form_setting, form_setting_owned, modal_footer_split,
-    modal_title_owned, panel_style, row_button, row_gap,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
+    form_section, form_setting, form_setting_owned, modal_footer_split, modal_h, modal_pad_h,
+    modal_title_owned, modal_w, panel_style, row_button, row_gap,
 };
 use crate::{
     DdlPreview, FieldCfg, ObjectTarget, Ui, ddl_preview, edit_field, icons, object_location, theme,
 };
 
-const PANEL_W: f64 = 700.0;
+fn panel_w() -> f64 {
+    modal_w(700.0)
+}
 const PANEL_H: f64 = 620.0;
 /// Text-field width, matching the designer's and the view editor's.
-const FIELD_W: f64 = 260.0;
+fn field_w() -> f64 {
+    theme::scaled(260.0)
+}
 /// Narrower, for the numbers a sequence is made of — a 20-character box for a
 /// value that is nearly always one or two digits reads as a text field.
-const NUM_W: f64 = 130.0;
+fn num_w() -> f64 {
+    theme::scaled(130.0)
+}
 /// Where a repeating row's Tab stops start: an enum's values and a domain's
 /// checks are lists that grow, so they claim a block of their own above every
 /// fixed control in the form. Shared with the trigger editor's two growing
 /// lists — see [`crate::widgets::VALUE_TAB`] for why it is one constant.
 use crate::widgets::{ROW_BUTTON_TAB, ROW_TAB_STRIDE, VALUE_TAB};
-/// The gap between two of those, side by side. Wider than [`FORM_GAP`] because
+/// The gap between two of those, side by side. Wider than [`form_gap`] because
 /// it separates two *questions* rather than two rows of one: Increment and Start
 /// sitting a form's gap apart read as one control with two boxes.
-const NUM_GAP: f64 = 50.0;
+fn num_gap() -> f64 {
+    theme::scaled(50.0)
+}
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
@@ -279,7 +287,7 @@ fn num_field(
             ..Default::default()
         },
     )
-    .style(|s| s.width(NUM_W))
+    .style(|s| s.width(num_w()))
     .into_any()
 }
 
@@ -452,7 +460,7 @@ fn enum_form(ui: &Ui, d: &EnumDraft, ring: FocusRing) -> AnyView {
                 }
             },
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
     let comment = form_setting(
         "Comment",
@@ -482,7 +490,7 @@ fn enum_form(ui: &Ui, d: &EnumDraft, ring: FocusRing) -> AnyView {
             enum_values(ui, ring),
         ),
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
 }
 
@@ -527,7 +535,7 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
                         }
                     },
                 )
-                .style(|s| s.width(190.0).flex_shrink(0.0_f32));
+                .style(|s| s.width(theme::scaled(190.0)).flex_shrink(0.0_f32));
                 let expr = bound_field(
                     &ui,
                     ck.expression.clone(),
@@ -636,7 +644,7 @@ fn domain_form(
                 }
             },
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
     // A dropdown of the usual types, but writable: a domain can be built on
     // anything the server has, including another domain and an array.
@@ -670,7 +678,7 @@ fn domain_form(
                         ..Default::default()
                     },
                 )
-                .style(move |s| s.width(FIELD_W)),
+                .style(move |s| s.width(field_w())),
                 suggest_chevron(
                     ui,
                     sig,
@@ -705,7 +713,7 @@ fn domain_form(
                 }
             },
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
     let not_null = bound_toggle(
         ui,
@@ -748,7 +756,7 @@ fn domain_form(
         form_section("Constraints").style(|s| s.margin_top(4.0)),
         domain_checks(ui, ring),
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
 }
 
@@ -796,7 +804,7 @@ fn sequence_form(
                 }
             },
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
     // The bounds are clamped to the storage type, so changing it re-checks them
     // — `SequenceDraft::validate` is what reports a range that no longer fits.
@@ -810,7 +818,7 @@ fn sequence_form(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
-                FIELD_W,
+                field_w(),
                 ring.clone(),
                 20,
                 move |v: String| {
@@ -833,7 +841,7 @@ fn sequence_form(
     // the leftovers divided into, twice what it was asked to be and different on
     // the two-field row from the three-field one.
     let num_col = |label: &'static str, field: AnyView| {
-        form_setting(label, field).style(|s| s.width(NUM_W).flex_shrink(0.0_f32))
+        form_setting(label, field).style(|s| s.width(num_w()).flex_shrink(0.0_f32))
     };
     let numbers = h_stack((
         num_col(
@@ -870,7 +878,7 @@ fn sequence_form(
             ),
         ),
     ))
-    .style(|s| s.flex_row().gap(NUM_GAP).width_full());
+    .style(|s| s.flex_row().gap(num_gap()).width_full());
     let bounds = h_stack((
         num_col(
             "Minimum",
@@ -895,7 +903,7 @@ fn sequence_form(
             ),
         ),
     ))
-    .style(|s| s.flex_row().gap(NUM_GAP).width_full());
+    .style(|s| s.flex_row().gap(num_gap()).width_full());
     let cycle = bound_toggle(
         ui,
         "Cycle",
@@ -957,7 +965,7 @@ fn sequence_form(
                     ..Default::default()
                 },
             )
-            .style(|s| s.width(FIELD_W))
+            .style(|s| s.width(field_w()))
         },
     );
 
@@ -975,7 +983,7 @@ fn sequence_form(
             form_setting_owned(
                 "Owned by".to_string(),
                 text(format!("{}.{}", o.table, o.column))
-                    .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
+                    .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
             ),
             bound_toggle(
                 ui,
@@ -991,7 +999,7 @@ fn sequence_form(
                 },
             ),
         ))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any(),
         // `nothing()`, not `empty()`: taffy counts a zero-sized child when it
         // distributes `gap` and skips a `display:none` one, so a bare `empty()`
@@ -1031,7 +1039,7 @@ fn sequence_form(
         position,
         owner,
     ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+    .style(|s| s.flex_col().gap(form_gap()).width_full())
     .into_any()
 }
 
@@ -1051,7 +1059,7 @@ fn form(ui: &Ui, target: &ObjectTarget, ring: FocusRing) -> AnyView {
         ),
     };
     v_stack((body,))
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
 }
 
@@ -1107,11 +1115,13 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
-            let body = crate::widgets::autohide(scroll(
-                form(&ui, &target, ring.clone())
-                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
-            ))
-            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
+            let body =
+                crate::widgets::autohide(scroll(form(&ui, &target, ring.clone()).style(|s| {
+                    s.width_full()
+                        .padding_horiz(modal_pad_h())
+                        .padding_vert(18.0)
+                })))
+                .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
             // Validation first (it blocks), then the change count. A field whose
             // text isn't a number yet is a validation failure like any other.
@@ -1124,7 +1134,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                         return text(first)
                             .style(|s| {
                                 s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
+                                    .font_size(theme::font_label())
                                     .max_width(420.0)
                             })
                             .into_any();
@@ -1136,7 +1146,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                         n => format!("{n} changes"),
                     })
                     .style(move |s| {
-                        s.font_size(theme::FONT_LABEL).color(if n == 0 {
+                        s.font_size(theme::font_label()).color(if n == 0 {
                             theme::text_faint()
                         } else {
                             theme::change_count()
@@ -1178,7 +1188,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                             },
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -1190,7 +1200,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
+            .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())

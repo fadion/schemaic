@@ -51,9 +51,9 @@ use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown};
 use crate::trigger_editor::{unique_name, value_rows};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
-    focus_root_with_ring, form_section, form_setting, modal_footer_split, modal_title_owned,
-    panel_style,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
+    form_section, form_setting, modal_footer_split, modal_h, modal_pad_h, modal_title_owned,
+    modal_w, panel_style,
 };
 use crate::{
     FieldCfg, RoutineSrcDoneFn, RoutineSrcRequest, RoutineTarget, Ui, ddl_preview, edit_field,
@@ -63,9 +63,13 @@ use crate::{
 /// Matches the trigger editor's, deliberately: the two are reached from one
 /// another, and a panel that changed size on the way through would read as a
 /// different modal rather than the next step.
-const PANEL_W: f64 = 900.0;
+fn panel_w() -> f64 {
+    modal_w(900.0)
+}
 const PANEL_H: f64 = 620.0;
-const FIELD_W: f64 = 260.0;
+fn field_w() -> f64 {
+    theme::scaled(260.0)
+}
 /// The body box's height before it scrolls.
 const BODY_ROWS: usize = 12;
 
@@ -383,7 +387,7 @@ fn bound_choice<T: Clone + PartialEq + 'static>(
     focusable_owned_dropdown(
         move || sig.get(),
         labels,
-        FIELD_W,
+        field_w(),
         ring,
         tabindex,
         move |label: String| {
@@ -456,7 +460,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             },
             |d, v| d.info.name = v.trim().to_string(),
         )
-        .style(move |s| s.width(FIELD_W)),
+        .style(move |s| s.width(field_w())),
     );
 
     // The parameter list as the server renders it, edited as text. It is one
@@ -482,7 +486,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 },
                 |d, v| d.info.arguments = v.trim().to_string(),
             )
-            .style(move |s| s.width(FIELD_W * 1.6)),
+            .style(move |s| s.width(field_w() * 1.6)),
         )
     });
 
@@ -502,7 +506,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 },
                 |d, v| d.info.returns = v.trim().to_string(),
             )
-            .style(move |s| s.width(FIELD_W)),
+            .style(move |s| s.width(field_w())),
         )
     });
 
@@ -527,7 +531,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             focusable_owned_dropdown(
                 move || sig.get(),
                 langs,
-                FIELD_W,
+                field_w(),
                 ring.clone(),
                 TAB_LANGUAGE,
                 move |v: String| {
@@ -636,7 +640,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     move || d.with(|s| s.info.settings.clone()),
                     move |v| d.update(|s| s.info.settings = v),
                 )
-                .style(move |s| s.width(FIELD_W * 1.6)),
+                .style(move |s| s.width(field_w() * 1.6)),
             )
             .into_any(),
         );
@@ -705,7 +709,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                         d.info.definer = (!v.is_empty()).then(|| v.to_string());
                     },
                 )
-                .style(move |s| s.width(FIELD_W)),
+                .style(move |s| s.width(field_w())),
             )
             .into_any(),
         );
@@ -725,7 +729,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                         d.info.comment = (!v.is_empty()).then(|| v.to_string());
                     },
                 )
-                .style(move |s| s.width(FIELD_W * 1.6)),
+                .style(move |s| s.width(field_w() * 1.6)),
             )
             .into_any(),
         );
@@ -747,7 +751,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     );
     rows.extend(options);
     v_stack_from_iter(rows)
-        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .style(|s| s.flex_col().gap(form_gap()).width_full())
         .into_any()
 }
 
@@ -820,8 +824,11 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                routine_form(ui.clone(), &target, ring.clone())
-                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
+                routine_form(ui.clone(), &target, ring.clone()).style(|s| {
+                    s.width_full()
+                        .padding_horiz(modal_pad_h())
+                        .padding_vert(18.0)
+                }),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
@@ -871,7 +878,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                         text(m)
                             .style(|s| {
                                 s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
+                                    .font_size(theme::font_label())
                                     .max_width(460.0)
                             })
                             .into_any()
@@ -881,7 +888,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                     // body rather than the routine as written.
                     if pending {
                         return text("Reading the routine's source…")
-                            .style(|s| s.color(theme::text_faint()).font_size(theme::FONT_LABEL))
+                            .style(|s| s.color(theme::text_faint()).font_size(theme::font_label()))
                             .into_any();
                     }
                     // …and once it has landed, the case waiting cannot cover.
@@ -908,7 +915,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                         n => format!("{n} changes"),
                     })
                     .style(move |s| {
-                        s.font_size(theme::FONT_LABEL).color(if n == 0 {
+                        s.font_size(theme::font_label()).color(if n == 0 {
                             theme::text_faint()
                         } else {
                             theme::change_count()
@@ -987,7 +994,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                             },
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .style(|s| s.flex_row().items_center().gap(action_gap()))
                     .into_any()
                 },
             );
@@ -999,7 +1006,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))
             .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
+            .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())

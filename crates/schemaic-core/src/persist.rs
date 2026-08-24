@@ -128,6 +128,11 @@ fn default_ui_theme() -> String {
 fn default_editor_theme() -> String {
     "tokyo-night".to_string()
 }
+/// Interface scale — `normal`, i.e. the size every release before this one drew
+/// at. Keep in step with `themes::UiScale::from_key`'s fallback.
+fn default_ui_scale() -> String {
+    "normal".to_string()
+}
 fn default_editor_font() -> f32 {
     14.0
 }
@@ -224,6 +229,11 @@ pub struct UiState {
     /// SQL-editor theme key: `tokyo-night` / `one-dark-pro` / `catppuccin-latte`.
     #[serde(default = "default_editor_theme")]
     pub editor_theme: String,
+    /// Interface scale key: `small` / `normal` / `large` / `huge`. Multiplies the
+    /// chrome's type and layout metrics (not the editor or terminal font, which
+    /// have their own size settings).
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: String,
     /// SQL-editor font size (px).
     #[serde(default = "default_editor_font")]
     pub editor_font_size: f32,
@@ -315,6 +325,7 @@ impl Default for UiState {
             ai_run_queries: true,
             ui_theme: default_ui_theme(),
             editor_theme: default_editor_theme(),
+            ui_scale: default_ui_scale(),
             editor_font_size: default_editor_font(),
             row_limit: default_row_limit(),
             confirm_writes: true,

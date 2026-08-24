@@ -783,6 +783,136 @@ impl EditorThemeKind {
     }
 }
 
+// ── Interface scale ──────────────────────────────────────────────────────────
+
+/// How large the app's own chrome is drawn — the third theme axis, and the only
+/// one that is about *size* rather than colour.
+///
+/// It multiplies the design tokens (the type scale in [`crate::theme`], the
+/// layout metrics in [`crate::consts`]) rather than the window: Floem has no
+/// user-settable render scale, and a paint transform over the whole tree would
+/// scale the hit-testing and the editor's own coordinate arithmetic with it. So
+/// every token that boxes text is a `fn() -> f32`/`fn() -> f64` reading this,
+/// which is the same rule the colours follow and for the same reason — a style
+/// closure that *calls* the accessor re-runs when the setting changes, a closure
+/// that captured a number cannot.
+///
+/// **What it deliberately does not touch:** the SQL editor's code font and the
+/// terminal font. Both already have their own size setting (and the editor a
+/// per-tab Ctrl+scroll zoom, whose override is an absolute px that a second
+/// multiplication would double-apply). The chrome is what had no control at all
+/// — a 13px label on a 4K panel — and that is what this is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UiScale {
+    Small,
+    Normal,
+    Large,
+    Huge,
+}
+
+impl UiScale {
+    /// Dropdown order: ascending by size. (Unlike `EditorThemeKind::ALL`, which
+    /// leads with the default — a list of *sizes* that starts in the middle
+    /// reads as unordered.)
+    pub const ALL: [UiScale; 4] = [
+        UiScale::Small,
+        UiScale::Normal,
+        UiScale::Large,
+        UiScale::Huge,
+    ];
+
+    /// The multiplier applied to every scaled token. `f64` rather than `f32`:
+    /// dimensions are `f64`, and `0.8_f32` widened to `f64` is `0.800000011…`,
+    /// which is enough to push a size that lands exactly on `.5` to the wrong
+    /// side of the rounding.
+    pub fn factor(self) -> f64 {
+        match self {
+            UiScale::Small => 0.8,
+            UiScale::Normal => 1.0,
+            UiScale::Large => 1.5,
+            UiScale::Huge => 2.0,
+        }
+    }
+
+    /// The canonical name of this scale, percentage included — for prose *about*
+    /// the setting (the README, release notes) and for the test diagnostics
+    /// below.
+    ///
+    /// **Not what the picker shows.** Its segments wear [`Self::short`]: four of
+    /// these side by side don't fit the Settings modal at 200%, which is exactly
+    /// the size at which somebody is reading them. The picker used to carry one
+    /// of these as a hint line under the row; it doesn't, because four segments
+    /// named Small → Huge that apply on press say the same thing without a
+    /// sentence.
+    pub fn label(self) -> &'static str {
+        match self {
+            UiScale::Small => "Small (80%)",
+            UiScale::Normal => "Normal (100%)",
+            UiScale::Large => "Large (150%)",
+            UiScale::Huge => "Huge (200%)",
+        }
+    }
+
+    /// The name alone — the segmented picker's button text, and the only one of
+    /// the two the app actually renders.
+    pub fn short(self) -> &'static str {
+        match self {
+            UiScale::Small => "Small",
+            UiScale::Normal => "Normal",
+            UiScale::Large => "Large",
+            UiScale::Huge => "Huge",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            UiScale::Small => "small",
+            UiScale::Normal => "normal",
+            UiScale::Large => "large",
+            UiScale::Huge => "huge",
+        }
+    }
+
+    /// An unknown key resolves to the **default** (`Normal`) — the rule the
+    /// theme keys follow, and what a config from a newer build degrades to. Keep
+    /// in step with `persist::default_ui_scale`.
+    pub fn from_key(s: &str) -> UiScale {
+        match s {
+            "small" => UiScale::Small,
+            "large" => UiScale::Large,
+            "huge" => UiScale::Huge,
+            _ => UiScale::Normal,
+        }
+    }
+}
+
+/// Scale one dimension (logical px) by `factor`, rounded to a whole pixel.
+///
+/// Pure, so the rounding rule is testable without a running app. Three
+/// properties it has to keep, each with a test:
+///
+///   • **`Normal` is the exact identity**, not `×1.0` rounded — otherwise every
+///     fractional token in the tree shifts half a pixel at the setting nobody
+///     chose.
+///   • **The result is integral.** A 19.5px font renders soft, and a fractional
+///     row height drifts against `VirtualItemSize::Fixed`'s own arithmetic.
+///   • **A positive size never rounds away.** At 80% a 1px rule would otherwise
+///     become 0 and disappear; a real `0` stays `0`.
+pub fn scale_at(base: f64, factor: f64) -> f64 {
+    if factor == 1.0 {
+        return base;
+    }
+    let scaled = (base * factor).round();
+    if base > 0.0 { scaled.max(1.0) } else { scaled }
+}
+
+/// [`scale_at`] for a font size — the `f32` face of the same arithmetic, since
+/// `Style::font_size` takes `f32` while every dimension is `f64`. Not a second
+/// rounding rule: it delegates.
+pub fn scale_font_at(base: f32, factor: f64) -> f32 {
+    scale_at(base as f64, factor) as f32
+}
+
 // ── Runtime registry (the live-switch machinery) ─────────────────────────────
 
 struct ThemeState {
@@ -803,6 +933,9 @@ struct ThemeState {
     editor_soft_tabs: RwSignal<bool>,
     // Whether long editor lines wrap to the viewport width vs scroll horizontally.
     editor_word_wrap: RwSignal<bool>,
+    // How large the app's own chrome is drawn (`UiScale`). Read by every scaled
+    // design token, so a change re-runs each style closure that uses one.
+    ui_scale: RwSignal<UiScale>,
 }
 
 thread_local! {
@@ -827,6 +960,7 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
                 editor_tab_width: scope.create_rw_signal(4usize),
                 editor_soft_tabs: scope.create_rw_signal(true),
                 editor_word_wrap: scope.create_rw_signal(false),
+                ui_scale: scope.create_rw_signal(UiScale::Normal),
                 _scope: scope,
             };
             *cell.borrow_mut() = Some(state);
@@ -835,9 +969,13 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
     })
 }
 
-/// Seed the active themes from persisted choices. Call once at startup, before
-/// building the view tree.
-pub fn init(ui: UiThemeKind, editor: EditorThemeKind) {
+/// Seed the active themes and the interface scale from persisted choices. Call
+/// once at startup, before building the view tree.
+pub fn init(ui: UiThemeKind, editor: EditorThemeKind, scale: UiScale) {
+    // Scale first: it feeds the layout metrics every view is about to be built
+    // with, and unlike a colour it can't be re-read from a `.style` closure by
+    // views that bake a size in (see `set_ui_scale`).
+    set_ui_scale(scale);
     set_ui(ui);
     set_editor(editor);
 }
@@ -856,6 +994,39 @@ pub fn set_editor(kind: EditorThemeKind) {
         st.editor.set(Rc::new(kind.build()));
         st.editor_gen.update(|g| *g += 1);
     });
+}
+
+/// The active interface scale. Reading it subscribes the caller's reactive
+/// scope, so a `.style(…)` closure that calls a scaled token re-runs on a change.
+pub fn ui_scale() -> UiScale {
+    with_state(|st| st.ui_scale.get())
+}
+
+/// Set the interface scale.
+///
+/// Bumps [`ui_generation`] as well as the scale signal: a size can be baked into
+/// a place no style closure reaches — a text `Attrs` list (`markdown.rs`) — and
+/// those views are keyed on the generation, which is the only way to repaint
+/// them. The editor generation is deliberately *not* bumped: the scale doesn't
+/// touch the code font.
+pub fn set_ui_scale(scale: UiScale) {
+    with_state(|st| {
+        st.ui_scale.set(scale);
+        st.ui_gen.update(|g| *g += 1);
+    });
+}
+
+/// Scale a dimension (logical px) by the active interface scale, rounded to a
+/// whole pixel — the reactive front of [`scale_at`]. Call it *inside* the style
+/// closure; a captured result can't re-run.
+pub fn scaled(base: f64) -> f64 {
+    scale_at(base, ui_scale().factor())
+}
+
+/// Scale a font size by the active interface scale — the reactive front of
+/// [`scale_font_at`].
+pub fn scaled_font(base: f32) -> f32 {
+    scale_font_at(base, ui_scale().factor())
 }
 
 /// The active UI theme. Reading a field subscribes the caller's reactive scope.
@@ -948,6 +1119,122 @@ pub fn set_editor_word_wrap(wrap: bool) {
         st.editor_word_wrap.set(wrap);
         st.editor_gen.update(|g| *g += 1);
     });
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    /// `Normal` is the size every existing install already renders at, so it has
+    /// to be the *exact* identity rather than "×1.0, rounded". An unconditional
+    /// `.round()` moves a fractional base — and there are several
+    /// (`consts::GRID_CHAR_W`-style measurements, `FOOTER_LIFT`) — by up to half
+    /// a pixel at the setting nobody chose, which is a silent visual change to
+    /// every window that never asked to be scaled.
+    #[test]
+    fn the_normal_scale_leaves_every_size_untouched() {
+        for base in [0.0, 0.5, 1.0, 2.5, 12.0, 12.5, 13.0, 26.0, 40.0, 190.5] {
+            assert_eq!(scale_at(base, UiScale::Normal.factor()), base, "{base}");
+        }
+    }
+
+    /// A size is always whole logical pixels: a 19.5px font renders blurry and a
+    /// fractional row height drifts against the virtual list's own arithmetic
+    /// (`VirtualItemSize::Fixed`), which is the bug that makes rows and viewport
+    /// disagree after a few hundred rows.
+    #[test]
+    fn a_scaled_size_lands_on_whole_pixels() {
+        // The 13px body text, at each offered scale.
+        assert_eq!(scale_at(13.0, UiScale::Small.factor()), 10.0); // 10.4
+        assert_eq!(scale_at(13.0, UiScale::Large.factor()), 20.0); // 19.5
+        assert_eq!(scale_at(13.0, UiScale::Huge.factor()), 26.0);
+        // A row height and a panel width, which have to stay integral too.
+        assert_eq!(scale_at(26.0, UiScale::Small.factor()), 21.0); // 20.8
+        assert_eq!(scale_at(34.0, UiScale::Large.factor()), 51.0);
+        assert_eq!(scale_at(250.0, UiScale::Small.factor()), 200.0);
+    }
+
+    /// Rounding down is fine for type; it is not fine for a 1px rule, which
+    /// rounds to nothing and takes the border with it. Anything positive stays
+    /// at least a pixel — and a real zero (a collapsed panel, `padding(0)`)
+    /// stays zero rather than being lifted to one.
+    #[test]
+    fn a_hairline_never_scales_away_and_a_zero_stays_zero() {
+        assert_eq!(scale_at(1.0, UiScale::Small.factor()), 1.0); // 0.8 → 1
+        assert_eq!(scale_at(2.0, UiScale::Small.factor()), 2.0); // 1.6 → 2
+        assert_eq!(scale_at(0.5, UiScale::Small.factor()), 1.0); // 0.4 → 1
+        assert_eq!(scale_at(0.0, UiScale::Huge.factor()), 0.0);
+    }
+
+    /// The font wrapper is the `f32` face of the same arithmetic — not a second
+    /// rounding rule. (`Style::font_size` takes `f32`; every dimension is `f64`.)
+    #[test]
+    fn the_font_and_dimension_scalers_agree() {
+        for kind in UiScale::ALL {
+            for base in [12.0_f32, 13.0, 14.0] {
+                assert_eq!(
+                    scale_font_at(base, kind.factor()) as f64,
+                    scale_at(base as f64, kind.factor()),
+                    "{} at {base}px",
+                    kind.label()
+                );
+            }
+        }
+    }
+
+    /// The keys are persisted, so a typo in one silently resets that user's
+    /// choice on the next load — the same rule the theme keys are tested under.
+    #[test]
+    fn every_ui_scale_key_round_trips() {
+        for kind in UiScale::ALL {
+            assert_eq!(
+                UiScale::from_key(kind.key()).key(),
+                kind.key(),
+                "{} does not round-trip",
+                kind.label()
+            );
+        }
+    }
+
+    /// A config written by a newer build (or hand-edited) degrades to the
+    /// default, and the default is what a fresh `UiState` carries — the two are
+    /// stated in different crates and nothing else makes them agree.
+    #[test]
+    fn an_unknown_ui_scale_key_reads_as_the_default() {
+        let default_key = schemaic_core::persist::UiState::default().ui_scale;
+        assert_eq!(default_key, "normal");
+        assert_eq!(UiScale::from_key("no-such-scale").key(), default_key);
+        assert_eq!(UiScale::Normal.key(), default_key);
+        assert_eq!(UiScale::from_key(&default_key).factor(), 1.0);
+    }
+
+    /// The dropdown labels quote the percentage, and a label that disagrees with
+    /// the factor it selects is a lie the user can measure. Computed from
+    /// `factor()`, so the pair can't drift.
+    #[test]
+    fn every_ui_scale_label_states_its_own_percentage() {
+        for kind in UiScale::ALL {
+            let pct = format!("{}%", (kind.factor() * 100.0).round() as i64);
+            assert!(
+                kind.label().contains(&pct),
+                "{:?} does not name {pct}",
+                kind.label()
+            );
+        }
+    }
+
+    /// The picker shows them in size order, smallest first — not the
+    /// definition order of the enum, and not "default first" (which is what
+    /// `EditorThemeKind::ALL` needs and this deliberately doesn't copy: a size
+    /// list that starts in the middle reads as unordered).
+    #[test]
+    fn the_scale_options_are_offered_in_size_order() {
+        let factors: Vec<f64> = UiScale::ALL.iter().map(|k| k.factor()).collect();
+        assert!(
+            factors.windows(2).all(|w| w[0] < w[1]),
+            "not ascending: {factors:?}"
+        );
+    }
 }
 
 #[cfg(test)]

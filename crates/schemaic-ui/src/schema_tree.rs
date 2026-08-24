@@ -612,7 +612,7 @@ fn is_nav_selected(nav: Nav, key: &str) -> bool {
 /// height − 0.5), so nothing bleeds into the rows on either side and no `z_index`
 /// is needed to keep their hover backgrounds off it — an outline, which floem
 /// inflates *outward*, would have needed exactly that. And since taffy sizes the
-/// **border box**, a row's `height(TREE_ROW_H)` is unchanged: the rule costs 2px of
+/// **border box**, a row's `height(tree_row_h())` is unchanged: the rule costs 2px of
 /// content box on a vertically centred row, and no layout shift.
 fn menu_mark(s: floem::style::Style, nav: Nav, key: &str) -> floem::style::Style {
     if nav.menu_row.with(|k| k.as_deref() == Some(key)) {
@@ -1175,9 +1175,9 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         // their own). Spacers not margins because any vertical margin on a flex
         // sibling isn't subtracted from the flex-grow scroll's height, so it
         // overflows and clips short of the footer.
-        empty().style(|s| s.height(5.0).flex_shrink(0.0_f32)),
+        empty().style(|s| s.height(theme::scaled(5.0)).flex_shrink(0.0_f32)),
         schema_search(filter_input),
-        empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
+        empty().style(|s| s.height(theme::scaled(10.0)).flex_shrink(0.0_f32)),
         tree,
     ))
     .style(move |s| {
@@ -1307,7 +1307,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                     theme::text()
                 }
             };
-            highlight_text(name_disp.clone(), term, theme::FONT_BODY, base, true, 1.0).into_any()
+            highlight_text(name_disp.clone(), term, theme::font_body, base, true, 1.0).into_any()
         },
     );
     let header = h_stack((
@@ -1317,10 +1317,10 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
             db_favorites,
             move || Some((active_conn.get(), star_db.clone())),
             13.0,
-            CHEVRON_GAP,
+            chevron_gap(),
             0.0,
         ),
-        icons::icon(icons::DATABASE, SCHEMA_ICON as f32).style(move |s| {
+        icons::icon(icons::DATABASE, SCHEMA_ICON_BASE).style(move |s| {
             // Favorited → gold icon (matching the gold name), else the default.
             let fav = db_favorites
                 .with(|r| schemaic_core::favorite::is_favorite(r, active_conn.get(), &icon_fav_db));
@@ -1329,8 +1329,8 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
             } else {
                 theme::db_icon()
             })
-            .margin_left(CHEVRON_GAP)
-            .margin_right(ICON_GAP)
+            .margin_left(chevron_gap())
+            .margin_right(icon_gap())
             .flex_shrink(0.0_f32)
         }),
         db_name,
@@ -1352,7 +1352,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         let hl = key.clone();
         let db_name = conn.database.clone();
         move |s| {
-            let s = tree_row(s, ROW_PAD);
+            let s = tree_row(s, row_pad());
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else if active_db.get().as_deref() == Some(db_name.as_str()) {
@@ -1398,11 +1398,11 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 SchemaState::Loading => container(loading_dots(
                     "Loading",
                     theme::text_muted,
-                    theme::FONT_LABEL,
+                    theme::font_label,
                 ))
                 .style(|s| {
                     s.min_width(tree_row_min_w())
-                        .padding_left(LEAF_PAD)
+                        .padding_left(leaf_pad())
                         .padding_vert(3.0)
                 })
                 .into_any(),
@@ -1445,7 +1445,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                                 ns,
                                 schema.clone(),
                                 db_hit,
-                                child_ctx(LEVEL_INDENT),
+                                child_ctx(level_indent()),
                             )
                         }))
                         .style(|s| s.flex_col())
@@ -1563,16 +1563,16 @@ fn schema_node(
         chevron(expanded, key.clone(), on_toggle),
         // Muted: a schema row is structural, not something you open — it should
         // read quieter than the database above and the tables below it.
-        icons::icon(icons::FOLDER, SCHEMA_ICON as f32).style(move |s| {
+        icons::icon(icons::FOLDER, SCHEMA_ICON_BASE).style(move |s| {
             s.color(theme::text_muted())
-                .margin_left(CHEVRON_GAP)
-                .margin_right(ICON_GAP)
+                .margin_left(chevron_gap())
+                .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
         highlight_text(
             ns.clone(),
             name_term,
-            theme::FONT_BODY,
+            theme::font_body,
             theme::text,
             false,
             1.0,
@@ -1590,7 +1590,7 @@ fn schema_node(
     .style({
         let hl = key.clone();
         move |s| {
-            let s = tree_row(s, ROW_PAD + LEVEL_INDENT).gap(6.0);
+            let s = tree_row(s, row_pad() + level_indent()).gap(6.0);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -1766,14 +1766,14 @@ fn object_group_node(
         chevron(expanded, key.clone(), on_toggle),
         // Muted like a namespace row: a folder is structural, not something you
         // open.
-        icons::icon(icons::FOLDER, SCHEMA_ICON as f32).style(move |s| {
+        icons::icon(icons::FOLDER, SCHEMA_ICON_BASE).style(move |s| {
             s.color(theme::text_muted())
-                .margin_left(CHEVRON_GAP)
-                .margin_right(ICON_GAP)
+                .margin_left(chevron_gap())
+                .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
         text(object_group_label(kind))
-            .style(|s| s.font_size(theme::FONT_BODY).color(theme::text())),
+            .style(|s| s.font_size(theme::font_body()).color(theme::text())),
         capsule(count.to_string()),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
@@ -1786,9 +1786,9 @@ fn object_group_node(
         move |s| {
             // Exactly `table_node`'s indent, because a folder sits at the same
             // level a table does: under the database when the tree is flat, and
-            // one step under the namespace row when it isn't. `ROW_PAD + indent`
+            // one step under the namespace row when it isn't. `row_pad() + indent`
             // put it *level with* the namespace it belongs to.
-            let s = tree_row(s, ROW_PAD + LEVEL_INDENT + indent).gap(6.0);
+            let s = tree_row(s, row_pad() + level_indent() + indent).gap(6.0);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -1896,15 +1896,15 @@ fn object_row(
     };
     let open_menu = marking_opener(nav, &nav_key, open_menu);
     let row = h_stack((
-        icons::icon(object_icon(kind), SCHEMA_ICON as f32).style(move |s| {
+        icons::icon(object_icon(kind), SCHEMA_ICON_BASE).style(move |s| {
             s.color(theme::text_muted().multiply_alpha(if dim { 0.4 } else { 0.7 }))
-                .margin_right(ICON_GAP)
+                .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
         highlight_text(
             name.clone(),
             term,
-            theme::FONT_BODY,
+            theme::font_body,
             move || {
                 if dim {
                     theme::text_muted()
@@ -1917,7 +1917,7 @@ fn object_row(
         ),
         text(detail).style(|s| {
             s.color(theme::text_muted())
-                .font_size(theme::FONT_LABEL)
+                .font_size(theme::font_label())
                 .margin_left(12.0)
         }),
     ))
@@ -1939,7 +1939,7 @@ fn object_row(
     .style({
         let hl = nav_key.clone();
         move |s| {
-            let s = tree_row(s, COL_PAD + indent);
+            let s = tree_row(s, col_pad() + indent);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -2005,7 +2005,7 @@ fn size_badge(
             None => empty().into_any(),
             Some(s) => text(s)
                 .style(|s| {
-                    s.font_size(theme::FONT_STATUS)
+                    s.font_size(theme::font_status())
                         .color(theme::text_faint())
                         .flex_shrink(0.0_f32)
                 })
@@ -2133,16 +2133,16 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let col_source = source.clone();
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle),
-        icons::icon(glyph, SCHEMA_ICON as f32).style(move |s| {
+        icons::icon(glyph, SCHEMA_ICON_BASE).style(move |s| {
             s.color(glyph_color())
-                .margin_left(CHEVRON_GAP)
-                .margin_right(ICON_GAP)
+                .margin_left(chevron_gap())
+                .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
         highlight_text(
             table.name.clone(),
             name_term.clone(),
-            theme::FONT_BODY,
+            theme::font_body,
             theme::text,
             false,
             1.0,
@@ -2176,7 +2176,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     .style({
         let hl = key.clone();
         move |s| {
-            let s = tree_row(s, ROW_PAD + LEVEL_INDENT + indent);
+            let s = tree_row(s, row_pad() + level_indent() + indent);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else if active_table.get().as_ref() == Some(&hl_source) {
@@ -2271,16 +2271,16 @@ fn count_row(cols: usize, keys: usize, indent: f64) -> impl IntoView {
     .style(move |s| {
         s.flex_row()
             .gap(5.0)
-            .padding_left(LEAF_PAD + indent)
+            .padding_left(leaf_pad() + indent)
             .margin_top(6.0)
             .margin_bottom(6.0)
     })
 }
 
 fn capsule(label: String) -> impl IntoView {
-    container(text(label).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_muted())))
+    container(text(label).style(|s| s.font_size(theme::font_label()).color(theme::text_muted())))
         .style(|s| {
-            s.height(18.0)
+            s.height(theme::scaled(18.0))
                 .items_center()
                 .justify_center()
                 .padding_horiz(7.0)
@@ -2369,22 +2369,22 @@ fn column_row(
     // colour so it reads as a quieter marker beside the full-strength name.
     let glyph = column_type_icon(classify_column_type(&ty));
     let row = h_stack((
-        icons::icon(glyph, SCHEMA_ICON as f32).style(move |s| {
+        icons::icon(glyph, SCHEMA_ICON_BASE).style(move |s| {
             s.color(kind.color().multiply_alpha(0.5))
-                .margin_right(ICON_GAP)
+                .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
         highlight_text(
             name,
             term,
-            theme::FONT_BODY,
+            theme::font_body,
             move || kind.color(),
             false,
             1.0,
         ),
         text(ty).style(|s| {
             s.color(theme::text_muted())
-                .font_size(theme::FONT_LABEL)
+                .font_size(theme::font_label())
                 .margin_left(12.0)
         }),
     ))
@@ -2399,7 +2399,7 @@ fn column_row(
     .style({
         let hl = nav_key.clone();
         move |s| {
-            let s = tree_row(s, COL_PAD + indent);
+            let s = tree_row(s, col_pad() + indent);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -2444,16 +2444,16 @@ fn key_row(
     let label = format!("{} ({cols})", ix.name);
     let ctx_index = ix.clone();
     h_stack((
-        icons::icon(icons::KEY_ROUND, SCHEMA_ICON as f32).style(move |s| {
+        icons::icon(icons::KEY_ROUND, SCHEMA_ICON_BASE).style(move |s| {
             // 50%-alpha key colour, matching the column icons' quieter marker.
             s.color(color.multiply_alpha(0.5))
-                .margin_right(ICON_GAP)
+                .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
         text(label),
         text(tag).style(|s| {
             s.color(theme::text_muted())
-                .font_size(theme::FONT_LABEL)
+                .font_size(theme::font_label())
                 .margin_left(12.0)
         }),
     ))
@@ -2485,7 +2485,7 @@ fn key_row(
     // it never shows a selection highlight either — it opens nowhere. The
     // context-menu mark is not that highlight: the row has a menu like any other,
     // and while it is open it says so.
-    .style(move |s| menu_mark(tree_row_static(s, COL_PAD + indent), nav, &mark_key))
+    .style(move |s| menu_mark(tree_row_static(s, col_pad() + indent), nav, &mark_key))
 }
 
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right
@@ -2505,14 +2505,14 @@ fn chevron(
             } else {
                 icons::CHEVRON_RIGHT
             };
-            icons::icon(svg, SCHEMA_ICON as f32).into_any()
+            icons::icon(svg, SCHEMA_ICON_BASE).into_any()
         },
     );
     container(glyph)
         .on_click_stop(move |_| (on_toggle)(key.clone()))
         .style(|s| {
-            s.width(SCHEMA_ICON)
-                .height(TREE_ROW_H)
+            s.width(schema_icon())
+                .height(tree_row_h())
                 .flex_shrink(0.0_f32)
                 .items_center()
                 .justify_center()
@@ -2564,13 +2564,13 @@ fn tree_row(s: floem::style::Style, pad_left: f64) -> floem::style::Style {
 // which can't be opened, so a hover/selection affordance would mislead).
 fn tree_row_static(s: floem::style::Style, pad_left: f64) -> floem::style::Style {
     s.min_width(tree_row_min_w())
-        .height(TREE_ROW_H)
-        .min_height(TREE_ROW_H)
+        .height(tree_row_h())
+        .min_height(tree_row_h())
         .items_center()
         .flex_row()
         .padding_left(pad_left)
         .padding_right(8.0)
-        .font_size(theme::FONT_BODY)
+        .font_size(theme::font_body())
 }
 
 // A non-interactive status line inside the tree (Loading / error / empty).
@@ -2581,10 +2581,10 @@ fn info_row(
     color: impl Fn() -> floem::peniko::Color + 'static,
 ) -> impl IntoView {
     let msg = msg.into();
-    container(text(msg).style(move |s| s.color(color()).font_size(theme::FONT_LABEL))).style(
+    container(text(msg).style(move |s| s.color(color()).font_size(theme::font_label()))).style(
         move |s| {
             s.min_width(tree_row_min_w())
-                .padding_left(LEAF_PAD)
+                .padding_left(leaf_pad())
                 .padding_vert(3.0)
         },
     )
