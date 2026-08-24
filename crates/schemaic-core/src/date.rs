@@ -270,6 +270,40 @@ impl Time {
     };
 }
 
+/// The local wall clock read **once**: today's date, the time of day, and the
+/// zone's offset from UTC (`"+02:00"`, `"+00:00"`).
+///
+/// One function rather than [`Date::today`] plus [`Time::now`], because two reads
+/// are two instants: the calendar's **Now** button did exactly that, and between
+/// them lies local midnight — where it writes yesterday's date beside today's
+/// time, a stamp a day in the past from the one control whose whole job is "the
+/// current instant". A caller that wants *only* the day still wants `Date::today`;
+/// a caller writing a timestamp wants all three or none.
+///
+/// The offset is the third part because a written instant is not fully stated
+/// without it wherever the column can hold one: a local wall-clock time under a
+/// value's inherited `+00` is an instant hours from now. It is chrono's own
+/// rendering (`%:z`), which is the form PostgreSQL and MySQL 8.0.19+ both read.
+pub fn local_now() -> (Date, Time, String) {
+    let now = chrono::Local::now();
+    let (y, m, d) = chrono_ymd(&now);
+    let (h, min, s) = chrono_hms(&now);
+    let offset = now.format("%:z").to_string();
+    (
+        Date {
+            year: y,
+            month: m,
+            day: d,
+        },
+        Time {
+            hour: h,
+            minute: min,
+            second: s,
+        },
+        offset,
+    )
+}
+
 /// `(year, month, day)` off a chrono timestamp, through its `Datelike` trait so
 /// nothing else in the workspace has to import it.
 fn chrono_ymd(now: &chrono::DateTime<chrono::Local>) -> (i32, u32, u32) {
@@ -352,6 +386,29 @@ impl Stamp {
         self
     }
 
+    /// Does the value carry anything after its seconds — in practice a timezone
+    /// offset (`+02`, `Z`)?
+    ///
+    /// Asked before [`Stamp::with_offset`], so a column that has nowhere to put
+    /// one (MySQL's `DATETIME`) is never given one.
+    pub fn has_offset(&self) -> bool {
+        !self.tail.is_empty()
+    }
+    /// Replace the timezone tail. **Replace, not keep**: an offset qualifies a
+    /// particular instant, so writing a *new* time under the old value's offset
+    /// states an instant that is hours away from the one intended — which is what
+    /// the calendar's **Now** did on a `timestamptz` read from a server in another
+    /// zone.
+    pub fn with_offset(mut self, offset: &str) -> Stamp {
+        self.tail = offset.to_string();
+        self
+    }
+    /// Drop the fractional seconds, keeping everything else. The old value's
+    /// microseconds are not the new time's.
+    pub fn without_frac(mut self) -> Stamp {
+        self.frac.clear();
+        self
+    }
     /// Drop the time of day, leaving a bare `YYYY-MM-DD`. The fraction and the
     /// timezone tail go with it — they qualify a time that is no longer there.
     pub fn without_time(mut self) -> Stamp {
@@ -400,13 +457,25 @@ pub fn month_cells(year: i32, month: u32) -> Vec<Date> {
 // so `Stamp::parse` is a walk rather than a set of overlapping slices.
 
 /// Leading ASCII digits, at most `max` of them: `(value, rest)`, or `None` when
-/// there isn't at least one.
+/// there isn't at least one — **or when there is a further digit after `max`**.
+///
+/// That last rule is what makes the cap a validation rather than a truncation.
+/// Without it `10:3045` read as 10:30 and handed `45` on to whoever wanted the
+/// rest, which for [`Stamp::parse`] is the timezone tail: the value came back out
+/// of [`Stamp::render`] as `10:30:0045`, and
+/// [`crate::celledit::fits`] reported it as a value the calendar could show, so
+/// picking a day rewrote the cell into that. A number wider than its field is not
+/// a shorter number followed by something else; it is not that field.
 fn take_digits(s: &str, max: usize) -> Option<(u32, &str)> {
     let end = s.bytes().take(max).take_while(u8::is_ascii_digit).count();
     if end == 0 {
         return None;
     }
-    Some((s[..end].parse().ok()?, &s[end..]))
+    let rest = &s[end..];
+    if rest.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((s[..end].parse().ok()?, rest))
 }
 
 /// A leading `YYYY-MM-DD`, validated through [`Date::new`].
@@ -716,6 +785,56 @@ mod tests {
         assert!(Stamp::parse("2024-01-15x10:30:00").is_none());
         assert!(Stamp::parse("2024-01-15 25:00:00").is_none());
         assert!(Stamp::parse("2024-01-15 BC").is_none());
+    }
+
+    /// **A number wider than its field is not that field.** Each scanner caps its
+    /// digits, and the cap used to *truncate*: `10:3045` read as 10:30 with `45`
+    /// left over, which `Stamp::parse` keeps as the timezone tail — so the value
+    /// re-rendered as `10:30:0045`, and `celledit::fits` called it a timestamp the
+    /// calendar could show, which meant picking a day rewrote the cell into that.
+    #[test]
+    fn a_field_with_too_many_digits_is_not_a_timestamp() {
+        for src in [
+            "2024-01-15 10:3045",
+            "2024-01-15 100:30",
+            "2024-01-15 10:30:001",
+            "2024-01-155 10:30:00",
+            "2024-011-15",
+        ] {
+            assert!(Stamp::parse(src).is_none(), "{src} must not parse");
+        }
+        // And a value that never had the extra digit is untouched.
+        assert_eq!(
+            Stamp::parse("2024-01-15 10:30:00").map(|s| s.render()),
+            Some("2024-01-15 10:30:00".to_string())
+        );
+    }
+
+    /// What **Now** has to write: the whole instant, in the value's own shape.
+    /// The fraction is dropped (the old value's microseconds are not this
+    /// instant's) and an offset is *replaced* rather than kept — a local
+    /// wall-clock time written under the old value's `+00` is an instant hours
+    /// away from now, which is the one thing that button must not produce.
+    #[test]
+    fn stamping_now_replaces_the_offset_and_drops_the_fraction() {
+        let s = Stamp::parse("2024-01-15 10:30:00.123456+00").expect("parses");
+        assert!(s.has_offset());
+        let now = s
+            .with_date(d(2024, 3, 1))
+            .with_time(Time::new(14, 5, 9).expect("valid"))
+            .without_frac()
+            .with_offset("+02:00");
+        assert_eq!(now.render(), "2024-03-01 14:05:09+02:00");
+    }
+
+    /// A value with no offset does not gain one: MySQL's `DATETIME` has nowhere
+    /// to put it, and "keep the shape the column is in" is the rule the whole
+    /// type follows.
+    #[test]
+    fn a_value_with_no_offset_is_not_given_one() {
+        let s = Stamp::parse("2024-01-15 10:30:00").expect("parses");
+        assert!(!s.has_offset());
+        assert_eq!(s.render(), "2024-01-15 10:30:00");
     }
 
     #[test]

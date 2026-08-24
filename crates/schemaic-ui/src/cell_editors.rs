@@ -44,7 +44,7 @@ use floem::prelude::*;
 use floem::style::FlexWrap;
 
 use schemaic_core::celledit::{self, CellEditor};
-use schemaic_core::date::{self, Date, Time};
+use schemaic_core::date::{self, Date};
 
 use crate::widgets::{MenuEntry, MenuFlags, MenuId, MenuInset, menu_inset};
 use crate::{DatePick, FieldCfg, PopupAnchor, edit_field, icons, theme};
@@ -735,14 +735,14 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
                 // calendar left open across local midnight would otherwise write
                 // yesterday's date beside the current time — a stamp a day in the
                 // past, from the one button whose whole job is "the current
-                // instant".
-                let today = Date::today();
-                let dated = celledit::set_date(&editor, &buf.get_untracked(), today);
-                buf.set(if picks_time {
-                    celledit::set_time(&editor, &dated, Time::now(), today)
-                } else {
-                    dated
-                });
+                // instant". And read it **once**, which is the same bug at a
+                // smaller scale: two readings straddle that midnight too.
+                let (date, time, offset) = date::local_now();
+                buf.set(celledit::set_now(
+                    &editor,
+                    &buf.get_untracked(),
+                    (date, time, &offset),
+                ));
                 (done)();
             })
             .style(|s| {
