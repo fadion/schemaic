@@ -79,11 +79,25 @@ pub fn init() {
     // ANSI off: the escape codes are noise in a file, and this writer is the one
     // that always exists. Debug builds tee to stdout and lose colour with it,
     // which is a fair trade for the console and the file agreeing.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_writer(writer.and(std::io::stdout))
-        .init();
+    //
+    // **The tee is debug-only, as this always said and did not do.** A release
+    // build on Windows is a GUI subsystem binary with no console attached, so
+    // stdout is an invalid handle: teeing to it made every log event perform a
+    // write that fails, and take the process-wide stdout lock to do it. Nothing
+    // was lost (the file is written first) and nothing was visible either.
+    if cfg!(debug_assertions) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(writer.and(std::io::stdout))
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(writer)
+            .init();
+    }
 }
 
 /// Open the log for appending, rotating it first if it has grown past the cap.
@@ -403,7 +417,14 @@ mod tests {
             MARKER_RAN.store(true, Ordering::SeqCst);
         }));
 
-        hook_writes_the_panic_through_tracing();
+        // **Caught, because the helper can fail.** Its own restore hands the
+        // hook back to *its* caller — this marker — before its three assertions
+        // run, so an assertion failing there unwound straight past the restore
+        // below and left the process holding a hook that prints nothing: the
+        // undiagnosable blank both these tests exist to prevent, produced by the
+        // pin against it. (A `Drop` guard is not the answer here: `set_hook`
+        // panics if called from a panicking thread, as the helper's own doc says.)
+        let helper = std::panic::catch_unwind(hook_writes_the_panic_through_tracing);
 
         // The marker has to be the hook the process still holds. Firing a panic
         // is the only way to ask, so fire one and swallow it.
@@ -411,6 +432,19 @@ mod tests {
         let restored = MARKER_RAN.load(Ordering::SeqCst);
         std::panic::set_hook(real_hook);
 
+        // Now that the real hook is back, **re-raise the helper's failure as
+        // text**. Two hops silenced it otherwise: the marker hook was installed
+        // when it fired, and `resume_unwind` deliberately doesn't call a hook
+        // either — so a failing helper reported as a bare `FAILED` with nothing
+        // under it. The payload *is* its assertion message ([`payload_text`]).
+        // Before the pin below, so a broken helper reports as itself rather than
+        // as this test.
+        if let Err(payload) = helper {
+            panic!(
+                "the hook test itself failed: {}",
+                payload_text(payload.as_ref())
+            );
+        }
         assert!(
             restored,
             "the hook test replaced the process-global panic hook and left it replaced"

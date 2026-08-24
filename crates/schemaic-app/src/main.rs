@@ -1834,10 +1834,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // ── Run EXPLAIN for the query-plan modal (targets the active tab's db) ──
     let plan_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+    // **Which run the modal is showing.** Cancelling the old token is not enough
+    // to keep a superseded run off the screen: a timed-out EXPLAIN ANALYZE
+    // returns *late* — its cancel path opens a second connection to `KILL` the
+    // query — and the arm that reports the timeout is not the `Cancelled` arm
+    // that returns, so it painted its message over a run the user had already
+    // started. Bumped per launch and checked where the result lands, which is on
+    // the UI thread and therefore the one place that can read it.
+    let plan_seq: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let run_plan: Rc<dyn Fn(String, bool)> = {
         let handle = handle.clone();
         let db_for = db_for.clone();
         let plan_token = plan_token.clone();
+        let plan_seq = plan_seq.clone();
         Rc::new(move |sql: String, analyze: bool| {
             if sql.trim().is_empty() {
                 return;
@@ -1863,7 +1872,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             *plan_token.borrow_mut() = Some(token.clone());
             plan_state.set(PlanState::Running);
 
-            let send = create_ext_action(cx, move |st: PlanState| plan_state.set(st));
+            let seq = plan_seq.get().wrapping_add(1);
+            plan_seq.set(seq);
+            // Every arm goes through this, not just the timeout one: a late
+            // failure of any kind belongs to the run that produced it.
+            let send = {
+                let plan_seq = plan_seq.clone();
+                create_ext_action(cx, move |(n, st): (u64, PlanState)| {
+                    if n == plan_seq.get() {
+                        plan_state.set(st);
+                    }
+                })
+            };
             // `analyze` *executes* the statement to measure it, so an EXPLAIN
             // ANALYZE is exactly as runaway-capable as the query itself. Plain
             // EXPLAIN only plans and is bounded too — it costs nothing, and an
@@ -1885,7 +1905,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(DbError::Cancelled) => return, // superseded — leave state alone
                     Err(e) => PlanState::Failed(e.to_string()),
                 };
-                send(st);
+                send((seq, st));
             });
         })
     };
