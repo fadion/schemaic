@@ -3216,6 +3216,12 @@ pub(crate) async fn collect_rows(
     // list; at the 200k-row cap on a wide result that is tens of millions of
     // calls in the row loop, for an answer that cannot change between rows.
     let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
+    // Hoisted for the same reason, and asked of the type name only: a bit-field's
+    // bytes are a number, and nothing but the column says so.
+    let bit: Vec<bool> = columns
+        .iter()
+        .map(|c| schemaic_core::model::type_is_bit(&c.type_name))
+        .collect();
     // Assemble the result columnar, one row at a time, so we never hold a
     // row-major `Vec<Vec<Value>>` copy alongside the final storage.
     let mut builder = ResultBuilder::new(columns);
@@ -3224,7 +3230,7 @@ pub(crate) async fn collect_rows(
         while let Some(row) = stream.next().await {
             let row = row.map_err(qerr)?;
             if builder.row_count() < row_cap {
-                let cells = convert_row(&row, builder.columns(), &binary);
+                let cells = convert_row(&row, builder.columns(), &binary, &bit);
                 builder.push_row(&cells);
             } else {
                 // A row beyond the cap exists → the result is truncated.
@@ -3427,12 +3433,20 @@ fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
 /// re-imported as the wrong bytes. It renders as `binary_display` now, the same
 /// `<n bytes>` SQLite and PostgreSQL show, which says what it is and cannot be
 /// mistaken for the value.
-fn convert_row(row: &Row, columns: &[Column], binary: &[bool]) -> Vec<Value> {
+fn convert_row(row: &Row, columns: &[Column], binary: &[bool], bit: &[bool]) -> Vec<Value> {
     (0..columns.len())
         .map(|i| match row.as_ref(i) {
             None | Some(MyValue::NULL) => Value::Null,
             Some(MyValue::Bytes(b)) if binary.get(i).copied().unwrap_or(false) => {
                 Value::Str(binary_display(b.len()))
+            }
+            // **A bit-field arrives as bytes and is a number.** Nothing in the
+            // value says so — only the column's type does — and lossy-decoding
+            // those bytes as text is how a `BIT(8)` holding 10 became a newline
+            // character. `bit_display` reads them the way MySQL wrote them and
+            // the way it takes them back.
+            Some(MyValue::Bytes(b)) if bit.get(i).copied().unwrap_or(false) => {
+                Value::Str(schemaic_core::model::bit_display(b))
             }
             Some(MyValue::Bytes(b)) => parse_typed(
                 String::from_utf8_lossy(b).into_owned(),
@@ -4072,7 +4086,11 @@ pub(crate) async fn refetch_on(
         let fetched: Vec<Row> = result.collect::<Row>().await.map_err(qerr)?;
         if let Some(r) = fetched.first() {
             let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
-            out.push((row.data_row, convert_row(r, &columns, &binary)));
+            let bit: Vec<bool> = columns
+                .iter()
+                .map(|c| schemaic_core::model::type_is_bit(&c.type_name))
+                .collect();
+            out.push((row.data_row, convert_row(r, &columns, &binary, &bit)));
         }
     }
     Ok(out)
@@ -4730,13 +4748,19 @@ mod tests {
             "BLOB",
             "TINYBLOB",
             "LONGBLOB",
-            "BIT",
             "GEOMETRY",
         ] {
             assert!(is_binary_data_type(t), "{t} should be binary data");
         }
-        // Temporal/numeric report charset 63 too, but aren't binary DATA.
-        for t in ["DATETIME", "INT", "VARCHAR", "TEXT", "JSON", "DECIMAL"] {
+        // Temporal/numeric report charset 63 too, but aren't binary DATA — and
+        // `BIT` is in that company rather than with the blobs: it arrives as
+        // bytes and is a *number*, which `convert_row` reads with `bit_display`
+        // (see `core::model::type_is_bit`). Being on the list above made a
+        // `BIT(8)` read `<1 bytes>`, kept it out of the CSV and JSON exports, and
+        // made the column read-only.
+        for t in [
+            "DATETIME", "INT", "VARCHAR", "TEXT", "JSON", "DECIMAL", "BIT",
+        ] {
             assert!(!is_binary_data_type(t), "{t} should not be binary data");
         }
     }
