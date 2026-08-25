@@ -3008,7 +3008,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       scrolling sideways. It is now out of flow and anchored to the panel: `absolute()`,
       `inset_left(0)`, `width(tree_row_min_w())`, `justify_end()`, the same value every row already
       uses as its `min_width`. `inset_left` rather than `inset_right` precisely because the right
-      edge is the one that moves. The trade is that a table name long enough to reach the panel
+      edge is the one that moves. **Vertically it centres rather than anchors** —
+      `align_self(AlignItems::Center)`, not `inset_top(0)` — and the two are not interchangeable:
+      taffy places a start-anchored absolute child at the border box *plus* the container's border
+      on that side (`flexbox.rs`, `perform_absolute_layout_on_absolute_children`: `start +
+      constants.border.cross_start + margin`), so the 1px rule `menu_mark` adds while a row's
+      context menu is open pushed the badge down by exactly 1px, and right-clicking a table
+      visibly nudged its size until the menu closed. `height_full()` still resolved against the
+      border box, so the box was displaced rather than squeezed, and the chevron, icon and name —
+      flex children, which that border does not move — stayed put, which is what made it read as
+      the badge's own bug. The centring branch instead derives the cross offset from
+      `content_box_inset` (padding + border) at *both* edges, so a rule present above and below
+      cancels. The horizontal anchor was left alone on purpose: `inset_left` measures from the
+      border box the same way, but a row wears no left or right border, so there is nothing there
+      to displace it. The trade is that a table name long enough to reach the panel
       edge now runs *under* the size instead of pushing it along — tolerable because sizes appear
       on table rows only, so there is no column row beneath to collide with. What runs underneath
       is also the chevron and the name, so `.pointer_events(|| false)` on the badge is load-bearing
@@ -4708,6 +4721,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   parent's **border** box and never adds its padding (taffy 0.4.4, `compute/flexbox.rs`,
   `perform_absolute_layout_on_absolute_children`: `offset_main = start + border.main_start`), so one
   inset lands identically on rows carrying different per-level `padding_left` — no depth arithmetic.
+  That same formula has a sharp edge, because the parent's **border** is *added* to the inset where
+  its padding is not (`start + constants.border.cross_start + margin`): a border that comes and goes
+  moves a start-anchored absolute child by its width, even though the parent's own height never
+  changes. The schema tree's 1px open-menu rule (`menu_mark`) shifted `size_badge` down 1px on every
+  right-click that way, while the row's flex children sat still. Anchor to an edge only if no border
+  will ever appear on it; otherwise centre — `align_self(AlignItems::Center)` takes taffy's other
+  branch, which subtracts `content_box_inset` at both ends and cancels a symmetric rule.
   What you give up is the flow's collision handling: the in-flow sibling now runs *under* the
   overlay instead of pushing it along — in paint order and in the hit test both, so the overlay
   also needs the `.pointer_events(|| false)` the absolute-overlays bullet above is about.
@@ -5615,7 +5635,15 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   onto the neighbouring rows and no `z_index` is needed to keep their hover backgrounds off it, while
   an `outline` — which floem inflates outward — would have needed one; and taffy sizes the **border
   box**, so `height(TREE_ROW_H)` is unchanged and the rule costs 2px of content box, not a layout
-  shift. The key/index leaf is the only row outside the nav sequence, so it carries its own
+  shift. That second half holds for a row's **flex** children only, and the gap in it shipped a bug:
+  taffy offsets a start-anchored *absolutely positioned* child from the border box plus the
+  container's border on that side, so the 1px top rule moved `size_badge` — the tree's one absolute
+  child — down by exactly 1px on right-click, and back when the menu closed, while the chevron, icon
+  and name beside it never budged. The badge now centres on the cross axis
+  (`align_self(AlignItems::Center)`), whose offset subtracts `content_box_inset` symmetrically and so
+  cancels a rule that is on both edges; **any absolute child of a row that can wear this mark must
+  centre rather than anchor to the edge the rule sits on**, and `size_badge` is the only one today.
+  The key/index leaf is the only row outside the nav sequence, so it carries its own
   `key_row_menu_key` (a prefix that never reaches the persisted expansion set) and calls `menu_mark`
   itself — a marker that skipped the one row kind with a menu but no cursor is a marker the user
   learns not to trust. `every_row_key_family_owns_its_prefix` guards the shared key space.
