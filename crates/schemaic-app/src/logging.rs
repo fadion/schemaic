@@ -42,6 +42,66 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 /// the ones that most need reading back, and they arrive on that target.
 const DEFAULT_FILTER: &str = "schemaic=info,velopack=info";
 
+/// Targets whose own `trace!`/`debug!` records carry **credentials**, capped at
+/// `warn` no matter what the environment asks for.
+///
+/// `russh`'s `session_write_encrypted` traces the packet body *before* the
+/// writer encrypts it, so `RUST_LOG=trace` (or `RUST_LOG=russh=trace`) put the
+/// pre-encryption `SSH_MSG_USERAUTH_REQUEST` — the tunnel account's password, as
+/// a decimal byte array — into `schemaic.log`. The same crate logs raw agent
+/// request and response buffers at `debug!`. `mysql_async`, `tokio-postgres` and
+/// `rusqlite` depend on neither `log` nor `tracing`, so this is russh's surface
+/// alone.
+///
+/// The route matters as much as the trace: Settings → General offers **Open
+/// folder** for the log, and its own doc calls that folder "everything anyone
+/// would be asked for". The password this app deliberately keeps out of
+/// `connections.json` and in the OS keyring was landing in a plain file beside
+/// it — against the invariant that says *no credential in a URL, argv or log*.
+///
+/// Underscores, not hyphens: a `log`/`tracing` target is the Rust module path,
+/// so the crate `russh-cryptovec` reports as `russh_cryptovec`. `russh` covers
+/// its submodules (`russh::keys::agent::client`) by prefix.
+const CREDENTIAL_TARGETS: &[&str] = &["russh", "russh_cryptovec", "russh_util"];
+
+/// The directive list to build the filter from: what the environment asked for
+/// (or [`DEFAULT_FILTER`]), then the floor the environment cannot lift.
+///
+/// **The floor comes last, and that is what makes it a floor.** `RUST_LOG`
+/// *replaces* the default filter rather than adding to it, so a bare
+/// `RUST_LOG=trace` takes the target allowlist away with it and every dependency
+/// in the graph starts writing to the file. Appending
+/// `russh=warn` after the user's directives wins twice over: a bare `trace` is a
+/// global directive and a target directive is more specific (`EnvFilter` matches
+/// most-specific-first), and an explicit `RUST_LOG=russh=trace` is an *equal*
+/// key, which `DirectiveSet::add` replaces with the later one — this one.
+fn log_directives(env: Option<&str>) -> String {
+    let asked = env
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .unwrap_or(DEFAULT_FILTER);
+    let mut out = asked.to_string();
+    for target in CREDENTIAL_TARGETS {
+        out.push(',');
+        out.push_str(target);
+        out.push_str("=warn");
+    }
+    out
+}
+
+/// The subscriber's filter for a given `RUST_LOG` value.
+///
+/// A malformed `RUST_LOG` falls back to the default filter — which is what
+/// `EnvFilter::try_from_default_env` did — rather than being applied
+/// directive-by-directive with the bad ones dropped: a filter half the user
+/// asked for is harder to notice than none of it.
+fn filter_for(env: Option<&str>) -> EnvFilter {
+    let asked = log_directives(env);
+    EnvFilter::builder()
+        .parse(&asked)
+        .unwrap_or_else(|_| EnvFilter::builder().parse_lossy(log_directives(None)))
+}
+
 /// Rotate once the log passes this. One generation is kept (`schemaic.log.1`),
 /// so the worst case on disk is twice this.
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -66,8 +126,7 @@ pub fn log_path() -> Option<PathBuf> {
 /// stdout-only behaviour rather than refusing to start, since a read-only or
 /// missing config directory is a reason to lose logs, not the app.
 pub fn init() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    let filter = filter_for(std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref());
 
     let Some(file) = open_log() else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -221,6 +280,65 @@ impl Write for FileHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`RUST_LOG` must not be able to ask for the SSH password.** `russh`
+    /// traces the pre-encryption packet body, so admitting its `trace!` records
+    /// puts the tunnel account's password into a file the Settings panel offers
+    /// to open for whoever is helping.
+    ///
+    /// Every way of asking, including asking for that target by name: the floor
+    /// is appended after the user's directives, and an equal key is *replaced* by
+    /// the later one (`DirectiveSet::add`), so `russh=trace,russh=warn` is
+    /// `warn`.
+    #[test]
+    fn no_rust_log_setting_can_admit_the_ssh_drivers_packet_trace() {
+        for asked in [
+            None,
+            Some("trace"),
+            Some("debug"),
+            Some("russh=trace"),
+            Some("russh=debug,schemaic=trace"),
+            Some(""),
+            Some("   "),
+        ] {
+            let directives = log_directives(asked);
+            for target in CREDENTIAL_TARGETS {
+                assert!(
+                    directives.ends_with(&format!("{target}=warn"))
+                        || directives.contains(&format!("{target}=warn,")),
+                    "{asked:?} left {target} un-floored: {directives}"
+                );
+            }
+            // The floor is *last*, which is what makes an explicit
+            // `RUST_LOG=russh=trace` lose to it.
+            assert!(
+                directives.ends_with("russh_util=warn"),
+                "the floor must come after what the environment asked for: {directives}"
+            );
+            // And it parses — a floor that cannot be built is not one.
+            let _ = filter_for(asked);
+        }
+    }
+
+    /// The floor adds to the environment's request; it does not replace it. A
+    /// user who asks for more of *Schemaic's* logging still gets it.
+    #[test]
+    fn the_floor_leaves_what_the_environment_asked_for_intact() {
+        assert!(log_directives(Some("schemaic=trace")).starts_with("schemaic=trace,"));
+        // Nothing set: the default allowlist, still first.
+        assert!(log_directives(None).starts_with(DEFAULT_FILTER));
+        // Whitespace is not a request.
+        assert!(log_directives(Some("  ")).starts_with(DEFAULT_FILTER));
+    }
+
+    /// A malformed `RUST_LOG` falls back to the default filter rather than being
+    /// applied with the bad directives dropped — and the floor survives the
+    /// fallback, which is the half that matters here.
+    #[test]
+    fn a_malformed_rust_log_still_gets_the_floor() {
+        let filter = filter_for(Some("this is not a directive=?!")).to_string();
+        assert!(filter.contains("russh"), "{filter}");
+    }
 
     #[test]
     fn a_fresh_log_is_not_rotated() {
