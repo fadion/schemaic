@@ -6076,7 +6076,15 @@ fn discard_edits(gs: GridState) {
         gs.new_rows_gen.update(|g| *g = g.wrapping_add(1));
     }
     clear_if_any(gs.del_rows);
-    clear_if_any(gs.commit_err);
+    // **The whole bar, not just its error surface.** Discard's meaning is "none of
+    // that is true any more", and the bar's *note* surface is the one that can hold
+    // a sentence about the edits it just threw away — `Pasted 5 cells, skipping 1
+    // in read-only columns.` describing five cells that no longer exist, standing
+    // until some other path happens to clear it. `clear_bar` is the one spelling;
+    // this site read `clear_if_any(gs.commit_err)` rather than
+    // `commit_err.get_untracked().is_some()`, which is why `7a5e458`'s sweep for
+    // the old shape found the other two copies and not this one.
+    gs.clear_bar();
 }
 
 /// Move the grid selection to the next (`forward`) / previous cell whose
