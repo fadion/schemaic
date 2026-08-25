@@ -2267,7 +2267,15 @@ impl EventSchedule {
     }
 }
 
-/// The interval keywords `EVERY` accepts, in MySQL's own documented order.
+/// The interval keywords `EVERY` accepts, **smallest unit first, then the
+/// compound ones** — a reading order for a dropdown, not the manual's.
+///
+/// The set is exactly MySQL's fifteen; the *order* is not. The manual lists them
+/// `YEAR | QUARTER | MONTH | DAY | HOUR | MINUTE | WEEK | SECOND | YEAR_MONTH |
+/// DAY_HOUR | …`, which puts `WEEK` between `MINUTE` and `SECOND` and is no order
+/// to scan a list in. This said "in MySQL's own documented order" and was simply
+/// wrong about it — noticed by the `S3.1` review pass, left unraised there for
+/// want of a server, and checked since.
 ///
 /// A vocabulary for the editor's dropdown, **not** a parse: the unit stays a
 /// `String` on [`EventSchedule::Every`], so a server carrying a keyword this
