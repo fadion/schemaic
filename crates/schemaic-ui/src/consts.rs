@@ -100,6 +100,32 @@ pub(crate) fn grid_copy_menu_w() -> f64 {
     scaled(170.0)
 }
 
+// ── Virtual space ───────────────────────────────────────────────────────────
+
+/// Scrollable height of a body of `content_h` rows-or-lines of `unit_h` in a
+/// `viewport_h`-tall viewport — the content **plus the virtual space under it**,
+/// which is what lets the last row (or line) be scrolled up to the top instead
+/// of sitting against the bottom edge.
+///
+/// One definition for both surfaces that have it. Floem's editor computes the
+/// same thing internally for `ScrollBeyondLastLine` (a `max(content, viewport)`
+/// box with a `min(viewport, content) − one unit` bottom margin), so the SQL
+/// editor's scrollbars mirror it here rather than measuring the text alone,
+/// while the results grid — whose scrolling is entirely ours — *is* sized by it.
+///
+/// The rule it encodes, and the one thing worth remembering: **the maximum
+/// scroll is `content_h − unit_h`**, whether or not the content overflows. Every
+/// caller that clamps a scroll offset has to agree with the layout it clamps
+/// against, which is why the wheel handlers over the grid's header and gutter
+/// call this too — measuring one of them against the bare content stops the
+/// wheel a viewport early over that pane alone.
+///
+/// An unmeasured (zero-height) viewport yields the bare content: no virtual
+/// space until something knows how tall the pane is.
+pub(crate) fn body_scroll_h(content_h: f64, viewport_h: f64, unit_h: f64) -> f64 {
+    content_h.max(viewport_h) + (content_h.min(viewport_h) - unit_h).max(0.0)
+}
+
 // ── SQL editor ──────────────────────────────────────────────────────────────
 
 /// Height of the query editor panel (a multiline SQL editor fills this box).
@@ -909,5 +935,51 @@ mod width_tests {
         assert!(right_panel_fits(panels_min_full_w()));
         assert!(!schema_panel_fits(panels_min_schema_w() - 1.0));
         assert!(schema_panel_fits(panels_min_schema_w()));
+    }
+}
+
+#[cfg(test)]
+mod virtual_space_tests {
+    use super::*;
+
+    /// The rule in one line, and the only one a caller has to hold: whatever the
+    /// viewport, the scroll ends with the last unit at the top.
+    #[test]
+    fn the_maximum_scroll_is_always_the_content_less_one_unit() {
+        for (content, viewport) in [
+            (540.0, 180.0), // overflowing, by a lot
+            (198.0, 180.0), // overflowing, by one unit
+            (180.0, 180.0), // exactly filling
+            (90.0, 180.0),  // fitting, with room to spare
+        ] {
+            let max_scroll = body_scroll_h(content, viewport, 18.0) - viewport;
+            assert_eq!(max_scroll, content - 18.0, "{content} in {viewport}");
+        }
+    }
+
+    /// A body one unit tall has nothing under it to scroll into — the floor the
+    /// `.max(0.0)` is there for.
+    #[test]
+    fn a_single_unit_has_no_virtual_space() {
+        assert_eq!(body_scroll_h(18.0, 180.0, 18.0), 180.0);
+        // And an empty body doesn't scroll *upwards* into a negative one.
+        assert_eq!(body_scroll_h(0.0, 180.0, 18.0), 180.0);
+    }
+
+    /// Before the first layout the viewport is zero: render the bare content
+    /// rather than inventing space against a height nothing has measured yet.
+    #[test]
+    fn an_unmeasured_viewport_gets_no_virtual_space() {
+        assert_eq!(body_scroll_h(540.0, 0.0, 18.0), 540.0);
+    }
+
+    /// The grid's units are rows, and its bodies are much taller than a line of
+    /// code — the same arithmetic, at the scale it actually runs at.
+    #[test]
+    fn a_grid_body_scrolls_its_last_row_to_the_top() {
+        // 200 rows of 26 in a 600px pane.
+        let h = body_scroll_h(200.0 * 26.0, 600.0, 26.0);
+        assert_eq!(h, 5200.0 + 600.0 - 26.0);
+        assert_eq!(h - 600.0, 5200.0 - 26.0);
     }
 }

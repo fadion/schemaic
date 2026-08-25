@@ -96,16 +96,13 @@ pub(crate) fn editor_placeholder(
 /// threshold and the thumb ratio had never been tested either.
 ///
 /// **The scrollable height is not the text height.** The editor runs with
-/// `ScrollBeyondLastLine`, and Floem lays its content out as `max(text,
-/// viewport)` plus a bottom margin of `min(viewport, text) − one line` — the
-/// virtual space that lets the last row be scrolled up to the top. Measured
-/// against the text alone the thumb would hit the bottom of the track a whole
-/// viewport before the wheel ran out, and a document that merely *fits* would
-/// show no bar at all while still scrolling.
+/// `ScrollBeyondLastLine`, so Floem lays its content out with the virtual space
+/// under it — [`body_scroll_h`], which the results grid is sized by too.
+/// Measured against the text alone the thumb would hit the bottom of the track a
+/// whole viewport before the wheel ran out, and a document that merely *fits*
+/// would show no bar at all while still scrolling.
 fn scrollbar_geo(lines: usize, line_h: f64, viewport_h: f64) -> Option<(f64, f64, f64)> {
-    let text_h = lines as f64 * line_h;
-    let virtual_h = (text_h.min(viewport_h) - line_h).max(0.0);
-    let content_h = text_h.max(viewport_h) + virtual_h;
+    let content_h = body_scroll_h(lines as f64 * line_h, viewport_h, line_h);
     if content_h <= viewport_h + 1.0 || viewport_h <= 0.0 {
         return None;
     }

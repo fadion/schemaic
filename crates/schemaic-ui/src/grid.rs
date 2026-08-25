@@ -3065,6 +3065,27 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     .with(|w| compute_window(gs.vp.get(), w, &win_cols, 2))
             });
 
+            // How tall the two bodies lay themselves out: the rows plus the
+            // **virtual space** under them, so the last row can be scrolled up to
+            // the top instead of sitting on the bottom edge (`body_scroll_h` — the
+            // SQL editor's rule, and the wheel clamps below share it).
+            //
+            // This *overrides* the height `virtual_stack` gives itself (the bare
+            // `rows × row_h`), which is what floem's scroll measures its range
+            // against — a `margin_bottom` would not do: `Scroll::child_size` reads
+            // the child's layout size, and margin falls outside it.
+            //
+            // A memo for the same reason `win` is one: it recomputes on every
+            // scroll but, dedupped on `PartialEq`, only *notifies* — and so only
+            // re-lays the bodies out — when the pane is actually resized. Both
+            // panes read this SAME height; a frozen pane one row shorter would
+            // clamp its own `scroll_to` early and drift out of line with the data
+            // rows exactly when the virtual space came into view.
+            let body_h: Memo<f64> = create_memo(move |_| {
+                let rh = row_h();
+                body_scroll_h(total as f64 * rh, gs.vp.get().height(), rh)
+            });
+
             // ── Headers ──
             let gutter_header = container(text("#").style(|s| {
                 s.font_size(theme::scaled_font(11.0))
@@ -3136,7 +3157,10 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                                 .sum::<f64>()
                         });
                         let max_x = (content_w - vp.width()).max(0.0);
-                        let max_y = ((total as f64 * row_h()) - vp.height()).max(0.0);
+                        // Against the bodies' laid-out height, virtual space and
+                        // all — clamping to the rows alone would stop the wheel a
+                        // viewport early over the header, and only there.
+                        let max_y = (body_h.get_untracked() - vp.height()).max(0.0);
                         gs.scroll_to.set(Some(Point::new(
                             (h_off.get_untracked() + pe.delta.x).clamp(0.0, max_x),
                             (vscroll.get_untracked() + pe.delta.y).clamp(0.0, max_y),
@@ -3171,7 +3195,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                         }
                     },
                 )
-                .style(|s| s.flex_col()),
+                .style(move |s| s.flex_col().height(body_h.get())),
             )
             .scroll_to(move || Some(Point::new(0.0, vscroll.get())))
             // Pure follower of `vscroll` (written by the data pane): NO `on_scroll`
@@ -3190,7 +3214,8 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     let dy = pe.delta.y;
                     if dy != 0.0 {
                         let vp = gs.vp.get_untracked();
-                        let max_y = ((total as f64 * row_h()) - vp.height()).max(0.0);
+                        // Same height the bodies lay out to — see the header's twin.
+                        let max_y = (body_h.get_untracked() - vp.height()).max(0.0);
                         let new_y = (vscroll.get_untracked() + dy).clamp(0.0, max_y);
                         gs.scroll_to.set(Some(Point::new(vp.x0, new_y)));
                     }
@@ -3227,7 +3252,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                         }
                     },
                 )
-                .style(|s| s.flex_col()),
+                .style(move |s| s.flex_col().height(body_h.get())),
             )
             .scroll_to(move || gs.scroll_to.get())
             .on_scroll(move |rect| {

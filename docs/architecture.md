@@ -4785,8 +4785,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   so Floem lays it out as `max(text, viewport)` plus a bottom margin of `min(viewport, text) − one
   line` — the virtual space that lets the last row be scrolled up to the top, which makes the maximum
   scroll `text − one line` whether or not the document overflows. `scrollbar_geo` (tested) adds that
-  margin back; measured against the text alone the thumb bottomed out a viewport early, and a
-  document that merely *fits* showed no bar while the wheel still moved it. Thumb `.style()` reads `viewport.get()` **and**
+  margin back through `consts::body_scroll_h`, the same function the results grid is sized by;
+  measured against the text alone the thumb bottomed out a viewport early, and a document that
+  merely *fits* showed no bar while the wheel still moved it. Thumb `.style()` reads `viewport.get()` **and**
   `query.get()` (content size isn't a signal). **Draggable**: `PointerDown` records grab offset +
   `id.request_active()` (pointer capture); each `PointerMove` sets `ed.scroll_to.set(Some(Vec2))`
   (it's `Option<Vec2>`, not `Point`). Thumbs use `scrollbar_hover()` + `CursorStyle::Default`.
@@ -5640,8 +5641,22 @@ for keyboard nav.
 - **⚠️ Scroll-sync rule (cost a hang):** a scroll view must **never both read and write the same
   offset signal** — it re-enters its own layout and hangs the UI thread. Strict one-writer/one-reader:
   the **data pane writes `vscroll`** (`on_scroll`) and reads `gs.scroll_to` (keyboard channel); the
-  **frozen pane reads `vscroll`** (its `scroll_to`), has **no `on_scroll`**, and blocks its own wheel
-  (`on_event(PointerWheel, |_| Stop)`).
+  **frozen pane reads `vscroll`** (its `scroll_to`), has **no `on_scroll`**, and never scrolls itself
+  on the wheel — it consumes the event (`Stop`) and forwards the delta into `gs.scroll_to`, so the
+  gutter isn't a dead zone under the pointer while the data pane still moves. The header pane
+  forwards **both** axes the same way.
+- **Virtual space under the last row.** Both bodies lay out to `consts::body_scroll_h` — the rows
+  plus `min(viewport, rows) − one row` — so the last row can be scrolled up to the top rather than
+  sitting on the bottom edge, and the maximum scroll is `rows − one row` whether or not the result
+  overflows. It **overrides** the height `virtual_stack` gives itself (`rows × row_h`); a
+  `margin_bottom` would not work, because `Scroll::child_size` reads the child's layout size and
+  margin falls outside it. Held in a `Memo` beside `win` (recomputes on scroll, notifies only on a
+  resize) that **both** panes read: a frozen pane sized to the bare rows would clamp its own
+  `scroll_to` a viewport early and drift out of line exactly when the virtual space came into view.
+  The two wheel handlers that clamp a vertical offset themselves (header, frozen) read that same
+  memo — clamping either to `rows × row_h` stops the wheel early over that pane alone. The SQL
+  editor gets the identical rule from Floem's `ScrollBeyondLastLine`, which is why `body_scroll_h`
+  is one function and not two.
 - **Column widths** (`gs.widths`) are estimated from content on load; the header's `col_resize_handle`
   drags to resize (moving-view trick) and double-clicks to auto-fit. Cells read `gs.widths` in
   `.style()` so resize is live. Every cell/header uses `flex_shrink(0)` so the row overflows (enabling
