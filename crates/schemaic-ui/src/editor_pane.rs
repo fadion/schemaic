@@ -94,8 +94,18 @@ pub(crate) fn editor_placeholder(
 /// Lifted out of the editor's `v_geo` so the arithmetic can be asserted: the bug
 /// it carried was in the *input* (buffer lines instead of visual ones), but the
 /// threshold and the thumb ratio had never been tested either.
+///
+/// **The scrollable height is not the text height.** The editor runs with
+/// `ScrollBeyondLastLine`, and Floem lays its content out as `max(text,
+/// viewport)` plus a bottom margin of `min(viewport, text) − one line` — the
+/// virtual space that lets the last row be scrolled up to the top. Measured
+/// against the text alone the thumb would hit the bottom of the track a whole
+/// viewport before the wheel ran out, and a document that merely *fits* would
+/// show no bar at all while still scrolling.
 fn scrollbar_geo(lines: usize, line_h: f64, viewport_h: f64) -> Option<(f64, f64, f64)> {
-    let content_h = lines as f64 * line_h;
+    let text_h = lines as f64 * line_h;
+    let virtual_h = (text_h.min(viewport_h) - line_h).max(0.0);
+    let content_h = text_h.max(viewport_h) + virtual_h;
     if content_h <= viewport_h + 1.0 || viewport_h <= 0.0 {
         return None;
     }
@@ -2200,7 +2210,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 })
                 // Tuck the line numbers closer to the editor's left edge
                 // (Floem's default is 25).
-                .gutter_left_padding(14.0);
+                .gutter_left_padding(14.0)
+                // Virtual space below the document: the last row can be scrolled
+                // up to the top of the viewport, so the line you're editing never
+                // has to sit on the bottom edge. Floem adds it as a bottom margin
+                // of `min(viewport, text) − one line` — which `scrollbar_geo`
+                // has to count, since our own scrollbars measure the content.
+                .scroll_beyond_last_line(true);
             // Current-line highlight — body AND gutter — only while focused; an
             // unfocused editor looks inert. The gutter band in particular must not
             // linger on blur (it also scrolled oddly with horizontal scroll).
@@ -3922,18 +3938,40 @@ mod geometry_tests {
     /// The observed case: one long statement on a single buffer line, wrapped to
     /// thirty visual rows in a 187px editor. Counting buffer lines said it fit,
     /// so no scrollbar was drawn at all — while the wheel still scrolled it.
+    ///
+    /// The virtual space has since made *both* counts scrollable, so what pins
+    /// the bug now is the distance: the wrapped rows scroll a whole document,
+    /// the two buffer lines only their own line of virtual space.
     #[test]
     fn a_wrapped_line_overflows_even_though_its_buffer_line_does_not() {
-        assert!(scrollbar_geo(30, 18.0, 187.0).is_some(), "30 visual rows");
-        assert!(scrollbar_geo(2, 18.0, 187.0).is_none(), "2 buffer lines");
+        let (_, _, wrapped) = scrollbar_geo(30, 18.0, 187.0).expect("30 visual rows");
+        let (_, _, buffer) = scrollbar_geo(2, 18.0, 187.0).expect("2 buffer lines");
+        assert_eq!(wrapped, 30.0 * 18.0 - 18.0);
+        assert_eq!(buffer, 2.0 * 18.0 - 18.0);
+        assert!(wrapped > 10.0 * buffer, "{wrapped} vs {buffer}");
     }
 
+    /// Only a document that ends where it starts has nothing to scroll: with the
+    /// virtual space on, every further row can still be lifted to the top.
     #[test]
-    fn content_that_fits_hides_the_bar() {
-        assert!(scrollbar_geo(10, 18.0, 187.0).is_none());
-        // Exactly filling the viewport is not overflow.
-        assert!(scrollbar_geo(10, 18.0, 180.0).is_none());
-        assert!(scrollbar_geo(11, 18.0, 180.0).is_some());
+    fn a_single_row_hides_the_bar() {
+        assert!(scrollbar_geo(1, 18.0, 187.0).is_none());
+        // Defensive: a zero-row document can't be produced by `last_vline() + 1`,
+        // but it must not underflow into a bar either.
+        assert!(scrollbar_geo(0, 18.0, 187.0).is_none());
+    }
+
+    /// The virtual space is scrollable height, so the bar has to measure it. A
+    /// document that fits the viewport still scrolls — by everything below its
+    /// first row — and before this the bar was simply hidden there.
+    #[test]
+    fn a_document_that_fits_still_scrolls_into_the_virtual_space() {
+        // 10 rows of 18 = 180px of text in a 187px viewport: the text fits, the
+        // virtual space under it does not.
+        let (_, _, max_scroll) = scrollbar_geo(10, 18.0, 187.0).expect("virtual space");
+        assert_eq!(max_scroll, 180.0 - 18.0);
+        // Exactly filling the viewport is the same story.
+        assert!(scrollbar_geo(10, 18.0, 180.0).is_some());
     }
 
     /// An unmeasured (zero-height) viewport has no bar rather than a bar of
@@ -3943,13 +3981,24 @@ mod geometry_tests {
         assert!(scrollbar_geo(100, 18.0, 0.0).is_none());
     }
 
+    /// The scroll ends with the **last** row at the top, not with it at the
+    /// bottom — the whole point of the virtual space. Measuring the text alone
+    /// stopped the thumb a viewport short of where the wheel could still go.
+    #[test]
+    fn the_scroll_ends_with_the_last_row_at_the_top() {
+        let (_, _, max_scroll) = scrollbar_geo(30, 18.0, 180.0).expect("overflows");
+        assert_eq!(max_scroll, 540.0 - 18.0);
+    }
+
     #[test]
     fn the_thumb_shrinks_with_the_visible_fraction_but_stays_grabbable() {
         let (track, thumb, max_scroll) = scrollbar_geo(30, 18.0, 180.0).expect("overflows");
         assert_eq!(track, 180.0);
-        assert_eq!(max_scroll, 540.0 - 180.0);
-        // A third of the content is visible → a third of the track.
-        assert!((thumb - 60.0).abs() < 0.01, "{thumb}");
+        // 540px of text + (180 − 18) of virtual space below it.
+        let content = 540.0 + 162.0;
+        assert_eq!(max_scroll, content - 180.0);
+        // The visible fraction of *that* is the thumb's share of the track.
+        assert!((thumb - 180.0 / content * 180.0).abs() < 0.01, "{thumb}");
         // A very long document keeps a minimum thumb rather than a hairline.
         let (_, thumb, _) = scrollbar_geo(10_000, 18.0, 180.0).expect("overflows");
         assert!(thumb >= 24.0, "{thumb}");
