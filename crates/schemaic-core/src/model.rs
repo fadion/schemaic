@@ -814,6 +814,17 @@ impl ResultBuilder {
         self.n_rows
     }
 
+    /// Bytes of cell **text** held so far, across every column.
+    ///
+    /// The figure a streamed export flushes on when the rows are wide: a row
+    /// count is a budget in the wrong unit, since nothing bounds a row's width,
+    /// and this is the same arena length the 512 MiB per-column ceiling is
+    /// measured against. Cheap — one `len()` per column, no walk — because the
+    /// caller asks it once per row.
+    pub fn text_bytes(&self) -> usize {
+        self.cols.iter().map(|c| c.arena.len()).sum()
+    }
+
     /// Append one row of cells (column order). A row shorter than the column
     /// count is padded with NULL; extra cells are ignored.
     pub fn push_row(&mut self, cells: &[Value]) {

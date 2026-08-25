@@ -84,6 +84,21 @@ pub(crate) enum RowDest {
     },
 }
 
+/// How much **text** one streamed chunk may hold before it is handed over,
+/// whatever its row count.
+///
+/// 32 MiB, and the figure is chosen against the pipeline rather than against a
+/// row: up to four chunks are in flight at once (one filling, two queued on the
+/// bounded channel, one rendering), so this is a ~128 MiB ceiling on the
+/// export's own footprint — the "megabytes rather than gigabytes" the row budget
+/// claimed and could not deliver. Well above any per-row cost, so an ordinary
+/// narrow table still flushes on its row count and pays nothing for this.
+///
+/// It bounds the *arena* — the cell text — and not the whole `ResultSet`, which
+/// also carries one offset word per cell. That part is proportional to
+/// `rows × columns` and is already bounded by the row count.
+pub(crate) const CHUNK_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+
 impl RowDest {
     /// The row cap to stop at. A stream has none — the point of it — and
     /// `usize::MAX` says so without every loop growing a second branch around
@@ -95,10 +110,25 @@ impl RowDest {
         }
     }
 
-    /// Has the builder filled a chunk? Always false for [`RowDest::Capped`],
-    /// which flushes nothing.
-    pub(crate) fn chunk_full(&self, rows: usize) -> bool {
-        matches!(self, RowDest::Chunked { chunk, .. } if rows >= *chunk)
+    /// Has the builder filled a chunk — **by rows or by bytes**? Always false for
+    /// [`RowDest::Capped`], which flushes nothing.
+    ///
+    /// The row count alone was a budget in the wrong unit. A chunk is
+    /// `chunk × the row width` and nothing bounds a row's width: the channel
+    /// holds two, the loop is filling a third and the writer is rendering a
+    /// fourth, so a table of 1 MB documents put ~40 GB in flight against a
+    /// constant whose own doc promised "megabytes rather than gigabytes". The
+    /// only thing that stopped it was the per-column 512 MiB arena ceiling, and
+    /// hitting *that* is the data loss `ExportTally::blanked` now reports.
+    ///
+    /// So a chunk also ends when its text passes [`CHUNK_BYTE_BUDGET`], which
+    /// makes the promise true for any row width: the block goes out smaller and
+    /// more often instead of larger.
+    pub(crate) fn chunk_full(&self, rows: usize, bytes: usize) -> bool {
+        matches!(
+            self,
+            RowDest::Chunked { chunk, .. } if rows >= *chunk || bytes >= CHUNK_BYTE_BUDGET
+        )
     }
 
     /// How much room to give the next chunk's per-column buffers — the chunk
@@ -3425,7 +3455,7 @@ pub(crate) async fn collect_rows(
                 // A stream hands the block over here and keeps reading into an
                 // empty builder; a capped read never fills a chunk, so this is
                 // dead weight for it and nothing more.
-                if dest.chunk_full(builder.row_count()) {
+                if dest.chunk_full(builder.row_count(), builder.text_bytes()) {
                     dest.flush(&mut builder, chunk_capacity).await?;
                 }
             } else {
@@ -4448,26 +4478,66 @@ fn value_to_param(v: &Value) -> MyValue {
     }
 }
 
-/// Parse a text-protocol cell into a typed [`Value`] using the column's SQL
-/// type. Integers/floats become compact numeric variants; anything else stays
-/// an exact string. Any parse failure falls back to the string — never lossy.
-pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
+/// Which numeric variant a column's text cells parse into — the whole of
+/// [`parse_typed`]'s decision, and a **per-column** fact.
+///
+/// Split out so a row loop can ask the type name once per column instead of once
+/// per cell. The question is a `to_ascii_uppercase()` (a heap allocation), six
+/// `starts_with` probes and, for integers, a `contains("UNSIGNED")` scan — which
+/// is nothing at all per column and 100M allocations on a 5M × 20 export. The
+/// neighbouring per-column answer was hoisted for exactly this reason
+/// (`pg::cell_kinds`' doc, and `type_is_binary` before it); this is the other
+/// half of the same `match`, and `f115e51` removed the row cap that used to bound
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumKind {
+    Int,
+    UInt,
+    Float,
+    /// Not numeric — the cell keeps its exact text, which is most columns.
+    Text,
+}
+
+/// [`NumKind`] for a column's declared type. Called once per column.
+pub(crate) fn num_kind(type_name: &str) -> NumKind {
     let t = type_name.to_ascii_uppercase();
     let is_integer = ["TINYINT", "SMALLINT", "MEDIUMINT", "INT", "BIGINT", "YEAR"]
         .iter()
         .any(|k| t.starts_with(k));
-    let is_float = t.starts_with("FLOAT") || t.starts_with("DOUBLE");
-
     if is_integer {
-        if t.contains("UNSIGNED") {
-            return s.parse::<u64>().map(Value::UInt).unwrap_or(Value::Str(s));
-        }
-        return s.parse::<i64>().map(Value::Int).unwrap_or(Value::Str(s));
+        return if t.contains("UNSIGNED") {
+            NumKind::UInt
+        } else {
+            NumKind::Int
+        };
     }
-    if is_float {
-        return s.parse::<f64>().map(Value::Float).unwrap_or(Value::Str(s));
+    if t.starts_with("FLOAT") || t.starts_with("DOUBLE") {
+        return NumKind::Float;
     }
-    Value::Str(s)
+    NumKind::Text
+}
+
+/// Parse a text-protocol cell into a typed [`Value`], given its column's
+/// [`NumKind`]. Any parse failure falls back to the string — never lossy.
+pub(crate) fn parse_as(kind: NumKind, s: String) -> Value {
+    match kind {
+        NumKind::UInt => s.parse::<u64>().map(Value::UInt).unwrap_or(Value::Str(s)),
+        NumKind::Int => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Str(s)),
+        NumKind::Float => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Str(s)),
+        NumKind::Text => Value::Str(s),
+    }
+}
+
+/// Parse a text-protocol cell into a typed [`Value`] using the column's SQL
+/// type. Integers/floats become compact numeric variants; anything else stays
+/// an exact string. Any parse failure falls back to the string — never lossy.
+///
+/// The composition of [`num_kind`] and [`parse_as`], and *only* that: the two
+/// cannot drift apart from the answer this function gives, because this function
+/// is them. What a row loop should call is `parse_as` with a kind it computed
+/// once; this spelling is for the callers with one cell to convert.
+pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
+    parse_as(num_kind(type_name), s)
 }
 
 #[cfg(test)]

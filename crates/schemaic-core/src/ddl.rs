@@ -16827,7 +16827,11 @@ mod event_tests {
     #[test]
     fn every_field_the_preview_names_is_a_field_the_alter_restates() {
         let e = ev();
-        let cases: Vec<(&str, Box<dyn Fn(&mut EventInfo)>)> = vec![
+        /// One field's edit, named. A `Box` because the closures differ, and a
+        /// named type because seven of them in a `Vec` is what `type_complexity`
+        /// is about.
+        type FieldEdit = (&'static str, Box<dyn Fn(&mut EventInfo)>);
+        let cases: Vec<FieldEdit> = vec![
             (
                 "name",
                 Box::new(|i: &mut EventInfo| i.name = "renamed".into()),
