@@ -442,11 +442,20 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
             // for the same reason: a list that didn't carry this event's own
             // unit would show the right label over options that silently retime
             // it the moment the control is touched.
-            let mut units: Vec<String> =
-                EVENT_INTERVAL_UNITS.iter().map(|u| u.to_string()).collect();
-            if !unit.trim().is_empty() && !units.iter().any(|u| u.eq_ignore_ascii_case(&unit)) {
-                units.push(unit.clone());
-            }
+            // The unit the **server** reported, not the one in the draft: the
+            // schedule sub-form is rebuilt on every shape change and the whole form
+            // on every preview round trip, so a list seeded from the draft forgets
+            // an exotic unit the moment the user moves off it. Same rule as
+            // `status_choices`.
+            let server_unit = ui.ddl.event.with_untracked(|t| {
+                t.as_ref()
+                    .and_then(|t| t.current.as_ref())
+                    .and_then(|c| match &c.schedule {
+                        EventSchedule::Every { unit, .. } => Some(unit.clone()),
+                        EventSchedule::At(_) => None,
+                    })
+            });
+            let units = interval_units(server_unit.as_deref(), &unit);
             let unit_sig = floem::reactive::create_rw_signal(unit);
             let unit_ui = ui.clone();
             let interval = form_setting(
@@ -539,9 +548,66 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
         .into_any()
 }
 
+/// The Status entries the dropdown offers.
+///
+/// `[Enabled, Disabled]`, plus the state the **server** reported and plus the
+/// draft's own — offering `DISABLE ON SLAVE` as a free choice would be offering a
+/// keyword MySQL 8.4 has removed, while hiding it from an event that has it would
+/// show "Enabled" over an event that isn't.
+///
+/// **`server` is the load-bearing argument, and it used to be missing.** The list
+/// was seeded from the draft alone, and the form is torn down and rebuilt whenever
+/// the preview opens or closes. So: move a `SLAVESIDE_DISABLED` event to Enabled,
+/// edit its body and schedule, press Preview, come back — and the list is
+/// `Enabled / Disabled`. "Disabled on replica" is gone, `EventStatus` has no other
+/// producer in this view, and the only route back to the state the event is
+/// actually in is Cancel and reopen, which throws away every other edit made in
+/// the same sitting, because `open` replaces the draft wholesale.
+///
+/// `taken` two hundred lines down reads `target.current` for exactly this reason.
+fn status_choices(server: Option<EventStatus>, draft: EventStatus) -> Vec<EventStatus> {
+    let mut choices = vec![EventStatus::Enabled, EventStatus::Disabled];
+    for extra in [server, Some(draft)].into_iter().flatten() {
+        if !choices.contains(&extra) {
+            choices.push(extra);
+        }
+    }
+    choices
+}
+
+/// The interval units the dropdown offers — the same rule, for the same reason.
+///
+/// `EVENT_INTERVAL_UNITS` is exactly MySQL's documented fifteen, so an event
+/// carrying something else is not reachable today; the shape is identical to
+/// [`status_choices`]' and it is fixed with it rather than left as the one that
+/// gets found next time. Case-insensitive, because the server's spelling is its
+/// own (`DAY` vs `day`) and a duplicate entry differing only in case is a list
+/// with two identical-looking rows.
+fn interval_units(server: Option<&str>, draft: &str) -> Vec<String> {
+    let mut units: Vec<String> = EVENT_INTERVAL_UNITS.iter().map(|u| u.to_string()).collect();
+    for extra in [server, Some(draft)].into_iter().flatten() {
+        let extra = extra.trim();
+        if !extra.is_empty() && !units.iter().any(|u| u.eq_ignore_ascii_case(extra)) {
+            units.push(extra.to_string());
+        }
+    }
+    units
+}
+
 fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl.event_draft;
     let draft = d.get_untracked();
+    // **What the server said, kept beside what the user is editing.** Every
+    // dropdown that offers "the standard list, plus whatever this event already
+    // uses" has to read the second half from here and not from the draft: the form
+    // is torn down and rebuilt whenever the preview opens or closes, so a list
+    // seeded from the draft forgets the exotic entry the moment the user moves off
+    // it — see `status_choices`.
+    let server = ui
+        .ddl
+        .event
+        .with_untracked(|t| t.as_ref().and_then(|t| t.current.clone()));
+    let server_status = server.as_ref().map(|c| c.status);
 
     let name = form_setting(
         "Name",
@@ -594,10 +660,11 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
     // that has it would show "Enabled" over an event that isn't.
     {
         let current = draft.info.status;
-        let mut choices = vec![EventStatus::Enabled, EventStatus::Disabled];
-        if !choices.contains(&current) {
-            choices.push(current);
-        }
+        // From the **server's** report, not from the draft — see `status_choices`.
+        // The draft is what the user has been moving around; the list has to carry
+        // the state the event is really in for the life of the modal, and the form
+        // is rebuilt every time the preview opens or closes.
+        let choices = status_choices(server_status, current);
         let labels: Vec<String> = choices.iter().map(|s| s.label().to_string()).collect();
         let sig = floem::reactive::create_rw_signal(current.label().to_string());
         options.push(
@@ -952,6 +1019,64 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The exotic entry belongs to the server, not to the draft.**
+    ///
+    /// The form is torn down and rebuilt whenever the preview opens or closes, so a
+    /// list seeded from the draft forgets `SLAVESIDE_DISABLED` the moment the user
+    /// moves off it — and `EventStatus` has no other producer in this view, so the
+    /// only route back is Cancel and reopen, which discards every other edit made
+    /// in the same sitting.
+    #[test]
+    fn the_status_list_carries_the_state_the_server_reported() {
+        use EventStatus::*;
+        // The ordinary event: two entries, no more.
+        assert_eq!(
+            status_choices(Some(Enabled), Enabled),
+            vec![Enabled, Disabled]
+        );
+        assert_eq!(
+            status_choices(Some(Disabled), Disabled),
+            vec![Enabled, Disabled]
+        );
+        // The replica-disabled one, **after the user has moved it to Enabled** —
+        // which is the case that used to lose the entry.
+        assert_eq!(
+            status_choices(Some(SlavesideDisabled), Enabled),
+            vec![Enabled, Disabled, SlavesideDisabled],
+            "the server's state stays on offer however the draft has been moved"
+        );
+        // And while it is still selected, exactly once.
+        assert_eq!(
+            status_choices(Some(SlavesideDisabled), SlavesideDisabled),
+            vec![Enabled, Disabled, SlavesideDisabled]
+        );
+        // A new event has no server state at all; the draft is the only input.
+        assert_eq!(status_choices(None, Enabled), vec![Enabled, Disabled]);
+        // Belt to that brace: a draft holding a third state with no server report
+        // still gets an entry, so the selected label always has a row.
+        assert_eq!(
+            status_choices(None, SlavesideDisabled),
+            vec![Enabled, Disabled, SlavesideDisabled]
+        );
+    }
+
+    /// The same rule for the interval unit, fixed with it rather than left as the
+    /// one that gets found next time. Case-insensitive, because the server's
+    /// spelling is its own and two rows differing only in case are two identical
+    /// rows to read.
+    #[test]
+    fn the_interval_unit_list_carries_the_servers_own_unit() {
+        let base = EVENT_INTERVAL_UNITS.len();
+        assert_eq!(interval_units(Some("DAY"), "DAY").len(), base);
+        assert_eq!(interval_units(Some("day"), "HOUR").len(), base, "case only");
+        assert_eq!(interval_units(None, ""), interval_units(None, "   "));
+        assert_eq!(interval_units(None, "").len(), base);
+        // An event on a unit Schemaic does not propose, moved off it in the draft.
+        let carried = interval_units(Some("FORTNIGHT"), "DAY");
+        assert_eq!(carried.len(), base + 1);
+        assert!(carried.contains(&"FORTNIGHT".to_string()));
+    }
 
     /// Every tab index this form hands out, **in the order the controls read
     /// down the panel**.
