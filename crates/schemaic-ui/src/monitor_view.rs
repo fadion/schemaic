@@ -856,7 +856,11 @@ fn save_log(
                 // The message is used as the pipeline produced it: it already
                 // begins "Export failed: …", and a second prefix here read
                 // "Export failed — Export failed: Access is denied".
-                crate::ExportOutcome::Failed(e) => {
+                //
+                // `partial` is not read here for the same reason: the message is
+                // taken as produced, and the truncated file it warns about is
+                // already what the sentence above is about.
+                crate::ExportOutcome::Failed { message: e, .. } => {
                     if open.try_get_untracked() == Some(true) {
                         export_err.try_update(|v| *v = Some(e));
                     } else {

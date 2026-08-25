@@ -2470,33 +2470,42 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let report = create_ext_action(cx, move |o: ExportOutcome| (done)(o));
                         let (rs, order) = (req.rs.clone(), req.order.clone());
                         handle.spawn_blocking(move || {
-                            let write = || -> std::io::Result<u64> {
-                                use std::io::Write as _;
-                                let mut w = create(&path)?;
-                                // `render_to`, not `stream_to` over a hand-built
-                                // `OneChunk`: that *is* `render_to`'s body, and
-                                // spelling it out here left the wrapper with no
-                                // caller and two copies of one construction to
-                                // drift apart.
-                                let n = format.render_to(
-                                    &mut w,
-                                    rs.as_ref(),
-                                    order.as_slice(),
-                                    source
-                                        .as_ref()
-                                        .map(|(d, ns, t)| (d.as_str(), ns.as_deref(), t.as_str())),
-                                    dialect,
-                                )?;
-                                // Explicit: `BufWriter` swallows a flush failure
-                                // on drop, which is exactly the case where the
-                                // last block never reached the disk — silently
-                                // truncating the file.
-                                w.flush()?;
-                                Ok(n)
-                            };
+                            let write =
+                                || -> std::io::Result<schemaic_core::export::ExportTally> {
+                                    use std::io::Write as _;
+                                    let mut w = create(&path)?;
+                                    // `render_to`, not `stream_to` over a hand-built
+                                    // `OneChunk`: that *is* `render_to`'s body, and
+                                    // spelling it out here left the wrapper with no
+                                    // caller and two copies of one construction to
+                                    // drift apart.
+                                    let tally = format.render_to(
+                                        &mut w,
+                                        rs.as_ref(),
+                                        order.as_slice(),
+                                        source.as_ref().map(|(d, ns, t)| {
+                                            (d.as_str(), ns.as_deref(), t.as_str())
+                                        }),
+                                        dialect,
+                                    )?;
+                                    // Explicit: `BufWriter` swallows a flush failure
+                                    // on drop, which is exactly the case where the
+                                    // last block never reached the disk — silently
+                                    // truncating the file.
+                                    w.flush()?;
+                                    Ok(tally)
+                                };
                             report(match write() {
-                                Ok(n) => ExportOutcome::Done(n),
-                                Err(e) => ExportOutcome::Failed(format!("Export failed: {e}")),
+                                Ok(tally) => ExportOutcome::Done(tally),
+                                // `partial`: `create` truncated the destination
+                                // before the first row was rendered, so whatever
+                                // is at that path now is this export's fragment.
+                                // A buffered render either wrote it all or
+                                // nothing; this one does not.
+                                Err(e) => ExportOutcome::Failed {
+                                    message: format!("Export failed: {e}"),
+                                    partial: true,
+                                },
                             });
                         });
                     }
@@ -2514,7 +2523,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let db = match db_for(conn_id) {
                             Ok(db) => db,
                             Err(e) => {
-                                (done)(ExportOutcome::Failed(e));
+                                // Refused before the writer task runs, so the
+                                // destination was never opened: `partial: false`,
+                                // and the message must not claim a file it never
+                                // touched is incomplete.
+                                (done)(ExportOutcome::Failed {
+                                    message: e,
+                                    partial: false,
+                                });
                                 return;
                             }
                         };
@@ -2527,10 +2543,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // same shape only because its modal admits one run;
                         // the Download menu is on every result tab.
                         if export_token.borrow().is_some() {
-                            (done)(ExportOutcome::Failed(
-                                "An export is already running. Cancel it or wait for it to finish."
-                                    .to_string(),
-                            ));
+                            (done)(ExportOutcome::Failed {
+                                message:
+                                    "An export is already running. Cancel it or wait for it to \
+                                     finish."
+                                        .to_string(),
+                                // Nothing was opened — see the arm above.
+                                partial: false,
+                            });
                             return;
                         }
                         let token = CancellationToken::new();
@@ -2561,7 +2581,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 // half-written file finished.
                                 Some(Err(e)) => Err(std::io::Error::other(e)),
                             });
-                            let n = format
+                            let tally = format
                                 .stream_to(
                                     &mut w,
                                     &mut src,
@@ -2572,7 +2592,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 )
                                 .map_err(|e| e.to_string())?;
                             w.flush().map_err(|e| e.to_string())?;
-                            Ok::<u64, String>(n)
+                            Ok::<schemaic_core::export::ExportTally, String>(tally)
                         });
                         handle.spawn(async move {
                             let read = db
@@ -2602,18 +2622,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // reader-side failure still arrives intact, because
                             // `stream_query` puts its reason on the channel and
                             // the writer returns that very message.
+                            // Every failure arm here is *after* the writer task
+                            // opened the destination with `File::create`, which
+                            // truncates: the previous file is already gone and
+                            // what is at that path is a fragment of this export.
+                            // `f115e51` turned that from a millisecond window
+                            // into a minutes-long one, so the message says it.
+                            let failed = |message: String| ExportOutcome::Failed {
+                                message,
+                                partial: true,
+                            };
                             report(match (read, written) {
                                 (Err(schemaic_db::DbError::Cancelled), _) => {
                                     ExportOutcome::Cancelled
                                 }
-                                (_, Ok(Err(e))) => {
-                                    ExportOutcome::Failed(format!("Export failed: {e}"))
-                                }
-                                (_, Err(e)) => ExportOutcome::Failed(format!(
-                                    "Export failed: worker died: {e}"
-                                )),
-                                (Err(e), _) => ExportOutcome::Failed(format!("Export failed: {e}")),
-                                (Ok(_), Ok(Ok(n))) => ExportOutcome::Done(n),
+                                (_, Ok(Err(e))) => failed(format!("Export failed: {e}")),
+                                (_, Err(e)) => failed(format!("Export failed: worker died: {e}")),
+                                (Err(e), _) => failed(format!("Export failed: {e}")),
+                                (Ok(_), Ok(Ok(tally))) => ExportOutcome::Done(tally),
                             });
                         });
                     }
@@ -2646,14 +2672,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let report = create_ext_action(cx, move |o: schemaic_ui::ExportOutcome| (done)(o));
                 handle.spawn_blocking(move || {
                     // A diagram is one document written in one call: there is no
-                    // row count and nothing to cancel, so `Done(0)` is the whole
-                    // of its success.
+                    // row count, nothing to withhold and nothing to cancel, so an
+                    // empty tally is the whole of its success. `fs::write` writes
+                    // the whole document or fails before it — `partial: false`.
                     report(
                         match req.doc.into_bytes().and_then(|b| {
                             std::fs::write(&req.path, b).map_err(|e| format!("Export failed: {e}"))
                         }) {
-                            Ok(()) => schemaic_ui::ExportOutcome::Done(0),
-                            Err(e) => schemaic_ui::ExportOutcome::Failed(e),
+                            Ok(()) => schemaic_ui::ExportOutcome::Done(Default::default()),
+                            Err(e) => schemaic_ui::ExportOutcome::Failed {
+                                message: e,
+                                partial: false,
+                            },
                         },
                     );
                 });
