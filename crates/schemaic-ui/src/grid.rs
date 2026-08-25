@@ -2128,19 +2128,19 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
                         }
                     }
                     // A note, not an error: stopping was the user's own doing.
-                    // It says the file is short because the alternative — a
-                    // silent partial file — is the thing this whole path is
-                    // careful about, and deleting it is not ours to do.
+                    // The sentence is `core::export`'s, where it is tested, and it
+                    // says two things: the destination was **not** changed (a
+                    // streamed export writes a `.part` sibling and renames it over
+                    // the target only on success), and the rows that did arrive are
+                    // in that sibling. Deleting it is still not ours to do — it is
+                    // the one thing the user may still want.
                     crate::ExportOutcome::Cancelled => {
-                        gs.commit_note.try_update(|v| {
-                            *v = Some(format!("Export cancelled — {name} is incomplete"))
-                        });
+                        let msg = schemaic_core::export::export_cancel_note(&name);
+                        gs.commit_note.try_update(|v| *v = Some(msg));
                     }
-                    // The same sentence the Cancel arm above uses, for the same
-                    // reason, whenever the file was already created — a failure
-                    // is the case where the user is least likely to look, and
-                    // `File::create` truncated whatever was at that path before
-                    // the first row arrived.
+                    // The same two facts the Cancel arm above states, for the
+                    // same reason, whenever the write had begun — a failure is
+                    // the case where the user is least likely to look.
                     crate::ExportOutcome::Failed { message, partial } => {
                         let msg = schemaic_core::export::export_failure_note(
                             &message,

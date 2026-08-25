@@ -2504,9 +2504,33 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .source
                     .as_ref()
                     .map(|s| (s.database.clone(), s.schema.clone(), s.table.clone()));
-                let create = |path: &std::path::PathBuf| {
+                // **The destination is not opened until the export has
+                // succeeded.** `File::create` truncates, so opening it first meant
+                // a stream that died ten minutes in had already destroyed whatever
+                // the user was overwriting — and `f115e51` turned that window from
+                // milliseconds into minutes. The rows go to a `.part` sibling and
+                // the sibling is renamed over the target at the end, which is the
+                // dance `persist` already does for every config file, and which is
+                // atomic *because* it is a sibling: a rename inside one directory
+                // never crosses a filesystem.
+                //
+                // On every failure path the target is untouched and the fragment is
+                // left in the sibling rather than swept away — see
+                // `export::export_failure_note`, which names it.
+                let part_of = |path: &std::path::Path| -> std::path::PathBuf {
+                    let mut p = path.as_os_str().to_owned();
+                    p.push(".part");
+                    std::path::PathBuf::from(p)
+                };
+                let create = |path: &std::path::Path| {
                     std::fs::File::create(path).map(std::io::BufWriter::new)
                 };
+                // Rename the finished sibling over the destination. Failing *here*
+                // is the one case where the export wrote everything and the user
+                // still has no file at the path they chose, so it is reported as a
+                // failure naming both halves rather than as a success.
+                let publish =
+                    |part: &std::path::Path, path: &std::path::Path| std::fs::rename(part, path);
 
                 match req.scope {
                     // Everything is already in memory: one blocking task, exactly
@@ -2515,10 +2539,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let report = create_ext_action(cx, move |o: ExportOutcome| (done)(o));
                         let (rs, order) = (req.rs.clone(), req.order.clone());
                         handle.spawn_blocking(move || {
+                            let part = part_of(&path);
                             let write =
                                 || -> std::io::Result<schemaic_core::export::ExportTally> {
                                     use std::io::Write as _;
-                                    let mut w = create(&path)?;
+                                    let mut w = create(&part)?;
                                     // `render_to`, not `stream_to` over a hand-built
                                     // `OneChunk`: that *is* `render_to`'s body, and
                                     // spelling it out here left the wrapper with no
@@ -2538,15 +2563,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     // last block never reached the disk — silently
                                     // truncating the file.
                                     w.flush()?;
+                                    publish(&part, &path)?;
                                     Ok(tally)
                                 };
                             report(match write() {
                                 Ok(tally) => ExportOutcome::Done(tally),
-                                // `partial`: `create` truncated the destination
-                                // before the first row was rendered, so whatever
-                                // is at that path now is this export's fragment.
-                                // A buffered render either wrote it all or
-                                // nothing; this one does not.
+                                // `partial`: the write had begun, so the `.part`
+                                // sibling holds whatever arrived. The destination
+                                // itself is untouched, which is what the message
+                                // says.
                                 Err(e) => ExportOutcome::Failed {
                                     message: format!("Export failed: {e}"),
                                     partial: true,
@@ -2612,9 +2637,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // avoids. Two lets the server read the next block while
                         // the disk takes the last.
                         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+                        let part = part_of(&path);
+                        // The writer needs the token as well as the reader: a
+                        // cancelled read closes the channel, which the writer sees
+                        // as an ordinary end of stream — so without this it would
+                        // rename a truncated file over the destination and only
+                        // *then* have the reader declare the cancel.
+                        let w_token = token.clone();
                         let writer = handle.spawn_blocking(move || {
                             use std::io::Write as _;
-                            let mut w = create(&path).map_err(|e| e.to_string())?;
+                            let mut w = create(&part).map_err(|e| e.to_string())?;
                             let mut src = schemaic_core::export::PullChunks::new(move || match rx
                                 .blocking_recv()
                             {
@@ -2637,6 +2669,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 )
                                 .map_err(|e| e.to_string())?;
                             w.flush().map_err(|e| e.to_string())?;
+                            // **Only now** does the destination change — and not
+                            // at all if the export was cancelled. A cancel reaches
+                            // the writer as an ordinary end of stream, so the check
+                            // has to be here: publishing first and letting the
+                            // reader declare the cancel afterwards would rename a
+                            // truncated file over the user's file, which is the
+                            // whole thing the sibling exists to prevent. The
+                            // caller's cancel arm reports it; this error is the
+                            // belt to that brace.
+                            drop(w);
+                            if w_token.is_cancelled() {
+                                return Err("export cancelled".to_string());
+                            }
+                            publish(&part, &path).map_err(|e| e.to_string())?;
                             Ok::<schemaic_core::export::ExportTally, String>(tally)
                         });
                         handle.spawn(async move {
@@ -2668,11 +2714,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // `stream_query` puts its reason on the channel and
                             // the writer returns that very message.
                             // Every failure arm here is *after* the writer task
-                            // opened the destination with `File::create`, which
-                            // truncates: the previous file is already gone and
-                            // what is at that path is a fragment of this export.
-                            // `f115e51` turned that from a millisecond window
-                            // into a minutes-long one, so the message says it.
+                            // opened the `.part` sibling, so that sibling holds
+                            // whatever arrived — and the destination is untouched,
+                            // because the rename only runs when the write
+                            // completed. `partial` is what says the sibling exists;
+                            // `export_failure_note` states both halves.
                             let failed = |message: String| ExportOutcome::Failed {
                                 message,
                                 partial: true,
