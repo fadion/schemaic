@@ -2572,7 +2572,7 @@ fn separator_keep(entries: &[MenuEntry]) -> Vec<bool> {
 /// `panel` is an *estimate* ([`menu_panel_height`] counts rows), so subtracting it
 /// from the cursor put the panel's real edge wherever the estimate was wrong —
 /// visible as a gap between the menu's bottom and the pointer that flipped it,
-/// tens of pixels at 150% and up. An inset from the window's far edge is exact
+/// tens of pixels at the top scales. An inset from the window's far edge is exact
 /// arithmetic: the panel's own size never enters it. This is the same trick
 /// [`submenu_insets`] plays, and it is why that one never drifted.
 ///
@@ -5041,7 +5041,7 @@ mod menu_placement_tests {
     /// **Asserted as an inset from the bottom**, which is the fix: 800 − 700 + 3
     /// puts the panel's own bottom edge 3px above the cursor whatever it measures,
     /// where `cursor − estimate` left it short by however much the estimate was
-    /// over (a visible gap at 150% and up).
+    /// over (a visible gap at the top scales).
     #[test]
     fn a_menu_near_the_bottom_flips_above_the_cursor() {
         let (x, y) = cursor_menu_insets((100.0, 700.0), PANEL, WINDOW, 3.0);
@@ -5138,7 +5138,7 @@ mod menu_placement_tests {
     ///
     /// The old flip had two arms — below, or above — and clamped the second at
     /// zero. That was invisible while menus were ~350px tall: something always
-    /// fitted. At 150% and 200% a table's context menu is 600–750px, so a click
+    /// fitted. At the two top scales a table's context menu is 600–750px, so a click
     /// in the middle of the schema tree fits neither way and every menu jumped to
     /// the *top-left of the window*, hundreds of pixels from the row it belonged
     /// to. Pinning the far edge instead keeps the whole panel reachable and as
