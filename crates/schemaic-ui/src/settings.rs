@@ -1345,9 +1345,9 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             let editor_section =
                 v_stack((settings_group_label("Editor theme"), editor_dd)).style(ctrl);
             // No hint under this one, unlike the settings that carry a
-            // consequence: four segments named Small → Huge, applying the instant
-            // they are pressed, explain themselves better than a line of prose
-            // restating them.
+            // consequence: four segments named by their percentage, applying the
+            // instant they are pressed, explain themselves better than a line of
+            // prose restating them.
             let scale_section =
                 v_stack((settings_group_label("Interface scale"), scale_dd)).style(ctrl);
             let theme_group = v_stack((

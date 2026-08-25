@@ -4345,12 +4345,21 @@ pub(crate) fn reveal_panel(right_panel: RwSignal<RightPanel>, which: RightPanel)
 ///
 /// **The sequence is what makes leaving instant.** There is no cancelling a
 /// floem timer, so `leave` bumps the number and the pending arm, when it fires,
-/// finds itself superseded and does nothing. The same comparison covers the
-/// harder case: `exec_after` timers are **not** cancelled on scope teardown
-/// either, so a divider disposed inside the delay — closing the tab that owns
-/// the editor/results splitter is enough — would otherwise have the arm write to
-/// a dead signal. `try_get_untracked` answers `None` there, and `None` is not
-/// `Some(mine)`, so one check retires both.
+/// finds itself superseded and does nothing. That half is load-bearing at every
+/// site.
+///
+/// The same comparison also covers a timer that outlives the scope that armed it
+/// — `exec_after` is not cancelled on teardown either, and `try_get_untracked`
+/// answers `None` for a disposed signal, which is not `Some(mine)`, so one check
+/// retires both. **That half is defensive here and not reachable**, and the
+/// reason this comment used to give for it was wrong: the editor/results splitter
+/// is *not* per-tab. `v_resize_handle` is called once from `center`, itself built
+/// once in `workspace`'s shell, and the per-tab `dyn_container`s (`editor_area`,
+/// `results_area`) are its siblings rather than its parents — so these two
+/// signals live in the workspace's own scope and cannot be disposed while the app
+/// runs. The guard stays because a divider whose panel is rebuilt would reach it,
+/// and because floem offers no way to cancel the timer that would make it
+/// unnecessary; it is not evidence that this site has ever needed it.
 #[derive(Clone, Copy)]
 struct DelayedHover {
     lit: RwSignal<bool>,
