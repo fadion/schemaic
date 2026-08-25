@@ -3770,10 +3770,10 @@ const _: () = assert!(DDL_LOCK_WAIT_SECS >= 1);
 /// row locks (and is already bounded at 50s by default).
 /// SQLite's answer is the empty string, and the caller skips an empty statement.
 /// It has no lock-timeout *setting* — waiting is configured per connection as a
-/// busy timeout, not as SQL — and it takes a single write lock over the whole
-/// file, so the failure mode this bounds (a plan queued behind someone else's
-/// metadata lock) has no analogue: the write either starts or returns
-/// `SQLITE_BUSY` immediately.
+/// busy timeout, which `sqlite::open` sets — and it takes a single write lock over
+/// the whole file, so the failure mode this bounds (a plan queued behind someone
+/// else's metadata lock) has no analogue: the write either starts, or waits out
+/// that busy timeout and returns `SQLITE_BUSY`.
 fn lock_wait_sql(engine: Engine) -> String {
     match engine {
         Engine::MySql => format!("SET SESSION lock_wait_timeout = {DDL_LOCK_WAIT_SECS}"),
