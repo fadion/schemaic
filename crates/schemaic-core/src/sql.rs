@@ -687,6 +687,28 @@ fn segment_has_code(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> boo
     false
 }
 
+/// The **first** top-level statement in `sql`, trimmed — or the whole string when
+/// it holds one (or holds nothing a lexer can call a statement).
+///
+/// Borrowed from `sql`, so it costs a lexer pass and no allocation. The caller is
+/// a reader that can only describe one result set and wants the statement that
+/// produces it: PostgreSQL's `Parse` takes a single command, so a multi-statement
+/// string cannot be prepared at all, and without a `PREPARE` there are no column
+/// *types* — which is how a `bytea` came to be read as an unknown kind and
+/// rendered as its whole hex encoding.
+///
+/// It is [`statement_ranges`]' first range verbatim, **terminator included**, and
+/// not a second notion of where a statement ends. A trailing `;` is one range's
+/// worth of statement to every other caller here — Run Everything hands
+/// `sql[lo..hi]` straight to the same reader, and so to the same `PREPARE` — and
+/// a server that parses that as one command is a server this already depends on.
+pub fn first_statement(sql: &str, dialect: SqlDialect) -> &str {
+    match statement_ranges(sql, dialect).first() {
+        Some(&(lo, hi)) => &sql[lo..hi],
+        None => sql,
+    }
+}
+
 /// Every top-level statement's trimmed byte range that contains real SQL, in
 /// order. Comment/whitespace-only segments (e.g. a trailing `# note` after the
 /// last `;`) are dropped so Run Everything doesn't emit an "empty query" tab.
@@ -1478,6 +1500,57 @@ mod tests {
     }
     fn leading_keyword(s: &str) -> Option<String> {
         super::leading_keyword(s, SqlDialect::MySql)
+    }
+
+    /// **The statement whose columns describe what comes back.** PostgreSQL's
+    /// `Parse` takes one command, so a multi-statement string cannot be prepared
+    /// and the reader gets no column *types* — and an unknown type is what turns
+    /// a `bytea` into a cell holding its whole hex encoding. Since that reader
+    /// reports only the first result set, the first statement is the one to
+    /// describe.
+    #[test]
+    fn the_first_statement_is_the_one_a_reader_can_describe() {
+        let pg = SqlDialect::Postgres;
+        // One statement: handed back whole, so the single-statement path prepares
+        // exactly the string it always did.
+        assert_eq!(
+            super::first_statement("SELECT id FROM a", pg),
+            "SELECT id FROM a"
+        );
+        // The terminator is part of the range, and stays — Run Everything already
+        // hands `sql[lo..hi]` to the same `PREPARE`, so one command plus its `;`
+        // is a shape this reader has always been given.
+        assert_eq!(
+            super::first_statement("SELECT id FROM a;", pg),
+            "SELECT id FROM a;"
+        );
+        // Two statements: only the first, and the second is not in the slice.
+        assert_eq!(
+            super::first_statement("SELECT id FROM a; SELECT photo FROM b", pg),
+            "SELECT id FROM a;"
+        );
+        // A leading comment belongs to the statement it introduces.
+        assert_eq!(
+            super::first_statement("/* note */ SELECT 1; SELECT 2", pg),
+            "/* note */ SELECT 1;"
+        );
+        // A semicolon inside a string or a dollar-quoted body is not a boundary,
+        // which is the whole reason this goes through `statement_ranges` rather
+        // than `split(';')`.
+        assert_eq!(
+            super::first_statement("SELECT 'a;b' AS s; SELECT 2", pg),
+            "SELECT 'a;b' AS s;"
+        );
+        assert_eq!(
+            super::first_statement("SELECT $$a;b$$; SELECT 2", pg),
+            "SELECT $$a;b$$;"
+        );
+        // Nothing a lexer can call a statement: hand back the input rather than an
+        // empty string, so the caller's `prepare` fails on the real text and its
+        // error is the server's own.
+        for empty in ["", "   ", ";", "-- just a comment"] {
+            assert_eq!(super::first_statement(empty, pg), empty, "{empty:?}");
+        }
     }
 
     // ── SQLite boundaries ────────────────────────────────────────────────────

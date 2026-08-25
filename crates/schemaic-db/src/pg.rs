@@ -418,7 +418,17 @@ pub(crate) async fn run_statement(
     // names + types AND per-column provenance (`table_oid` / `column_id`) — the
     // Postgres analog of MySQL's `org_table`/`org_name`, which the editing system
     // (`analyze_edit`) needs. Columns from expressions carry no provenance.
-    let prepared_cols: Option<Vec<Column>> = match client.prepare(sql).await {
+    //
+    // **The first statement, not the whole string.** `Parse` takes one command, so
+    // a multi-statement string cannot be prepared at all — and the loop below
+    // reports only the first result set, so the first statement is exactly the one
+    // whose columns describe what comes back. Preparing the whole string instead
+    // left `type_name` empty for every column, and an empty type name is an
+    // unknown [`CellKind`]: a `bytea` was then read as text and its entire hex
+    // encoding went into the cell. For a single statement this is the same string
+    // and the same one round trip.
+    let describe = schemaic_core::sql::first_statement(sql, PG);
+    let prepared_cols: Option<Vec<Column>> = match client.prepare(describe).await {
         Ok(stmt) => {
             let cols = stmt.columns();
             let mut columns: Vec<Column> = cols
@@ -507,6 +517,17 @@ pub(crate) async fn run_statement(
         });
     let mut affected: u64 = 0;
     let mut truncated = false;
+    // How many row-returning result sets the stream has announced. A simple query
+    // is one string, and PostgreSQL will happily run several statements from it —
+    // the MCP server hands one straight through, and nothing upstream splits it.
+    // Each row-returning statement announces itself with its own
+    // `RowDescription`, which is the only boundary marker on the stream, and it
+    // used to be discarded by the wildcard below: the second set's rows were then
+    // pushed through the *first* set's columns and cell kinds, so a `bytea` in set
+    // two was read under set one's `INT4` and dumped its whole hex encoding into a
+    // cell headed by the first set's column name — the case `pg_cell` exists to
+    // prevent ("a hex dump of a 40 MB blob is a cell no grid survives").
+    let mut sets = 0usize;
 
     loop {
         // Cancellation is checked per message now rather than only around the
@@ -565,6 +586,29 @@ pub(crate) async fn run_statement(
                 }
             }
             SimpleQueryMessage::CommandComplete(n) => affected = n,
+            // A second one means a second result set, and this stops rather than
+            // merging: one result set per read is what the MySQL path already
+            // reports (`collect_rows` reads `columns_ref()` once and its stream
+            // yields only the first set), so the two engines answer a
+            // multi-statement string the same way. Dropping the stream here is
+            // safe for the same reason the row cap's `break` is — the driver's
+            // connection task keeps paging, so the connection stays reusable.
+            SimpleQueryMessage::RowDescription(_) => {
+                sets += 1;
+                if sets > 1 {
+                    tracing::warn!(
+                        "multi-statement query returned more than one result set; \
+                         reporting only the first"
+                    );
+                    break;
+                }
+            }
+            // `SimpleQueryMessage` is `#[non_exhaustive]`, so this arm cannot be
+            // removed — which is exactly how `RowDescription` came to be swallowed.
+            // Anything new arriving here must be *considered* before it is
+            // ignored: the question to ask is whether it carries a boundary or a
+            // column list, because those are the two things this loop's state
+            // depends on.
             _ => {}
         }
     }
