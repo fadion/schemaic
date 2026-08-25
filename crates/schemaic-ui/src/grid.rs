@@ -257,9 +257,6 @@ type FollowFn = Rc<dyn Fn(TableSource, String)>;
 /// Re-run the active tab with a rewritten (filtered/sorted) statement — the
 /// server-side filter/sort callback (`TabsActions::apply_view`).
 type ApplyViewFn = Rc<dyn Fn(String)>;
-/// Staged cell edits grouped `(table_idx, data_row) → [(result_ci, new_value)]`,
-/// ordered (BTreeMap) so a failing commit reproduces identically.
-type EditGroups = BTreeMap<(usize, usize), Vec<(usize, Option<String>)>>;
 
 /// Per-result interactive grid state. `Copy` (every field is an `RwSignal`, which
 /// is `Copy`) so it threads freely into the many cell/handler closures. Created
@@ -538,16 +535,6 @@ fn export_finished(current: Option<ExportRun>, finished: ExportRun) -> Option<Ex
         Some(run) if run == finished => None,
         other => other,
     }
-}
-
-/// A result column's **real** name on its base table, from the wire provenance.
-/// Empty for an expression column, which is never written to.
-fn origin_column(rs: &ResultSet, ci: usize) -> String {
-    rs.columns
-        .get(ci)
-        .and_then(|c| c.origin.as_ref())
-        .map(|o| o.column.clone())
-        .unwrap_or_default()
 }
 
 impl GridState {
@@ -1054,61 +1041,19 @@ impl GridState {
         self.edit_cell.set(None);
     }
 
-    /// Turn the staged `dirty` map into one [`RowEdit`] per (base table, row),
-    /// using the edit model's provenance for real column names + the WHERE key.
-    /// One base table's `UPDATE` for data row `di`: the `SET` list from `sets`
-    /// (result-column index → new value, `None` = SQL NULL) and the `WHERE` key
-    /// from the row's **original** values.
+    /// Turn the staged `dirty` map into one [`RowEdit`] per (base table, row).
     ///
-    /// Shared by the staged-batch builder and the row panel's immediate save,
-    /// which had ~35 identical lines each. The WHERE key's construction is the
-    /// part that matters: it is the identity every write on this path is aimed
-    /// at, and it had drifted into three copies (a fourth, `build_refetch`,
-    /// deliberately differs — it keys by the *post-edit* value, because the
-    /// re-fetch has to find the row the write just left).
-    fn row_edit_for(
-        model: &schemaic_core::edit::EditModel,
-        rs: &ResultSet,
-        ti: usize,
-        di: usize,
-        mut sets: Vec<(usize, Option<String>)>,
-    ) -> Option<RowEdit> {
-        let tbl = model.table(ti)?;
-        sets.sort_by_key(|(ci, _)| *ci); // stable SET-clause order
-        let set = sets
-            .into_iter()
-            .map(|(ci, v)| (origin_column(rs, ci), v))
-            .collect();
-        Some(RowEdit {
-            database: tbl.database.clone(),
-            schema: tbl.schema.clone(),
-            table: tbl.table.clone(),
-            set,
-            key: row_key(rs, tbl, di),
-        })
-    }
-
+    /// **A wrapper**: the assembly is `core::edit::build_edits`, where it can be
+    /// tested with a paste-shaped map. It sat here, in a struct no test can
+    /// construct, which is how the one step a paste stresses — grouping a
+    /// rectangle of staged cells into multi-column `RowEdit`s — came to be the
+    /// only untested link between a paste and the write plan's 1-row safety net.
     fn build_edits(&self) -> Vec<RowEdit> {
-        let model = self.edit_model.get_untracked();
-        let rs = self.rs.get_untracked();
-        let dirty = self.dirty.get_untracked();
-        // (table_idx, data_row) → [(result_ci, new_value)]  (None = SQL NULL).
-        // BTreeMap (+ sorted sets below) so the UPDATE order and SET-clause order
-        // are deterministic — a failing commit reproduces identically (§7.5).
-        let mut groups: EditGroups = BTreeMap::new();
-        for ((di, ci), new) in &dirty {
-            let Some(ti) = model.table_index(*ci) else {
-                continue; // read-only column somehow staged — skip defensively
-            };
-            groups
-                .entry((ti, *di))
-                .or_default()
-                .push((*ci, new.clone()));
-        }
-        groups
-            .into_iter()
-            .filter_map(|((ti, di), sets)| Self::row_edit_for(&model, &rs, ti, di, sets))
-            .collect()
+        schemaic_core::edit::build_edits(
+            &self.edit_model.get_untracked(),
+            &self.rs.get_untracked(),
+            &self.dirty.get_untracked(),
+        )
     }
 
     /// Like [`GridState::build_edits`], but for one data row `di` from an explicit change set
@@ -1128,7 +1073,7 @@ impl GridState {
         }
         groups
             .into_iter()
-            .filter_map(|(ti, sets)| Self::row_edit_for(&model, &rs, ti, di, sets))
+            .filter_map(|(ti, sets)| schemaic_core::edit::row_edit_for(&model, &rs, ti, di, sets))
             .collect()
     }
 

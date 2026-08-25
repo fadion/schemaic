@@ -15,7 +15,7 @@
 //! (a wrong key misdirects an UPDATE), so it lives here with tests rather than
 //! welded to Floem signals in the UI.
 
-use crate::model::{RefetchTemplate, ResultSet, Value};
+use crate::model::{RefetchTemplate, ResultSet, RowEdit, Value};
 use crate::schema::TableInfo;
 use std::collections::HashMap;
 
@@ -240,6 +240,87 @@ pub fn row_key(rs: &ResultSet, tbl: &EditTable, di: usize) -> Vec<(String, Value
                 .unwrap_or(Value::Null);
             (name, val)
         })
+        .collect()
+}
+
+/// A result column's **real** name on its base table, from the wire provenance.
+/// Empty for an expression column, which is never written to.
+pub fn origin_column(rs: &ResultSet, ci: usize) -> String {
+    rs.columns
+        .get(ci)
+        .and_then(|c| c.origin.as_ref())
+        .map(|o| o.column.clone())
+        .unwrap_or_default()
+}
+
+/// One base table's `UPDATE` for data row `di`: the `SET` list from `sets`
+/// (result-column index → new value, `None` = SQL NULL) and the `WHERE` key from
+/// the row's **original** values.
+///
+/// The WHERE key's construction is the part that matters: it is the identity every
+/// write on this path is aimed at, and it had drifted into three copies (a fourth,
+/// the re-fetch, deliberately differs — it keys by the *post-edit* value, because
+/// it has to find the row the write just left).
+pub fn row_edit_for(
+    model: &EditModel,
+    rs: &ResultSet,
+    ti: usize,
+    di: usize,
+    mut sets: Vec<(usize, Option<String>)>,
+) -> Option<RowEdit> {
+    let tbl = model.table(ti)?;
+    sets.sort_by_key(|(ci, _)| *ci); // stable SET-clause order
+    let set = sets
+        .into_iter()
+        .map(|(ci, v)| (origin_column(rs, ci), v))
+        .collect();
+    Some(RowEdit {
+        database: tbl.database.clone(),
+        schema: tbl.schema.clone(),
+        table: tbl.table.clone(),
+        set,
+        key: row_key(rs, tbl, di),
+    })
+}
+
+/// The grid's staged cell edits: `(data row, result column) → new value`, where
+/// `None` is SQL NULL. The shape `GridState::dirty` holds.
+pub type DirtyCells = std::collections::HashMap<(usize, usize), Option<String>>;
+
+/// [`build_edits`]' working grouping: `(base-table index, data row) →
+/// [(result column, new value)]`. A `BTreeMap` so the `UPDATE` order is
+/// deterministic.
+type EditGroups = std::collections::BTreeMap<(usize, usize), Vec<(usize, Option<String>)>>;
+
+/// Turn a staged `dirty` map into one [`RowEdit`] per (base table, data row).
+///
+/// **Here rather than in the view, because it is the step a paste stresses and the
+/// one nothing could reach.** A typed edit stages one cell, so every fixture the
+/// write-back family has ever had carries one `SET` column and one key column; a
+/// paste stages a rectangle, and grouping that rectangle by `(table, row)` into
+/// multi-column `RowEdit`s is what stands between it and `GridWrite::plan`'s 1-row
+/// safety net. That grouping lived in `GridState`, which no test can construct, so
+/// the chain paste → `dirty` → these edits → `GridWrite::plan` → `one_row_verdict`
+/// was untested end to end.
+///
+/// `BTreeMap` (and the sorted `SET` list in [`row_edit_for`]) so the `UPDATE` order
+/// and the `SET`-clause order are deterministic: a failing commit has to reproduce
+/// identically. A column with no base table is skipped defensively — it should not
+/// be in `dirty` at all, since only an editable cell can be staged.
+pub fn build_edits(model: &EditModel, rs: &ResultSet, dirty: &DirtyCells) -> Vec<RowEdit> {
+    let mut groups: EditGroups = std::collections::BTreeMap::new();
+    for ((di, ci), new) in dirty {
+        let Some(ti) = model.table_index(*ci) else {
+            continue;
+        };
+        groups
+            .entry((ti, *di))
+            .or_default()
+            .push((*ci, new.clone()));
+    }
+    groups
+        .into_iter()
+        .filter_map(|((ti, di), sets)| row_edit_for(model, rs, ti, di, sets))
         .collect()
 }
 
@@ -1124,6 +1205,142 @@ mod tests {
         let m = analyze_edit(&r, schema);
         assert!(m.editable(0));
         assert!(m.editable(1));
+    }
+
+    /// **A paste-shaped batch, all the way to the write plan's safety net.**
+    ///
+    /// Every fixture the write-back family has ever had carries **one** `SET`
+    /// column and one key column, because a typed edit stages one cell. A paste
+    /// stages a rectangle, and the step between the two — grouping that rectangle
+    /// by `(table, row)` into multi-column `RowEdit`s — lived in `GridState`, which
+    /// no test can construct. So the chain paste → `dirty` → these edits →
+    /// `GridWrite::plan` → `one_row_verdict` was untested end to end, and the 1-row
+    /// safety net had never seen the shape it exists to guard.
+    #[test]
+    fn a_pasted_block_commits_one_row_per_row_not_one_per_cell() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "t", true, false),
+                col("a", "VARCHAR", "t", false, false),
+                col("b", "VARCHAR", "t", false, false),
+                col("c", "VARCHAR", "t", false, false),
+                col("d", "VARCHAR", "t", false, false),
+            ],
+            (0..3)
+                .map(|i| {
+                    vec![
+                        Value::Int(i + 1),
+                        Value::Str("x".into()),
+                        Value::Str("x".into()),
+                        Value::Str("x".into()),
+                        Value::Str("x".into()),
+                    ]
+                })
+                .collect(),
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| {
+                schema_with_pk(
+                    "t",
+                    &["id"],
+                    &[
+                        ("id", "int"),
+                        ("a", "varchar"),
+                        ("b", "varchar"),
+                        ("c", "varchar"),
+                        ("d", "varchar"),
+                    ],
+                )
+            })
+        };
+        let model = analyze_edit(&r, schema);
+
+        // Three rows x four columns of pasted values — a `dirty` map exactly as
+        // `stage_many` leaves one.
+        let mut dirty: HashMap<(usize, usize), Option<String>> = HashMap::new();
+        for di in 0..3 {
+            for ci in 1..5 {
+                dirty.insert((di, ci), Some(format!("r{di}c{ci}")));
+            }
+        }
+
+        let edits = build_edits(&model, &r, &dirty);
+        assert_eq!(edits.len(), 3, "one UPDATE per row, not per cell");
+        for (di, e) in edits.iter().enumerate() {
+            assert_eq!(e.table, "t");
+            assert_eq!(e.set.len(), 4, "four SET columns in one statement");
+            // Deterministic order — a failing commit has to reproduce identically.
+            assert_eq!(
+                e.set.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+                vec!["a", "b", "c", "d"]
+            );
+            assert_eq!(
+                e.set.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+                (1..5)
+                    .map(|ci| Some(format!("r{di}c{ci}")))
+                    .collect::<Vec<_>>()
+            );
+            // And the WHERE key is the row's own identity, from its original
+            // values — one column, the primary key.
+            assert_eq!(e.key.len(), 1);
+            assert_eq!(e.key[0].0, "id");
+        }
+        // The rows come out in row order, which is what makes the SQL reproducible.
+        let ids: Vec<Value> = edits.iter().map(|e| e.key[0].1.clone()).collect();
+        assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+
+        // The whole point of doing this here: the safety net can now see the shape.
+        // Each statement of the plan touches exactly one row, so `one_row_verdict`
+        // accepts a 1-row result for each of the three.
+        let write = crate::model::GridWrite {
+            updates: edits,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+        };
+        let plan = write.plan();
+        assert_eq!(plan.len(), 3, "three statements, one per row");
+        for (i, step) in plan.iter().enumerate() {
+            assert_eq!(
+                crate::model::one_row_verdict(*step, 1),
+                Ok(()),
+                "statement {i} of a paste-shaped batch must accept its single row"
+            );
+            // And it refuses the shape it exists to refuse, on this batch too: a
+            // multi-column `UPDATE` whose `WHERE` matched more than one row is the
+            // case the net is for, and it had never been handed one.
+            assert!(crate::model::one_row_verdict(*step, 2).is_err());
+        }
+    }
+
+    /// A column with no base table is not in `dirty` in the first place — only an
+    /// editable cell can be staged — but it is skipped rather than trusted, and a
+    /// row that groups to nothing produces no statement at all rather than an
+    /// `UPDATE` with an empty `SET`.
+    #[test]
+    fn a_cell_with_no_base_table_reaches_no_statement() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "t", true, false),
+                Column {
+                    name: "expr".to_string(),
+                    type_name: "INT".to_string(),
+                    origin: None,
+                },
+            ],
+            vec![vec![Value::Int(1), Value::Int(9)]],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int")]))
+        };
+        let model = analyze_edit(&r, schema);
+        assert!(!model.editable(1), "an expression column is not editable");
+
+        let mut dirty: HashMap<(usize, usize), Option<String>> = HashMap::new();
+        dirty.insert((0, 1), Some("7".into()));
+        assert!(build_edits(&model, &r, &dirty).is_empty());
+
+        // Nothing staged at all is nothing to write.
+        assert!(build_edits(&model, &r, &HashMap::new()).is_empty());
     }
 
     // ── multi-schema: the namespace is part of a table's identity ─────────
