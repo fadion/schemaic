@@ -343,6 +343,20 @@ impl Stamp {
         }
         let (time, rest) = take_time(&rest[sep.len_utf8()..])?;
         let (frac, rest) = take_frac(rest);
+        // **The tail is kept without being understood, but not without being
+        // checked.** It is documented as a timezone offset or nothing, and
+        // everything downstream treats it as one — `has_offset` says any tail is
+        // an offset, and `with_offset` replaces it. A PostgreSQL BC timestamp
+        // (`0044-03-15 00:00:00 BC`) came through here with `tail = " BC"`, so
+        // `fits` said the calendar could show it, the picker opened on March 44
+        // *AD*, and **Now** wrote the era away by replacing " BC" with "+02:00".
+        //
+        // The date-only spelling was already refused two lines up, because
+        // `take_time("BC")` fails — so the asymmetry was that adding a time let
+        // the same suffix through.
+        if !is_offset_tail(rest) {
+            return None;
+        }
         Some(Stamp {
             date,
             time: Some(time),
@@ -511,6 +525,35 @@ fn take_frac(s: &str) -> (&str, &str) {
         return ("", s);
     }
     s.split_at(n + 1)
+}
+
+/// Is `s` something [`Stamp::tail`] may hold — a UTC offset, or nothing?
+///
+/// `Z`/`z`, or a sign and one to three colon-separated pairs of digits
+/// (`+02`, `-05:30`, `+00:00:00`), with an optional space before the sign, which
+/// is how PostgreSQL prints one. Anything else means the value carries something
+/// this module does not model, and a stamp is the wrong reading of it: the caller
+/// falls back to the text editor, which is where the module doc says a value no
+/// picker can represent belongs.
+fn is_offset_tail(s: &str) -> bool {
+    let s = s.trim_start();
+    if s.is_empty() || s.eq_ignore_ascii_case("z") {
+        return true;
+    }
+    let Some(rest) = s.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    // One to three pairs, every one of them two digits: an offset is written
+    // `+HH`, `+HH:MM` or `+HH:MM:SS`, and nothing else.
+    let mut n = 0;
+    for part in &mut parts {
+        n += 1;
+        if n > 3 || part.len() != 2 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    n > 0
 }
 
 #[cfg(test)]
@@ -785,6 +828,41 @@ mod tests {
         assert!(Stamp::parse("2024-01-15x10:30:00").is_none());
         assert!(Stamp::parse("2024-01-15 25:00:00").is_none());
         assert!(Stamp::parse("2024-01-15 BC").is_none());
+    }
+
+    /// **A tail is an offset or the value is not a stamp.** The date-only
+    /// spelling was already refused (`take_time("BC")` fails); adding a time let
+    /// the same suffix through as an un-inspected `tail`, so a PostgreSQL BC
+    /// timestamp was handed to the calendar as an **AD** date 87 years and an era
+    /// away from what the cell held — and `has_offset` said `" BC"` was an
+    /// offset, so **Now** replaced it with `+02:00`.
+    #[test]
+    fn an_era_suffix_is_not_a_timezone_offset() {
+        assert!(Stamp::parse("0044-03-15 00:00:00 BC").is_none());
+        assert!(Stamp::parse("2024-01-15 10:30:00 AD").is_none());
+        // Anything else the module does not model goes the same way, rather than
+        // riding along as a tail nobody looked at.
+        assert!(Stamp::parse("2024-01-15 10:30:00 Europe/Berlin").is_none());
+        assert!(Stamp::parse("2024-01-15 10:30:00 +2").is_none());
+        assert!(Stamp::parse("2024-01-15 10:30:00+2:00").is_none());
+        assert!(Stamp::parse("2024-01-15 10:30:00 CET").is_none());
+
+        // …and every offset spelling either engine prints still parses, tail
+        // intact.
+        for (src, tail) in [
+            ("2024-01-15 10:30:00Z", "Z"),
+            ("2024-01-15 10:30:00z", "z"),
+            ("2024-01-15 10:30:00+02", "+02"),
+            ("2024-01-15 10:30:00-05:30", "-05:30"),
+            ("2024-01-15 10:30:00+00:00:00", "+00:00:00"),
+            // PostgreSQL puts a space before the sign in some styles.
+            ("2024-01-15 10:30:00 +02", " +02"),
+            ("2024-01-15 10:30:00", ""),
+        ] {
+            let s = Stamp::parse(src).unwrap_or_else(|| panic!("{src} parses"));
+            assert_eq!(s.render(), src, "{src}");
+            assert_eq!(s.has_offset(), !tail.is_empty(), "{src}");
+        }
     }
 
     /// **A number wider than its field is not that field.** Each scanner caps its
