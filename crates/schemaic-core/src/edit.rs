@@ -732,6 +732,23 @@ pub fn parse_tsv_block(text: &str) -> Vec<Vec<String>> {
 /// means "set this column for every row" wants one `UPDATE`, not 200k of them.
 pub const PASTE_CELL_CAP: usize = 50_000;
 
+/// The most **positions** one paste may walk, staged or not.
+///
+/// [`PASTE_CELL_CAP`] bounds what a paste costs in memory; this bounds what it
+/// costs in time, and they are not the same gesture. A cell skipped as off-grid
+/// or read-only rightly consumes no staging budget — so a result with no editable
+/// column (every column an expression: a `CONCAT`, a `YEAR(…)`, a `salary*1.1`)
+/// never reaches the staged cap at all, and Ctrl+A then Ctrl+V asked the walk to
+/// visit every display cell of the whole result: 600k positions on a 200k × 3,
+/// twelve million on a 200k × 60. On the UI thread, for a paste whose entire
+/// outcome is "Nothing pasted".
+///
+/// Four times the staged cap: a paste may skip four positions for every one it
+/// lands and still complete, which covers a mis-aimed selection with room to
+/// spare, and what it declines to visit is *reported* ([`PastePlan::capped`])
+/// rather than dropped quietly.
+pub const PASTE_VISIT_CAP: usize = 4 * PASTE_CELL_CAP;
+
 /// Where a pasted block lands, and what of it doesn't.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PastePlan {
@@ -832,22 +849,23 @@ pub fn plan_paste(
     let mut seen = 0usize;
     'block: for dr in 0..span_r {
         for dc in 0..span_c {
-            // Checked before the value is cloned, and against the *staged* count:
-            // a cell skipped as off-grid or read-only costs nothing to stage, so
-            // it must not consume the budget either.
-            if plan.cells.len() >= PASTE_CELL_CAP {
+            // **Two ceilings, because there are two costs.** The staged count is
+            // the memory one, and a cell skipped as off-grid or read-only costs
+            // nothing to stage, so it must not consume that budget. `seen` is the
+            // *walk*: a selection is the user's whole result, so a paste that
+            // stages nothing can still be asked to visit millions of positions —
+            // Ctrl+A on a 200k-row expression result is 600k of them, and the
+            // gesture `PASTE_CELL_CAP`'s doc names is exactly this one.
+            if plan.cells.len() >= PASTE_CELL_CAP || seen >= PASTE_VISIT_CAP {
                 plan.capped = carried.saturating_sub(seen);
                 break 'block;
             }
-            let Some(value) = (if single {
-                Some(block[0][0].clone())
-            } else {
-                block.get(dr).and_then(|r| r.get(dc)).cloned()
-            }) else {
-                // A ragged block: this row is shorter than the widest. Nothing
-                // to write and nothing lost — the cell already there stays.
+            // **Does the block carry a value here at all**, asked without taking
+            // one. A ragged block's short row has nothing to write and nothing
+            // lost — the cell already there stays.
+            if !single && block.get(dr).and_then(|r| r.get(dc)).is_none() {
                 continue;
-            };
+            }
             seen += 1;
             let row = r0 + dr;
             let Some(&col) = target_cols.get(dc) else {
@@ -864,6 +882,16 @@ pub fn plan_paste(
                 plan.read_only += 1;
                 continue;
             }
+            // **Cloned last.** The two tests above need neither the value nor an
+            // allocation, and they were below it: a paste over a result with no
+            // editable column performed one heap allocation per selected position
+            // and then discarded it, which is a visible freeze for a gesture whose
+            // whole outcome is "Nothing pasted".
+            let value = if single {
+                block[0][0].clone()
+            } else {
+                block[dr][dc].clone()
+            };
             plan.cells.push((row, col, value));
         }
     }
@@ -926,25 +954,37 @@ impl PastePlan {
 /// `skipped_deleted` is the view's own: a row marked for deletion is a display
 /// state the plan knows nothing about. What actually *landed* is what decides
 /// between the two voices — not whether anything was skipped.
+///
+/// **Every figure is grouped and every noun agrees**, because this sentence
+/// shares a bar with the stats line: `Pasted 1 cells` four pixels from
+/// `200k of ~292.02k rows` reads as a bug in the paste, and the range's own code
+/// says why the helpers are not optional — `save_export`'s note carries a comment
+/// about `plural` returning the noun and nothing else, after forgetting the count
+/// once produced "Exported rows to employees.csv".
 pub fn paste_report(counts: PasteCounts, skipped_deleted: usize) -> PasteReport {
+    let n = crate::text::human_count;
     let mut notes = Vec::new();
     if counts.dropped > 0 {
-        notes.push(format!("{} outside the grid", counts.dropped));
+        notes.push(format!("{} outside the grid", n(counts.dropped)));
     }
     if counts.read_only > 0 {
-        notes.push(format!("{} in read-only columns", counts.read_only));
+        notes.push(format!("{} in read-only columns", n(counts.read_only)));
     }
     if counts.capped > 0 {
         // The limit is named, not just the overflow: "skipping 5,950,000" with no
         // reason reads as a bug, and the number is what tells the user this was a
         // ceiling rather than something about their data.
         notes.push(format!(
-            "{} over the {PASTE_CELL_CAP}-cell paste limit",
-            counts.capped
+            "{} over the {}-cell paste limit",
+            n(counts.capped),
+            n(PASTE_CELL_CAP)
         ));
     }
     if skipped_deleted > 0 {
-        notes.push(format!("{skipped_deleted} in rows marked for deletion"));
+        notes.push(format!(
+            "{} in rows marked for deletion",
+            n(skipped_deleted)
+        ));
     }
     if notes.is_empty() {
         return PasteReport::Clean;
@@ -954,7 +994,9 @@ pub fn paste_report(counts: PasteCounts, skipped_deleted: usize) -> PasteReport 
         PasteReport::Failed(format!("Nothing pasted: {}.", notes.join(", ")))
     } else {
         PasteReport::Notice(format!(
-            "Pasted {staged} cells, skipping {}.",
+            "Pasted {} {}, skipping {}.",
+            n(staged),
+            crate::text::plural(staged, "cell", "cells"),
             notes.join(", ")
         ))
     }
@@ -2219,6 +2261,38 @@ mod tests {
         assert_eq!(plan.counts().capped, 10, "and it survives into the report");
     }
 
+    /// **A paste that stages nothing is bounded too.** The staged cap cannot
+    /// stop this walk: a result whose every column is an expression has no
+    /// editable column, so `plan.cells` never grows and the ceiling is never
+    /// reached — while Ctrl+A selected every display cell and each one was
+    /// *cloned* before being classified as read-only. That is a heap allocation
+    /// per position for a gesture whose whole outcome is "Nothing pasted", on the
+    /// UI thread.
+    ///
+    /// Two properties: the walk stops at [`PASTE_VISIT_CAP`], and what it did not
+    /// visit is counted so the report can say so.
+    #[test]
+    fn a_paste_that_can_stage_nothing_still_stops() {
+        let block = parse_tsv_block("x");
+        // A million selected positions, none of them editable.
+        let rows = 1_000_000;
+        let plan = plan_paste(&block, (0, 0, rows - 1, 0), rows, 1, None, |_| false);
+        assert!(plan.cells.is_empty(), "nothing could be staged");
+        assert_eq!(
+            plan.read_only, PASTE_VISIT_CAP,
+            "the walk stops at the visit ceiling"
+        );
+        assert_eq!(
+            plan.read_only + plan.capped,
+            rows,
+            "and everything is accounted for"
+        );
+        // The ordinary read-only paste — small, and fully classified — is
+        // untouched by the ceiling.
+        let plan = plan_paste(&block, (0, 0, 3, 0), 4, 1, None, |_| false);
+        assert_eq!((plan.read_only, plan.capped), (4, 0));
+    }
+
     /// A paste that fits is untouched by the cap — the ordinary case has to stay
     /// exactly what it was, including reporting nothing at all.
     #[test]
@@ -2303,10 +2377,34 @@ mod tests {
         let r = paste_report(planned_over(PASTE_CELL_CAP, 12), 0);
         assert_eq!(
             r,
-            PasteReport::Notice(format!(
-                "Pasted {PASTE_CELL_CAP} cells, skipping 12 over the \
-                 {PASTE_CELL_CAP}-cell paste limit."
-            ))
+            PasteReport::Notice(
+                "Pasted 50k cells, skipping 12 over the 50k-cell paste limit.".to_string()
+            )
+        );
+        // A big overflow, in the printer the stats line uses — this test's own
+        // doc comment wrote the figure grouped, which is what the sentence was
+        // always meant to read like.
+        let r = paste_report(planned_over(PASTE_CELL_CAP, 5_950_000), 0);
+        assert_eq!(
+            r,
+            PasteReport::Notice(
+                "Pasted 50k cells, skipping 5.95m over the 50k-cell paste limit.".to_string()
+            )
+        );
+    }
+
+    /// **"Pasted 1 cells."** The noun follows the figure, on a bar whose stats
+    /// line four pixels away reads `200k of ~292.02k rows` — and no fixture in
+    /// this module ever staged exactly one cell, so the singular was unpinned.
+    #[test]
+    fn one_pasted_cell_is_one_cell() {
+        assert_eq!(
+            paste_report(planned(1, 1, 0), 0),
+            PasteReport::Notice("Pasted 1 cell, skipping 1 outside the grid.".to_string())
+        );
+        assert_eq!(
+            paste_report(planned(2, 1, 0), 0),
+            PasteReport::Notice("Pasted 2 cells, skipping 1 outside the grid.".to_string())
         );
     }
 

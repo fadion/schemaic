@@ -586,16 +586,18 @@ pub struct ResultSet {
     /// claimed to be.
     ///
     /// The backend's assertion, not a guess from a type name, and it exists
-    /// because on one engine the type name cannot answer. A SQLite result column
-    /// carries `origin: None` and `decl_type()` — an *affinity*, or nothing at
-    /// all: `CREATE TABLE files(id INTEGER PRIMARY KEY, data)` is legal and is
-    /// the ordinary shape for a blob store, and a computed column
-    /// (`SELECT zeroblob(4)`) has no declared type either. So
-    /// [`Column::is_binary`] is `false` for it, the export's two-signal rule
-    /// degenerates to "never withhold", and the `<n bytes>` placeholder went into
-    /// CSV, JSON **and** SQL as though it were the data — the one place the
-    /// placeholder is certainly not a user's prose is exactly where the guard
-    /// refused to act.
+    /// because on one engine the type name cannot always answer. SQLite types
+    /// *values*, not columns: `decl_type()` is an affinity or nothing, so a blob
+    /// in a column declared `TEXT` is legal and the type says the wrong thing
+    /// outright, and a computed column (`SELECT zeroblob(4)`) or one from a join
+    /// or a CTE has no `origin` to fall back on either. Where the type *can*
+    /// answer it already does — an untyped column has BLOB affinity
+    /// ([`crate::schema::sqlite_affinity`]) and the backend's `attach_origins`
+    /// sets `binary` from it. This covers the rest, where
+    /// [`Column::is_binary`] is `false`, the export's two-signal rule degenerates
+    /// to "never withhold", and the `<n bytes>` placeholder went into CSV, JSON
+    /// **and** SQL as though it were the data — the one place the placeholder is
+    /// certainly not a user's prose being exactly where the guard refused to act.
     ///
     /// Set per value (`ValueRef::Blob` is not a heuristic) and reported per
     /// *column*, since that is the grain everything downstream asks at. A column

@@ -36,11 +36,23 @@
 //!     **Whether they should scale at all is an open question** (the review's
 //!     `R2-L8-04`): the honest answer needs the app on screen at 160%, so what is
 //!     written down here is what the code does, not a defence of it.
+//!   • **The terminal's own font ladder** (`TERM_FONT_SIZES`) — the terminal
+//!     font has its own size setting, like the editor's, and the interface scale
+//!     deliberately doesn't touch either.
 //!   • Anything that isn't a length: durations, counts, thresholds.
 //!
+//! **One shape no list of names can cover**: a `border_radius` that is *half a
+//! scaled box*. It is a length, it is a literal, and it is correct — the radius
+//! of a pill is half its height, so the term to scale is the height and the
+//! `0.5` is arithmetic. Five sites crate-wide; three derive it, and
+//! `connection_form.rs`'s colour swatch and `settings.rs`'s toggle track still
+//! carry a literal `9.0` over a `scaled(18.0)` box, which is the F10a sweep's
+//! (`S7.3-L2-01`).
+//!
 //! The list is prose, and prose is the wrong shape for it — it has been found
-//! short three times. `S7.1-L3-03` proposes a source-gate test with the
-//! exceptions as *data*, which is the form that gets updated when it fails.
+//! short three times, once by the site comment below pointing at a bullet that
+//! wasn't here. `S7.1-L3-03` proposes a source-gate test with the exceptions as
+//! *data*, which is the form that gets updated when it fails.
 
 use crate::theme;
 use crate::theme::scaled;
