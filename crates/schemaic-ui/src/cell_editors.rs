@@ -524,15 +524,58 @@ fn day_h() -> f64 {
     theme::scaled(24.0)
 }
 
+/// The padding the calendar panel draws on every side — **air, so it scales**.
+///
+/// A function rather than a literal in two places, because it *was* a literal in
+/// two places: the panel's style call and [`calendar_size`]'s measurement of that
+/// same style. `61352d0` scaled the style call and left the measurement, and from
+/// then on the panel was declared smaller than its own contents at every scale
+/// above Normal.
+fn calendar_pad() -> f64 {
+    theme::scaled(8.0)
+}
+
+/// The gap between the panel's four bands (header, weekday row, grid, footer) —
+/// air as well, and the other half of the same divergence.
+fn calendar_gap() -> f64 {
+    theme::scaled(4.0)
+}
+
+/// The panel's border, on every side. A **hairline**: one physical line at every
+/// size, which is why this one does not scale. `menu_panel_height` draws the same
+/// distinction, and `calendar_size` used to have it backwards — scaling its boxes
+/// and treating its air as a hairline.
+const CALENDAR_BORDER: f64 = 1.0;
+
+/// One band of chrome above and below the day grid: the month header and the
+/// `Now`/`Today` footer.
+fn calendar_band_h() -> f64 {
+    theme::scaled(22.0)
+}
+
+/// The weekday initials row, which is shorter than a band.
+fn calendar_headings_h() -> f64 {
+    theme::scaled(16.0)
+}
+
 /// The calendar panel's own size, computed rather than measured: the panel is a
 /// fixed grid, and [`crate::overlays::date_pick_overlay`] needs the real numbers
 /// to decide which way it flips at a window edge. An estimate there is a panel
 /// that lands a few pixels off, or off-screen entirely.
+///
+/// **Every term is the one the style closure uses**, through the same function —
+/// which is the whole point, and was the whole bug. taffy 0.4 has no
+/// `box_sizing`, so the `.width`/`.height` this feeds size the *border box*: a
+/// figure short of the contents does not clip, it overflows the background and
+/// the border, and it makes `calendar_insets`' edge flip an under-estimate at the
+/// same time.
 pub(crate) fn calendar_size() -> (f64, f64) {
-    let pad = 8.0 * 2.0 + 2.0; // padding both sides + the 1px border both sides
+    // Padding both sides + the border both sides.
+    let pad = calendar_pad() * 2.0 + CALENDAR_BORDER * 2.0;
     let rows = day_h() * 6.0;
-    let chrome = theme::scaled(22.0) * 2.0 + theme::scaled(16.0); // header, footer, weekday row
-    let gaps = 4.0 * 3.0;
+    let chrome = calendar_band_h() * 2.0 + calendar_headings_h();
+    // Four bands, so three gaps between them.
+    let gaps = calendar_gap() * 3.0;
     (day_w() * 7.0 + pad, rows + chrome + gaps + pad)
 }
 
@@ -769,7 +812,7 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
         .style(|s| s.flex_grow(1.0_f32).items_center().justify_center()),
         arrow(icons::CHEVRON_RIGHT, 1),
     ))
-    .style(move |s| s.width_full().height(theme::scaled(22.0)).items_center());
+    .style(move |s| s.width_full().height(calendar_band_h()).items_center());
 
     let headings = h_stack_from_iter(date::WEEKDAY_INITIALS.iter().map(|d| {
         text(*d)
@@ -781,7 +824,7 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
             })
             .into_any()
     }))
-    .style(move |s| s.flex_row().height(theme::scaled(16.0)));
+    .style(move |s| s.flex_row().height(calendar_headings_h()));
 
     // Rebuilt per month rather than per day-cell, so paging doesn't leave 42
     // reactive closures each re-deciding which month they are in.
@@ -833,7 +876,7 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
                     .hover(|s| s.background(theme::row_hover()))
             }),
     ))
-    .style(move |s| s.width_full().height(theme::scaled(22.0)).items_center());
+    .style(move |s| s.width_full().height(calendar_band_h()).items_center());
 
     let (w, h) = calendar_size();
     v_stack((header, headings, grid, footer))
@@ -847,14 +890,16 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
             CALENDAR_PRESS.set(true)
         })
         .style(move |s| {
-            s.gap(theme::scaled(4.0))
-                .padding(theme::scaled(8.0))
+            // Every length here is also a term in `calendar_size`, and reached
+            // through the same function so the two cannot drift again.
+            s.gap(calendar_gap())
+                .padding(calendar_pad())
                 .width(w)
                 .height(h)
                 .background(theme::bg_panel())
-                .border(1.0)
+                .border(CALENDAR_BORDER as f32)
                 .border_color(theme::border())
-                .border_radius(8.0)
+                .border_radius(theme::scaled(8.0))
         })
         .into_any()
 }
@@ -1009,6 +1054,57 @@ mod row_panel_focus_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The panel's declared box must hold the panel's contents, at every
+    /// scale.** taffy 0.4 has no `box_sizing`, so the `.width`/`.height`
+    /// `calendar_size` feeds size the *border box*: a figure short of the contents
+    /// does not clip, it overflows the background and the border — and it makes
+    /// `calendar_insets`' edge flip an under-estimate at the same time, which is
+    /// the exactness `box_menu_inset` was bought for.
+    ///
+    /// The sum here is assembled from the same functions the panel's own style
+    /// closure calls, which is what the fix made possible: `pad` and `gaps` used
+    /// to be literals in the measurement and `theme::scaled(…)` in the view, so
+    /// the two agreed only at Normal. `61352d0` scaled the view and left the
+    /// measurement.
+    #[test]
+    fn the_calendar_declares_a_box_that_holds_it_at_every_scale() {
+        use crate::theme::UiScale;
+        for scale in [
+            UiScale::Small,
+            UiScale::Normal,
+            UiScale::Large,
+            UiScale::Huge,
+        ] {
+            crate::theme::set_ui_scale(scale);
+            let (w, h) = calendar_size();
+            let frame = calendar_pad() * 2.0 + CALENDAR_BORDER * 2.0;
+            let need_w = day_w() * 7.0 + frame;
+            let need_h = day_h() * 6.0
+                + calendar_band_h() * 2.0
+                + calendar_headings_h()
+                + calendar_gap() * 3.0
+                + frame;
+            crate::theme::set_ui_scale(UiScale::Normal);
+            assert!(
+                w >= need_w,
+                "{scale:?}: declared width {w}, contents need {need_w}"
+            );
+            assert!(
+                h >= need_h,
+                "{scale:?}: declared height {h}, contents need {need_h}"
+            );
+        }
+    }
+
+    /// And Normal is the exact identity, written out rather than derived — the
+    /// numbers the app laid out with before the scale setting existed. Comparing
+    /// against the formula would pass even if every term moved together.
+    #[test]
+    fn the_calendar_at_normal_is_the_box_the_app_shipped_with() {
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        assert_eq!(calendar_size(), (228.0, 234.0));
+    }
 
     const SIZE: (f64, f64) = (230.0, 220.0);
     const WIN: (f64, f64) = (1000.0, 700.0);
