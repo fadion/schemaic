@@ -21,9 +21,9 @@ use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton}
 
 use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
 use crate::widgets::{
-    ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_insets, dialog_button,
-    focus_root, measure_text_px_at, menu_inset, menu_item_style, menu_panel, menu_panel_height,
-    modal_body_h, modal_w, panel_style, window_size,
+    ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
+    dialog_button, focus_root, measure_text_px_at, menu_inset, menu_item_style, menu_panel,
+    menu_panel_height, modal_body_h, modal_w, panel_style, window_size,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
@@ -2168,16 +2168,19 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
             }
             // A menu dropping from a box (an enum field, a cell open for editing):
             // **left edges flush**, so the list lines up under the value it is
-            // replacing rather than under a glyph. Same two flips as the icon case
-            // — right-aligned at the window's right edge, upward at its bottom —
-            // and the same shared `menu_inset` for the vertical.
-            Some(PopupAnchor::BelowBox(left, right, bottom)) => {
+            // replacing rather than under a glyph. Right-aligned at the window's
+            // right edge, as the icon case is — but its vertical goes through
+            // `box_menu_inset` rather than `menu_inset`: with no room below, the
+            // menu opens **above the control**, not above the control's bottom
+            // edge, which had it covering the field it is about (and, in the row
+            // panel, the box the next click has to reach to close it).
+            Some(PopupAnchor::BelowBox(left, right, top, bottom)) => {
                 let x = if ww > 1.0 && left + pw > ww {
                     (right - pw).max(0.0)
                 } else {
                     left.max(0.0)
                 };
-                let y = menu_inset(bottom, ph, wh, 2.0);
+                let y = box_menu_inset(top, bottom, ph, wh, 2.0);
                 y.apply_y(s.absolute().inset_left(x))
             }
             // Cursor menus (right-click): open at the pointer, flipping to the

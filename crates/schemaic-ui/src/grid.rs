@@ -4849,7 +4849,9 @@ fn typed_editor(
     // just the ones with a text field in them. (A control with its own popup up
     // takes the first Escape: that one is on the shared popup registry, which the
     // window root peels off before anything else — see
-    // `widgets::dismiss_open_popup`.)
+    // `widgets::dismiss_open_popup`. The root only gets the key when the popup
+    // took the keyboard, which a *menu* does and the calendar does not; the date
+    // control peels its own, in `cell_editors::peeling_escape`.)
     let open = gs.edit_row_open;
     let close_panel = move || -> Option<Rc<dyn Fn()>> { Some(Rc::new(move || open.set(false))) };
     let control: Rc<dyn Fn() -> AnyView> = match editor {
