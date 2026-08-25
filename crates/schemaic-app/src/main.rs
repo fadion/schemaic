@@ -141,7 +141,7 @@ use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::{SchemaState, TableSource};
 use schemaic_core::sql::{GuardPolicy, RunVerdict, run_verdict};
 use schemaic_core::tx::{
-    StmtOutcome, TabTx, TxEngine, TxMode, TxState, ddl_blocking_tabs, session_still_wanted,
+    self, StmtOutcome, TabTx, TxEngine, TxMode, TxState, ddl_blocking_tabs, session_still_wanted,
 };
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiScale, UiThemeKind};
@@ -1774,6 +1774,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 let timed_out = watchdog.fired();
                 drop(watchdog);
+                // What the error text cannot say: on MySQL a DDL statement
+                // commits the open transaction before it runs, so a rejected or
+                // killed one has spent it — and nothing else on screen says so.
+                // `None` (no session) can't have had a transaction to spend.
+                let note = |m: String| match stmt {
+                    Some(o) => tx::failed_message(&m, o),
+                    None => m,
+                };
                 let state = match res {
                     Ok(rs) => {
                         tracing::info!(
@@ -1789,7 +1797,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // so the watchdog's flag is the only thing that can tell the
                     // user which of the two stopped their query.
                     Err(DbError::Cancelled) if timed_out => {
-                        QueryState::Failed(timeout_message(timeout_secs))
+                        QueryState::Failed(note(timeout_message(timeout_secs)))
                     }
                     Err(DbError::Cancelled) => {
                         tracing::info!("query cancelled");
@@ -1797,7 +1805,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     Err(e) => {
                         tracing::error!("query failed: {e}");
-                        QueryState::Failed(e.to_string())
+                        QueryState::Failed(note(e.to_string()))
                     }
                 };
                 send((state, stmt, started.elapsed().as_millis() as u64));
@@ -2171,11 +2179,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             took[i] = clock.elapsed().as_millis() as u64;
                             clock = std::time::Instant::now();
                             outcomes[i] = Some(out.stmt);
+                            // Same disclosure as the single-run path, and it
+                            // matters more here: the statements after this one
+                            // are skipped, so the pill is the only place the
+                            // spent transaction would otherwise show.
                             states[i] = match out.result {
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
                                 Err(DbError::Cancelled) if timed_out => {
                                     stopped = true;
-                                    QueryState::Failed(timeout_message(timeout_secs))
+                                    QueryState::Failed(tx::failed_message(
+                                        &timeout_message(timeout_secs),
+                                        out.stmt,
+                                    ))
                                 }
                                 Err(DbError::Cancelled) => {
                                     stopped = true;
@@ -2183,7 +2198,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                                 Err(e) => {
                                     stopped = true;
-                                    QueryState::Failed(e.to_string())
+                                    QueryState::Failed(tx::failed_message(&e.to_string(), out.stmt))
                                 }
                             };
                         }
