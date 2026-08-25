@@ -604,9 +604,10 @@ fn type_names_of(columns: &[Column]) -> Vec<String> {
 /// other direction. The type name comes from the prepared statement rather than
 /// the catalog, so this reaches a `bytea` expression with no table provenance —
 /// which the wire `ColumnOrigin::binary` flag never did.
-/// `binary` is the column's answer, computed once per result by
-/// [`binary_columns`]: `type_is_binary` splits a type name and walks a keyword
-/// list, which is not something to re-derive for every cell of a 200k-row read.
+/// `kind` is the column's answer, computed once per result by [`cell_kinds`]:
+/// `type_is_binary` splits a type name and walks a keyword list, and the numeric
+/// kind allocates a `String` to do it — neither is something to re-derive for
+/// every cell of a read that has no row cap.
 fn pg_cell(text: &str, kind: CellKind) -> Value {
     if kind.binary
         && let Some(len) = bytea_hex_len(text)

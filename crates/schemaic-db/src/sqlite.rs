@@ -694,14 +694,16 @@ fn run_query(
         for i in 0..ncols {
             let raw = row.get_ref(i).map_err(query_err)?;
             // **The one moment anything knows this column holds bytes.** SQLite
-            // types values, not columns: `decl_type()` is an affinity or nothing
-            // (`CREATE TABLE files(id INTEGER PRIMARY KEY, data)` is legal, and a
-            // computed `zeroblob(4)` has no declared type at all) and `origin` is
-            // always `None` here, so every downstream reader that asked the
-            // column got "not binary" — and the export wrote `value_of`'s
-            // `<n bytes>` placeholder into CSV, JSON and SQL as though it were
-            // the data. `ValueRef::Blob` is not a guess, so it is recorded while
-            // it is in hand.
+            // types values, not columns, so the two signals `attach_origins`
+            // supplies do not cover every case: an *untyped* column is fine
+            // (`declares_bytes("")` is true — blank means BLOB affinity), but a
+            // blob in a column declared `TEXT` has a type that says the wrong
+            // thing outright, and a computed `zeroblob(4)`, a join or a CTE has no
+            // origin to read at all. Those got "not binary" from every downstream
+            // reader, and the export wrote `value_of`'s `<n bytes>` placeholder
+            // into CSV, JSON and SQL as though it were the data.
+            // `ValueRef::Blob` is not a guess, so it is recorded while it is in
+            // hand.
             if matches!(raw, ValueRef::Blob(_)) {
                 builder.mark_binary(i);
             }
