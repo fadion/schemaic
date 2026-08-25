@@ -391,6 +391,10 @@ struct GridState {
     /// This tab's SQL dialect (from its connection's engine) — used to build
     /// engine-correct SQL for grid actions like Follow-FK.
     dialect: SqlDialect,
+    /// This tab's commit mode — see [`GridCtx::tx_mode`]. The export menu's, and
+    /// held as the signal rather than resolved at build because the mode is
+    /// toggled from the footer while the grid stays mounted.
+    tx_mode: RwSignal<schemaic_core::tx::TxMode>,
     /// Server-side filter/sort: the base SQL to splice into, the active
     /// filter/sort state (persists across result reloads), and the re-run callback
     /// (wrapped so `GridState` stays `Copy`). See `schemaic_core::filter`.
@@ -553,6 +557,7 @@ impl GridState {
             conn_id: gctx.conn_id,
             connections: gctx.connections,
             dialect,
+            tx_mode: gctx.tx_mode,
             base_sql: gctx.base_sql,
             grid_query: gctx.grid_query,
             row_cap_override: gctx.row_cap_override,
@@ -1895,19 +1900,23 @@ fn export_menu(
                     Some(n) => format!("~{}", schemaic_core::text::human_count(n.value() as usize)),
                     None => String::new(),
                 };
-                // **A client-side sort cannot come along, so the label says so.**
-                // A column-header sort is a permutation of the rows in hand
-                // (`compute_order`), not something the server was asked for, and
-                // the re-run returns rows in the server's order. Presenting the
-                // two scopes as one export at two sizes while silently dropping
-                // the sort is the misreading worth heading off at the point of
-                // choice — after the file is written is too late.
-                match (size.is_empty(), sorted) {
-                    (true, false) => "All rows".to_string(),
-                    (true, true) => "All rows (server order)".to_string(),
-                    (false, false) => format!("All rows ({size})"),
-                    (false, true) => format!("All rows ({size}, server order)"),
-                }
+                // **Every way the file will differ from the screen, said at the
+                // point of choice** — after the file is written is too late.
+                // Which differences those are, and how they read, is
+                // `export::all_rows_label`'s, in core where it is tested; this
+                // line only answers whether each holds.
+                //
+                // The transaction one is the larger of the two and was the
+                // undisclosed one: `All rows` re-runs on a *fresh* connection,
+                // outside this tab's pinned session, so a manual-transaction
+                // tab's uncommitted inserts are on screen and absent from the
+                // file, and rows it deleted are in the file and gone from the
+                // screen.
+                schemaic_core::export::all_rows_label(
+                    &size,
+                    sorted,
+                    gs.tx_mode.get_untracked() == schemaic_core::tx::TxMode::Manual,
+                )
             },
             per_format(true),
         ),
@@ -2006,25 +2015,20 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
                 // unrelated messages rather than an operation told in two
                 // tenses.
                 match outcome {
-                    // Only the streamed scope says how many rows it wrote. A
-                    // snapshot export of what is already on screen has nothing to
-                    // report that the screen doesn't already show, and a note on
-                    // every save is a note nobody reads.
-                    crate::ExportOutcome::Done(n) if streaming => {
-                        // `plural` returns the *noun* and nothing else, by
-                        // design — the count is the call site's to render, and
-                        // forgetting it here read "Exported rows to
-                        // employees.csv". `human_count` is the row-count
-                        // printer the stats line already uses, so the figure in
-                        // the report matches the one in `1k of ~16k rows`.
-                        let n = n as usize;
-                        let rows = schemaic_core::text::plural(n, "row", "rows");
-                        let count = schemaic_core::text::human_count(n);
-                        gs.commit_note.try_update(|v| {
-                            *v = Some(format!("Exported {count} {rows} to {name}"))
-                        });
+                    // **Which sentence, and whether there is one at all, is
+                    // `export_note`'s** — in `core::export` where it is tested.
+                    // Only the streamed scope announces a row count (a snapshot
+                    // of what is already on screen has nothing to report that
+                    // the screen doesn't show), but a *loss* is announced in
+                    // either scope: a CSV that blanked a blob column looked
+                    // exactly like one that had nothing to blank.
+                    crate::ExportOutcome::Done(tally) => {
+                        if let Some(msg) =
+                            schemaic_core::export::export_note(&tally, &name, streaming)
+                        {
+                            gs.commit_note.try_update(|v| *v = Some(msg));
+                        }
                     }
-                    crate::ExportOutcome::Done(_) => {}
                     // A note, not an error: stopping was the user's own doing.
                     // It says the file is short because the alternative — a
                     // silent partial file — is the thing this whole path is
@@ -2034,8 +2038,17 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
                             *v = Some(format!("Export cancelled — {name} is incomplete"))
                         });
                     }
-                    crate::ExportOutcome::Failed(e) => {
-                        gs.commit_err.try_update(|v| *v = Some(e));
+                    // The same sentence the Cancel arm above uses, for the same
+                    // reason, whenever the file was already created — a failure
+                    // is the case where the user is least likely to look, and
+                    // `File::create` truncated whatever was at that path before
+                    // the first row arrived.
+                    crate::ExportOutcome::Failed { message, partial } => {
+                        let msg = schemaic_core::export::export_failure_note(
+                            &message,
+                            partial.then_some(name.as_str()),
+                        );
+                        gs.commit_err.try_update(|v| *v = Some(msg));
                     }
                 }
                 // **Only the export that raised the flag may lower it.** A
@@ -2470,6 +2483,11 @@ pub(crate) struct GridCtx {
     /// The tab's connection is read-only → disable all inline editing (an empty
     /// `EditModel`, so no cell is editable / committable). Reactive.
     pub(crate) read_only: Memo<bool>,
+    /// The tab's commit mode. Read by the export menu and nothing else here: an
+    /// `All rows` export re-runs the statement on a **fresh connection**, so a
+    /// `TxMode::Manual` tab's uncommitted rows are on screen and absent from the
+    /// file, which the label has to say before the file is written.
+    pub(crate) tx_mode: RwSignal<schemaic_core::tx::TxMode>,
     /// The tab's connection id — keys per-column display formatters together with
     /// the source `(database, table)`.
     pub(crate) conn_id: RwSignal<u64>,

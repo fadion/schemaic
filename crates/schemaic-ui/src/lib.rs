@@ -169,14 +169,22 @@ pub enum ExportScope {
 /// Mirrors `ImportOutcome`, which answers the same question for the other
 /// direction.
 pub enum ExportOutcome {
-    /// Written, with the number of rows in the file.
-    Done(u64),
+    /// Written: the rows in the file, and what the file could not carry
+    /// (`schemaic_core::export::ExportTally`). The caveats travel with the count
+    /// rather than being a private fact of the emitter, because CSV and JSON
+    /// have no comment syntax to put them in and the bar is the only place left.
+    Done(schemaic_core::export::ExportTally),
     /// Stopped by the user. **The partial file is left where it is**, and the
     /// message says so — deleting it would be the one irreversible thing this
     /// path could do, and the save dialog may well have been pointed at a file
     /// that already mattered.
     Cancelled,
-    Failed(String),
+    /// Failed. `partial` says whether the destination was already created: the
+    /// write opens with `File::create`, which truncates, so a failure after that
+    /// point leaves a fragment where the user's previous file was — and the
+    /// message has to say so. An export refused *before* the write (no
+    /// connection, one already running) must not claim a file it never touched.
+    Failed { message: String, partial: bool },
 }
 
 /// What an ER-diagram export writes.
@@ -5045,6 +5053,7 @@ fn center(ui: Ui) -> impl IntoView {
                     // multi-result path leaves it `None` (full-re-run on commit).
                     sync_canonical: None,
                     read_only,
+                    tx_mode: tab.tx_mode,
                     conn_id: tab.conn_id,
                     formats,
                     save_formats: save_formats.clone(),

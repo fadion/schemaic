@@ -97,7 +97,8 @@ impl ExportFormat {
 
     /// Stream the same rendering into `w` — the file export's path, so a large
     /// result never exists twice in memory. Identical output to [`Self::render`],
-    /// returning the number of rows written.
+    /// returning what was written and what could not be carried
+    /// ([`ExportTally`]).
     ///
     /// Errors are the writer's own (a full disk, a revoked permission). They must
     /// reach the user: unlike the buffered path, which either produced the whole
@@ -110,14 +111,14 @@ impl ExportFormat {
         order: &[usize],
         source: Option<(&str, Option<&str>, &str)>,
         dialect: SqlDialect,
-    ) -> io::Result<u64> {
+    ) -> io::Result<ExportTally> {
         self.stream_to(w, &mut OneChunk::new(rs, order), source, dialect)
     }
 
-    /// Stream this rendering from a [`RowChunks`] source, returning the number of
-    /// rows written — what an export of a whole table uses, where the rows arrive
-    /// from the server in blocks and must reach the file as they come rather than
-    /// be gathered first.
+    /// Stream this rendering from a [`RowChunks`] source, returning what it wrote
+    /// — what an export of a whole table uses, where the rows arrive from the
+    /// server in blocks and must reach the file as they come rather than be
+    /// gathered first.
     ///
     /// [`Self::render_to`] is this over a source of one chunk, so the two cannot
     /// drift: there is one renderer per format, not a buffered one and a streamed
@@ -128,7 +129,7 @@ impl ExportFormat {
         src: &mut dyn RowChunks,
         source: Option<(&str, Option<&str>, &str)>,
         dialect: SqlDialect,
-    ) -> io::Result<u64> {
+    ) -> io::Result<ExportTally> {
         match self {
             ExportFormat::Json => export_json_chunks(w, src),
             ExportFormat::Csv => export_csv_chunks(w, src),
@@ -136,6 +137,71 @@ impl ExportFormat {
             ExportFormat::Markdown => export_markdown_chunks(w, src),
             ExportFormat::Html => export_html_chunks(w, src),
         }
+    }
+}
+
+/// What an export wrote, and what it **could not carry**.
+///
+/// The row count was the whole of an export's result until it turned out that
+/// two kinds of loss are invisible in the file itself:
+///
+/// - **Withheld bytes.** A raw-bytes cell has no `Value` variant to hold it, so
+///   it arrives as [`crate::model::binary_display`]'s `<n bytes>` placeholder,
+///   and the formats Schemaic reads back must not write that text as data (see
+///   [`dropped_binary_columns`]). The SQL emitter says so in a `-- NOTE:` line;
+///   CSV and JSON have no comment syntax, so an empty field was the only trace
+///   — and an empty field is what a NULL looks like. Those two formats are
+///   exactly `import::ImportFormat`, so the export a user reaches for as a
+///   portable copy was the one that silently dropped a column.
+/// - **Blanked cells.** A column's text arena stops at 512 MiB and does not
+///   fail: every cell past the ceiling reads back as the empty string
+///   ([`ResultSet::capped_columns`]). The grid
+///   surfaces that with its own note, but a streamed chunk is never mounted in a
+///   grid, so a whole-table export of a wide-text column could write a file with
+///   holes in it and report a full row count. `RowChunks`' own doc names this
+///   hazard as the reason the trait exists; nothing read the flag.
+///
+/// Both are *columns*, named, because that is what a user needs to know which
+/// part of the file to distrust. Neither is an error: the file is written and
+/// the rows in it are real. What must not happen is the caveat going unsaid,
+/// which is [`export_note`]'s job.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportTally {
+    /// Rows written to the file.
+    pub rows: u64,
+    /// Columns whose bytes could not be carried, in column order. Empty for
+    /// Markdown and HTML, which keep the placeholder deliberately — nothing
+    /// reads those back, and there the placeholder is the useful rendering.
+    pub withheld: Vec<String>,
+    /// Columns whose cells past the arena ceiling were written **blank**.
+    pub blanked: Vec<String>,
+}
+
+impl ExportTally {
+    /// Fold one chunk's losses in, keeping column order and never repeating a
+    /// name: a streamed export sees the same column in every chunk, and a
+    /// caveat that named `body` two hundred times would say less than one that
+    /// names it once.
+    fn note(&mut self, rs: &ResultSet, withheld: &[usize]) {
+        for &ci in withheld {
+            if let Some(c) = rs.columns.get(ci)
+                && !self.withheld.contains(&c.name)
+            {
+                self.withheld.push(c.name.clone());
+            }
+        }
+        for &ci in &rs.capped_columns {
+            if let Some(c) = rs.columns.get(ci)
+                && !self.blanked.contains(&c.name)
+            {
+                self.blanked.push(c.name.clone());
+            }
+        }
+    }
+
+    /// Did anything about this export need saying beyond the row count?
+    pub fn has_caveat(&self) -> bool {
+        !self.withheld.is_empty() || !self.blanked.is_empty()
     }
 }
 
@@ -520,14 +586,14 @@ pub fn export_json_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> i
 /// array however many chunks it took: the keys are derived from the first chunk's
 /// columns and reused, since a source that changed them mid-stream would already
 /// have broken every other format's header.
-pub fn export_json_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
+pub fn export_json_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<ExportTally> {
     use serde::ser::{SerializeSeq, Serializer as _};
 
     let mut ser = serde_json::Serializer::pretty(w);
     let mut seq = ser.serialize_seq(None).map_err(io::Error::other)?;
     let mut keys: Vec<String> = Vec::new();
     let mut first = true;
-    let mut written = 0_u64;
+    let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
         if first {
             keys = unique_column_keys(c.rs);
@@ -539,7 +605,9 @@ pub fn export_json_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::R
         // bytes in one chunk and a placeholder in the next is withheld only
         // where it is a placeholder, which is the same rule the one-shot path
         // applies to the only chunk it has.
-        let mask = binary_mask(c.rs, &dropped_binary_columns(c.rs, c.order));
+        let dropped = dropped_binary_columns(c.rs, c.order);
+        let mask = binary_mask(c.rs, &dropped);
+        tally.note(c.rs, &dropped);
         for &di in c.order.iter().filter(|&&di| di < c.rs.row_count()) {
             seq.serialize_element(&RowObject {
                 rs: c.rs,
@@ -548,11 +616,11 @@ pub fn export_json_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::R
                 di,
             })
             .map_err(io::Error::other)?;
-            written += 1;
+            tally.rows += 1;
         }
     }
     seq.end().map_err(io::Error::other)?;
-    Ok(written)
+    Ok(tally)
 }
 
 /// Column names made unique for use as JSON object keys: a repeated name gets a
@@ -644,9 +712,9 @@ pub fn export_csv_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io
 /// The header comes from the **first** chunk and is written once — which is why
 /// [`OneChunk`] yields even for an empty result, so a header-only CSV stays a
 /// header-only CSV rather than an empty file.
-pub fn export_csv_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
+pub fn export_csv_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<ExportTally> {
     let mut first = true;
-    let mut written = 0_u64;
+    let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
         if first {
             for (ci, col) in c.rs.columns.iter().enumerate() {
@@ -662,7 +730,9 @@ pub fn export_csv_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Re
         // go out in it — see [`dropped_binary_columns`]. An empty field, which
         // is already how this format renders NULL. Per chunk, for the reason
         // given in [`export_json_chunks`].
-        let mask = binary_mask(c.rs, &dropped_binary_columns(c.rs, c.order));
+        let dropped = dropped_binary_columns(c.rs, c.order);
+        let mask = binary_mask(c.rs, &dropped);
+        tally.note(c.rs, &dropped);
         for &di in c.order {
             if di >= c.rs.row_count() {
                 continue;
@@ -679,10 +749,10 @@ pub fn export_csv_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Re
                 }
             }
             w.write_all(b"\n")?;
-            written += 1;
+            tally.rows += 1;
         }
     }
-    Ok(written)
+    Ok(tally)
 }
 
 /// Escape a Markdown table cell. A `|` starts a new column, so it must be
@@ -734,10 +804,19 @@ fn md_row_line<W: Write>(w: &mut W, cells: &mut dyn Iterator<Item = String>) -> 
 }
 
 /// [`export_markdown_to`] over a [`RowChunks`] source. Returns the rows written.
-pub fn export_markdown_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
+///
+/// No withheld columns in its [`ExportTally`], deliberately — Markdown keeps the
+/// `<n bytes>` placeholder because nothing reads it back and there the
+/// placeholder is the useful rendering. A blanked column is still reported: an
+/// empty cell reads as empty whatever the format.
+pub fn export_markdown_chunks<W: Write>(
+    w: &mut W,
+    src: &mut dyn RowChunks,
+) -> io::Result<ExportTally> {
     let mut first = true;
-    let mut written = 0_u64;
+    let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
+        tally.note(c.rs, &[]);
         let n = c.rs.columns.len();
         if first {
             md_row_line(w, &mut c.rs.columns.iter().map(|col| md_cell(&col.name)))?;
@@ -756,10 +835,10 @@ pub fn export_markdown_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> i
                     Some(cell) => md_cell(cell.display()),
                 }),
             )?;
-            written += 1;
+            tally.rows += 1;
         }
     }
-    Ok(written)
+    Ok(tally)
 }
 
 /// The whole result as an HTML `<table>` (thead + tbody). Cells/headers are
@@ -780,10 +859,11 @@ pub fn export_html_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> i
 /// The closing tags are written **only if the opening ones were** — a source that
 /// yields no chunk at all produces an empty file rather than a `</tbody></table>`
 /// closing a table that was never opened.
-pub fn export_html_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
+pub fn export_html_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<ExportTally> {
     let mut opened = false;
-    let mut written = 0_u64;
+    let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
+        tally.note(c.rs, &[]);
         if !opened {
             // The charset declaration is not optional. The bytes written here are
             // UTF-8, but for a `file://` URL with no declaration and no BOM the
@@ -816,13 +896,13 @@ pub fn export_html_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::R
                 w.write_all(b"</td>")?;
             }
             w.write_all(b"</tr>\n")?;
-            written += 1;
+            tally.rows += 1;
         }
     }
     if opened {
         w.write_all(b"</tbody>\n</table>\n")?;
     }
-    Ok(written)
+    Ok(tally)
 }
 
 /// The result as `INSERT` statements, in the connection's dialect. `source` is
@@ -939,6 +1019,104 @@ fn withheld_binary(mask: &[bool], ci: usize, c: &crate::model::CellRef<'_>) -> b
     mask.get(ci).copied().unwrap_or(false) && crate::model::is_binary_display(c.text())
 }
 
+/// The sentence a finished export puts on the grid's bar, or `None` when there
+/// is nothing to say.
+///
+/// **Silence is the default and a caveat overrides it.** A save of what is
+/// already on screen has nothing to report that the screen doesn't show, and a
+/// note on every save is a note nobody reads — so an ordinary `Fetched` export
+/// stays quiet, and only a streamed one announces its row count. But a *loss*
+/// is not silent in either scope: the whole failure this exists to fix was a CSV
+/// of a blob column writing empty fields, reporting nothing, and being one of
+/// the two formats Schemaic itself reads back.
+///
+/// The caveats read the way the grid's own arena note does — the column names,
+/// then what happened to them — because a user comparing the file to the screen
+/// needs to know *which* part of it to distrust, and "some data was lost" tells
+/// them nothing.
+pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<String> {
+    if !streaming && !t.has_caveat() {
+        return None;
+    }
+    let n = t.rows as usize;
+    let mut s = format!(
+        "Exported {} {} to {name}",
+        crate::text::human_count(n),
+        crate::text::plural(n, "row", "rows")
+    );
+    if !t.withheld.is_empty() {
+        s.push_str(&format!(
+            " — {} {} not carried: a text export cannot hold raw bytes",
+            crate::text::plural(t.withheld.len(), "binary column", "binary columns"),
+            t.withheld.join(", ")
+        ));
+    }
+    if !t.blanked.is_empty() {
+        s.push_str(if t.withheld.is_empty() { " — " } else { "; " });
+        s.push_str(&format!(
+            "{} too large to hold in full: later rows are blank",
+            t.blanked.join(", ")
+        ));
+    }
+    Some(s)
+}
+
+/// What a failed export says. `partial` is the file name when the destination
+/// had already been created, and `None` when the export never got that far.
+///
+/// **A failure is the case where the user is least likely to look**, and it is
+/// the one where the file at that path is a fragment: the write opens with
+/// `File::create`, which truncates, so a stream that dies ten minutes in has
+/// already destroyed whatever was there. The `Cancelled` arm has always said
+/// this ("`Export cancelled — orders.csv is incomplete`") with a comment calling
+/// a silent partial file the thing that path is careful about; the failure arm
+/// said only what the engine said.
+///
+/// `None` is not a formality: an export refused before the write starts (no
+/// connection, one already running) must not claim a file it never touched is
+/// incomplete.
+pub fn export_failure_note(message: &str, partial: Option<&str>) -> String {
+    match partial {
+        Some(name) => format!("{message} — {name} is incomplete"),
+        None => message.to_string(),
+    }
+}
+
+/// The `All rows` menu entry's label: the scope's size, and every way the file
+/// it writes will differ from the grid it was launched from.
+///
+/// **A disclosure at the point of choice, because after the file is written is
+/// too late.** Two differences, and neither is visible in the result:
+///
+/// - `sorted` — a column-header sort is a permutation of the rows in hand
+///   (`compute_order`), not something the server was asked for, so the re-run
+///   returns rows in the server's order.
+/// - `manual_tx` — the re-run is a *second read on a fresh connection*
+///   (`Db::stream_query`, deliberately outside the tab's pinned session), so a
+///   manual-transaction tab's uncommitted rows are on screen and absent from the
+///   file, and rows it deleted are in the file and gone from the screen.
+///
+/// `size` is pre-rendered by the caller (`~16k`, or empty when the total is not
+/// known) because the estimate and its `~` belong to the stats line's vocabulary,
+/// not to this decision.
+pub fn all_rows_label(size: &str, sorted: bool, manual_tx: bool) -> String {
+    let mut notes: Vec<&str> = Vec::new();
+    if !size.is_empty() {
+        notes.push(size);
+    }
+    if sorted {
+        notes.push("server order");
+    }
+    if manual_tx {
+        notes.push("committed rows only");
+    }
+    if notes.is_empty() {
+        "All rows".to_string()
+    } else {
+        format!("All rows ({})", notes.join(", "))
+    }
+}
+
 /// [`export_inserts`], streamed. One statement per row and no batching, so a row
 /// carries no state into the next — the table and column lists are computed once
 /// and repeated verbatim.
@@ -971,7 +1149,7 @@ pub fn export_inserts_chunks<W: Write>(
     src: &mut dyn RowChunks,
     source: Option<(&str, Option<&str>, &str)>,
     dialect: SqlDialect,
-) -> io::Result<u64> {
+) -> io::Result<ExportTally> {
     let q = |s: &str| ident_sql(s, dialect);
     let table_sql = match source {
         Some((db, ns, table)) => qualified_table(db, ns, table, dialect),
@@ -980,7 +1158,7 @@ pub fn export_inserts_chunks<W: Write>(
     let mut cols = String::new();
     let mut noted: Vec<bool> = Vec::new();
     let mut first = true;
-    let mut written = 0_u64;
+    let mut tally = ExportTally::default();
     while let Some(c) = src.next_chunk()? {
         if first {
             cols =
@@ -994,6 +1172,7 @@ pub fn export_inserts_chunks<W: Write>(
         }
         let dropped = dropped_binary_columns(c.rs, c.order);
         let mask = binary_mask(c.rs, &dropped);
+        tally.note(c.rs, &dropped);
         let fresh: Vec<usize> = dropped
             .iter()
             .copied()
@@ -1036,10 +1215,10 @@ pub fn export_inserts_chunks<W: Write>(
                 w.write_all(lit.as_bytes())?;
             }
             w.write_all(b");\n")?;
-            written += 1;
+            tally.rows += 1;
         }
     }
-    Ok(written)
+    Ok(tally)
 }
 
 #[cfg(test)]
@@ -1127,7 +1306,7 @@ mod tests {
                     format.label()
                 );
                 assert_eq!(
-                    n,
+                    n.rows,
                     rows.len() as u64,
                     "{} miscounted its rows at chunk size {size}",
                     format.label()
@@ -1170,7 +1349,7 @@ mod tests {
                 .stream_to(&mut buf, &mut src, None, MySql)
                 .expect("writing to a Vec cannot fail");
             let streamed = String::from_utf8(buf).expect("utf-8");
-            assert_eq!(n, 0, "{} counted rows it never saw", format.label());
+            assert_eq!(n.rows, 0, "{} counted rows it never saw", format.label());
             match format {
                 // The array framing is the format's own, not the data's, so an
                 // empty array is still valid JSON — where a bare header row is a
@@ -1794,6 +1973,205 @@ mod tests {
         assert!(export_json(&rs, &[0]).contains("<12 bytes>"));
         assert!(export_column_csv(&rs, &[0], 0).contains("<12 bytes>"));
         assert!(export_column_json(&rs, &[0], 0).contains("<12 bytes>"));
+    }
+
+    // ── What the export says it could not carry ───────────────────────────
+    //
+    // The loss itself is right (above); these are about *saying so*. CSV and
+    // JSON have no comment syntax, so the withheld column left no trace in the
+    // file at all — and an empty CSV field is what a NULL looks like.
+
+    /// **The formats that drop the bytes report the columns they dropped.** The
+    /// SQL emitter writes a `-- NOTE:` line for exactly this loss; the two
+    /// formats Schemaic itself re-imports wrote nothing anywhere.
+    #[test]
+    fn a_withholding_export_reports_the_columns_it_blanked() {
+        let rs = blob_rs();
+        for format in [ExportFormat::Csv, ExportFormat::Json, ExportFormat::Sql] {
+            let mut buf = Vec::new();
+            let t = format
+                .render_to(&mut buf, &rs, &[0], None, MySql)
+                .expect("writing to a Vec cannot fail");
+            assert_eq!(t.rows, 1, "{}", format.label());
+            assert_eq!(t.withheld, vec!["thumb".to_string()], "{}", format.label());
+            assert!(t.has_caveat(), "{}", format.label());
+        }
+        // Markdown and HTML keep the placeholder on purpose, so they have
+        // nothing to disclose — reporting a loss they did not take would send
+        // the user looking for data that is in the file.
+        for format in [ExportFormat::Markdown, ExportFormat::Html] {
+            let mut buf = Vec::new();
+            let t = format
+                .render_to(&mut buf, &rs, &[0], None, MySql)
+                .expect("writing to a Vec cannot fail");
+            assert!(t.withheld.is_empty(), "{}", format.label());
+            assert!(!t.has_caveat(), "{}", format.label());
+        }
+    }
+
+    /// A column named once, however many chunks carried it — a streamed export
+    /// sees the same blob column in every block.
+    #[test]
+    fn a_withheld_column_is_named_once_across_a_stream() {
+        let rs = blob_rs();
+        // Three chunks of the same one-row result: the same column withheld in
+        // each. `chunked` is the same helper the round-trip test uses.
+        struct Thrice<'a>(&'a ResultSet, &'a [usize], usize);
+        impl RowChunks for Thrice<'_> {
+            fn next_chunk(&mut self) -> io::Result<Option<RowChunk<'_>>> {
+                if self.2 == 0 {
+                    return Ok(None);
+                }
+                self.2 -= 1;
+                Ok(Some(RowChunk {
+                    rs: self.0,
+                    order: self.1,
+                }))
+            }
+        }
+        let mut src = Thrice(&rs, &[0], 3);
+        let mut buf = Vec::new();
+        let t = ExportFormat::Csv
+            .stream_to(&mut buf, &mut src, None, MySql)
+            .expect("writing to a Vec cannot fail");
+        assert_eq!(t.rows, 3);
+        assert_eq!(t.withheld, vec!["thumb".to_string()]);
+    }
+
+    /// **The arena ceiling, which nothing read.** A column whose 512 MiB text
+    /// arena filled up renders blank from that row on; the grid says so in its
+    /// own note, but a streamed chunk is never mounted in a grid, so a
+    /// whole-table export could write a file with holes in it and report a full
+    /// row count. Every format reports it — an empty cell reads as empty
+    /// whatever the syntax around it.
+    #[test]
+    fn a_column_blanked_by_the_arena_ceiling_is_reported_by_every_format() {
+        let mut rs = blob_rs();
+        // The blanking is `ColumnData::finish_cell`'s and is tested there; what
+        // reaches an exporter is the flag.
+        rs.capped_columns = vec![1];
+        for format in ExportFormat::ALL {
+            let mut buf = Vec::new();
+            let t = format
+                .render_to(&mut buf, &rs, &[0], None, MySql)
+                .expect("writing to a Vec cannot fail");
+            assert_eq!(t.blanked, vec!["thumb".to_string()], "{}", format.label());
+            assert!(t.has_caveat(), "{}", format.label());
+        }
+    }
+
+    /// The sentence the bar shows. **Silence is the default and a caveat
+    /// overrides it**: a save of what is already on screen says nothing, a
+    /// streamed one says its count, and a loss is said in either scope.
+    #[test]
+    fn the_export_note_says_what_could_not_be_carried() {
+        let clean = ExportTally {
+            rows: 2,
+            ..Default::default()
+        };
+        assert_eq!(export_note(&clean, "docs.csv", false), None);
+        assert_eq!(
+            export_note(&clean, "docs.csv", true).as_deref(),
+            Some("Exported 2 rows to docs.csv")
+        );
+
+        let one = ExportTally {
+            rows: 2,
+            withheld: vec!["file".to_string()],
+            blanked: Vec::new(),
+        };
+        assert_eq!(
+            export_note(&one, "docs.csv", false).as_deref(),
+            Some(
+                "Exported 2 rows to docs.csv — binary column file not carried: a text export \
+                 cannot hold raw bytes"
+            )
+        );
+        let two = ExportTally {
+            rows: 1,
+            withheld: vec!["file".to_string(), "thumb".to_string()],
+            blanked: Vec::new(),
+        };
+        assert_eq!(
+            export_note(&two, "docs.csv", true).as_deref(),
+            Some(
+                "Exported 1 row to docs.csv — binary columns file, thumb not carried: a text \
+                 export cannot hold raw bytes"
+            )
+        );
+        let blanked = ExportTally {
+            rows: 2_000_000,
+            withheld: Vec::new(),
+            blanked: vec!["body".to_string()],
+        };
+        assert_eq!(
+            export_note(&blanked, "docs.csv", true).as_deref(),
+            Some(
+                "Exported 2m rows to docs.csv — body too large to hold in full: later rows are blank"
+            )
+        );
+        // Both losses, one sentence.
+        let both = ExportTally {
+            rows: 3,
+            withheld: vec!["file".to_string()],
+            blanked: vec!["body".to_string()],
+        };
+        let msg = export_note(&both, "docs.csv", true).expect("a caveat is always said");
+        assert!(msg.contains("binary column file not carried"), "{msg}");
+        assert!(msg.contains("; body too large to hold in full"), "{msg}");
+    }
+
+    /// A failure leaves the destination truncated — `File::create` opened it
+    /// before the first row — and a failure is the case where the user is least
+    /// likely to look. The `Cancelled` arm has always said this; the failure arm
+    /// said only what the engine said. And an export refused *before* the write
+    /// must not claim a file it never touched.
+    #[test]
+    fn a_failed_write_says_the_file_is_incomplete() {
+        assert_eq!(
+            export_failure_note("Export failed: No space left on device", Some("orders.csv")),
+            "Export failed: No space left on device — orders.csv is incomplete"
+        );
+        assert_eq!(
+            export_failure_note("An export is already running.", None),
+            "An export is already running."
+        );
+    }
+
+    /// **Every way the file will differ from the screen, at the point of
+    /// choice.** The sort was disclosed; the transaction was not, and it is the
+    /// larger of the two — an `All rows` export re-runs on a fresh connection,
+    /// so a manual-transaction tab's uncommitted rows are on screen and absent
+    /// from the file.
+    #[test]
+    fn the_all_rows_label_discloses_every_way_the_file_differs() {
+        assert_eq!(all_rows_label("", false, false), "All rows");
+        assert_eq!(all_rows_label("~16k", false, false), "All rows (~16k)");
+        assert_eq!(
+            all_rows_label("", true, false),
+            "All rows (server order)",
+            "the sort was already disclosed and must stay so"
+        );
+        assert_eq!(
+            all_rows_label("~16k", true, false),
+            "All rows (~16k, server order)"
+        );
+        assert_eq!(
+            all_rows_label("", false, true),
+            "All rows (committed rows only)"
+        );
+        assert_eq!(
+            all_rows_label("~16k", false, true),
+            "All rows (~16k, committed rows only)"
+        );
+        assert_eq!(
+            all_rows_label("", true, true),
+            "All rows (server order, committed rows only)"
+        );
+        assert_eq!(
+            all_rows_label("~16k", true, true),
+            "All rows (~16k, server order, committed rows only)"
+        );
     }
 
     /// And the inverse, again in every format: a binary column carrying real

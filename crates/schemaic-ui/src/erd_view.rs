@@ -2034,7 +2034,12 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                                     (say)(format!("Saved {name}"), false)
                                 }
                                 crate::ExportOutcome::Cancelled => {}
-                                crate::ExportOutcome::Failed(e) => (say)(e, true),
+                                // A diagram is written whole or not at all
+                                // (`fs::write`), so there is no partial file to
+                                // mention here.
+                                crate::ExportOutcome::Failed { message, .. } => {
+                                    (say)(message, true)
+                                }
                             }),
                         );
                     });
