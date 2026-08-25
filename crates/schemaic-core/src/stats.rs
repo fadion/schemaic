@@ -729,6 +729,16 @@ fn rows_read_of(loaded: usize, total: Option<RowCount>) -> String {
 /// The noun follows the last figure named, which is the total when there is one:
 /// `1 of ~4.2m row` is the wrong noun, and so is `0 of 1 rows`.
 pub fn rows_read_clause(loaded: usize, total: Option<RowCount>, truncated: bool) -> String {
+    // **The premise is enforced here rather than documented above it.** A total
+    // is in hand only for a capped read — `grid_view`'s `scanned` is gated on
+    // `truncated` before the catalogue is asked — and that gate lives in a view
+    // closure no test can reach. Fetching the total unconditionally is the
+    // obvious optimisation (the tree already holds it), and the moment anyone
+    // takes it, `42 of 1,000 rows` would appear over a
+    // `SELECT … WHERE` that legitimately matched 42 of 1,000: a claim that 958
+    // rows were withheld, with no `(capped)` to hint a cap was ever involved.
+    // An uncapped read has nothing to compare itself to, so it does not.
+    let total = truncated.then_some(total).flatten();
     let figure = rows_read_of(loaded, total);
     // Whether the total was *named* is what decides both the noun and the
     // notice, and only `rows_read_of` knows it — asking `total.is_some()` here
@@ -1640,6 +1650,31 @@ mod tests {
     fn an_uncapped_result_just_counts_what_it_holds() {
         assert_eq!(rows_read_clause(42, None, false), "42 rows");
         assert_eq!(rows_read_clause(0, None, false), "0 rows");
+    }
+
+    /// **An uncapped read has nothing to compare itself to, even when a total is
+    /// handed to it.** The premise this line rests on — "a total is in hand only
+    /// for a capped read" — is enforced by a gate in a view closure that no test
+    /// can reach, and fetching the total unconditionally is the obvious
+    /// optimisation. Taken, it would print `42 of 1,000 rows` over a
+    /// `SELECT … WHERE` that legitimately matched 42 of 1,000: 958 rows claimed
+    /// withheld, and no `(capped)` to say a cap was involved.
+    #[test]
+    fn a_total_says_nothing_about_a_read_that_was_not_capped() {
+        assert_eq!(
+            rows_read_clause(42, Some(RowCount::Exact(1_000)), false),
+            "42 rows"
+        );
+        assert_eq!(
+            rows_read_clause(42, Some(RowCount::Estimate(1_000)), false),
+            "42 rows"
+        );
+        // The capped read with the same figures still makes the comparison —
+        // this narrows the input, not the feature.
+        assert_eq!(
+            rows_read_clause(42, Some(RowCount::Exact(1_000)), true),
+            "42 of 1,000 rows"
+        );
     }
 
     /// The noun belongs to the figure it follows, and the total is the last one

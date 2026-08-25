@@ -20,13 +20,26 @@
 //! smaller failure than a control over the wrong values.
 //!
 //! **A value the control cannot represent keeps the text editor.** That is
-//! [`fits`], and it is the reason a `tinyint(1)` holding `7`, an `ENUM` column
-//! holding the empty string MySQL writes for a rejected insert, and a `DATE`
-//! holding `0000-00-00` all stay editable as what they are. A toggle rendered
-//! over `7` would write `0` or `1` the moment it was touched, which is data loss
-//! dressed up as a feature. An **empty** value is the exception: it is "nothing
-//! chosen yet" (a NULL field switched to a value, a pending row's blank cell) and
-//! every control opens on it unselected.
+//! [`fits`], and it is the reason a `tinyint(1)` holding `7` and a `DATE` holding
+//! `0000-00-00` stay editable as what they are. A toggle rendered over `7` would
+//! write `0` or `1` the moment it was touched, which is data loss dressed up as a
+//! feature. An **empty** value is the exception: it is "nothing chosen yet" (a
+//! NULL field switched to a value, a pending row's blank cell) and every control
+//! opens on it unselected.
+//!
+//! **The exception has a cost, and it is not the `ENUM` protection this used to
+//! claim.** A MySQL `ENUM` holding the empty string — what a rejected insert
+//! writes in non-strict mode — is *not* kept on the text editor: `fits` answers
+//! `true` for `""` before it looks at the editor at all, so such a cell gets the
+//! dropdown, and the dropdown has no row that writes `''` back. The cell is also
+//! indistinguishable from a NULL one, because `start_edit` seeds a NULL cell from
+//! the empty string too. Telling the two apart means telling `fits` *which cell*
+//! it is looking at, which no caller can say without threading the row down to
+//! it — so the exception stands, on the grounds that a NULL cell and a fresh
+//! pending row are the common cases and a literal `''` in an `ENUM` is what a
+//! misconfigured server produced once. Recorded rather than implied: the doc used
+//! to promise the opposite in the sentence above, and a data-safety property is
+//! the kind a reader trusts without re-deriving.
 
 use crate::date::{Date, Stamp, Time};
 use crate::intel::SqlDialect;
@@ -353,7 +366,21 @@ pub fn pick_options(editor: &CellEditor, current: &str) -> Vec<PickOption> {
                 .into_iter()
                 .map(|on| PickOption {
                     label: if on { "true" } else { "false" }.to_string(),
-                    value: wire.text(on).to_string(),
+                    // **The row already held writes the text that is there**, not
+                    // the wire spelling. [`BoolWire`]'s own property is that
+                    // choosing what the column already reads back is recognised
+                    // as a revert — and that only holds where the engine's read
+                    // spelling *is* its write spelling. SQLite has neither type
+                    // nor opinion, so a `BOOLEAN` column can legally hold
+                    // `'true'`: the picker showed that row as ticked, and
+                    // clicking it to confirm staged `1`, a different stored value
+                    // from an action whose only visible meaning was "yes, that
+                    // one".
+                    value: if held == Some(on) {
+                        current.to_string()
+                    } else {
+                        wire.text(on).to_string()
+                    },
                     held: held == Some(on),
                 })
                 .collect()
@@ -980,6 +1007,10 @@ mod tests {
 
     // ── Fitting a value to a control ────────────────────────────────────────
 
+    /// The exception, and — since the module doc used to claim the opposite —
+    /// what it costs: a MySQL `ENUM` holding a literal `''` gets the dropdown
+    /// like a NULL cell does, and the dropdown cannot write `''` back. Pinned so
+    /// the limitation is a decision on the record rather than a surprise.
     #[test]
     fn an_empty_value_fits_every_control() {
         for e in [
@@ -991,6 +1022,13 @@ mod tests {
         ] {
             assert!(fits(&e, ""), "{e:?}");
         }
+        // No row of the picker writes it back — the cost, stated.
+        assert!(
+            !pick_options(&CellEditor::Enum(vec!["a".into(), "b".into()]), "")
+                .iter()
+                .any(|o| o.value.is_empty()),
+            "the dropdown has no way back to the empty string"
+        );
     }
 
     #[test]
@@ -1301,6 +1339,34 @@ mod tests {
             opts.iter().map(|o| o.held).collect::<Vec<_>>(),
             [false, true]
         );
+    }
+
+    /// **Confirming the row already ticked must not rewrite the value.**
+    /// `read_bool` is deliberately wider than `BoolWire::text` — it reads every
+    /// spelling the three engines hand back — and SQLite is the one engine whose
+    /// read spelling is whatever was inserted, so a `BOOLEAN` column can legally
+    /// hold `'true'`. The picker showed *true* as held and writing
+    /// `BoolWire::of(Sqlite).text(true)` for it staged `1`: a different stored
+    /// value, from a click whose only visible meaning was "yes, that one" — and it
+    /// breaks the revert property `BoolWire`'s own doc is built on.
+    #[test]
+    fn confirming_the_row_a_boolean_already_holds_writes_what_is_there() {
+        for text in ["true", "TRUE", "yes", "on", "t"] {
+            let opts = pick_options(&CellEditor::Bool(BoolWire::OneZero), text);
+            assert!(opts[1].held, "{text}: the true row is the held one");
+            assert_eq!(
+                opts[1].value, text,
+                "{text}: confirming it must stage the text the cell already has"
+            );
+            // The *other* row is a real change, so it writes the engine's own
+            // spelling — that is what the wire is for.
+            assert_eq!(opts[0].value, "0", "{text}");
+            assert!(!opts[0].held, "{text}");
+        }
+        // And the false side of the same rule.
+        let opts = pick_options(&CellEditor::Bool(BoolWire::OneZero), "off");
+        assert_eq!(opts[0].value, "off");
+        assert_eq!(opts[1].value, "1");
     }
 
     #[test]
