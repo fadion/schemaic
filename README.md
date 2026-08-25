@@ -98,9 +98,14 @@ production data, or any data you care about.
 Schemaic is **keyboard-operable but not screen-reader accessible**, and the
 second half is not a plan we haven't got to — it is a limit of what the app is
 built on. Every modal has a focus ring and a Tab order, every destructive action
-can be reached and confirmed from the keyboard, the header's **?** opens a
-reference of every shortcut, and **Settings → Appearance → Interface scale**
-enlarges the whole interface (not just one font) up to 160%.
+**in a modal, in the schema tree or in the results grid** can be reached and
+confirmed from the keyboard, the header's **?** opens a reference of every
+shortcut, and **Settings → Appearance → Interface scale** enlarges the whole
+interface (not just one font) up to 160%. The one place that qualifier is doing
+work is the Server Activity panel: its rows have no keyboard cursor and their
+context menu has no `Shift+F10` opener, so *Kill session* and *Cancel query* are
+reachable by right-click only. The lock-wait banner's own **Kill** button is
+keyboard-reachable.
 But Floem 0.2 exposes no accessibility tree at all — there is no AccessKit
 integration in the toolkit, so there is nothing for Narrator, VoiceOver or Orca
 to read, and no amount of markup in this repository can add one. If you need a
