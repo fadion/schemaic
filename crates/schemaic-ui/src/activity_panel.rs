@@ -475,42 +475,53 @@ fn banner(
     // a `FocusRing` this panel has none of. Same fill, hover and radius, like the
     // header's ring-less Retry.
     //
+    // **It still answers the keyboard.** `widgets::key_pressable` is the no-ring
+    // half of that contract — navigable, and Enter/Space press it — so the one
+    // action that ends a lock wait is reachable without a pointer. It was not,
+    // which made the README's "every destructive action can be reached and
+    // confirmed from the keyboard" false at this site; the per-row Kill, which
+    // hangs off a right-click menu with no keyboard opener, is still pointer-only
+    // and the README now says so.
+    //
     // **Dimmed and inert on a read-only connection.** `kill_session` refuses
     // before the confirm and there is no "Run anyway", but a fully enabled
     // button in the danger fill that silently does nothing is the half
     // `accept_launch`'s contract asks this side to supply: "The disabled button
     // stays: it is what *says* the action is unavailable."
-    let kill_btn = text(format!("Kill {holder_id}"))
-        .on_click_stop(move |_| {
+    let kill_btn = crate::widgets::key_pressable(
+        text(format!("Kill {holder_id}")),
+        theme::scaled(5.0),
+        move || {
             if !read_only {
                 (kill)(holder_id, KillKind::Session);
             }
+        },
+    )
+    .style(move |s| {
+        let s = s
+            .font_size(font_body())
+            .color(theme::btn_danger_text())
+            .padding_horiz(theme::scaled(10.0))
+            .padding_vert(theme::scaled(4.0))
+            .border_radius(5.0)
+            .flex_shrink(0.0_f32)
+            .cursor(floem::style::CursorStyle::Default);
+        if read_only {
+            s.background(theme::btn_danger().multiply_alpha(0.45))
+                .color(theme::btn_danger_text().multiply_alpha(0.6))
+        } else {
+            s.background(theme::btn_danger())
+                .hover(|s| s.background(theme::btn_danger_hover()))
+        }
+    })
+    .tooltip(move || {
+        text(if read_only {
+            "This connection is marked read-only.".to_string()
+        } else {
+            format!("Terminate session {holder_id}")
         })
-        .style(move |s| {
-            let s = s
-                .font_size(font_body())
-                .color(theme::btn_danger_text())
-                .padding_horiz(theme::scaled(10.0))
-                .padding_vert(theme::scaled(4.0))
-                .border_radius(5.0)
-                .flex_shrink(0.0_f32)
-                .cursor(floem::style::CursorStyle::Default);
-            if read_only {
-                s.background(theme::btn_danger().multiply_alpha(0.45))
-                    .color(theme::btn_danger_text().multiply_alpha(0.6))
-            } else {
-                s.background(theme::btn_danger())
-                    .hover(|s| s.background(theme::btn_danger_hover()))
-            }
-        })
-        .tooltip(move || {
-            text(if read_only {
-                "This connection is marked read-only.".to_string()
-            } else {
-                format!("Terminate session {holder_id}")
-            })
-            .style(tooltip_style)
-        });
+        .style(tooltip_style)
+    });
 
     v_stack((
         heading,
