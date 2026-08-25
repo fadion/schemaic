@@ -52,6 +52,115 @@ pub enum DbError {
     Cancelled,
 }
 
+/// One block of an export on its way from the server to the file — or the reason
+/// there will be no more.
+///
+/// The error rides the **channel** rather than only being returned from
+/// [`Db::stream_query`], because the writer is on the other end of it and would
+/// otherwise see a closed channel and call the file finished. A partial export
+/// that reports success is the failure mode this whole path exists to avoid.
+pub type ExportChunk = Result<ResultSet, String>;
+
+/// Where a row loop puts the rows it reads.
+///
+/// The three engines each have one row loop, and each is the product of a long
+/// argument with its driver — PostgreSQL's is `simple_query_raw` precisely so the
+/// cap can apply before the result materialises, MySQL's chooses per caller
+/// whether to abandon or drain the stream, SQLite's is the blocking half of a
+/// `spawn_blocking`. **Streaming a whole table is a second destination for those
+/// rows, not a second way to read them**, so it is a parameter here rather than
+/// three more loops that would have to be kept in step with the originals.
+pub(crate) enum RowDest {
+    /// Accumulate into one [`ResultSet`], stopping at this many rows and
+    /// reporting `truncated` — every ordinary query.
+    Capped(usize),
+    /// No cap: hand over every `chunk` rows as their own [`ResultSet`], so an
+    /// export reaches the disk as it comes off the wire and memory stays bounded
+    /// by one chunk. `sent` counts what went out.
+    Chunked {
+        chunk: usize,
+        tx: tokio::sync::mpsc::Sender<ExportChunk>,
+        sent: u64,
+    },
+}
+
+impl RowDest {
+    /// The row cap to stop at. A stream has none — the point of it — and
+    /// `usize::MAX` says so without every loop growing a second branch around
+    /// the comparison it already makes.
+    pub(crate) fn cap(&self) -> usize {
+        match self {
+            RowDest::Capped(cap) => *cap,
+            RowDest::Chunked { .. } => usize::MAX,
+        }
+    }
+
+    /// Has the builder filled a chunk? Always false for [`RowDest::Capped`],
+    /// which flushes nothing.
+    pub(crate) fn chunk_full(&self, rows: usize) -> bool {
+        matches!(self, RowDest::Chunked { chunk, .. } if rows >= *chunk)
+    }
+
+    /// How much room to give the next chunk's per-column buffers — the chunk
+    /// size for a stream, nothing for a capped read, which never starts a second
+    /// builder.
+    pub(crate) fn chunk_capacity(&self) -> usize {
+        match self {
+            RowDest::Capped(_) => 0,
+            RowDest::Chunked { chunk, .. } => *chunk,
+        }
+    }
+
+    /// Rows handed to the channel so far.
+    pub(crate) fn sent(&self) -> u64 {
+        match self {
+            RowDest::Capped(_) => 0,
+            RowDest::Chunked { sent, .. } => *sent,
+        }
+    }
+
+    /// Take the rows built so far and send them, from an **async** loop
+    /// (MySQL, PostgreSQL). A no-op for [`RowDest::Capped`].
+    ///
+    /// The channel is bounded, so this is also the backpressure: a server faster
+    /// than the disk waits here instead of queueing the table in memory.
+    pub(crate) async fn flush(
+        &mut self,
+        builder: &mut ResultBuilder,
+        next_capacity: usize,
+    ) -> Result<(), DbError> {
+        let RowDest::Chunked { tx, sent, .. } = self else {
+            return Ok(());
+        };
+        let rs = builder.take_chunk(next_capacity);
+        *sent += rs.row_count() as u64;
+        tx.send(Ok(rs)).await.map_err(|_| writer_gone())
+    }
+
+    /// [`Self::flush`] from a **blocking** loop (SQLite, which runs inside
+    /// `spawn_blocking`). `blocking_send` panics on a runtime thread, so the two
+    /// cannot be one method.
+    pub(crate) fn flush_blocking(
+        &mut self,
+        builder: &mut ResultBuilder,
+        next_capacity: usize,
+    ) -> Result<(), DbError> {
+        let RowDest::Chunked { tx, sent, .. } = self else {
+            return Ok(());
+        };
+        let rs = builder.take_chunk(next_capacity);
+        *sent += rs.row_count() as u64;
+        tx.blocking_send(Ok(rs)).map_err(|_| writer_gone())
+    }
+}
+
+/// The receiver hung up: the file writer failed or the export was abandoned.
+/// Reported as a query error so the row loop stops rather than reading a table
+/// nobody is writing down.
+fn writer_gone() -> DbError {
+    DbError::Query("the export stopped reading".to_string())
+}
+
 /// The binary collation id (`binary`) — a column with this charset holds raw
 /// bytes (BLOB/BINARY/VARBINARY) rather than text.
 const BINARY_CHARSET: u16 = 63;
@@ -267,12 +376,83 @@ impl Db {
         row_cap: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
+        self.run_to(database, sql, &mut RowDest::Capped(row_cap), cancel)
+            .await
+    }
+
+    /// Run `sql` with **no row cap**, handing the rows to `tx` in blocks of
+    /// `chunk_rows` as they arrive. Returns how many rows went out.
+    ///
+    /// This is the whole-table export, and the row cap is the thing it exists to
+    /// escape. A capped fetch answers "what is in this table" and a cap is the
+    /// right answer for a grid nobody can scroll two million rows of; an export
+    /// answers "give me the table", where a cap is not a kindness but a silently
+    /// short file.
+    ///
+    /// **It is still one connection for one operation** — this connects, runs,
+    /// and disconnects like every other `Db` method. What is new is only how long
+    /// that takes, and the receiving end is what bounds it: the channel is
+    /// bounded, so a server faster than the disk waits rather than queueing the
+    /// table in memory. Nothing is cached and no second connection path is
+    /// added — the rule that `Session` is the one exception still holds.
+    ///
+    /// **A failure goes down the channel as well as back to the caller.** The
+    /// writer is on the other end and would otherwise read a closed channel as
+    /// "the table ended", and call a half-written file finished.
+    pub async fn stream_query(
+        &self,
+        database: Option<&str>,
+        sql: &str,
+        chunk_rows: usize,
+        cancel: CancellationToken,
+        tx: tokio::sync::mpsc::Sender<ExportChunk>,
+    ) -> Result<u64, DbError> {
+        let mut dest = RowDest::Chunked {
+            chunk: chunk_rows.max(1),
+            tx: tx.clone(),
+            sent: 0,
+        };
+        let outcome = self.run_to(database, sql, &mut dest, cancel).await;
+        match outcome {
+            // **A statement with no result set is not an empty export.** All
+            // three engines return before their tail flush when the statement
+            // returns no columns (a DML/DDL/utility outcome reports `affected`
+            // instead), so nothing at all reaches the channel — and a writer
+            // that saw no chunk would produce an empty file and call it done.
+            // The export path never offers such a statement, but this is public
+            // API and the next caller may not be gated the same way, so the
+            // refusal lives here rather than in the caller that happens to be
+            // careful.
+            Ok(rs) if rs.columns.is_empty() && dest.sent() == 0 => {
+                let e = DbError::Query("that statement returns no rows to export".to_string());
+                let _ = tx.send(Err(e.to_string())).await;
+                Err(e)
+            }
+            Ok(_) => Ok(dest.sent()),
+            Err(e) => {
+                // Best effort: if the writer has already gone the send fails, and
+                // then it is the writer's own error that reaches the user.
+                let _ = tx.send(Err(e.to_string())).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The engine dispatch both [`Self::fetch_query`] and [`Self::stream_query`]
+    /// go through — one connection, one statement, one destination for its rows.
+    async fn run_to(
+        &self,
+        database: Option<&str>,
+        sql: &str,
+        dest: &mut RowDest,
+        cancel: CancellationToken,
+    ) -> Result<ResultSet, DbError> {
         // Stamped here, in the one place that knows what the connection was
         // actually scoped to, rather than by the caller from the tab it will land
         // in — see `ResultSet::database`.
         let mut rs = match self.engine {
-            Engine::Postgres => pg::fetch_query(self, database, sql, row_cap, cancel).await?,
-            Engine::Sqlite => sqlite::fetch_query(self, sql, row_cap, cancel).await?,
+            Engine::Postgres => pg::fetch_query(self, database, sql, dest, cancel).await?,
+            Engine::Sqlite => sqlite::fetch_query(self, sql, dest, cancel).await?,
             Engine::MySql => {
                 let mut conn = self.open(database, false).await?;
                 // The connection id, so a second connection can KILL its in-flight query.
@@ -281,7 +461,7 @@ impl Db {
                 let outcome = tokio::select! {
                     // `early_stop`: this connection is torn down right after, so we can bail
                     // out of the row stream at the cap without draining the rest.
-                    r = collect_rows(&mut conn, sql, row_cap, true) => r,
+                    r = collect_rows(&mut conn, sql, dest, true) => r,
                     _ = cancel.cancelled() => {
                         self.kill_query(conn_id).await;
                         Err(DbError::Cancelled)
@@ -445,8 +625,9 @@ impl Db {
             return Err(DbError::Query(e.to_string()));
         }
 
+        let mut dest = RowDest::Capped(EXPLAIN_ROW_CAP);
         let outcome = tokio::select! {
-            r = collect_rows(&mut conn, cmd, EXPLAIN_ROW_CAP, true) => r,
+            r = collect_rows(&mut conn, cmd, &mut dest, true) => r,
             _ = cancel.cancelled() => {
                 self.kill_query(conn_id).await;
                 Err(DbError::Cancelled)
@@ -793,7 +974,13 @@ impl Db {
                         on_result(i, Err(DbError::Cancelled));
                         continue;
                     }
-                    let r = sqlite::fetch_query(self, stmt, row_cap, cancel.clone()).await;
+                    let r = sqlite::fetch_query(
+                        self,
+                        stmt,
+                        &mut RowDest::Capped(row_cap),
+                        cancel.clone(),
+                    )
+                    .await;
                     let failed = r.is_err();
                     on_result(i, r);
                     // A batch stops at its first failure, as the other two do:
@@ -835,11 +1022,12 @@ impl Db {
                 on_result(i, Err(DbError::Cancelled));
                 continue;
             }
+            let mut dest = RowDest::Capped(row_cap);
             let outcome = tokio::select! {
                 // `early_stop = false`: the connection is reused for the next
                 // statement, so a truncated result must be drained fully to leave
                 // the connection clean.
-                r = collect_rows(&mut conn, sql, row_cap, false) => r,
+                r = collect_rows(&mut conn, sql, &mut dest, false) => r,
                 _ = cancel.cancelled() => {
                     self.kill_query(conn_id).await;
                     Err(DbError::Cancelled)
@@ -3189,9 +3377,10 @@ pub(crate) fn assemble_schema(
 pub(crate) async fn collect_rows(
     conn: &mut Conn,
     sql: &str,
-    row_cap: usize,
+    dest: &mut RowDest,
     early_stop: bool,
 ) -> Result<ResultSet, DbError> {
+    let row_cap = dest.cap();
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
     let start = std::time::Instant::now();
 
@@ -3224,7 +3413,8 @@ pub(crate) async fn collect_rows(
         .collect();
     // Assemble the result columnar, one row at a time, so we never hold a
     // row-major `Vec<Vec<Value>>` copy alongside the final storage.
-    let mut builder = ResultBuilder::new(columns);
+    let chunk_capacity = dest.chunk_capacity();
+    let mut builder = ResultBuilder::with_capacity(columns, chunk_capacity);
     let mut truncated = false;
     if let Some(mut stream) = result.stream::<Row>().await.map_err(qerr)? {
         while let Some(row) = stream.next().await {
@@ -3232,6 +3422,12 @@ pub(crate) async fn collect_rows(
             if builder.row_count() < row_cap {
                 let cells = convert_row(&row, builder.columns(), &binary, &bit);
                 builder.push_row(&cells);
+                // A stream hands the block over here and keeps reading into an
+                // empty builder; a capped read never fills a chunk, so this is
+                // dead weight for it and nothing more.
+                if dest.chunk_full(builder.row_count()) {
+                    dest.flush(&mut builder, chunk_capacity).await?;
+                }
             } else {
                 // A row beyond the cap exists → the result is truncated.
                 truncated = true;
@@ -3243,6 +3439,13 @@ pub(crate) async fn collect_rows(
         }
     }
 
+    // The tail: a stream's last block is usually short and may be empty, and the
+    // export needs that last block even when it is — the columns for its header
+    // come from the first chunk, and a table with no rows has only this one. Not
+    // reached by a statement that returns no columns at all, which returned
+    // above; `Db::stream_query` refuses those rather than letting the writer see
+    // an empty stream and call the file finished.
+    dest.flush(&mut builder, 0).await?;
     builder.set_truncated(truncated);
     builder.set_elapsed(start.elapsed().as_millis());
     Ok(builder.finish())

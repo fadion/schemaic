@@ -595,7 +595,7 @@ fn refuse_if_cancelled(cancel: &CancellationToken) -> Result<(), DbError> {
 pub(crate) async fn fetch_query(
     db: &Db,
     sql: &str,
-    row_cap: usize,
+    dest: &mut crate::RowDest,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     refuse_if_cancelled(&cancel)?;
@@ -603,25 +603,45 @@ pub(crate) async fn fetch_query(
     let db = db.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
+    // The row loop is the blocking half, so the destination travels *with* it and
+    // comes back: a stream's `sent` is written inside that loop, and the caller
+    // asks for it after. `spawn_blocking` needs `'static`, which is why `RowDest`
+    // owns its channel handle rather than borrowing the caller's.
+    let mut moved = std::mem::replace(dest, crate::RowDest::Capped(0));
+
     let work = tokio::task::spawn_blocking(move || {
-        let conn = open(&db)?;
+        let conn = match open(&db) {
+            Ok(c) => c,
+            Err(e) => return (Err(e), moved),
+        };
         // Hand the interrupt handle to the async side before doing any work.
         let _ = tx.send(conn.get_interrupt_handle());
-        run_query(&conn, &sql, row_cap)
+        let rs = run_query(&conn, &sql, &mut moved);
+        (rs, moved)
     });
 
     // The handle arrives as soon as the connection is open; if the blocking task
     // failed before sending, the `rx` error is not the interesting one — the task's
     // own result is, so it is simply awaited.
     let interrupt = rx.await.ok();
-    tokio::select! {
-        r = work => r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+    let outcome = tokio::select! {
+        r = work => Some(r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?),
         _ = cancel.cancelled() => {
             if let Some(h) = interrupt {
                 h.interrupt();
             }
-            Err(DbError::Cancelled)
+            None
         }
+    };
+    match outcome {
+        Some((rs, back)) => {
+            *dest = back;
+            rs
+        }
+        // Cancelled: the worker is being interrupted and its `RowDest` goes with
+        // it, so `dest` keeps the placeholder. Nothing reads a cancelled stream's
+        // count — the outcome is `Cancelled`, not a row total.
+        None => Err(DbError::Cancelled),
     }
 }
 
@@ -631,7 +651,12 @@ pub(crate) async fn fetch_query(
 /// returns none *of a row-bearing shape*: `stmt.column_count() == 0` is SQLite's
 /// answer for `INSERT`/`UPDATE`/`DELETE`/DDL, and those report `affected` instead,
 /// exactly as the other two engines do.
-fn run_query(conn: &SqliteConn, sql: &str, row_cap: usize) -> Result<ResultSet, DbError> {
+fn run_query(
+    conn: &SqliteConn,
+    sql: &str,
+    dest: &mut crate::RowDest,
+) -> Result<ResultSet, DbError> {
+    let row_cap = dest.cap();
     let start = Instant::now();
     let mut stmt = conn.prepare(sql).map_err(query_err)?;
 
@@ -654,7 +679,8 @@ fn run_query(conn: &SqliteConn, sql: &str, row_cap: usize) -> Result<ResultSet, 
     let mut columns = columns_of(&stmt);
     attach_origins(conn, sql, &mut columns);
     let ncols = columns.len();
-    let mut builder = ResultBuilder::new(columns);
+    let chunk_capacity = dest.chunk_capacity();
+    let mut builder = ResultBuilder::with_capacity(columns, chunk_capacity);
     let mut rows = stmt.query([]).map_err(query_err)?;
     let mut cells: Vec<Value> = Vec::with_capacity(ncols);
     let mut truncated = false;
@@ -669,8 +695,17 @@ fn run_query(conn: &SqliteConn, sql: &str, row_cap: usize) -> Result<ResultSet, 
             cells.push(value_of(row.get_ref(i).map_err(query_err)?));
         }
         builder.push_row(&cells);
+        // `flush_blocking`, not `flush`: this loop is inside a `spawn_blocking`,
+        // where awaiting is not available and `blocking_send` is correct.
+        if dest.chunk_full(builder.row_count()) {
+            dest.flush_blocking(&mut builder, chunk_capacity)?;
+        }
     }
 
+    // The tail — see MySQL's `collect_rows` for why an empty last block still has
+    // to go out. A statement with no result columns returned above and never
+    // reaches here; `Db::stream_query` refuses those outright.
+    dest.flush_blocking(&mut builder, 0)?;
     let mut rs = builder.finish();
     rs.truncated = truncated;
     rs.elapsed_ms = start.elapsed().as_millis();
@@ -2589,7 +2624,7 @@ mod tests {
             "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (42), ('x'), (NULL), (1.5);",
         )
         .unwrap();
-        let rs = run_query(&conn, "SELECT a FROM t", 100).unwrap();
+        let rs = run_query(&conn, "SELECT a FROM t", &mut crate::RowDest::Capped(100)).unwrap();
         let tag = |r: usize| rs.cell(r, 0).expect("cell").tag;
         let text = |r: usize| rs.cell(r, 0).expect("cell").display().to_string();
         // The tags are the assertion: `display()` would read "42" either way, so
@@ -2612,7 +2647,7 @@ mod tests {
         let conn = SqliteConn::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (b BLOB); INSERT INTO t VALUES (x'00ff10');")
             .unwrap();
-        let rs = run_query(&conn, "SELECT b FROM t", 10).unwrap();
+        let rs = run_query(&conn, "SELECT b FROM t", &mut crate::RowDest::Capped(10)).unwrap();
         assert_eq!(rs.cell(0, 0).expect("cell").display(), "<3 bytes>");
     }
 
@@ -2629,7 +2664,12 @@ mod tests {
             "CREATE TABLE t (id INTEGER, b BLOB); INSERT INTO t VALUES (1, x'00ff10');",
         )
         .unwrap();
-        let rs = run_query(&conn, "SELECT id, b FROM t", 10).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT id, b FROM t",
+            &mut crate::RowDest::Capped(10),
+        )
+        .unwrap();
         let sql = schemaic_core::export::export_inserts(
             &rs,
             &[0],
@@ -2797,12 +2837,22 @@ mod tests {
     #[test]
     fn a_statement_returning_no_rows_reports_affected_instead() {
         let conn = seeded();
-        let rs = run_query(&conn, "UPDATE artist SET note = 'y' WHERE id = 1", 10).unwrap();
+        let rs = run_query(
+            &conn,
+            "UPDATE artist SET note = 'y' WHERE id = 1",
+            &mut crate::RowDest::Capped(10),
+        )
+        .unwrap();
         assert_eq!(rs.affected, Some(1));
         assert_eq!(rs.columns.len(), 0);
         // …and a SELECT reports rows, with `affected` left None so the UI can
         // tell the two apart.
-        let rs = run_query(&conn, "SELECT * FROM artist", 10).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT * FROM artist",
+            &mut crate::RowDest::Capped(10),
+        )
+        .unwrap();
         assert_eq!(rs.affected, None);
         assert_eq!(rs.row_count(), 2);
     }
@@ -2810,10 +2860,20 @@ mod tests {
     #[test]
     fn the_row_cap_truncates_and_says_so() {
         let conn = seeded();
-        let rs = run_query(&conn, "SELECT * FROM artist", 1).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT * FROM artist",
+            &mut crate::RowDest::Capped(1),
+        )
+        .unwrap();
         assert_eq!(rs.row_count(), 1);
         assert!(rs.truncated);
-        let rs = run_query(&conn, "SELECT * FROM artist", 50).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT * FROM artist",
+            &mut crate::RowDest::Capped(50),
+        )
+        .unwrap();
         assert_eq!(rs.row_count(), 2);
         assert!(!rs.truncated);
     }
@@ -3220,9 +3280,10 @@ mod tests {
                 schemaic_core::filter::Order::Asc,
                 10,
             );
-            let rs = run_query(&keeper, &sql, 10).unwrap_or_else(|e| {
-                panic!("generated statement does not run: {sql}\n  {e}");
-            });
+            let rs =
+                run_query(&keeper, &sql, &mut crate::RowDest::Capped(10)).unwrap_or_else(|e| {
+                    panic!("generated statement does not run: {sql}\n  {e}");
+                });
             assert_eq!(rs.row_count(), 1, "{sql}");
         }
     }
@@ -3325,7 +3386,12 @@ mod tests {
         assert!(!o[1].as_ref().unwrap().implicit_key);
 
         // And the editing system reaches the same conclusion end to end.
-        let rs = run_query(&conn, "SELECT rowid, * FROM plain", 100).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT rowid, * FROM plain",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
         assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![0]));
         assert!(m.editable(1) && m.editable(2));
@@ -3337,7 +3403,12 @@ mod tests {
     #[test]
     fn the_same_keyless_table_stays_read_only_without_the_rowid() {
         let conn = shadowing();
-        let rs = run_query(&conn, "SELECT * FROM plain", 100).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT * FROM plain",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
         assert!(!m.editable(0));
         assert!(m.insert_target().is_none());
@@ -3375,7 +3446,12 @@ mod tests {
         assert_eq!(o[0].as_ref().unwrap().column, "a");
         assert_eq!(o[2].as_ref().unwrap().column, "a", "`a` twice");
 
-        let rs = run_query(&conn, "SELECT a, * FROM keyed", 100).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT a, * FROM keyed",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
         assert!(m.insert_target().is_none(), "no row can be identified");
         for ci in 0..3 {
@@ -3391,7 +3467,12 @@ mod tests {
     #[test]
     fn a_computed_leading_item_keys_on_the_tables_own_primary_key() {
         let conn = shadowing();
-        let rs = run_query(&conn, "SELECT 1, * FROM keyed", 100).unwrap();
+        let rs = run_query(
+            &conn,
+            "SELECT 1, * FROM keyed",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
         assert_eq!(
             m.table(0).map(|t| t.key_cols.clone()),
@@ -3534,6 +3615,235 @@ mod tests {
 
         // …and what it hands back is the name to open, untouched.
         assert_eq!(open_target("C:/db.sqlite", false).unwrap(), "C:/db.sqlite");
+    }
+
+    /// **The export's whole promise: no cap, and never the table in memory.**
+    ///
+    /// A capped fetch of the same table stops short and says so; the stream keeps
+    /// going and hands the rows over in blocks, none of which is ever bigger than
+    /// the chunk size. That last part is the one that matters and the one a test
+    /// of the row *total* alone would miss — a loop that accumulated everything
+    /// and sent it as one block at the end would pass a count check and still be
+    /// the bug this exists to prevent.
+    #[tokio::test]
+    async fn a_streamed_query_ignores_the_cap_and_arrives_in_bounded_blocks() {
+        let (keeper, db) = shared_memory("stream_export_blocks");
+        keeper
+            .execute_batch("CREATE TABLE nums (id INTEGER PRIMARY KEY, label TEXT);")
+            .unwrap();
+        for i in 1..=25 {
+            keeper
+                .execute("INSERT INTO nums VALUES (?1, ?2)", (i, format!("row {i}")))
+                .unwrap();
+        }
+
+        // The capped read the grid does, for contrast: short, and it says so.
+        let capped = db
+            .fetch_query(None, "SELECT * FROM nums", 10, CancellationToken::new())
+            .await
+            .expect("the capped fetch");
+        assert_eq!(capped.row_count(), 10);
+        assert!(capped.truncated, "10 of 25 rows is a truncated result");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stream = tokio::spawn({
+            let db = db.clone();
+            async move {
+                db.stream_query(None, "SELECT * FROM nums", 10, CancellationToken::new(), tx)
+                    .await
+            }
+        });
+
+        let mut blocks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            blocks.push(chunk.expect("no chunk should carry an error"));
+        }
+        let sent = stream.await.expect("the stream task").expect("the stream");
+
+        assert_eq!(sent, 25, "every row should have gone out");
+        assert_eq!(
+            blocks.iter().map(|b| b.row_count()).sum::<usize>(),
+            25,
+            "the blocks should add up to the table"
+        );
+        assert!(
+            blocks.iter().all(|b| b.row_count() <= 10),
+            "a block exceeded the chunk size: {:?}",
+            blocks.iter().map(|b| b.row_count()).collect::<Vec<_>>()
+        );
+        assert!(
+            blocks.len() >= 3,
+            "25 rows at 10 a block is at least 3 blocks, got {}",
+            blocks.len()
+        );
+        // No block claims truncation: a stream has no cap to be cut off by, and a
+        // chunk that said otherwise would put a "showing 10 of ~N" notice on an
+        // export that is complete.
+        assert!(blocks.iter().all(|b| !b.truncated), "a block claimed a cap");
+        // The columns ride on every block, so the export's header can come off
+        // the first one whichever it turns out to be.
+        assert!(
+            blocks.iter().all(|b| b
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["id", "label"])),
+            "every block should carry the same columns"
+        );
+        // And the rows are all of them, in order, exactly once.
+        let mut seen = Vec::new();
+        for b in &blocks {
+            for r in 0..b.row_count() {
+                seen.push(b.cell(r, 0).expect("a cell").display().to_string());
+            }
+        }
+        assert_eq!(
+            seen,
+            (1..=25).map(|i| i.to_string()).collect::<Vec<_>>(),
+            "rows should arrive once each, in order"
+        );
+    }
+
+    /// A table with no rows still has to hand over one block, because that is
+    /// where the export's header comes from. A stream that sent nothing would
+    /// write an empty file for an empty table, losing the columns.
+    #[tokio::test]
+    async fn an_empty_table_still_streams_the_block_that_carries_its_columns() {
+        let (keeper, db) = shared_memory("stream_export_empty");
+        keeper
+            .execute_batch("CREATE TABLE blanks (id INTEGER PRIMARY KEY, label TEXT);")
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stream = tokio::spawn({
+            let db = db.clone();
+            async move {
+                db.stream_query(
+                    None,
+                    "SELECT * FROM blanks",
+                    100,
+                    CancellationToken::new(),
+                    tx,
+                )
+                .await
+            }
+        });
+        let mut blocks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            blocks.push(chunk.expect("no chunk should carry an error"));
+        }
+        let sent = stream.await.expect("the stream task").expect("the stream");
+
+        assert_eq!(sent, 0);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "exactly the one block that carries columns"
+        );
+        assert_eq!(blocks[0].row_count(), 0);
+        assert!(
+            blocks[0]
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["id", "label"]),
+            "the empty block must still name the columns"
+        );
+    }
+
+    /// **A failing statement reaches the writer, not just the caller.** The
+    /// export is on the far end of this channel and reads its close as "the table
+    /// ended"; without the error riding along, a query that died halfway would
+    /// leave a truncated file reported as a finished export.
+    #[tokio::test]
+    async fn a_failed_stream_sends_its_reason_down_the_channel() {
+        let (_keeper, db) = shared_memory("stream_export_error");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stream = tokio::spawn({
+            let db = db.clone();
+            async move {
+                db.stream_query(
+                    None,
+                    "SELECT * FROM no_such_table",
+                    10,
+                    CancellationToken::new(),
+                    tx,
+                )
+                .await
+            }
+        });
+
+        let mut last = None;
+        while let Some(chunk) = rx.recv().await {
+            last = Some(chunk);
+        }
+        let err = stream
+            .await
+            .expect("the stream task")
+            .expect_err("a missing table should fail");
+
+        let carried = last.expect("the channel should carry the failure, not just close");
+        let carried = carried.expect_err("the last message should be the error");
+        assert!(
+            carried.contains("no_such_table"),
+            "the reason should survive the channel: {carried}"
+        );
+        assert!(
+            err.to_string().contains("no_such_table"),
+            "and reach the caller too: {err}"
+        );
+    }
+
+    /// **A statement with no result set is refused, not exported as nothing.**
+    ///
+    /// All three engines return before their tail flush when the statement
+    /// returns no columns, so no block reaches the channel at all — and a writer
+    /// that saw none would write an empty file and report it finished. The
+    /// export menu never offers such a statement, but `stream_query` is public
+    /// API and the refusal has to live where the next caller will meet it.
+    #[tokio::test]
+    async fn a_statement_with_no_result_set_is_refused_rather_than_exported_empty() {
+        let (keeper, db) = shared_memory("stream_export_no_rowset");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stream = tokio::spawn({
+            let db = db.clone();
+            async move {
+                db.stream_query(
+                    None,
+                    "UPDATE t SET id = id",
+                    10,
+                    CancellationToken::new(),
+                    tx,
+                )
+                .await
+            }
+        });
+        let mut msgs = Vec::new();
+        while let Some(m) = rx.recv().await {
+            msgs.push(m);
+        }
+        let err = stream
+            .await
+            .expect("the stream task")
+            .expect_err("a statement with no result set must not report success");
+
+        assert!(
+            err.to_string().contains("no rows to export"),
+            "the caller should be told why: {err}"
+        );
+        // And the writer must hear it too, or it would see an empty stream, write
+        // an empty file and call the export done.
+        assert_eq!(msgs.len(), 1, "exactly the refusal, and no data block");
+        let carried = msgs
+            .pop()
+            .expect("a message")
+            .expect_err("the one message should be the refusal");
+        assert!(carried.contains("no rows to export"), "{carried}");
     }
 
     /// **SQLite accepts `:name`, so the driver's parameter count is what stops a
@@ -3895,7 +4205,12 @@ mod tests {
             .unwrap();
 
         // The key is resolved and built the way the app does it, not hand-written.
-        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let rs = run_query(
+            &keeper,
+            "SELECT rowid, * FROM t",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m =
             schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
         let tbl = m.insert_target().expect("a single writable table");
@@ -3960,7 +4275,12 @@ mod tests {
             .unwrap();
 
         // What the grid read: rowids 2, 3, 4.
-        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let rs = run_query(
+            &keeper,
+            "SELECT rowid, * FROM t",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m =
             schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
         let tbl = m.insert_target().expect("writable");
@@ -4037,7 +4357,12 @@ mod tests {
             )
             .unwrap();
 
-        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let rs = run_query(
+            &keeper,
+            "SELECT rowid, * FROM t",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m =
             schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
         let tbl = m.insert_target().expect("writable");
@@ -4237,7 +4562,12 @@ mod tests {
                  INSERT INTO t VALUES ('one', 'x'), ('two', 'y');",
             )
             .unwrap();
-        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let rs = run_query(
+            &keeper,
+            "SELECT rowid, * FROM t",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
         let m =
             schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
         let template =

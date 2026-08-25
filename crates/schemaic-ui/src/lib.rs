@@ -129,6 +129,54 @@ pub struct ExportRequest {
     /// The tab's connection dialect, so an exported `INSERT` loads back into the
     /// engine the rows came from.
     pub dialect: schemaic_core::intel::SqlDialect,
+    /// Which rows to write — the ones on screen, or every row the statement has.
+    pub scope: ExportScope,
+}
+
+/// How much of a result an export covers.
+///
+/// The distinction exists because a grid is capped and a file is not. The row
+/// cap is what keeps a result openable — nobody scrolls two million rows — and
+/// for years "export" quietly meant "export whatever the cap fetched", which is
+/// the right answer only by coincidence.
+pub enum ExportScope {
+    /// The rows the grid already holds, in the order it shows them — including
+    /// any client-side sort. A snapshot taken before the save dialog opens, so
+    /// what lands in the file is what the user was looking at when they asked.
+    Fetched,
+    /// Re-run `sql` with **no cap** and stream every row it returns.
+    ///
+    /// The statement, not the table: a filtered or sorted grid exports what it is
+    /// showing all of, and a table tab's statement is `SELECT * FROM t` anyway.
+    /// This is deliberately a *second read* of the server rather than a
+    /// continuation of the first — the rows on screen may be minutes old, and an
+    /// export that stitched a stale page onto fresh ones would be neither.
+    AllRows {
+        conn_id: u64,
+        /// The database the statement ran under, from the result rather than the
+        /// tab — a tab's selection moves, and the export must re-run in the scope
+        /// the rows came from. See `ResultSet::database`.
+        database: Option<String>,
+        sql: String,
+    },
+}
+
+/// How an export ended.
+///
+/// Three outcomes and not a `Result`, because "the user stopped it" is neither a
+/// success nor a failure and reporting it as either is a lie: a red bar for a
+/// deliberate Cancel, or a cheerful count for a file that stops halfway.
+/// Mirrors `ImportOutcome`, which answers the same question for the other
+/// direction.
+pub enum ExportOutcome {
+    /// Written, with the number of rows in the file.
+    Done(u64),
+    /// Stopped by the user. **The partial file is left where it is**, and the
+    /// message says so — deleting it would be the one irreversible thing this
+    /// path could do, and the save dialog may well have been pointed at a file
+    /// that already mattered.
+    Cancelled,
+    Failed(String),
 }
 
 /// What an ER-diagram export writes.
@@ -794,9 +842,8 @@ pub struct DdlUi {
     pub session: RwSignal<u64>,
 }
 
-/// Reports an export's outcome back on the UI thread (`Err` carries a
-/// user-facing message).
-pub type ExportDoneFn = Rc<dyn Fn(Result<(), String>)>;
+/// Reports an export's outcome back on the UI thread.
+pub type ExportDoneFn = Rc<dyn Fn(ExportOutcome)>;
 /// Stream a result set to a file **off the UI thread**, reporting via
 /// [`ExportDoneFn`]. Writing a large export inline froze the window for as long
 /// as it took; the grid owns the save dialog, the app owns the worker.
@@ -1818,6 +1865,9 @@ pub struct TabsActions {
     /// dialog and the snapshot; this does the rendering + writing, so a large
     /// export doesn't block the window.
     pub export_file: ExportFn,
+    /// Stop the running streamed export. The app owns the cancellation token, as
+    /// it does for query runs and imports.
+    pub export_cancel: Rc<dyn Fn()>,
     /// Write an exported ER diagram to a file on a worker thread. The diagram
     /// modal owns the save dialog and renders the document; this rasterises (PNG
     /// only) and writes.
@@ -4790,6 +4840,7 @@ fn center(ui: Ui) -> impl IntoView {
     let dismiss_menus: Rc<dyn Fn()> = Rc::new(move || all_menus.close_except(None));
     let commit_edits = ui.tab_actions.commit_edits.clone();
     let export_file = ui.tab_actions.export_file.clone();
+    let export_cancel = ui.tab_actions.export_cancel.clone();
     let apply_view = ui.tab_actions.apply_view.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
@@ -4989,6 +5040,7 @@ fn center(ui: Ui) -> impl IntoView {
                     dismiss: dismiss_menus.clone(),
                     commit: commit_edits.clone(),
                     export_file: export_file.clone(),
+                    export_cancel: export_cancel.clone(),
                     // `results_view` fills this in for the single-result path; the
                     // multi-result path leaves it `None` (full-re-run on commit).
                     sync_canonical: None,
@@ -5015,6 +5067,18 @@ fn center(ui: Ui) -> impl IntoView {
                     commit_err: RwSignal::new(None),
                     commit_note: RwSignal::new(None),
                     commit_wait: RwSignal::new(None),
+                    // **Beside the two it turns into, not above them.** A
+                    // streamed export raises this flag and then reports through
+                    // `commit_note`, so the two must share a lifetime: created
+                    // once for the whole window, the flag was global while the
+                    // note was per-tab-render, and switching tabs mid-export drew
+                    // `Exporting… Cancel` on a tab that had nothing to do with it
+                    // while the report landed on a disposed signal and was lost.
+                    // Here the bar belongs to the result that started it, and an
+                    // export the user has navigated away from simply reports
+                    // nowhere — the same thing a commit does, and the bar's
+                    // established behaviour.
+                    exporting: RwSignal::new(false),
                     tx_holders: {
                         // Answered when a write has been waiting a while, not at
                         // build time: the user can open (or end) a transaction in
@@ -5124,6 +5188,7 @@ fn results_section(
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
     let commit_note = gctx.commit_note;
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
+    let (exporting, export_cancel) = (gctx.exporting, gctx.export_cancel.clone());
     let view_err = gctx.view_err;
     // A Run-Everything statement's own error, which the bottom bar carries for the
     // same reason the editor's carries a single run's: a server error is one long
@@ -5141,6 +5206,7 @@ fn results_section(
         commit_note,
         view_err,
         commit_wait,
+        exporting,
     };
     // **The panel-level bars must not outlive the grid they describe.** All three
     // are mounted here, outside `body`, while their only writer lives inside
@@ -5264,7 +5330,13 @@ fn results_section(
             find_open, find_query, find_step, find_total, find_pos, find_more,
         ),
         grid_goto_bar(goto_open, goto_query, goto_step),
-        grid_error_bar(bars, rollback_tx, error_open, error_text),
+        grid_error_bar(
+            bars,
+            rollback_tx,
+            export_cancel.clone(),
+            error_open,
+            error_text,
+        ),
         // Last, so it paints over the panel — and it lifts itself above the
         // bottom bar when that one is up, through the **same** predicate
         // `grid_error_bar` decides its own visibility with. It used to be a

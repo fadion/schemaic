@@ -518,7 +518,13 @@ impl ColumnData {
 /// A fully materialized result set, stored **columnar** (one [`ColumnData`] per
 /// column) rather than row-major. `schemaic_db::Db` loads rows into memory up to
 /// a caller-supplied row cap (`truncated` flags when more exist) via
-/// [`ResultBuilder`]; true streaming is a future change.
+/// [`ResultBuilder`].
+///
+/// **A grid's result is still materialised whole; an export is not.** The cap is
+/// what makes materialising one safe — nobody scrolls two million rows — and
+/// `Db::stream_query` escapes it by cutting the load into a sequence of these
+/// with [`ResultBuilder::take_chunk`], so a whole-table export is bounded by one
+/// chunk rather than by the table.
 ///
 /// Cells are read through [`ResultSet::cell`] (a borrowed [`CellRef`]); the field
 /// is private so the columnar invariant (each column's packed `ends` words stay
@@ -754,6 +760,31 @@ impl ResultBuilder {
             }
         }
         self.n_rows += 1;
+    }
+
+    /// Close off the rows pushed so far as one [`ResultSet`] and start a fresh,
+    /// empty builder over the **same columns** — the streaming export's flush.
+    ///
+    /// This is what keeps an uncapped export bounded in memory. `finish` consumes
+    /// the builder because a normal load produces exactly one result; a load that
+    /// is being written to a file as it arrives produces a sequence of them, and
+    /// without this the loader would have to hold every row to the end — the very
+    /// thing the export exists to avoid, and the thing the 512 MiB per-column
+    /// arena ceiling ([`ResultSet::capped_columns`]) would silently truncate.
+    ///
+    /// `capacity` sizes the new chunk's per-column buffers, so a loader flushing
+    /// every N rows pays one allocation per column per chunk rather than growing
+    /// from empty each time.
+    pub fn take_chunk(&mut self, capacity: usize) -> ResultSet {
+        let next = ResultBuilder::with_capacity(self.columns.clone(), capacity);
+        let mut done = std::mem::replace(self, next);
+        // The elapsed time belongs to the whole load, not to a chunk of it; a
+        // per-chunk figure would be meaningless and the caller stamps the total
+        // on whatever it reports. `truncated` is likewise the load's, and an
+        // uncapped stream is never truncated.
+        done.elapsed_ms = 0;
+        done.truncated = false;
+        done.finish()
     }
 
     pub fn set_elapsed(&mut self, ms: u128) {
@@ -1252,6 +1283,123 @@ mod tests {
             type_name: type_name.to_string(),
             origin: None,
         }
+    }
+
+    // ── Chunked loads (the streamed export's builder) ──
+
+    fn named(name: &str, type_name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            origin: None,
+        }
+    }
+
+    /// The happy path: a chunk carries the rows pushed since the last one, and
+    /// the builder keeps going over the **same columns** — which is what lets an
+    /// export take its header off whichever block arrives first.
+    #[test]
+    fn take_chunk_cuts_the_rows_so_far_and_carries_the_columns_on() {
+        let cols = vec![named("id", "INT"), named("name", "TEXT")];
+        let mut b = ResultBuilder::with_capacity(cols, 2);
+        b.push_row(&[Value::Int(1), Value::Str("a".into())]);
+        b.push_row(&[Value::Int(2), Value::Str("b".into())]);
+
+        let first = b.take_chunk(2);
+        assert_eq!(first.row_count(), 2);
+        assert!(
+            first
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["id", "name"]),
+            "the chunk must name its columns"
+        );
+        assert_eq!(first.cell(0, 1).unwrap().display(), "a");
+
+        // The builder is empty but still typed — not a fresh untyped one.
+        assert_eq!(b.row_count(), 0);
+        assert!(
+            b.columns()
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["id", "name"])
+        );
+
+        b.push_row(&[Value::Int(3), Value::Str("c".into())]);
+        let second = b.take_chunk(0);
+        assert_eq!(second.row_count(), 1);
+        assert_eq!(second.cell(0, 0).unwrap().display(), "3");
+        assert!(
+            second
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["id", "name"])
+        );
+    }
+
+    /// **A chunk is never truncated and carries no elapsed time**, because
+    /// neither is a fact about it. `truncated` says a row cap cut the read short,
+    /// and a stream has no cap; a per-chunk duration would be a fraction of the
+    /// load presented as the whole of one. A chunk that inherited `truncated`
+    /// would put "showing N of ~M" on an export that is complete.
+    #[test]
+    fn a_chunk_claims_neither_truncation_nor_the_loads_elapsed_time() {
+        let mut b = ResultBuilder::new(vec![named("id", "INT")]);
+        b.set_truncated(true);
+        b.set_elapsed(1234);
+        b.push_row(&[Value::Int(1)]);
+
+        let chunk = b.take_chunk(0);
+        assert!(!chunk.truncated, "a chunk of a stream is not truncated");
+        assert_eq!(
+            chunk.elapsed_ms, 0,
+            "the duration belongs to the whole load"
+        );
+
+        // And the flags do not survive into the successor either — the next
+        // chunk starts as clean as this one ended.
+        b.push_row(&[Value::Int(2)]);
+        let next = b.take_chunk(0);
+        assert!(!next.truncated);
+        assert_eq!(next.elapsed_ms, 0);
+    }
+
+    /// The edge the export actually hits: a load whose rows divide evenly by the
+    /// chunk size ends on an **empty** chunk, and that chunk still has to be a
+    /// real result with the columns on it.
+    #[test]
+    fn taking_a_chunk_with_nothing_in_it_still_yields_the_columns() {
+        let mut b = ResultBuilder::new(vec![named("id", "INT"), named("name", "TEXT")]);
+        let empty = b.take_chunk(0);
+        assert_eq!(empty.row_count(), 0);
+        assert!(
+            empty
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .eq(["id", "name"])
+        );
+        assert!(
+            empty.affected.is_none(),
+            "a chunk is a grid, not a DML outcome"
+        );
+        assert!(empty.capped_columns.is_empty());
+    }
+
+    /// `capped_columns` is per chunk, like every other property of one: a column
+    /// that hit its arena ceiling in an earlier block must not mark a later block
+    /// that never came near it, or the UI would report blank cells in a chunk
+    /// whose cells are all there.
+    #[test]
+    fn capped_columns_are_not_inherited_by_the_next_chunk() {
+        let mut b = ResultBuilder::new(vec![named("id", "INT")]);
+        b.push_row(&[Value::Int(1)]);
+        let first = b.take_chunk(0);
+        assert!(first.capped_columns.is_empty());
+        b.push_row(&[Value::Int(2)]);
+        assert!(b.take_chunk(0).capped_columns.is_empty());
     }
 
     // ── Raw-bytes columns ──

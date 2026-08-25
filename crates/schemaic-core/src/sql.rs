@@ -1040,6 +1040,32 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
     RunVerdict::Allow
 }
 
+/// May this statement be **re-run to stream an export**?
+///
+/// The whole-table export takes the statement a result came from and executes it
+/// a second time, uncapped, on a fresh connection. That is a path executing user
+/// SQL, so it answers to the write guard like every other one — but it answers a
+/// *narrower* question than [`run_verdict`], and deliberately so.
+///
+/// `run_verdict` can say `Confirm`: on a writable connection a statement that
+/// modifies data is allowed through once the user agrees, because they typed it
+/// and pressed Run. **An export has no such moment.** The user picked a file name
+/// from a Save dialog; nothing about that asks to run an `UPDATE … RETURNING` a
+/// second time, and a confirmation raised from a file picker would be a question
+/// about something they never requested. So this is a flat refusal rather than a
+/// verdict with a `Confirm` arm — strictly stronger than the guard, never weaker,
+/// which is what keeps it from being a second, laxer gate.
+///
+/// Built on [`contains_write`], the same predicate `run_verdict` uses, so there
+/// is one answer to "does this statement write" and one place to grep. That
+/// predicate is a **whitelist of read heads**, which is what makes it right here:
+/// a `CALL proc()`, an `INSERT … RETURNING` and a data-modifying CTE are all
+/// writes to it, and each of the three returns rows, so each could otherwise have
+/// reached a truncated grid and been offered an "All rows" export.
+pub fn rerunnable_for_export(sql: &str, dialect: SqlDialect) -> bool {
+    !contains_write(sql, dialect)
+}
+
 /// Bounded Levenshtein edit distance between two ASCII strings.
 pub fn edit_distance(a: &str, b: &str) -> usize {
     let a = a.as_bytes();
@@ -1838,6 +1864,63 @@ mod tests {
         assert!(contains_write("DROP TABLE t"));
         // A write anywhere in a multi-statement batch trips it.
         assert!(contains_write("SELECT 1; DELETE FROM t"));
+    }
+
+    /// **The export's gate is the write guard's, only stricter.** These are the
+    /// row-returning writes — each would otherwise reach a truncated grid, be
+    /// offered an "All rows" export, and be executed a second time from a Save
+    /// dialog with nothing asked.
+    #[test]
+    fn a_row_returning_write_is_never_rerunnable_for_an_export() {
+        for d in EVERY_DIALECT {
+            assert!(
+                !super::rerunnable_for_export("UPDATE orders SET n = n + 1 RETURNING *", d),
+                "{d:?}: an UPDATE … RETURNING returns rows and must not be re-run"
+            );
+            assert!(
+                !super::rerunnable_for_export("INSERT INTO t (a) VALUES (1) RETURNING id", d),
+                "{d:?}: an INSERT … RETURNING returns rows and must not be re-run"
+            );
+            assert!(
+                !super::rerunnable_for_export("DELETE FROM t WHERE id = 1 RETURNING *", d),
+                "{d:?}: a DELETE … RETURNING returns rows and must not be re-run"
+            );
+            // A data-modifying CTE reads as a `WITH`, which *is* a read head —
+            // `contains_write`'s keyword sweep is what catches it, and this is
+            // the case that would slip a head-only check.
+            assert!(
+                !super::rerunnable_for_export(
+                    "WITH moved AS (DELETE FROM a RETURNING *) SELECT * FROM moved",
+                    d
+                ),
+                "{d:?}: a data-modifying CTE must not be re-run"
+            );
+        }
+        // A stored procedure returns rows and may write anything at all.
+        assert!(!super::rerunnable_for_export(
+            "CALL restock()",
+            SqlDialect::MySql
+        ));
+    }
+
+    /// And the other half: the reads an export exists for are all allowed, so
+    /// the gate has not simply refused everything.
+    #[test]
+    fn an_ordinary_read_is_rerunnable_for_an_export() {
+        for d in EVERY_DIALECT {
+            for sql in [
+                "SELECT * FROM rental",
+                "SELECT a, b FROM t WHERE a > 1 ORDER BY b LIMIT 10",
+                "WITH c AS (SELECT 1) SELECT * FROM c",
+                // A write word inside a string or a comment is not a write.
+                "SELECT 'update me' FROM t -- delete later",
+            ] {
+                assert!(
+                    super::rerunnable_for_export(sql, d),
+                    "{d:?}: refused a plain read: {sql}"
+                );
+            }
+        }
     }
 
     #[test]

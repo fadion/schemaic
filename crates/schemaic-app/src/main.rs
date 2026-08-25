@@ -2426,34 +2426,209 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     //
     // `spawn_blocking`, not `spawn`: this is synchronous file IO, and running it
     // on a runtime worker would stall every other task sharing that thread.
+    /// Rows per block when streaming a table to a file.
+    ///
+    /// Ten thousand is a compromise the two ends pull on: small enough that a
+    /// block of a wide result is megabytes rather than gigabytes, and large
+    /// enough that the per-block cost — a `ResultSet`, one allocation per column,
+    /// a channel hop — is paid once per ten thousand rows instead of per row.
+    /// Nothing downstream depends on the figure: the renderers take whatever
+    /// blocks they are given, which is what `a_chunked_export_matches_the_same_
+    /// rows_in_one_go` pins.
+    const EXPORT_CHUNK_ROWS: usize = 10_000;
+
+    // The running streamed export's token, in the shape `import_token` above
+    // uses and for the same reasons — including the one about clearing the slot
+    // when a run reports, so a later Cancel can't "cancel" an export that already
+    // finished.
+    let export_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+
     let export_file: schemaic_ui::ExportFn = {
         let handle = handle.clone();
+        let db_for = db_for.clone();
+        let export_token = export_token.clone();
         Rc::new(
             move |req: schemaic_ui::ExportRequest, done: schemaic_ui::ExportDoneFn| {
-                let report = create_ext_action(cx, move |res: Result<(), String>| (done)(res));
-                handle.spawn_blocking(move || {
-                    let write = || -> std::io::Result<()> {
-                        use std::io::Write as _;
-                        let file = std::fs::File::create(&req.path)?;
-                        let mut w = std::io::BufWriter::new(file);
-                        req.format.render_to(
-                            &mut w,
-                            req.rs.as_ref(),
-                            req.order.as_slice(),
-                            req.source.as_ref().map(|s| {
-                                (s.database.as_str(), s.schema.as_deref(), s.table.as_str())
-                            }),
-                            req.dialect,
-                        )?;
-                        // Explicit: `BufWriter` swallows a flush failure on drop,
-                        // which is exactly the case where the last block never
-                        // reached the disk — silently truncating the file.
-                        w.flush()
-                    };
-                    report(write().map_err(|e| format!("Export failed: {e}")));
-                });
+                use schemaic_ui::{ExportOutcome, ExportScope};
+
+                let (path, format, dialect) = (req.path.clone(), req.format, req.dialect);
+                // Owned, because it crosses to a worker thread; borrowed back
+                // as the `(&str, Option<&str>, &str)` the renderer wants at the
+                // point of use.
+                let source = req
+                    .source
+                    .as_ref()
+                    .map(|s| (s.database.clone(), s.schema.clone(), s.table.clone()));
+                let create = |path: &std::path::PathBuf| {
+                    std::fs::File::create(path).map(std::io::BufWriter::new)
+                };
+
+                match req.scope {
+                    // Everything is already in memory: one blocking task, exactly
+                    // as this has always worked.
+                    ExportScope::Fetched => {
+                        let report = create_ext_action(cx, move |o: ExportOutcome| (done)(o));
+                        let (rs, order) = (req.rs.clone(), req.order.clone());
+                        handle.spawn_blocking(move || {
+                            let write = || -> std::io::Result<u64> {
+                                use std::io::Write as _;
+                                let mut w = create(&path)?;
+                                // `render_to`, not `stream_to` over a hand-built
+                                // `OneChunk`: that *is* `render_to`'s body, and
+                                // spelling it out here left the wrapper with no
+                                // caller and two copies of one construction to
+                                // drift apart.
+                                let n = format.render_to(
+                                    &mut w,
+                                    rs.as_ref(),
+                                    order.as_slice(),
+                                    source
+                                        .as_ref()
+                                        .map(|(d, ns, t)| (d.as_str(), ns.as_deref(), t.as_str())),
+                                    dialect,
+                                )?;
+                                // Explicit: `BufWriter` swallows a flush failure
+                                // on drop, which is exactly the case where the
+                                // last block never reached the disk — silently
+                                // truncating the file.
+                                w.flush()?;
+                                Ok(n)
+                            };
+                            report(match write() {
+                                Ok(n) => ExportOutcome::Done(n),
+                                Err(e) => ExportOutcome::Failed(format!("Export failed: {e}")),
+                            });
+                        });
+                    }
+                    // **Two tasks and a bounded channel.** The reader is async
+                    // (two of the three drivers are) and the writer is
+                    // synchronous file IO, which must not run on a runtime
+                    // worker; the channel's bound is what keeps a server faster
+                    // than the disk from queueing the table in memory, which is
+                    // the entire point of streaming it.
+                    ExportScope::AllRows {
+                        conn_id,
+                        database,
+                        sql,
+                    } => {
+                        let db = match db_for(conn_id) {
+                            Ok(db) => db,
+                            Err(e) => {
+                                (done)(ExportOutcome::Failed(e));
+                                return;
+                            }
+                        };
+                        // **One streamed export at a time.** The token is a
+                        // single slot, and it can be, because this refuses the
+                        // second rather than overwriting it: two exports sharing
+                        // the slot meant Cancel reached only the later one, and
+                        // whichever finished first cleared the slot and left the
+                        // other uncancellable. `import_token` gets away with the
+                        // same shape only because its modal admits one run;
+                        // the Download menu is on every result tab.
+                        if export_token.borrow().is_some() {
+                            (done)(ExportOutcome::Failed(
+                                "An export is already running. Cancel it or wait for it to finish."
+                                    .to_string(),
+                            ));
+                            return;
+                        }
+                        let token = CancellationToken::new();
+                        *export_token.borrow_mut() = Some(token.clone());
+                        let report = {
+                            let export_token = export_token.clone();
+                            create_ext_action(cx, move |o: ExportOutcome| {
+                                *export_token.borrow_mut() = None;
+                                (done)(o)
+                            })
+                        };
+                        // Small on purpose: each block is `EXPORT_CHUNK_ROWS`
+                        // rows, so a deep queue would be exactly the memory this
+                        // avoids. Two lets the server read the next block while
+                        // the disk takes the last.
+                        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+                        let writer = handle.spawn_blocking(move || {
+                            use std::io::Write as _;
+                            let mut w = create(&path).map_err(|e| e.to_string())?;
+                            let mut src = schemaic_core::export::PullChunks::new(move || match rx
+                                .blocking_recv()
+                            {
+                                None => Ok(None),
+                                Some(Ok(rs)) => Ok(Some(rs)),
+                                // The reason the reader put on the channel.
+                                // Without this the writer would read the
+                                // close as "the table ended" and call a
+                                // half-written file finished.
+                                Some(Err(e)) => Err(std::io::Error::other(e)),
+                            });
+                            let n = format
+                                .stream_to(
+                                    &mut w,
+                                    &mut src,
+                                    source
+                                        .as_ref()
+                                        .map(|(d, ns, t)| (d.as_str(), ns.as_deref(), t.as_str())),
+                                    dialect,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            w.flush().map_err(|e| e.to_string())?;
+                            Ok::<u64, String>(n)
+                        });
+                        handle.spawn(async move {
+                            let read = db
+                                .stream_query(
+                                    database.as_deref(),
+                                    &sql,
+                                    EXPORT_CHUNK_ROWS,
+                                    token,
+                                    tx,
+                                )
+                                .await;
+                            let written = writer.await;
+                            // **Cancel is the reader's to declare; every other
+                            // failure is the writer's to describe.**
+                            //
+                            // The reader has to win on cancel, because a
+                            // cancelled read closes the channel and the writer
+                            // sees an ordinary end of stream — on its own it
+                            // would call a truncated file a finished export.
+                            //
+                            // On anything else the writer is the more proximate
+                            // witness, and asking the reader first got it
+                            // backwards: a full disk fails the *writer*, whose
+                            // exit then fails the reader's next `send` with "the
+                            // export stopped reading" — so the user was told the
+                            // symptom instead of "No space left on device". A
+                            // reader-side failure still arrives intact, because
+                            // `stream_query` puts its reason on the channel and
+                            // the writer returns that very message.
+                            report(match (read, written) {
+                                (Err(schemaic_db::DbError::Cancelled), _) => {
+                                    ExportOutcome::Cancelled
+                                }
+                                (_, Ok(Err(e))) => {
+                                    ExportOutcome::Failed(format!("Export failed: {e}"))
+                                }
+                                (_, Err(e)) => ExportOutcome::Failed(format!(
+                                    "Export failed: worker died: {e}"
+                                )),
+                                (Err(e), _) => ExportOutcome::Failed(format!("Export failed: {e}")),
+                                (Ok(_), Ok(Ok(n))) => ExportOutcome::Done(n),
+                            });
+                        });
+                    }
+                }
             },
         )
+    };
+
+    let export_cancel: Rc<dyn Fn()> = {
+        let export_token = export_token.clone();
+        Rc::new(move || {
+            if let Some(t) = export_token.borrow().as_ref() {
+                t.cancel();
+            }
+        })
     };
 
     // Write an exported ER diagram. The modal captures what the user was looking
@@ -2468,11 +2643,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let handle = handle.clone();
         Rc::new(
             move |req: schemaic_ui::ErdExportRequest, done: schemaic_ui::ExportDoneFn| {
-                let report = create_ext_action(cx, move |res: Result<(), String>| (done)(res));
+                let report = create_ext_action(cx, move |o: schemaic_ui::ExportOutcome| (done)(o));
                 handle.spawn_blocking(move || {
-                    report(req.doc.into_bytes().and_then(|b| {
-                        std::fs::write(&req.path, b).map_err(|e| format!("Export failed: {e}"))
-                    }));
+                    // A diagram is one document written in one call: there is no
+                    // row count and nothing to cancel, so `Done(0)` is the whole
+                    // of its success.
+                    report(
+                        match req.doc.into_bytes().and_then(|b| {
+                            std::fs::write(&req.path, b).map_err(|e| format!("Export failed: {e}"))
+                        }) {
+                            Ok(()) => schemaic_ui::ExportOutcome::Done(0),
+                            Err(e) => schemaic_ui::ExportOutcome::Failed(e),
+                        },
+                    );
                 });
             },
         )
@@ -7665,6 +7848,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // fetched and sitting in memory, so it works fine on a connection
             // that has since gone away.
             export_file,
+            export_cancel,
             export_erd,
             set_tx_mode,
             commit_tx,
