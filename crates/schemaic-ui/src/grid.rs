@@ -5111,6 +5111,57 @@ fn cell_shape(editor: CellEditor, buf: &str) -> CellShape {
     }
 }
 
+/// How a cell's text is weighted — which is the only thing that distinguishes
+/// **the values it is about to write**.
+///
+/// A cell paints one of five ways, and four of them were an `if` chain inside the
+/// style closure. The fifth is the reason this is a function: a staged SQL NULL
+/// and a staged four-character string reading `NULL` went through the *same* arm,
+/// so `middle_name = NULL` and `middle_name = 'NULL'` were pixel-identical before
+/// the Commit that writes one of them. Copy a NULL cell and paste it (the
+/// clipboard carries the display text, uninterpreted — deliberately) and the
+/// grid had nothing to audit: `WHERE middle_name IS NULL` stops matching a row
+/// that looks exactly like the ones it does match.
+///
+/// The italic is not a new vocabulary: it is the treatment a NULL *original* has
+/// always had, which is the point — "there is no value here" reads the same
+/// whether the emptiness is stored or staged, and a value that merely spells
+/// `NULL` reads as the text it is.
+///
+/// A decision, so it is testable: `staged` is `dirty`'s entry for the cell
+/// (`None` = nothing staged, `Some(None)` = staged SQL NULL, `Some(Some(t))` =
+/// staged text), and the last three are the painter's own flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellInk {
+    /// A staged edit — white on the green fill.
+    Staged,
+    /// A staged **SQL NULL** — white, and italic like every other absence.
+    StagedNull,
+    /// No value: a NULL original, or a pending row's `<auto>`/`<required>`/
+    /// `<null>`/`<default>` placeholder.
+    Absent,
+    /// A foreign key, underlined as a followable relation.
+    Fk,
+    Plain,
+}
+
+fn cell_ink(
+    staged: Option<&Option<String>>,
+    is_null: bool,
+    placeholder: bool,
+    is_fk: bool,
+) -> CellInk {
+    match staged {
+        Some(None) => CellInk::StagedNull,
+        Some(Some(_)) => CellInk::Staged,
+        // The order is the painter's: a NULL original outranks the FK underline,
+        // because there is no key in the cell to follow.
+        None if is_null || placeholder => CellInk::Absent,
+        None if is_fk => CellInk::Fk,
+        None => CellInk::Plain,
+    }
+}
+
 /// Does the control take the **whole cell**, padding and all?
 ///
 /// Only a picker does: it carries its own surface and puts the text back on the
@@ -8038,6 +8089,10 @@ fn data_cell(
                 // is tinted with the error colour — leaving it blank fails the
                 // INSERT; `<auto>` / `<default>` are faint (the server fills them).
                 let placeholder = !edited && pending.is_some() && (col_editable || auto_inc);
+                // How the text is *weighted* — and the reason it is a decision
+                // rather than a chain of `if`s in the closure below. See
+                // [`cell_ink`].
+                let ink = cell_ink(staged.as_ref(), is_null, placeholder, is_fk);
                 let src = match &staged {
                     Some(Some(t)) => t.clone(),       // staged text
                     Some(None) => "NULL".to_string(), // staged SQL NULL
@@ -8061,22 +8116,28 @@ fn data_cell(
                 text(shown)
                     .style(move |s| {
                         let s = s.font_size(theme::font_body());
-                        if edited {
+                        match ink {
                             // Staged edit: white text over the green cell fill.
-                            s.color(floem::peniko::Color::WHITE)
-                        } else if is_null || placeholder {
+                            CellInk::Staged => s.color(floem::peniko::Color::WHITE),
+                            // A staged **SQL NULL**, in the same italic the grid
+                            // has always used for "there is no value here" — the
+                            // one thing that tells it apart from a staged
+                            // four-character string reading `NULL`.
+                            CellInk::StagedNull => s
+                                .color(floem::peniko::Color::WHITE)
+                                .font_style(floem::text::Style::Italic),
                             // NULL originals + all pending-row placeholders
                             // (`<auto>`/`<required>`/`<null>`/`<default>`) render faint.
-                            s.color(theme::text_faint())
-                                .font_style(floem::text::Style::Italic)
-                        } else if is_fk {
+                            CellInk::Absent => s
+                                .color(theme::text_faint())
+                                .font_style(floem::text::Style::Italic),
                             // Foreign-key value: underline it (in the text colour) as
                             // a "followable relation" affordance (Ctrl-click follows).
-                            s.color(theme::text())
+                            CellInk::Fk => s
+                                .color(theme::text())
                                 .border_bottom(1.0)
-                                .border_color(theme::text())
-                        } else {
-                            s.color(theme::text())
+                                .border_color(theme::text()),
+                            CellInk::Plain => s.color(theme::text()),
                         }
                     })
                     .into_any()
@@ -8752,6 +8813,62 @@ mod tests {
             cell_shape(CellEditor::Date, ""),
             CellShape::Calendar(CellEditor::Date)
         );
+    }
+
+    /// **A staged SQL NULL and a staged string spelling `NULL` are different
+    /// writes, so they cannot paint the same.** Copy a NULL cell and paste it and
+    /// the clipboard's display text comes back as the four characters — by
+    /// design, since nothing may reinterpret a block that came from outside — so
+    /// the grid is where the difference has to be visible, before the Commit that
+    /// writes `middle_name = 'NULL'` into a column where `IS NULL` will then never
+    /// match it again.
+    ///
+    /// Both are still white on the green fill: the fill is what says "staged",
+    /// and it stays the same claim. The italic is the absence, which is the
+    /// treatment a NULL *original* has always had.
+    #[test]
+    fn a_staged_null_does_not_paint_like_a_staged_word_null() {
+        let sql_null: Option<Option<String>> = Some(None);
+        let the_word: Option<Option<String>> = Some(Some("NULL".to_string()));
+        assert_ne!(
+            cell_ink(sql_null.as_ref(), false, false, false),
+            cell_ink(the_word.as_ref(), false, false, false),
+            "a staged NULL and a staged \"NULL\" are the two writes this cell \
+             could make; nothing else in the grid tells them apart"
+        );
+        assert_eq!(
+            cell_ink(sql_null.as_ref(), false, false, false),
+            CellInk::StagedNull
+        );
+        assert_eq!(
+            cell_ink(the_word.as_ref(), false, false, false),
+            CellInk::Staged
+        );
+        // Any other staged text is ordinary staged text — the case above is not a
+        // rule about the string `NULL`, it is a rule about a staged *absence*.
+        let other: Option<Option<String>> = Some(Some("Ada".to_string()));
+        assert_eq!(
+            cell_ink(other.as_ref(), false, false, false),
+            CellInk::Staged
+        );
+        // A staged value outranks every unstaged treatment, including a NULL
+        // original underneath it and the FK underline.
+        assert_eq!(
+            cell_ink(the_word.as_ref(), true, true, true),
+            CellInk::Staged
+        );
+    }
+
+    /// And the four unstaged weightings, in the painter's own order — a NULL
+    /// original outranks the foreign-key underline, because there is no key in
+    /// the cell to follow.
+    #[test]
+    fn an_unstaged_cell_keeps_the_weighting_it_always_had() {
+        assert_eq!(cell_ink(None, true, false, false), CellInk::Absent);
+        assert_eq!(cell_ink(None, false, true, false), CellInk::Absent);
+        assert_eq!(cell_ink(None, true, false, true), CellInk::Absent);
+        assert_eq!(cell_ink(None, false, false, true), CellInk::Fk);
+        assert_eq!(cell_ink(None, false, false, false), CellInk::Plain);
     }
 
     /// The same seam [`fitting_editor`] guards, on the cell's side: MySQL's
