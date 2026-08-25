@@ -379,6 +379,40 @@ pub(crate) fn in_ring_button<V: IntoView + 'static>(
         .into_any()
 }
 
+/// A view that answers the keyboard like a button, with **no** [`FocusRing`] to
+/// join.
+///
+/// [`in_ring_button`] is this contract inside a modal's Tab order. This is the one
+/// for a form that has no ring — the row panel, whose fields join floem's own
+/// traversal — and the difference is only the registration: `keyboard_navigable`
+/// instead of `in_focus_ring`.
+///
+/// Enter and Space press it and stop there; **every other key carries on**, so Tab
+/// still walks past and the panel's Escape still reaches the panel.
+pub(crate) fn key_pressable<V: IntoView + 'static>(
+    view: V,
+    radius: f64,
+    on_press: impl Fn() + 'static,
+) -> AnyView {
+    container(view)
+        .style(move |s| button_focus_ring(s, radius).flex_shrink(0.0_f32))
+        .keyboard_navigable()
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            if matches!(
+                ke.key.logical_key,
+                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter)
+            ) {
+                on_press();
+                return EventPropagation::Stop;
+            }
+            EventPropagation::Continue
+        })
+        .into_any()
+}
+
 /// [`in_ring_button`] for a control in a **toolbar strip** rather than a modal
 /// form — the results grid's icon cluster, which is the app's first ring outside
 /// an overlay.
