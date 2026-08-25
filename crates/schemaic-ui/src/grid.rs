@@ -30,7 +30,7 @@ use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_key, refetch_template, row_key};
 use schemaic_core::export::{ExportFormat, suggested_filename};
-use schemaic_core::filter::{FilterError, build_query, eq_condition};
+use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_statement};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
@@ -628,9 +628,15 @@ impl GridState {
         }
     }
 
-    /// The statement that produced the result currently on screen, for a re-run
-    /// that changes nothing about the query itself — the capped notice's "read
-    /// N rows".
+    /// The statement that produced the result currently on screen and **may be
+    /// executed a second time**, for a re-run that changes nothing about the
+    /// query itself — the capped notice's "read N rows", the export's "All rows".
+    ///
+    /// A two-line wrapper over [`rerun_statement`], which is where both halves
+    /// of the decision live and are tested: the rewrite, and the write guard.
+    /// The guard is not spelled out again here on purpose — a term a caller can
+    /// delete is a term the suite cannot hold, and this call site had no test at
+    /// all while the pure predicate beside it had a full table of them.
     ///
     /// **Not [`GridState::apply_grid_query`]**, which is the wrong tool here even
     /// though it would usually work: it treats a base it cannot rewrite as a
@@ -644,13 +650,7 @@ impl GridState {
     /// again rather than caching the answer.
     fn current_statement(&self) -> Option<String> {
         let base = self.base_sql.get_untracked()?;
-        let gq = self.grid_query.get_untracked();
-        if gq.is_empty() {
-            return Some(base);
-        }
-        build_query(&base, &gq.filter, &gq.sort, self.dialect)
-            .ok()
-            .flatten()
+        rerun_statement(&base, &self.grid_query.get_untracked(), self.dialect)
     }
 
     /// Append a cell-derived condition (`col = 'val'` / `IS NULL` / negated) to the
@@ -1848,13 +1848,17 @@ fn export_menu(
     let truncated = gs.rs.with_untracked(|rs| rs.truncated);
     // **The write guard reaches this menu too.** "All rows" re-executes the
     // statement, so it is a path running user SQL and answers to
-    // `sql::rerunnable_for_export` — a flat refusal rather than a `Confirm`,
+    // `filter::rerun_statement`'s refusal — flat rather than a `Confirm`,
     // because a Save dialog is not a moment at which to ask whether to run an
     // `UPDATE … RETURNING` again. Not offering it is the whole enforcement: the
     // scope cannot be chosen, so it cannot be requested.
-    let rerunnable = gs
-        .current_statement()
-        .is_some_and(|sql| schemaic_core::sql::rerunnable_for_export(&sql, gs.dialect));
+    //
+    // The refusal is *inside* `current_statement`, not a second term ANDed onto
+    // it here, and that is the fix rather than a tidy-up: the term this line
+    // used to carry could be deleted with the whole suite still green, and
+    // `save_export` re-read the same signal at click time without re-asking it.
+    // One tested function, asked by everything that re-runs.
+    let rerunnable = gs.current_statement().is_some();
     if !truncated || !rerunnable {
         return per_format(false);
     }
@@ -6392,11 +6396,27 @@ fn grid_toolbar(
     // disagree with the first. So the label names the number rather than saying
     // "more", and the verb is *read*, not *load*.
     //
-    // Shown only where the re-run can actually happen — `apply_grid_query`
-    // rebuilds the statement from `base_sql`, which a Run Everything panel does
-    // not have. A missing action beats one that does nothing.
+    // Shown only where the re-run can actually happen — the statement is rebuilt
+    // from `base_sql`, which a Run Everything panel does not have. A missing
+    // action beats one that does nothing.
+    //
+    // **And only where it may happen.** The offer is gated on the *content* of
+    // the statement, not on `base_sql` merely existing: `base_sql` is a tab
+    // signal that every manual run overwrites, for any statement kind, so a
+    // capped `SELECT` followed by a `DELETE` used to leave this link drawn over
+    // the new base — and clicking it re-ran the `DELETE`, through `apply_view`,
+    // which is a bare run with no verdict. `rerun_statement` refuses a write
+    // outright (see its doc for why a `Confirm` would be the wrong answer from a
+    // link that says *read*), and the click below asks it again.
     let read_more = dyn_container(
-        move || truncated && gs.base_sql.get().is_some(),
+        move || {
+            truncated
+                && gs.base_sql.with(|b| {
+                    b.as_deref().is_some_and(|base| {
+                        rerun_statement(base, &gs.grid_query.get(), gs.dialect).is_some()
+                    })
+                })
+        },
         move |show| {
             if !show {
                 return empty().into_any();

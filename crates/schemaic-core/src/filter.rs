@@ -149,6 +149,43 @@ pub fn build_query(
     Ok(Some(stmts[0].to_string()))
 }
 
+/// The statement to **re-run** for a result already on screen, or `None` when
+/// there isn't one — the capped notice's "read N rows" and the whole-table
+/// export's "All rows".
+///
+/// Composes the two halves the callers used to hold apart: *what* would run
+/// ([`build_query`], or the base verbatim when the grid has no filter or sort)
+/// and *whether it may* ([`crate::sql::rerunnable_for_export`]). The write guard
+/// is asked about the string that would actually be dispatched, so there is no
+/// arrangement of base and filter that gets a write past it.
+///
+/// **Why the guard is here and not at the call sites.** Both callers are a UI
+/// affordance that is not a Run — a link that says *read*, and a format picked
+/// from a Save dialog — so neither has a moment at which to raise "this modifies
+/// data, run it again?". A flat refusal is the only honest answer, which is why
+/// this returns `None` rather than a verdict with a `Confirm` arm: strictly
+/// stronger than [`crate::sql::run_verdict`], never weaker. Deciding it here
+/// also means the offer's predicate and the click ask one tested function
+/// instead of two reads of one signal.
+///
+/// `build_query` refuses anything that is not a single-table `SELECT`, so a
+/// filtered result could never carry a write; an *unfiltered* one skips the
+/// rewrite entirely and reached the run path with whatever the user last typed,
+/// which is the hole this closes.
+pub fn rerun_statement(base: &str, gq: &GridQuery, dialect: SqlDialect) -> Option<String> {
+    let sql = if gq.is_empty() {
+        base.to_string()
+    } else {
+        build_query(base, &gq.filter, &gq.sort, dialect)
+            .ok()
+            .flatten()?
+    };
+    if sql.trim().is_empty() {
+        return None;
+    }
+    crate::sql::rerunnable_for_export(&sql, dialect).then_some(sql)
+}
+
 /// Build a `WHERE`-fragment for the cell right-click "Filter by / Exclude value"
 /// actions, ready to append (with ` AND `) into the filter field. `value` is the
 /// cell's raw text, or `None` for a NULL cell.
@@ -478,6 +515,102 @@ mod tests {
     fn build(base: &str, filter: &str, sort: &[(&str, bool)], d: SqlDialect) -> Option<String> {
         let sort: Vec<(String, bool)> = sort.iter().map(|(c, a)| (c.to_string(), *a)).collect();
         build_query(base, filter, &sort, d).unwrap()
+    }
+
+    const EVERY_DIALECT: [SqlDialect; 3] =
+        [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+
+    // ── rerun_statement: which SQL may be executed a second time ──────────
+    //
+    // The decision the two re-run affordances (the capped notice's "read N
+    // rows", the export's "All rows") ask. Both used to compose two tested
+    // functions through an untested `GridState` method, which is where the
+    // write guard went missing; these tests are that composition.
+
+    fn rerun(base: &str, filter: &str, sort: &[(&str, bool)], d: SqlDialect) -> Option<String> {
+        let gq = GridQuery {
+            filter: filter.to_string(),
+            sort: sort.iter().map(|(c, a)| (c.to_string(), *a)).collect(),
+        };
+        rerun_statement(base, &gq, d)
+    }
+
+    /// With nothing in the filter bar the base *is* the statement — including a
+    /// base [`build_query`] cannot rewrite. This is the property the read-more
+    /// link exists for: a join or a CTE is perfectly re-runnable at a bigger cap.
+    #[test]
+    fn an_unfiltered_read_reruns_as_itself_even_when_it_cannot_be_rewritten() {
+        for d in EVERY_DIALECT {
+            assert_eq!(
+                rerun("SELECT * FROM rental", "", &[], d).as_deref(),
+                Some("SELECT * FROM rental")
+            );
+            // A join: `build_query` returns `Ok(None)` for it, and re-running it
+            // must still be offered.
+            let join = "SELECT * FROM a JOIN b ON a.id = b.a_id";
+            assert_eq!(rerun(join, "", &[], d).as_deref(), Some(join), "{d:?}");
+            // As does a CTE.
+            let cte = "WITH c AS (SELECT 1 AS n) SELECT * FROM c";
+            assert_eq!(rerun(cte, "", &[], d).as_deref(), Some(cte), "{d:?}");
+        }
+    }
+
+    /// A filter or sort re-runs the *rewrite*, not the base.
+    #[test]
+    fn a_filtered_read_reruns_the_rewritten_statement() {
+        let sql = rerun("SELECT * FROM t", "a > 1", &[], SqlDialect::Postgres)
+            .expect("a filtered simple SELECT is rewritable and re-runnable");
+        assert!(sql.contains("WHERE"), "{sql}");
+        assert!(sql.contains("a > 1"), "{sql}");
+        // And a base the rewrite cannot handle, *with* a filter, has no
+        // statement — that case is a filter failure the caller reports.
+        assert_eq!(
+            rerun(
+                "SELECT * FROM a JOIN b ON a.id = b.a_id",
+                "a > 1",
+                &[],
+                SqlDialect::Postgres
+            ),
+            None
+        );
+    }
+
+    /// **The write guard.** Each of these returns rows, so each can reach a
+    /// truncated grid and be offered a re-run from an affordance that says
+    /// *read*. `rerunnable_for_export` refused them all along; nothing composed
+    /// it with the statement the re-run would actually dispatch.
+    #[test]
+    fn a_row_returning_write_has_no_rerun_statement() {
+        for d in EVERY_DIALECT {
+            for sql in [
+                "UPDATE orders SET n = n + 1 RETURNING *",
+                "INSERT INTO t (a) VALUES (1) RETURNING id",
+                "DELETE FROM t WHERE id = 1 RETURNING *",
+                "WITH moved AS (DELETE FROM a RETURNING *) SELECT * FROM moved",
+                // A stored procedure returns rows and may write anything at all.
+                // Asserted on every dialect, unlike the predicate's own test.
+                "CALL restock()",
+            ] {
+                assert_eq!(rerun(sql, "", &[], d), None, "{d:?}: {sql} must not re-run");
+                // And not by way of a filter either: the guard asks about the
+                // string that would be dispatched, whatever built it.
+                assert_eq!(
+                    rerun(sql, "n > 0", &[], d),
+                    None,
+                    "{d:?}: {sql} must not re-run with a filter either"
+                );
+            }
+        }
+    }
+
+    /// An empty base is not a statement. `contains_write("")` is `false`, so a
+    /// bare "is it a write?" gate says yes to it.
+    #[test]
+    fn a_blank_base_has_no_rerun_statement() {
+        for d in EVERY_DIALECT {
+            assert_eq!(rerun("", "", &[], d), None, "{d:?}");
+            assert_eq!(rerun("   \n\t ", "", &[], d), None, "{d:?}");
+        }
     }
 
     // ── table_query: the generated "open this table" statement ────────────
