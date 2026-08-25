@@ -537,6 +537,81 @@ fn write_mode(path: &Path, bytes: &[u8], exclusive: bool) -> std::io::Result<()>
     f.write_all(bytes)
 }
 
+/// Open `path` for **appending**, owner-only where the platform supports it —
+/// [`write_private`]'s rule for a file that is written a line at a time rather
+/// than replaced.
+///
+/// The log is the caller: it carries the SSH tunnel's account and endpoints, the
+/// DB username and the client's source IP out of server error text, fragments of
+/// the user's own SQL (MySQL error 1064 quotes the offending statement), the full
+/// path of a SQLite database that failed to open, and every panic payload and
+/// backtrace. `OpenOptions` with no `.mode(…)` creates at `0o666 & !umask` — 0644
+/// under the usual one — so on a shared Unix host every other local account could
+/// read all of that, while every *config* write in the same directory was
+/// deliberately 0600.
+///
+/// It lives here rather than in the logger for the reason `write_mode` gives:
+/// one place knows the mode. On Windows the file inherits the user profile's ACL
+/// and there is nothing to narrow.
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[allow(unused_mut)]
+    let mut f = opts.open(path)?;
+    // As in `write_mode`: the mode applies only on creation, so a file an older
+    // build already created 0644 keeps it. Narrowed through the open handle, so
+    // there is no path to re-resolve and no TOCTOU. A rotation is a `rename`,
+    // which preserves the inode, so `schemaic.log.1` inherits whatever this set.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = &mut f;
+    Ok(f)
+}
+
+/// The log file this process is **actually writing**, once whoever opened it has
+/// said so — `None` until then, and `None` for good if the open failed.
+///
+/// A process global rather than a value threaded through the UI, and a *fact*
+/// rather than a derivation: the Settings row that answers "where is the log" used
+/// to build a path out of `config_dir()`, which performs no I/O, so on a machine
+/// whose config directory exists but is not writable it named a file nobody had
+/// written. The one row whose purpose is to be trusted about this has to ask the
+/// writer.
+static ACTIVE_LOG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the log this process opened (or `None` if it could not). First call
+/// wins; the logger calls it once at startup.
+pub fn set_active_log(path: Option<PathBuf>) {
+    let _ = ACTIVE_LOG.set(path);
+}
+
+/// [`set_active_log`]'s answer.
+pub fn active_log() -> Option<PathBuf> {
+    ACTIVE_LOG.get().cloned().flatten()
+}
+
+/// Create `dir` (and its parents) and narrow it to owner-only — what every
+/// creator of the config directory owes, rather than whichever one happens to run
+/// first deciding for the rest.
+///
+/// The logger runs before any config write, so on a fresh install the directory
+/// used to be created 0755 by `logging::init` and narrowed only later, by the
+/// first save.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    make_dir_private(dir);
+    Ok(())
+}
+
 /// Narrow `dir` to owner-only on Unix (best effort). Applied to our own config
 /// directory, so anything added to it later is protected by default rather than
 /// by each writer remembering.

@@ -27,7 +27,7 @@
 //! still calls the hook it replaced, so a debug build keeps its console
 //! message.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -129,10 +129,16 @@ pub fn init() {
     let filter = filter_for(std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref());
 
     let Some(file) = open_log() else {
+        // **Recorded, so the Settings row can stop promising a file.** The warning
+        // below goes to a console a release build does not have, and the row that
+        // answers "where is the log" was deriving a path from `config_dir()` — a
+        // question about an environment variable, not about a writer.
+        schemaic_core::persist::set_active_log(None);
         tracing_subscriber::fmt().with_env_filter(filter).init();
-        tracing::warn!("no config directory — logging to stdout only");
+        tracing::warn!("no writable config directory — logging to stdout only");
         return;
     };
+    schemaic_core::persist::set_active_log(log_path());
 
     let writer = FileWriter(Arc::new(Mutex::new(file)));
     // ANSI off: the escape codes are noise in a file, and this writer is the one
@@ -163,7 +169,11 @@ pub fn init() {
 fn open_log() -> Option<File> {
     let path = log_path()?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok()?;
+        // **This is the first thing that creates the config directory** —
+        // `logging::init` runs before any config load or save — so it is the one
+        // that owes the 0700, rather than leaving the directory 0755 until the
+        // first save narrows it.
+        schemaic_core::persist::ensure_private_dir(dir).ok()?;
     }
     if std::fs::metadata(&path).is_ok_and(|m| should_rotate(m.len())) {
         // Replaces any previous generation. Best-effort: if the rename fails
@@ -171,11 +181,14 @@ fn open_log() -> Option<File> {
         // oversized log beats not logging.
         let _ = std::fs::rename(&path, path.with_extension("log.1"));
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok()
+    // Owner-only, through the one place that knows the mode
+    // (`persist::open_private_append`). Not a credential at the default filter —
+    // that is the `russh` floor's job — but the SSH tunnel's account and
+    // endpoints, the DB username, the client's source IP out of server error
+    // text, fragments of the user's SQL, a SQLite path and every panic backtrace
+    // are all in here, and every config write in the same directory has always
+    // been 0600 for less.
+    schemaic_core::persist::open_private_append(&path).ok()
 }
 
 /// Route panics through the log file, then on to the hook we replaced.

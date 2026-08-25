@@ -8679,7 +8679,10 @@ fn open_config_dir() {
         tracing::warn!("no config directory to open");
         return;
     };
-    let _ = std::fs::create_dir_all(&dir);
+    // Owner-only if we are the one creating it — the same rule the logger and
+    // every config write follow, and this button is one of the three places that
+    // can bring the directory into existence.
+    let _ = schemaic_core::persist::ensure_private_dir(&dir);
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("explorer").arg(&dir).spawn();
