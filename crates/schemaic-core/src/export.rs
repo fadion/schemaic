@@ -92,11 +92,12 @@ impl ExportFormat {
         source: Option<(&str, Option<&str>, &str)>,
         dialect: SqlDialect,
     ) -> String {
-        to_string(|w| self.render_to(w, rs, order, source, dialect))
+        to_string(|w| self.render_to(w, rs, order, source, dialect).map(|_| ()))
     }
 
     /// Stream the same rendering into `w` — the file export's path, so a large
-    /// result never exists twice in memory. Identical output to [`Self::render`].
+    /// result never exists twice in memory. Identical output to [`Self::render`],
+    /// returning the number of rows written.
     ///
     /// Errors are the writer's own (a full disk, a revoked permission). They must
     /// reach the user: unlike the buffered path, which either produced the whole
@@ -109,14 +110,162 @@ impl ExportFormat {
         order: &[usize],
         source: Option<(&str, Option<&str>, &str)>,
         dialect: SqlDialect,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
+        self.stream_to(w, &mut OneChunk::new(rs, order), source, dialect)
+    }
+
+    /// Stream this rendering from a [`RowChunks`] source, returning the number of
+    /// rows written — what an export of a whole table uses, where the rows arrive
+    /// from the server in blocks and must reach the file as they come rather than
+    /// be gathered first.
+    ///
+    /// [`Self::render_to`] is this over a source of one chunk, so the two cannot
+    /// drift: there is one renderer per format, not a buffered one and a streamed
+    /// one that have to be kept in agreement.
+    pub fn stream_to<W: Write>(
+        self,
+        w: &mut W,
+        src: &mut dyn RowChunks,
+        source: Option<(&str, Option<&str>, &str)>,
+        dialect: SqlDialect,
+    ) -> io::Result<u64> {
         match self {
-            ExportFormat::Json => export_json_to(w, rs, order),
-            ExportFormat::Csv => export_csv_to(w, rs, order),
-            ExportFormat::Sql => export_inserts_to(w, rs, order, source, dialect),
-            ExportFormat::Markdown => export_markdown_to(w, rs, order),
-            ExportFormat::Html => export_html_to(w, rs, order),
+            ExportFormat::Json => export_json_chunks(w, src),
+            ExportFormat::Csv => export_csv_chunks(w, src),
+            ExportFormat::Sql => export_inserts_chunks(w, src, source, dialect),
+            ExportFormat::Markdown => export_markdown_chunks(w, src),
+            ExportFormat::Html => export_html_chunks(w, src),
         }
+    }
+}
+
+/// One block of rows on its way out — a [`ResultSet`] and the rows to take from
+/// it, as display indices into it.
+///
+/// Every chunk of one export must carry the **same columns**: the header is
+/// written from the first chunk and never revisited, so a source that changed
+/// them mid-stream would produce a file whose header describes only its opening
+/// rows.
+pub struct RowChunk<'a> {
+    pub rs: &'a ResultSet,
+    pub order: &'a [usize],
+}
+
+/// A pull source of rows for an export.
+///
+/// **The reason exports take one of these rather than a `&ResultSet`.** A result
+/// the grid is showing is bounded by the row cap and already in memory, so
+/// handing it over whole costs nothing; a *table* export is neither. Materialising
+/// 2 million rows to render them would hold the table twice over and run into the
+/// 512 MiB per-column arena ceiling, which does not fail — it blanks the cells
+/// past it ([`ResultSet::capped_columns`]) — so the export would quietly write a
+/// file with holes in it. Pulling chunks bounds the memory at one chunk and lets
+/// the rows go to disk as they come off the wire.
+///
+/// **Pull and not push**, because JSON decides it. Its renderer holds a
+/// `serde_json` sequence serializer open across the whole array, borrowing the
+/// writer; a push API would have to store that across calls and it is not a type
+/// that can be stored. Inverting it keeps the serializer a local in one function,
+/// which is also what keeps the five formats to one implementation each — the
+/// `export_*_to` entry points are this same code over a source of exactly one
+/// chunk ([`OneChunk`]), not a second copy of it.
+///
+/// The lifetime on the returned chunk ties it to the borrow of `self`, so a
+/// source may hand out a view of a buffer it reuses: only one chunk is alive at
+/// a time, by construction.
+pub trait RowChunks {
+    /// The next block of rows, or `None` when the source is exhausted.
+    ///
+    /// An error aborts the export. It is an [`io::Error`] because that is what
+    /// the writer already returns and what the caller must report either way — a
+    /// source that fails for its own reasons (a dropped connection, a cancelled
+    /// export) wraps that reason in one.
+    fn next_chunk(&mut self) -> io::Result<Option<RowChunk<'_>>>;
+}
+
+/// A [`RowChunks`] over one already-materialised result — what the grid's export
+/// uses.
+///
+/// It yields exactly one chunk, **even when the result has no rows**, which is
+/// load-bearing rather than an edge case: CSV, Markdown and HTML take their
+/// header from the first chunk, so a source that yielded nothing for an empty
+/// result would write an empty file where the old code wrote a header.
+pub struct OneChunk<'a> {
+    rs: &'a ResultSet,
+    order: &'a [usize],
+    done: bool,
+}
+
+impl<'a> OneChunk<'a> {
+    pub fn new(rs: &'a ResultSet, order: &'a [usize]) -> Self {
+        OneChunk {
+            rs,
+            order,
+            done: false,
+        }
+    }
+}
+
+impl RowChunks for OneChunk<'_> {
+    fn next_chunk(&mut self) -> io::Result<Option<RowChunk<'_>>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        Ok(Some(RowChunk {
+            rs: self.rs,
+            order: self.order,
+        }))
+    }
+}
+
+/// A [`RowChunks`] over whole result sets pulled from `next` — every row of each,
+/// in the order the server sent them.
+///
+/// The adapter between a loader that produces results and an export that consumes
+/// rows. `next` blocks: on the export's own thread that is the point, since the
+/// alternative is a buffer that grows to whatever the disk is behind by.
+///
+/// The natural order is materialised as a `Vec<usize>` rather than threaded
+/// through the renderers as an `Option`, and the buffer is **reused** across
+/// chunks — a chunk is thousands of rows, so this is one allocation for the whole
+/// export, against five renderers that would each need a second code path.
+pub struct PullChunks<F> {
+    next: F,
+    cur: Option<ResultSet>,
+    order: Vec<usize>,
+}
+
+impl<F> PullChunks<F>
+where
+    F: FnMut() -> io::Result<Option<ResultSet>>,
+{
+    pub fn new(next: F) -> Self {
+        PullChunks {
+            next,
+            cur: None,
+            order: Vec::new(),
+        }
+    }
+}
+
+impl<F> RowChunks for PullChunks<F>
+where
+    F: FnMut() -> io::Result<Option<ResultSet>>,
+{
+    fn next_chunk(&mut self) -> io::Result<Option<RowChunk<'_>>> {
+        let Some(rs) = (self.next)()? else {
+            return Ok(None);
+        };
+        let n = rs.row_count();
+        self.order.clear();
+        self.order.extend(0..n);
+        self.cur = Some(rs);
+        Ok(Some(RowChunk {
+            // `cur` was just assigned, so the borrow is of a live value.
+            rs: self.cur.as_ref().expect("just assigned"),
+            order: &self.order,
+        }))
     }
 }
 
@@ -360,22 +509,50 @@ impl serde::Serialize for RowObject<'_> {
 /// Serializing the array element-by-element through a `serde_json::Serializer`
 /// emits the same pretty output while only ever holding one row.
 pub fn export_json_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
+    export_json_chunks(w, &mut OneChunk::new(rs, order)).map(|_| ())
+}
+
+/// [`export_json_to`] over a [`RowChunks`] source — the form the whole-table
+/// export uses, and the one the single-result form above is a special case of.
+/// Returns the number of rows written.
+///
+/// The `serialize_seq` handle stays open across every chunk, so the array is one
+/// array however many chunks it took: the keys are derived from the first chunk's
+/// columns and reused, since a source that changed them mid-stream would already
+/// have broken every other format's header.
+pub fn export_json_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
     use serde::ser::{SerializeSeq, Serializer as _};
 
-    let keys = unique_column_keys(rs);
-    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
     let mut ser = serde_json::Serializer::pretty(w);
     let mut seq = ser.serialize_seq(None).map_err(io::Error::other)?;
-    for &di in order.iter().filter(|&&di| di < rs.row_count()) {
-        seq.serialize_element(&RowObject {
-            rs,
-            keys: &keys,
-            mask: &mask,
-            di,
-        })
-        .map_err(io::Error::other)?;
+    let mut keys: Vec<String> = Vec::new();
+    let mut first = true;
+    let mut written = 0_u64;
+    while let Some(c) = src.next_chunk()? {
+        if first {
+            keys = unique_column_keys(c.rs);
+            first = false;
+        }
+        // Per chunk, not once: whether a binary column's text is a placeholder
+        // this codebase generated is a fact about the *rows in hand*, and a
+        // streamed export never has them all at once. A column carrying real
+        // bytes in one chunk and a placeholder in the next is withheld only
+        // where it is a placeholder, which is the same rule the one-shot path
+        // applies to the only chunk it has.
+        let mask = binary_mask(c.rs, &dropped_binary_columns(c.rs, c.order));
+        for &di in c.order.iter().filter(|&&di| di < c.rs.row_count()) {
+            seq.serialize_element(&RowObject {
+                rs: c.rs,
+                keys: &keys,
+                mask: &mask,
+                di,
+            })
+            .map_err(io::Error::other)?;
+            written += 1;
+        }
     }
-    seq.end().map_err(io::Error::other)
+    seq.end().map_err(io::Error::other)?;
+    Ok(written)
 }
 
 /// Column names made unique for use as JSON object keys: a repeated name gets a
@@ -459,35 +636,53 @@ pub fn export_csv(rs: &ResultSet, order: &[usize]) -> String {
 
 /// [`export_csv`], streamed.
 pub fn export_csv_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
-    // CSV is a format Schemaic reads back, so a blob's placeholder must not go
-    // out in it — see [`dropped_binary_columns`]. An empty field, which is
-    // already how this format renders NULL.
-    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
-    for (ci, c) in rs.columns.iter().enumerate() {
-        if ci > 0 {
-            w.write_all(b",")?;
-        }
-        w.write_all(csv_field(&c.name).as_bytes())?;
-    }
-    w.write_all(b"\n")?;
-    for &di in order {
-        if di >= rs.row_count() {
-            continue;
-        }
-        for ci in 0..rs.columns.len() {
-            if ci > 0 {
-                w.write_all(b",")?;
+    export_csv_chunks(w, &mut OneChunk::new(rs, order)).map(|_| ())
+}
+
+/// [`export_csv_to`] over a [`RowChunks`] source. Returns the rows written.
+///
+/// The header comes from the **first** chunk and is written once — which is why
+/// [`OneChunk`] yields even for an empty result, so a header-only CSV stays a
+/// header-only CSV rather than an empty file.
+pub fn export_csv_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
+    let mut first = true;
+    let mut written = 0_u64;
+    while let Some(c) = src.next_chunk()? {
+        if first {
+            for (ci, col) in c.rs.columns.iter().enumerate() {
+                if ci > 0 {
+                    w.write_all(b",")?;
+                }
+                w.write_all(csv_field(&col.name).as_bytes())?;
             }
-            match rs.cell(di, ci) {
-                None => {}
-                Some(c) if c.is_null() => {}
-                Some(c) if withheld_binary(&mask, ci, &c) => {}
-                Some(c) => w.write_all(csv_field(c.display()).as_bytes())?,
-            }
+            w.write_all(b"\n")?;
+            first = false;
         }
-        w.write_all(b"\n")?;
+        // CSV is a format Schemaic reads back, so a blob's placeholder must not
+        // go out in it — see [`dropped_binary_columns`]. An empty field, which
+        // is already how this format renders NULL. Per chunk, for the reason
+        // given in [`export_json_chunks`].
+        let mask = binary_mask(c.rs, &dropped_binary_columns(c.rs, c.order));
+        for &di in c.order {
+            if di >= c.rs.row_count() {
+                continue;
+            }
+            for ci in 0..c.rs.columns.len() {
+                if ci > 0 {
+                    w.write_all(b",")?;
+                }
+                match c.rs.cell(di, ci) {
+                    None => {}
+                    Some(cell) if cell.is_null() => {}
+                    Some(cell) if withheld_binary(&mask, ci, &cell) => {}
+                    Some(cell) => w.write_all(csv_field(cell.display()).as_bytes())?,
+                }
+            }
+            w.write_all(b"\n")?;
+            written += 1;
+        }
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Escape a Markdown table cell. A `|` starts a new column, so it must be
@@ -519,37 +714,52 @@ pub fn export_markdown(rs: &ResultSet, order: &[usize]) -> String {
 
 /// [`export_markdown`], streamed.
 pub fn export_markdown_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
-    let n = rs.columns.len();
-    // One row's cells, already escaped, as `| a | b |`. The separator row is a
-    // fixed `---` per column, so no pass over the data is needed to size them.
-    // Mirrors the old `format!("| {} |\n", cells.join(" | "))` exactly, including
-    // the degenerate zero-column case (`|  |`).
-    let row_line = |w: &mut W, cells: &mut dyn Iterator<Item = String>| -> io::Result<()> {
-        w.write_all(b"| ")?;
-        for (i, cell) in cells.enumerate() {
-            if i > 0 {
-                w.write_all(b" | ")?;
-            }
-            w.write_all(cell.as_bytes())?;
+    export_markdown_chunks(w, &mut OneChunk::new(rs, order)).map(|_| ())
+}
+
+/// One row's cells, already escaped, as `| a | b |`. The separator row is a fixed
+/// `---` per column, so no pass over the data is needed to size them — which is
+/// what lets Markdown stream at all. Mirrors the original
+/// `format!("| {} |\n", cells.join(" | "))` exactly, including the degenerate
+/// zero-column case (`|  |`).
+fn md_row_line<W: Write>(w: &mut W, cells: &mut dyn Iterator<Item = String>) -> io::Result<()> {
+    w.write_all(b"| ")?;
+    for (i, cell) in cells.enumerate() {
+        if i > 0 {
+            w.write_all(b" | ")?;
         }
-        w.write_all(b" |\n")
-    };
-    row_line(w, &mut rs.columns.iter().map(|c| md_cell(&c.name)))?;
-    row_line(w, &mut (0..n).map(|_| "---".to_string()))?;
-    for &di in order {
-        if di >= rs.row_count() {
-            continue;
-        }
-        row_line(
-            w,
-            &mut (0..n).map(|ci| match rs.cell(di, ci) {
-                None => String::new(),
-                Some(c) if c.is_null() => String::new(),
-                Some(c) => md_cell(c.display()),
-            }),
-        )?;
+        w.write_all(cell.as_bytes())?;
     }
-    Ok(())
+    w.write_all(b" |\n")
+}
+
+/// [`export_markdown_to`] over a [`RowChunks`] source. Returns the rows written.
+pub fn export_markdown_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
+    let mut first = true;
+    let mut written = 0_u64;
+    while let Some(c) = src.next_chunk()? {
+        let n = c.rs.columns.len();
+        if first {
+            md_row_line(w, &mut c.rs.columns.iter().map(|col| md_cell(&col.name)))?;
+            md_row_line(w, &mut (0..n).map(|_| "---".to_string()))?;
+            first = false;
+        }
+        for &di in c.order {
+            if di >= c.rs.row_count() {
+                continue;
+            }
+            md_row_line(
+                w,
+                &mut (0..n).map(|ci| match c.rs.cell(di, ci) {
+                    None => String::new(),
+                    Some(cell) if cell.is_null() => String::new(),
+                    Some(cell) => md_cell(cell.display()),
+                }),
+            )?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 /// The whole result as an HTML `<table>` (thead + tbody). Cells/headers are
@@ -562,36 +772,57 @@ pub fn export_html(rs: &ResultSet, order: &[usize]) -> String {
 /// [`export_html`], streamed. The preamble and closing tags are fixed strings, so
 /// nothing here needs to see the whole result first.
 pub fn export_html_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
-    // The charset declaration is not optional. The bytes written here are UTF-8,
-    // but for a `file://` URL with no declaration and no BOM the HTML spec leaves
-    // the default to the user agent — windows-1252 in Western locales — so
-    // `José` opened as `JosÃ©`. Chrome dropped its manual encoding override in
-    // 2014, so there was no in-browser workaround; the user had to edit the file.
-    w.write_all(b"<meta charset=\"utf-8\">\n")?;
-    w.write_all(b"<table>\n<thead>\n<tr>")?;
-    for c in &rs.columns {
-        w.write_all(b"<th>")?;
-        w.write_all(html_escape(&c.name).as_bytes())?;
-        w.write_all(b"</th>")?;
-    }
-    w.write_all(b"</tr>\n</thead>\n<tbody>\n")?;
-    for &di in order {
-        if di >= rs.row_count() {
-            continue;
-        }
-        w.write_all(b"<tr>")?;
-        for ci in 0..rs.columns.len() {
-            w.write_all(b"<td>")?;
-            match rs.cell(di, ci) {
-                None => {}
-                Some(c) if c.is_null() => {}
-                Some(c) => w.write_all(html_escape(c.display()).as_bytes())?,
+    export_html_chunks(w, &mut OneChunk::new(rs, order)).map(|_| ())
+}
+
+/// [`export_html_to`] over a [`RowChunks`] source. Returns the rows written.
+///
+/// The closing tags are written **only if the opening ones were** — a source that
+/// yields no chunk at all produces an empty file rather than a `</tbody></table>`
+/// closing a table that was never opened.
+pub fn export_html_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::Result<u64> {
+    let mut opened = false;
+    let mut written = 0_u64;
+    while let Some(c) = src.next_chunk()? {
+        if !opened {
+            // The charset declaration is not optional. The bytes written here are
+            // UTF-8, but for a `file://` URL with no declaration and no BOM the
+            // HTML spec leaves the default to the user agent — windows-1252 in
+            // Western locales — so `José` opened as `JosÃ©`. Chrome dropped its
+            // manual encoding override in 2014, so there was no in-browser
+            // workaround; the user had to edit the file.
+            w.write_all(b"<meta charset=\"utf-8\">\n")?;
+            w.write_all(b"<table>\n<thead>\n<tr>")?;
+            for col in &c.rs.columns {
+                w.write_all(b"<th>")?;
+                w.write_all(html_escape(&col.name).as_bytes())?;
+                w.write_all(b"</th>")?;
             }
-            w.write_all(b"</td>")?;
+            w.write_all(b"</tr>\n</thead>\n<tbody>\n")?;
+            opened = true;
         }
-        w.write_all(b"</tr>\n")?;
+        for &di in c.order {
+            if di >= c.rs.row_count() {
+                continue;
+            }
+            w.write_all(b"<tr>")?;
+            for ci in 0..c.rs.columns.len() {
+                w.write_all(b"<td>")?;
+                match c.rs.cell(di, ci) {
+                    None => {}
+                    Some(cell) if cell.is_null() => {}
+                    Some(cell) => w.write_all(html_escape(cell.display()).as_bytes())?,
+                }
+                w.write_all(b"</td>")?;
+            }
+            w.write_all(b"</tr>\n")?;
+            written += 1;
+        }
     }
-    w.write_all(b"</tbody>\n</table>\n")
+    if opened {
+        w.write_all(b"</tbody>\n</table>\n")?;
+    }
+    Ok(written)
 }
 
 /// The result as `INSERT` statements, in the connection's dialect. `source` is
@@ -718,58 +949,97 @@ pub fn export_inserts_to<W: Write>(
     source: Option<(&str, Option<&str>, &str)>,
     dialect: SqlDialect,
 ) -> io::Result<()> {
+    export_inserts_chunks(w, &mut OneChunk::new(rs, order), source, dialect).map(|_| ())
+}
+
+/// [`export_inserts_to`] over a [`RowChunks`] source. Returns the rows written.
+///
+/// **The `-- NOTE:` line is the one thing here that a stream cannot know up
+/// front.** Which binary columns were withheld is a fact about the rows, and a
+/// streamed export never holds them all: a column can carry its real bytes for a
+/// million rows and hit a blob placeholder in the next chunk. So the note is
+/// emitted the first time a column is actually withheld, naming the ones newly
+/// discovered, and again later only if a further column joins them. Over a single
+/// chunk that collapses to exactly the old behaviour — one note, before the first
+/// `INSERT`, naming every withheld column — which is what
+/// `a_chunked_export_matches_the_same_rows_in_one_go` pins.
+///
+/// A comment and not a refusal, either way: the script still runs, and the one
+/// thing it must not do is pretend the placeholder was the data.
+pub fn export_inserts_chunks<W: Write>(
+    w: &mut W,
+    src: &mut dyn RowChunks,
+    source: Option<(&str, Option<&str>, &str)>,
+    dialect: SqlDialect,
+) -> io::Result<u64> {
     let q = |s: &str| ident_sql(s, dialect);
     let table_sql = match source {
         Some((db, ns, table)) => qualified_table(db, ns, table, dialect),
         None => q("table"),
     };
-    let cols = rs
-        .columns
-        .iter()
-        .map(|c| q(&c.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // A comment, not a refusal: the script still runs, and the one thing it
-    // must not do is pretend the placeholder was the data. Emitted only when a
-    // cell was actually dropped, so an export with nothing to say says nothing.
-    let dropped = dropped_binary_columns(rs, order);
-    let mask = binary_mask(rs, &dropped);
-    if !dropped.is_empty() {
-        writeln!(
-            w,
-            "-- NOTE: binary column{} {} exported as NULL — a text export cannot carry raw bytes.",
-            if dropped.len() == 1 { "" } else { "s" },
-            dropped
-                .iter()
-                .map(|&ci| q(&rs.columns[ci].name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )?;
-    }
-    for &di in order {
-        if di >= rs.row_count() {
-            continue;
+    let mut cols = String::new();
+    let mut noted: Vec<bool> = Vec::new();
+    let mut first = true;
+    let mut written = 0_u64;
+    while let Some(c) = src.next_chunk()? {
+        if first {
+            cols =
+                c.rs.columns
+                    .iter()
+                    .map(|col| q(&col.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            noted = vec![false; c.rs.columns.len()];
+            first = false;
         }
-        write!(w, "INSERT INTO {table_sql} ({cols}) VALUES (")?;
-        for ci in 0..rs.columns.len() {
-            if ci > 0 {
-                w.write_all(b", ")?;
+        let dropped = dropped_binary_columns(c.rs, c.order);
+        let mask = binary_mask(c.rs, &dropped);
+        let fresh: Vec<usize> = dropped
+            .iter()
+            .copied()
+            .filter(|&ci| !noted.get(ci).copied().unwrap_or(true))
+            .collect();
+        if !fresh.is_empty() {
+            for &ci in &fresh {
+                noted[ci] = true;
             }
-            let lit = rs
-                .cell(di, ci)
-                .map(|c| {
-                    if withheld_binary(&mask, ci, &c) {
-                        "NULL".to_string()
-                    } else {
-                        sql_literal(&c.to_value(), dialect)
-                    }
-                })
-                .unwrap_or_else(|| "NULL".to_string());
-            w.write_all(lit.as_bytes())?;
+            writeln!(
+                w,
+                "-- NOTE: binary column{} {} exported as NULL — a text export cannot carry raw bytes.",
+                if fresh.len() == 1 { "" } else { "s" },
+                fresh
+                    .iter()
+                    .map(|&ci| q(&c.rs.columns[ci].name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
         }
-        w.write_all(b");\n")?;
+        for &di in c.order {
+            if di >= c.rs.row_count() {
+                continue;
+            }
+            write!(w, "INSERT INTO {table_sql} ({cols}) VALUES (")?;
+            for ci in 0..c.rs.columns.len() {
+                if ci > 0 {
+                    w.write_all(b", ")?;
+                }
+                let lit =
+                    c.rs.cell(di, ci)
+                        .map(|cell| {
+                            if withheld_binary(&mask, ci, &cell) {
+                                "NULL".to_string()
+                            } else {
+                                sql_literal(&cell.to_value(), dialect)
+                            }
+                        })
+                        .unwrap_or_else(|| "NULL".to_string());
+                w.write_all(lit.as_bytes())?;
+            }
+            w.write_all(b");\n")?;
+            written += 1;
+        }
     }
-    Ok(())
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -796,6 +1066,207 @@ mod tests {
     }
 
     use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+
+    /// Rows with something for every renderer to trip over: a NULL, an embedded
+    /// quote, a pipe and a newline (Markdown), an angle bracket (HTML), a
+    /// backslash (the dialect-sensitive SQL literal), and a non-ASCII glyph.
+    fn awkward_rows() -> (Vec<Column>, Vec<Vec<Value>>) {
+        let cols = vec![col("id"), col("a`b")];
+        let rows = vec![
+            vec![Value::Int(1), Value::Str("x".to_string())],
+            vec![Value::Null, Value::Str("y | z".to_string())],
+            vec![Value::Int(3), Value::Str("line\nbreak".to_string())],
+            vec![Value::Int(4), Value::Str("<b>&\"quoted\"".to_string())],
+            vec![Value::Int(5), Value::Str("back\\slash".to_string())],
+            vec![Value::Int(6), Value::Str("José".to_string())],
+            vec![Value::Int(7), Value::Null],
+        ];
+        (cols, rows)
+    }
+
+    /// Split `rows` into `ResultSet`s of at most `size` rows, as a source.
+    fn chunked(cols: &[Column], rows: &[Vec<Value>], size: usize) -> impl RowChunks {
+        let mut queue: std::collections::VecDeque<ResultSet> = rows
+            .chunks(size)
+            .map(|part| ResultSet::from_rows(cols.to_vec(), part.to_vec()))
+            .collect();
+        PullChunks::new(move || Ok(queue.pop_front()))
+    }
+
+    /// **The seam this whole design rests on.** Every `export_*_to` is now the
+    /// streaming renderer over a source of one chunk, so the only way the two can
+    /// disagree is at a chunk boundary — a header written twice, a JSON array
+    /// closed and reopened, a `-- NOTE:` line that moves. Splitting the same rows
+    /// every possible way and demanding the same bytes is what catches that; a
+    /// test of either half alone would not.
+    #[test]
+    fn a_chunked_export_matches_the_same_rows_in_one_go() {
+        let (cols, rows) = awkward_rows();
+        let whole = ResultSet::from_rows(cols.clone(), rows.clone());
+        let order: Vec<usize> = (0..rows.len()).collect();
+        let src_name = Some(("shop", None, "orders"));
+        for format in ExportFormat::ALL {
+            let one_go = to_string(|w| {
+                format
+                    .render_to(w, &whole, &order, src_name, MySql)
+                    .map(|_| ())
+            })
+            .into_bytes();
+            // Every split from one row per chunk up to one chunk for the lot,
+            // plus a size that leaves a short final chunk.
+            for size in 1..=rows.len() + 1 {
+                let mut src = chunked(&cols, &rows, size);
+                let mut buf = Vec::new();
+                let n = format
+                    .stream_to(&mut buf, &mut src, src_name, MySql)
+                    .expect("writing to a Vec cannot fail");
+                assert_eq!(
+                    String::from_utf8_lossy(&buf),
+                    String::from_utf8_lossy(&one_go),
+                    "{} differs when chunked {size} rows at a time",
+                    format.label()
+                );
+                assert_eq!(
+                    n,
+                    rows.len() as u64,
+                    "{} miscounted its rows at chunk size {size}",
+                    format.label()
+                );
+            }
+        }
+    }
+
+    /// **One empty chunk and no chunk at all are different things**, and the
+    /// distinction is the whole reason [`OneChunk`] yields when it has nothing to
+    /// yield. A result with no rows still knows its columns, so it gets its
+    /// header; a source that ended before producing anything — a query that
+    /// failed before its first block — knows nothing, and a header invented for
+    /// it would describe columns nobody ever saw.
+    #[test]
+    fn an_empty_chunk_carries_a_header_and_no_chunk_carries_nothing() {
+        let (cols, _) = awkward_rows();
+        let empty = ResultSet::from_rows(cols.clone(), vec![]);
+        for format in ExportFormat::ALL {
+            // One empty chunk — what the grid exports for a result with no rows.
+            let one_go = to_string(|w| format.render_to(w, &empty, &[], None, MySql).map(|_| ()));
+            match format {
+                ExportFormat::Csv => assert_eq!(one_go, "id,a`b\n"),
+                ExportFormat::Markdown => assert_eq!(one_go, "| id | a`b |\n| --- | --- |\n"),
+                ExportFormat::Json => assert_eq!(one_go, "[]"),
+                ExportFormat::Html => {
+                    assert!(one_go.contains("<th>id</th>"), "{one_go}");
+                    assert!(one_go.ends_with("</tbody>\n</table>\n"), "{one_go}");
+                }
+                // SQL has no header to write — the column list lives on each
+                // `INSERT`, so no rows means no output at all.
+                ExportFormat::Sql => assert_eq!(one_go, ""),
+            }
+
+            // No chunk at all: `[].chunks(n)` yields nothing, so this is a source
+            // that ended before its first block.
+            let mut src = chunked(&cols, &[], usize::MAX);
+            let mut buf = Vec::new();
+            let n = format
+                .stream_to(&mut buf, &mut src, None, MySql)
+                .expect("writing to a Vec cannot fail");
+            let streamed = String::from_utf8(buf).expect("utf-8");
+            assert_eq!(n, 0, "{} counted rows it never saw", format.label());
+            match format {
+                // The array framing is the format's own, not the data's, so an
+                // empty array is still valid JSON — where a bare header row is a
+                // claim about columns.
+                ExportFormat::Json => assert_eq!(streamed, "[]"),
+                _ => assert_eq!(
+                    streamed,
+                    "",
+                    "{} wrote a header for a source that produced nothing",
+                    format.label()
+                ),
+            }
+        }
+    }
+
+    /// The `-- NOTE:` line is the one piece of SQL output that used to need the
+    /// whole result. A column whose placeholder only shows up in a later chunk
+    /// still gets a note — once, before the rows that dropped it — and a column
+    /// already noted is not announced again.
+    #[test]
+    fn the_binary_note_finds_a_column_that_only_drops_later() {
+        let mut blob = col("thumb");
+        blob.type_name = "BLOB".to_string();
+        let cols = vec![col("id"), blob];
+        let rows = vec![
+            vec![Value::Int(1), Value::Str("real text".to_string())],
+            vec![Value::Int(2), Value::Str("still text".to_string())],
+            vec![
+                Value::Int(3),
+                Value::Str(crate::model::binary_display(4096)),
+            ],
+            vec![
+                Value::Int(4),
+                Value::Str(crate::model::binary_display(8192)),
+            ],
+            // A second chunk that also drops the column — without these the
+            // fixture never asks whether the note repeats, and a renderer with
+            // no de-duplication at all passes.
+            vec![Value::Int(5), Value::Str(crate::model::binary_display(16))],
+            vec![Value::Int(6), Value::Str(crate::model::binary_display(32))],
+        ];
+        let mut src = chunked(&cols, &rows, 2);
+        let mut buf = Vec::new();
+        ExportFormat::Sql
+            .stream_to(&mut buf, &mut src, Some(("shop", None, "img")), MySql)
+            .expect("writing to a Vec cannot fail");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert_eq!(
+            out.matches("-- NOTE:").count(),
+            1,
+            "the note should be announced once, not per chunk: {out}"
+        );
+        // The rows carrying real text keep it; only the placeholder rows are
+        // nulled. A note emitted for the whole export up front would have been
+        // right about the columns and wrong about these two rows.
+        assert!(out.contains("(1, 'real text')"), "{out}");
+        assert!(out.contains("(2, 'still text')"), "{out}");
+        assert!(out.contains("(3, NULL)"), "{out}");
+        assert!(!out.contains("4096 bytes"), "placeholder exported: {out}");
+        // And the note precedes the first row it applies to, not the file.
+        let note_at = out.find("-- NOTE:").expect("a note");
+        let row3_at = out.find("(3, NULL)").expect("row 3");
+        assert!(
+            note_at < row3_at,
+            "the note came after the dropped row: {out}"
+        );
+    }
+
+    /// A source that fails mid-stream must not be reported as a finished export.
+    /// This is the dropped connection and the cancelled table export, which the
+    /// one-shot path could never produce because its source was already in memory.
+    #[test]
+    fn a_source_failing_mid_stream_fails_the_export() {
+        let (cols, rows) = awkward_rows();
+        for format in ExportFormat::ALL {
+            let mut sent = 0;
+            let cols = cols.clone();
+            let rows = rows.clone();
+            let mut src = PullChunks::new(move || {
+                sent += 1;
+                match sent {
+                    1 => Ok(Some(ResultSet::from_rows(cols.clone(), rows[..2].to_vec()))),
+                    _ => Err(io::Error::other("connection reset")),
+                }
+            });
+            let mut buf = Vec::new();
+            let err = format
+                .stream_to(&mut buf, &mut src, None, MySql)
+                .expect_err("a failing source must fail the export");
+            assert!(
+                err.to_string().contains("connection reset"),
+                "{}: the source's reason should survive: {err}",
+                format.label()
+            );
+        }
+    }
 
     /// A writer that fails after `ok_bytes` bytes — stands in for a full disk or a
     /// revoked permission part-way through a large export.

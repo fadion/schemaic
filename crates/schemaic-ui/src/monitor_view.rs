@@ -828,15 +828,24 @@ fn save_log(
                 // one, so there is nothing to `INSERT INTO`.
                 source: None,
                 dialect: Default::default(),
+                // The log is the rows in hand by definition — it is a record of
+                // what the monitor saw, not a query anything could re-run.
+                scope: crate::ExportScope::Fetched,
             },
             // `try_update`: the modal may have closed while the dialog was open
             // or the write ran, and a plain `set` would panic on a freed signal.
-            Rc::new(move |res| match res {
+            Rc::new(move |outcome| match outcome {
                 // The log on screen now has a copy on disk, which is what lets
                 // Clear stop asking (`monitor::discard_needs_asking`).
-                Ok(()) => {
+                crate::ExportOutcome::Done(_) => {
                     exported.try_update(|v| *v = true);
                 }
+                // A log export is never streamed, so there is nothing to cancel
+                // and this cannot arrive. Spelled out rather than folded in with
+                // `Done`: if it ever could, marking the log exported off a
+                // half-written file is exactly the wrong answer — Clear would
+                // stop asking about a log that was never fully saved.
+                crate::ExportOutcome::Cancelled => {}
                 // **A failure that lands after the modal closed has to go
                 // somewhere.** `monitor_export_err` is only visible inside the
                 // modal, so reporting there and nowhere else left the user with
@@ -847,7 +856,7 @@ fn save_log(
                 // The message is used as the pipeline produced it: it already
                 // begins "Export failed: …", and a second prefix here read
                 // "Export failed — Export failed: Access is denied".
-                Err(e) => {
+                crate::ExportOutcome::Failed(e) => {
                     if open.try_get_untracked() == Some(true) {
                         export_err.try_update(|v| *v = Some(e));
                     } else {

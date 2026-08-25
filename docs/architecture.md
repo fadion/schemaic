@@ -49,7 +49,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     strong count of 2; with the columns inline that deep-copied every arena (30 ms and ~160 MB at
     200k×50, on the UI thread, on the one path built to avoid a rebuild). `splice_rows` replaces
     only the column `Arc`s whose values actually changed, so an untouched column is never copied
-    (29.6 ms → 1.8 ms at 200k×50, measured). `Column`/`ColumnOrigin`/`ColumnFlags` carry the
+    (29.6 ms → 1.8 ms at 200k×50, measured).
+    **`ResultBuilder::take_chunk(capacity)` is the one way a load produces more than one result**:
+    it closes off the rows pushed so far as a `ResultSet` and starts a fresh builder over the same
+    columns, which is what lets an uncapped export reach the disk in blocks instead of holding the
+    table. `finish` still *consumes*, because an ordinary load produces exactly one result; a load
+    being written to a file as it arrives produces a sequence of them. The chunk's `elapsed_ms` and
+    `truncated` are deliberately zeroed — both are facts about the whole load, and an uncapped
+    stream is never truncated — so the caller stamps the total on whatever it reports. Four tests
+    here pin the chunking directly, where it had only the indirect coverage of the db crate's
+    streaming tests: the columns carrying forward with the builder left empty but *typed*
+    (`take_chunk_cuts_the_rows_so_far_and_carries_the_columns_on`), `truncated`/`elapsed_ms` zeroed
+    on the emitted chunk and not inherited by its successor
+    (`a_chunk_claims_neither_truncation_nor_the_loads_elapsed_time`), the empty chunk a load whose
+    rows divide evenly by the block size ends on
+    (`taking_a_chunk_with_nothing_in_it_still_yields_the_columns`), and `capped_columns` not carried
+    into the next block, which would report blank cells in a chunk whose cells are all there
+    (`capped_columns_are_not_inherited_by_the_next_chunk`). Note that
+    the **grid's** result is still materialised whole up to the row cap; it is the *export* that
+    streams. `Column`/`ColumnOrigin`/`ColumnFlags` carry the
     write-back provenance the wire reports per column, and a binary column is unconditionally
     read-only (it can't round-trip through text). **A raw-bytes cell has exactly one rendering, and
     it lives here:** `binary_display(len)` → `<n bytes>`, with `is_binary_display` as its
@@ -403,11 +421,35 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     raw and the cell menu offers *Copy formatted* as its own entry. A staged value is never
     formatted either way, because it is text the user typed and the painter doesn't format one.
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
-    Markdown pipe/backslash escaping; HTML entity escaping). Every renderer has a **streaming**
-    `*_to<W: io::Write>` form (`ExportFormat::render_to`) — what file export uses, so a large
-    result is never rendered into a second full copy in memory — with the `String` versions kept
-    as thin wrappers for the clipboard. A test asserts the two agree byte-for-byte per format;
-    add new formats to both by adding the `*_to` and wrapping it. **The formats anything reads
+    Markdown pipe/backslash escaping; HTML entity escaping). **Rows arrive through a pull source,
+    not as a `&ResultSet`**: `RowChunks::next_chunk` hands over one `RowChunk { rs, order }` at a
+    time and `ExportFormat::stream_to` renders from it, returning the rows written. Every entry
+    point took a whole result until the whole-table export landed, which made "export" mean
+    "export whatever the row cap fetched" — and materialising two million rows to render them
+    would hold the table twice over and run into `ResultSet`'s 512 MiB per-column arena ceiling,
+    which does not fail but blanks the cells past it, so the file would quietly have holes in it.
+    **Pull and not push, because JSON decides it**: its renderer holds a `serde_json` sequence
+    serializer open across the whole array, borrowing the writer, and that is not a value a push
+    API could store between calls — inverting it keeps the serializer a local in one function.
+    `OneChunk` is a source of exactly one chunk (what the grid's own export uses) and `PullChunks`
+    adapts a `FnMut() -> io::Result<Option<ResultSet>>` — the app's `rx.blocking_recv()` —
+    materialising natural order into a **reused** `Vec<usize>`, one allocation for the whole
+    export against five renderers that would each have needed a second code path. `OneChunk`
+    yields **even for an empty result**, which is load-bearing rather than an edge case: CSV,
+    Markdown and HTML take their header from the first chunk, so a source that yielded nothing for
+    a zero-row result would write an empty file where the old code wrote a header. One empty chunk
+    and no chunk at all are deliberately different things
+    (`an_empty_chunk_carries_a_header_and_no_chunk_carries_nothing`). Each `export_*_chunks` is
+    now the *only* implementation: every `*_to<W: io::Write>` form is that function over a
+    `OneChunk` and `ExportFormat::render_to` is `stream_to` over one, returning the same
+    `io::Result<u64>` — so there is no buffered renderer and streamed renderer to keep in
+    agreement, with the `String` versions still thin wrappers for the clipboard. `render_to` is the
+    wrapper the app's `Fetched` export calls: building the `OneChunk` and calling `stream_to` at the
+    call site is that body verbatim, and doing so left `render_to` with no production caller at all. Two tests hold that together —
+    `streaming_render_matches_the_string_render_in_every_format` for the byte-for-byte agreement
+    per format, and `a_chunked_export_matches_the_same_rows_in_one_go` for the same rows split
+    into blocks rendering identically; add a new format by writing the `*_chunks` and wrapping it.
+    **The formats anything reads
     back must not pass a raw-bytes cell straight through.** Such a cell is
     `model::binary_display`'s `<n bytes>` (a `Value` has no bytes variant to hold the real thing),
     and emitting that produces a file which silently stores the *placeholder* as the column's data
@@ -429,6 +471,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     while the loop asks per *cell*, where `Vec::contains` is a linear scan over the answer (12M of
     them on a 200k × 60 result); the same hoist `Db::convert_row` and `pg_cell` make for
     `Column::is_binary`.
+    **Both are computed per chunk, and the `-- NOTE:` line is the one thing a stream genuinely
+    cannot know up front.** Which columns were withheld is a fact about the rows in hand — it needs
+    the column's type *and* a `binary_display` placeholder in the data to agree — and a stream never
+    holds them all, so a column can carry real bytes for a million rows and meet a placeholder in
+    the next block. The note is therefore emitted the first time a column is actually withheld,
+    naming only the newly discovered ones and tracked in a `noted: Vec<bool>`; over a single chunk
+    that collapses to exactly the old behaviour, one note before the first `INSERT` naming every
+    withheld column (`the_binary_note_finds_a_column_that_only_drops_later`).
   - `import.rs` — the inverse of `export.rs`: CSV/TSV + JSON (array *or* NDJSON) → table. Format
     inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
     a header, positional without), per-column `coerce` (only the families a wrong answer would
@@ -1902,11 +1952,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       *failed* check does re-arm — it is the one negative outcome expected to be temporary, and it is
       invisible anyway, so retrying costs the user nothing.
     - `text.rs` — `plural(n, one, many)`, returning only the noun form so a humanized count
-      (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n`;
-      `human_count` (`1250` → `1.25k`), the **row-count** printer, shared by the grid's stats line
-      and the properties surface so `200k` means one thing — and bound by a round-trip property:
-      every string it emits must parse back through `model::goto_row_index`. Not the namesake in
-      `transcript.rs`, which buckets token counts differently on purpose.
+      (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n` —
+      a contract that reads as "returns the phrase" if you skim it, and the export note shipped as
+      `Exported rows to employees.csv` on exactly that misreading, so a call site here owes the
+      count as well as the noun. `human_count` (`1250` → `1.25k`), the **row-count** printer, shared
+      by the grid's stats line and the properties surface so `200k` means one thing — and bound by a
+      round-trip property: every string it emits must parse back through `model::goto_row_index`.
+      Not the namesake in `transcript.rs`, which buckets token counts differently on purpose.
     - `stats.rs` — table statistics: `TableStats`/`IndexStats`/`SchemaStats`, `format_bytes`
       (1024-based, IEC units), `format_age`, and the honesty types. Every figure is an `Option`
       because the three engines publish different facts — `supports_table_stats` is `false` for
@@ -2058,9 +2110,44 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   plus `reloptions` for the storage params a replace would reset (`pg_view_options`) — all
   folded on *after* the shared `assemble_schema` (which both engines share and neither's
   extras belong in).
-  `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/`prepare_check`
+  `fetch_query`/`stream_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/
+  `prepare_check`
   (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`fetch_table_stats`/
   `count_rows` are `Db` methods taking the target DB per call.
+  **`Db::stream_query` is the whole-table export, and the row cap is the thing it exists to
+  escape**: it runs `sql` uncapped and hands the rows to a *bounded*
+  `tokio::sync::mpsc::Sender<ExportChunk>` in blocks of `chunk_rows` as they arrive, returning how
+  many went out. `ExportChunk` is `Result<ResultSet, String>`, and **the error rides the channel as
+  well as being returned**, because the writer is on the other end and would otherwise read a
+  closed channel as "the table ended" and call a half-written file finished. It shares the engine
+  dispatch with `fetch_query` through the private `Db::run_to` — one connection, one statement, one
+  destination for its rows — and that destination is `RowDest`: `Capped(n)` for every ordinary
+  query, `Chunked { chunk, tx, sent }` for a stream, whose `cap()` is `usize::MAX` so no row loop
+  grows a second branch around the comparison it already makes. **Streaming is a second destination
+  for the rows, not a second way to read them.** Each engine has exactly one row loop, each the
+  product of a long argument with its driver, so `RowDest` is threaded through them as a parameter
+  rather than three more loops to keep in step; every previously-capped call site — `Db::fetch_query`,
+  every arm of `run_batch`, `explain`, `pg::fetch_table`, `Session::fetch_query` on both backends,
+  and SQLite's `run_query` — simply passes `&mut RowDest::Capped(n)` and behaves exactly as it did. It *owns* its `Sender`
+  rather than borrowing one, because SQLite's loop is moved into a `spawn_blocking` that needs
+  `'static`, and that same split is why there are two flush methods and not one: `flush` awaits
+  (MySQL, PostgreSQL) while `flush_blocking` calls `blocking_send`, which is right inside
+  `spawn_blocking` and panics on a runtime thread. All three loops flush the tail
+  **unconditionally for a row-returning statement, including an empty tail**, since the export's
+  header comes from the first chunk and a table with no rows has only that block.
+  **A statement with no result set is a refusal, not an empty export.** All three return *before*
+  that flush when the statement yields no columns at all (a DML/DDL/utility outcome reports
+  `affected` instead), so nothing whatever reached the channel — and the writer, seeing no chunk,
+  produced an empty file and reported it as `Done(0)`. `stream_query` answers
+  `DbError::Query("that statement returns no rows to export")` when the run comes back with no
+  columns and nothing sent, and puts it on the channel as well, like every other error here. The
+  refusal lives in `stream_query` rather than in the caller that happens to be careful — the export
+  menu never offers such a statement — because this is public API and the next caller may not be
+  gated the same way. The four tests are in `sqlite.rs`, over in-memory
+  SQLite (`a_streamed_query_ignores_the_cap_and_arrives_in_bounded_blocks`,
+  `an_empty_table_still_streams_the_block_that_carries_its_columns`,
+  `a_failed_stream_sends_its_reason_down_the_channel`,
+  `a_statement_with_no_result_set_is_refused_rather_than_exported_empty`).
   `fetch_table_stats` fills `core::stats::SchemaStats` for a whole database — one round trip
   either way, and having the set is what feeds the schema tree's size column. It is **lazy and
   deliberately not part of `fetch_schema`**: selecting `DATA_LENGTH` from
@@ -3321,7 +3408,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is the one caller with nowhere to hand the work and pays for the document here — and it answers
     `None` for a PNG, which that channel cannot hold, which is why PNG is not in the copy menu. The
     outcome lands in the diagram's own `notice_bar` at the canvas's bottom edge rather than the
-    app's shared error modal, which is painted *under* this one. A confirmation fades after
+    app's shared error modal, which is painted *under* this one. It arrives as the `ExportOutcome`
+    the results export shares, of which a diagram uses two: one document has no row count and
+    nothing to cancel, so `export_erd` reports `Done(0)` and never `Cancelled`. The handler still
+    **spells all three arms out**, the way `monitor_view::save_log` spells its own and for the
+    reason that call site gives — the arm is unreachable today, but the rasterise it wraps is one
+    change away from being cancellable, and the catch-all `_ =>` this had would then report a
+    cancelled export as "Saved <name>". A confirmation fades after
     `NOTICE_LINGER`; a failure stays until dismissed, since it is the only place the reason is
     written down. The fade is `flash_seq`-guarded and `try_get_untracked`-read for the same two
     reasons the find flash is.
@@ -3383,7 +3476,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `save_log`, which mirrors `grid::save_export` in snapshotting the log **before** the file dialog
     opens — the dialog is modal and slow and the poll keeps appending behind it — then renders
     through `log_result_set` and hands an `ExportRequest` to the app's `ExportFn` worker with
-    `source: None` and a default dialect, both of which only the SQL renderer would read.
+    `source: None` and a default dialect, both of which only the SQL renderer would read. The log is
+    always `ExportScope::Fetched` — it is a record of what the monitor saw, not a query anything
+    could re-run — so its `ExportOutcome::Cancelled` arm cannot arrive, and it is spelled out as an
+    explicit no-op rather than folded in with `Done`: marking the log exported off a half-written
+    file would stop Clear asking about it (`monitor::discard_needs_asking`).
     `status_line(export_err, poll_err, paused, partial, capped)` decides what the sub-header says:
     an error takes the line outright, worst-to-mislead first (a failed export beats a poll error,
     because the user believes they have a file and doesn't), and otherwise it is a lead — `Watching`
@@ -3536,6 +3633,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (`an_ineligible_base_is_still_ineligible_with_nothing_to_splice` pins the premise). Clearing the
   override on a fresh manual run is the other half: a raised cap belongs to the result it was
   raised for, and carrying it forward would be the global setting the user didn't change.
+  **The export is the other way past the cap, and it is a different shape.** `export_file` branches
+  on `ExportScope`: `Fetched` is the one `spawn_blocking` it has always been and writes through
+  `ExportFormat::render_to`, which is exactly a `OneChunk` plus `stream_to` — spelling that pair out
+  at the call site instead left the wrapper with no production caller and two copies of one
+  construction to drift apart. `AllRows` is
+  **two tasks and a bounded channel of 2** — the reader is async (two of the three drivers are) and
+  the writer is synchronous file IO, which must not run on a runtime worker. The writer's
+  `PullChunks` closure turns a channel `Err` into an `io::Error` and a channel close into
+  end-of-stream, and **the reader's verdict wins where the two disagree**: a cancelled read closes
+  the channel, which the writer sees as an ordinary end of stream, so the writer alone would report
+  a truncated file as a finished export. `EXPORT_CHUNK_ROWS` is 10,000, with the trade stated at
+  the constant and nothing downstream depending on the figure. `export_token` is an
+  `Rc<RefCell<Option<CancellationToken>>>` in the same shape as `import_token` — cleared when a run
+  reports, so a later Cancel can't cancel an export that already finished.
+  **One slot means one streamed export, and the second is refused rather than queued or keyed.**
+  Two sharing the slot is what the shape would otherwise permit: Cancel reached only the later one,
+  and whichever finished first cleared the slot and left the other with no way to stop it. The
+  `AllRows` branch therefore answers `ExportOutcome::Failed("An export is already running. Cancel it
+  or wait for it to finish.")` while the slot is full, rather than growing into a keyed map — a
+  single slot is correct once nothing can overwrite it. Only that branch asks: a `Fetched` save
+  takes no token and is never refused. `import_token` gets away with the same shape and no refusal
+  only because its modal admits one run at a time, while the Download menu sits on every result tab.
   **The offer wears the accent, and its separator does not.** It shipped `text_dim` like the
   description beside it, reaching the accent only under the pointer — which put the one escape from
   the row cap behind a hover nobody had a reason to perform. It is now accent at rest (registered
@@ -4130,8 +4249,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
 Re-introducing the anti-patterns these guard against is a regression:
 
 - **The write guard lives on the run action, not in a caller of it.** Every path that executes
-  user SQL goes through `TabsActions::run`/`run_all`, which *are* the guarded pair: they call
-  `schemaic_core::sql::run_verdict` (pure + tested) and, on anything but `Allow`, park the request
+  user SQL goes through `TabsActions::run`/`run_all` — or, where there is no moment at which to
+  ask the user anything, through a refusal *strictly stronger* than the verdict (the export menu,
+  below). The pair *are* the guarded ones: they call `schemaic_core::sql::run_verdict`
+  (pure + tested) and, on anything but `Allow`, park the request
   in `ui.overlay.run_guard` and execute **nothing**. The unguarded actions never leave
   `schemaic-app`; `TabsActions::run_anyway` is the only way back to them, and it replays only what
   the guard parked. The editor pane renders the bar — it does not own the guard.
@@ -4143,6 +4264,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
   un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
   `EXPLAIN ANALYZE` may run a statement for its timings.)
+  **The export menu answers to the guard too, through a refusal strictly stronger than it.**
+  `ExportScope::AllRows` re-executes the tab's captured statement through `Db::stream_query`, which
+  is a path executing user SQL and reached the server without passing `run_verdict` at all — so an
+  `UPDATE … RETURNING` on a table past the row cap could be run a second time from a Save dialog,
+  with no confirmation, on a read-only connection included. `sql::rerunnable_for_export` is the
+  gate, built on the same `contains_write` the verdict uses so there is one answer to "does this
+  statement write" and one place to grep, and it is **never weaker than `run_verdict` and
+  deliberately stronger**: the verdict may say `Confirm`, but an export has no moment at which to
+  ask — the user picked a file name, and a confirmation raised from a file picker would be a
+  question about something they never requested. So it is a flat refusal. That `contains_write` is
+  a whitelist of read *heads* is what makes it right here: `CALL proc()`, `INSERT … RETURNING` and
+  a data-modifying CTE are all writes to it, and each of the three returns rows, so each could
+  otherwise have reached a truncated grid and been offered the scope. `grid::export_menu` simply
+  does not offer `All rows` when it fails — not offering it is the whole enforcement, since the
+  scope cannot then be chosen (`a_row_returning_write_is_never_rerunnable_for_an_export`,
+  `an_ordinary_read_is_rerunnable_for_an_export`).
 - **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
   Every path that can put a cell value in a prompt — `run_query`, `describe_table`'s samples, the
   grid's attach-to-chat, AI Summary, AI Fill, AI Seed — is gated on
@@ -4232,6 +4369,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   since no other connection can see uncommitted rows). Read-only side channels (schema
   introspection, live-validate `PREPARE`, EXPLAIN, Live Monitor, AI/MCP) stay on fresh connections so
   a long transaction can't block them. Don't add a second connection-caching path; extend `Session`.
+  **A streamed whole-table export fits this rule rather than bending it.** `Db::stream_query`
+  connects, runs and disconnects like every other `Db` method; what is new is only how *long* that
+  takes, and the bounded channel is what keeps that bounded in memory too — a server faster than the
+  disk waits rather than queueing the table. Nothing is cached and no second connection path is
+  added, so a `Db` call that runs for minutes is not evidence the rule has been abandoned.
   **SQLite has no exception at all** — every operation opens its own connection inside
   `spawn_blocking`, which is this invariant rather than a concession to a blocking driver, and
   `Session::open` refuses it (see `core::tx` above for why the pinned form needs its own design).
@@ -5993,18 +6135,22 @@ for keyboard nav.
   unwrapped across the middle of the window and out over the schema sidebar. A batch has no editor
   bar to fall back on — `run_all` sets the tab's `results` to `Idle` — which is why the panel bar is
   where this goes, **View** (`text::hides_detail`) and all.
-- **That bar has three surfaces, and the surface is the message.** The red fill means an error; the
-  ordinary chrome carries both the wait note (a write taking long enough to explain, with its
-  one-click `Rollback`) and a plain **note** — something worth saying about an operation that
-  *worked*. The note exists because there was no non-red channel: a partial paste used
-  `commit_err`, so an ordinary success was drawn in the colour that means a write-back failed. The
-  five signals travel as one `BarSignals`, whose `any_up` is asked by the bar's own style **and**
-  by the selection summary that lifts itself above it — two hand-written copies of the same
-  `is_some` chain before, which a new surface would have had to be added to twice, and a bar that
-  is up while the summary thinks it isn't is the two of them drawn on top of each other. On the
-  writing side, `GridState::clear_bar` is the one way the bar comes down: seven identical copies of
-  `if commit_err.is_some() { … }` were what a second signal would otherwise have had to be added to
-  seven times.
+- **That bar has four states on two surfaces, and the surface is the message.** The red fill means
+  an error; the ordinary chrome carries the wait note (a write taking long enough to explain, with
+  its one-click `Rollback`), a plain **note** — something worth saying about an operation that
+  *worked* — and the running export above. The note exists because there was no non-red channel: a
+  partial paste used `commit_err`, so an ordinary success was drawn in the colour that means a
+  write-back failed. The six signals travel as one `BarSignals`, whose `any_up` is asked by the
+  bar's own style **and** by the selection summary that lifts itself above it — two hand-written
+  copies of the same `is_some` chain before, which a new surface would have had to be added to
+  twice, and a bar that is up while the summary thinks it isn't is the two of them drawn on top of
+  each other. **What travels in `BarSignals` is state, never an action**: `export_cancel` is an
+  `Rc<dyn Fn()>` parameter of `grid_error_bar` beside `rollback_tx`, because the struct is
+  `#[derive(Clone, Copy)]` and an `Rc` in it would cost every reader of `any_up` a clone.
+  `results_section` reads the flag and the action off `GridCtx`, so `GridState` keeps no copy of the
+  latter. On the writing side, `GridState::clear_bar` is the one way the bar comes down: seven
+  identical copies of `if commit_err.is_some() { … }` were what a second signal would otherwise have
+  had to be added to seven times.
 - **A result says which database it came from, and the answer lives on the result.** The grid's
   stats line leads with `ResultSet::database` (`world · 100 rows · 15 cols · 1 ms`), stamped by the
   loader that knows the scope — `Db::fetch_query`, `Session::fetch_query` (its *pinned* database,
@@ -6043,6 +6189,91 @@ for keyboard nav.
   agrees with — belongs to `stats::rows_read_clause`, not to the view; the view supplies
   `truncated` and the total and prints what comes back. The cap itself is unchanged and is still a
   **client-side stream cutoff**, not a `LIMIT`; this only says how much of the table went past it.
+- **The Download menu names the scope, and only when there is a choice to make.** `export_menu`
+  normally opens the flat five formats; when the result is `truncated` **and**
+  `GridState::current_statement` yields something to re-run, it puts a scope step in front of them —
+  `Fetched rows (N)` and `All rows (~N)`, both through `text::human_count`, the `~` for the same
+  reason the stats line carries one (the figure is the catalogue's estimate, and a menu promising an
+  exact count the export then missed would be worse than one that never claimed it). **The step
+  appears only when the two scopes differ**: an uncapped result *is* every row, so offering to fetch
+  them again would be a choice between a thing and itself, and a result with no statement to re-run
+  has only the honest scope left — **and the statement must be re-runnable at all**, which is the
+  write guard reaching this menu (`sql::rerunnable_for_export`, under the write-guard invariant). It
+  is a refusal by omission: the scope is simply absent, so it cannot be asked for. `All rows` is
+  `ExportScope::AllRows`, which carries the **statement** rather than the table — a filtered or
+  sorted grid exports all of what it is showing, and a table tab's statement is `SELECT * FROM t`
+  anyway — plus the *result's* `database` and `GridState::conn_at_load`, so **both halves of "where
+  did this result come from" answer as of the same moment**. The `conn_id` used to come off the live
+  tab while the `database` deliberately came off the result, and a tab rebound to another connection
+  keeps its loaded result on screen: the two then disagreed and the export could re-run the
+  statement against a different server. `conn_at_load` is snapshotted in `GridState::new` from the
+  same `gctx.conn_id.get_untracked()` the format seeding already reads. It is
+  deliberately a **second read** of the server rather than a continuation of the first: the rows on
+  screen may be minutes old, and stitching a stale page onto fresh ones would be neither. The
+  statement is snapshotted before the save dialog opens for the same reason the rows are — the
+  dialog is modal and slow, and a filter typed while it stood open must not change what the export
+  was asked for.
+  **A client-side sort is declared at the point of choice, not discovered in the file.** `Fetched`
+  honours `gs.order`; `AllRows` streams the server's order, because a column-header sort is a
+  permutation of the rows in hand (`compute_order`) that no re-run reproduces. The menu presented
+  the two as one export at two sizes, so the label now reads `All rows (~16k, server order)` — or
+  `All rows (server order)` where there is no estimate — while a sort is applied. Whether one is
+  comes in as a parameter of `export_menu` rather than off `GridState`, because the sort does not
+  live there: it is `grid_view`'s, threaded to the header and the toolbar.
+- **A running export is the bottom bar's fourth state, and its Cancel outlives the result.** Only a
+  *streamed* export raises it — a snapshot of rows already in memory is written faster than a notice
+  about it would be read — and `BarState::Exporting` draws `Exporting… Cancel` (`export_bar`) on the
+  note's own fill, with **Cancel** at the right in `theme::err_fix_btn()`, the bar's action colour
+  that the error surface's **View** and the wait note's **Rollback** already use. **It began on the
+  stats line and moved**, which is worth writing down because it is the kind of thing that gets
+  tidied back: that line is the result's own and is the crowded end of the panel — a capped result
+  already spends it on `db · 1k of ~16k rows · read 5k rows`, and a fourth clause pushed the whole
+  line toward the toolbar icons. The bar is empty almost always, is the full width of the grid, and
+  **already owns the report this turns into**: the same strip now says `Exporting… Cancel` and then
+  `Exported 16k rows to employees.csv`, so one operation occupies one place from beginning to end
+  instead of announcing itself in one surface and reporting in another. It sits **above `Note` and
+  below `Error`/`Wait`** in `grid_error_bar`'s chain — a running export is not a problem, so an error
+  or a stalled write outranks it, but it *is* live where the note it will become is not, and a
+  leftover note must not sit on top of a Cancel the user may still need. The same ordering is why
+  `save_export` takes down the bar's *stale* messages before setting the flag: `Exporting` outranks a
+  note but not an error, and a failure left standing would otherwise hide the Cancel for as long as
+  the export ran. That is **two clears, not one** — `GridState::clear_bar` covers the commit pair,
+  and the filter/sort error is the third dismissible message and needs saying separately under its
+  own `is_some` guard, exactly the way `dismiss_overlays` already pairs the two. `clear_bar` is
+  deliberately not widened to swallow `view_err`: its contract is the commit pair and it runs on the
+  keystroke paths, where the guard exists to keep a bar that is already down from invalidating its
+  container. The other two bar states are left standing on purpose, and that is the interesting
+  half. A stalled write's note (`commit_wait`) is **live, not stale** — the Rollback it offers is the
+  more urgent action, so it may sit on top of a running export for as long as the write is out. A
+  batch statement's own failure (`batch_err`) means **no grid is mounted** to export from, so it
+  cannot coincide. `GridCtx::exporting` / `GridState::exporting` is **panel-level, not
+  per-result**, because an export outlives the `GridState` a re-run replaces and a Cancel that
+  vanished when the rows refreshed would be unreachable exactly when it matters. But it is created
+  **beside `commit_err`/`commit_note` in the `GridCtx` literal, per active-tab render — not once in
+  `center`**, and those two are the surfaces it turns into, so the three must share a lifetime.
+  Created once for the window, the flag was global while the note was per-render: starting an export
+  in tab A and switching to B drew `Exporting… Cancel` on a tab that had nothing to do with it,
+  while A's completion report landed on a disposed signal and vanished. The accepted cost is the
+  other side of the same coin — navigating away from a running export loses its Cancel and its
+  report, though the export itself finishes and the file is whole — and that is what a commit's own
+  note already does. **Only the export that raised the flag may lower it:** the done callback
+  clears `exporting` under the same `streaming` test that decides whether to raise it, because a
+  `Fetched` save finishes in milliseconds and one taken while a stream ran tore that stream's Cancel
+  down and left no way to stop it. `export_cancel` is a `TabsActions` action; the app owns the
+  token, as it does for query runs and imports. The report
+  is an `ExportOutcome` — `Done(u64)`, `Cancelled`, `Failed(String)` — three outcomes and not a
+  `Result` because "the user stopped it" is neither: a red bar for a deliberate Cancel, or a
+  cheerful row count for a file that stops halfway, are both lies. It mirrors `ImportOutcome`. A row
+  count goes to `commit_note` (the non-error surface) and **only a streamed export writes one**,
+  since the screen already shows what a snapshot export wrote and a note on every save is a note
+  nobody reads. The count is printed through `text::human_count`, the same row-count printer the
+  stats line uses, so the figure in the report agrees with the `1k of ~16k rows` directly above it —
+  and the note shipped once as `Exported rows to employees.csv`, with no count at all, because
+  `text::plural` returns the noun and nothing else and this call site simply never rendered the
+  number. Cancel is a note too, `Export cancelled — <name> is incomplete`.
+  **The partial file is left on disk on a cancel or a failure, and the message says so** — deleting
+  it is the one irreversible thing this path could do, and the save dialog may well have been aimed
+  at a file that already mattered.
 - **The results strip shrinks its prose, never its controls.** It is one flex row — stats, the
   read-more offer, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
   flex row squeezes its children before it overflows, so whichever child refuses to shrink is the

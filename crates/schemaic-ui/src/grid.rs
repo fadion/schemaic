@@ -359,6 +359,21 @@ struct GridState {
     commit: RwSignal<Option<crate::CommitFn>>,
     /// Writes an export to disk on a worker thread (see [`crate::ExportFn`]).
     export_file: RwSignal<Option<crate::ExportFn>>,
+    /// The connection this result was **loaded on**, snapshotted at build.
+    ///
+    /// A tab can be rebound to another connection while a result stays on
+    /// screen, and the live `conn_id` moves with it. The export re-runs the
+    /// statement the rows came from, so it must re-run it where they came from —
+    /// the same argument `ResultSet::database` already makes for the scope, and
+    /// the two have to agree or the export runs a statement against a server
+    /// that never saw it.
+    conn_at_load: u64,
+    /// True while a **streamed** export is running — the affordance that offers
+    /// to stop it. Panel-level rather than per-result: an export outlives the
+    /// grid it was started from (a re-run replaces the `GridState`), and a Cancel
+    /// that vanished the moment the rows refreshed would be a Cancel the user
+    /// cannot reach for exactly as long as it matters.
+    exporting: RwSignal<bool>,
     /// Update the tab's *canonical* result set after a splice, so a later grid
     /// rebuild (tab switch away/back) reflects the committed values. `None` for the
     /// multi-result path, which stays on the full-re-run commit flow. Present ⇒ the
@@ -531,6 +546,8 @@ impl GridState {
             dismiss: RwSignal::new(Some(gctx.dismiss.clone())),
             commit: RwSignal::new(Some(gctx.commit.clone())),
             export_file: RwSignal::new(Some(gctx.export_file.clone())),
+            conn_at_load: conn,
+            exporting: gctx.exporting,
             sync_canonical: RwSignal::new(gctx.sync_canonical.clone()),
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
@@ -1804,7 +1821,82 @@ fn export_column_csv(gs: GridState, ci: usize) -> String {
 /// they asked. `ResultSet` and the display order are behind `Arc`s, so holding
 /// that snapshot costs a refcount rather than a copy — and a cancelled dialog now
 /// costs nothing at all, where it used to pay a full render first.
-fn save_export(gs: GridState, format: ExportFormat) {
+/// The Download icon's menu: a format per entry, or — when there is more of the
+/// result than the grid fetched — a scope step in front of them.
+///
+/// **The scope step appears only when the two scopes differ.** An uncapped result
+/// *is* every row, so offering to fetch them again would be a choice between a
+/// thing and itself, and the flat five-item menu the user already knows is the
+/// right menu for it. It also needs a statement to re-run
+/// (`current_statement`) — a result spliced together by a refetch, or one with no
+/// captured `base_sql`, has none, and the cap is then the only honest scope on
+/// offer.
+fn export_menu(
+    gs: GridState,
+    row_total: Option<schemaic_core::stats::RowCount>,
+    // Whether a column-header sort is applied. Not read off `GridState` because
+    // it does not live there: the sort is `grid_view`'s, threaded to the header
+    // and the toolbar.
+    sorted: bool,
+) -> Vec<MenuEntry> {
+    let per_format = |scope_all: bool| -> Vec<MenuEntry> {
+        ExportFormat::ALL
+            .iter()
+            .map(|&f| MenuEntry::action(f.label(), move || save_export(gs, f, scope_all)))
+            .collect()
+    };
+    let truncated = gs.rs.with_untracked(|rs| rs.truncated);
+    // **The write guard reaches this menu too.** "All rows" re-executes the
+    // statement, so it is a path running user SQL and answers to
+    // `sql::rerunnable_for_export` — a flat refusal rather than a `Confirm`,
+    // because a Save dialog is not a moment at which to ask whether to run an
+    // `UPDATE … RETURNING` again. Not offering it is the whole enforcement: the
+    // scope cannot be chosen, so it cannot be requested.
+    let rerunnable = gs
+        .current_statement()
+        .is_some_and(|sql| schemaic_core::sql::rerunnable_for_export(&sql, gs.dialect));
+    if !truncated || !rerunnable {
+        return per_format(false);
+    }
+    let fetched = gs.rs.with_untracked(|rs| rs.row_count());
+    vec![
+        MenuEntry::sub(
+            format!(
+                "Fetched rows ({})",
+                schemaic_core::text::human_count(fetched)
+            ),
+            per_format(false),
+        ),
+        // Named off the same total the stats line reports, and `~` for the same
+        // reason it does: the figure is an estimate from the catalogue, and a
+        // menu that promised an exact count the export then missed would be
+        // worse than one that never claimed it.
+        MenuEntry::sub(
+            {
+                let size = match row_total {
+                    Some(n) => format!("~{}", schemaic_core::text::human_count(n.value() as usize)),
+                    None => String::new(),
+                };
+                // **A client-side sort cannot come along, so the label says so.**
+                // A column-header sort is a permutation of the rows in hand
+                // (`compute_order`), not something the server was asked for, and
+                // the re-run returns rows in the server's order. Presenting the
+                // two scopes as one export at two sizes while silently dropping
+                // the sort is the misreading worth heading off at the point of
+                // choice — after the file is written is too late.
+                match (size.is_empty(), sorted) {
+                    (true, false) => "All rows".to_string(),
+                    (true, true) => "All rows (server order)".to_string(),
+                    (false, false) => format!("All rows ({size})"),
+                    (false, true) => format!("All rows ({size}, server order)"),
+                }
+            },
+            per_format(true),
+        ),
+    ]
+}
+
+fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
     let default_name = suggested_filename(
         gs.source
             .get_untracked()
@@ -1824,6 +1916,15 @@ fn save_export(gs: GridState, format: ExportFormat) {
     let order = gs.order.get_untracked();
     let source = gs.source.get_untracked();
     let dialect = gs.dialect;
+    // The statement is snapshotted with the rows and for the same reason: the
+    // dialog is modal and slow, and a filter typed while it stood open must not
+    // change what the export was asked for.
+    let statement = gs.current_statement();
+    // The connection the *rows* came from, not the tab's current one — see
+    // `GridState::conn_at_load`. Paired with `rs.database` so both halves of
+    // "where did this result come from" answer as of the same moment.
+    let conn_id = gs.conn_at_load;
+    let database = rs.database.clone();
     let Some(export) = gs.export_file.get_untracked() else {
         return;
     };
@@ -1831,6 +1932,37 @@ fn save_export(gs: GridState, format: ExportFormat) {
         let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
             return; // cancelled
         };
+        let scope = match (all_rows, statement.clone()) {
+            (true, Some(sql)) => crate::ExportScope::AllRows {
+                conn_id,
+                database: database.clone(),
+                sql,
+            },
+            // No statement to re-run: the menu only offers "All rows" when there
+            // is one, so this is the belt to that brace rather than a path the
+            // user can take.
+            _ => crate::ExportScope::Fetched,
+        };
+        let streaming = matches!(scope, crate::ExportScope::AllRows { .. });
+        if streaming {
+            // Clear the bar's *stale* messages first: `Exporting` outranks a
+            // note but not an error, so a failure left standing from an earlier
+            // commit or filter would hide the Cancel for as long as the export
+            // ran. `clear_bar` covers the commit pair; the filter/sort error is
+            // the third dismissible message and needs saying separately, the way
+            // `dismiss_overlays` says it.
+            //
+            // A stalled write's note (`commit_wait`) and a batch statement's own
+            // failure are deliberately *not* cleared: neither is stale — the
+            // first is live and offers a Rollback more urgent than this Cancel,
+            // and the second means no grid is mounted to export from.
+            gs.clear_bar();
+            if gs.view_err.get_untracked().is_some() {
+                gs.view_err.set(None);
+            }
+            gs.exporting.set(true);
+        }
+        let shown = path.file_name().map(|n| n.to_string_lossy().into_owned());
         // `save_as` takes an `Fn`, so the snapshot is cloned rather than moved —
         // two `Arc` bumps and a small `Option<TableSource>`, not the rows.
         (export)(
@@ -1841,13 +1973,60 @@ fn save_export(gs: GridState, format: ExportFormat) {
                 order: order.clone(),
                 source: source.clone(),
                 dialect,
+                scope,
             },
             // `try_update`: the result-set scope may have been disposed while the
             // dialog was open or the write ran — a plain `set` would panic on the
             // freed signal.
-            Rc::new(move |res| {
-                if let Err(e) = res {
-                    gs.commit_err.try_update(|v| *v = Some(e));
+            Rc::new(move |outcome| {
+                let name = shown.clone().unwrap_or_else(|| "the file".to_string());
+                // **The message goes up before the flag comes down**, and the
+                // order is the whole reason the bar reads as one strip. Signal
+                // writes take effect one at a time, so clearing `exporting`
+                // first leaves a moment with no state at all — `any_up` false —
+                // and the bar collapses and reopens, which reads as two
+                // unrelated messages rather than an operation told in two
+                // tenses.
+                match outcome {
+                    // Only the streamed scope says how many rows it wrote. A
+                    // snapshot export of what is already on screen has nothing to
+                    // report that the screen doesn't already show, and a note on
+                    // every save is a note nobody reads.
+                    crate::ExportOutcome::Done(n) if streaming => {
+                        // `plural` returns the *noun* and nothing else, by
+                        // design — the count is the call site's to render, and
+                        // forgetting it here read "Exported rows to
+                        // employees.csv". `human_count` is the row-count
+                        // printer the stats line already uses, so the figure in
+                        // the report matches the one in `1k of ~16k rows`.
+                        let n = n as usize;
+                        let rows = schemaic_core::text::plural(n, "row", "rows");
+                        let count = schemaic_core::text::human_count(n);
+                        gs.commit_note.try_update(|v| {
+                            *v = Some(format!("Exported {count} {rows} to {name}"))
+                        });
+                    }
+                    crate::ExportOutcome::Done(_) => {}
+                    // A note, not an error: stopping was the user's own doing.
+                    // It says the file is short because the alternative — a
+                    // silent partial file — is the thing this whole path is
+                    // careful about, and deleting it is not ours to do.
+                    crate::ExportOutcome::Cancelled => {
+                        gs.commit_note.try_update(|v| {
+                            *v = Some(format!("Export cancelled — {name} is incomplete"))
+                        });
+                    }
+                    crate::ExportOutcome::Failed(e) => {
+                        gs.commit_err.try_update(|v| *v = Some(e));
+                    }
+                }
+                // **Only the export that raised the flag may lower it.** A
+                // `Fetched` save finishes in milliseconds, and clearing
+                // unconditionally meant one of those, taken while a stream was
+                // running, tore down that stream's Cancel and left no way to
+                // stop it.
+                if streaming {
+                    gs.exporting.try_update(|v| *v = false);
                 }
             }),
         );
@@ -2263,6 +2442,10 @@ pub(crate) struct GridCtx {
     pub(crate) commit: crate::CommitFn,
     /// Write an export to disk off the UI thread (see [`crate::ExportFn`]).
     pub(crate) export_file: crate::ExportFn,
+    /// True while a streamed export is running — see [`GridState::exporting`].
+    pub(crate) exporting: RwSignal<bool>,
+    /// Stop the running export (the app owns the cancellation token).
+    pub(crate) export_cancel: Rc<dyn Fn()>,
     /// Splice sink: replace the tab's canonical result set (so a later rebuild is
     /// fresh). `None` on the multi-result path (no splice — full re-run instead).
     pub(crate) sync_canonical: Option<SyncCanonicalFn>,
@@ -2365,6 +2548,7 @@ pub(crate) struct GridCtx {
 pub(crate) fn grid_error_bar(
     bars: BarSignals,
     rollback_tx: Rc<dyn Fn(usize)>,
+    export_cancel: Rc<dyn Fn()>,
     error_open: RwSignal<bool>,
     error_text: RwSignal<Option<String>>,
 ) -> impl IntoView {
@@ -2374,6 +2558,7 @@ pub(crate) fn grid_error_bar(
         commit_note,
         view_err,
         commit_wait,
+        exporting,
     } = bars;
     // The batch error leads, because a failed statement has no grid mounted at
     // all: a commit error left over from another result tab's grid would be
@@ -2388,6 +2573,11 @@ pub(crate) fn grid_error_bar(
             .or_else(|| view_err.get())
             .map(BarState::Error)
             .or_else(|| commit_wait.get().map(BarState::Wait))
+            // Above the note and below the two problems. A running export is not
+            // a problem, so an error or a stalled write outranks it; but it is
+            // *live*, and the note it will itself be replaced by is not, so a
+            // leftover note must not sit on top of a Cancel the user may need.
+            .or_else(|| exporting.get().then_some(BarState::Exporting))
             .or_else(|| commit_note.get().map(BarState::Note))
     };
     dyn_container(current, move |state| {
@@ -2395,6 +2585,9 @@ pub(crate) fn grid_error_bar(
             None => return empty().into_any(),
             Some(BarState::Wait(note)) => return wait_bar(note, rollback_tx.clone()).into_any(),
             Some(BarState::Note(m)) => return note_bar(m).into_any(),
+            Some(BarState::Exporting) => {
+                return export_bar(export_cancel.clone()).into_any();
+            }
             Some(BarState::Error(msg)) => msg,
         };
         // Collapse to a single line (a multi-line server error would spill out
@@ -2455,12 +2648,18 @@ pub(crate) fn grid_error_bar(
     })
 }
 
-/// Which of the three the bar is showing. An enum rather than the
+/// Which of the four the bar is showing. An enum rather than the
 /// `Result<WaitNote, String>` this was, because a third arm arrived and
-/// `Ok`/`Err` had already stopped meaning success and failure.
+/// `Ok`/`Err` had already stopped meaning success and failure — and a fourth has
+/// since, so the shape has earned itself twice.
+///
+/// Four *states*, on two surfaces: `Exporting` and `Note` share the ordinary
+/// chrome (`export_bar` draws `note_bar`'s exact fill), because they are one
+/// operation told in two tenses.
 enum BarState {
     Error(String),
     Wait(WaitNote),
+    Exporting,
     Note(String),
 }
 
@@ -2482,6 +2681,14 @@ pub(crate) struct BarSignals {
     pub(crate) commit_note: RwSignal<Option<String>>,
     pub(crate) view_err: RwSignal<Option<String>>,
     pub(crate) commit_wait: RwSignal<Option<WaitNote>>,
+    /// True while a streamed export is running. The bar's fourth state, and the
+    /// only one that is *not* the tail of an operation: it stands for the whole
+    /// length of one, which is why it is the only state here carrying a control
+    /// that stops something rather than explaining it. The action itself is a
+    /// parameter of [`grid_error_bar`] beside `rollback_tx`, for the reason this
+    /// struct is `Copy`: an `Rc` in here would cost every reader of `any_up` a
+    /// clone.
+    pub(crate) exporting: RwSignal<bool>,
 }
 
 impl BarSignals {
@@ -2492,7 +2699,56 @@ impl BarSignals {
             || self.commit_note.with(Option::is_some)
             || self.view_err.with(Option::is_some)
             || self.commit_wait.with(Option::is_some)
+            || self.exporting.get()
     }
+}
+
+/// The bar while a streamed export runs: `Exporting…` on the note's surface,
+/// with **Cancel** at the right where the error bar puts **View** and the wait
+/// note puts **Rollback**.
+///
+/// **On the bar rather than on the stats line**, which is where it started. That
+/// line is the result's own, and it is the crowded end of the panel — a capped
+/// result already spends it on `db · 1k of ~16k rows · read 5k rows`, and a
+/// fourth clause pushed the whole thing toward the icons. The bar is empty
+/// almost always, is the width of the grid, and already owns the report this
+/// turns into: the same strip says `Exporting… Cancel` and then
+/// `Exported 16k rows to employees.csv`, so the export occupies one place from
+/// beginning to end instead of announcing itself in one and reporting in
+/// another.
+fn export_bar(cancel: Rc<dyn Fn()>) -> impl IntoView {
+    h_stack((
+        text("Exporting…").style(|s| {
+            s.color(theme::text())
+                .font_size(theme::font_body())
+                .margin_left(theme::scaled(8.0))
+        }),
+        empty().style(|s| s.flex_grow(1.0_f32)),
+        // `err_fix_btn` is the bar's own action colour — what **View** uses two
+        // arms up. Cancel is the same kind of thing in the same place, and a
+        // second accent here would read as a different class of control.
+        text("Cancel")
+            .on_click_stop(move |_| (cancel)())
+            .style(|s| {
+                s.color(theme::err_fix_btn())
+                    .font_size(theme::font_body())
+                    .margin_right(theme::scaled(8.0))
+                    .cursor(CursorStyle::Pointer)
+            }),
+    ))
+    .style(|s| {
+        s.flex_row()
+            .items_center()
+            .width_full()
+            .height_full()
+            // The note's surface, because this *is* the note — one operation
+            // told in two tenses, and a different fill for the first half would
+            // read as two unrelated messages.
+            .background(theme::bg_deepest())
+            .border(1.0)
+            .border_color(theme::border())
+            .border_radius(5.0)
+    })
 }
 
 /// The note half of [`grid_error_bar`]: one line on the ordinary chrome, no
@@ -6501,12 +6757,11 @@ fn grid_toolbar(
         gs.popup_width.set(grid_copy_menu_w());
         gs.popup_anchor
             .set(Some(anchor_below(save_origin.get_untracked())));
-        gs.popup.set(Some(
-            ExportFormat::ALL
-                .iter()
-                .map(|&f| MenuEntry::action(f.label(), move || save_export(gs, f)))
-                .collect(),
-        ));
+        gs.popup.set(Some(export_menu(
+            gs,
+            row_total.get_untracked(),
+            sort.with_untracked(Option::is_some),
+        )));
     });
     let save_click = open_save.clone();
     let save_menu = container(

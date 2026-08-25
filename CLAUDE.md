@@ -65,7 +65,9 @@ Each is stated in full, with the bug that motivated it, under *Architecture inva
 substitute for the statement, and none of these is a style preference.
 
 - **The write guard lives on the run action**, not in a caller of it — every path executing user
-  SQL goes through `TabsActions::run`/`run_all` and `sql::run_verdict`.
+  SQL goes through `TabsActions::run`/`run_all` and `sql::run_verdict`, or through a refusal
+  *strictly stronger* than it (`sql::rerunnable_for_export`, which has no `Confirm` arm). Never a
+  second, laxer gate.
 - **One SQL boundary lexer** — everything scanning SQL for string/comment/quote boundaries builds
   on `core::sql::skip_noncode`, and it is dialect-aware.
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new

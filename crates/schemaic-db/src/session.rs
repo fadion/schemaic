@@ -337,11 +337,12 @@ impl Session {
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
+                let mut dest = crate::RowDest::Capped(row_cap);
                 tokio::select! {
                     // `early_stop = false`: the connection outlives this
                     // statement, so a truncated result must be drained fully to
                     // leave it clean for the next one.
-                    r = collect_rows(conn, sql, row_cap, false) => r,
+                    r = collect_rows(conn, sql, &mut dest, false) => r,
                     _ = cancel.cancelled() => {
                         self.db.kill_query(conn_id).await;
                         Err(DbError::Cancelled)
@@ -351,8 +352,9 @@ impl Session {
             Backend::Postgres { client } => {
                 let token = client.cancel_token();
                 let db = self.database.as_deref().unwrap_or("");
+                let mut dest = crate::RowDest::Capped(row_cap);
                 tokio::select! {
-                    r = pg::run_statement(client, db, sql, row_cap, &cancel) => r,
+                    r = pg::run_statement(client, db, sql, &mut dest, &cancel) => r,
                     _ = cancel.cancelled() => {
                         let _ = token.cancel_query(NoTls).await;
                         Err(DbError::Cancelled)

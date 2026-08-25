@@ -172,14 +172,14 @@ pub(crate) async fn fetch_query(
     db: &Db,
     database: Option<&str>,
     sql: &str,
-    row_cap: usize,
+    dest: &mut crate::RowDest,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let client = match database {
         Some(d) => connect_to(db, d).await?,
         None => connect_maintenance(db).await?,
     };
-    run_statement(&client, database.unwrap_or(""), sql, row_cap, &cancel).await
+    run_statement(&client, database.unwrap_or(""), sql, dest, &cancel).await
 }
 
 /// Run several statements in order on ONE connection, so session state carries
@@ -222,7 +222,14 @@ pub(crate) async fn run_batch(
             on_result(i, Err(DbError::Cancelled));
             continue;
         }
-        let outcome = run_statement(&client, database.unwrap_or(""), sql, row_cap, &cancel).await;
+        let outcome = run_statement(
+            &client,
+            database.unwrap_or(""),
+            sql,
+            &mut crate::RowDest::Capped(row_cap),
+            &cancel,
+        )
+        .await;
         if outcome.is_err() {
             stopped = true;
         }
@@ -282,7 +289,14 @@ pub(crate) async fn fetch_table(
         crate::order_by_clause(order_by, pg_ident),
         limit
     );
-    fetch_query(db, Some(database), &sql, limit, cancel).await
+    fetch_query(
+        db,
+        Some(database),
+        &sql,
+        &mut crate::RowDest::Capped(limit),
+        cancel,
+    )
+    .await
 }
 
 /// Run `EXPLAIN sql` (or `EXPLAIN ANALYZE sql`) and return the plan as a result
@@ -306,7 +320,14 @@ pub(crate) async fn explain(
 ) -> Result<ResultSet, DbError> {
     let stmt = sql.trim().trim_end_matches(';').trim_end();
     if !analyze {
-        return fetch_query(db, database, &format!("EXPLAIN {stmt}"), 10_000, cancel).await;
+        return fetch_query(
+            db,
+            database,
+            &format!("EXPLAIN {stmt}"),
+            &mut crate::RowDest::Capped(10_000),
+            cancel,
+        )
+        .await;
     }
 
     let client = match database {
@@ -322,7 +343,7 @@ pub(crate) async fn explain(
         &client,
         database.unwrap_or(""),
         &format!("EXPLAIN ANALYZE {stmt}"),
-        10_000,
+        &mut crate::RowDest::Capped(10_000),
         &cancel,
     )
     .await;
@@ -387,9 +408,10 @@ pub(crate) async fn run_statement(
     client: &Client,
     database: &str,
     sql: &str,
-    row_cap: usize,
+    dest: &mut crate::RowDest,
     cancel: &CancellationToken,
 ) -> Result<ResultSet, DbError> {
+    let row_cap = dest.cap();
     let start = Instant::now();
 
     // Column metadata from a non-executing PREPARE. The prepared columns carry
@@ -474,11 +496,16 @@ pub(crate) async fn run_statement(
     // The binary flags ride along with the type names, and for the same reason:
     // both are per-column answers, and re-deriving either per cell would put a
     // string split in the path of every one of up to 200k x N reads.
+    let chunk_capacity = dest.chunk_capacity();
     let mut grid: Option<(ResultBuilder, Vec<String>, Vec<bool>)> =
         prepared_cols.filter(|c| !c.is_empty()).map(|c| {
             let names = type_names_of(&c);
             let binary = binary_columns(&names);
-            (ResultBuilder::new(c.clone()), names, binary)
+            (
+                ResultBuilder::with_capacity(c.clone(), chunk_capacity),
+                names,
+                binary,
+            )
         });
     let mut affected: u64 = 0;
     let mut truncated = false;
@@ -509,7 +536,11 @@ pub(crate) async fn run_statement(
                         .collect();
                     let names = type_names_of(&cols);
                     let flags = binary_columns(&names);
-                    (ResultBuilder::new(cols), names, flags)
+                    (
+                        ResultBuilder::with_capacity(cols, chunk_capacity),
+                        names,
+                        flags,
+                    )
                 });
                 if builder.row_count() >= row_cap {
                     // A row beyond the cap exists → the result is truncated. Drop
@@ -533,6 +564,12 @@ pub(crate) async fn run_statement(
                     })
                     .collect();
                 builder.push_row(&cells);
+                // Hand a full block to the export and keep reading into an empty
+                // builder. A capped read never fills one.
+                if dest.chunk_full(builder.row_count()) {
+                    let next = dest.chunk_capacity();
+                    dest.flush(builder, next).await?;
+                }
             }
             SimpleQueryMessage::CommandComplete(n) => affected = n,
             _ => {}
@@ -544,6 +581,12 @@ pub(crate) async fn run_statement(
         return Ok(ResultSet::affected_rows(Vec::new(), affected)
             .with_elapsed(start.elapsed().as_millis()));
     };
+    // The tail — see the same flush in MySQL's `collect_rows`: the export's
+    // header comes from the first chunk, so a table with no rows must still hand
+    // over the empty one that carries its columns. A statement with no result
+    // columns returned just above and never reaches here; `Db::stream_query`
+    // refuses those outright.
+    dest.flush(&mut builder, 0).await?;
     builder.set_truncated(truncated);
     builder.set_elapsed(start.elapsed().as_millis());
     Ok(builder.finish())

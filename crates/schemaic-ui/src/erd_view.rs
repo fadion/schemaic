@@ -2020,9 +2020,21 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                                 path,
                                 doc: doc.clone(),
                             },
-                            Rc::new(move |res: Result<(), String>| match res {
-                                Ok(()) => (say)(format!("Saved {name}"), false),
-                                Err(e) => (say)(e, true),
+                            // A diagram is one document, not a stream: no row
+                            // count to report and nothing to cancel, so
+                            // `export_erd` reports `Done(0)` and never
+                            // `Cancelled`. **Spelled out rather than a catch-all
+                            // `_`**, the way `monitor_view::save_log` spells
+                            // its own: the arm is unreachable today, but the
+                            // rasterise this wraps is one change away from being
+                            // cancellable, and a catch-all would then tell the
+                            // user a file was saved that never was.
+                            Rc::new(move |outcome| match outcome {
+                                crate::ExportOutcome::Done(_) => {
+                                    (say)(format!("Saved {name}"), false)
+                                }
+                                crate::ExportOutcome::Cancelled => {}
+                                crate::ExportOutcome::Failed(e) => (say)(e, true),
                             }),
                         );
                     });
