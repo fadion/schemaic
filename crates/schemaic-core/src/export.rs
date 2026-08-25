@@ -594,7 +594,27 @@ pub fn export_json_chunks<W: Write>(w: &mut W, src: &mut dyn RowChunks) -> io::R
     let mut keys: Vec<String> = Vec::new();
     let mut first = true;
     let mut tally = ExportTally::default();
-    while let Some(c) = src.next_chunk()? {
+    loop {
+        // **A source error closes the array before it propagates.** Every other
+        // format leaves a usable prefix when a stream is cancelled or the
+        // connection drops — CSV, Markdown and SQL are line-based and a browser
+        // closes an HTML table itself — while JSON's `]` is written once, after
+        // the loop, so a `?` inside it left `…},` on disk and every parser
+        // rejects the 90% of rows that did arrive. "Incomplete" reads very
+        // differently for a file with most of the data in it than for one with
+        // none.
+        //
+        // The source's error, not the writer's: a writer that has failed cannot
+        // be asked to write a bracket, and `seq.end()`'s own failure is dropped
+        // for the same reason.
+        let chunk = match src.next_chunk() {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                let _ = seq.end();
+                return Err(e);
+            }
+        };
+        let Some(c) = chunk else { break };
         if first {
             keys = unique_column_keys(c.rs);
             first = false;
@@ -1430,6 +1450,56 @@ mod tests {
         );
     }
 
+    /// **A display order can name a row that is gone.** All five renderers guard
+    /// it — four with `if di >= c.rs.row_count() { continue }`, JSON with a
+    /// `filter` — and no test passed an out-of-range `order`, so dropping any one
+    /// guard left a green suite and a format that panics on `rs.cell`'s slice
+    /// arithmetic or writes a short file.
+    ///
+    /// It is unreachable on the *streaming* path (`PullChunks` rebuilds `order` as
+    /// `0..row_count` per chunk) and live on the one-shot path, where the order is
+    /// the caller's: the grid reads `gs.rs` and `gs.order` as two separate
+    /// untracked reads, so an order can outlive the result it indexes.
+    #[test]
+    fn an_order_naming_a_row_that_is_gone_is_skipped_by_every_format() {
+        let rs = ResultSet::from_rows(
+            vec![col("id"), col("note")],
+            vec![
+                vec![Value::Int(1), Value::Str("one".into())],
+                vec![Value::Int(2), Value::Str("two".into())],
+            ],
+        );
+        // Two real rows with a stale index between them — the shape a result
+        // spliced smaller under a held order produces.
+        let order = [0usize, 5, 1];
+        for format in ExportFormat::ALL {
+            let mut buf = Vec::new();
+            let tally = format
+                .render_to(&mut buf, &rs, &order, Some(("shop", None, "t")), MySql)
+                .expect("writing to a Vec cannot fail");
+            assert_eq!(
+                tally.rows,
+                2,
+                "{}: only the rows that exist are written",
+                format.label()
+            );
+            let out = String::from_utf8(buf).expect("utf-8");
+            assert!(out.contains("one"), "{}: {out}", format.label());
+            assert!(out.contains("two"), "{}: {out}", format.label());
+            // Nothing invented for the missing index: two data rows, not three.
+            if format == ExportFormat::Sql {
+                assert_eq!(out.matches("INSERT INTO").count(), 2, "{out}");
+            }
+            if format == ExportFormat::Json {
+                let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+                assert_eq!(parsed.as_array().map(Vec::len), Some(2), "{out}");
+            }
+            if format == ExportFormat::Csv {
+                assert_eq!(out.lines().count(), 3, "header + two rows: {out}");
+            }
+        }
+    }
+
     /// A source that fails mid-stream must not be reported as a finished export.
     /// This is the dropped connection and the cancelled table export, which the
     /// one-shot path could never produce because its source was already in memory.
@@ -1456,6 +1526,21 @@ mod tests {
                 "{}: the source's reason should survive: {err}",
                 format.label()
             );
+            // **And what is on disk is still openable.** JSON's `]` is written
+            // once, after the loop, so a source error used to leave `…},` — a
+            // file every parser rejects, i.e. the one format whose partial export
+            // is worth nothing. The rows that did arrive are the point of a
+            // cancel.
+            if format == ExportFormat::Json {
+                let text = String::from_utf8(buf).expect("utf-8");
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+                assert_eq!(
+                    parsed.as_array().map(Vec::len),
+                    Some(2),
+                    "the rows that arrived before the failure: {text}"
+                );
+            }
         }
     }
 

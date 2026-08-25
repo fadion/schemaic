@@ -920,15 +920,21 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
 /// [`schemaic_core::tx`] encodes (Postgres poisons a transaction on any error;
 /// MySQL implicitly commits on DDL).
 ///
-/// SQLite takes MySQL's arm and never reaches it: manual-transaction mode isn't
+/// **`schemaic_db`'s mapping, not a second copy of it.** This decides the footer
+/// pill and what Commit and Rollback may do; `Session`'s decides whether the next
+/// statement issues a `BEGIN`. They are the two halves of one tab's transaction
+/// model, and they were the same three-arm match written out twice — one pinned
+/// by `session.rs`'s tests and one structurally unreachable from them, so a
+/// fourth engine was one clean-compiling edit away from a pill that disagreed
+/// with the session it describes.
+///
+/// (SQLite takes MySQL's arm and never reaches it: manual-transaction mode isn't
 /// offered on a SQLite connection and `Session::open` refuses one. Of the two,
 /// MySQL's is the safe default to answer with — Postgres' would report a
-/// transaction as poisoned when there is no transaction at all.
+/// transaction as poisoned when there is no transaction at all. The reasoning
+/// lives with the mapping now.)
 fn tx_engine(db: &Db) -> TxEngine {
-    match db.engine() {
-        schemaic_db::Engine::Postgres => TxEngine::Postgres,
-        schemaic_db::Engine::MySql | schemaic_db::Engine::Sqlite => TxEngine::MySql,
-    }
+    schemaic_db::session::tx_engine_of(db.engine())
 }
 
 fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> impl IntoView {
@@ -8716,11 +8722,43 @@ fn open_url(url: &str) {
 mod app_tests {
     use super::{
         CliLauncher, RunTimeout, inline_outcome, mysql_shell_config, psql_database,
-        psql_shell_config, resolve_native_cli, sqlite_shell_config, timeout_message, unique_name,
+        psql_shell_config, resolve_native_cli, sqlite_shell_config, timeout_message, tx_engine,
+        unique_name,
     };
     use schemaic_core::connection::Connection;
     use schemaic_ui::InlineAiState;
     use tokio_util::sync::CancellationToken;
+
+    /// **The pill and the session read one mapping.** These are the two halves of
+    /// one tab's transaction decision — this crate's answer drives the footer pill
+    /// and what Commit and Rollback may do, `Session`'s decides whether the next
+    /// statement issues a `BEGIN` — and they used to be the same three-arm match
+    /// written out twice, one pinned by `session.rs`'s tests and one unreachable
+    /// from them. This test could not be *written* before the fix (the mapping was
+    /// private to `schemaic-db`), which is the finding; it fails now the moment
+    /// anybody re-inlines one of the two.
+    #[test]
+    fn the_pill_and_the_session_agree_on_every_engine() {
+        for engine in [
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            let db = schemaic_db::Db::from_parts(
+                engine,
+                String::new(),
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+            );
+            assert_eq!(
+                tx_engine(&db),
+                schemaic_db::session::tx_engine_of(engine),
+                "{engine:?}"
+            );
+        }
+    }
 
     /// **A timeout and the Cancel button arrive as the same `DbError`.** If the
     /// message were the plain "Cancelled" the user's own button produces, they
