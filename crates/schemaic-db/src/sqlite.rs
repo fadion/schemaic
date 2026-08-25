@@ -710,7 +710,7 @@ fn run_query(
         builder.push_row(&cells);
         // `flush_blocking`, not `flush`: this loop is inside a `spawn_blocking`,
         // where awaiting is not available and `blocking_send` is correct.
-        if dest.chunk_full(builder.row_count()) {
+        if dest.chunk_full(builder.row_count(), builder.text_bytes()) {
             dest.flush_blocking(&mut builder, chunk_capacity)?;
         }
     }
@@ -3628,6 +3628,82 @@ mod tests {
 
         // …and what it hands back is the name to open, untouched.
         assert_eq!(open_target("C:/db.sqlite", false).unwrap(), "C:/db.sqlite");
+    }
+
+    /// **A block is bounded in bytes, not only in rows.** The row count was a
+    /// budget in the wrong unit: a block is `rows × the row width` and nothing
+    /// bounds a row's width, so a table of large documents put gigabytes in
+    /// flight through a figure whose doc promised megabytes — and the only thing
+    /// that stopped it was the per-column arena ceiling, which loses data.
+    ///
+    /// The row budget here is far larger than the table, so the row rule alone
+    /// would send **one** block; every split this sees comes from the byte rule.
+    #[tokio::test]
+    async fn a_streamed_query_flushes_on_bytes_when_the_rows_are_wide() {
+        let (keeper, db) = shared_memory("stream_export_bytes");
+        keeper
+            .execute_batch("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);")
+            .unwrap();
+        // 1 MiB a row, comfortably over the byte budget in total and comfortably
+        // under it per row.
+        let mib = "x".repeat(1024 * 1024);
+        for i in 1..=40 {
+            keeper
+                .execute("INSERT INTO docs VALUES (?1, ?2)", (i, &mib))
+                .unwrap();
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let stream = tokio::spawn({
+            let db = db.clone();
+            async move {
+                db.stream_query(
+                    None,
+                    "SELECT * FROM docs",
+                    // A row budget nothing here can reach.
+                    1_000_000,
+                    CancellationToken::new(),
+                    tx,
+                )
+                .await
+            }
+        });
+        let mut blocks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            blocks.push(chunk.expect("no chunk should carry an error"));
+        }
+        let sent = stream.await.expect("the stream task").expect("the stream");
+
+        assert_eq!(sent, 40, "every row still goes out");
+        assert_eq!(
+            blocks.iter().map(|b| b.row_count()).sum::<usize>(),
+            40,
+            "the blocks add up to the table"
+        );
+        // The bound, and the split that proves the byte rule fired: a 40 MiB
+        // table cannot arrive as one block under a 32 MiB budget.
+        let bytes = |b: &schemaic_core::model::ResultSet| -> usize {
+            (0..b.row_count())
+                .flat_map(|r| (0..b.col_count()).map(move |c| (r, c)))
+                .filter_map(|(r, c)| b.cell(r, c).map(|v| v.text().len()))
+                .sum()
+        };
+        assert!(
+            blocks.len() >= 2,
+            "40 MiB of rows arrived as one block: {:?}",
+            blocks.iter().map(|b| b.row_count()).collect::<Vec<_>>()
+        );
+        for b in &blocks {
+            assert!(
+                bytes(b) <= crate::CHUNK_BYTE_BUDGET + mib.len(),
+                "a block carried {} bytes over a {} budget",
+                bytes(b),
+                crate::CHUNK_BYTE_BUDGET
+            );
+        }
+        // And no column was blanked on the way — the arena ceiling was never
+        // approached, which is the outcome the byte budget exists to keep.
+        assert!(blocks.iter().all(|b| b.capped_columns.is_empty()));
     }
 
     /// **A backend's own cells, put through a real exporter.** Every other test

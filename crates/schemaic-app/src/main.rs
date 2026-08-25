@@ -2426,13 +2426,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     //
     // `spawn_blocking`, not `spawn`: this is synchronous file IO, and running it
     // on a runtime worker would stall every other task sharing that thread.
-    /// Rows per block when streaming a table to a file.
+    /// Rows per block when streaming a table to a file — the **upper** bound of
+    /// two, the other being bytes.
     ///
-    /// Ten thousand is a compromise the two ends pull on: small enough that a
-    /// block of a wide result is megabytes rather than gigabytes, and large
-    /// enough that the per-block cost — a `ResultSet`, one allocation per column,
-    /// a channel hop — is paid once per ten thousand rows instead of per row.
-    /// Nothing downstream depends on the figure: the renderers take whatever
+    /// Ten thousand is a compromise the two ends pull on: large enough that the
+    /// per-block cost — a `ResultSet`, one allocation per column, a channel hop —
+    /// is paid once per ten thousand rows instead of per row, and small enough
+    /// that an ordinary result's block is a modest allocation.
+    ///
+    /// **It is not what keeps a wide table's block small**, and it used to claim
+    /// it was: a block is `rows × the row width`, nothing bounds a row's width,
+    /// and four blocks are in flight at once — so a table of 1 MB documents put
+    /// tens of gigabytes through a figure whose doc promised megabytes. The row
+    /// loop also flushes on `schemaic_db`'s byte budget, which is what makes the
+    /// promise true for any row width; this figure decides only how often a
+    /// *narrow* table flushes.
+    ///
+    /// Nothing downstream depends on either figure: the renderers take whatever
     /// blocks they are given, which is what `a_chunked_export_matches_the_same_
     /// rows_in_one_go` pins.
     const EXPORT_CHUNK_ROWS: usize = 10_000;

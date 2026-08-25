@@ -65,7 +65,7 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Db, DbError, FkColRow, TxScope, assemble_schema, parse_typed};
+use crate::{Db, DbError, FkColRow, TxScope, assemble_schema};
 
 /// This module's dialect, once. Every boundary scan here is PostgreSQL's — the
 /// engine the file exists for — and spelling it out at each call site is what
@@ -497,14 +497,12 @@ pub(crate) async fn run_statement(
     // both are per-column answers, and re-deriving either per cell would put a
     // string split in the path of every one of up to 200k x N reads.
     let chunk_capacity = dest.chunk_capacity();
-    let mut grid: Option<(ResultBuilder, Vec<String>, Vec<bool>)> =
+    let mut grid: Option<(ResultBuilder, Vec<CellKind>)> =
         prepared_cols.filter(|c| !c.is_empty()).map(|c| {
-            let names = type_names_of(&c);
-            let binary = binary_columns(&names);
+            let kinds = cell_kinds(&type_names_of(&c));
             (
                 ResultBuilder::with_capacity(c.clone(), chunk_capacity),
-                names,
-                binary,
+                kinds,
             )
         });
     let mut affected: u64 = 0;
@@ -524,7 +522,7 @@ pub(crate) async fn run_statement(
         let Some(msg) = next else { break };
         match msg.map_err(|e| db_err(&e))? {
             SimpleQueryMessage::Row(r) => {
-                let (builder, type_names, binary) = grid.get_or_insert_with(|| {
+                let (builder, kinds) = grid.get_or_insert_with(|| {
                     let cols: Vec<Column> = r
                         .columns()
                         .iter()
@@ -534,13 +532,8 @@ pub(crate) async fn run_statement(
                             origin: None,
                         })
                         .collect();
-                    let names = type_names_of(&cols);
-                    let flags = binary_columns(&names);
-                    (
-                        ResultBuilder::with_capacity(cols, chunk_capacity),
-                        names,
-                        flags,
-                    )
+                    let kinds = cell_kinds(&type_names_of(&cols));
+                    (ResultBuilder::with_capacity(cols, chunk_capacity), kinds)
                 });
                 if builder.row_count() >= row_cap {
                     // A row beyond the cap exists → the result is truncated. Drop
@@ -555,18 +548,18 @@ pub(crate) async fn run_statement(
                 // Parse each text cell by its column type (integers/floats become
                 // compact numeric variants; everything else stays an exact string
                 // — never lossy).
-                let cells: Vec<Value> = (0..type_names.len())
-                    .map(|i| match r.get(i) {
+                let cells: Vec<Value> = kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &kind)| match r.get(i) {
                         None => Value::Null,
-                        Some(s) => {
-                            pg_cell(s, &type_names[i], binary.get(i).copied().unwrap_or(false))
-                        }
+                        Some(s) => pg_cell(s, kind),
                     })
                     .collect();
                 builder.push_row(&cells);
                 // Hand a full block to the export and keep reading into an empty
                 // builder. A capped read never fills one.
-                if dest.chunk_full(builder.row_count()) {
+                if dest.chunk_full(builder.row_count(), builder.text_bytes()) {
                     let next = dest.chunk_capacity();
                     dest.flush(builder, next).await?;
                 }
@@ -577,7 +570,7 @@ pub(crate) async fn run_statement(
     }
 
     // No result columns → DML/DDL/utility: report affected rows, not a grid.
-    let Some((mut builder, _, _)) = grid else {
+    let Some((mut builder, _)) = grid else {
         return Ok(ResultSet::affected_rows(Vec::new(), affected)
             .with_elapsed(start.elapsed().as_millis()));
     };
@@ -614,18 +607,37 @@ fn type_names_of(columns: &[Column]) -> Vec<String> {
 /// `binary` is the column's answer, computed once per result by
 /// [`binary_columns`]: `type_is_binary` splits a type name and walks a keyword
 /// list, which is not something to re-derive for every cell of a 200k-row read.
-fn pg_cell(text: &str, type_name: &str, binary: bool) -> Value {
-    if binary && let Some(len) = bytea_hex_len(text) {
+fn pg_cell(text: &str, kind: CellKind) -> Value {
+    if kind.binary
+        && let Some(len) = bytea_hex_len(text)
+    {
         return Value::Str(binary_display(len));
     }
-    parse_typed(text.to_string(), type_name)
+    crate::parse_as(kind.num, text.to_string())
 }
 
-/// Which of these columns hold raw bytes, in column order.
-fn binary_columns(type_names: &[String]) -> Vec<bool> {
+/// Everything a text cell's conversion needs to know about its column, computed
+/// **once per column**.
+///
+/// Both halves are per-column answers derived from a type name by splitting it
+/// and walking a keyword list, which is not something to re-derive for every cell
+/// of a read that no longer has a row cap. `binary` was hoisted for that reason
+/// already; `num` is the other half of the same `match`, and it was still paying
+/// a `String` allocation per cell — 100M of them on a 5M-row × 20-column export.
+#[derive(Clone, Copy)]
+struct CellKind {
+    num: crate::NumKind,
+    binary: bool,
+}
+
+/// [`CellKind`] per column, in column order.
+fn cell_kinds(type_names: &[String]) -> Vec<CellKind> {
     type_names
         .iter()
-        .map(|t| schemaic_core::model::type_is_binary(t))
+        .map(|t| CellKind {
+            num: crate::num_kind(t),
+            binary: schemaic_core::model::type_is_binary(t),
+        })
         .collect()
 }
 
@@ -2810,7 +2822,7 @@ pub(crate) async fn refetch_on(
             Err(_) => vec![String::new(); template.columns.len()],
         }
     };
-    let binary = binary_columns(&type_names);
+    let kinds = cell_kinds(&type_names);
 
     {
         let mut out = Vec::with_capacity(rows.len());
@@ -2835,12 +2847,12 @@ pub(crate) async fn refetch_on(
                 .map_err(|e| DbError::Query(e.to_string()))?;
             for m in msgs {
                 if let SimpleQueryMessage::Row(r) = m {
-                    let cells: Vec<Value> = (0..template.columns.len())
-                        .map(|i| match r.get(i) {
+                    let cells: Vec<Value> = kinds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &kind)| match r.get(i) {
                             None => Value::Null,
-                            Some(s) => {
-                                pg_cell(s, &type_names[i], binary.get(i).copied().unwrap_or(false))
-                            }
+                            Some(s) => pg_cell(s, kind),
                         })
                         .collect();
                     out.push((row.data_row, cells));
@@ -3242,13 +3254,12 @@ mod tests {
     }
 
     /// One column's cell, through the same pair the read loop uses:
-    /// `binary_columns` decides, `pg_cell` renders. Split so the flag is
-    /// computed once per result rather than per cell — and asserted together,
-    /// because a test that passed the flag by hand would still pass if
-    /// `binary_columns` stopped recognising `BYTEA`.
+    /// `cell_kinds` decides, `pg_cell` renders. Split so the answer is computed
+    /// once per result rather than per cell — and asserted together, because a
+    /// test that passed the flag by hand would still pass if `cell_kinds` stopped
+    /// recognising `BYTEA`.
     fn one_cell(text: &str, type_name: &str) -> Value {
-        let names = vec![type_name.to_string()];
-        pg_cell(text, type_name, binary_columns(&names)[0])
+        pg_cell(text, cell_kinds(&[type_name.to_string()])[0])
     }
 
     #[test]
@@ -3285,21 +3296,31 @@ mod tests {
         assert_eq!(one_cell("\\x4869", &t), Value::Str("\\x4869".into()));
     }
 
+    /// The pg type names feed the shared parser correctly — and through the
+    /// hoisted path the row loop actually takes (`cell_kinds` once per column,
+    /// then `pg_cell` per cell), not through the one-cell `parse_typed`
+    /// convenience. The two cannot disagree, because `parse_typed` *is* their
+    /// composition, but the loop is what runs 100M times.
     #[test]
     fn parse_typed_uses_pg_type_names() {
-        // The pg type names feed the shared parse_typed correctly.
         assert!(matches!(
-            parse_typed("42".to_string(), &pg_type_name(&Type::INT4)),
+            one_cell("42", &pg_type_name(&Type::INT4)),
             Value::Int(42)
         ));
         assert!(matches!(
-            parse_typed("1.5".to_string(), &pg_type_name(&Type::FLOAT8)),
+            one_cell("1.5", &pg_type_name(&Type::FLOAT8)),
             Value::Float(f) if f == 1.5
         ));
         // NUMERIC preserved as an exact string.
         assert!(matches!(
-            parse_typed("1.10".to_string(), &pg_type_name(&Type::NUMERIC)),
+            one_cell("1.10", &pg_type_name(&Type::NUMERIC)),
             Value::Str(s) if s == "1.10"
+        ));
+        // An unsigned MySQL spelling still reaches the `u64` arm — `num_kind` is
+        // shared, and this is the one branch a per-column split could drop.
+        assert!(matches!(
+            crate::parse_typed("18446744073709551615".to_string(), "BIGINT UNSIGNED"),
+            Value::UInt(u) if u == u64::MAX
         ));
     }
 
