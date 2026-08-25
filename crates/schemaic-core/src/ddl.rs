@@ -1673,18 +1673,29 @@ pub fn type_dependents(
         }
         for c in &t.columns {
             let declared = c.type_name.trim().trim_end_matches("[]").trim();
-            let matches = match declared.rsplit_once('.') {
+            // **Through the catalogue's own reader, not a dot split.** The column's
+            // `type_name` is `format_type` output, which quotes what needs
+            // quoting: `rsplit_once('.')` on `"MyMood"` compared `"MyMood"` —
+            // quotes included — against `MyMood` and matched nothing, and on
+            // `"my schema".mood` it took a quoted namespace. `celledit` had the
+            // identical parse and `ac25138` fixed it there; this is the twin,
+            // reading the same string from the same source.
+            let matches = match crate::schema::split_type_name(declared) {
                 // Qualified: both halves, or it is a different type that merely
                 // shares a name.
-                Some((ns, bare)) => {
+                Some((Some(ns), bare)) => {
                     ns.eq_ignore_ascii_case(target_ns) && bare.eq_ignore_ascii_case(name)
                 }
                 // Unqualified ⇒ resolved through the `search_path`, so it is the
                 // default namespace's type and nothing else.
-                None => {
-                    declared.eq_ignore_ascii_case(name)
+                Some((None, bare)) => {
+                    bare.eq_ignore_ascii_case(name)
                         && target_ns.eq_ignore_ascii_case(crate::schema::PG_DEFAULT_SCHEMA)
                 }
+                // Not one or two identifiers. A name this cannot read is a name to
+                // leave alone rather than guess at — and it is not a dependent
+                // this plan can re-cast either way.
+                None => false,
             };
             if matches {
                 out.push(TypeDependent {
@@ -14570,6 +14581,76 @@ mod object_tests {
             type_dependents(&schema_using_mood(), Some("sales"), "mood").len(),
             1
         );
+    }
+
+    /// **A type whose name needs quoting still finds its dependents.** The
+    /// column's `type_name` is `format_type` output, so a mixed-case type arrives
+    /// as `"MyMood"` — quotes and all — and the old `rsplit_once('.')` compared
+    /// that against `MyMood` and matched nothing. Two consequences, both wrong on
+    /// a path that drops a type: the preview's risk sentence said "Nothing uses it
+    /// today", and `recreate_type_sql` emitted no `ALTER COLUMN … TYPE`, so the
+    /// `DROP TYPE` failed on a dependent the plan never mentioned.
+    ///
+    /// `celledit` had the identical parse and it was fixed there; every existing
+    /// test on this side used the all-lower-case `mood`, where quoting never
+    /// happens.
+    #[test]
+    fn a_quoted_type_name_still_matches_its_dependents() {
+        let colt = |name: &str, ty: &str| ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            ..Default::default()
+        };
+        let db = crate::schema::DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "people".into(),
+                    schema: Some("public".into()),
+                    columns: vec![
+                        colt("m", "\"MyMood\""),
+                        colt("tags", "\"MyMood\"[]"),
+                        colt("qualified", "public.\"MyMood\""),
+                        colt("other", "text"),
+                    ],
+                    ..Default::default()
+                },
+                // A namespace that needs quoting on both halves — and the case
+                // `rsplit_once` got wrong in the other direction, taking a
+                // namespace out of the middle of one quoted name.
+                TableInfo {
+                    name: "spaced".into(),
+                    schema: Some("my schema".into()),
+                    columns: vec![
+                        colt("m", "\"my schema\".\"MyMood\""),
+                        colt("odd", "\"my schema\".\"od.d\""),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let deps = type_dependents(&db, Some("public"), "MyMood");
+        let names: Vec<&str> = deps.iter().map(|d| d.column.as_str()).collect();
+        assert_eq!(names, vec!["m", "tags", "qualified"]);
+        assert!(deps[1].is_array());
+
+        // The other namespace's same-named type is a different type, and the
+        // quoted namespace is compared unquoted.
+        let deps = type_dependents(&db, Some("my schema"), "MyMood");
+        assert_eq!(
+            deps.iter().map(|d| d.column.as_str()).collect::<Vec<_>>(),
+            vec!["m"]
+        );
+        // And a name carrying the separator inside its quotes is that one name.
+        assert_eq!(
+            type_dependents(&db, Some("my schema"), "od.d")
+                .iter()
+                .map(|d| d.column.as_str())
+                .collect::<Vec<_>>(),
+            vec!["odd"]
+        );
+        assert!(type_dependents(&db, Some("my schema"), "od").is_empty());
     }
 
     /// Three draft validators had the same omission: a section with no arm,

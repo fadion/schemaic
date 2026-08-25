@@ -3927,6 +3927,62 @@ pub enum SqliteAffinity {
     Numeric,
 }
 
+/// A PostgreSQL type name as `format_type` writes it, split into `(namespace,
+/// name)` **and unquoted** — the form the catalogue holds.
+///
+/// `format_type` quotes what needs quoting, and the naive `rsplit_once('.')` this
+/// replaced kept the quotes: a type named `MyMood` arrived as `"MyMood"` and was
+/// looked up under that spelling, which no catalogue row has, so every
+/// mixed-case enum type silently kept the plain text field instead of its
+/// dropdown. A quoted name may also *contain* the separator (`"a.b"`), where
+/// splitting on the last dot picks a namespace out of the middle of one name.
+///
+/// `None` when the text isn't one or two identifiers — an unterminated quote, a
+/// third part, trailing text. A name this cannot read is a name to leave alone,
+/// not to guess at.
+///
+/// **It lives here because two readers of that same string need it**, and the
+/// second one was still splitting on the last dot: `celledit::editor_for_column`
+/// decides whether a column gets an enum dropdown, and `ddl::type_dependents`
+/// decides which columns an enum recreate has to re-cast — and *that* one
+/// answering "none" makes the preview say nothing uses the type and the plan
+/// emit no `ALTER COLUMN`, so the `DROP TYPE` fails on a dependent the plan
+/// never mentioned. One reader for the catalogue's own spelling.
+pub(crate) fn split_type_name(declared: &str) -> Option<(Option<String>, String)> {
+    let (first, rest) = type_ident(declared)?;
+    if rest.is_empty() {
+        return Some((None, first));
+    }
+    let (second, rest) = type_ident(rest.strip_prefix('.')?)?;
+    rest.is_empty().then_some((Some(first), second))
+}
+
+/// One identifier off the front: a `"…"` run (in which `""` is one literal quote
+/// and a `.` is an ordinary character), or everything up to the next `.`.
+///
+/// The bare arm keeps spaces, because a bare multi-word type name (`character
+/// varying`) is one name — it will simply match no enum.
+fn type_ident(s: &str) -> Option<(String, &str)> {
+    let Some(body) = s.strip_prefix('"') else {
+        let end = s.find('.').unwrap_or(s.len());
+        return (!s.is_empty()).then(|| (s[..end].to_string(), &s[end..]));
+    };
+    let (mut out, mut rest) = (String::new(), body);
+    loop {
+        let q = rest.find('"')?;
+        out.push_str(&rest[..q]);
+        rest = &rest[q + 1..];
+        match rest.strip_prefix('"') {
+            // A doubled quote inside the run is one quote of the name itself.
+            Some(r) => {
+                out.push('"');
+                rest = r;
+            }
+            None => return Some((out, rest)),
+        }
+    }
+}
+
 /// Which affinity SQLite gives a column declared `declared`.
 ///
 /// This is [the five rules of *Determination of Column

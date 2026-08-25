@@ -500,7 +500,17 @@ impl Session {
 /// Free rather than a method so the mapping can be asserted without a live
 /// connection — a `Session` cannot be constructed without one, and this is the
 /// only decision in this module that does not need one.
-fn tx_engine_of(engine: Engine) -> tx::TxEngine {
+///
+/// **Public because the app asked the same question in its own words.** The two
+/// answers feed the two halves of one tab's transaction decision — this one
+/// decides whether the next statement issues a `BEGIN` (`tx_open_after`), the
+/// app's decided what the footer pill says and what Commit and Rollback are
+/// allowed to do (`TxState::on_statement`) — and they were a character-for-
+/// character duplicate of each other, one pinned by the two tests below and one
+/// unreachable from them. A fourth engine, or any change to which engines take
+/// PostgreSQL's arm, is one edit that compiles cleanly while the pill and the
+/// session disagree about the transaction model.
+pub fn tx_engine_of(engine: Engine) -> tx::TxEngine {
     match engine {
         Engine::Postgres => tx::TxEngine::Postgres,
         Engine::MySql | Engine::Sqlite => tx::TxEngine::MySql,

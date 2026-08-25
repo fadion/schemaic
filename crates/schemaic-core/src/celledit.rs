@@ -257,60 +257,12 @@ pub fn editor_for_column(
     if name.len() != declared.trim().len() {
         return plain;
     }
-    let Some((ns, base)) = split_type_name(name) else {
+    let Some((ns, base)) = crate::schema::split_type_name(name) else {
         return plain;
     };
     match schema.find_enum(ns.as_deref(), &base) {
         Some(e) if !e.values.is_empty() => CellEditor::Enum(e.values.clone()),
         _ => plain,
-    }
-}
-
-/// A PostgreSQL type name as `format_type` writes it, split into `(namespace,
-/// name)` **and unquoted** — the form the catalogue holds.
-///
-/// `format_type` quotes what needs quoting, and the naive `rsplit_once('.')` this
-/// replaced kept the quotes: a type named `MyMood` arrived as `"MyMood"` and was
-/// looked up under that spelling, which no catalogue row has, so every
-/// mixed-case enum type silently kept the plain text field instead of its
-/// dropdown. A quoted name may also *contain* the separator (`"a.b"`), where
-/// splitting on the last dot picks a namespace out of the middle of one name.
-///
-/// `None` when the text isn't one or two identifiers — an unterminated quote, a
-/// third part, trailing text. A name this cannot read is a name to leave alone,
-/// not to guess at.
-fn split_type_name(declared: &str) -> Option<(Option<String>, String)> {
-    let (first, rest) = type_ident(declared)?;
-    if rest.is_empty() {
-        return Some((None, first));
-    }
-    let (second, rest) = type_ident(rest.strip_prefix('.')?)?;
-    rest.is_empty().then_some((Some(first), second))
-}
-
-/// One identifier off the front: a `"…"` run (in which `""` is one literal quote
-/// and a `.` is an ordinary character), or everything up to the next `.`.
-///
-/// The bare arm keeps spaces, because a bare multi-word type name (`character
-/// varying`) is one name — it will simply match no enum.
-fn type_ident(s: &str) -> Option<(String, &str)> {
-    let Some(body) = s.strip_prefix('"') else {
-        let end = s.find('.').unwrap_or(s.len());
-        return (!s.is_empty()).then(|| (s[..end].to_string(), &s[end..]));
-    };
-    let (mut out, mut rest) = (String::new(), body);
-    loop {
-        let q = rest.find('"')?;
-        out.push_str(&rest[..q]);
-        rest = &rest[q + 1..];
-        match rest.strip_prefix('"') {
-            // A doubled quote inside the run is one quote of the name itself.
-            Some(r) => {
-                out.push('"');
-                rest = r;
-            }
-            None => return Some((out, rest)),
-        }
     }
 }
 
@@ -862,7 +814,8 @@ mod tests {
     /// look up and must not be guessed at.
     #[test]
     fn a_type_name_splits_on_the_separator_outside_the_quotes() {
-        let split = |s: &str| split_type_name(s).map(|(ns, n)| (ns.unwrap_or_default(), n));
+        let split =
+            |s: &str| crate::schema::split_type_name(s).map(|(ns, n)| (ns.unwrap_or_default(), n));
         assert_eq!(split("mood"), Some((String::new(), "mood".into())));
         assert_eq!(split("sales.mood"), Some(("sales".into(), "mood".into())));
         assert_eq!(split("\"MyMood\""), Some((String::new(), "MyMood".into())));
