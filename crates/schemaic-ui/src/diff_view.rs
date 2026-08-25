@@ -89,10 +89,18 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
             num,
             text: line,
         } => {
-            let (bg, marker, mcolor) = match tag {
-                DiffTag::Equal => (None, " ", theme::text_muted()),
-                DiffTag::Del => (Some(theme::diff_del_bg()), "-", theme::diff_del_marker()),
-                DiffTag::Ins => (Some(theme::diff_add_bg()), "+", theme::diff_add_marker()),
+            // **`fn() -> Color`, never a captured `Color`.** These are read inside
+            // the two `.style` closures below, so calling them *here* would bake
+            // the palette at build time and a live theme switch would leave the
+            // row tint and the `+`/`-` marker on the old one. The rebuild key now
+            // carries `ui_generation` as well (see `editor_pane`), which would
+            // repaint them anyway — but the invariant is the invariant, and the
+            // key exists for `content_w`, which cannot be made reactive.
+            type Ink = fn() -> Color;
+            let (bg, marker, mcolor): (Option<Ink>, &str, Ink) = match tag {
+                DiffTag::Equal => (None, " ", theme::text_muted),
+                DiffTag::Del => (Some(theme::diff_del_bg), "-", theme::diff_del_marker),
+                DiffTag::Ins => (Some(theme::diff_add_bg), "+", theme::diff_add_marker),
             };
             h_stack((
                 container(text(num.to_string()).style(move |s| mono(s).color(theme::text_muted())))
@@ -106,7 +114,7 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
                     mono(s)
                         .width(theme::scaled(14.0))
                         .flex_shrink(0.0_f32)
-                        .color(mcolor)
+                        .color(mcolor())
                 }),
                 diff_line(line, dialect),
             ))
@@ -120,7 +128,7 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
             .style(move |s| {
                 let s = s.flex_row().items_center().padding_vert(theme::scaled(1.0));
                 match bg {
-                    Some(c) => s.background(c),
+                    Some(c) => s.background(c()),
                     None => s,
                 }
             })

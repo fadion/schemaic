@@ -293,8 +293,20 @@ fn cmdk_popup(
     };
 
     let content = dyn_container(
-        move || (cmdk.open.get(), inline_ai.get()),
-        move |(open, state)| {
+        // `ui_generation` is in the key because the child resolves two things no
+        // style closure can re-read: `diff_view`'s `content_w` (the diff's scroll
+        // range, measured from the font at build time) and the text `Attrs` the
+        // diff's syntax colouring is built from. Without it a live scale change
+        // left the rows rendering 1.6x inside a `min_width` computed at 100%, so
+        // the end of a long line could not be scrolled to. It is bumped by a scale
+        // change as well as a theme change, which is exactly the two things that
+        // invalidate those measurements.
+        //
+        // Safe to rebuild: everything the overlay remembers — the prompt text
+        // (`cmdk.input`), the range, the state — lives in signals outside this
+        // scope, and the container already rebuilds on every state transition.
+        move || (cmdk.open.get(), inline_ai.get(), theme::ui_generation()),
+        move |(open, state, _gen)| {
             if !open {
                 return empty().into_any();
             }
