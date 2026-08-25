@@ -490,7 +490,10 @@ fn banner(
     // stays: it is what *says* the action is unavailable."
     let kill_btn = crate::widgets::key_pressable(
         text(format!("Kill {holder_id}")),
-        theme::scaled(5.0),
+        // The same literal the box below rounds itself by — a small button radius
+        // is a shape, so it stays literal, and the focus ring must round with the
+        // thing it rings rather than drifting from it at 130% and 160%.
+        5.0,
         move || {
             if !read_only {
                 (kill)(holder_id, KillKind::Session);
