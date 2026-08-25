@@ -5106,7 +5106,7 @@ fn cell_shape(editor: CellEditor, buf: &str) -> CellShape {
     }
     match editor {
         CellEditor::Bool(_) | CellEditor::Enum(_) | CellEditor::Set(_) => CellShape::Pick(editor),
-        CellEditor::Date | CellEditor::DateTime => CellShape::Calendar(editor),
+        CellEditor::Date | CellEditor::DateTime(_) => CellShape::Calendar(editor),
         CellEditor::Text => CellShape::Text,
     }
 }
@@ -5167,7 +5167,7 @@ fn typed_editor(
         editor @ CellEditor::Set(_) => Rc::new(move || {
             cell_editors::set_control(f.buf, editor.clone(), autofocus, close_panel())
         }),
-        editor @ (CellEditor::Date | CellEditor::DateTime) => Rc::new(move || {
+        editor @ (CellEditor::Date | CellEditor::DateTime(_)) => Rc::new(move || {
             cell_editors::date_control(f.buf, editor.clone(), autofocus, close_panel(), gs.menus)
         }),
         CellEditor::Text => return scalar_editor(gs, nullable, autofocus, f),
@@ -8537,7 +8537,14 @@ mod tests {
         )
     }
 
-    use schemaic_core::celledit::BoolWire;
+    use schemaic_core::celledit::{BoolWire, Zoned};
+
+    /// A datetime column that stores the wall clock as written. Which flavour is
+    /// beside the point for everything in this module — the grid asks what
+    /// *shape* a cell takes, and both take a calendar.
+    fn naive() -> CellEditor {
+        CellEditor::DateTime(Zoned::Naive)
+    }
 
     // ── Type-aware editors: which control a column's cells get ──
     //
@@ -8645,8 +8652,10 @@ mod tests {
         // The database is in the tree but its introspection hasn't landed.
         let nodes = RwSignal::new(vec![node("app", None)]);
         let editors = column_editors(&rs, nodes, SqlDialect::MySql);
-        assert_eq!(editors[0], CellEditor::DateTime);
-        assert_eq!(editors[1], CellEditor::DateTime);
+        // Both are `DATETIME`: the wire type is all there is, and it stores the
+        // wall clock as written.
+        assert_eq!(editors[0], naive());
+        assert_eq!(editors[1], naive());
         assert_eq!(editors[2], CellEditor::Text);
     }
 
@@ -8734,8 +8743,8 @@ mod tests {
             CellShape::Calendar(CellEditor::Date)
         );
         assert_eq!(
-            cell_shape(CellEditor::DateTime, "2026-08-24 19:16:07"),
-            CellShape::Calendar(CellEditor::DateTime)
+            cell_shape(naive(), "2026-08-24 19:16:07"),
+            CellShape::Calendar(naive())
         );
         // A pending row's blank cell: "nothing chosen yet" fits every control, so
         // the calendar is there to enter the date *with*.
@@ -8751,10 +8760,7 @@ mod tests {
     #[test]
     fn a_date_no_calendar_can_show_keeps_the_plain_field() {
         assert_eq!(cell_shape(CellEditor::Date, "0000-00-00"), CellShape::Text);
-        assert_eq!(
-            cell_shape(CellEditor::DateTime, "0000-00-00 00:00:00"),
-            CellShape::Text
-        );
+        assert_eq!(cell_shape(naive(), "0000-00-00 00:00:00"), CellShape::Text);
     }
 
     /// **The composition, which is where this can go wrong**: the cell's padding
@@ -8769,7 +8775,7 @@ mod tests {
         assert!(fills(CellEditor::Enum(vec!["G".into()]), "G"));
         assert!(fills(CellEditor::Set(vec!["a".into()]), "a"));
         assert!(!fills(CellEditor::Date, "2026-08-24"));
-        assert!(!fills(CellEditor::DateTime, "2026-08-24 19:16:07"));
+        assert!(!fills(naive(), "2026-08-24 19:16:07"));
         assert!(!fills(CellEditor::Text, "anything"));
         // And the fallback keeps the field's padding too — a `tinyint(1)` holding
         // 7 edits as text, in a cell that still reads like the display.

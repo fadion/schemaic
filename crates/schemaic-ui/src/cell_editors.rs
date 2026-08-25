@@ -804,7 +804,7 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
         },
     );
 
-    let picks_time = editor == CellEditor::DateTime;
+    let picks_time = matches!(editor, CellEditor::DateTime(_));
     let now_label = if picks_time { "Now" } else { "Today" };
     let footer = h_stack((
         empty().style(|s| s.flex_grow(1.0_f32)),
