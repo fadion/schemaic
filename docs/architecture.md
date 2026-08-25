@@ -86,6 +86,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     hoists that per column beside the binary mask, since only the column's type can say those bytes
     are a number). PostgreSQL's `bit` never arrived as bytes at all — its text protocol sends
     `00001010`, which was being reported as a byte count.
+    **`bit_cell(bytes)` is what the MySQL loader stores for a `BIT` column, and the variant is the
+    load-bearing part**: it is a `Value::UInt`, because a `Value::Str` reached `export::sql_literal`
+    as the quoted `'10'`, and `'10'` assigned to a MySQL `BIT` column is not the number ten —
+    `Field_bit::store(const char*, …)` takes the raw bits of the *bytes*, so it is `0x3132` = 12594
+    on a `BIT(16)` and "Data too long" on a `BIT(8)`. A named function rather than two words in the
+    loader's `match`, so the seam that broke is reachable from a test: `bit_value` was right and had
+    a table of tests all along, and what was wrong was the variant its answer got wrapped in on the
+    way to an exporter.
     `Column::is_binary` reads **two**
     inputs because neither covers every result: `ColumnOrigin::binary` is the authoritative wire
     flag but exists only for a table-backed column, so a `bytea` expression with no catalog
@@ -93,10 +101,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Conversely nothing may act on the type name *alone* — a SQLite `BLOB` column is an affinity,
     not a promise, and may hold ordinary text — which is why every decision that discards a value
     (`export::dropped_binary_columns`, `pg::pg_cell`) requires the type and the value to agree.
+    **`ResultSet::binary_columns` is a third input, and it is not a type at all** — it is the
+    backend's own record that a value in this column *arrived* as raw bytes, set through
+    `ResultBuilder::mark_binary` (SQLite's `fetch_query`, from `ValueRef::Blob`, which is an
+    assertion rather than a heuristic). `export::dropped_binary_columns` ORs it into the type signal
+    because on SQLite there are two shapes with no type signal to find: a blob living in a column
+    declared `TEXT`, and any column with no `origin` at all — an expression, a join, a CTE.
+    (The untyped column was already covered: `db::sqlite::declares_bytes` asks
+    `schema::sqlite_affinity("")`, which is `Blob`.) Recorded per value and reported per *column*,
+    since that is the grain everything downstream asks at, and a column marked here is still tested
+    per cell against `is_binary_display` before anything is withheld — so a row of real text in a
+    column that held a blob elsewhere is untouched.
     **The flag is computed once per result, never per cell.** `Column::is_binary` splits a type
     name and walks a keyword list; the read loops run up to the row cap times the column count, so
     both backends hoist it out — MySQL into a `Vec<bool>` before `ResultBuilder::new`, PostgreSQL
-    into `pg::binary_columns` riding alongside the per-column type names in the `grid` tuple. Asked
+    into `pg::cell_kinds`, which now carries the binary flag and the numeric `NumKind` **together**,
+    one `CellKind` per column, since both halves were derived from the same type name. Asked
     per cell it would be tens of millions of string splits for an answer that cannot change between
     rows.
     `ColumnOrigin::implicit_key` is the one field no
@@ -206,7 +226,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the introspected `DbSchema`s (columns + FK edges); building one is O(tables × columns) and a keystroke asks
     for it up to four times, so the UI goes through `CatalogCache` — a memo keyed on the **`Arc<DbSchema>`
     identity** of the schemas it was built from rather than a hand-bumped generation, so a re-introspection
-    misses by construction and there is no write site to remember. Hosts the shared `SQL_KEYWORDS`/`SQL_FUNCTIONS`/
+    misses by construction and there is no write site to remember. Hosts the shared `SQL_KEYWORDS`/`FUNCTIONS`/
     `STMT_KEYWORDS` (the UI's completion + editor build on these). Also `join_condition` (FK-aware
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
@@ -310,6 +330,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     ("not filterable") rather than erroring, because eligibility is the caller's question — a
     question it now asks `intel::simple_select_source`, which is also what SQLite's write-back
     asks, rather than answering inline.
+    **`rerun_statement` is what the two affordances that re-run a result on screen ask** — the
+    capped notice's "read N rows" and the export's `All rows` — and it composes *what* would run
+    (`build_query`, or the base verbatim when the filter bar and the sort are both empty) with
+    *whether it may* (`sql::rerunnable_for_export`), so the write guard sees the exact string that
+    would be dispatched. It lives here rather than at either call site because a term a caller can
+    delete is a term the suite cannot hold: the export menu's copy of the guard was deletable with
+    everything green, and the read-more link had no copy at all (*Architecture invariants*, the write
+    guard). An empty or whitespace base is `None` too, since `contains_write("")` is `false` and a
+    bare "is it a write?" gate therefore says yes to nothing at all.
     `eq_condition` is the right-click "Filter by / Exclude" fragment. `table_query` is what opening
     a table from the tree generates: it orders by the PK on purpose — no engine promises row
     order for a capped page, and PG heap order shifts under an `UPDATE` — while leaving an ordinary
@@ -403,8 +432,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `GridCells` is a borrow struct over what the grid's signals hold — `rs`, the display→data
     `order`, the per-column `formats`, `dirty` and `new_rows` — and `text(i, ci, formatted)`
     resolves one *display* cell in the painter's order: a pending new row's typed value, then a
-    staged edit, then the stored cell through `format::apply`. `tsv(rect)` is the clipboard's block
-    and `attached(rect, cap)` is an AI attachment's column names, rows and pre-cap total. One rule,
+    staged edit, then the stored cell through `format::apply`. `tsv(rect, frozen)` is the clipboard's
+    block and `attached(rect, cap, frozen)` is an AI attachment's column names, rows and pre-cap
+    total — both emitting the selected columns in the order they are **drawn** (`visual_cols`) rather
+    than in index order, because whoever receives the block reads it left to right and a copy across
+    a freeze reached a spreadsheet transposed. One rule,
     because this resolution kept going out one source short where nothing could test it:
     `attached_rows` first read `rs.cell` and never `dirty`, so a green uncommitted edit was on
     screen while the pre-edit value went to the model, and the fix for *that* left the rule in
@@ -420,10 +452,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     promise being that the model is answering about what the user is looking at, while Ctrl+C stays
     raw and the cell menu offers *Copy formatted* as its own entry. A staged value is never
     formatted either way, because it is text the user typed and the painter doesn't format one.
+    **`visual_cols(ncols, frozen)` is the one definition of the order the grid draws columns in** —
+    the frozen column, then every other column in index order. A frozen column keeps its *absolute*
+    index on purpose, so selection, sort and resize stay consistent, which means draw order and index
+    order disagree the moment `frozen` is `Some(f)` with `f > 0`. That is fine for a rectangle's
+    *membership* and wrong for everything about adjacency or reading order: `plan_paste` extends a
+    block along this order from the anchor, and `tsv`/`attached` emit along it. Walking the index
+    range instead put the second value of a two-wide paste dropped on `email` into a frozen `ssn` —
+    a column at the far *left* of the screen the user never pointed at, one `UPDATE … SET ssn` away
+    from destroying it — and sent a copy across the freeze to a spreadsheet transposed. One list,
+    because `grid::scroll_active_into_view` already sums widths with the same filter and a second
+    spelling of the order is a second chance to disagree with it. The **single-value** paste is not
+    an exception: it fills the *selection*, which is the set of cells already painted highlighted, so
+    no translation applies. **What this deliberately does not fix**: a selection whose absolute range
+    straddles the frozen column is visually discontiguous, so copy→paste of such a selection no
+    longer round-trips. The ambiguity is in the selection model, not in either surface, and both now
+    agree with what is drawn rather than with each other.
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping). **Rows arrive through a pull source,
     not as a `&ResultSet`**: `RowChunks::next_chunk` hands over one `RowChunk { rs, order }` at a
-    time and `ExportFormat::stream_to` renders from it, returning the rows written. Every entry
+    time and `ExportFormat::stream_to` renders from it, returning an `ExportTally`. Every entry
     point took a whole result until the whole-table export landed, which made "export" mean
     "export whatever the row cap fetched" — and materialising two million rows to render them
     would hold the table twice over and run into `ResultSet`'s 512 MiB per-column arena ceiling,
@@ -442,7 +490,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`an_empty_chunk_carries_a_header_and_no_chunk_carries_nothing`). Each `export_*_chunks` is
     now the *only* implementation: every `*_to<W: io::Write>` form is that function over a
     `OneChunk` and `ExportFormat::render_to` is `stream_to` over one, returning the same
-    `io::Result<u64>` — so there is no buffered renderer and streamed renderer to keep in
+    `io::Result<ExportTally>` — so there is no buffered renderer and streamed renderer to keep in
     agreement, with the `String` versions still thin wrappers for the clipboard. `render_to` is the
     wrapper the app's `Fetched` export calls: building the `OneChunk` and calling `stream_to` at the
     call site is that body verbatim, and doing so left `render_to` with no production caller at all. Two tests hold that together —
@@ -453,10 +501,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     back must not pass a raw-bytes cell straight through.** Such a cell is
     `model::binary_display`'s `<n bytes>` (a `Value` has no bytes variant to hold the real thing),
     and emitting that produces a file which silently stores the *placeholder* as the column's data
-    on re-import. `dropped_binary_columns` finds those cells in a pre-pass — requiring the column's
-    type **and** the cell's text to agree, since either signal alone is wrong in a way that loses
+    on re-import. `dropped_binary_columns` finds those cells in a pre-pass — requiring a *column*
+    signal **and** the cell's text to agree, since either alone is wrong in a way that loses
     data — and `withheld_binary` is the one per-cell test every withholding emitter shares, so the
-    two-signals rule cannot be spelled differently in one of them.
+    two-signals rule cannot be spelled differently in one of them. **The column signal is
+    `Column::is_binary` OR `ResultSet::binary_columns`**, the second being the backend's own
+    per-value assertion that the column handed over raw bytes (`ResultBuilder::mark_binary`, set from
+    `ValueRef::Blob` in SQLite's `fetch_query`). It is there because on SQLite a type name cannot
+    always answer: `declares_bytes` already covers every `…BLOB…` spelling, the `BINARY` family
+    **and** the untyped column (`schema::sqlite_affinity("")` is `Blob`), but it cannot see a blob
+    living in a column declared `TEXT`, and a column with no `origin` at all — an expression, a join,
+    a CTE — has no declared type to ask. In both of those the two-signal rule degenerated to "never
+    withhold" and the `<n bytes>` placeholder went into CSV, JSON and SQL as though it were the data.
+    The consequence to know: in a column that has handed over raw bytes, a cell whose text reads
+    exactly `<n bytes>` is now withheld — the same answer a declared `BLOB` column always gave.
     **Which emitters withhold is decided by whether anything reads the format back**, and that is
     three of the five: the SQL export (`NULL`, plus a `-- NOTE:` heading the script — a comment
     rather than a refusal, since the script still runs and the one thing it may not do is pretend
@@ -473,12 +531,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `Column::is_binary`.
     **Both are computed per chunk, and the `-- NOTE:` line is the one thing a stream genuinely
     cannot know up front.** Which columns were withheld is a fact about the rows in hand — it needs
-    the column's type *and* a `binary_display` placeholder in the data to agree — and a stream never
+    the column signal *and* a `binary_display` placeholder in the data to agree — and a stream never
     holds them all, so a column can carry real bytes for a million rows and meet a placeholder in
     the next block. The note is therefore emitted the first time a column is actually withheld,
     naming only the newly discovered ones and tracked in a `noted: Vec<bool>`; over a single chunk
     that collapses to exactly the old behaviour, one note before the first `INSERT` naming every
     withheld column (`the_binary_note_finds_a_column_that_only_drops_later`).
+    **`ExportTally` is what a renderer returns, because a row count was never the whole result.**
+    `rows`, plus `withheld` (those binary columns, named — empty for Markdown and HTML) and `blanked`
+    (`ResultSet::capped_columns`, the cells past a column's 512 MiB arena, which read back as the
+    empty string). Nothing had ever read that second flag, so a streamed chunk that overran the arena
+    wrote a file with holes in it and reported a full row count: the grid surfaces the arena cap with
+    a note of its own, but a streamed chunk is never mounted in a grid. `ExportTally::note` folds one
+    chunk's losses in without repeating a name, since a streamed export meets the same column in
+    every chunk and a caveat that named `body` two hundred times would say less than one that names
+    it once. Neither loss is an error — the file is written and the rows in it are real — so the one
+    thing that must not happen is the caveat going unsaid, which is `export_note(tally, name,
+    streaming)`'s job: silent for a clean non-streamed save, and never silent when there is a caveat.
+    `export_failure_note(message, partial)` is the same rule on the other side, appending
+    `— <name> is incomplete` when the destination had already been created (`File::create`
+    truncates) and saying nothing extra when the export was refused before the write started. And
+    `all_rows_label(size, sorted, manual_tx)` is the Download menu's `All rows` entry, three
+    disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
   - `import.rs` — the inverse of `export.rs`: CSV/TSV + JSON (array *or* NDJSON) → table. Format
     inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
     a header, positional without), per-column `coerce` (only the families a wrong answer would
@@ -1117,7 +1191,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     has no such table — its rows are observations *about* one, a third of them deletions. Both caps
     are here for one reason, that the modal has to be able to *name* them: `ROW_CAP` (rows per poll,
     past which the monitor watches a page rather than a table) and `LOG_CAP` (changes kept, oldest
-    dropping — the app's old private `MONITOR_LOG_MAX`, moved once the log became exportable, since
+    dropping — a cap the app used to keep private, moved here once the log became exportable, since
     a silently truncated record looks complete and isn't). **`trim_log` is the one place `LOG_CAP`
     is applied**, and it returns how many entries went, because the app trimming on `> LOG_CAP`
     while the modal's caveat printed on `>= LOG_CAP` meant a log resting exactly at the cap claimed
@@ -1597,25 +1671,55 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     its type. `rows`/`TreeRow` is the flattened outline the UI renders.
   - `celledit.rs` — **which editor a column's cells get**, and the value rules that editor
     enforces. `editor_for_type` reads a *declared* type into a `CellEditor` (`Bool(BoolWire)`,
-    `Enum(members)`, `Set(members)`, `Date`, `DateTime`, else `Text`) and `editor_for_column` adds
+    `Enum(members)`, `Set(members)`, `Date`, `DateTime(Zoned)`, else `Text`) and `editor_for_column` adds
     the one thing the type text can't answer — a PostgreSQL enum type's members, which live in
     `DbSchema::enums`. **Declared, never the wire type**: MySQL sends an `ENUM` as
     `MYSQL_TYPE_STRING` and a `BOOLEAN` as `TINYINT`, so `Column::type_name` knows neither the
     member list nor the `tinyint(1)` width, and a result whose schema hasn't loaded falls back to
     the wire type (where the date family still resolves and the rest stay text). `fits` is the
     other half and the safety one: a control may only be offered for a value it could itself have
-    produced, so a `tinyint(1)` holding `7`, an `ENUM` holding the empty string MySQL wrote for a
-    rejected insert, and a `DATE` holding `0000-00-00` all keep the plain text field — a toggle
-    rendered over `7` writes `0` the moment it is touched. An **empty** value fits everything (it
-    means "nothing chosen yet"), which is what hands a NULL field its dropdown. `BoolWire` is which
+    produced, so a `tinyint(1)` holding `7` and a `DATE` holding `0000-00-00` keep the plain text
+    field — a toggle rendered over `7` writes `0` the moment it is touched. An **empty** value fits
+    everything (it means "nothing chosen yet"), which is what hands a NULL field its dropdown — and
+    that arm answers `true` *before* it looks at the editor, so it is **not** the `ENUM` protection
+    this entry used to claim. A MySQL `ENUM` holding the empty string a rejected insert wrote in
+    non-strict mode gets the dropdown, and the dropdown has no row that writes `''` back; the cell
+    is also indistinguishable from a NULL one, which `start_edit` seeds from the empty string too.
+    Telling the two apart means telling `fits` *which cell* it is looking at, which no caller can
+    say, so the exception stands and the cost is written down instead: a NULL cell and a fresh
+    pending row are the common cases, a literal `''` in an `ENUM` is what a misconfigured server
+    produced once. `BoolWire` is which
     two literals a boolean writes, and it is **the engine's own spelling, not the readable one**
     (`1`/`0` on MySQL and SQLite, `t`/`f` on PostgreSQL): every engine accepts several on the way
     in, so the round trip decides — a toggle back to what the column already reads back is
     recognised as a revert and un-stages, where `true` written over a `t` leaves a green cell whose
-    `UPDATE` writes a value already there. Writing back is
-    `set_date`/`set_time` (which keep a datetime's other parts — see `date.rs`) and
+    `UPDATE` writes a value already there. **The row already *held* is the one exception, and writes
+    the text the cell already has** rather than the wire spelling (`pick_options`), because the
+    revert property only holds where the engine's read spelling *is* its write spelling. SQLite has
+    neither a boolean type nor an opinion about one, so such a column may legally hold `'true'`: the
+    picker showed that row as held, and clicking it to confirm staged `1` — a different stored value
+    out of an action whose only visible meaning was "yes, that one". Writing back is
+    `set_date`/`set_now` (which keep a datetime's other parts — see `date.rs`) and
     `toggle_set_member`, which re-emits a `SET` in **declaration order** because that is the order
-    MySQL stores and returns one in. The `ENUM`/`SET` member list is parsed off the type text
+    MySQL stores and returns one in.
+    **An offset is a property of the destination, not text carried from the old value.**
+    `CellEditor::DateTime` carries `Zoned::{Offset, Naive}`, decided by type name *and* dialect
+    (`zoned_for_type`), because the same word means different things on two engines: a MySQL
+    `TIMESTAMP` and a PostgreSQL `timestamptz` resolve an offset, while a MySQL `DATETIME`,
+    PostgreSQL's bare `timestamp` (which parses one and *discards* it) and SQLite's text stamps have
+    nowhere to put one. `set_now` asks the destination, where the gate used to be "did the old text
+    carry a tail" — which reads `false` for exactly the column that most needs an offset, since a
+    MySQL `TIMESTAMP` is rendered in the session zone with no tail at all. So **Now** sent a client
+    wall clock the server read as its own: server at `+00:00`, client at `+02`, an instant stored two
+    hours in the future and rendered back in the session zone so the cell re-read as correct. It
+    drops the old value's fraction for the same class of reason — those were its microseconds, not
+    this instant's. `set_date` drops the offset on **both** flavours of column, because an offset
+    qualifies a particular instant: `+01` on a Berlin `timestamptz` is true in January and false in
+    July, so carrying it onto a picked July day restates the time of day an hour out and changes the
+    one thing the user did not touch. **The assumption worth recording**: `[+-]hh:mm` inside a
+    datetime literal is MySQL 8.0.19+, so on MariaDB or an older MySQL a `TIMESTAMP` **Now** will now
+    fail loudly where it used to store a wrong instant silently. That is the intended trade, and it
+    is on the release's live-check list. The `ENUM`/`SET` member list is parsed off the type text
     through `sql::skip_noncode` — the one boundary lexer — and unescaped as the exact inverse of
     `export::sql_literal`, since splitting on commas loses a member containing one.
   - `date.rs` — civil dates, clock times, and the month grid a picker draws. `Date`/`Time` are
@@ -1625,13 +1729,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the fractional seconds, the timezone offset, and whether the source separated date from time
     with a space or a `T`. Picking a day out of `2024-01-15 10:30:00.123456+02` must not quietly
     drop the rest, which is the same silent-rewrite class `jsontree` keeps a number's source text
-    for. The arithmetic is Howard Hinnant's `days_from_civil`/`civil_from_days` pair — the
+    for. **The tail is kept without being understood, but not without being checked**: `Stamp::parse`
+    validates it as an offset — `Z`, or a sign and one to three digit pairs — and answers `None`
+    otherwise, because everything downstream treats *any* tail as one (`has_offset` says so,
+    `with_offset` replaces it). A PostgreSQL BC timestamp (`0044-03-15 00:00:00 BC`) came through
+    with `tail = " BC"`, so `celledit::fits` said a calendar could show it, the picker opened on
+    March 44 **AD**, and *Now* wrote the era away by replacing ` BC` with `+02:00`. The date-only
+    spelling was already refused, since `take_time("BC")` fails; the asymmetry was that adding a time
+    let the same suffix through. The arithmetic is Howard Hinnant's `days_from_civil`/`civil_from_days` pair — the
     workspace's only date maths, `format.rs`'s epoch formatter included — and `month_cells` is
     **always 42 dates** (six weeks, Monday-first) so the panel doesn't change height as you page
-    through the year. `Date::today`/`Time::now` are the module's only impure functions and the only
-    use of `chrono` in the workspace: they read the **local** clock, because `SystemTime` is UTC and
-    a picker that highlights yesterday between local midnight and the offset is wrong at exactly the
-    hours somebody is most likely to be looking at it.
+    through the year. `Date::today`, `Time::now` and `local_now` are the module's only impure
+    functions and the only use of `chrono` in the workspace: they read the **local** clock, because
+    `SystemTime` is UTC and a picker that highlights yesterday between local midnight and the offset
+    is wrong at exactly the hours somebody is most likely to be looking at it. **A timestamp field
+    goes through `local_now`**, which returns the day, the time of day and the zone's offset from
+    **one** reading of the clock: two reads are two instants and local midnight can fall between
+    them, which is how the calendar's *Now* — `Date::today` plus `Time::now` — wrote yesterday's
+    date beside today's time, a stamp a day in the past from the one control whose whole job is the
+    current instant. A caller that wants only the day still wants `Date::today`.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
     warnings (full scan / filesort / temp table); `to_prompt_text` for the AI.
   - **AI prompt + reply plumbing** (all pure, all dialect-aware — a prompt that hardcodes
@@ -1990,7 +2106,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
         catalogue is asked — so `200k of ~292.02k rows` cannot mean anything but a read that
         stopped short, and `200k of ~292.02k rows (capped)` spent nine characters restating it on
         a strip already wide enough to push its own buttons off a narrow panel. The word stays
-        wherever there is no comparison to make. The noun follows the last figure named, which is
+        wherever there is no comparison to make. **That premise is now enforced here rather than
+        assumed**: the function drops the total outright when `truncated` is false. The gate that
+        guaranteed it lives in a view closure no test can reach, and fetching the total
+        unconditionally is the obvious optimisation — the tree already holds it — so the moment
+        anyone takes it, `42 of 1,000 rows` would appear over a `SELECT … WHERE` that legitimately
+        matched 42 of 1,000: a claim that 958 rows were withheld, with no `(capped)` to hint a cap
+        was ever involved. The noun follows the last figure named, which is
         the total when there is one: `1 of ~4.2m row` and `0 of 1 rows` are both wrong.
         `truncate_prompt`/`drop_prompt` are the destructive confirmations'
         wording, and they name a figure only above `CONFIRM_ROW_FLOOR` (1,000) when it is an
@@ -2148,6 +2270,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `an_empty_table_still_streams_the_block_that_carries_its_columns`,
   `a_failed_stream_sends_its_reason_down_the_channel`,
   `a_statement_with_no_result_set_is_refused_rather_than_exported_empty`).
+  **Uncapped changes what a per-cell cost means, and three things came out of that.** A chunk ends
+  by rows **or by bytes**: `RowDest::chunk_full(rows, bytes)` also cuts at `CHUNK_BYTE_BUDGET`
+  (32 MiB, read off `ResultBuilder::text_bytes`), because a block is `chunk × the row width` and
+  nothing bounded the width — the channel holds two, the loop is filling a third and the writer is
+  rendering a fourth, so a table of 1 MB documents put ~40 GB in flight against a constant whose own
+  doc promised "megabytes rather than gigabytes". That was a claim about bytes made by a figure
+  counted in rows; the only thing that had ever stopped it was the per-column 512 MiB arena ceiling,
+  and hitting *that* is the loss `export::ExportTally::blanked` now reports. The budget bounds the
+  arena and not the whole `ResultSet`, whose one offset word per cell is proportional to
+  `rows × columns` and already bounded by the row count. Then the two type hoists: `db::NumKind` /
+  `num_kind` / `parse_as` split `parse_typed`'s *decision* from its *parse*, since the decision is a
+  `to_ascii_uppercase()` (a heap allocation), six `starts_with` probes and, for integers, a
+  `contains("UNSIGNED")` scan — nothing at all per column and 100M allocations on a 5M × 20 export.
+  A row loop calls `parse_as` with a kind computed once per column, `parse_typed` stays for the
+  callers with a single cell to convert, and it **is** the composition of the other two, so the two
+  spellings cannot drift. `pg::cell_kinds` is the same hoist on PostgreSQL and answers the numeric
+  kind and the binary flag **together**, once per column, replacing a per-cell
+  `to_ascii_uppercase()`.
   `fetch_table_stats` fills `core::stats::SchemaStats` for a whole database — one round trip
   either way, and having the set is what feeds the schema tree's size column. It is **lazy and
   deliberately not part of `fetch_schema`**: selecting `DATA_LENGTH` from
@@ -2482,7 +2622,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     surface reads that one name — the diff view, and `FieldCfg::mono` (the DDL preview's
     script box, the view editor's definition). Most of the file is `fn() -> f64` rather than
     `const`, because the interface scale multiplies anything that boxes text; the module doc lists
-    what stays a `const` and why (hairlines, editor-relative metrics, seeds for persisted widths).
+    what stays a `const` and why — hairlines, editor-relative metrics, seeds for persisted widths,
+    icon bases, `TERM_FONT_SIZES`, and the two floating-bar insets — and **that list is the copy to
+    extend**, since a prose list has been found short three times.
     `field_input_h()` is the same idea for the
     **compact single-line field** every transient bar wears (the editor's find/replace/goto, the
     grid's find/goto, the row panel's inputs): `FieldCfg::height` is an `Option`, and leaving it
@@ -2506,7 +2648,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `.keyboard_navigable().request_focus(|| {})` again; that pair is what left every modal
     unclosable from the keyboard while a field was focused.
     Also the **shared modal form chrome** every modal wears — `form_setting`/`form_section`/
-    `form_separator`/`FORM_GAP`/`control_button`/`footer_button`/`modal_footer`. Manage
+    `form_separator`/`form_gap()`/`control_button`/`footer_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
     than copying them a third time.
     And the **keyboard-navigation cluster**, which is the subject of the Tab gotchas below:
@@ -2848,7 +2990,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     deliberately not a copy of the header: a press anywhere along it moves the window, because
     nothing else up there does anything while a modal is up and a real title bar drags from
     anywhere. It stays **under** the resize zones, which are the layer outside the root, so the top
-    corners still resize rather than drag. `controls_width` is the one place `CONTROL_W` meets `Chrome::own_control_count`, and a
+    corners still resize rather than drag. `controls_width` is the one place `control_w()` meets `Chrome::own_control_count`, and a
     source-scanning test pins that against the buttons `controls` actually builds — a fourth
     caption button added without touching the count would leave 46px of title bar dimmed and dead.
     It returns **two** siblings, not one, for the reason the zones are eight: the header's
@@ -3161,8 +3303,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     that file is transient, so it gets **italic title text** and no glyph at all. Both markers as
     dots was the first attempt and the wrong one on this chip, because a tab can already carry the
     DB-identity dot: the strip ended up with two dots of unrelated meanings a few pixels apart.
-    Italic also costs no width, so unlike `TAB_DOT_W` and `TAB_FILE_W` — neither of which is inside
-    `TAB_TITLE_AVAIL`'s 40, so a title has to shed whichever of them is showing or a full-width one
+    Italic also costs no width, so unlike `tab_dot_w()` and `tab_file_w()` — neither of which is inside
+    `tab_title_avail()`'s 40, so a title has to shed whichever of them is showing or a full-width one
     pushes the × past the chip cap — the slant needs nothing shed for it. (Truncation is measured
     upright: an italic face is a hair wider, and being a hair late to ellipsize isn't worth a second
     text measurement.) A file tab's tooltip is its **full path**, which subsumes the truncated-title
@@ -3630,7 +3772,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   the latter reports a base it cannot rewrite as a *filter* failure ("not a simple single-table
   SELECT"), and a join is perfectly re-runnable at a bigger cap — telling a user with no filter
   that their filter is at fault is worse than the cap they were trying to get past
-  (`an_ineligible_base_is_still_ineligible_with_nothing_to_splice` pins the premise). Clearing the
+  (`an_ineligible_base_is_still_ineligible_with_nothing_to_splice` pins the premise). **And the same
+  call is the write guard**: `current_statement` wraps `filter::rerun_statement`, so a statement that
+  may not be executed a second time draws no link at all — the offer's predicate and its click ask
+  the one function, where they used to ask only whether `base_sql` was `Some` (*Architecture
+  invariants*, the write guard). Clearing the
   override on a fresh manual run is the other half: a raised cap belongs to the result it was
   raised for, and carrying it forward would be the global setting the user didn't change.
   **The export is the other way past the cap, and it is a different shape.** `export_file` branches
@@ -3644,7 +3790,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   end-of-stream, and **the reader's verdict wins where the two disagree**: a cancelled read closes
   the channel, which the writer sees as an ordinary end of stream, so the writer alone would report
   a truncated file as a finished export. `EXPORT_CHUNK_ROWS` is 10,000, with the trade stated at
-  the constant and nothing downstream depending on the figure. `export_token` is an
+  the constant and nothing downstream depending on the figure — but **it is no longer the only thing
+  that ends a block**: `RowDest::chunk_full` also cuts at `db::CHUNK_BYTE_BUDGET`, because a row
+  count is the wrong unit for a promise about memory (see `schemaic-db`'s streaming account). `export_token` is an
   `Rc<RefCell<Option<CancellationToken>>>` in the same shape as `import_token` — cleared when a run
   reports, so a later Cancel can't cancel an export that already finished.
   **One slot means one streamed export, and the second is refused rather than queued or keyed.**
@@ -4039,7 +4187,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `schemaic=info` filter discarded every one of those records because they carry a `velopack`
     target — that was the other half of why the field failure was undiagnosable
     (`the_default_filter_admits_velopack` pins it); `RUST_LOG` still overrides the pair where it is
-    set. Rotation is a size check **once per launch**, not per write: `MAX_LOG_BYTES` is 4 MB and
+    set. **But `RUST_LOG` cannot ask for a credential.** The filter is built by
+    `log_directives`/`filter_for`, which take what the environment asked for (or `DEFAULT_FILTER`)
+    and then append `russh=warn`, `russh_cryptovec=warn` and `russh_util=warn` — `CREDENTIAL_TARGETS`,
+    a floor the environment cannot lift. Three facts composed into the bug it closes: `RUST_LOG`
+    *replaces* the default filter rather than adding to it, so a bare `RUST_LOG=trace` takes the
+    target allowlist away with it; `tracing-subscriber` bridges every dependency's `log` records into
+    `tracing`; and `russh`'s `session_write_encrypted` traces the packet body **before** the writer
+    encrypts it. So `RUST_LOG=trace` put the pre-encryption `SSH_MSG_USERAUTH_REQUEST` — the tunnel
+    account's password, as a decimal byte array — into `schemaic.log`, the file Settings → General
+    offers an **Open folder** button for, which is to say into the folder whose own doc calls it
+    "everything anyone would be asked for". **The order is what makes it a floor**: a bare `trace` is
+    a global directive and a target directive is more specific (`EnvFilter` matches
+    most-specific-first), while an explicit `RUST_LOG=russh=trace` is an *equal* key that
+    `DirectiveSet::add` replaces with the later one — this one. Underscores, not hyphens, since a
+    target is a Rust module path (`russh-cryptovec` reports as `russh_cryptovec`), and `russh` covers
+    its submodules by prefix. It is russh's surface alone on purpose: `mysql_async`,
+    `tokio-postgres` and `rusqlite` depend on neither `log` nor `tracing`, so there is nothing of
+    theirs to cap. A malformed `RUST_LOG` falls back to the whole default filter rather than being
+    applied directive-by-directive with the bad ones dropped — a filter half the user asked for is
+    harder to notice than none of it. Rotation is a size check **once per launch**, not per write: `MAX_LOG_BYTES` is 4 MB and
     one generation is kept as `schemaic.log.1`, so the worst case on disk is twice that, and a
     `stat` stays out of the path of every trace call. Failing to open the log is not fatal — it
     degrades to the old stdout-only behaviour rather than refusing to start, since a read-only or
@@ -4264,22 +4431,40 @@ Re-introducing the anti-patterns these guard against is a regression:
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
   un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
   `EXPLAIN ANALYZE` may run a statement for its timings.)
-  **The export menu answers to the guard too, through a refusal strictly stronger than it.**
-  `ExportScope::AllRows` re-executes the tab's captured statement through `Db::stream_query`, which
-  is a path executing user SQL and reached the server without passing `run_verdict` at all — so an
-  `UPDATE … RETURNING` on a table past the row cap could be run a second time from a Save dialog,
-  with no confirmation, on a read-only connection included. `sql::rerunnable_for_export` is the
-  gate, built on the same `contains_write` the verdict uses so there is one answer to "does this
-  statement write" and one place to grep, and it is **never weaker than `run_verdict` and
-  deliberately stronger**: the verdict may say `Confirm`, but an export has no moment at which to
-  ask — the user picked a file name, and a confirmation raised from a file picker would be a
-  question about something they never requested. So it is a flat refusal. That `contains_write` is
-  a whitelist of read *heads* is what makes it right here: `CALL proc()`, `INSERT … RETURNING` and
-  a data-modifying CTE are all writes to it, and each of the three returns rows, so each could
-  otherwise have reached a truncated grid and been offered the scope. `grid::export_menu` simply
-  does not offer `All rows` when it fails — not offering it is the whole enforcement, since the
-  scope cannot then be chosen (`a_row_returning_write_is_never_rerunnable_for_an_export`,
+  **The two re-run affordances answer to the guard too, through a refusal strictly stronger than
+  it.** `ExportScope::AllRows` re-executes the tab's captured statement through `Db::stream_query`,
+  and the capped notice's "read N rows" re-executes it through `apply_view` at a bigger ceiling.
+  Both are paths executing user SQL that reached the server without passing `run_verdict` at all —
+  so an `UPDATE … RETURNING` on a table past the row cap could be run a second time from a Save
+  dialog or from a link that says *read*, with no confirmation, on a read-only connection included.
+  `sql::rerunnable_for_export` is the gate, built on the same `contains_write` the verdict uses so
+  there is one answer to "does this statement write" and one place to grep, and it is **never weaker
+  than `run_verdict` and deliberately stronger**: the verdict may say `Confirm`, but neither of these
+  has a moment at which to ask — the user picked a file name, or followed a link about reading, and
+  a confirmation raised from either would be a question about something they never requested. So it
+  is a flat refusal. That `contains_write` is a whitelist of read *heads* is what makes it right
+  here: `CALL proc()`, `INSERT … RETURNING` and a data-modifying CTE are all writes to it, and each
+  of the three returns rows, so each could otherwise have reached a truncated grid and been offered
+  the scope (`a_row_returning_write_is_never_rerunnable_for_an_export`,
   `an_ordinary_read_is_rerunnable_for_an_export`).
+  **One tested function is asked by everything that re-runs**, and that is the shape of the fix
+  rather than a tidy-up. `filter::rerun_statement(base, &GridQuery, dialect)` composes *what* would
+  run (`build_query`, or the base verbatim when there is no filter or sort) with *whether it may*
+  (`rerunnable_for_export`), so the guard is asked about the string that would actually be
+  dispatched and there is no arrangement of base and filter that gets a write past it.
+  `GridState::current_statement` is a two-line wrapper over it, and the read-more link's predicate,
+  its click and `grid::export_menu` all ask the wrapper. Before this the export menu ANDed a
+  separate `!rerunnable` term of its own — a term that could be deleted with the whole suite still
+  green, which is exactly what it was worth — while the read-more link asked only whether `base_sql`
+  was `Some`, so a `SELECT` followed by a `DELETE` left the link drawn over the new base and a
+  row-returning write could be re-run outright. `grid::export_menu` simply does not offer `All rows`
+  when the function says `None`, and the notice draws no link; not offering is the whole enforcement,
+  since the scope cannot then be chosen. The composition is where the tests now live
+  (`a_row_returning_write_has_no_rerun_statement`, which asserts the refusal with *and* without a
+  filter, `a_blank_base_has_no_rerun_statement` — `contains_write("")` is `false`, so a bare "is it a
+  write?" gate says yes to an empty base — and
+  `an_unfiltered_read_reruns_as_itself_even_when_it_cannot_be_rewritten`, the join-and-CTE property
+  the read-more link exists for).
 - **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
   Every path that can put a cell value in a prompt — `run_query`, `describe_table`'s samples, the
   grid's attach-to-chat, AI Summary, AI Fill, AI Seed — is gated on
@@ -4391,6 +4576,15 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
   endpoint via a temp `--mcp-config` file, not argv. Don't add new plaintext-secret surfaces.
+  **"Never in a log" includes a log the environment asked for.** `app::logging`'s
+  `log_directives`/`filter_for` append `russh=warn`, `russh_cryptovec=warn` and `russh_util=warn`
+  *after* whatever `RUST_LOG` said, because `RUST_LOG` **replaces** the default filter rather than
+  adding to it, `tracing-subscriber`'s `tracing-log` bridge brings every dependency's `log` records
+  in, and `russh` traces the packet body before encryption — so `RUST_LOG=trace` wrote the SSH
+  tunnel password into
+  `schemaic.log` in cleartext, in the folder Settings offers an **Open folder** button for. A
+  dependency that logs a secret gets a line in `CREDENTIAL_TARGETS`, appended last so the floor
+  outranks an equal key; never a `debug!` we hope nobody enables.
 - **Connection secrets persist to the OS keyring, not `connections.json`.** DB/SSH passwords and the
   SSH key passphrase go through `schemaic_core::secrets` (`SecretStore` seam) + `schemaic-app`'s
   keyring-backed store; the JSON on disk is blanked and hydrated on load. All connection saves route
@@ -4403,6 +4597,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   `exec_after(Duration::ZERO, …)` — one tick later, after the keyed `dyn_container` has unmounted
   the old view. Synchronous disposal frees signals a still-mounted view reads this frame → panic.
   Same for any "replace + free" of scoped state.
+  **The mirror image is a callback that outlives the scope it reads**, and a window-global menu is
+  the usual carrier: an entry on the shared popup channel is an `Rc` closure over a cell's signals,
+  and nothing clears that channel when the cell goes away. Two defences and both are needed — the
+  control takes its **own** menu down in `on_cleanup` (`cell_editors::close_picker`, at the anchor
+  `open_picker` returned, held in a plain `Cell` because a signal read inside `on_cleanup` is the
+  hazard the cleanup exists to prevent), and the actions those entries call open with
+  `GridState::alive()`, which is `rs.try_get_untracked().is_some()`. Since `get_untracked` is
+  `try_get_untracked().unwrap()`, the failure this prevents is a panic that takes the window and
+  every tab's uncommitted edits — not a no-op.
 - **Themable colors reach reactive styles as `fn() -> Color`, never a captured `Color`.** A `Color`
   read once at build freezes and won't follow a live theme switch; pass the fn and call it inside
   the `.style(move |s| …)` closure (see `FieldCfg::background`).
@@ -4413,12 +4616,31 @@ Re-introducing the anti-patterns these guard against is a regression:
   argument**: `FieldCfg::font_size` and `highlight_text`'s size are `fn() -> f32`, because a caller
   that resolves `theme::font_body()` at build time freezes the value just as surely as a `const`
   would. If a size ends up inside something that isn't a style closure (a text `Attrs` list, an
-  editor `Styling`), pass the fn and read it *there*. The exceptions are written down on
-  `consts.rs`'s module doc and are all one of three things: a hairline, an editor-relative metric
-  (the code font has its own size setting and the scale doesn't touch it), or the seed for a
-  persisted width the user dragged. `icons::icon(markup, size)` takes a **base** size and scales it
-  itself, so never hand it an already-scaled value — the two-way trap `consts::COMPLETION_ICON_BASE`
-  and `consts::SCHEMA_ICON_BASE` exist to spell out.
+  editor `Styling`), pass the fn and read it *there*. **The exception list lives on `consts.rs`'s
+  module doc** — extend it there, not here: it is prose, prose is the wrong shape for it, and it has
+  been found short three times (a source-gate test holding the exceptions as *data* is the form that
+  gets updated when it fails, and is proposed but not written). What it says today is that an
+  unscaled length is a hairline, an editor-relative metric (the code font has its own size setting
+  and the scale doesn't touch it), the seed for a persisted width the user dragged, an **icon base**,
+  `TERM_FONT_SIZES` (the terminal font, which the scale deliberately doesn't reach either), or the
+  **air a floating bar keeps from the panel edge** — `GRID_BAR_INSET` (5.0) and
+  `SELECTION_BAR_INSET` (8.0), which are the only two length `const`s in `consts.rs` that fit none
+  of the rest. Whether *those two* should scale is unsettled and is written down as unsettled: both
+  bars overlay the panel rather than spanning it and the gap between them is `grid_selection_lift`'s
+  arithmetic, which both have to read the same way — but the honest answer needs the app on screen
+  at 160%, so the doc records what the code does rather than defending it. The icon bases are the
+  two-way trap: `icons::icon(markup, size)` takes a **base** size and scales it itself, so never hand
+  it an already-scaled value, which is what `consts::COMPLETION_ICON_BASE` and
+  `consts::SCHEMA_ICON_BASE` exist to spell out — and scaling the base constant too would square the
+  factor. One more exception is a *shape* rather than a name, and no textual sweep can find it: a
+  `border_radius` that is **half a scaled box** is a circle or a pill, not a shape constant, so it
+  has to move with the box — a `scaled(8.0)` dot with a fixed 4px radius is a rounded square at 160%,
+  in a list where the dot is the only colour cue. Five sites crate-wide: the connection colour dot,
+  the jump-to-bottom circle in `widgets.rs` and `properties.rs`'s
+  `bar_h() / 2.0` derive the radius from the box, while the connection-form swatch and
+  `settings::themed_toggle`'s track are both still a literal `9.0` over a `scaled(18.0)` box. It is
+  *not* the `SEGMENT_RADIUS` case (a shape inside a box that scales), and grepping for an unwrapped
+  literal cannot tell the two apart.
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
   export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
 - **Generated DDL is never run silently, and never emitted from a second differ.** Every
@@ -4657,7 +4879,10 @@ Re-introducing the anti-patterns these guard against is a regression:
     rather than a larger one — and a 1px rule or border is a hairline at every scale, so `.height(1)`,
     the menu separator's rule, the menu panel's border and `edit_field`'s `+ 3.0` (two borders plus a
     pixel of rounding slack) are all deliberately unwrapped. `menu_panel_height` is where the
-    distinction is visible in arithmetic: its boxes scale, its two borders don't.
+    distinction is visible in arithmetic: its boxes scale, its two borders don't. **The exception is
+    a radius that is half a scaled box** — a circle or a pill, which stops being one the moment the
+    box grows and the radius doesn't; see the interface-scale invariant for the five sites and for
+    why no grep finds them.
   - **A modal's size scales, then caps against the window** — `widgets::modal_w` for the width,
     `modal_h` for a fixed-height panel, `modal_body_h` for a scrolling body inside one. All three
     read `window_size()` inside the caller's style closure, so a resize re-runs them, and all three
@@ -5154,7 +5379,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   reachable at all, which is the same call `trigger_editor`'s per-engine form already made.
   **The else-arm is still `display:none`, via `widgets::nothing()`** — taffy skips a `display:none`
   child when it distributes `gap` but counts a zero-sized one, so a bare `empty()` arm leaves a
-  whole `FORM_GAP` of dead space where the block would have been. The rule is about *controls*: an
+  whole `form_gap()` of dead space where the block would have been. The rule is about *controls*: an
   arm with nothing inside it has nothing to be Tab-reachable. Where the conditional is a
   `dyn_container`, the hide goes on the **container** — that is the flex child, not its inner view.
 - **Buttons are in the ring too, and Space or Enter presses them — but there is no default Enter.**
@@ -5417,7 +5642,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   width, not `width_full()`: a percentage resolves against a definite parent width, and a `scroll`
   lays its child out against max-content available space, so the percentage quietly became "as wide
   as the widest row" and the rows never stretched to the box at all. And `row_width` carries
-  `COMPLETION_SLACK_W` of air and rounds up, because a box sized to exactly its widest row puts
+  `completion_slack_w()` of air and rounds up, because a box sized to exactly its widest row puts
   that row on its own ellipsis boundary, where a sub-pixel disagreement between the measurement and
   the layout is a visibly wrong string.
   The **Ctrl+Enter run menu** is the fourth caret-anchored overlay and obeys both halves the same
@@ -5429,7 +5654,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   caret, so the menu stays beside the statement it is about to run; vertically it **clamps**, since
   flipping would need the caret line's top edge and covering a line beats a jump. The flip alone is
   not enough: an anchor already past the fold (a caret scrolled out to the right) flips to somewhere
-  still past it. `RUN_MENU_W` is one constant for the panel's `min_width` and the placement's
+  still past it. `run_menu_w()` is one metric for the panel's `min_width` and the placement's
   arithmetic — comparing an unscrolled anchor against a width the panel wasn't drawn at is what cut
   the menu off at the editor's right edge on a long line.
 - **The floem editor owns its document once mounted, and the sync is one-way — writing the `query`
@@ -5866,6 +6091,9 @@ for keyboard nav.
   *absolute* index, set from the header right-click menu (no toolbar button). The data pane renders
   `data_cols` = `(0..ncols)` minus the frozen index (an `Arc<Vec<usize>>`); cells keep their
   *absolute* `ci` so selection/resize/sort stay consistent. Frozen pane width = `GUTTER_W + widths[frozen]`.
+  The resulting **draw order** — frozen first, then the rest in index order — is
+  `core::edit::visual_cols`, and it is what paste, Ctrl+C and an AI attachment walk (see `core::edit`)
+  so they agree with the screen rather than with the index.
 - **⚠️ Scroll-sync rule (cost a hang):** a scroll view must **never both read and write the same
   offset signal** — it re-enters its own layout and hangs the UI thread. Strict one-writer/one-reader:
   the **data pane writes `vscroll`** (`on_scroll`) and reads `gs.scroll_to` (keyboard channel); the
@@ -5915,7 +6143,11 @@ for keyboard nav.
   lays the block over the grid: **one copied cell fills the whole selection** (that is how a column
   gets set to a constant), anything larger keeps **its own** shape from the selection's top-left,
   and everything is clipped to the display rows — pending new rows included, so a paste can fill
-  rows the user just added. What falls outside, what lands on a read-only column, and what lands
+  rows the user just added. **It takes `frozen`, because that is what "extends" means**: a block
+  grows into the columns drawn beside the anchor, which under a freeze are not the ones indexed
+  beside it (`core::edit::visual_cols`), and the index walk it replaced put the second value of a
+  two-wide paste on `email` into a frozen `ssn` at the far left of the screen. The single-value case
+  still fills the *selection*, which is what is painted highlighted, so it needs no translation. What falls outside, what lands on a read-only column, and what lands
   on a row marked for deletion are **counted and reported** in the same bottom bar a commit error
   uses (set *after* staging, since `stage` clears it), because a paste that discarded half a
   spreadsheet looks exactly like one that worked. **Which surface** is
@@ -5928,14 +6160,23 @@ for keyboard nav.
   skipped **in place**, never
   shifted, which would write one column's values into the next. Nothing is interpreted: a pasted
   cell reading `NULL` stages the four-character string, because that is what the copy side wrote
-  and turning text into SQL `NULL` would be editing the user's data on their behalf. An open
+  and turning text into SQL `NULL` would be editing the user's data on their behalf. **The two are
+  at least distinguishable before the Commit now**: `grid::cell_ink` → `CellInk` replaced the
+  painter's `if` chain, and a staged `None` renders in the same italic a NULL *original* has always
+  had (white on the same green fill), where the two used to share one arm and `middle_name = NULL`
+  was pixel-identical to `middle_name = 'NULL'` right up to the write. The italic is deliberately
+  not a new vocabulary — "there is no value here" reads the same whether the emptiness is stored or
+  staged. The clipboard still carries the display text uninterpreted, and what a pasted `NULL`
+  *should* mean remains an open product decision. An open
   inline editor takes Ctrl+V back — `paste_selection` returns early while `edit_cell` is set,
   explicitly rather than trusting the text field to swallow the key first, because being wrong
   about the dispatch order costs a block overwrite instead of a caret insertion.
 - **What a cell *says* is resolved in one place, and it isn't the view.** `copy_selection` and
   `attached_rows` read the signals once into `grid_cells` — a `core::edit::GridCells` borrow over
-  `rs`, `order`, `formats`, `dirty` and `new_rows` — and ask it for `tsv(rect)` or
-  `attached(rect, cap)`; they contain no resolution of their own, and `displayed_cell_text` /
+  `rs`, `order`, `formats`, `dirty` and `new_rows` — and ask it for `tsv(rect, frozen)` or
+  `attached(rect, cap, frozen)`, both of which emit the selected columns in **draw** order
+  (`visual_cols`) because the receiver reads them left to right; they contain no resolution of their
+  own, and `displayed_cell_text` /
   `pending_cell_text` are gone. The reason is under `core::edit`: the rule went out one source
   short twice in the view, most recently without `format::apply`, so a `Timestamp` column attached
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
@@ -5943,7 +6184,10 @@ for keyboard nav.
   so it is the reference implementation `GridCells::text` is written against — the two must be
   changed together, and neither `grid_cells` nor its callers may become a per-frame path. Ctrl+C
   passes `formatted = false` and an attachment passes `true`, which is the *Copy formatted* entry's
-  reason for existing.
+  reason for existing. **How a cell is *weighted* is a decision too**, and it is `grid::cell_ink` →
+  `CellInk` (`Staged`, `StagedNull`, `Absent`, `Fk`, `Plain`) rather than an `if` chain inside the
+  style closure — the fifth case is why: a staged SQL NULL and a staged four-character `NULL` went
+  through one arm and painted identically (see the paste rules above).
 - **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers `Copy › CSV / JSON`
   of that column's values (`export_column_csv`/`_json`); a data cell offers `View`, `Edit` (editable
   cells only), a Copy entry whose scope and wording come from `edit::copy_scope` (**Copy** for the
@@ -6045,6 +6289,18 @@ for keyboard nav.
     inside a box. What an open cell *is* — a plain field, a picker in place of one, or a field with
     the calendar beside it — is the pure `cell_shape(editor, buf)`, three shapes rather than "a
     control or not" because the two controls want opposite things from the cell around them.
+    **And the menu may not outlive the cell.** The popup channel is window-global and nothing but a
+    pointer-down anywhere clears it — not a tab switch, not a re-run, not a scrolled-away row — while
+    the entries are `Rc` closures over this cell's signals, so clicking one after the scope is gone is
+    a `get_untracked` on a disposed signal, i.e. `try_get_untracked().unwrap()`: a panic that takes
+    the window and every other tab's uncommitted edits with it. `cell_pick_editor` and
+    `cell_editors::pick_field` therefore carry the `on_cleanup` → `cell_editors::close_picker` that
+    `cell_calendar_editor` already had, and `close_picker` takes down only a menu standing at **its
+    own** anchor. That anchor is *remembered*, not recomputed: `open_picker` returns the anchor it
+    left standing and each control holds it in a plain `Cell`, because a view's `layout_rect` is not
+    something to ask about while its scope is being disposed and a signal read inside `on_cleanup` is
+    the very hazard the cleanup exists to prevent. `keep_cell_edit` is the belt to that brace, and
+    opens with the `gs.alive()` guard `drop_cell_edit` already had.
   - **In the row panel**: `typed_editor` puts the control inside the same NULL toggle a text field
     gets (`nullable_field`, extracted from `scalar_editor` for exactly this). Only the `SET`'s
     wrapping chips can outgrow a line, so only that row grows.
@@ -6197,9 +6453,11 @@ for keyboard nav.
   exact count the export then missed would be worse than one that never claimed it). **The step
   appears only when the two scopes differ**: an uncapped result *is* every row, so offering to fetch
   them again would be a choice between a thing and itself, and a result with no statement to re-run
-  has only the honest scope left — **and the statement must be re-runnable at all**, which is the
-  write guard reaching this menu (`sql::rerunnable_for_export`, under the write-guard invariant). It
-  is a refusal by omission: the scope is simply absent, so it cannot be asked for. `All rows` is
+  has only the honest scope left. **"Something to re-run" already includes "may be re-run"**: the
+  write guard is *inside* `filter::rerun_statement`, which `current_statement` wraps, not a second
+  term ANDed on here — the term this menu used to carry could be deleted with the whole suite green
+  (see the write-guard invariant). It is a refusal by omission: the scope is simply absent, so it
+  cannot be asked for. `All rows` is
   `ExportScope::AllRows`, which carries the **statement** rather than the table — a filtered or
   sorted grid exports all of what it is showing, and a table tab's statement is `SELECT * FROM t`
   anyway — plus the *result's* `database` and `GridState::conn_at_load`, so **both halves of "where
@@ -6213,13 +6471,22 @@ for keyboard nav.
   statement is snapshotted before the save dialog opens for the same reason the rows are — the
   dialog is modal and slow, and a filter typed while it stood open must not change what the export
   was asked for.
-  **A client-side sort is declared at the point of choice, not discovered in the file.** `Fetched`
-  honours `gs.order`; `AllRows` streams the server's order, because a column-header sort is a
-  permutation of the rows in hand (`compute_order`) that no re-run reproduces. The menu presented
-  the two as one export at two sizes, so the label now reads `All rows (~16k, server order)` — or
-  `All rows (server order)` where there is no estimate — while a sort is applied. Whether one is
-  comes in as a parameter of `export_menu` rather than off `GridState`, because the sort does not
-  live there: it is `grid_view`'s, threaded to the header and the toolbar.
+  **Every way the file will differ from the grid is declared at the point of choice, not discovered
+  in the file**, and the label is `export::all_rows_label(size, sorted, manual_tx)` — one tested
+  function in place of the `match` the menu used to hold, which had none. Two differences, neither of
+  them visible in the result. A **client-side sort**: `Fetched` honours `gs.order`, while `AllRows`
+  streams the *server's* order, because a column-header sort is a permutation of the rows in hand
+  (`compute_order`) that no re-run reproduces — the menu had presented the two as one export at two
+  sizes. And a **manual-transaction tab**: `AllRows` is a second read on a fresh connection
+  (`Db::stream_query`, deliberately outside the tab's pinned session), so a `TxMode::Manual` tab's
+  uncommitted rows are on screen and absent from the file, and rows it deleted are in the file and
+  gone from the screen. So the label reads `All rows (~16k, server order)`,
+  `All rows (~16k, committed rows only)`, `All rows (server order)` where there is no estimate, or
+  plain `All rows` when neither applies. `size` is pre-rendered by the caller, since the estimate and
+  its `~` belong to the stats line's vocabulary rather than to this decision; `sorted` comes in as a
+  parameter of `export_menu` rather than off `GridState`, because the sort does not
+  live there — it is `grid_view`'s, threaded to the header and the toolbar — and `manual_tx` reaches
+  it through the `tx_mode` signal `GridCtx`/`GridState` gained for exactly this.
 - **A running export is the bottom bar's fourth state, and its Cancel outlives the result.** Only a
   *streamed* export raises it — a snapshot of rows already in memory is written faster than a notice
   about it would be read — and `BarState::Exporting` draws `Exporting… Cancel` (`export_bar`) on the
@@ -6261,16 +6528,32 @@ for keyboard nav.
   `Fetched` save finishes in milliseconds and one taken while a stream ran tore that stream's Cancel
   down and left no way to stop it. `export_cancel` is a `TabsActions` action; the app owns the
   token, as it does for query runs and imports. The report
-  is an `ExportOutcome` — `Done(u64)`, `Cancelled`, `Failed(String)` — three outcomes and not a
+  is an `ExportOutcome` — `Done(export::ExportTally)`, `Cancelled`, `Failed { message, partial }` —
+  three outcomes and not a
   `Result` because "the user stopped it" is neither: a red bar for a deliberate Cancel, or a
-  cheerful row count for a file that stops halfway, are both lies. It mirrors `ImportOutcome`. A row
-  count goes to `commit_note` (the non-error surface) and **only a streamed export writes one**,
-  since the screen already shows what a snapshot export wrote and a note on every save is a note
-  nobody reads. The count is printed through `text::human_count`, the same row-count printer the
+  cheerful row count for a file that stops halfway, are both lies. It mirrors `ImportOutcome`.
+  **`Done` carries a tally and not a row count**, because two kinds of loss are invisible in the file
+  itself: `withheld` is the binary columns whose `<n bytes>` placeholder was dropped rather than
+  written as data (empty for Markdown and HTML, which keep it deliberately) and `blanked` is
+  `ResultSet::capped_columns`, the cells past a column's 512 MiB text arena, which read back as the
+  empty string. Nothing had ever read that flag, so a streamed chunk that overran the arena wrote a
+  file with holes in it and reported a full row count. The sentence on the bar is
+  `export::export_note(tally, name, streaming)`, whose rule is that **silence is the default and a
+  caveat overrides it**: a clean `Fetched` save says nothing, since the screen already shows what it
+  wrote and a note on every save is a note nobody reads; a streamed one always announces its count;
+  and a *loss* speaks in either scope, naming the columns, because a user comparing the file to the
+  screen needs to know which part of it to distrust. The count is printed through
+  `text::human_count`, the same row-count printer the
   stats line uses, so the figure in the report agrees with the `1k of ~16k rows` directly above it —
   and the note shipped once as `Exported rows to employees.csv`, with no count at all, because
   `text::plural` returns the noun and nothing else and this call site simply never rendered the
-  number. Cancel is a note too, `Export cancelled — <name> is incomplete`.
+  number. Cancel is a note too, `Export cancelled — <name> is incomplete`, and **the failure arm now
+  says the same thing**: `Failed` carries `partial`, and `export::export_failure_note` appends
+  `— <name> is incomplete` when the destination had already been opened. The write opens with
+  `File::create`, which truncates, so a stream that dies ten minutes in has already destroyed
+  whatever was at that path, and the failure arm used to report only what the engine said. `partial`
+  is false — and the clause absent — for an export refused *before* the write starts (no connection,
+  one already running), which must not claim a file it never touched is incomplete.
   **The partial file is left on disk on a cancel or a failure, and the message says so** — deleting
   it is the one irreversible thing this path could do, and the save dialog may well have been aimed
   at a file that already mattered.
@@ -6392,7 +6675,7 @@ for keyboard nav.
   bounded like `run_ddl`'s `lock_wait_sql` — a timeout is right for a modal that refuses every
   exit, wrong for a cell edit that could just have waited a moment longer. `commit_seq` is what
   keeps an earlier commit's timer from narrating a later one.
-- **Type-aware headers** show `type_name` under the name (two-line, `GRID_HEADER_H`). A sorted column's
+- **Type-aware headers** show `type_name` under the name (two-line, `grid_header_h()`). A sorted column's
   name + chevron use `grid_sort()`; a column with selected cells gets a `grid_col_sel()` header
   background. **Key icons** (PK = gold key-round, single-col index = blue key-square, FK = purple
   key-square; colours shared with the schema tree via `key_primary/index/foreign`) come from
