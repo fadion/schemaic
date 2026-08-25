@@ -12,7 +12,7 @@ use floem::reactive::create_effect;
 use floem::style::TextOverflow;
 use floem::views::TooltipExt;
 
-use crate::consts::{tab_bar_h, tab_max_w};
+use crate::consts::{chat_pad_h, tab_bar_h, tab_max_w};
 use crate::widgets::{MenuEntry, measure_text_px, wheel_hscroll};
 use crate::{FieldCfg, Tab, Ui, bg_transparent, db_color_dot, edit_field, icons, theme};
 
@@ -162,6 +162,15 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
         // title, and `tab_title_avail()`), so without a rebuild a tab that starts
         // ellipsizing at a larger scale ellipsizes with no tooltip — losing the
         // one cue that says what the clipped title is.
+        //
+        // **And the DB-identity dot, for exactly the same reason.** It is the
+        // third term of that comparison — `avail()` sheds `tab_dot_w()` when a dot
+        // shows, and reads `has_dot()` *reactively* everywhere else — so assigning
+        // a colour to the open tab's database narrows the title enough to
+        // ellipsize it while `truncated`, computed once at build, still says it
+        // fits. The title clips and the tooltip never arrives. Read here as a
+        // presence rather than a colour: the swatch itself is a style read, and
+        // only the *width* it costs is structural.
         move || {
             (
                 tab.editing.get(),
@@ -171,9 +180,14 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 tab.path
                     .with(|p| p.as_ref().map(|p| p.to_string_lossy().into_owned())),
                 theme::ui_scale(),
+                tab.database.get().is_some_and(|db| {
+                    db_colors
+                        .with(|r| schemaic_core::db_color::lookup(r, tab.conn_id.get(), &db))
+                        .is_some()
+                }),
             )
         },
-        move |(editing, title, pinned, modified, path, _scale)| -> AnyView {
+        move |(editing, title, pinned, modified, path, _scale, _dot)| -> AnyView {
             if editing {
                 // Inline rename field. `edit_field` (unlike floem's `text_input`,
                 // which swallows Escape into its own `clear_focus`) routes Escape
@@ -211,8 +225,15 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 // tab max (the chip's `max_width` is the hard cap).
                 return edit_field(tab.edit_buf, cfg)
                     .style(move |s| {
-                        let w = (tab.edit_buf.with(|b| measure_text_px(b)) + 24.0)
-                            .clamp(60.0, tab_max_w() - 2.0);
+                        // The reserve is the field's own chrome — its horizontal
+                        // padding both sides plus its border — and every part of
+                        // that scales, so a flat 24 leaves the box *narrower* than
+                        // the text it was measured for from 130% up (the chrome is
+                        // 22/28/34/42 across the four scales). `tab_title_avail()`
+                        // does the same sum correctly a hundred lines above.
+                        let chrome = chat_pad_h() * 2.0 + 2.0;
+                        let w = (tab.edit_buf.with(|b| measure_text_px(b)) + chrome)
+                            .clamp(theme::scaled(60.0), tab_max_w() - 2.0);
                         s.width(w)
                     })
                     .into_any();

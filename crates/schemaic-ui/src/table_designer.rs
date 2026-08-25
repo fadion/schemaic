@@ -59,8 +59,30 @@ const PANEL_H: f64 = 550.0;
 /// doesn't shift the form. Wide enough that a long name and a long type
 /// (`timestamp without time zone`) can both be read — the detail pane has the
 /// slack to give.
+///
+/// **A preference, not a claim on the panel** — see [`list_min_w`]. This is
+/// exactly `modal_w`'s own floor, so on a window narrow enough for the cap to
+/// bottom out the list used to consume the whole panel and leave the detail pane
+/// at zero: every field, both buttons' context, the entire form. `modal_w` caps
+/// the panel against the window and nothing capped the contents against the
+/// panel, which is the same failure `modal_w` exists to prevent, one level in.
 fn list_w() -> f64 {
     theme::scaled(320.0)
+}
+/// How narrow the item list may be squeezed before it stops giving.
+///
+/// The list is what the form is *about*, so it cannot be squeezed to nothing
+/// either; this is the width at which a short name is still readable. Between
+/// this and [`list_w`] the pane gives room back to the form rather than taking
+/// all of it, and the app sets no `min_inner_size`, so the narrow case is
+/// reachable by dragging rather than hypothetical.
+fn list_min_w() -> f64 {
+    theme::scaled(180.0)
+}
+/// The room the detail form has, once the list has taken its share — the width a
+/// field inside it must not exceed.
+fn form_w() -> f64 {
+    (panel_w() - list_w() - theme::scaled(60.0)).max(list_min_w())
 }
 /// One row of the item list.
 fn row_h() -> f64 {
@@ -981,7 +1003,9 @@ pub(crate) fn list_pane(
     .style(|s| {
         s.flex_col()
             .width(list_w())
-            .flex_shrink(0.0_f32)
+            // It shrinks now, down to `list_min_w()`. `flex_shrink(0)` against a
+            // width equal to `modal_w`'s floor is what left the form pane at 0px.
+            .min_width(list_min_w())
             .height_full()
             .border(1.0)
             .border_color(theme::border())
@@ -1089,7 +1113,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 draft.comment.clone().unwrap_or_default(),
-                field_w() * 1.6,
+                (field_w() * 1.6).min(form_w()),
                 "What this table is for",
                 ring.clone(),
                 20,
@@ -1930,7 +1954,7 @@ fn check_form(
             bound_field(
                 &ui,
                 ck.expression.clone(),
-                field_w() * 1.6,
+                (field_w() * 1.6).min(form_w()),
                 "qty > 0",
                 ring.clone(),
                 20,

@@ -38,7 +38,15 @@ fn ctx_menu_w() -> f64 {
 
 /// How far left of its icon a SCHEMA dropdown opens, so the panel overlaps the
 /// glyph it belongs to rather than starting beside it.
-const MENU_ICON_TUCK: f64 = 30.0;
+///
+/// **Scaled, because both things it registers between are.** The glyph comes from
+/// `icons::icon`, which `c2187aa` made scale from one choke point, and the panel's
+/// width is a `scaled(…)`; a frozen offset between two growing boxes is not an
+/// offset, it is a drift. At 160% a 154px-wide panel tucked by 30 lands its right
+/// edge ~18px inside the icon rather than flush past it.
+fn menu_icon_tuck() -> f64 {
+    theme::scaled(30.0)
+}
 
 /// The activity panel's interval dropdown, at a fixed width so it can be
 /// right-aligned to its icon exactly (a content-sized panel would have to be
@@ -48,7 +56,10 @@ fn activity_menu_w() -> f64 {
 }
 
 /// How close to a window edge an anchored menu may sit before it is pushed back.
-const MENU_EDGE_PAD: f64 = 4.0;
+/// Air between the panel and the window, so it grows with the panel.
+fn menu_edge_pad() -> f64 {
+    theme::scaled(4.0)
+}
 
 /// How far under its icon an anchored dropdown hangs, in px.
 ///
@@ -67,7 +78,16 @@ const MENU_ICON_DROP: f64 = 3.0;
 /// From the window's top edge, not its container's: `find_overlay` sits in the
 /// modal layer, which starts `theme::header_h()` down, and that is subtracted
 /// where the margin is set.
-const FIND_TOP: f64 = 80.0;
+///
+/// **Scaled, because the thing it is subtracted from is.** As a literal 80 against
+/// a `header_h()` that grows, the gap under the title bar ran 48 / 40 / 28 / 16px
+/// across the four scales — shrinking as everything around it grew, which is the
+/// inversion no reader of the number would predict. It is not one of
+/// `consts.rs`'s stated exceptions: not a hairline, not a shape, not measured
+/// against the code font, and not a seed for a dragged size.
+fn find_top() -> f64 {
+    theme::scaled(80.0)
+}
 
 /// Is the active connection read-only? Every schema-editing menu entry asks,
 /// because a write it can't perform is shown dimmed rather than hidden — a
@@ -511,7 +531,8 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     .padding_vert(theme::scaled(6.0))
                     .margin_left(theme::scaled(36.0))
                     // 3px below the switcher button (which sits ~HEADER_H-7 down).
-                    .margin_top(theme::header_h() - 4.0)
+                    // Both terms of that derivation scale, so this one does too.
+                    .margin_top(theme::header_h() - theme::scaled(4.0))
                     // Match the switcher button's size (the shell sets this, but
                     // overlays are siblings of the shell and don't inherit it).
                     .font_size(theme::font_title())
@@ -767,7 +788,7 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
         if open.get() {
             let a = anchor.get();
             s.absolute()
-                .inset_left((a.x - MENU_ICON_TUCK).max(0.0))
+                .inset_left((a.x - menu_icon_tuck()).max(0.0))
                 .inset_top(a.y + MENU_ICON_DROP)
         } else {
             s
@@ -863,9 +884,9 @@ pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
         // Right edge against the icon's, tucked outward by the same amount the
         // schema menus tuck inward so the panel overlaps its own icon; then
         // clamped so neither edge leaves the window.
-        let left = (a.x + MENU_ICON_TUCK - activity_menu_w())
-            .min(win_w - activity_menu_w() - MENU_EDGE_PAD)
-            .max(MENU_EDGE_PAD);
+        let left = (a.x + menu_icon_tuck() - activity_menu_w())
+            .min(win_w - activity_menu_w() - menu_edge_pad())
+            .max(menu_edge_pad());
         s.absolute()
             .inset_left(left)
             .inset_top(a.y + MENU_ICON_DROP)
@@ -973,7 +994,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
         if open.get() {
             let a = anchor.get();
             s.absolute()
-                .inset_left((a.x - MENU_ICON_TUCK).max(0.0))
+                .inset_left((a.x - menu_icon_tuck()).max(0.0))
                 .inset_top(a.y + MENU_ICON_DROP)
         } else {
             s
@@ -2144,7 +2165,10 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
                 };
                 s.absolute()
                     .inset_left(x)
-                    .inset_bottom(theme::footer_h() + 5.0)
+                    // The gap above the bar is air over a bar whose own height
+                    // scales — 5px over a 28px bar and 5px over a 45px one are not
+                    // the same gap.
+                    .inset_bottom(theme::footer_h() + theme::scaled(5.0))
             }
             // Toolbar dropdown (grid Copy): drop 5px below the icon, tucked under it
             // (left edge 40px left of the icon's right edge, so it overlaps the icon
@@ -2152,7 +2176,10 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
             // the icon) if it'd spill past the window's right edge, and flip upward if
             // it'd spill past the bottom. Real panel width → no drift.
             Some(PopupAnchor::BelowIcon(_left, right, bottom)) => {
-                let open_x = right - 40.0;
+                // The same registration `menu_icon_tuck` states for the SCHEMA
+                // menus, and scaled for the same reason: it is measured between an
+                // icon and a panel that both grow.
+                let open_x = right - theme::scaled(40.0);
                 let x = if ww > 1.0 && open_x + pw > ww {
                     (right - pw).max(0.0)
                 } else {
@@ -3862,7 +3889,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     // off the figure. Written as the subtraction rather than as
                     // the answer, because 40 next to a 40px-tall title bar reads
                     // like a coincidence.
-                    .margin_top(FIND_TOP - theme::header_h())
+                    .margin_top(find_top() - theme::header_h())
                     .border_color(theme::modal_border())
             });
 
