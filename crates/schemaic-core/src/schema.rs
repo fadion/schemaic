@@ -6731,6 +6731,32 @@ mod event_tests {
         assert!(s.create_ddl_script_all(MySql).contains("EVENT `nightly`"));
     }
 
+    /// **The `DELIMITER` wrapping is what that `client_script` call is for**, and
+    /// the fixture above cannot see it: its body has no internal `;`, so
+    /// `needs_delimiter` returns false and `client_script` takes its early
+    /// return — which means the arm passes identically with the call deleted.
+    /// A `BEGIN … END` body is what `EventDraft::blank` starts every new event
+    /// from, so this is the ordinary shape, not an edge case.
+    #[test]
+    fn a_copied_event_with_a_compound_body_is_wrapped_in_a_delimiter() {
+        let mut e = ev();
+        e.body = "BEGIN\n  DELETE FROM sessions;\n  DELETE FROM tokens;\nEND".into();
+        let script = ObjectItem::Event(std::sync::Arc::new(e)).create_sql(MySql);
+        assert!(script.starts_with("DELIMITER $$\n"), "{script}");
+        assert!(script.trim_end().ends_with("DELIMITER ;"), "{script}");
+        // The `CREATE` is terminated with `$$`, not the `;` that would cut it
+        // mid-body.
+        assert!(script.contains("END$$"), "{script}");
+        assert!(
+            !script.contains("END;\nDELIMITER"),
+            "the statement must not carry a bare `;` terminator: {script}"
+        );
+        // A one-line body needs none of it, which is the case the existing
+        // fixture covers — and the reason it could not see this.
+        let plain = ObjectItem::Event(std::sync::Arc::new(ev())).create_sql(MySql);
+        assert!(!plain.contains("DELIMITER"), "{plain}");
+    }
+
     /// The lazy read's two halves are applied separately, because the caller has
     /// to gate them differently — the body is the user's to overwrite, the
     /// session state is not editable anywhere.
