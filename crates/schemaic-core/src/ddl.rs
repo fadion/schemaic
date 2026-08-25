@@ -16638,6 +16638,22 @@ mod event_tests {
     use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
     use crate::schema::EventStatus;
 
+    /// **Every field the model carries is populated**, the bar `users()` sets for
+    /// the table fixture and for the same reason: the round-trip gate below can
+    /// only catch an unconditional restate if the fields whose clauses are
+    /// *silent at their defaults* are not sitting at them. This one used to leave
+    /// `preserve`, `status`, `comment` and `schedule.ends` at exactly the values
+    /// where `event_alter_clauses` emits nothing, so turning any of its
+    /// `from.X != to.X` guards into an unconditional push kept the gate green.
+    ///
+    /// `status` is `SlavesideDisabled` on purpose: it is the state `91ff983`
+    /// exists for, and `EventStatus`' own doc claims `diff_event` "restates the
+    /// status only when it changed, so an event in this state that nobody touched
+    /// keeps it" — a sentence nothing pinned, because the replica states reached
+    /// only `parse` and `create_sql`.
+    ///
+    /// Only `schema` is left at its default, which is by design (`None` = the
+    /// connection's current database).
     fn ev() -> EventInfo {
         EventInfo {
             name: "nightly".into(),
@@ -16646,8 +16662,11 @@ mod event_tests {
                 value: "1".into(),
                 unit: "DAY".into(),
                 starts: Some("'2026-01-01 03:00:00'".into()),
-                ends: None,
+                ends: Some("'2027-01-01 03:00:00'".into()),
             },
+            preserve: true,
+            status: EventStatus::SlavesideDisabled,
+            comment: Some("nightly purge".into()),
             body: "DELETE FROM sessions".into(),
             sql_mode: Some("STRICT_TRANS_TABLES".into()),
             charset_client: Some("utf8mb4".into()),
@@ -16657,15 +16676,32 @@ mod event_tests {
         }
     }
 
+    /// The other schedule shape, which nothing round-tripped at all: an `AT`
+    /// event, and one that deletes itself when it has run (`preserve: false`,
+    /// which is what makes it the destructive shape).
+    fn one_shot() -> EventInfo {
+        EventInfo {
+            schedule: EventSchedule::At("'2026-06-01 00:00:00'".into()),
+            preserve: false,
+            ..ev()
+        }
+    }
+
     /// **The round-trip gate.** An event diffed against its own draft must
     /// produce nothing — the same rule `diff` and `diff_routine` are held to,
     /// and the one that decides whether opening the editor shows "No changes".
     #[test]
     fn an_untouched_event_is_no_change() {
-        let e = ev();
-        let cs = diff_event(&e, &EventDraft::from_info(&e), MySql);
-        assert!(cs.is_empty(), "{:?}", cs.changes);
-        assert!(cs.emit().is_empty());
+        for e in [ev(), one_shot()] {
+            let cs = diff_event(&e, &EventDraft::from_info(&e), MySql);
+            assert!(cs.is_empty(), "{:?}", cs.changes);
+            assert!(cs.emit().is_empty());
+        }
+        // The claim `EventStatus`' doc makes, now that a replica state reaches
+        // the differ: an event nobody touched keeps it.
+        let mut e = ev();
+        e.status = EventStatus::ReplicaDisabled;
+        assert!(diff_event(&e, &EventDraft::from_info(&e), MySql).is_empty());
     }
 
     /// The emptiness test is over the **clauses**, not over the struct: an event
@@ -16690,7 +16726,7 @@ mod event_tests {
         let e = ev();
         let mut d = EventDraft::from_info(&e);
         d.info.name = "nightly_v2".into();
-        d.info.preserve = true;
+        d.info.preserve = false;
         d.info.status = EventStatus::Disabled;
         d.info.comment = Some("paused".into());
         d.info.body = "DELETE FROM sessions WHERE expires_at < NOW()".into();
@@ -16703,7 +16739,7 @@ mod event_tests {
         assert_eq!(
             alter,
             "ALTER EVENT `nightly`\n  \
-             ON COMPLETION PRESERVE\n  \
+             ON COMPLETION NOT PRESERVE\n  \
              RENAME TO `nightly_v2`\n  \
              DISABLE\n  \
              COMMENT 'paused'\n  \
@@ -16713,6 +16749,143 @@ mod event_tests {
             !alter.contains("ON SCHEDULE"),
             "an unchanged schedule must not be restated"
         );
+    }
+
+    /// **An `ALTER` that changes when the event fires**, which no test emitted:
+    /// the schedule clause is the only one whose payload is multi-line
+    /// (`EventSchedule::sql` embeds its own `STARTS`/`ENDS` on indented lines) and
+    /// the only one where the two *shapes* can swap. The headline test above pins
+    /// the clause's **absence**; the one test that changed a schedule read only
+    /// `is_destructive` and never called `emit`.
+    #[test]
+    fn an_alter_that_changes_the_schedule_restates_it_whole() {
+        let e = ev();
+        let mut d = EventDraft::from_info(&e);
+        d.info.schedule = EventSchedule::Every {
+            value: "1".into(),
+            unit: "HOUR".into(),
+            starts: Some("'2026-01-01 03:00:00'".into()),
+            ends: Some("'2027-01-01 03:00:00'".into()),
+        };
+        let alter = diff_event(&e, &d, MySql)
+            .emit()
+            .into_iter()
+            .find(|s| s.starts_with("ALTER EVENT"))
+            .expect("one ALTER EVENT");
+        assert_eq!(
+            alter,
+            "ALTER EVENT `nightly`\n  \
+             ON SCHEDULE EVERY 1 HOUR\n  \
+             STARTS '2026-01-01 03:00:00'\n  \
+             ENDS '2027-01-01 03:00:00';"
+        );
+        // The sentence the user reads names the same edit, on one line.
+        let summary = diff_event(&e, &d, MySql).changes[0].summary();
+        assert!(
+            summary.contains(
+                "schedule to EVERY 1 HOUR STARTS '2026-01-01 03:00:00' ENDS '2027-01-01 03:00:00'"
+            ),
+            "{summary}"
+        );
+
+        // **A shape swap is restated whole**, because there is no grammar for
+        // altering just the `ENDS` of an `EVERY` — and no `STARTS`/`ENDS` residue
+        // may survive onto an `AT`.
+        let mut swapped = EventDraft::from_info(&e);
+        swapped.info.schedule = EventSchedule::At("'2026-06-01 00:00:00'".into());
+        let alter = diff_event(&e, &swapped, MySql)
+            .emit()
+            .into_iter()
+            .find(|s| s.starts_with("ALTER EVENT"))
+            .expect("one ALTER EVENT");
+        assert_eq!(
+            alter,
+            "ALTER EVENT `nightly`\n  ON SCHEDULE AT '2026-06-01 00:00:00';"
+        );
+        // …and back, from the one-shot to a recurring schedule.
+        let from = one_shot();
+        let mut back = EventDraft::from_info(&from);
+        back.info.schedule = ev().schedule;
+        let alter = diff_event(&from, &back, MySql)
+            .emit()
+            .into_iter()
+            .find(|s| s.starts_with("ALTER EVENT"))
+            .expect("one ALTER EVENT");
+        assert!(
+            alter.contains("ON SCHEDULE EVERY 1 DAY\n  STARTS "),
+            "{alter}"
+        );
+        assert!(!alter.contains(" AT "), "{alter}");
+    }
+
+    /// **`event_edits` and `event_alter_clauses` answer the same question per
+    /// field**, which is the rule `event_edits`' doc states and which nothing
+    /// held at compile time: the two write their own seven comparisons, in
+    /// different orders. Only `name` and `status` were ever asserted together, so
+    /// a predicate that drifted on any of the other five would ship a preview
+    /// that names an edit the statement doesn't make, or the reverse.
+    #[test]
+    fn every_field_the_preview_names_is_a_field_the_alter_restates() {
+        let e = ev();
+        let cases: Vec<(&str, Box<dyn Fn(&mut EventInfo)>)> = vec![
+            (
+                "name",
+                Box::new(|i: &mut EventInfo| i.name = "renamed".into()),
+            ),
+            (
+                "schedule",
+                Box::new(|i: &mut EventInfo| {
+                    i.schedule = EventSchedule::At("'2026-06-01 00:00:00'".into())
+                }),
+            ),
+            (
+                "status",
+                Box::new(|i: &mut EventInfo| i.status = EventStatus::Enabled),
+            ),
+            ("preserve", Box::new(|i: &mut EventInfo| i.preserve = false)),
+            (
+                "definer",
+                Box::new(|i: &mut EventInfo| i.definer = Some("app@%".into())),
+            ),
+            (
+                "comment",
+                Box::new(|i: &mut EventInfo| i.comment = Some("changed".into())),
+            ),
+            (
+                "body",
+                Box::new(|i: &mut EventInfo| i.body = "DELETE FROM tokens".into()),
+            ),
+        ];
+        for (field, mutate) in &cases {
+            let mut d = EventDraft::from_info(&e);
+            (mutate)(&mut d.info);
+            let clauses = event_alter_clauses(&e, &d.info, MySql);
+            let edits = event_edits(&e, &d.info);
+            assert!(
+                !clauses.is_empty(),
+                "{field}: the statement restates nothing"
+            );
+            assert!(!edits.is_empty(), "{field}: the preview names nothing");
+            // The one deliberate asymmetry, pinned rather than left to be
+            // rediscovered: a definer change lives in the *header*, so its entry
+            // in the clause list is the `ON COMPLETION` no-op the grammar needs.
+            if *field == "definer" {
+                assert_eq!(clauses, vec!["ON COMPLETION PRESERVE".to_string()]);
+                assert!(event_definer_clause(&e, &d.info).is_some());
+            }
+        }
+        // …and empty together for a no-op.
+        let same = EventDraft::from_info(&e);
+        assert!(event_alter_clauses(&e, &same.info, MySql).is_empty());
+        assert!(event_edits(&e, &same.info).is_empty());
+        // Including the documented `None` / `Some("")` comment equivalence: two
+        // spellings of "no comment" are one event to the server.
+        let mut cleared = ev();
+        cleared.comment = None;
+        let mut empty = EventDraft::from_info(&cleared);
+        empty.info.comment = Some(String::new());
+        assert!(event_alter_clauses(&cleared, &empty.info, MySql).is_empty());
+        assert!(event_edits(&cleared, &empty.info).is_empty());
     }
 
     /// **The header names the event the server holds; `RENAME TO` names the one
@@ -16835,6 +17008,45 @@ mod event_tests {
         assert_eq!(sql, vec!["DROP EVENT `nightly`;".to_string()]);
     }
 
+    /// **What puts the drop behind the destructive gate**, which nothing
+    /// asserted: `Change::risks`' `DropEvent` arm is non-empty, and
+    /// `is_destructive` is `!risks().is_empty()`, so emptying that arm turns a
+    /// drop into an ordinary change the preview applies without the plain-language
+    /// warning the invariant promises — with a green suite. The statement's shape
+    /// was tested next door; the gate was not.
+    #[test]
+    fn dropping_an_event_is_destructive_and_says_why() {
+        let cs = drop_event(&ev(), MySql);
+        assert!(cs.changes[0].is_destructive(MySql));
+        let risks = cs.changes[0].risks(MySql);
+        assert_eq!(risks.len(), 1, "{risks:?}");
+        assert!(risks[0].contains("nightly"), "{risks:?}");
+        assert!(
+            risks[0].contains("body are gone"),
+            "the risk has to say what is lost: {risks:?}"
+        );
+    }
+
+    /// The three event arms of `Change::summary` — the line the preview lists a
+    /// change by. None of the three was asserted anywhere.
+    #[test]
+    fn the_event_changes_name_themselves() {
+        assert_eq!(
+            create_event(&EventDraft::from_info(&ev()), MySql).changes[0].summary(),
+            "Create event nightly"
+        );
+        assert_eq!(
+            drop_event(&ev(), MySql).changes[0].summary(),
+            "Drop event nightly"
+        );
+        let mut d = EventDraft::from_info(&ev());
+        d.info.body = "DELETE FROM tokens".into();
+        assert_eq!(
+            diff_event(&ev(), &d, MySql).changes[0].summary(),
+            "Alter event nightly: body"
+        );
+    }
+
     /// The shared `DropObject` arm cannot address an event, so `drop_object`
     /// refuses rather than emitting a statement that happens to look right —
     /// the same refusal a routine gets, and the reason [`drop_event`] exists.
@@ -16872,11 +17084,11 @@ mod event_tests {
             .expect("one ALTER");
         assert_eq!(
             alter,
-            "ALTER DEFINER = `app`@`%` EVENT `nightly`\n  ON COMPLETION NOT PRESERVE;"
+            "ALTER DEFINER = `app`@`%` EVENT `nightly`\n  ON COMPLETION PRESERVE;"
         );
         // The no-op restates what the event already says, so applying it can't
         // change anything but the definer.
-        assert!(!e.preserve);
+        assert!(e.preserve);
     }
 
     /// An event change set that reaches the **PostgreSQL** emitter still emits
@@ -16920,8 +17132,7 @@ mod event_tests {
     /// destructive with no `DROP` anywhere in the plan to say so.
     #[test]
     fn a_one_shot_that_is_not_preserved_says_it_will_delete_itself() {
-        let mut e = ev();
-        e.schedule = EventSchedule::At("'2026-06-01 00:00:00'".into());
+        let e = one_shot();
         let cs = create_event(&EventDraft::from_info(&e), MySql);
         assert!(cs.changes[0].is_destructive(MySql));
         assert!(cs.changes[0].risks(MySql)[0].contains("runs once and the server then deletes it"));
@@ -16937,10 +17148,19 @@ mod event_tests {
         );
 
         // …and the same on the edit that *turns* a schedule into a one-shot.
+        // Both halves have to move: a preserved event stays preserved whatever
+        // its schedule, so the recurring fixture needs its Preserve turned off in
+        // the same edit for this to be the shape that deletes itself.
         let mut d = EventDraft::from_info(&ev());
         d.info.schedule = EventSchedule::At("'2026-06-01 00:00:00'".into());
+        d.info.preserve = false;
         let cs = diff_event(&ev(), &d, MySql);
         assert!(cs.changes[0].is_destructive(MySql));
+        // Turning it into an `AT` event while *keeping* Preserve is not the
+        // destructive shape — the event survives its one firing.
+        let mut kept_shot = EventDraft::from_info(&ev());
+        kept_shot.info.schedule = EventSchedule::At("'2026-06-01 00:00:00'".into());
+        assert!(!diff_event(&ev(), &kept_shot, MySql).changes[0].is_destructive(MySql));
 
         // **But not on an edit that merely leaves it that way.** The alter arm
         // warns about what the plan *introduces*: an event that was already a

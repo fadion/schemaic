@@ -5714,6 +5714,79 @@ mod tests {
         assert!(!sql.iter().any(|s| s.contains("ON SCHEDULE")), "{sql:?}");
     }
 
+    /// **The reader's output, put through the emitter.** Both halves of this seam
+    /// were tested only against themselves: the tests above assert the *model* a
+    /// catalogue row folds into and stop, and every `EventInfo` fixture in
+    /// `schemaic-core` hand-writes `starts: Some("'2026-01-01 03:00:00'")` — i.e.
+    /// hand-writes the answer `event_time_expr` is supposed to produce. So the
+    /// quoting is asserted twice against one assumption and never end to end,
+    /// which is what would let a second `ddl_string` downstream
+    /// (`'''2026-01-01 03:00:00'''`) or a reader that stopped quoting
+    /// (`STARTS 2026-01-01 03:00:00`) through.
+    #[test]
+    fn a_catalogue_row_emits_a_statement_with_its_datetimes_quoted_once() {
+        use schemaic_core::ddl::{EventDraft, create_event, diff_event};
+
+        // The columns exactly as `information_schema.EVENTS` reports them: bare,
+        // unquoted.
+        let mut row = er("nightly", "RECURRING");
+        row.interval_value = Some(s("1"));
+        row.interval_field = Some(s("day"));
+        row.starts = Some(s("2026-01-01 03:00:00"));
+        row.ends = Some(s("2027-01-01 03:00:00"));
+        row.comment = s("nightly purge");
+        let e = mysql_events(&[row]).remove(0);
+
+        let sql = create_event(&EventDraft::from_info(&e), SqlDialect::MySql).emit();
+        let create = sql
+            .iter()
+            .find(|s| s.starts_with("CREATE DEFINER"))
+            .expect("one CREATE EVENT");
+        assert!(
+            create.contains("STARTS '2026-01-01 03:00:00'"),
+            "one pair of quotes, not three and not none: {create}"
+        );
+        assert!(create.contains("ENDS '2027-01-01 03:00:00'"), "{create}");
+        assert!(create.contains("COMMENT 'nightly purge'"), "{create}");
+
+        // …and the round-trip gate holds across the seam: what the reader
+        // produced diffs to nothing against its own draft, so opening the editor
+        // on an untouched event says "No changes".
+        assert!(diff_event(&e, &EventDraft::from_info(&e), SqlDialect::MySql).is_empty());
+
+        // The one-time shape too — a different column (`EXECUTE_AT`) through a
+        // different arm.
+        let mut row = er("once", "ONE TIME");
+        row.execute_at = Some(s("2026-06-01 00:00:00"));
+        let e = mysql_events(&[row]).remove(0);
+        let sql = create_event(&EventDraft::from_info(&e), SqlDialect::MySql).emit();
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("ON SCHEDULE AT '2026-06-01 00:00:00'")),
+            "{sql:?}"
+        );
+        assert!(diff_event(&e, &EventDraft::from_info(&e), SqlDialect::MySql).is_empty());
+
+        // **And the fabricated fallback reaching `create_sql`**, which is the
+        // half `mysql_events`' own comment does not cover: the copy path restates
+        // every clause unconditionally, so a row the server reported nothing
+        // readable for emits the fallback rather than an empty clause. It has to
+        // be legal SQL, which is why the fallback is a keyword and not "".
+        let e = mysql_events(&[er("mystery", "RECURRING")]).remove(0);
+        let sql = create_event(&EventDraft::from_info(&e), SqlDialect::MySql).emit();
+        assert!(
+            sql.iter().any(|s| s.contains("ON SCHEDULE EVERY 1 DAY")),
+            "{sql:?}"
+        );
+        let e = mysql_events(&[er("mystery_once", "ONE TIME")]).remove(0);
+        let sql = create_event(&EventDraft::from_info(&e), SqlDialect::MySql).emit();
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("ON SCHEDULE AT CURRENT_TIMESTAMP")),
+            "an unquoted keyword, not a literal: {sql:?}"
+        );
+    }
+
     /// The body is everything after the **top-level** `DO`, and the two things
     /// that sit before it and spell it are stepped over rather than matched: a
     /// quoted identifier, and a string literal.
