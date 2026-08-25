@@ -47,8 +47,51 @@ pub enum CellEditor {
     Set(Vec<String>),
     /// A calendar date, no time of day.
     Date,
-    /// A calendar date **and** a time of day.
-    DateTime,
+    /// A calendar date **and** a time of day, and what the column does with a
+    /// UTC offset written into it ([`Zoned`]).
+    DateTime(Zoned),
+}
+
+/// What the destination column does with a UTC offset in the literal written to
+/// it — the one thing a datetime edit cannot read off the *value*.
+///
+/// **An offset is a property of the destination, not text carried from the old
+/// value.** The old text was the server's rendering, and the two engines that
+/// resolve an offset do not both put one in it: a MySQL `TIMESTAMP` is rendered
+/// in the session zone with no tail at all, so "did the old value carry an
+/// offset" answered *no* for the very column that most needs one — and **Now**
+/// then sent a client wall clock that the server read as its own. Server at
+/// `+00:00`, client at `+02`, and the stored instant is two hours in the future,
+/// rendered back in the session zone so the cell re-reads as correct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zoned {
+    /// The column **resolves** an offset: PostgreSQL `timestamptz`, and MySQL's
+    /// `TIMESTAMP`, which since 8.0.19 accepts `[+-]hh:mm` in a datetime literal
+    /// and converts it to the session zone. Writing an instant here without one
+    /// leaves the server to guess which zone the wall clock was in, and it
+    /// guesses its own.
+    Offset,
+    /// The column has nowhere to put one and no zone to resolve it against:
+    /// MySQL `DATETIME`, PostgreSQL `timestamp without time zone` (which parses
+    /// an offset and **discards** it), SQLite's text stamps. The literal is
+    /// stored as written, so the wall clock is the whole of the value and an
+    /// offset would be noise at best.
+    Naive,
+}
+
+/// Does a datetime column resolve a UTC offset, or store the wall clock as
+/// written?
+///
+/// Type name **and** dialect, because the same word means different things: PG's
+/// bare `timestamp` is zone-less while MySQL's `TIMESTAMP` is an instant stored
+/// in UTC and rendered in the session zone. `base` is the leading type token,
+/// lower-cased, as [`editor_for_type`] has it.
+fn zoned_for_type(base: &str, dialect: SqlDialect) -> Zoned {
+    match base {
+        "timestamptz" | "timestamp with time zone" => Zoned::Offset,
+        "timestamp" if dialect == SqlDialect::MySql => Zoned::Offset,
+        _ => Zoned::Naive,
+    }
 }
 
 /// How a boolean is spelled in the column it goes back to.
@@ -163,10 +206,12 @@ pub fn editor_for_type(declared: &str, dialect: SqlDialect) -> CellEditor {
             }
         }
         "date" => return CellEditor::Date,
-        "datetime" | "timestamp" | "timestamptz" => return CellEditor::DateTime,
+        "datetime" | "timestamp" | "timestamptz" => {
+            return CellEditor::DateTime(zoned_for_type(base.as_str(), dialect));
+        }
         // PostgreSQL's verbose spellings, which `format_type` really does return.
         "timestamp without time zone" | "timestamp with time zone" => {
-            return CellEditor::DateTime;
+            return CellEditor::DateTime(zoned_for_type(base.as_str(), dialect));
         }
         _ => {}
     }
@@ -274,7 +319,7 @@ pub fn fits(editor: &CellEditor, text: &str) -> bool {
             .iter()
             .all(|v| members.iter().any(|m| m == v)),
         CellEditor::Date => Date::parse(text).is_some(),
-        CellEditor::DateTime => Stamp::parse(text).is_some(),
+        CellEditor::DateTime(_) => Stamp::parse(text).is_some(),
     }
 }
 
@@ -332,7 +377,7 @@ pub fn pick_options(editor: &CellEditor, current: &str) -> Vec<PickOption> {
                 })
                 .collect()
         }
-        CellEditor::Text | CellEditor::Date | CellEditor::DateTime => Vec::new(),
+        CellEditor::Text | CellEditor::Date | CellEditor::DateTime(_) => Vec::new(),
     }
 }
 
@@ -386,17 +431,33 @@ pub fn toggle_set_member(value: &str, member: &str, members: &[String]) -> Strin
 ///
 /// A [`CellEditor::Date`] column gets the bare date. A
 /// [`CellEditor::DateTime`] column keeps the time of day it already had — along
-/// with its fractional seconds and timezone offset — and gains midnight when
-/// there was nothing there. Any other editor is not a date column and is left
-/// alone; a caller that reached here with one has a bug, and rewriting the cell
-/// would hide it.
+/// with its fractional seconds — and gains midnight when there was nothing
+/// there. Any other editor is not a date column and is left alone; a caller that
+/// reached here with one has a bug, and rewriting the cell would hide it.
+///
+/// **The offset does not come along, on either flavour of column.** It is the
+/// old value's, and an offset qualifies a particular instant: `+01` on a Berlin
+/// `timestamptz` is true in January and false in July, so carrying it onto a
+/// picked July day restates the time of day an hour out — pick 15 July on
+/// `2024-01-15 11:30:00+01` and the cell re-reads as `12:30:00+02`. The day
+/// changed and so did the thing the user did not touch. Dropping it hands the
+/// wall clock to the server to resolve in its session zone, which is what
+/// "keep the time of day" means to whoever picked the day.
+///
+/// [`set_now`] does the opposite and for the same reason: *that* instant is the
+/// client's, so it has to be stated. Here the instant is the server's rendering,
+/// and the user changed only which day it falls on.
 pub fn set_date(editor: &CellEditor, current: &str, date: Date) -> String {
     match editor {
         CellEditor::Date => date.iso(),
-        CellEditor::DateTime => match Stamp::parse(current) {
+        CellEditor::DateTime(_) => match Stamp::parse(current) {
             Some(s) => match s.time() {
-                Some(_) => s.with_date(date).render(),
-                None => s.with_date(date).with_time(Time::MIDNIGHT).render(),
+                Some(_) => s.with_date(date).with_offset("").render(),
+                None => s
+                    .with_date(date)
+                    .with_time(Time::MIDNIGHT)
+                    .with_offset("")
+                    .render(),
             },
             None => Stamp::from_date(date).with_time(Time::MIDNIGHT).render(),
         },
@@ -418,24 +479,35 @@ pub fn set_date(editor: &CellEditor, current: &str, date: Date) -> String {
 /// are dropped rather than kept:
 ///
 /// * **the fraction**, which was the old value's microseconds, not this one's;
-/// * **the offset**, which is *replaced* where the value had one at all. Keeping
-///   it wrote a local wall-clock time under the old value's zone — on a
-///   `timestamptz` read as `+00` from a UTC+2 machine, an instant two hours from
-///   the one the button names. A value with no offset is not given one: MySQL's
-///   `DATETIME` has nowhere to put it.
+/// * **the offset**, which is the *destination's* to decide and not the old
+///   text's to carry ([`Zoned`]). A column that resolves an offset is given the
+///   client's, because that is which instant "now" is; a column that cannot is
+///   given none, because the wall clock is the whole of the value there.
+///
+/// **Asking the value was the bug.** The gate used to be "did the old text carry
+/// a tail", which reads `false` for a MySQL `TIMESTAMP` — a column rendered in
+/// the session zone, with no tail, that resolves an offset perfectly well. So the
+/// one case that most needed the offset was the one that never got it: a server
+/// at `+00:00` read a 12:35 wall clock from a UTC+2 machine as 12:35 UTC and
+/// stored an instant two hours in the future, then rendered it back in its own
+/// zone so the cell re-read as correct.
 pub fn set_now(editor: &CellEditor, current: &str, now: (Date, Time, &str)) -> String {
     let (date, time, offset) = now;
     match editor {
         CellEditor::Date => date.iso(),
-        CellEditor::DateTime => {
+        CellEditor::DateTime(zoned) => {
             let stamp = Stamp::parse(current).unwrap_or_else(|| Stamp::from_date(date));
             let stamp = stamp.with_date(date).with_time(time).without_frac();
-            let stamp = if stamp.has_offset() {
-                stamp.with_offset(offset)
-            } else {
-                stamp
-            };
-            stamp.render()
+            stamp
+                .with_offset(match zoned {
+                    Zoned::Offset => offset,
+                    // Not merely "don't add one": a tail the destination cannot
+                    // resolve is noise on the way in, and on PostgreSQL's bare
+                    // `timestamp` it is silently discarded — so leaving one there
+                    // would suggest the instant was pinned when it was not.
+                    Zoned::Naive => "",
+                })
+                .render()
         }
         _ => current.to_string(),
     }
@@ -829,25 +901,64 @@ mod tests {
 
     // ── Dates ───────────────────────────────────────────────────────────────
 
+    /// A datetime column that stores the wall clock as written — MySQL
+    /// `DATETIME`, PostgreSQL `timestamp`, SQLite.
+    fn naive() -> CellEditor {
+        CellEditor::DateTime(Zoned::Naive)
+    }
+
+    /// One that resolves a UTC offset — MySQL `TIMESTAMP`, PostgreSQL
+    /// `timestamptz`.
+    fn zoned() -> CellEditor {
+        CellEditor::DateTime(Zoned::Offset)
+    }
+
+    /// The calendar's columns, **and what each of them does with an offset**.
+    /// The same word does not mean the same thing on two engines: MySQL's
+    /// `TIMESTAMP` is an instant stored in UTC and rendered in the session zone,
+    /// PostgreSQL's bare `timestamp` has no zone at all and discards one it is
+    /// handed.
     #[test]
     fn the_date_family_maps_to_a_calendar() {
+        use CellEditor::DateTime;
         assert_eq!(editor_for_type("date", MySql), CellEditor::Date);
         assert_eq!(editor_for_type("DATE", Sqlite), CellEditor::Date);
-        assert_eq!(editor_for_type("datetime", MySql), CellEditor::DateTime);
-        assert_eq!(editor_for_type("datetime(6)", MySql), CellEditor::DateTime);
-        assert_eq!(editor_for_type("timestamp", MySql), CellEditor::DateTime);
+        // MySQL: `DATETIME` stores the wall clock as written; `TIMESTAMP`
+        // resolves an offset and needs one.
+        assert_eq!(editor_for_type("datetime", MySql), DateTime(Zoned::Naive));
         assert_eq!(
-            editor_for_type("timestamptz", Postgres),
-            CellEditor::DateTime
+            editor_for_type("datetime(6)", MySql),
+            DateTime(Zoned::Naive)
         );
         assert_eq!(
-            editor_for_type("timestamp(3) without time zone", Postgres),
-            CellEditor::DateTime
+            editor_for_type("timestamp", MySql),
+            DateTime(Zoned::Offset),
+            "a MySQL TIMESTAMP is rendered in the session zone, so a bare wall \
+             clock written to it means whatever the *server* is set to"
+        );
+        // PostgreSQL: the distinction is in the type's own name.
+        assert_eq!(
+            editor_for_type("timestamptz", Postgres),
+            DateTime(Zoned::Offset)
         );
         assert_eq!(
             editor_for_type("timestamp with time zone", Postgres),
-            CellEditor::DateTime
+            DateTime(Zoned::Offset)
         );
+        assert_eq!(
+            editor_for_type("timestamp(3) without time zone", Postgres),
+            DateTime(Zoned::Naive)
+        );
+        assert_eq!(
+            editor_for_type("timestamp", Postgres),
+            DateTime(Zoned::Naive),
+            "PostgreSQL's bare `timestamp` is the zone-less one — the opposite \
+             of MySQL's"
+        );
+        // SQLite stores what it is given and has no session zone to resolve
+        // against, so a tail would be text nothing interprets.
+        assert_eq!(editor_for_type("timestamp", Sqlite), DateTime(Zoned::Naive));
+        assert_eq!(editor_for_type("datetime", Sqlite), DateTime(Zoned::Naive));
     }
 
     /// MySQL's `TIME` is a *duration* (`-838:59:59` … `838:59:59`), not a clock
@@ -876,7 +987,7 @@ mod tests {
             CellEditor::Enum(vec!["a".into()]),
             CellEditor::Set(vec!["a".into()]),
             CellEditor::Date,
-            CellEditor::DateTime,
+            naive(),
         ] {
             assert!(fits(&e, ""), "{e:?}");
         }
@@ -915,9 +1026,9 @@ mod tests {
         assert!(fits(&CellEditor::Date, "2024-01-15"));
         assert!(!fits(&CellEditor::Date, "0000-00-00"));
         assert!(!fits(&CellEditor::Date, "2024-01-15 10:00:00"));
-        assert!(fits(&CellEditor::DateTime, "2024-01-15 10:00:00"));
-        assert!(fits(&CellEditor::DateTime, "2024-01-15"));
-        assert!(!fits(&CellEditor::DateTime, "0000-00-00 00:00:00"));
+        assert!(fits(&naive(), "2024-01-15 10:00:00"));
+        assert!(fits(&naive(), "2024-01-15"));
+        assert!(!fits(&naive(), "0000-00-00 00:00:00"));
     }
 
     // ── Writing a value back ────────────────────────────────────────────────
@@ -950,28 +1061,55 @@ mod tests {
     #[test]
     fn picking_a_day_on_a_datetime_column_keeps_the_time_of_day() {
         assert_eq!(
-            set_date(
-                &CellEditor::DateTime,
-                "2020-05-05 23:59:59.250+02",
-                day(2024, 1, 15)
-            ),
-            "2024-01-15 23:59:59.250+02"
+            set_date(&naive(), "2020-05-05 23:59:59.250", day(2024, 1, 15)),
+            "2024-01-15 23:59:59.250"
+        );
+    }
+
+    /// **And the offset is not part of the time of day.** `+01` on a Berlin
+    /// `timestamptz` is true in January and false in July, so carrying it onto a
+    /// picked July day restates the wall clock an hour out: the value below used
+    /// to come back `2024-07-15 11:30:00+01`, which the server stores as
+    /// `10:30Z` and renders back as **`12:30:00+02`**. The day changed and so did
+    /// the one thing the user did not touch.
+    ///
+    /// Dropped rather than recomputed: recomputing needs the zone's DST rules,
+    /// which `core` has no business carrying, and the server resolves a bare wall
+    /// clock in its session zone — which is what "keep the time of day" means to
+    /// whoever picked the day.
+    #[test]
+    fn picking_a_day_does_not_carry_the_old_values_offset() {
+        assert_eq!(
+            set_date(&zoned(), "2024-01-15 11:30:00+01", day(2024, 7, 15)),
+            "2024-07-15 11:30:00"
+        );
+        // A `Z` is an offset too, and the same reasoning applies.
+        assert_eq!(
+            set_date(&zoned(), "2024-01-15 11:30:00Z", day(2024, 7, 15)),
+            "2024-07-15 11:30:00"
+        );
+        // A column that cannot hold one had none to drop, and the fraction —
+        // which *is* part of the time of day — stays either way.
+        assert_eq!(
+            set_date(&naive(), "2020-05-05 23:59:59.250", day(2024, 1, 15)),
+            "2024-01-15 23:59:59.250"
+        );
+        // A value with no time of day gains midnight and still no tail.
+        assert_eq!(
+            set_date(&zoned(), "2024-01-15+01", day(2024, 7, 15)),
+            "2024-07-15 00:00:00"
         );
     }
 
     #[test]
     fn picking_a_day_on_an_empty_datetime_starts_at_midnight() {
         assert_eq!(
-            set_date(&CellEditor::DateTime, "", day(2024, 1, 15)),
+            set_date(&naive(), "", day(2024, 1, 15)),
             "2024-01-15 00:00:00"
         );
         // Same for a value the parser can make nothing of — the cell had no time.
         assert_eq!(
-            set_date(
-                &CellEditor::DateTime,
-                "0000-00-00 00:00:00",
-                day(2024, 1, 15)
-            ),
+            set_date(&naive(), "0000-00-00 00:00:00", day(2024, 1, 15)),
             "2024-01-15 00:00:00"
         );
     }
@@ -979,7 +1117,7 @@ mod tests {
     #[test]
     fn a_datetime_column_holding_only_a_date_gains_midnight() {
         assert_eq!(
-            set_date(&CellEditor::DateTime, "2020-05-05", day(2024, 1, 15)),
+            set_date(&naive(), "2020-05-05", day(2024, 1, 15)),
             "2024-01-15 00:00:00"
         );
     }
@@ -1002,11 +1140,7 @@ mod tests {
     #[test]
     fn stamping_now_writes_the_whole_instant() {
         assert_eq!(
-            set_now(
-                &CellEditor::DateTime,
-                "2020-05-05 10:00:00",
-                now_at(23, 5, 9, "+02:00")
-            ),
+            set_now(&naive(), "2020-05-05 10:00:00", now_at(23, 5, 9, "+02:00")),
             "2024-01-15 23:05:09"
         );
         assert_eq!(
@@ -1023,7 +1157,7 @@ mod tests {
     fn stamping_now_states_the_instant_in_the_local_zone() {
         assert_eq!(
             set_now(
-                &CellEditor::DateTime,
+                &zoned(),
                 "2020-05-05 10:00:00.123456+00",
                 now_at(23, 5, 9, "+02:00")
             ),
@@ -1031,23 +1165,101 @@ mod tests {
         );
     }
 
-    /// A column with nowhere to put an offset is not given one: MySQL's
-    /// `DATETIME` rejects the statement, and it is the same rule the rest of
-    /// `Stamp` follows — keep the shape the value came in.
+    /// **The destination decides the offset, not the old text.** A MySQL
+    /// `TIMESTAMP` is rendered in the session zone and so never carries a tail —
+    /// which is exactly the column that must be given one. Asking the value
+    /// instead ("did the old text have an offset?") answered *no* here, so
+    /// **Now** sent a bare client wall clock: server at `+00:00`, client at
+    /// `+02`, and the stored instant is two hours in the future, rendered back in
+    /// the session zone so the cell re-reads as correct.
+    #[test]
+    fn stamping_now_offsets_a_column_that_resolves_one_however_the_value_reads() {
+        for current in [
+            // A MySQL `TIMESTAMP`, as the server renders it: no tail at all.
+            "2020-05-05 10:00:00",
+            // A NULL cell switched to a value, or a pending row's blank.
+            "",
+            // Something the parser can make nothing of.
+            "0000-00-00 00:00:00",
+        ] {
+            assert_eq!(
+                set_now(&zoned(), current, now_at(9, 0, 0, "+02:00")),
+                "2024-01-15 09:00:00+02:00",
+                "current = {current:?}"
+            );
+        }
+    }
+
+    /// And the other half of the same rule: a column with nowhere to put an
+    /// offset is never given one — MySQL's `DATETIME` and PostgreSQL's bare
+    /// `timestamp`, where the wall clock *is* the value.
     #[test]
     fn stamping_now_does_not_invent_an_offset() {
         assert_eq!(
-            set_now(&CellEditor::DateTime, "", now_at(9, 0, 0, "+02:00")),
+            set_now(&naive(), "", now_at(9, 0, 0, "+02:00")),
             "2024-01-15 09:00:00"
         );
         assert_eq!(
+            set_now(&naive(), "2020-05-05 10:00:00", now_at(9, 0, 0, "+02:00")),
+            "2024-01-15 09:00:00"
+        );
+        // Nor kept: a tail the destination cannot resolve is noise on the way in,
+        // and PostgreSQL's `timestamp` discards it silently.
+        assert_eq!(
             set_now(
-                &CellEditor::DateTime,
-                "2020-05-05 10:00:00",
+                &naive(),
+                "2020-05-05 10:00:00+05",
                 now_at(9, 0, 0, "+02:00")
             ),
             "2024-01-15 09:00:00"
         );
+    }
+
+    /// **The clock read the production path actually makes.** `local_now` is
+    /// called by the calendar's `Now` and by nothing else, and by no test — so
+    /// the specifier its offset is rendered with (`%:z`, chosen because MySQL
+    /// 8.0.19+ needs `[+-]hh:mm`) was asserted nowhere: `%z` yields `+0200`,
+    /// which MySQL rejects, and the whole suite stayed green.
+    ///
+    /// No assertion about *what time it is* — the parts have to be valid and the
+    /// offset has to survive a round trip through the writer, which is what a
+    /// specifier typo breaks.
+    #[test]
+    fn the_clock_the_now_button_reads_round_trips_through_the_writer() {
+        let (d, t, off) = crate::date::local_now();
+        assert_eq!(
+            Date::new(d.year, d.month, d.day),
+            Some(d),
+            "local_now handed out a date that is not one: {d:?}"
+        );
+        assert_eq!(
+            Time::new(t.hour, t.minute, t.second),
+            Some(t),
+            "local_now handed out a time that is not one: {t:?}"
+        );
+        // `[+-]hh:mm`, and nothing else — the form both engines read.
+        let b = off.as_bytes();
+        assert!(
+            off.len() == 6
+                && (b[0] == b'+' || b[0] == b'-')
+                && b[1].is_ascii_digit()
+                && b[2].is_ascii_digit()
+                && b[3] == b':'
+                && b[4].is_ascii_digit()
+                && b[5].is_ascii_digit(),
+            "the offset must be [+-]hh:mm, got {off:?}"
+        );
+        // The round trip: what `Now` writes for a zoned column parses back, and
+        // its tail is the offset the clock gave — `+0200` would not survive this.
+        let written = set_now(&zoned(), "2024-01-15 10:00:00+00", (d, t, &off));
+        let back = Stamp::parse(&written).expect("what Now writes must parse back");
+        assert!(
+            written.ends_with(&off),
+            "the offset was reshaped on the way out: {written:?} vs {off:?}"
+        );
+        assert_eq!(back.date(), d);
+        assert_eq!(back.time(), Some(t));
+        assert!(back.has_offset());
     }
 
     /// What the calendar paints as selected — and, on a value it cannot point
@@ -1136,7 +1348,7 @@ mod tests {
 
     #[test]
     fn a_control_with_no_list_offers_no_rows() {
-        for e in [CellEditor::Text, CellEditor::Date, CellEditor::DateTime] {
+        for e in [CellEditor::Text, CellEditor::Date, naive()] {
             assert!(pick_options(&e, "x").is_empty(), "{e:?}");
         }
     }
