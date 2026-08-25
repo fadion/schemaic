@@ -396,7 +396,77 @@ impl Session {
         {
             self.in_tx.store(open, Ordering::SeqCst);
         }
-        Session::classify(&mut guard, result).await
+        let mut out = Session::classify(&mut guard, result).await;
+        // **And the same thing when the statement did not apply.** The implicit
+        // commit happens before the DDL runs, so an `ALTER` the server rejected —
+        // or one this range's statement timeout killed halfway through — has
+        // ended the transaction just as surely as a successful one would. Leaving
+        // the flag and the pill saying otherwise is what made a later
+        // **Rollback** report an undo that never happened, over data now
+        // permanently written.
+        //
+        // The statement's text is not enough to decide it, which is why this asks
+        // the server: the commit sits between the parser and the executor, so
+        // `DROP TABLE nosuch` has committed and `ALTER TABLE t GARBAGE` has not,
+        // over the same leading keyword. `tx::failure_committed` consults the
+        // text first, so the round trip is only paid on a statement that could
+        // possibly have committed — and only on one that failed.
+        if matches!(out.stmt, StmtOutcome::Failed | StmtOutcome::Cancelled) {
+            let engine = self.tx_engine();
+            if tx::implicit_commit(engine, sql) {
+                let alive = Session::tx_alive(&mut guard).await;
+                if tx::failure_committed(engine, sql, alive) {
+                    out.stmt = StmtOutcome::FailedAndCommitted;
+                    self.in_tx.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        out
+    }
+
+    /// Is a transaction still open on this connection, as far as the **server**
+    /// is concerned? `None` = it could not be asked.
+    ///
+    /// The one question [`tx::implicit_commit`]'s doc names as the thing that
+    /// would replace its keyword guess with the truth. It is asked only where the
+    /// guess is not good enough — a failed or cancelled statement whose text says
+    /// it commits — because it costs a round trip and the answer is otherwise
+    /// already known.
+    ///
+    /// Two probes, in order, because no single one covers both servers on this
+    /// dialect:
+    ///
+    /// * `@@in_transaction` is MariaDB's, exact, needs no privilege, and counts a
+    ///   read-only transaction. MySQL has no such variable and answers
+    ///   `ERROR 1193 Unknown system variable`.
+    /// * `information_schema.INNODB_TRX` exists on both and needs the `PROCESS`
+    ///   privilege (which the Server Activity panel already assumes). It misses a
+    ///   transaction that has done no InnoDB work — harmless here, because a
+    ///   transaction with nothing in it is a transaction with nothing to lose,
+    ///   and this is only ever asked about one that may have been committed.
+    ///
+    /// If neither answers, so be it: the caller falls back to the conservative
+    /// reading rather than guessing, which is what
+    /// [`tx::failure_committed`]'s `None` arm is for.
+    ///
+    /// PostgreSQL is not asked at all. Its DDL is transactional, so nothing there
+    /// commits a transaction out from under a statement, and its failure state is
+    /// already reported exactly by `Poisoned`.
+    async fn tx_alive(guard: &mut Backend) -> Option<bool> {
+        let Backend::MySql { conn, .. } = guard else {
+            return None;
+        };
+        if let Ok(Some(v)) = conn.query_first::<i64, _>("SELECT @@in_transaction").await {
+            return Some(v != 0);
+        }
+        conn.query_first::<i64, _>(
+            "SELECT COUNT(*) FROM information_schema.INNODB_TRX \
+             WHERE trx_mysql_thread_id = CONNECTION_ID()",
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|n| n != 0)
     }
 
     /// This session's engine, in the vocabulary `schemaic_core::tx` speaks.

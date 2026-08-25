@@ -71,6 +71,22 @@ pub enum StmtOutcome {
     FailedIsolated,
     /// The user cancelled it (`KILL QUERY` / PG cancel request).
     Cancelled,
+    /// It failed or was cancelled, **and the transaction it was inside is gone**:
+    /// MySQL performs its implicit commit *before* a DDL statement runs, so an
+    /// `ALTER` the server rejected — or one a statement timeout killed halfway
+    /// through — has committed the open transaction just as surely as a
+    /// successful one would.
+    ///
+    /// Distinct from [`StmtOutcome::Failed`] because **the text of the statement
+    /// cannot decide it**, and [`implicit_commit`] is therefore not enough on its
+    /// own. Verified against MariaDB 10.11.14: a parsed-but-rejected
+    /// `DROP TABLE nosuch` (`ERROR 1051`) leaves `@@in_transaction` at `0` — the
+    /// transaction is committed and a later `ROLLBACK` undoes nothing — while a
+    /// *syntax* error on the same keyword (`ALTER TABLE t GARBAGE`,
+    /// `ERROR 1064`) leaves it at `1`, with the transaction untouched. Only the
+    /// server can tell those two apart, which is why this variant exists rather
+    /// than a wider reading of `implicit_commit`: see [`failure_committed`].
+    FailedAndCommitted,
     /// The connection itself died — idle-in-transaction timeout, server
     /// restart, network drop. Whatever was in the transaction is gone.
     ConnectionLost,
@@ -170,6 +186,12 @@ impl TxState {
                         TxEngine::Postgres => TxState::Poisoned { stmts },
                         TxEngine::MySql => TxState::Open { stmts },
                     },
+                    // The same, except the server has *said* the transaction is
+                    // gone — see [`StmtOutcome::FailedAndCommitted`]. It is the
+                    // one failure that ends a transaction rather than leaving it
+                    // where it was, and it ends it on either engine, because the
+                    // answer came from the connection and not from the engine.
+                    StmtOutcome::FailedAndCommitted => TxState::Idle,
                     // Its savepoint already absorbed the abort, so the enclosing
                     // transaction is untouched on either engine — it just gains
                     // no statement.
@@ -272,6 +294,61 @@ pub fn tx_open_after(engine: TxEngine, sql: &str) -> Option<bool> {
         Some("BEGIN") | Some("START")
     );
     Some(opens)
+}
+
+/// Did a statement that **did not apply** nonetheless end the transaction it was
+/// running in?
+///
+/// The question only has a `true` answer on the engine with no transactional DDL,
+/// and only for the statements [`implicit_commit`] names — but on that engine the
+/// statement's text is not sufficient, because the implicit commit happens after
+/// the parser and before the executor. `DROP TABLE nosuch` is rejected *by the
+/// executor* and has committed; `ALTER TABLE t GARBAGE` is rejected by the parser
+/// and has not. Both arrive here as [`StmtOutcome::Failed`] over identical
+/// leading keywords.
+///
+/// So the deciding input is the server's own answer, passed in as `tx_alive`:
+///
+/// * `Some(false)` — asked, and the transaction is gone. With the statement's
+///   text agreeing that this is a statement that ends one, that is a confirmed
+///   implicit commit: [`StmtOutcome::FailedAndCommitted`].
+/// * `Some(true)` — asked, and the transaction is still there. The statement
+///   never got far enough to commit anything, so the failure is an ordinary one.
+/// * `None` — **not asked, or the server could not answer.** The fallback is the
+///   conservative one: report an ordinary failure, leaving the pill counting. It
+///   is the behaviour that was there before the probe existed, and its cost is
+///   the one [`implicit_commit`]'s doc names — a later **Rollback** reporting an
+///   undo that never happened. Widening it to a guess here would trade that for
+///   the mirror failure, a pill that says *Idle* over an open transaction whose
+///   next statement's `BEGIN` would commit it without being asked.
+///
+/// `sql` is consulted first, so the caller only pays for the round trip on the
+/// statements that could possibly have committed.
+pub fn failure_committed(engine: TxEngine, sql: &str, tx_alive: Option<bool>) -> bool {
+    implicit_commit(engine, sql) && tx_alive == Some(false)
+}
+
+/// The message a failed statement carries, with what the error itself cannot say.
+///
+/// A server error names what it refused. It does not mention that refusing it
+/// cost the user their open transaction — and on the one engine where that
+/// happens the loss is invisible: the statements folded into the transaction are
+/// already permanent, **Rollback** will succeed and undo nothing, and the pill
+/// going quiet is the only thing on screen that moved.
+///
+/// So the disclosure is attached to the message, at the one seam that knows both
+/// halves. Only [`StmtOutcome::FailedAndCommitted`] gets it, which is only ever
+/// set when the server was asked and said the transaction was gone — see
+/// [`failure_committed`]. Every other outcome's message is returned untouched.
+pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
+    if stmt != StmtOutcome::FailedAndCommitted {
+        return message.to_string();
+    }
+    format!(
+        "{message}\n\nThe transaction this ran in is gone: MySQL commits before it \
+         runs a DDL statement, so the statements already in it are permanent and \
+         Rollback will not undo them."
+    )
 }
 
 /// Does this `SET …` statement implicitly commit? Only two forms do, so `SET`
@@ -821,6 +898,154 @@ mod tests {
         ] {
             assert_eq!(tx_open_after(TxEngine::MySql, sql), None, "{sql}");
         }
+    }
+
+    /// **The commit happens before the DDL does**, so an `ALTER` that is killed
+    /// or rejected has ended the transaction just as surely as one that
+    /// succeeded — and folding it as `Open` is what makes the next **Rollback**
+    /// report an undo that never happened over data now permanently written.
+    ///
+    /// Verified against MariaDB 10.11.14, by opening a transaction, running
+    /// `UPDATE z_tx SET v = …`, running a DDL statement, then `ROLLBACK` and
+    /// re-reading the row:
+    ///
+    /// * DDL **succeeds** (`ALTER TABLE z_tx ADD COLUMN tmpc INT`) — the update
+    ///   survives the rollback.
+    /// * DDL is **rejected by the executor** (`DROP TABLE z_does_not_exist` →
+    ///   `ERROR 1051 Unknown table`) — the update survives, and the DDL never
+    ///   touched a table.
+    /// * DDL is **killed mid-flight** (`ALTER TABLE z_big ADD INDEX …`, a second
+    ///   session issuing `KILL QUERY` → `ERROR 1317 Query execution was
+    ///   interrupted`) — the update survives, and `SHOW INDEX` reports the index
+    ///   was never built.
+    /// * DDL is **rejected by the parser** (`ALTER TABLE z_tx GARBAGE GARBAGE` →
+    ///   `ERROR 1064`) — the update is **rolled back**. This is the case that
+    ///   keeps the decision out of `implicit_commit`, whose input is the leading
+    ///   keyword and which cannot see the difference.
+    ///
+    /// PostgreSQL is the contrast that keeps the whole thing engine-conditional:
+    /// the same sequences there roll the update back every time, and a failing
+    /// `ALTER` leaves the transaction aborted rather than committed.
+    #[test]
+    fn a_confirmed_implicit_commit_ends_the_transaction_a_failure_left_open() {
+        for sql in [
+            "ALTER TABLE t ADD INDEX ix (c)",
+            "CREATE TABLE t (a INT)",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+        ] {
+            // The server said the transaction is gone.
+            assert!(
+                failure_committed(TxEngine::MySql, sql, Some(false)),
+                "{sql}"
+            );
+            // It said the transaction is still there — the parser rejection.
+            assert!(
+                !failure_committed(TxEngine::MySql, sql, Some(true)),
+                "{sql}"
+            );
+            // Nobody could ask.
+            assert!(!failure_committed(TxEngine::MySql, sql, None), "{sql}");
+            // And PostgreSQL never commits its DDL out from under a transaction,
+            // so the probe's answer is not even consulted.
+            for alive in [Some(false), Some(true), None] {
+                assert!(
+                    !failure_committed(TxEngine::Postgres, sql, alive),
+                    "{sql} / {alive:?}"
+                );
+            }
+        }
+        // A statement that commits nothing is not turned into one by a probe that
+        // happens to answer `false` — that would be a lost connection wearing an
+        // implicit commit's clothes.
+        assert!(!failure_committed(
+            TxEngine::MySql,
+            "UPDATE t SET a = 1",
+            Some(false)
+        ));
+    }
+
+    /// And the fold, which is the half the pill and the session both read: the
+    /// confirmed commit is the one failure that *ends* a transaction instead of
+    /// leaving it where it was, on either engine, because the answer came from
+    /// the connection rather than from the engine.
+    #[test]
+    fn a_confirmed_commit_folds_to_idle_and_a_plain_failure_does_not() {
+        for engine in [TxEngine::MySql, TxEngine::Postgres] {
+            assert_eq!(
+                TxState::Open { stmts: 3 }.on_statement(
+                    engine,
+                    "ALTER TABLE t ADD INDEX ix (c)",
+                    StmtOutcome::FailedAndCommitted
+                ),
+                TxState::Idle,
+                "{engine:?}"
+            );
+        }
+        // Unconfirmed, so unchanged: MySQL keeps counting, PostgreSQL poisons.
+        for outcome in [StmtOutcome::Failed, StmtOutcome::Cancelled] {
+            assert_eq!(
+                TxState::Open { stmts: 3 }.on_statement(
+                    TxEngine::MySql,
+                    "ALTER TABLE t ADD INDEX ix (c)",
+                    outcome
+                ),
+                TxState::Open { stmts: 3 },
+                "{outcome:?}"
+            );
+            assert_eq!(
+                TxState::Open { stmts: 3 }.on_statement(
+                    TxEngine::Postgres,
+                    "ALTER TABLE t ADD COLUMN c int",
+                    outcome
+                ),
+                TxState::Poisoned { stmts: 3 },
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// The disclosure, which is the only thing on screen that can say a
+    /// transaction was spent — and which must not appear on any other outcome,
+    /// because an unconfirmed failure leaves the transaction open and telling the
+    /// user it is gone would send them to re-run work that is still pending.
+    #[test]
+    fn only_a_confirmed_commit_says_the_transaction_is_gone() {
+        let confirmed = failed_message("ERROR 1317: interrupted", StmtOutcome::FailedAndCommitted);
+        assert!(confirmed.starts_with("ERROR 1317: interrupted"));
+        assert!(confirmed.contains("Rollback will not undo them"));
+        for stmt in [
+            StmtOutcome::Ok,
+            StmtOutcome::Failed,
+            StmtOutcome::FailedIsolated,
+            StmtOutcome::Cancelled,
+            StmtOutcome::ConnectionLost,
+        ] {
+            assert_eq!(
+                failed_message("ERROR 1064: syntax", stmt),
+                "ERROR 1064: syntax",
+                "{stmt:?}"
+            );
+        }
+    }
+
+    /// The session's own flag, on the same evidence: `tx_open_after` answers what
+    /// the *statement* does, and the session pairs it with the outcome — the
+    /// success path takes it directly, the failure path takes it only once
+    /// [`failure_committed`] has the server's word for it.
+    #[test]
+    fn the_session_flag_and_the_pill_agree_on_a_confirmed_commit() {
+        let sql = "ALTER TABLE t ADD INDEX ix (c)";
+        assert_eq!(tx_open_after(TxEngine::MySql, sql), Some(false));
+        assert!(failure_committed(TxEngine::MySql, sql, Some(false)));
+        // Both silent about a statement that commits nothing, whatever became of
+        // it.
+        assert_eq!(tx_open_after(TxEngine::MySql, "UPDATE t SET a = 1"), None);
+        assert!(!failure_committed(
+            TxEngine::MySql,
+            "UPDATE t SET a = 1",
+            Some(false)
+        ));
     }
 
     #[test]
