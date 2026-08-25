@@ -5503,6 +5503,48 @@ fn session_wrapped_with(
     )
 }
 
+/// Does this statement of an emitted plan change anything that **outlives the
+/// connection it runs on**?
+///
+/// Asked so that a plan's session scaffolding is not counted as work. A MySQL
+/// routine, trigger or event edit is emitted wrapped in a session guard — see
+/// [`session_wrapped_all`] — and every one of those wrapper statements is a `SET`
+/// against session variables on a connection the runner disconnects a line later.
+/// Counting them made a rejected `ALTER EVENT` report *2 earlier statements
+/// already applied and cannot be rolled back* when nothing had been, over the
+/// app's **only** disclosure of a genuinely half-applied MySQL migration.
+///
+/// **`SET` is the whole test**, and it is sound because the guard is the only
+/// thing in an emitted plan whose leading keyword is one: everything else the
+/// emitters produce is `ALTER`/`CREATE`/`DROP`/`RENAME`/`TRUNCATE`, and PostgreSQL's
+/// `SET search_path=…` appears only as a *clause inside* a `CREATE FUNCTION`, never
+/// as its own statement. `a_session_guard_is_not_a_statement_that_applied_anything`
+/// composes this with the emitters rather than with hand-written SQL, so an emitter
+/// that starts producing a real `SET` fails there rather than quietly under-counting
+/// here.
+///
+/// The keyword comes from [`sql::leading_keyword`], so a leading comment or a
+/// `/* … */` block cannot disguise one.
+pub fn alters_the_database(sql: &str, dialect: SqlDialect) -> bool {
+    sql::leading_keyword(sql, dialect).as_deref() != Some("SET")
+}
+
+/// How many of `stmts[..upto]` are in effect on the server — the number a failure
+/// at `upto` may honestly claim it cannot roll back.
+///
+/// The runner stops at its first failure, so everything before `upto` succeeded;
+/// what this adds is that succeeding and *applying* are not the same thing
+/// ([`alters_the_database`]). It lives here rather than as a counter in the runner
+/// because it is a decision about emitted SQL, and the runner has only strings —
+/// which is exactly how the scaffolding came to be counted.
+pub fn applied_count(stmts: &[String], upto: usize, dialect: SqlDialect) -> usize {
+    stmts
+        .iter()
+        .take(upto)
+        .filter(|s| alters_the_database(s, dialect))
+        .count()
+}
+
 /// The wrapper itself. `time_zone` is `None` for everything but an event — see
 /// [`event_session_wrapped`] — and a `None` setting is simply not carried, so
 /// the emitted shape for a trigger or a routine is byte-identical to what it was
@@ -17342,6 +17384,91 @@ mod event_tests {
         // A *new* event has no `current` to excuse it.
         let fresh = EventDraft::blank("weekly", None);
         assert!(fresh.name_clash(None, &taken).is_some());
+    }
+
+    /// **Nothing that outlives the connection ran, so nothing was applied.**
+    ///
+    /// A MySQL routine/trigger/event edit is emitted wrapped in a session guard:
+    /// `SET @schemaic_… = @@SESSION.…`, `SET SESSION … = …`, the statement, and a
+    /// restoring `SET`. The runner counted every `Ok` into `DdlError::applied`, so
+    /// a rejected `ALTER EVENT` came back saying *2 earlier statements already
+    /// applied and cannot be rolled back* — over two session variables on a
+    /// connection the runner drops one line later. That sentence is the app's only
+    /// disclosure of a genuinely half-applied MySQL migration, and firing it on a
+    /// plan that changed nothing teaches the user to disbelieve it on the day it
+    /// is true.
+    ///
+    /// Composed with the emitter on purpose, rather than asserted against
+    /// hand-written SQL: the classification is only sound as long as the guard is
+    /// the *only* thing in a plan whose leading keyword is `SET`, and the emitter
+    /// is what decides that.
+    #[test]
+    fn a_session_guard_is_not_a_statement_that_applied_anything() {
+        let mut e = EventInfo {
+            name: "nightly".into(),
+            body: "DO SET @x = 1".into(),
+            ..Default::default()
+        };
+        e.sql_mode = Some("STRICT_TRANS_TABLES".into());
+        e.charset_client = Some("utf8mb4".into());
+        e.collation_connection = Some("utf8mb4_0900_ai_ci".into());
+        e.time_zone = Some("+02:00".into());
+        let plan = event_session_wrapped("ALTER EVENT `nightly` DO SET @x = 1".into(), &e, MySql);
+        assert_eq!(plan.len(), 4, "{plan:#?}");
+        let alters: Vec<bool> = plan.iter().map(|s| alters_the_database(s, MySql)).collect();
+        assert_eq!(
+            alters,
+            vec![false, false, true, false],
+            "only the ALTER outlives the connection: {plan:#?}"
+        );
+
+        // The count the runner reports when the wrapped statement is the one that
+        // failed: the two `SET`s before it succeeded, and neither applied
+        // anything.
+        assert_eq!(applied_count(&plan, 2, MySql), 0);
+        // And when the *restoring* `SET` is what failed, the `ALTER` before it did
+        // apply — which is the case the sentence exists for.
+        assert_eq!(applied_count(&plan, 3, MySql), 1);
+        // Nothing ran at all.
+        assert_eq!(applied_count(&plan, 0, MySql), 0);
+
+        // A routine carries three session values and no time zone; same answer.
+        let f = RoutineInfo {
+            name: "f".into(),
+            kind: RoutineKind::Procedure,
+            body: "BEGIN SELECT 1; END".into(),
+            sql_mode: Some("STRICT_TRANS_TABLES".into()),
+            charset_client: Some("utf8mb4".into()),
+            collation_connection: Some("utf8mb4_0900_ai_ci".into()),
+            ..Default::default()
+        };
+        let routine = create_routine(&RoutineDraft::from_info(&f), MySql).emit();
+        assert_eq!(
+            routine
+                .iter()
+                .filter(|s| alters_the_database(s, MySql))
+                .count(),
+            1,
+            "{routine:#?}"
+        );
+
+        // An ordinary table plan has no scaffolding at all, so every statement
+        // counts and the arithmetic is what it always was.
+        let table = vec![
+            "ALTER TABLE `t` ADD COLUMN `a` INT".to_string(),
+            "CREATE INDEX `ix` ON `t` (`a`)".to_string(),
+            "DROP TABLE `old`".to_string(),
+        ];
+        assert!(table.iter().all(|s| alters_the_database(s, MySql)));
+        assert_eq!(applied_count(&table, 2, MySql), 2);
+
+        // The guard is MySQL's alone, and on the other engines the plan is the
+        // statement — so nothing is ever excluded there.
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let bare = event_session_wrapped("CREATE TRIGGER x …".into(), &e, d);
+            assert_eq!(bare.len(), 1, "{d:?}");
+            assert!(alters_the_database(&bare[0], d), "{d:?}");
+        }
     }
 
     /// **A regression pin on the wrapper the events work widened.** A trigger
