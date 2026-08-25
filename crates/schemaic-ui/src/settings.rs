@@ -1148,10 +1148,22 @@ fn thousands(n: usize) -> String {
 /// location. It stays readable even where the button cannot work — a headless
 /// or sandboxed machine with no file manager — which is the case the fallback
 /// string is for.
-fn log_hint(dir: Option<&std::path::Path>) -> String {
-    match dir {
-        Some(d) => format!("Diagnostics, including crashes, are written to {}.", d.join("schemaic.log").display()),
-        None => "No config directory is available on this machine, so nothing is being logged to a file.".to_string(),
+/// **The file that is actually open, not a path derived from one that exists.**
+/// This row's whole purpose is to answer "where is the log", so it has to answer
+/// about the writer: a config directory can exist and be unwritable — a
+/// locked-down profile, a read-only roaming mount, an ACL the user lost — and
+/// `logging::init` then degrades to stdout with a warning that goes to a console
+/// a release build does not have. The row went on naming a file nobody had
+/// written, and a crash report gathered from it comes back empty with nobody able
+/// to say why.
+fn log_hint(log: Option<&std::path::Path>) -> String {
+    match log {
+        Some(p) => format!(
+            "Diagnostics, including crashes, are written to {}.",
+            p.display()
+        ),
+        None => "No log file could be opened on this machine, so nothing is being written to one."
+            .to_string(),
     }
 }
 
@@ -1163,12 +1175,16 @@ fn log_hint(dir: Option<&std::path::Path>) -> String {
 /// same folder is where `tabs.json` and `connections.json` live — everything
 /// anyone would be asked for.
 fn log_row(open: Rc<dyn Fn()>, ring: crate::widgets::FocusRing, tabindex: u32) -> impl IntoView {
-    let dir = schemaic_core::persist::config_dir();
-    let enabled = dir.is_some();
+    // Two different questions, deliberately: the *hint* asks whether a log is
+    // being written (`persist::active_log`, recorded by whoever opened it), the
+    // *button* asks whether there is a folder to reveal. A directory that exists
+    // but could not be written to answers no to the first and yes to the second.
+    let log = schemaic_core::persist::active_log();
+    let enabled = schemaic_core::persist::config_dir().is_some();
     h_stack((
         v_stack((
             text("Log file").style(|s| s.color(theme::text()).font_size(theme::font_label())),
-            form_hint(log_hint(dir.as_deref())),
+            form_hint(log_hint(log.as_deref())),
         ))
         .style(|s| {
             s.flex_col()
@@ -1481,21 +1497,33 @@ mod tests {
     /// the answer the user already didn't have.
     #[test]
     fn the_log_hint_names_the_file_and_its_full_path() {
-        let hint = log_hint(Some(std::path::Path::new("/home/x/.config/schemaic")));
+        let hint = log_hint(Some(std::path::Path::new(
+            "/home/x/.config/schemaic/schemaic.log",
+        )));
         assert!(hint.contains("/home/x/.config/schemaic"), "{hint}");
         assert!(hint.contains("schemaic.log"), "{hint}");
     }
 
-    /// No config directory means no file writer at all (`logging::init` says so
-    /// and degrades to stdout), and a row that still promised a path would be
-    /// pointing at nothing.
+    /// **No writer, no promise.** The input used to be the config *directory*,
+    /// which is a question about an environment variable — so on a machine whose
+    /// config directory exists but is not writable (a locked-down profile, a
+    /// read-only roaming mount, a lost ACL) the row named a file nobody had
+    /// written, and a crash report gathered from it comes back empty. The input is
+    /// now the log the process actually opened, so this arm covers both reasons
+    /// there might not be one and names neither.
     #[test]
-    fn the_log_hint_says_when_there_is_no_log_at_all() {
+    fn the_log_hint_says_nothing_is_logged_when_no_file_was_opened() {
         let hint = log_hint(None);
         assert!(!hint.contains("schemaic.log"), "{hint}");
         assert!(
-            hint.to_lowercase().contains("no config directory"),
+            hint.to_lowercase().contains("nothing is being written"),
             "{hint}"
+        );
+        // It must not name a cause it cannot know: an unwritable directory and a
+        // missing one produce the same `None`.
+        assert!(
+            !hint.to_lowercase().contains("no config directory"),
+            "the reason is not this function's to assert: {hint}"
         );
     }
 
