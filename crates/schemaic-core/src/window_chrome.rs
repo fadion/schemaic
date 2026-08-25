@@ -98,9 +98,10 @@ impl Chrome {
     /// than at that band because it is a fact about *this platform's chrome*,
     /// and the module rule is to ask the capability, never the host.
     ///
-    /// A count, not a width: the pixels are the UI's (`window_chrome::CONTROL_W`
-    /// is the Windows caption metric), and core has no business holding a
-    /// measurement it cannot check.
+    /// A count, not a width: the pixels are the UI's
+    /// (`ui::window_chrome::control_w()`, the Windows caption metric scaled by
+    /// the interface setting), and core has no business holding a measurement it
+    /// cannot check.
     pub const fn own_control_count(self) -> usize {
         if self.draws_own_controls() { 3 } else { 0 }
     }

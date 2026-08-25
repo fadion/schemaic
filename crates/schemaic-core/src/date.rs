@@ -216,7 +216,12 @@ impl Date {
     /// looking at a calendar: from UTC+2, everything between midnight and 02:00
     /// is a different day in the two frames, and a picker that highlights
     /// yesterday is wrong at exactly the hours somebody is most likely to be
-    /// looking. It is the one impure function in this module.
+    /// looking.
+    ///
+    /// One of the module's three impure functions, with [`Time::now`] and
+    /// [`local_now`]. A caller that wants *only* the day wants this one; a caller
+    /// writing a timestamp wants `local_now`, which reads the clock **once** —
+    /// two reads are two instants, and local midnight can fall between them.
     pub fn today() -> Date {
         let now = chrono::Local::now();
         let (y, m, d) = chrono_ymd(&now);

@@ -23,8 +23,24 @@
 //!     deliberately doesn't touch. Scaling them would slide the statement
 //!     highlight and the squiggles off the glyphs they mark.
 //!   • **Seeds for persisted, user-dragged sizes** (`theme::SCHEMA_W`,
-//!     `theme::AI_W`, `EDITOR_H`) — see [`crate::theme::SCHEMA_W`].
+//!     `theme::AI_W`, `EDITOR_H`, `TREE_ROW_MIN_W`) — see
+//!     [`crate::theme::SCHEMA_W`].
+//!   • **Icon bases** (`SCHEMA_ICON_BASE`, `COMPLETION_ICON_BASE`) — the
+//!     unscaled figure a `scaled()` is *applied to* at the call site, so scaling
+//!     the constant too would square the factor.
+//!   • **The air a floating bar keeps from the panel edge** — `GRID_BAR_INSET`
+//!     and `SELECTION_BAR_INSET`, and those two only. Both bars overlay the
+//!     panel rather than spanning it, and the gap between them is arithmetic
+//!     (`grid_selection_lift`) that both have to read the same way; a scale that
+//!     moved one and not the other is the overlap that lift exists to prevent.
+//!     **Whether they should scale at all is an open question** (the review's
+//!     `R2-L8-04`): the honest answer needs the app on screen at 160%, so what is
+//!     written down here is what the code does, not a defence of it.
 //!   • Anything that isn't a length: durations, counts, thresholds.
+//!
+//! The list is prose, and prose is the wrong shape for it — it has been found
+//! short three times. `S7.1-L3-03` proposes a source-gate test with the
+//! exceptions as *data*, which is the form that gets updated when it fails.
 
 use crate::theme;
 use crate::theme::scaled;
@@ -489,9 +505,12 @@ pub(crate) fn header_key_icon_w() -> f64 {
 pub(crate) fn grid_bar_h() -> f64 {
     scaled(35.0)
 }
-/// The inset both floating bars keep from the panel edge. Not scaled — it is air,
-/// like every other `padding` still literal here (see the module doc), and both
-/// bars have to read it the *same* way or the gap between them is decided twice.
+/// The inset both floating bars keep from the panel edge. Not scaled — it is the
+/// air a floating bar keeps, which is its own bullet on the module doc's
+/// exception list and covers exactly this constant and [`SELECTION_BAR_INSET`].
+/// ("Every other `padding` still literal here", which this comment used to point
+/// at, was an empty set.) Both bars have to read it the *same* way or the gap
+/// between them is decided twice.
 pub(crate) const GRID_BAR_INSET: f64 = 5.0;
 /// How far off the bottom the selection summary sits: clear of the error bar when
 /// that one is up, at the edge otherwise.
