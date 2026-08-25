@@ -522,9 +522,15 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                     theme::toggle_handle_off(),
                 )
             };
+            // The track's radius is half its height — the same arithmetic as the
+            // colour swatches in `connection_form`, and wrong in the same way when
+            // it is frozen: at 160% an 18px track is 29px tall and a literal 9
+            // leaves every Settings switch a rounded rectangle instead of a
+            // stadium.
+            let track_h = theme::scaled(18.0);
             let s = s
                 .width(theme::scaled(36.0))
-                .height(theme::scaled(18.0))
+                .height(track_h)
                 // Floem dresses every `ToggleButtonClass` in a 1px `#8c8c8c`
                 // border (`theme::default_theme`'s `border_style`), which reads
                 // as a grey outline around the dark off track and vanishes under
@@ -540,7 +546,7 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                 // the border costs no geometry either way, and a border that
                 // cannot paint is one floem's `.focus` rule cannot colour.
                 .border(0.0)
-                .border_radius(9.0)
+                .border_radius((track_h / 2.0) as f32)
                 .flex_shrink(0.0_f32)
                 .set(ToggleButtonInset, PxPct::Pct(12.0))
                 .set(ToggleButtonCircleRad, PxPct::Pct(72.0))

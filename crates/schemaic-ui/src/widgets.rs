@@ -1187,13 +1187,20 @@ pub(crate) fn form_section_owned(label: String) -> impl IntoView {
 ///
 /// The margin is 20 *minus* the enclosing stack's gap, which also applies above
 /// and below — so the gap that lands on screen is exactly 20, not 28.
+///
+/// **Both terms of that subtraction have to be at the same scale.** `stack_gap`
+/// comes from the caller, and every caller's gap is scaled — `import_view` hands
+/// it the app's own `form_gap()`, which is 29 at 160%. Against a literal 20 that
+/// is a **negative** margin: the rule would be pulled up over the section above
+/// it. The floor is belt-and-braces for a caller whose gap is wider than the
+/// separation it is asking for, which is a request that has no positive answer.
 pub(crate) fn form_separator(stack_gap: f64) -> impl IntoView {
     empty().style(move |s| {
         s.width_full()
             .height(1.0)
             .flex_shrink(0.0_f32)
             .background(theme::border())
-            .margin_vert(20.0 - stack_gap)
+            .margin_vert((theme::scaled(20.0) - stack_gap).max(0.0))
     })
 }
 
@@ -2285,7 +2292,10 @@ fn menu_row(
     h_stack_from_iter(kids)
         .style(menu_item_style)
         .style(move |s| {
-            let s = s.padding_vert(theme::scaled(8.0));
+            // The same constant `menu_panel_height` estimates with — see
+            // `MENU_ROW_PAD`. This overrides `menu_item_style`'s narrower
+            // `padding_vert` (later style wins), so it is the padding that lands.
+            let s = s.padding_vert(theme::scaled(MENU_ROW_PAD));
             // A disabled row suppresses the hover highlight so it reads as inert.
             if disabled {
                 s.hover(|h| h.background(floem::peniko::Color::TRANSPARENT))
@@ -2463,9 +2473,22 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
         + MENU_PANEL_BORDER * 2.0
 }
 
-/// A menu row's text line box at 100% (`font_title`'s 14px × ≈1.32).
-const MENU_LINE_H: f64 = 18.5;
-/// A row's vertical padding at 100%.
+/// A menu row's text line box at 100% — the residual of the ≈30.5px a row was
+/// measured at, once [`MENU_ROW_PAD`] is taken off both sides.
+///
+/// It was 18.5 against a `MENU_ROW_PAD` of 6, which is a third decomposition of
+/// the same row. The estimate said 18.5 + 6 + 6; `menu_panel_height`'s own doc
+/// said 14 + 8 + 8; and `menu_row` *drew* a `font_title()` line box inside
+/// `padding_vert(scaled(8.0))`. All three land near 30.5 at 100%, which is why
+/// nothing caught it — but `scaled()` is applied to each term separately, on
+/// purpose, so away from 100% the split is what decides the answer. The padding
+/// half is now the drawn one; this is the residual of the measured total, which
+/// is the half that was actually observed.
+const MENU_LINE_H: f64 = 14.5;
+/// A row's vertical padding at 100%, **and the one `menu_row` is drawn with** —
+/// it reads this constant, so the estimate and the row cannot state different
+/// numbers again. (Note it overrides `menu_item_style`'s own `padding_vert`; the
+/// later style wins, and this is the one that lands.)
 ///
 /// **Composed of scaled parts rather than scaled whole**, and that is still the
 /// point even now that every part of it scales: each piece rounds to its own
@@ -2478,7 +2501,7 @@ const MENU_LINE_H: f64 = 18.5;
 /// `scaled(30.5)` grew a padding that the styles were leaving literal, which
 /// over-predicted a sixteen-entry menu by ~190px at 200% and flipped menus that
 /// had room to open downwards.)
-const MENU_ROW_PAD: f64 = 6.0;
+const MENU_ROW_PAD: f64 = 8.0;
 /// A separator's rule. A hairline stays 1px at every scale — it is a rule, not a
 /// box — so unlike the margin below it, this one does not move.
 const SEPARATOR_RULE_H: f64 = 1.0;
@@ -5194,18 +5217,31 @@ mod menu_placement_tests {
     /// parts (rather than `scaled(44.5)`) is what lets the two behave
     /// differently at all — and each part rounds to its own whole pixel, the way
     /// the style that draws it does.
+    ///
+    /// **The split changed, the total at Normal did not.** The padding half is now
+    /// the padding `menu_row` is drawn with — it reads `MENU_ROW_PAD` too — so the
+    /// two can no longer state different numbers, and the line half is the
+    /// residual of the measured 30.5 rather than a line-height theory that
+    /// disagrees with it (14 x 1.32 + 8 + 8 is 34.5, not 30.5; the two were never
+    /// reconciled and this keeps the measurement, which is the half that was
+    /// actually observed).
     #[test]
     fn the_menu_estimate_scales_its_boxes_but_not_its_hairlines() {
         let one = [MenuEntry::action("x", || {})];
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
-        // row (18.5 line + 6 padding both sides) + chrome (6 padding + 1 border,
-        // both sides).
+        // row (14.5 line + 8 padding both sides) + chrome (6 padding + 1 border,
+        // both sides) — the same 30.5 + 14 the row was measured at.
         assert_eq!(menu_panel_height(&one), 30.5 + 14.0);
 
         crate::theme::set_ui_scale(crate::theme::UiScale::Huge);
-        // 18.5 → 30 and 6 → 10, so the row is 50 and the panel's padding 20; the
-        // borders are still 1px each.
-        assert_eq!(menu_panel_height(&one), 50.0 + 22.0);
+        // 14.5 → 23 and 8 → 13, so the row is 49 and the panel's padding 20; the
+        // borders are still 1px each. The padding term is the one the row draws.
+        assert_eq!(
+            theme::scaled(MENU_ROW_PAD),
+            13.0,
+            "the padding the row is drawn with"
+        );
+        assert_eq!(menu_panel_height(&one), 49.0 + 22.0);
         assert_eq!(
             menu_panel_height(&[]),
             22.0,

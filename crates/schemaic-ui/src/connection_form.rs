@@ -282,10 +282,17 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
             })
             .style(move |s| {
                 let fill = theme::parse_hex(&hx).unwrap_or(floem::peniko::Color::TRANSPARENT);
+                // **Half of the box, so it scales with the box.** A radius is a
+                // shape and shapes stay literal — but half of a scaled square is
+                // not a shape, it is the box's own arithmetic, and frozen at 9
+                // against an 18px square that becomes 23 at 130% and 29 at 160%
+                // the identity swatches stop being circles. The selection border
+                // and the keyboard halo square with them.
+                let box_w = theme::scaled(18.0);
                 let s = s
-                    .size(theme::scaled(18.0), theme::scaled(18.0))
+                    .size(box_w, box_w)
                     .flex_shrink(0.0_f32)
-                    .border_radius(9.0)
+                    .border_radius((box_w / 2.0) as f32)
                     .background(fill);
                 let s = if color.get().as_deref() == Some(hx.as_str()) {
                     s.border(2.0).border_color(floem::peniko::Color::WHITE)

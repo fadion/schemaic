@@ -1467,9 +1467,15 @@ pub(crate) fn completion_popup(
 /// stack — the hint returns the moment the list closes (empty arg slot, a literal,
 /// or nothing left to complete). The suggestion list stays useful for column args.
 pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> impl IntoView {
-    const SIG_HELP_H: f64 = 48.0;
-    // Nudged right of the caret so it doesn't sit on top of the cursor.
-    const SIG_HELP_DX: f64 = 30.0;
+    // **How tall the hint is, so it can be lifted clear of the caret's line** —
+    // and it is as tall as its own two lines of text plus its padding, every one
+    // of which scales. Frozen at 48 it was correct at Normal only: from 130% the
+    // popup's bottom fell below the caret's line top and covered the statement
+    // being typed, which is the one thing a hint about that statement must not do.
+    let sig_help_h = || theme::scaled(48.0);
+    // Nudged right of the caret so it doesn't sit on top of the cursor. Air, so
+    // it grows with the caret it is dodging.
+    let sig_help_dx = || theme::scaled(30.0);
     dyn_container(
         move || (comp.sig.get(), comp.open.get()),
         move |(sig, open)| {
@@ -1518,13 +1524,13 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
             let p = comp.sig_point.get();
             let (px, py) = (p.x - vp.x0, p.y - vp.y0);
             // Above the caret when there's room; otherwise below the line (near line 1).
-            let top = if py >= SIG_HELP_H {
-                py - SIG_HELP_H
+            let top = if py >= sig_help_h() {
+                py - sig_help_h()
             } else {
                 py + COMPLETION_LINE_H
             };
             s.absolute()
-                .inset_left(COMPLETION_GUTTER + px + SIG_HELP_DX)
+                .inset_left(COMPLETION_GUTTER + px + sig_help_dx())
                 .inset_top(top)
                 .max_width(560.0)
         } else {

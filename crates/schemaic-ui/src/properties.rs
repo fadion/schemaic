@@ -33,7 +33,7 @@ use schemaic_core::stats;
 use schemaic_core::stats::{IndexStats, RowCount, TableStats, format_bytes};
 use schemaic_core::text::plural;
 
-use crate::theme::{font_body, font_hint, font_label, font_title};
+use crate::theme::{font_body, font_hint, font_label};
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
     focus_root_with_ring, in_ring_button, loading_dots, modal_body_h, modal_footer_split,
@@ -311,7 +311,11 @@ fn headline(stats: &TableStats) -> AnyView {
 fn tile(value: String, caption: String) -> AnyView {
     v_stack((
         text(value).style(|s| {
-            s.font_size(font_title() + 8.0)
+            // **One scaled term, not a scaled one plus a literal.** `font_title()
+            // + 8.0` is 22 at Normal and 30 at 160%, where the composition wants
+            // 35 — the one figure the panel exists to show, under-growing while
+            // its caption grows — and 19 at 80% where it wants 18.
+            s.font_size(theme::scaled_font(22.0))
                 .font_bold()
                 .color(theme::text())
         }),
@@ -599,7 +603,11 @@ fn index_section(stats: &TableStats) -> Option<AnyView> {
     // Looser than the detail lists above it: an index row is a name plus a run of
     // facts (and sometimes a second line under it), so at the shared 4px the rows
     // ran together into one block instead of reading as a list.
-    Some(section_with_gap("Indexes", rows, row_gap() + 3.0))
+    Some(section_with_gap(
+        "Indexes",
+        rows,
+        row_gap() + theme::scaled(3.0),
+    ))
 }
 
 fn index_row(idx: &IndexStats) -> AnyView {
