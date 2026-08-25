@@ -2542,6 +2542,36 @@ pub(crate) fn menu_inset(anchor: f64, size: f64, win: f64, gap: f64) -> MenuInse
     }
 }
 
+/// The vertical placement of a panel dropped from a **box** — a field, a button,
+/// a cell — rather than from a cursor: below it if there is room, else above it.
+///
+/// The difference from [`menu_inset`], and the only reason this exists: a box has
+/// two edges and the flip has to use the *other* one. A cursor is a point, so
+/// flipping to `gap` above it is right; measuring a flipped panel from the box's
+/// **bottom** puts it over the box — and when the box is the button that opened
+/// the panel, and the same button closes it, the panel covers its own dismissal.
+/// That is what the date field's calendar did in the row panel, which sits at the
+/// bottom of the results area and so flips upward nearly always.
+///
+/// The last two arms are [`menu_inset`]'s, for its reasons: flush with the
+/// window's far edge when the panel fits in neither direction, and the window
+/// origin when it is taller than the window.
+pub(crate) fn box_menu_inset(top: f64, bottom: f64, size: f64, win: f64, gap: f64) -> MenuInset {
+    if win <= 1.0 || bottom + gap + size <= win {
+        return MenuInset::Start(bottom + gap);
+    }
+    if top - gap - size >= 0.0 {
+        // Its trailing edge `gap` before the box's *top*, expressed from the
+        // window's bottom so the panel's real size decides where it starts.
+        return MenuInset::End(win - top + gap);
+    }
+    if size >= win {
+        MenuInset::Start(0.0)
+    } else {
+        MenuInset::End(0.0)
+    }
+}
+
 /// One axis of a cursor menu's placement: an inset from the window's leading edge
 /// (left / top) or from its trailing one (right / bottom). See
 /// [`cursor_menu_insets`] for why the flipped case is expressed as the latter.
@@ -4890,6 +4920,61 @@ mod menu_placement_tests {
         assert_eq!(y, MenuInset::End(103.0));
     }
 
+    // ── Dropped from a box, not from a cursor ─────────────────────────────
+
+    /// A 28px control near the bottom of an 800px window. Below it there is no
+    /// room, so the panel goes above — and **above the control**, not above the
+    /// point it drops from: `800 − 700 + 3` would put the panel's bottom edge 3px
+    /// above the control's *bottom*, i.e. across the control itself.
+    #[test]
+    fn a_panel_flipped_above_a_box_clears_the_box() {
+        let (top, bottom) = (700.0, 728.0);
+        let y = box_menu_inset(top, bottom, 350.0, 800.0, 3.0);
+        assert_eq!(y, MenuInset::End(800.0 - top + 3.0));
+        // Which is to say: the panel's own bottom edge lands above the control's
+        // top, whatever the panel measures.
+        let MenuInset::End(from_bottom) = y else {
+            panic!("a flipped panel is measured from the window's bottom")
+        };
+        assert!(800.0 - from_bottom <= top, "the control stays uncovered");
+    }
+
+    /// With room below, a box drops from its **bottom** edge — unchanged, and the
+    /// case that is not a flip.
+    #[test]
+    fn a_panel_with_room_drops_below_the_box() {
+        assert_eq!(
+            box_menu_inset(100.0, 128.0, 350.0, 800.0, 3.0),
+            MenuInset::Start(131.0)
+        );
+    }
+
+    /// A control too near the top for the panel to fit above it, and too near the
+    /// bottom to fit below: the panel goes flush with the window's bottom rather
+    /// than half off-screen. (It covers the control — there is nowhere it doesn't
+    /// — but it is wholly visible, which is `menu_inset`'s rule and stays.)
+    #[test]
+    fn a_box_with_room_on_neither_side_pins_to_the_window_edge() {
+        assert_eq!(
+            box_menu_inset(300.0, 328.0, 350.0, 500.0, 3.0),
+            MenuInset::End(0.0)
+        );
+        // Taller than the window: show its start instead.
+        assert_eq!(
+            box_menu_inset(300.0, 328.0, 900.0, 500.0, 3.0),
+            MenuInset::Start(0.0)
+        );
+    }
+
+    /// An unmeasured window never flips, exactly as the cursor rule doesn't.
+    #[test]
+    fn a_box_in_an_unmeasured_window_drops_below_it() {
+        assert_eq!(
+            box_menu_inset(100.0, 128.0, 350.0, 0.0, 3.0),
+            MenuInset::Start(131.0)
+        );
+    }
+
     /// And the pin does not move when the estimate is wrong — the whole point.
     #[test]
     fn a_flipped_menu_pins_the_same_however_wrong_the_estimate_is() {
@@ -5846,7 +5931,7 @@ mod menu_exclusivity {
             date_pick: scope.create_rw_signal(Some(crate::DatePick {
                 buf: scope.create_rw_signal(String::new()),
                 editor: schemaic_core::celledit::CellEditor::Date,
-                anchor: (0.0, 0.0, 0.0),
+                anchor: (0.0, 0.0, 0.0, 0.0),
                 on_pick: None,
             })),
         }

@@ -2471,14 +2471,21 @@ pub enum PopupAnchor {
     BelowIcon(f64, f64, f64),
     /// A menu dropping from a **box** — an enum field, a grid cell open for
     /// editing: left edge flush with the control's own, so the list lines up with
-    /// the value it replaces. Flips to right-aligned at the window's right edge
-    /// and upward at its bottom, like [`PopupAnchor::BelowIcon`]. `(box_left,
-    /// box_right, box_bottom)` in window coords.
+    /// the value it replaces. Flips to right-aligned at the window's right edge,
+    /// and **above the box** when there is no room below it. `(box_left,
+    /// box_right, box_top, box_bottom)` in window coords.
     ///
-    /// Distinct from `BelowIcon` because that one tucks the panel under a ~28px
-    /// glyph by opening 40px left of its **right** edge — which, measured from a
-    /// 200px cell, puts the menu most of the way across it.
-    BelowBox(f64, f64, f64),
+    /// It carries `box_top` where [`PopupAnchor::BelowIcon`] does not, and that is
+    /// the difference between the two flips: a box is a control the user is
+    /// looking at and clicking — the row panel's enum field, an open cell — so a
+    /// menu that flipped up from its *bottom* edge covered the very thing it is
+    /// about (`widgets::box_menu_inset`). An icon's menu deliberately overlaps its
+    /// 28px glyph.
+    ///
+    /// Distinct from `BelowIcon` for a second reason: that one tucks the panel
+    /// under the glyph by opening 40px left of its **right** edge — which,
+    /// measured from a 200px cell, puts the menu most of the way across it.
+    BelowBox(f64, f64, f64, f64),
     /// Status-bar segment menu: centered on the segment's x-range and sitting 5px
     /// above the footer, growing upward. `(seg_left, seg_right)` in window coords.
     AboveFooter(f64, f64),
@@ -2504,9 +2511,15 @@ pub struct DatePick {
     /// day writes (`celledit::set_date` keeps a datetime's time of day) and
     /// whether the footer offers **Now** or **Today**.
     pub editor: schemaic_core::celledit::CellEditor,
-    /// The control's rect in window coords: `(left, right, bottom)`, the three
-    /// numbers [`PopupAnchor::BelowBox`] carries and the panel's identity.
-    pub anchor: (f64, f64, f64),
+    /// The control's rect in window coords: `(left, right, top, bottom)`, and the
+    /// panel's identity.
+    ///
+    /// **Both** vertical edges, unlike [`PopupAnchor::BelowBox`]'s three numbers:
+    /// the panel drops from the bottom but flips above the *top*, so that a
+    /// calendar with no room below it doesn't cover the button that opened it —
+    /// and that button is also the one that closes it
+    /// (`widgets::box_menu_inset`).
+    pub anchor: (f64, f64, f64, f64),
     /// What to run once a day (or **Now**) has been written into `buf` — and
     /// only then, which is why it is here rather than on the channel: the panel
     /// is closed by a pick, by Escape and by a click away, and only the opener

@@ -3090,7 +3090,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **calendar** is a panel in the window's own overlay layer (`DatePick` →
     `overlays::date_pick_overlay`), placed by the pure `calendar_insets` against a `calendar_size`
     that is *computed, not measured* — which is what makes its edge flips exact rather than
-    estimated. `open_calendar` is the one place a `DatePick` is built, and `toggle_calendar` is the
+    estimated. Its `DatePick::anchor` carries **both** vertical edges of the control, unlike
+    `PopupAnchor::BelowBox`'s three numbers, because it flips through `widgets::box_menu_inset`:
+    down from the control's bottom, up from its **top**. The row panel is a strip at the bottom of
+    the results area, so the flip is the common case there, and a panel measured from the bottom
+    edge (`menu_inset`'s cursor rule) opened straight across the button — which is also the button
+    that closes it. `open_calendar` is the one place a `DatePick` is built, and `toggle_calendar` is the
     row panel's second-press-closes wrapper over it; a grid cell opens the panel directly, one tick
     after its field is built. `DatePick::on_pick` is what the two openers do *not* share: it runs
     when a day or **Now** has been written and only then, so the row panel (whose field is what
@@ -3107,7 +3112,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     every date field in the panel, so asking only "is a calendar open" lit every field's button at
     once and let any one field's teardown close another's panel. That identity is what the grid's
     `cell_calendar_up` asks too — a cell editor always binds `gs.edit_buf`, which no row-panel field
-    ever is.
+    ever is. **The calendar peels its own Escape** (`peeling_escape`, wrapping the row panel's
+    `on_escape`): every other control's popup takes the keyboard, so the key reaches the window root
+    and `dismiss_open_popup` answers it — but a day, a month arrow and *Now* are not focusable, so
+    the field beside the calendar keeps the focus and stops the key before the root ever runs.
+    Escape closed the row panel out from under an open calendar. While it is up the toggle is lit,
+    and **it pins its own hover**: it is the calendar's dismissal then, and `field_box`'s hover tint
+    would otherwise repaint the accent border grey under the pointer.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `results_view`/`loaded_view` are the
     entry points). `editor_pane.rs` — SQL editor pane
     (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
@@ -4519,6 +4530,15 @@ Re-introducing the anti-patterns these guard against is a regression:
     subtracting it from the cursor put the real edge wherever the estimate was wrong, which showed
     as a gap between a flipped menu's bottom and the pointer that flipped it. `submenu_insets` has
     always worked this way; this is the same trick, and the reason that one never drifted.
+    - **A panel dropped from a *box* flips above the box's top, not above the point it drops from**
+      (`widgets::box_menu_inset`). A cursor is a point, so `menu_inset`'s single anchor is right for
+      it; a control has two edges, and reusing the bottom one for the flipped arm puts the panel
+      across the control — which, when the control is the button that opened *and* closes the panel,
+      means the panel covers its own dismissal. Two callers: the date field's calendar
+      (`calendar_insets`) and every menu anchored `PopupAnchor::BelowBox` — the row panel's enum,
+      boolean and set pickers, and an open grid cell's. Both anchors therefore carry the control's
+      **top** edge as well as its bottom. `BelowIcon` does not and stays on `menu_inset`: its panel
+      is meant to overlap its 28px glyph, which is the whole difference between the two variants.
     - Two earlier spellings both failed at scale, and both are worth not re-deriving: clamping the
       flipped arm at zero threw every context menu to the window's top-left corner once a menu was
       600–750px tall, and scaling the whole 30.5px row estimate (padding included, back when the
@@ -5413,7 +5433,9 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   **Which placement it asks for is part of the same answer.** `BelowIcon` tucks the panel under a
   ~28px glyph by opening 40px left of the icon's *right* edge; measured from a 220px enum field or
   a grid cell that is most of the way across the control, so a menu dropping from a **box** uses
-  `BelowBox` instead — left edges flush, the same right-edge and bottom-edge flips. The two are
+  `BelowBox` instead — left edges flush, the same right-edge flip, and a *vertical* flip that clears
+  the control instead of covering it (`box_menu_inset`; `BelowBox` carries the box's top edge for
+  exactly that, `BelowIcon` doesn't and deliberately overlaps its glyph). The two are
   distinct variants rather than a flag because the anchor is also the menu's identity: a control
   compares the placement it *would* set against the open one, and two controls that disagreed about
   which variant they use would each fail to recognise the other's menu.

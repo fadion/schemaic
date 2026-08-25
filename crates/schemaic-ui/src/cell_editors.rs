@@ -46,7 +46,7 @@ use floem::style::FlexWrap;
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::date::{self, Date};
 
-use crate::widgets::{MenuEntry, MenuFlags, MenuId, MenuInset, menu_inset};
+use crate::widgets::{MenuEntry, MenuFlags, MenuId, MenuInset, box_menu_inset};
 use crate::{DatePick, FieldCfg, PopupAnchor, edit_field, icons, theme};
 
 /// What a control needs to put a menu up: every menu flag in the app, where to
@@ -128,7 +128,7 @@ pub(crate) fn open_picker(
 ) {
     let here = anchor
         .map(|id| id.layout_rect())
-        .map(|r| PopupAnchor::BelowBox(r.x0, r.x1, r.y1));
+        .map(|r| PopupAnchor::BelowBox(r.x0, r.x1, r.y0, r.y1));
     if here.is_some_and(|mine| {
         crate::widgets::menu_anchored_at(
             ch.menus.popup.get_untracked().is_some(),
@@ -259,6 +259,27 @@ pub(crate) fn pick_field(
 /// A `fn` rather than a closure per control: `EventPropagation::Stop` on the key
 /// is the load-bearing half (the row panel's own handler would otherwise close it
 /// twice over), and it is the half easiest to leave out.
+/// The Escape a control with a popup of its **own** owes: peel the popup first,
+/// and fall through to the panel's Escape only when there is no popup to peel.
+///
+/// Escape peels one layer per press and the window root is where that happens
+/// ([`crate::widgets::dismiss_open_popup`]) — for every control here but one. A
+/// picker's menu takes the keyboard itself, so the field is not the focused view
+/// and the key reaches the root. **The calendar takes nothing**: a day, a month
+/// arrow and *Now* are none of them focusable, so the date field keeps the focus,
+/// [`escape`] stops the key there, and the root never runs. Escape then closed
+/// the row panel out from under an open calendar instead of closing the calendar.
+fn peeling_escape(panel: Option<Rc<dyn Fn()>>) -> Option<Rc<dyn Fn()>> {
+    Some(Rc::new(move || {
+        if crate::widgets::dismiss_open_popup() {
+            return;
+        }
+        if let Some(esc) = &panel {
+            (esc)();
+        }
+    }))
+}
+
 fn escape(e: &floem::event::Event, on_escape: &Option<Rc<dyn Fn()>>) -> EventPropagation {
     let floem::event::Event::KeyDown(ke) = e else {
         return EventPropagation::Continue;
@@ -498,7 +519,10 @@ pub(crate) fn date_control(
             font_size: theme::font_body,
             autofocus,
             height: Some(crate::consts::field_input_h),
-            on_escape,
+            // The calendar is not focusable, so this field keeps the keyboard
+            // while it is up and Escape has to peel the panel here — see
+            // [`peeling_escape`].
+            on_escape: peeling_escape(on_escape),
             ..Default::default()
         },
     )
@@ -521,7 +545,15 @@ pub(crate) fn date_control(
                 .padding(0.0);
             // Tracked, so the button un-lights when the calendar closes.
             if pick.with(|p| p.as_ref().is_some_and(|d| d.buf == buf)) {
-                s.color(theme::accent()).border_color(theme::accent())
+                // **Lit, and hovering it changes nothing.** The button is the
+                // calendar's dismissal while it is up, and a control that looks
+                // like it is about to do something else under the pointer is
+                // lying about that. It has to say so itself: `field_box` tints
+                // the border on hover, and that rule outlives the accent one
+                // set here — so the lit border turned grey under the pointer.
+                s.color(theme::accent())
+                    .border_color(theme::accent())
+                    .hover(|s| s.color(theme::accent()).border_color(theme::accent()))
             } else {
                 s.color(theme::text_dim()).hover(|s| s.color(theme::text()))
             }
@@ -600,7 +632,7 @@ pub(crate) fn open_calendar(
     menus.date_pick.set(Some(DatePick {
         buf,
         editor: editor.clone(),
-        anchor: (rect.x0, rect.x1, rect.y1),
+        anchor: (rect.x0, rect.x1, rect.y0, rect.y1),
         on_pick,
     }));
 }
@@ -841,25 +873,31 @@ fn day_cell(
 }
 
 /// Where the calendar goes: left edge on the control's, dropping below it —
-/// flipped to right-aligned at the window's right edge and upward at its bottom,
-/// which is the placement rule [`PopupAnchor::BelowBox`] states for a menu.
+/// flipped to right-aligned at the window's right edge, and **above the control**
+/// when there is no room under it.
+///
+/// Above the *control*, not above the point it drops from, which is the whole of
+/// [`box_menu_inset`]: the row panel is a strip at the bottom of the results
+/// area, so the flip is the common case there rather than the edge one, and a
+/// panel measured from the control's bottom edge landed across the button — the
+/// same button that closes it.
 ///
 /// Pure, and the panel's size is exact rather than estimated ([`calendar_size`]),
 /// so the flip is a fact rather than a guess: this is the whole reason a fixed
 /// grid was worth building instead of letting the panel size itself.
 pub(crate) fn calendar_insets(
-    anchor: (f64, f64, f64),
+    anchor: (f64, f64, f64, f64),
     size: (f64, f64),
     win: (f64, f64),
 ) -> (f64, MenuInset) {
-    let (left, right, bottom) = anchor;
+    let (left, right, top, bottom) = anchor;
     let ((w, h), (ww, wh)) = (size, win);
     let x = if ww > 1.0 && left + w > ww {
         (right - w).max(0.0)
     } else {
         left.max(0.0)
     };
-    (x, menu_inset(bottom, h, wh, 4.0))
+    (x, box_menu_inset(top, bottom, h, wh, 4.0))
 }
 
 /// **Every control that stands in for a text field owes the keyboard the same
@@ -933,6 +971,34 @@ mod tests {
     /// **spent** by the first asker. A flag that lingered would be handed to the
     /// next focus loss instead — which is Escape, the press already having been
     /// answered — and Escape would go on closing nothing.
+    /// Escape peels one layer: the open calendar, then the row panel. The field
+    /// beside the calendar is what stays focused while it is up, so this closure
+    /// is the only thing standing between the key and a panel that closes with
+    /// its calendar still on screen.
+    #[test]
+    fn escape_peels_the_calendar_before_the_row_panel() {
+        use std::cell::Cell as StdCell;
+        // The slot is a `thread_local` and this test owns its thread, but a
+        // leftover from a `--test-threads=1` neighbour would answer the first
+        // press instead of ours.
+        let _ = crate::widgets::dismiss_open_popup();
+
+        let panel_closed = Rc::new(StdCell::new(false));
+        let p = panel_closed.clone();
+        let esc = peeling_escape(Some(Rc::new(move || p.set(true)))).expect("a panel Escape");
+
+        let calendar_closed = Rc::new(StdCell::new(false));
+        let c = calendar_closed.clone();
+        crate::widgets::set_open_popup(crate::widgets::popup_token(), Rc::new(move || c.set(true)));
+
+        esc();
+        assert!(calendar_closed.get(), "the first press closes the calendar");
+        assert!(!panel_closed.get(), "and leaves the panel it dropped from");
+
+        esc();
+        assert!(panel_closed.get(), "the second press is the panel's");
+    }
+
     #[test]
     fn a_calendar_press_is_spent_once() {
         assert!(
@@ -947,38 +1013,53 @@ mod tests {
         );
     }
 
+    /// A date control near the top of the window: 30px wide, 28 tall, at y 12.
+    const CTRL: (f64, f64, f64, f64) = (100.0, 130.0, 12.0, 40.0);
+    /// The same control near the bottom of a 700px window — where the row panel
+    /// actually puts it.
+    const LOW: (f64, f64, f64, f64) = (100.0, 130.0, 622.0, 650.0);
+
     #[test]
     fn a_calendar_drops_from_the_controls_left_edge() {
-        let (x, y) = calendar_insets((100.0, 130.0, 40.0), SIZE, WIN);
+        let (x, y) = calendar_insets(CTRL, SIZE, WIN);
         assert_eq!(x, 100.0);
         assert_eq!(y, MenuInset::Start(44.0), "4px below the control");
     }
 
     #[test]
     fn a_calendar_at_the_right_edge_is_right_aligned_on_the_control() {
-        let (x, _) = calendar_insets((900.0, 930.0, 40.0), SIZE, WIN);
+        let (x, _) = calendar_insets((900.0, 930.0, 12.0, 40.0), SIZE, WIN);
         assert_eq!(x, 700.0, "its right edge lands on the control's");
     }
 
     /// The row panel is a strip at the *bottom* of the results area, so this is
-    /// the common case there rather than an edge case.
+    /// the common case there rather than an edge case — and the flipped panel has
+    /// to clear the **button**, which is what also closes it. Measured from the
+    /// control's bottom edge (`700 − 650 + 4`) the calendar sat across it.
     #[test]
-    fn a_calendar_with_no_room_below_grows_upward() {
-        let (_, y) = calendar_insets((100.0, 130.0, 650.0), SIZE, WIN);
+    fn a_calendar_with_no_room_below_grows_upward_clear_of_the_button() {
+        let (_, y) = calendar_insets(LOW, SIZE, WIN);
         // Expressed from the window's bottom so the panel's own height decides
-        // where it starts — `menu_inset`'s rule.
-        assert_eq!(y, MenuInset::End(700.0 - 650.0 + 4.0));
+        // where it starts — `box_menu_inset`'s rule.
+        assert_eq!(y, MenuInset::End(700.0 - 622.0 + 4.0));
+        let MenuInset::End(from_bottom) = y else {
+            panic!("a flipped calendar is measured from the window's bottom")
+        };
+        assert!(
+            700.0 - from_bottom <= 622.0,
+            "the calendar's bottom edge stays above the control's top"
+        );
     }
 
     #[test]
     fn a_calendar_taller_than_the_window_pins_to_the_top() {
-        let (_, y) = calendar_insets((100.0, 130.0, 500.0), (230.0, 900.0), WIN);
+        let (_, y) = calendar_insets((100.0, 130.0, 472.0, 500.0), (230.0, 900.0), WIN);
         assert_eq!(y, MenuInset::Start(0.0));
     }
 
     #[test]
     fn an_unmeasured_window_never_flips() {
-        let (x, y) = calendar_insets((100.0, 130.0, 40.0), SIZE, (0.0, 0.0));
+        let (x, y) = calendar_insets(CTRL, SIZE, (0.0, 0.0));
         assert_eq!(x, 100.0);
         assert_eq!(y, MenuInset::Start(44.0));
     }
