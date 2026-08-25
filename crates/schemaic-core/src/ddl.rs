@@ -5440,7 +5440,7 @@ fn session_wrapped_create(t: &TriggerInfo, d: SqlDialect) -> Vec<String> {
 /// `CREATE` **and inside the wrapper** — the recreate's `DROP`. It is not merely
 /// cosmetic ordering: anything left outside the wrapper but after the `DROP`
 /// sits in a gap where a refused statement costs the routine outright.
-fn session_wrapped(
+pub(crate) fn session_wrapped(
     lead: Option<String>,
     create: String,
     r: &RoutineInfo,
@@ -5464,7 +5464,15 @@ fn session_wrapped(
 /// session in another zone moves every future firing by the offset between the
 /// two — a nightly 03:00 job that starts running at 22:00. It rides here for
 /// exactly the reason `sql_mode` does.
-fn event_session_wrapped(stmt: String, e: &EventInfo, d: SqlDialect) -> Vec<String> {
+///
+/// **Both callers of the emitter need it, not just the applying one.** The copy
+/// path (`ObjectItem::create_sql`, i.e. Generate DDL) used to hand over the bare
+/// `CREATE EVENT`, and a script with no `SET SESSION time_zone` recreates the
+/// event under whatever zone the reader's session happens to have — silently, for
+/// every future firing. The test that guards the copy path calls a script missing
+/// its events "the worst shape a backup can take"; a script whose events fire two
+/// hours out is a worse one, because nothing on screen says so.
+pub(crate) fn event_session_wrapped(stmt: String, e: &EventInfo, d: SqlDialect) -> Vec<String> {
     session_wrapped_all(
         None,
         stmt,

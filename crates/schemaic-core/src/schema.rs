@@ -3105,13 +3105,34 @@ impl ObjectItem {
             // into a query tab it was cut mid-body, and two of them joined in a
             // folder's script ran together. Every other object here already
             // ends in its own `;` and the call leaves those untouched.
-            ObjectItem::Routine(r) => {
-                crate::ddl::client_script(&[r.create_sql(dialect, false)], dialect)
-            }
+            //
+            // **And through the session wrapper the apply path uses**, which is
+            // the difference between a script that recreates the object and one
+            // that recreates something adjacent to it. A routine's body was
+            // parsed under the `sql_mode` and character set of the session that
+            // wrote it and re-parses under the applying one's: `"col"` under
+            // `ANSI_QUOTES` is an identifier there and a string literal here. The
+            // emitter is deliberately shared with the apply path; the wrapper has
+            // to be too, or four of the twelve fields the model carries reach the
+            // server on one caller and are dropped on the other.
+            ObjectItem::Routine(r) => crate::ddl::client_script(
+                &crate::ddl::session_wrapped(None, r.create_sql(dialect, false), r, dialect),
+                dialect,
+            ),
             // Through `client_script` for the same reason a routine is: this
             // `CREATE` carries no terminator of its own (the apply path sends it
             // whole) and its body may be a `BEGIN … END` full of `;`.
-            ObjectItem::Event(e) => crate::ddl::client_script(&[e.create_sql(dialect)], dialect),
+            //
+            // The wrapper carries a fourth value here, and it is the one with no
+            // other carrier: an event's `AT`/`STARTS`/`ENDS` are stored against
+            // the session `time_zone` that wrote them and `CREATE EVENT` has no
+            // clause for it, so a script run from another zone moves every future
+            // firing by the offset between the two — a nightly 03:00 job that
+            // starts running at 01:00, for ever, with nothing saying so.
+            ObjectItem::Event(e) => crate::ddl::client_script(
+                &crate::ddl::event_session_wrapped(e.create_sql(dialect), e, dialect),
+                dialect,
+            ),
         }
     }
 }
@@ -6573,11 +6594,20 @@ mod event_tests {
     use super::*;
     use crate::intel::SqlDialect::MySql;
 
+    /// The session state is populated, and `time_zone` is the reason: it is the
+    /// one field of an event that no clause of `CREATE EVENT` carries, so a script
+    /// that drops it recreates the event on a different schedule. A fixture that
+    /// left it `None` made the wrapper a no-op and could not tell a script that
+    /// carries it from one that does not.
     fn ev() -> EventInfo {
         EventInfo {
             name: "nightly".into(),
             definer: Some("root@localhost".into()),
             body: "DELETE FROM sessions WHERE expires_at < NOW()".into(),
+            time_zone: Some("+00:00".into()),
+            sql_mode: Some("STRICT_TRANS_TABLES".into()),
+            charset_client: Some("utf8mb4".into()),
+            collation_connection: Some("utf8mb4_0900_ai_ci".into()),
             ..Default::default()
         }
     }
@@ -6767,6 +6797,9 @@ mod event_tests {
             name: "purge".into(),
             kind: RoutineKind::Procedure,
             body: "BEGIN DELETE FROM sessions; END".into(),
+            // The mode the body was parsed under — the routine's half of the same
+            // wrapper the event needs.
+            sql_mode: Some("ANSI_QUOTES".into()),
             ..Default::default()
         }));
 
@@ -6782,6 +6815,32 @@ mod event_tests {
         // Through `client_script`, so a body full of `;` is pasteable — the same
         // treatment a MySQL routine's `CREATE` gets.
         assert!(script.contains("DO\nDELETE FROM sessions WHERE expires_at < NOW()"));
+
+        // **And through the session wrapper**, which is what makes the script a
+        // backup rather than a lookalike. `time_zone` is the field with no other
+        // carrier: `CREATE EVENT` has no clause for it, so a script run from
+        // another zone moves every future firing by the offset between the two —
+        // silently, and for ever. The apply path has always wrapped; the copy
+        // path handed over the bare `CREATE`.
+        assert!(
+            script.contains("SESSION time_zone = '+00:00'"),
+            "the event's own zone has to travel with it: {script}"
+        );
+        assert!(
+            script.contains("@schemaic_time_zone = @@SESSION.time_zone"),
+            "{script}"
+        );
+        assert!(
+            script.contains("SESSION time_zone = @schemaic_time_zone"),
+            "the restore: {script}"
+        );
+        // The routine's three travel for the same reason — a body parsed under
+        // `ANSI_QUOTES` re-parses under the applying session's mode, where `"col"`
+        // is a string literal.
+        assert!(
+            script.contains("SESSION sql_mode = 'ANSI_QUOTES'"),
+            "the routine's mode: {script}"
+        );
 
         // And the whole-database walk goes through the same builder.
         assert!(s.create_ddl_script_all(MySql).contains("EVENT `nightly`"));
