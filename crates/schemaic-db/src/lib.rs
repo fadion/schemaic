@@ -3714,10 +3714,16 @@ fn convert_row(row: &Row, columns: &[Column], binary: &[bool], bit: &[bool]) -> 
 #[derive(Debug, Clone)]
 pub struct DdlError {
     pub message: String,
-    /// 0-based index of the statement that failed.
+    /// 0-based index of the statement that failed, **counted over the whole
+    /// emitted plan** — including its session scaffolding, because the script the
+    /// user is reading in the preview panel includes it too, and an ordinal that
+    /// disagreed with what is on screen would be a second wrong number rather
+    /// than a fix for the first.
     pub at: usize,
-    /// Statements that are in effect on the server despite the failure. Always 0
-    /// on PostgreSQL.
+    /// Statements that are in effect on the server despite the failure — the ones
+    /// that changed something outliving the connection, which is not the same as
+    /// the ones that succeeded (`ddl::alters_the_database`). Always 0 on
+    /// PostgreSQL.
     pub applied: usize,
 }
 
@@ -3851,7 +3857,7 @@ impl Db {
         // Best-effort: a server old enough not to have the variable keeps its own
         // default rather than failing the plan over the bound.
         let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
-        let mut applied = 0usize;
+        let dialect = self.engine.dialect();
         let mut out = Ok(());
         for (i, sql) in stmts.iter().enumerate() {
             let step = tokio::select! {
@@ -3861,12 +3867,26 @@ impl Db {
                     Err(DbError::Cancelled)
                 }
             };
-            match step {
-                Ok(()) => applied += 1,
-                Err(e) => {
-                    out = Err(fail(i, applied, e));
-                    break;
-                }
+            if let Err(e) = step {
+                // **What applied, not what succeeded.** A routine, trigger or
+                // event edit is emitted wrapped in a session guard, and those
+                // `SET`s succeed against session variables on a connection this
+                // function disconnects four lines down — nothing about them
+                // outlives the call. Counting them made a rejected `ALTER EVENT`
+                // report "2 earlier statements already applied and cannot be
+                // rolled back" over a plan that had changed nothing, on the app's
+                // only disclosure of a genuinely half-applied migration.
+                //
+                // The decision is `ddl::applied_count`'s, and it is there rather
+                // than a counter here because it is a decision about emitted SQL
+                // and this loop has only strings — which is how the scaffolding
+                // came to be counted in the first place.
+                out = Err(fail(
+                    i,
+                    schemaic_core::ddl::applied_count(stmts, i, dialect),
+                    e,
+                ));
+                break;
             }
         }
         let _ = conn.disconnect().await;
