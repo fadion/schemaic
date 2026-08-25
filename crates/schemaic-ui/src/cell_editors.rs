@@ -355,7 +355,7 @@ fn escape(e: &floem::event::Event, on_escape: &Option<Rc<dyn Fn()>>) -> EventPro
 /// focusing a `ViewId` that is gone leaves the window's focus pointing at nothing,
 /// which is keyboard-dead rather than merely wrong. A disposed signal answers
 /// `None`, so the id is only ever asked for while its owner is alive.
-fn focus_on_mount(autofocus: bool, id: RwSignal<Option<floem::ViewId>>) {
+pub(crate) fn focus_on_mount(autofocus: bool, id: RwSignal<Option<floem::ViewId>>) {
     if !autofocus {
         return;
     }

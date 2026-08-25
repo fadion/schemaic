@@ -5131,16 +5131,32 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
 
 /// A small borderless text button (the per-field Set-NULL / Set-value / Unset
 /// affordances): no background, just a text-colour hover.
-fn field_mini_btn(label: &'static str, action: impl Fn() + 'static) -> AnyView {
-    container(text(label).style(|s| s.font_size(theme::scaled_font(13.0))))
-        .on_click_stop(move |_| action())
-        .style(|s| {
-            s.padding_horiz(theme::scaled(4.0))
-                .flex_shrink(0.0_f32)
-                .color(theme::text_dim())
-                .hover(|s| s.color(theme::text()))
-        })
-        .into_any()
+/// **A row-panel affordance owes the keyboard the same contract a field does.**
+///
+/// `autofocus` is the panel's, handed down the same way `typed_editor` hands it to
+/// a control: when this button *is* the panel's first editable field — which is
+/// what a NULL first column makes it — it has to take the caret on mount, or the
+/// panel opens with the keyboard still on the grid behind it and the arrow keys
+/// move the grid's selection under an open panel.
+///
+/// Navigable regardless of `autofocus`, because Tab walking past a button as
+/// though it were a label is the other half of the same complaint.
+fn field_mini_btn(label: &'static str, autofocus: bool, action: impl Fn() + 'static) -> AnyView {
+    let id = floem::reactive::create_rw_signal(None);
+    let btn = crate::widgets::key_pressable(
+        text(label).style(|s| s.font_size(theme::scaled_font(13.0))),
+        theme::scaled(3.0),
+        action,
+    )
+    .style(|s| {
+        s.padding_horiz(theme::scaled(4.0))
+            .flex_shrink(0.0_f32)
+            .color(theme::text_dim())
+            .hover(|s| s.color(theme::text()))
+    });
+    id.set(Some(btn.id()));
+    crate::cell_editors::focus_on_mount(autofocus, id);
+    btn.into_any()
 }
 
 /// The dim `<null>` sentinel shown for a NULL field / value.
@@ -5164,7 +5180,12 @@ fn null_sentinel() -> AnyView {
 /// `control` is a builder rather than a view because the `dyn_container` rebuilds
 /// it every time the null flag flips, and a control holding signals of its own
 /// (the calendar's open month) must be rebuilt with them, not moved.
-fn nullable_field(nullable: bool, f: FieldSig, control: Rc<dyn Fn() -> AnyView>) -> AnyView {
+fn nullable_field(
+    nullable: bool,
+    autofocus: bool,
+    f: FieldSig,
+    control: Rc<dyn Fn() -> AnyView>,
+) -> AnyView {
     if !nullable {
         return container((control)()).style(|s| s.width_full()).into_any();
     }
@@ -5175,7 +5196,14 @@ fn nullable_field(nullable: bool, f: FieldSig, control: Rc<dyn Fn() -> AnyView>)
                 h_stack((
                     null_sentinel(),
                     empty().style(|s| s.flex_grow(1.0_f32)),
-                    field_mini_btn("Set value", move || f.is_null.set(false)),
+                    // **The `autofocus` reaches here, not only the control.** This
+                    // branch never calls `control`, so a panel whose first editable
+                    // column is NULL in this row handed its autofocus to a closure
+                    // that was never run: nothing took the keyboard, and the arrow
+                    // keys went on moving the grid's selection behind the open
+                    // panel. Pressing this turns the field into its control, and the
+                    // control's own autofocus then takes the caret.
+                    field_mini_btn("Set value", autofocus, move || f.is_null.set(false)),
                 ))
                 .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
                 .on_double_click_stop(move |_| f.is_null.set(false))
@@ -5183,7 +5211,10 @@ fn nullable_field(nullable: bool, f: FieldSig, control: Rc<dyn Fn() -> AnyView>)
             } else {
                 h_stack((
                     container((control)()).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
-                    field_mini_btn("Set NULL", move || f.is_null.set(true)),
+                    // Never autofocused: the control beside it has the panel's
+                    // autofocus, and two views asking for the caret on the same
+                    // mount is a race with no right answer.
+                    field_mini_btn("Set NULL", false, move || f.is_null.set(true)),
                 ))
                 .style(|s| s.items_center().width_full().gap(theme::scaled(6.0)))
                 .into_any()
@@ -5212,7 +5243,7 @@ fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) ->
         .style(|s| s.width_full())
         .into_any()
     });
-    nullable_field(nullable, f, make_field)
+    nullable_field(nullable, autofocus, f, make_field)
 }
 
 /// The control this field may actually use: its column's, unless the value in
@@ -5386,7 +5417,7 @@ fn typed_editor(
         }),
         CellEditor::Text => return scalar_editor(gs, nullable, autofocus, f),
     };
-    nullable_field(nullable, f, control)
+    nullable_field(nullable, autofocus, f, control)
 }
 
 /// True for a JSON/JSONB column type (MySQL `json`, Postgres `json`/`jsonb`).
@@ -5714,7 +5745,16 @@ fn json_editor(f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
 /// A JSON-typed editable field: the tree editor, wrapped (for a nullable column) in
 /// the same NULL toggle as scalar fields. Activating a NULL field seeds an empty
 /// object so the tree has something to edit.
-fn json_field(nullable: bool, f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
+///
+/// `autofocus` reaches the NULL branch's button, the same as `nullable_field`'s —
+/// this arm never builds the tree editor either. The tree editor itself does not
+/// take the panel's autofocus, which is a separate gap and is not this change's.
+fn json_field(
+    nullable: bool,
+    autofocus: bool,
+    f: FieldSig,
+    sink: RwSignal<Option<String>>,
+) -> AnyView {
     if !nullable {
         return json_editor(f, sink);
     }
@@ -5735,7 +5775,7 @@ fn json_field(nullable: bool, f: FieldSig, sink: RwSignal<Option<String>>) -> An
                 h_stack((
                     null_sentinel(),
                     empty().style(|s| s.flex_grow(1.0_f32)),
-                    field_mini_btn("Set value", enable),
+                    field_mini_btn("Set value", autofocus, enable),
                 ))
                 .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
                 .on_double_click_stop(move |_| enable())
@@ -5788,7 +5828,7 @@ fn field_row(
     let editor = if !editable {
         readonly_value(f)
     } else if is_json {
-        json_field(nullable, f, gs.commit_err)
+        json_field(nullable, autofocus, f, gs.commit_err)
     } else {
         typed_editor(gs, typed, nullable, autofocus, f)
     };
@@ -8744,6 +8784,68 @@ fn truncate(s: &str, max: usize) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod row_panel_null_gate {
+    /// The row panel's field wrappers — the three functions that stand between the
+    /// panel's `autofocus` and the control that would consume it.
+    ///
+    /// `nullable_field` and `json_field` each have a branch that **never builds the
+    /// control**: a nullable column that is NULL in this row renders the `<null>`
+    /// sentinel and a "Set value" button instead. Both took `autofocus` only for
+    /// the other branch, so opening the panel on a row whose first editable column
+    /// was NULL took no keyboard at all — the arrow keys went on moving the grid's
+    /// selection under an open panel, and reaching the first field cost a Tab walk
+    /// or a click.
+    ///
+    /// `cell_editors::row_panel_focus_gate` is the same instrument one layer down,
+    /// and its own doc says what it cannot see: "that the control *uses* them".
+    /// This is the half above it — the wrapper that decides whether a control is
+    /// built at all — and it is a source scan for the same reason: what went wrong
+    /// was not a calculation but a parameter that never arrived.
+    const WRAPPERS: &[&str] = &["nullable_field", "json_field", "field_mini_btn"];
+
+    fn source() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("grid.rs");
+        std::fs::read_to_string(path).expect("this module's own source")
+    }
+
+    #[test]
+    fn every_null_branch_can_still_take_the_keyboard() {
+        let src = source();
+        for name in WRAPPERS {
+            let at = src
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} is gone — the list above is stale"));
+            let sig = &src[at..];
+            let end = sig.find("-> AnyView").expect("a view builder");
+            assert!(
+                sig[..end].contains("autofocus"),
+                "{name} does not take the row panel's autofocus — its NULL branch \
+                 builds no control, so a panel opening on a NULL first column \
+                 would take no keyboard and the arrows would move the grid behind \
+                 it"
+            );
+        }
+        // And the affordance that branch renders has to be reachable by keyboard at
+        // all, not merely focusable on mount: Tab walking past a button as though it
+        // were a label is the other half of the same complaint.
+        let at = src.find("fn field_mini_btn(").expect("field_mini_btn");
+        let body_end = src[at..].find("\n}\n").expect("the end of the function");
+        let body = &src[at..at + body_end];
+        assert!(
+            body.contains("key_pressable"),
+            "field_mini_btn no longer answers Enter/Space — `on_click_stop` alone \
+             makes it a pointer-only control, which is what it was"
+        );
+        assert!(
+            body.contains("focus_on_mount"),
+            "field_mini_btn takes an autofocus it does not act on"
+        );
     }
 }
 
