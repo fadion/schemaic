@@ -930,17 +930,57 @@ pub enum PasteReport {
 /// positional `usize`s, which transpose silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PasteCounts {
-    pub planned: usize,
     pub dropped: usize,
     pub read_only: usize,
     pub capped: usize,
+}
+
+/// What a **blank** value means when it is staged into a pending new row.
+///
+/// A pending row has no original to diff against, so a blank has to mean
+/// something chosen rather than something derived — and the two callers want
+/// different things:
+///
+/// * [`BlankCell::UnsetsIt`] — a *typed* blank. The user cleared a cell they had
+///   typed into, so the column goes back to unset and the `INSERT` omits it,
+///   letting the server's default fill it. Undoing an edit is what clearing a
+///   field means.
+/// * [`BlankCell::IsAValue`] — a **pasted** blank. The clipboard says this cell is
+///   empty, and a paste is an assertion about values rather than an undo. This is
+///   the arm that did not exist: `stage_new_many` applied `UnsetsIt` to everything,
+///   while `stage_many` (the real-row half, three lines away) staged `''`. So one
+///   block wrote `''` above the pending-row boundary and the *server default*
+///   below it — the same clipboard cell, two stored values, decided by a line the
+///   user cannot see. It also discarded a value the user had typed into a pending
+///   row when the pasted cell over it happened to be empty.
+///
+/// NULL is a separate question and is not this one's: a pasted cell reading `NULL`
+/// stages the four-character string, deliberately, and whether it should is the
+/// product decision `S5-L1-01` carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlankCell {
+    /// A blank clears the cell back to "let the server decide".
+    UnsetsIt,
+    /// A blank is the empty string, as it is on a real row.
+    IsAValue,
+}
+
+/// The entry a staged value produces in a pending row: `None` means *remove the
+/// column* (so the `INSERT` omits it), `Some(v)` means store `v`.
+///
+/// Only a blank is ambiguous — see [`BlankCell`]. SQL NULL (`None`) is an explicit
+/// value on either reading and is always stored.
+pub fn pending_cell(val: Option<String>, blank: BlankCell) -> Option<Option<String>> {
+    match &val {
+        Some(s) if s.is_empty() && blank == BlankCell::UnsetsIt => None,
+        _ => Some(val),
+    }
 }
 
 impl PastePlan {
     /// This plan's counts, for [`paste_report`]. Call it before staging.
     pub fn counts(&self) -> PasteCounts {
         PasteCounts {
-            planned: self.cells.len(),
             dropped: self.dropped,
             read_only: self.read_only,
             capped: self.capped,
@@ -955,13 +995,21 @@ impl PastePlan {
 /// state the plan knows nothing about. What actually *landed* is what decides
 /// between the two voices — not whether anything was skipped.
 ///
+/// **`staged` is counted by the caller, after staging, and is not derived here.**
+/// It used to be `planned - skipped_deleted`, which is what the plan *intended* —
+/// and staging drops entries the plan cannot know about: `stage_many` un-stages a
+/// cell pasted back over its own original value, and `stage_new_many` removes a
+/// column whose pasted cell is blank. So pasting a column's own values over
+/// itself reported `Pasted N cells` while `dirty` gained nothing at all. The two
+/// `stage_*_many` calls return what they changed and the caller sums them.
+///
 /// **Every figure is grouped and every noun agrees**, because this sentence
 /// shares a bar with the stats line: `Pasted 1 cells` four pixels from
 /// `200k of ~292.02k rows` reads as a bug in the paste, and the range's own code
 /// says why the helpers are not optional — `save_export`'s note carries a comment
 /// about `plural` returning the noun and nothing else, after forgetting the count
 /// once produced "Exported rows to employees.csv".
-pub fn paste_report(counts: PasteCounts, skipped_deleted: usize) -> PasteReport {
+pub fn paste_report(counts: PasteCounts, skipped_deleted: usize, staged: usize) -> PasteReport {
     let n = crate::text::human_count;
     let mut notes = Vec::new();
     if counts.dropped > 0 {
@@ -989,7 +1037,6 @@ pub fn paste_report(counts: PasteCounts, skipped_deleted: usize) -> PasteReport 
     if notes.is_empty() {
         return PasteReport::Clean;
     }
-    let staged = counts.planned.saturating_sub(skipped_deleted);
     if staged == 0 {
         PasteReport::Failed(format!("Nothing pasted: {}.", notes.join(", ")))
     } else {
@@ -2300,7 +2347,10 @@ mod tests {
         let block = parse_tsv_block("a\tb\nc\td");
         let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, None, all_editable);
         assert_eq!(plan.capped, 0);
-        assert_eq!(paste_report(plan.counts(), 0), PasteReport::Clean);
+        assert_eq!(
+            paste_report(plan.counts(), 0, plan.cells.len()),
+            PasteReport::Clean
+        );
     }
 
     #[test]
@@ -2321,35 +2371,109 @@ mod tests {
     }
 
     /// Built through [`PastePlan::counts`] rather than by hand, so the test
-    /// exercises the same snapshot the caller takes — the field that had to be
-    /// captured before staging drains it is `planned`, and reading it off a
-    /// real plan is what says the two agree.
-    fn planned(cells: usize, dropped: usize, read_only: usize) -> PasteCounts {
-        PastePlan {
+    /// exercises the same snapshot the caller takes.
+    ///
+    /// `cells` is what the plan *held*, and it is deliberately no longer part of
+    /// the snapshot: how many cells landed is the caller's own count, taken after
+    /// staging, and is passed to `paste_report` separately. These fixtures hand
+    /// both in so the two can be told apart — `report(cells, …)` is the honest
+    /// case where everything the plan held was staged.
+    fn planned(cells: usize, dropped: usize, read_only: usize) -> (PasteCounts, usize) {
+        let plan = PastePlan {
             cells: (0..cells).map(|i| (i, 0, String::new())).collect(),
             dropped,
             read_only,
             capped: 0,
-        }
-        .counts()
+        };
+        let staged = plan.cells.len();
+        (plan.counts(), staged)
     }
 
     /// As [`planned`], for the one count that is a *ceiling* rather than
     /// something about the data.
-    fn planned_over(cells: usize, capped: usize) -> PasteCounts {
-        PastePlan {
+    fn planned_over(cells: usize, capped: usize) -> (PasteCounts, usize) {
+        let plan = PastePlan {
             cells: (0..cells).map(|i| (i, 0, String::new())).collect(),
             capped,
             ..PastePlan::default()
+        };
+        let staged = plan.cells.len();
+        (plan.counts(), staged)
+    }
+
+    /// `paste_report` over a fixture, with everything the plan held having landed.
+    fn report(f: (PasteCounts, usize), skipped_deleted: usize) -> PasteReport {
+        let (counts, staged) = f;
+        paste_report(
+            counts,
+            skipped_deleted,
+            staged.saturating_sub(skipped_deleted),
+        )
+    }
+
+    /// **The sentence has to count what landed, not what was planned.**
+    ///
+    /// Staging drops entries the plan cannot know about: `stage_many` un-stages a
+    /// cell pasted back over its own original value, and `stage_new_many` removes a
+    /// column whose pasted cell is blank. `staged` was derived here as
+    /// `planned - skipped_deleted`, so pasting a column's own values over itself
+    /// reported `Pasted N cells` while `dirty` gained nothing at all.
+    #[test]
+    fn the_report_counts_what_landed_and_not_what_was_planned() {
+        let (counts, held) = planned(2, 1, 0);
+        assert_eq!(held, 2, "the plan held two cells");
+        // Both were staged: the ordinary case, and the one the old arithmetic got
+        // right.
+        assert_eq!(
+            paste_report(counts, 0, 2),
+            PasteReport::Notice("Pasted 2 cells, skipping 1 outside the grid.".to_string())
+        );
+        // One of the two was a no-op — pasted back over its own value. The plan
+        // still held two.
+        assert_eq!(
+            paste_report(counts, 0, 1),
+            PasteReport::Notice("Pasted 1 cell, skipping 1 outside the grid.".to_string())
+        );
+        // Neither landed: that is a failure, however many the plan held.
+        assert_eq!(
+            paste_report(counts, 0, 0),
+            PasteReport::Failed("Nothing pasted: 1 outside the grid.".to_string())
+        );
+    }
+
+    /// **A pasted blank is a value; a typed blank is an undo.**
+    ///
+    /// One block used to write `''` above the pending-row boundary and leave the
+    /// column unset — so the *server default* — below it: the same clipboard cell,
+    /// two stored values, decided by a line the user cannot see. It also threw away
+    /// a value typed into a pending row when the pasted cell over it was empty.
+    #[test]
+    fn a_blank_means_what_the_gesture_means() {
+        use BlankCell::*;
+        // A paste: the empty cell is stored, the same as it would be on a real row.
+        assert_eq!(
+            pending_cell(Some(String::new()), IsAValue),
+            Some(Some(String::new()))
+        );
+        // A typed clear: the column goes back to unset, so the INSERT omits it.
+        assert_eq!(pending_cell(Some(String::new()), UnsetsIt), None);
+        // Everything else is the same on either reading — an ordinary value...
+        for blank in [IsAValue, UnsetsIt] {
+            assert_eq!(
+                pending_cell(Some("a".to_string()), blank),
+                Some(Some("a".to_string())),
+                "{blank:?}"
+            );
+            // ...and SQL NULL, which is explicit on both and is never an undo.
+            assert_eq!(pending_cell(None, blank), Some(None), "{blank:?}");
         }
-        .counts()
     }
 
     /// A paste that lost nothing says nothing. A bar on every paste is a bar
     /// nobody reads.
     #[test]
     fn a_clean_paste_reports_nothing() {
-        assert_eq!(paste_report(planned(6, 0, 0), 0), PasteReport::Clean);
+        assert_eq!(report(planned(6, 0, 0), 0), PasteReport::Clean);
     }
 
     /// **The finding this split exists for.** Five cells landed and one didn't:
@@ -2357,7 +2481,7 @@ mod tests {
     /// error surface — indistinguishable from a write-back that failed.
     #[test]
     fn a_partial_paste_is_a_notice_and_not_an_error() {
-        let r = paste_report(planned(5, 0, 1), 0);
+        let r = report(planned(5, 0, 1), 0);
         assert_eq!(
             r,
             PasteReport::Notice("Pasted 5 cells, skipping 1 in read-only columns.".into())
@@ -2374,7 +2498,7 @@ mod tests {
     /// filing a report.
     #[test]
     fn a_capped_paste_says_what_the_ceiling_was() {
-        let r = paste_report(planned_over(PASTE_CELL_CAP, 12), 0);
+        let r = report(planned_over(PASTE_CELL_CAP, 12), 0);
         assert_eq!(
             r,
             PasteReport::Notice(
@@ -2384,7 +2508,7 @@ mod tests {
         // A big overflow, in the printer the stats line uses — this test's own
         // doc comment wrote the figure grouped, which is what the sentence was
         // always meant to read like.
-        let r = paste_report(planned_over(PASTE_CELL_CAP, 5_950_000), 0);
+        let r = report(planned_over(PASTE_CELL_CAP, 5_950_000), 0);
         assert_eq!(
             r,
             PasteReport::Notice(
@@ -2399,11 +2523,11 @@ mod tests {
     #[test]
     fn one_pasted_cell_is_one_cell() {
         assert_eq!(
-            paste_report(planned(1, 1, 0), 0),
+            report(planned(1, 1, 0), 0),
             PasteReport::Notice("Pasted 1 cell, skipping 1 outside the grid.".to_string())
         );
         assert_eq!(
-            paste_report(planned(2, 1, 0), 0),
+            report(planned(2, 1, 0), 0),
             PasteReport::Notice("Pasted 2 cells, skipping 1 outside the grid.".to_string())
         );
     }
@@ -2414,7 +2538,7 @@ mod tests {
     #[test]
     fn a_paste_that_lands_nothing_is_a_failure() {
         assert_eq!(
-            paste_report(planned(0, 0, 4), 0),
+            report(planned(0, 0, 4), 0),
             PasteReport::Failed("Nothing pasted: 4 in read-only columns.".into())
         );
     }
@@ -2425,11 +2549,11 @@ mod tests {
     #[test]
     fn rows_marked_for_deletion_count_against_what_landed() {
         assert_eq!(
-            paste_report(planned(3, 0, 0), 3),
+            report(planned(3, 0, 0), 3),
             PasteReport::Failed("Nothing pasted: 3 in rows marked for deletion.".into())
         );
         assert_eq!(
-            paste_report(planned(3, 0, 0), 1),
+            report(planned(3, 0, 0), 1),
             PasteReport::Notice("Pasted 2 cells, skipping 1 in rows marked for deletion.".into())
         );
     }
@@ -2439,7 +2563,7 @@ mod tests {
     #[test]
     fn every_reason_a_cell_was_skipped_is_named() {
         assert_eq!(
-            paste_report(planned(4, 2, 3), 1),
+            report(planned(4, 2, 3), 1),
             PasteReport::Notice(
                 "Pasted 3 cells, skipping 2 outside the grid, 3 in read-only columns, \
                  1 in rows marked for deletion."

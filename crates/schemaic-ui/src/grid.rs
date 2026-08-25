@@ -807,10 +807,17 @@ impl GridState {
     /// and by every derived view, so updating it per cell makes a 10,000-cell
     /// paste ten thousand invalidations of the grid — each one re-resolving the
     /// visible cells — where the user asked for one edit.
-    fn stage_many(&self, cells: Vec<(usize, usize, Option<String>)>) {
+    ///
+    /// **Returns how many cells it actually staged**, which is not `cells.len()`:
+    /// the revert rule below *removes* an entry when the value equals the
+    /// original, so pasting a column's own values back over it stages nothing.
+    /// `paste_report` used to be handed the plan's own count and reported
+    /// `Pasted N cells` over a `dirty` that had gained none of them.
+    fn stage_many(&self, cells: Vec<(usize, usize, Option<String>)>) -> usize {
         if cells.is_empty() {
-            return;
+            return 0;
         }
+        let mut staged = 0usize;
         let rs = self.rs.get_untracked();
         self.dirty.update(|d| {
             for (di, ci, val) in cells {
@@ -829,11 +836,13 @@ impl GridState {
                     d.remove(&(di, ci)); // reverted to original → no longer dirty
                 } else {
                     d.insert((di, ci), val);
+                    staged += 1;
                 }
             }
         });
         // A fresh edit clears a stale message.
         self.clear_bar();
+        staged
     }
 
     /// Stage an **explicit** value into a real cell, always recording it as an edit
@@ -854,31 +863,53 @@ impl GridState {
     /// original to diff against, so an empty `Some("")` reverts the cell to unset
     /// (server default) rather than inserting an empty string.
     fn stage_new(&self, pidx: usize, ci: usize, val: Option<String>) {
-        self.stage_new_many(vec![(pidx, ci, val)]);
+        // A typed blank clears the cell back to "let the server decide" — the
+        // gesture is an undo. `paste_selection` says otherwise, deliberately.
+        self.stage_new_many(
+            vec![(pidx, ci, val)],
+            schemaic_core::edit::BlankCell::UnsetsIt,
+        );
     }
 
     /// [`GridState::stage_new`] for a whole batch, one signal update — see
     /// [`GridState::stage_many`] for why that matters.
-    fn stage_new_many(&self, cells: Vec<(usize, usize, Option<String>)>) {
+    ///
+    /// `blank` is **what an empty value means here**, and it has to be the
+    /// caller's: see [`schemaic_core::edit::BlankCell`]. A typed clear undoes an
+    /// edit; a pasted blank is a value, the same as it is on a real row three
+    /// lines up. Applying the typed rule to a paste is what wrote `''` above the
+    /// pending-row boundary and left the column unset — so the server default —
+    /// below it.
+    ///
+    /// **Returns how many cells it staged**, for the same reason `stage_many`
+    /// does: an unset is not a stage, and the report must not count it.
+    fn stage_new_many(
+        &self,
+        cells: Vec<(usize, usize, Option<String>)>,
+        blank: schemaic_core::edit::BlankCell,
+    ) -> usize {
         if cells.is_empty() {
-            return;
+            return 0;
         }
+        let mut staged = 0usize;
         self.new_rows.update(|rows| {
             for (pidx, ci, val) in cells {
                 let Some(row) = rows.get_mut(pidx) else {
                     continue;
                 };
-                match &val {
-                    Some(s) if s.is_empty() => {
+                match schemaic_core::edit::pending_cell(val, blank) {
+                    None => {
                         row.remove(&ci); // blank → fall back to the DB default
                     }
-                    _ => {
-                        row.insert(ci, val);
+                    Some(v) => {
+                        row.insert(ci, v);
+                        staged += 1;
                     }
                 }
             }
         });
         self.clear_bar();
+        staged
     }
 
     /// Append a blank pending row and return its index.
@@ -1754,8 +1785,13 @@ fn paste_selection(gs: GridState) {
         }
         real.push((di, ci, Some(value)));
     }
-    gs.stage_many(real);
-    gs.stage_new_many(pending);
+    // **What landed, summed from the two halves** — not what the plan held. Each
+    // returns the entries it really changed: `stage_many` un-stages a cell pasted
+    // back over its own original, and `stage_new_many` is told that a *pasted*
+    // blank is a value rather than an undo, so the same clipboard cell now stores
+    // the same thing on either side of the pending-row boundary.
+    let staged =
+        gs.stage_many(real) + gs.stage_new_many(pending, schemaic_core::edit::BlankCell::IsAValue);
     // After staging, because `stage` clears this bar on every edit. Silence
     // would be the wrong answer here: a paste that discarded half a spreadsheet
     // looks exactly like one that worked.
@@ -1766,7 +1802,7 @@ fn paste_selection(gs: GridState) {
     // earns the red fill. Both used to be errors, so "Pasted 5 cells, skipping
     // 1 in read-only columns." was rendered indistinguishably from a write-back
     // that failed.
-    match schemaic_core::edit::paste_report(counts, skipped_deleted) {
+    match schemaic_core::edit::paste_report(counts, skipped_deleted, staged) {
         schemaic_core::edit::PasteReport::Clean => {}
         schemaic_core::edit::PasteReport::Notice(m) => gs.commit_note.set(Some(m)),
         schemaic_core::edit::PasteReport::Failed(m) => gs.commit_err.set(Some(m)),
