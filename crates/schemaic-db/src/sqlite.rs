@@ -87,8 +87,62 @@ pub const MAIN: &str = "main";
 /// Everything that isn't a connection failure is a query failure, matching how
 /// the other two backends split them: the distinction the UI draws is "couldn't
 /// reach it" versus "it said no".
+///
+/// A lock failure keeps SQLite's own sentence and gains [`LOCK_ADVICE`], because
+/// on this engine "database is locked" is a sentence about *another operation of
+/// the user's own* and names neither it nor the way out.
 fn query_err(e: rusqlite::Error) -> DbError {
+    if is_lock_failure(&e) {
+        return DbError::Query(format!("{e}\n\n{LOCK_ADVICE}"));
+    }
     DbError::Query(e.to_string())
+}
+
+/// Why a write to a SQLite file was refused, and what to do about it.
+///
+/// **The one engine where a long read blocks a write.** MySQL and PostgreSQL are
+/// MVCC and the same export blocks nothing, so a user who has only met those two
+/// has no reason to connect a failed cell edit to the export running in another
+/// tab — and SQLite's own text says only *database is locked*, with no hint that
+/// the lock is the user's own.
+///
+/// Verified against a real 53 MB file in rollback-journal mode (`journal_mode =
+/// delete`, SQLite's default for a file not already in WAL): a whole-table
+/// `stream_query` over 400,000 rows, drained slowly, with an `UPDATE` on a second
+/// connection issued a quarter-second in. With the export finishing inside the
+/// busy timeout the write **waited 3,495 ms and then succeeded**; with the export
+/// running longer it **failed after 5,536 ms** with *database is locked*. So the
+/// wait is real, the failure is a timeout, and neither is visible from the
+/// message SQLite hands back.
+///
+/// WAL is named rather than applied: `journal_mode` is a persistent property of
+/// the user's file, it adds `-wal`/`-shm` siblings, and it is not available on
+/// every filesystem. Changing someone's database as a side effect of a failed
+/// cell edit is not this layer's call.
+const LOCK_ADVICE: &str = "On SQLite a long read blocks a write: a whole-table export or import \
+     holds a read lock on the file until it finishes, and no write can start until it does \
+     (MySQL and PostgreSQL do not work this way). Wait for it or cancel it, then try again. To \
+     let reads and writes overlap on this file for good, switch it to WAL journal mode — \
+     `PRAGMA journal_mode = WAL` — which changes the file itself, so Schemaic will not do it \
+     for you.";
+
+/// Is this the file being locked by another connection, rather than the statement
+/// being wrong?
+///
+/// Both codes, because the two arrive from different places and mean the same
+/// thing to the user: `SQLITE_BUSY` is a file-level lock that outlasted the busy
+/// timeout, and `SQLITE_LOCKED` is a table-level one from a shared cache. Read
+/// off `ErrorCode` rather than matched in the message text, so a reworded SQLite
+/// build cannot quietly drop the advice.
+fn is_lock_failure(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 /// Open the file this handle points at.
@@ -128,8 +182,24 @@ fn open(db: &Db) -> Result<SqliteConn, DbError> {
     {
         flags |= OpenFlags::SQLITE_OPEN_URI;
     }
-    SqliteConn::open_with_flags(target, flags)
-        .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))
+    let conn = SqliteConn::open_with_flags(target, flags)
+        .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))?;
+    // **How long a write waits for a lock is this app's number, not the
+    // driver's.** rusqlite sets 5 s of its own accord, which is an implementation
+    // detail the app's behaviour was resting on: a cell edit issued while a
+    // whole-table export held the file's read lock failed at exactly that mark
+    // (measured: 5,536 ms, *database is locked*), and one issued against an export
+    // that finished just inside it succeeded after waiting (3,495 ms). Both
+    // numbers move if rusqlite changes its default.
+    //
+    // Fifteen seconds because the band between 5 and 15 is where a wait actually
+    // *resolves*: a chunk flush, a commit, an import's transaction. Past that the
+    // blocker is a whole-table read whose length is the size of the table, and
+    // waiting minutes with no way to cancel is worse than a refusal that says why
+    // — which is what [`LOCK_ADVICE`] is for.
+    conn.busy_timeout(std::time::Duration::from_secs(15))
+        .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))?;
+    Ok(conn)
 }
 
 /// The name [`open`] may hand to SQLite, or why it may not.
@@ -3555,6 +3625,112 @@ mod tests {
                 .map(|(c, v)| (c.to_string(), v.clone()))
                 .collect(),
         }
+    }
+
+    /// **A write refused because the file is locked says whose lock it is.**
+    ///
+    /// SQLite is the one engine here where a long read blocks a write, and the
+    /// long read the app itself offers is a whole-table export: it holds the lock
+    /// for the length of the table, and every write to the same file fails until
+    /// it ends. SQLite's own sentence — *database is locked* — names neither the
+    /// export nor the way out, and a user who has only used MySQL or PostgreSQL
+    /// has no reason to connect the two.
+    ///
+    /// A shared-cache database gives the same refusal deterministically and with
+    /// no file: the keeper holds a read transaction open, exactly as the export's
+    /// stepping loop does, and the write arrives on the fresh connection that this
+    /// module's one-connection-per-operation rule mandates. The file case was
+    /// measured separately against a real 53 MB database — see [`LOCK_ADVICE`] —
+    /// and cannot be a test here, because the suite touches no filesystem.
+    #[tokio::test]
+    async fn a_write_blocked_by_a_long_read_says_what_is_holding_the_file() {
+        let (keeper, db) = shared_memory("locked_write_advice");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); \
+                 INSERT INTO t VALUES (1, 'a'), (2, 'b');",
+            )
+            .expect("seed");
+        // The export's read, still open — a `SELECT` that has not run out of rows.
+        let held = keeper.unchecked_transaction().expect("read transaction");
+        let n: i64 = held
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .expect("read");
+        assert_eq!(n, 2);
+
+        let err = db
+            .fetch_query(
+                None,
+                "UPDATE t SET v = 'x' WHERE id = 1",
+                1,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a write cannot proceed while a read transaction is open");
+        let msg = err.to_string();
+        // SQLite's own sentence survives — the code is still what it was.
+        assert!(msg.contains("locked"), "{msg}");
+        // And it now says which of the user's own operations is holding the file,
+        // and both ways out.
+        assert!(msg.contains("whole-table export"), "{msg}");
+        assert!(msg.contains("cancel it"), "{msg}");
+        assert!(msg.contains("journal_mode = WAL"), "{msg}");
+        // Not a claim about the other two engines being broken the same way.
+        assert!(
+            msg.contains("MySQL and PostgreSQL do not work this way"),
+            "{msg}"
+        );
+
+        // Once the read ends the write goes through, which is what makes the
+        // advice true rather than merely sympathetic.
+        drop(held);
+        db.fetch_query(
+            None,
+            "UPDATE t SET v = 'x' WHERE id = 1",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the write succeeds once the read transaction closes");
+    }
+
+    /// And an ordinary refusal is left alone: the advice is for a lock, not for
+    /// every failure. A rewritten SQLite message must not be able to attract it
+    /// either, which is why the decision reads `ErrorCode`.
+    #[test]
+    fn only_a_lock_failure_gets_the_lock_advice() {
+        use rusqlite::{ErrorCode, ffi};
+        let lock = |code: ErrorCode| {
+            rusqlite::Error::SqliteFailure(
+                ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                Some("database is locked".to_string()),
+            )
+        };
+        assert!(super::is_lock_failure(&lock(ErrorCode::DatabaseBusy)));
+        assert!(super::is_lock_failure(&lock(ErrorCode::DatabaseLocked)));
+        for other in [
+            ErrorCode::ConstraintViolation,
+            ErrorCode::ReadOnly,
+            ErrorCode::CannotOpen,
+            ErrorCode::TypeMismatch,
+        ] {
+            assert!(!super::is_lock_failure(&lock(other)), "{other:?}");
+        }
+        // Not a `SqliteFailure` at all — the parameter-count refusal the skeleton
+        // path depends on, for one.
+        assert!(!super::is_lock_failure(
+            &rusqlite::Error::InvalidParameterCount(0, 1)
+        ));
+        // And the mapping that uses it keeps SQLite's own text in both cases.
+        let advised = super::query_err(lock(ErrorCode::DatabaseBusy)).to_string();
+        assert!(advised.contains("database is locked"), "{advised}");
+        assert!(advised.contains("journal_mode = WAL"), "{advised}");
+        let plain = super::query_err(lock(ErrorCode::ConstraintViolation)).to_string();
+        assert!(plain.contains("database is locked"), "{plain}");
+        assert!(!plain.contains("journal_mode"), "{plain}");
     }
 
     /// **A `file:` path is a URI, and SQLite reads it as one whatever the flag
