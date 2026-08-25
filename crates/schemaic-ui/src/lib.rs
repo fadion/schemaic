@@ -8263,8 +8263,9 @@ mod modal_backdrop_gate {
     /// And the other direction, which `07bda98`'s "loud failure" argument covers
     /// and which is worth pinning next to it: every term of `modal_backdrop_up` is
     /// a predicate the layer also uses to size itself, so a modal in the layer with
-    /// no term gets a zero box. The four grouped predicates are named here so a
-    /// fifth added without joining `modal_backdrop_up` fails.
+    /// no term gets a zero box. All six terms are named here — the three grouped
+    /// predicates and the three signals the layer raises directly — so a seventh
+    /// added without joining `modal_backdrop_up` fails.
     #[test]
     fn the_predicate_names_every_group_the_layer_raises() {
         let src = std::fs::read_to_string(src_dir().join("lib.rs")).expect("lib.rs");

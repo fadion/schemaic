@@ -899,7 +899,15 @@ pub(crate) fn calendar_panel(pick: DatePick, close: Rc<dyn Fn()>) -> AnyView {
                 .background(theme::bg_panel())
                 .border(CALENDAR_BORDER as f32)
                 .border_color(theme::border())
-                .border_radius(theme::scaled(8.0))
+                // **A corner, so it stays literal.** Not every number beside a
+                // scaled one is arithmetic: `border_radius` here is a *shape*, the
+                // same 8 that `panel_style`'s 10 and the day cells' 4 are, and
+                // scaling it alone would leave the calendar the one panel in the
+                // app that changes silhouette with the interface scale. The radius
+                // that *does* scale is the one that is half of a scaled box — the
+                // colour swatches and the Settings toggles — which is a different
+                // thing wearing the same property name.
+                .border_radius(8.0)
         })
         .into_any()
 }
