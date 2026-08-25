@@ -543,6 +543,87 @@ pub(crate) fn button_focus_ring(s: floem::style::Style, radius: f64) -> floem::s
         .focus_visible(|s| s.outline(2.0).outline_color(theme::accent()))
 }
 
+/// The rule a row wears **while its own context menu is open** — 1px above and
+/// below in [`theme::row_menu_edge`]. Call it from the row's `.style()` with
+/// whatever "this row raised the open menu" means on that list.
+///
+/// A menu is a panel floating clear of the row it acts on, and once the pointer
+/// is on the menu nothing on screen says which row Duplicate or Delete is about.
+/// The schema tree answered that first; this lives here so the second list to
+/// need it wears the *same* mark rather than a lookalike that drifts.
+///
+/// **A border, not an `outline`.** Floem strokes a per-side border *inside* the
+/// view's own rect (`paint_border` puts the top line at y = 0.5 and the bottom at
+/// height − 0.5), so nothing bleeds onto the rows either side and no `z_index` is
+/// needed to keep their hover backgrounds off it; an `outline`, which floem
+/// inflates *outward*, would have needed exactly that.
+///
+/// **The caller owns the 2px, because only the caller knows where to take it
+/// from.** Taffy sizes the border box, so a row with a fixed `height` absorbs the
+/// rule into its content box and nothing moves (the schema tree's rows), while a
+/// row sized by its own padding grows by 2px and pushes the whole list down
+/// unless it gives that padding back for as long as it is marked (Manage
+/// Connections' rows). And in either case an **absolutely positioned** child
+/// anchored with `inset_top`/`inset_bottom` is displaced by the border, since
+/// taffy adds the container's border to such a child's inset — centre those
+/// (`align_self`) rather than anchoring them to an edge this rule can appear on.
+pub(crate) fn row_menu_mark(s: floem::style::Style, marked: bool) -> floem::style::Style {
+    if marked {
+        s.border_top(1.0)
+            .border_bottom(1.0)
+            .border_color(theme::row_menu_edge())
+    } else {
+        s
+    }
+}
+
+/// The vertical padding a row sized *by its padding* should use while it wears
+/// [`row_menu_mark`] — one pixel less per side, so the rule lands inside the
+/// height the row already had.
+///
+/// A row with a fixed `height` needs none of this: taffy sizes the border box, so
+/// the rule comes out of its content box and nothing moves. A row that is content
+/// plus padding has no such slack, and a border added to it grows the row and
+/// shoves every row below it down 2px for as long as the menu stands open —
+/// which is a list twitching under a right-click, the opposite of what a mark
+/// meant to steady it is for.
+///
+/// Its own function, and pinned by a test, because the two halves live apart: the
+/// border is added in a style helper and the pixel is given back at the call
+/// site, so nothing but the arithmetic stated here says they must agree.
+///
+/// The floor matters below 1px of base padding, where there is no pixel to give
+/// back: taffy resolves a length as written, and a negative padding would take
+/// height *off* the row rather than leaving it alone — the same shift this
+/// function exists to prevent, inverted. A row that tight grows by whatever it
+/// couldn't pay, which is the honest failure of the two.
+pub(crate) fn row_menu_mark_pad(base: f64, marked: bool) -> f64 {
+    if marked { (base - 1.0).max(0.0) } else { base }
+}
+
+/// **The mark goes away with the menu**, however the menu went: Escape, a click
+/// outside, an action taken from it, or a second right-click somewhere the list
+/// doesn't own. Derive it from the menu channel's own state rather than clearing
+/// at each of those sites — the last of them isn't the list's code at all.
+///
+/// The guard is not a micro-optimisation: `RwSignal::set` doesn't dedup, so an
+/// unguarded write re-notifies every row of a mark-less list on every close of
+/// any menu in the app.
+///
+/// Generic over both halves because the two lists that want it keep the menu in
+/// different channels (the schema tree's `context_menu`, Manage Connections'
+/// `popup_menu`) and identify a row differently (a `String` key, a `u64` id).
+pub(crate) fn clear_row_mark_on_close<T: 'static, K: 'static>(
+    menu: RwSignal<Option<T>>,
+    mark: RwSignal<Option<K>>,
+) {
+    create_effect(move |_| {
+        if menu.with(|m| m.is_none()) && mark.with_untracked(|k| k.is_some()) {
+            mark.set(None);
+        }
+    });
+}
+
 /// Where a **growing** block of Tab stops starts — a list of enum values, of
 /// domain checks, of trigger arguments, of function settings — one stop per row
 /// from here upwards.
@@ -4126,6 +4207,54 @@ mod menu_icon_tests {
         assert_eq!(menu_icon_color(false, false), theme::text_muted());
         assert_ne!(menu_icon_color(true, true), menu_icon_color(false, true));
         assert_ne!(menu_icon_color(false, true), menu_icon_color(false, false));
+    }
+}
+
+#[cfg(test)]
+mod row_menu_mark_tests {
+    use super::*;
+
+    /// The whole point of the compensation: a padding-sized row is exactly as
+    /// tall marked as unmarked, so right-clicking one row doesn't shift the rows
+    /// below it. Stated as the *outer box* — content + padding + border — because
+    /// that is what the list sees, and because checking only `pad - 1.0` would
+    /// pass for a border of any width.
+    #[test]
+    fn the_rule_costs_a_padding_sized_row_no_height() {
+        const BORDER: f64 = 1.0; // what `row_menu_mark` strokes per side
+        for base in [11.0_f64, 8.8, 16.5, 22.0] {
+            let plain = 2.0 * row_menu_mark_pad(base, false);
+            let marked = 2.0 * row_menu_mark_pad(base, true) + 2.0 * BORDER;
+            assert!(
+                (plain - marked).abs() < 1e-9,
+                "base {base}: marked box {marked} should match the plain {plain}"
+            );
+        }
+    }
+
+    /// An unmarked row is the untouched original — the helper must not quietly
+    /// retune the list's resting padding on its way past.
+    #[test]
+    fn an_unmarked_row_keeps_its_own_padding() {
+        for base in [0.0_f64, 11.0, 22.0] {
+            assert_eq!(row_menu_mark_pad(base, false), base);
+        }
+    }
+
+    /// The interface scale can take the base below the pixel the mark gives
+    /// back. Padding must not go negative: taffy passes a length through as
+    /// written (`util/resolve.rs`, `LengthPercentage::Length(l) => Some(l)` —
+    /// no clamp), so a negative padding would take height *off* the row instead
+    /// of leaving it alone, and the shift this guards against would come back
+    /// inverted.
+    #[test]
+    fn a_tiny_base_never_pays_more_than_it_has() {
+        for base in [0.0_f64, 0.5, 1.0] {
+            assert!(
+                row_menu_mark_pad(base, true) >= 0.0,
+                "base {base} produced a negative padding"
+            );
+        }
     }
 }
 
