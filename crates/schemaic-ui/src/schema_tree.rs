@@ -614,6 +614,13 @@ fn is_nav_selected(nav: Nav, key: &str) -> bool {
 /// inflates *outward*, would have needed exactly that. And since taffy sizes the
 /// **border box**, a row's `height(tree_row_h())` is unchanged: the rule costs 2px of
 /// content box on a vertically centred row, and no layout shift.
+///
+/// "No layout shift" holds for a row's *flex* children only. An **absolutely
+/// positioned** child anchored with `inset_top(0.0)` is offset from the border
+/// box *plus* this border, so it moves down 1px the moment the rule appears —
+/// which is how right-clicking a table used to nudge its [`size_badge`]. An
+/// absolute child of a row that can wear this rule must centre itself
+/// (`align_self`) rather than anchor to the edge the rule sits on.
 fn menu_mark(s: floem::style::Style, nav: Nav, key: &str) -> floem::style::Style {
     if nav.menu_row.with(|k| k.as_deref() == Some(key)) {
         s.border_top(1.0)
@@ -2026,10 +2033,20 @@ fn size_badge(
     // padding is the row's own 8px plus 10 more: sitting hard against the panel
     // edge read as too tight next to the tree's scrollbar, so the column is
     // pulled in by eye rather than to match a constant.
+    //
+    // Vertically **centred, not `inset_top(0.0)`**. Taffy offsets an absolute
+    // child from the row's border box *plus* the row's own border on that side
+    // (`flexbox.rs`, `perform_absolute_layout_on_absolute_children`: `start +
+    // constants.border.cross_start`), so the 1px rule `menu_mark` adds while a
+    // row's context menu is open — harmless to the row's flex-centred children —
+    // pushed the badge down by exactly that pixel, and right-clicking a table
+    // visibly nudged its size. `align_self: center` takes the other branch, which
+    // subtracts the border symmetrically (`+ content_box_inset.cross_start -
+    // content_box_inset.cross_end`) and so cancels a rule that is on both edges.
     .style(|s| {
         s.absolute()
             .inset_left(0.0)
-            .inset_top(0.0)
+            .align_self(Some(floem::taffy::style::AlignItems::Center))
             .width(tree_row_min_w())
             .height_full()
             .justify_end()
