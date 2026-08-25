@@ -1866,14 +1866,34 @@ pub(crate) fn modal_w(base: f64) -> f64 {
     )
 }
 
-/// `want`, but never larger than the window's own extent less `reserve` — and
-/// never smaller than `floor`, so a very small window yields a scrollable panel
-/// rather than a sliver (or, with the subtraction going negative, nothing at all).
+/// `want`, but never larger than the box a modal is centred in, less `reserve` —
+/// and never smaller than `floor`, so a very small window yields a scrollable
+/// panel rather than a sliver (or, with the subtraction going negative, nothing at
+/// all).
+///
+/// **The extent is the modal *layer*, not the window.** Since `07bda98` every
+/// modal hangs in a layer inset `theme::header_h()` from the top, and
+/// `header_h()` is `theme::scaled(40.0)` — exactly `modal_h`'s reserve. Measured
+/// against the window, the layer therefore spent the guard's whole budget before
+/// the panel was sized: on a roomy window the panel came out *exactly* as tall as
+/// its container, flush under the title bar and flush against the window's
+/// bottom, and on a short one the floor (clamped to the window) made it taller
+/// than the container, with nothing clipping it back — the footer, where Apply
+/// lives, off the bottom edge.
 ///
 /// Reads the axis its callers need: `modal_h`/`modal_body_h` pass the height and
 /// `modal_w` the width, and the caller picks by which of the pair it hands in.
+/// Only the height needs the inset: the layer is full-width.
 fn cap_to_window(want: f64, reserve: f64, floor: f64) -> f64 {
-    cap_to(want, window_size().get().1, reserve, floor)
+    cap_to(want, modal_layer_h(), reserve, floor)
+}
+
+/// How tall the modal layer is — the window less the title bar it starts under.
+///
+/// Zero when the window has not been measured yet, which [`cap_to`] reads as "not
+/// yet" and answers with the uncapped size, exactly as an unmeasured window did.
+fn modal_layer_h() -> f64 {
+    (window_size().get().1 - theme::header_h()).max(0.0)
 }
 
 /// [`cap_to_window`] against the window's width.
@@ -1886,10 +1906,11 @@ fn cap_to(want: f64, extent: f64, reserve: f64, floor: f64) -> f64 {
         return want;
     }
     // The floor is there so the subtraction can't hand back a sliver (or, on a
-    // window smaller than the reserve, a negative). It is itself clamped to the
-    // window: a floor *wider than the screen* would clip the panel through the
-    // very guard meant to keep it usable — which at 160% is not hypothetical, its
-    // scaled value passes 500px.
+    // window smaller than the reserve, a negative). It is itself clamped to
+    // `extent` — which for a height is the modal layer, not the window, since a
+    // floor larger than the box the panel is centred in overflows it through the
+    // very guard meant to keep it usable. At 160% that is not hypothetical: the
+    // scaled floor passes 500px.
     want.min((extent - reserve).max(floor.min(extent)))
 }
 
@@ -4942,6 +4963,49 @@ mod modal_height_tests {
         out
     }
 
+    /// **The cap has to be measured against the box the modal is centred in**,
+    /// which since `07bda98` is not the window: every modal lives in a layer
+    /// inset `theme::header_h()` from the top. `modal_h`'s reserve was
+    /// `theme::scaled(40.0)` and `header_h()` *is* `scaled(40.0)`, so the layer
+    /// spent the guard's entire budget before the panel was measured.
+    ///
+    /// Two consequences, and the deterministic one is the everyday case: on a
+    /// roomy window the panel came out **exactly** as tall as its container —
+    /// flush under the title bar and flush against the window's bottom, where it
+    /// used to have scrim above and below. On a short window the floor, which is
+    /// clamped to the *window* rather than to the container, made the panel taller
+    /// than the box it sits in, and neither the layer nor the backdrop clips, so
+    /// the footer — where Apply lives — went off the bottom edge.
+    #[test]
+    fn a_modal_fits_the_layer_it_is_centred_in_not_the_window() {
+        at(UiScale::Huge, (1000.0, 1000.0), || {
+            let h = modal_h(620.0);
+            assert!(
+                h + theme::header_h() < 1000.0,
+                "{h} plus the title bar fills the window edge to edge"
+            );
+        });
+        // And the short-window arm, where the floor used to win against the
+        // window and overflow the container.
+        at(UiScale::Huge, (400.0, 400.0), || {
+            let h = modal_h(620.0);
+            assert!(
+                h <= 400.0 - theme::header_h(),
+                "{h} is taller than the {} the layer offers",
+                400.0 - theme::header_h()
+            );
+        });
+        // The scrolling-body variant sits in the same layer and is capped the same
+        // way.
+        at(UiScale::Huge, (1000.0, 1000.0), || {
+            let h = modal_body_h(560.0);
+            assert!(
+                h + theme::header_h() < 1000.0,
+                "{h} plus the title bar fills the window"
+            );
+        });
+    }
+
     /// At Normal, on a window with room, a modal is exactly the height it always
     /// was — the cap must not quietly reshape every existing install.
     #[test]
@@ -4964,30 +5028,40 @@ mod modal_height_tests {
         });
     }
 
-    /// And the cap is what makes growing safe: a modal is centred in a
-    /// full-window backdrop, so one taller than the window loses its footer —
-    /// where Apply lives — off the bottom.
+    /// And the cap is what makes growing safe: a modal is centred in the modal
+    /// layer — the window **less the title bar it starts under** — so one taller
+    /// than that loses its footer, where Apply lives, off the bottom.
+    ///
+    /// The numbers here are the layer's, not the window's, and that is the
+    /// correction: this test used to assert `900 - 64`, the exact height of the
+    /// container, i.e. a panel with zero margin, while its own doc described a
+    /// "full-window backdrop" that `07bda98` had already replaced.
     #[test]
-    fn a_modal_never_outgrows_the_window() {
+    fn a_modal_never_outgrows_the_layer() {
         at(UiScale::Huge, (1920.0, 900.0), || {
             let h = modal_h(620.0);
-            assert!(h < 900.0, "{h} does not fit a 900px window");
-            assert_eq!(h, 900.0 - 64.0, "window less the scaled reserve");
+            let layer = 900.0 - 64.0;
+            assert!(h < layer, "{h} does not fit a {layer}px layer");
+            assert_eq!(h, layer - 64.0, "the layer less the scaled reserve");
         });
         // A scrolling body reserves more, for the title and footer around it.
         at(UiScale::Huge, (1920.0, 900.0), || {
-            assert_eq!(modal_body_h(560.0), 900.0 - 256.0);
+            assert_eq!(modal_body_h(560.0), 900.0 - 64.0 - 256.0);
         });
     }
 
     /// A window too small for even the reserve yields a scrollable panel, not a
     /// zero-height one (nor, with the subtraction the other way, something
-    /// enormous).
+    /// enormous). The floor is clamped to the **layer**, so the panel still fits
+    /// the box it is centred in — it used to be clamped to the window, and on this
+    /// very case that made it 40px taller than its container.
     #[test]
     fn a_tiny_window_still_leaves_a_usable_panel() {
         at(UiScale::Normal, (400.0, 200.0), || {
-            assert_eq!(modal_h(620.0), 200.0, "the floor, clamped to the window");
-            assert_eq!(modal_body_h(560.0), 160.0);
+            let layer = 200.0 - 40.0;
+            assert_eq!(modal_h(620.0), layer, "the floor, clamped to the layer");
+            assert!(modal_h(620.0) <= layer);
+            assert_eq!(modal_body_h(560.0), layer);
         });
     }
 
@@ -5028,7 +5102,10 @@ mod modal_height_tests {
         });
         at(UiScale::Huge, (4000.0, 600.0), || {
             assert_eq!(modal_w(900.0), 1440.0);
-            assert_eq!(modal_h(620.0), 600.0 - 64.0);
+            // The layer is the window less the title bar (600 - 64), and the
+            // reserve comes off that — so two 64s, one of them the inset the
+            // modal layer already applied.
+            assert_eq!(modal_h(620.0), 600.0 - 64.0 - 64.0);
         });
     }
 
