@@ -140,6 +140,7 @@ impl WindowChrome {
             } else {
                 drag_window();
             }
+            give_the_keyboard_back();
         })
     }
 
@@ -168,6 +169,7 @@ impl WindowChrome {
             icons::icon(icons::WINDOW_MINIMIZE, GLYPH).into_any(),
             theme::caption_hover,
             theme::text,
+            true,
             minimize_window,
         );
 
@@ -189,6 +191,7 @@ impl WindowChrome {
             .into_any(),
             theme::caption_hover,
             theme::text,
+            true,
             move || this.toggle_maximized(),
         );
 
@@ -202,6 +205,7 @@ impl WindowChrome {
             icons::icon(icons::WINDOW_CLOSE, GLYPH).into_any(),
             theme::caption_close_hover,
             theme::caption_close_glyph,
+            false,
             move || close_window(window),
         );
 
@@ -374,14 +378,25 @@ impl WindowChrome {
 /// The hover colours arrive as `fn() -> Color` and are called *inside* the style
 /// closure, so a theme switch repaints them (a captured `Color` would freeze the
 /// button at the theme it was built under).
+/// `keeps_the_window` is false for **Close** alone: it is the one press after
+/// which there is no window to hand a keyboard back to, and requesting focus into
+/// a torn-down tree is a question with no useful answer. Minimize and Maximize
+/// both leave the window standing, and both cleared its focus on the way — see
+/// [`give_the_keyboard_back`].
 fn control_button(
     glyph: AnyView,
     hover_bg: fn() -> Color,
     hover_fg: fn() -> Color,
+    keeps_the_window: bool,
     on_press: impl Fn() + 'static,
 ) -> impl IntoView {
     container(glyph)
-        .on_click_stop(move |_| on_press())
+        .on_click_stop(move |_| {
+            on_press();
+            if keeps_the_window {
+                give_the_keyboard_back();
+            }
+        })
         .style(move |s| {
             s.width(control_w())
                 .height_full()
@@ -391,6 +406,38 @@ fn control_button(
                 .color(theme::text_muted())
                 .hover(|s| s.background(hover_bg()).color(hover_fg()))
         })
+}
+
+/// Give the keyboard back to whoever should have it, after a press on the window
+/// chrome.
+///
+/// **Floem clears focus at the top of every `PointerDown` dispatch** —
+/// `window_handle.rs`'s `if is_pointer_down { … app_state.focus.take() }` — and
+/// only a `keyboard_navigable` view re-takes it during the walk that follows. The
+/// title-bar band and the caption buttons are neither navigable nor inside
+/// anything that is, so a press on them left `focus` at `None`.
+///
+/// Inside the app that is invisible, because the window root's own listeners still
+/// see the key. Over a **modal** it is not: the modal's `focus_root` requests
+/// focus once, on build (floem's `request_focus` is an effect over a closure with
+/// no tracked reads), so nothing re-requests it and the panel went keyboard-dead —
+/// its ✕ and Cancel still worked, Tab recovered through the root's ring backstop,
+/// and **Escape had no equivalent backstop**, so the one keyboard route to
+/// dismissing the modal was gone until the user clicked the panel.
+///
+/// This is `07bda98`'s half of the class: before it, the backdrop was
+/// `absolute().inset(0)` over the whole window and the band could not be pressed
+/// at all.
+///
+/// `hand_keyboard_back(None)` is the existing answer — it resolves the innermost
+/// mounted focus root and falls back to the workspace's keyboard home outside a
+/// modal, so this does not need to know which it is. **Deferred**, because the
+/// clear happens *before* the listeners run: requesting focus inside the same
+/// dispatch would be undone by it.
+fn give_the_keyboard_back() {
+    floem::action::exec_after(std::time::Duration::ZERO, |_| {
+        crate::widgets::hand_keyboard_back(None);
+    });
 }
 
 /// Which part of the frame a grab zone covers.
