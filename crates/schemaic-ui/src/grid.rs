@@ -271,6 +271,16 @@ struct GridState {
     rs: RwSignal<Arc<ResultSet>>,
     order: RwSignal<Arc<Vec<usize>>>,
     widths: RwSignal<Vec<f64>>,
+    /// The `grid_char_w()` the stored [`GridState::widths`] were measured against.
+    ///
+    /// They are pixels, and pixels do not follow the interface scale on their own
+    /// — floem calls a `dyn_container`'s builder outside the effect that wraps its
+    /// key, so `init_widths`' read subscribes nothing and the grid has no scale
+    /// term in its key. This is what lets the change be *carried* instead:
+    /// `rescale_widths` needs the ratio between the width a character used to
+    /// take and the width it takes now, and only the widths themselves know the
+    /// first half of that.
+    widths_at: RwSignal<f64>,
     active: RwSignal<Option<(usize, usize)>>,
     anchor: RwSignal<Option<(usize, usize)>>,
     /// The frozen column: its *absolute* index, pinned to the left of the grid
@@ -516,6 +526,7 @@ impl GridState {
             rs: RwSignal::new(rs),
             order: RwSignal::new(Arc::new(Vec::new())),
             widths: RwSignal::new(widths),
+            widths_at: RwSignal::new(grid_char_w()),
             active: RwSignal::new(None),
             anchor: RwSignal::new(None),
             frozen: RwSignal::new(None),
@@ -1317,6 +1328,47 @@ pub(crate) fn selection_kind(
 /// Exact rendered pixel width of `text` in the grid's cell font (the app default
 /// sans — IBM Plex Sans — at `font_body()`), via a throwaway `TextLayout`. Used to
 /// Estimate a column's initial width from its header + a sample of cell values.
+/// The room a grid cell spends on itself, beyond the value it shows.
+///
+/// `grid_pad_h()` on each side plus the right-hand divider — which is a *border*,
+/// so it comes out of the content box as well. Both width estimators reserved a
+/// flat `22.0` for it, which is a pixel generous at Normal and short by 6px at
+/// 130% and 11px at 160%: **Auto-fit clipped the value it exists to fit**.
+/// `numeric_edit_pad_left` composes the same three terms correctly, and is the
+/// reason the shortfall is a composition bug rather than a wrong constant.
+fn cell_chrome_w() -> f64 {
+    2.0 * grid_pad_h() + GRID_CELL_DIVIDER
+}
+
+/// Carry stored column widths across an interface-scale change.
+///
+/// `gs.widths` is measured in pixels from `grid_char_w()` and then *stored*, and
+/// the grid's rebuild key has no scale term — floem wraps only a `dyn_container`'s
+/// key closure in an effect and calls the builder outside it, so the `grid_char_w()`
+/// read in `init_widths` subscribes nothing. Raising the scale with a result open
+/// therefore grew every cell's font, padding and row height while the columns
+/// stayed cut for the old one: text at 21px in columns measured for 13px type,
+/// ellipsized across the board until the statement was re-run or every divider
+/// double-clicked. Lowering it left every column ~1.6x wider than its content.
+///
+/// **Every column is carried, including one the user dragged.** A width chosen to
+/// fit that column's content is a width that should still fit it when the content
+/// is 1.6x bigger, so there is no case for exempting it — and no `dragged` set to
+/// maintain. `min_w` is applied *after*, because `min_col_w()` scales too: a
+/// column dragged to 48px at Normal is under the 77px floor at Huge.
+///
+/// A `ratio` that is not a positive finite number leaves the widths alone. The old
+/// measurement is a better answer than a column collapsed to the floor.
+fn rescale_widths(widths: &[f64], ratio: f64, min_w: f64) -> Vec<f64> {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return widths.to_vec();
+    }
+    if ratio == 1.0 {
+        return widths.to_vec();
+    }
+    widths.iter().map(|w| (w * ratio).max(min_w)).collect()
+}
+
 fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
     let sample = rs.row_count().min(200);
     rs.columns
@@ -1337,7 +1389,8 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
             } else {
                 0.0
             };
-            (chars as f64 * grid_char_w() + 22.0 + icon).clamp(min_col_w(), max_col_w_init())
+            (chars as f64 * grid_char_w() + cell_chrome_w() + icon)
+                .clamp(min_col_w(), max_col_w_init())
         })
         .collect()
 }
@@ -1360,7 +1413,7 @@ fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
         }
     }
     let icon = if has_key { header_key_icon_w() } else { 0.0 };
-    (chars as f64 * grid_char_w() + 22.0 + icon).clamp(min_col_w(), 900.0)
+    (chars as f64 * grid_char_w() + cell_chrome_w() + icon).clamp(min_col_w(), 900.0)
 }
 
 fn cell_in(bounds: Option<(usize, usize, usize, usize)>, i: usize, ci: usize) -> bool {
@@ -3285,6 +3338,30 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 f.request_focus();
             }
         });
+    });
+
+    // **Carry the column widths across an interface-scale change.** Everything
+    // else in the grid follows the scale by itself, because its style closures
+    // call the scaled fns and reading one there subscribes the closure. Stored
+    // pixels cannot: `gs.widths` is seeded once and the rebuild key below has no
+    // scale term, so raising the scale with a result open used to grow every
+    // cell's text inside columns still cut for the old size.
+    //
+    // An effect rather than a scale term in the rebuild key, deliberately: keying
+    // the grid on the scale would discard the whole child scope and take the
+    // selection, the scroll position and every staged edit with it. This
+    // recomputes one signal. `grid_char_w()` is read *inside* the effect, so the
+    // effect is what subscribes.
+    create_effect(move |_| {
+        let now = grid_char_w();
+        let before = gs.widths_at.get_untracked();
+        if now == before {
+            return;
+        }
+        gs.widths_at.set(now);
+        let floor = min_col_w();
+        let ratio = now / before;
+        gs.widths.update(|w| *w = rescale_widths(w, ratio, floor));
     });
 
     // Horizontal offset shared between the header and the body so columns stay
@@ -8587,6 +8664,103 @@ mod tests {
             name: name.to_string(),
             type_name: ty.to_string(),
             origin: None,
+        }
+    }
+
+    /// Run `f` at `scale`, then put the scale back — the registry is a
+    /// `thread_local` and `--test-threads=1` shares one across tests, where a
+    /// leaked scale is a *silent* failure (every number still self-consistent,
+    /// just 1.6x what the next test expects). Same shape as `consts::scale_tests`.
+    fn at_scale<R>(scale: crate::theme::UiScale, f: impl FnOnce() -> R) -> R {
+        crate::theme::set_ui_scale(scale);
+        let out = f();
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        out
+    }
+
+    /// **A column width estimate must reserve what the cell actually spends on
+    /// chrome.** A cell pays `grid_pad_h()` on each side and its right divider is
+    /// a border, so it comes out of the content box too — 21px at Normal, and
+    /// scaling with the interface. Both estimators reserved a flat `22.0`, which
+    /// is generous by 1px at Normal and short by 6px at 130% and 11px at 160%, so
+    /// **Auto-fit clipped the value it exists to fit**. `numeric_edit_pad_left`
+    /// composes the same three terms correctly, 7,000 lines away.
+    ///
+    /// The assertion is the relation, not the number: whatever the estimate is, it
+    /// must leave room for `chars` characters *plus* the chrome. Pinning `21.0`
+    /// would pass just as well with both sides wrong.
+    #[test]
+    fn a_width_estimate_reserves_the_chrome_the_cell_really_spends() {
+        use crate::theme::UiScale;
+        let rs = ResultSet::from_rows(
+            vec![col("id", "INT")],
+            vec![vec![Value::Str("1234567890".into())]],
+        );
+        let key_map = HashMap::new();
+        for scale in [
+            UiScale::Small,
+            UiScale::Normal,
+            UiScale::Large,
+            UiScale::Huge,
+        ] {
+            at_scale(scale, || {
+                let chrome = 2.0 * grid_pad_h() + GRID_CELL_DIVIDER;
+                // The widest thing in the column is the 10-character value; the
+                // header is `id` + 3 for the sort arrow, and the type line `INT`.
+                let text = 10.0 * grid_char_w();
+                let want = text + chrome;
+
+                let est = init_widths(&rs, &key_map)[0];
+                assert!(
+                    est >= want || est >= max_col_w_init(),
+                    "{scale:?}: init_widths reserved {est}, needs {want} \
+                     ({text} of text + {chrome} of chrome)"
+                );
+                let fit = autofit_width(&rs, 0, false);
+                assert!(
+                    fit >= want,
+                    "{scale:?}: autofit reserved {fit}, needs {want} \
+                     ({text} of text + {chrome} of chrome)"
+                );
+            });
+        }
+    }
+
+    /// **A stored width does not follow the scale, so it has to be carried.**
+    ///
+    /// `gs.widths` is seeded once from `init_widths` and the grid's rebuild key has
+    /// no scale term, so raising the scale with a result open grew every cell's
+    /// text inside columns still measured for the old one — text at 21px in
+    /// columns cut for 13px type, ellipsized across the board until the statement
+    /// was re-run or every divider double-clicked. Lowering it left every column
+    /// ~1.6x wider than its content.
+    ///
+    /// Every column is carried, including one the user dragged: a width they chose
+    /// to fit that column's *content* is a width that should still fit it when the
+    /// content is 1.6x bigger. The new floor is applied after, because
+    /// `min_col_w()` scales too — a column dragged to 48px at Normal is below the
+    /// 77px floor at Huge.
+    #[test]
+    fn rescaling_widths_carries_every_column_and_re_applies_the_floor() {
+        // Doubling: everything doubles.
+        assert_eq!(
+            rescale_widths(&[100.0, 250.0], 2.0, 10.0),
+            vec![200.0, 500.0]
+        );
+        // Halving, with the floor biting on the narrow one only.
+        assert_eq!(rescale_widths(&[100.0, 40.0], 0.5, 60.0), vec![60.0, 60.0]);
+        // The identity is exact — a no-op ratio must not drift a single column,
+        // because the effect that calls this runs on every scale *write*, not only
+        // on a change.
+        let widths = vec![63.0, 194.5, 900.0];
+        assert_eq!(rescale_widths(&widths, 1.0, 10.0), widths);
+        // Nothing to carry.
+        assert!(rescale_widths(&[], 2.0, 10.0).is_empty());
+        // A ratio that isn't a ratio leaves the widths alone rather than
+        // collapsing them to the floor: the old measurement is a better answer
+        // than zero.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(rescale_widths(&widths, bad, 10.0), widths, "{bad}");
         }
     }
 
