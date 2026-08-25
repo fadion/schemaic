@@ -1793,10 +1793,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         );
                         QueryState::Loaded(Arc::new(rs))
                     }
+                    // A statement that never left the client is neither a
+                    // timed-out query nor a killed one, and saying either put a
+                    // cause on screen that the run cannot support. This arm goes
+                    // first for that reason.
+                    Err(DbError::Cancelled) if stmt == Some(StmtOutcome::NotSent) => {
+                        tracing::info!("run cancelled before the statement was sent");
+                        QueryState::Failed(tx::not_sent_message(timed_out))
+                    }
                     // A timeout and the Cancel button arrive as the same error,
                     // so the watchdog's flag is the only thing that can tell the
                     // user which of the two stopped their query.
-                    Err(DbError::Cancelled) if timed_out => {
+                    Err(DbError::Cancelled) if tx::timeout_reached(stmt, timed_out) => {
                         QueryState::Failed(note(timeout_message(timeout_secs)))
                     }
                     Err(DbError::Cancelled) => {
@@ -2185,7 +2193,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // spent transaction would otherwise show.
                             states[i] = match out.result {
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
-                                Err(DbError::Cancelled) if timed_out => {
+                                Err(DbError::Cancelled) if out.stmt == StmtOutcome::NotSent => {
+                                    stopped = true;
+                                    QueryState::Failed(tx::not_sent_message(timed_out))
+                                }
+                                Err(DbError::Cancelled)
+                                    if tx::timeout_reached(Some(out.stmt), timed_out) =>
+                                {
                                     stopped = true;
                                     QueryState::Failed(tx::failed_message(
                                         &timeout_message(timeout_secs),
