@@ -20,6 +20,7 @@ use schemaic_core::connection::SshAuth;
 
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
+use crate::widgets;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button_icon,
     action_face, action_gap, autohide, control_button, focus_root_with_ring, form_hint,
@@ -512,6 +513,18 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     // reset never fires on a disposed signal.
     let save_flash = RwSignal::new(false);
     let test_flash = RwSignal::new(false);
+    // Which row raised the open menu, painted as the rule the schema tree's rows
+    // already wear (`widgets::row_menu_mark`). The list's menu names no
+    // connection — Duplicate and Delete carry the id themselves, and the *click*
+    // deliberately selects nothing (the entries select when they run; see the
+    // row's handler) — so without a mark nothing on screen answered "which one is
+    // this about" while the pointer was on the menu.
+    //
+    // In the stable scope with the two flashes above, for the same reason: the
+    // clearing effect below outlives the open/close `dyn_container`, and a signal
+    // built inside it would be disposed out from under that effect.
+    let menu_row: RwSignal<Option<u64>> = RwSignal::new(None);
+    widgets::clear_row_mark_on_close(popup_menu, menu_row);
     // Test's flash is driven by the *result arriving*, not by the click — the
     // click only starts the round trip, and how long that takes is the server's
     // business. `test_gen` is what keeps an earlier result's timer from cutting a
@@ -630,6 +643,11 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                         .on_secondary_click_stop(move |_| {
                             let (dup, del, sel) = (dup.clone(), del.clone(), menu_select.clone());
                             let sel_del = sel.clone();
+                            // The mark the selection deliberately isn't: it says
+                            // which row the menu acts on without loading the
+                            // draft, which is the whole reason selecting waits
+                            // for the entry to run.
+                            menu_row.set(Some(id));
                             popup_anchor.set(None);
                             popup_width.set(conn_menu_w());
                             popup_menu.set(Some(vec![
@@ -653,10 +671,23 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                         // `conn_list_sel_bg`.
                         .style(move |s| {
                             let selected = draft.id.get() == Some(id);
-                            let s = s
-                                .width_full()
-                                .padding_horiz(theme::scaled(12.0))
-                                .padding_vert(theme::scaled(11.0));
+                            // **The rule's 2px comes out of the padding.** These
+                            // rows have no fixed height — they are content plus
+                            // `padding_vert` — so unlike the schema tree's, which
+                            // absorb the border into a fixed box, a border added
+                            // here would grow the row and shove every row below it
+                            // down 2px for as long as the menu stood open.
+                            // `row_menu_mark_pad` gives the pixel back per side.
+                            let marked = menu_row.get() == Some(id);
+                            let s = widgets::row_menu_mark(
+                                s.width_full()
+                                    .padding_horiz(theme::scaled(12.0))
+                                    .padding_vert(widgets::row_menu_mark_pad(
+                                        theme::scaled(11.0),
+                                        marked,
+                                    )),
+                                marked,
+                            );
                             if selected {
                                 s.color(theme::conn_list_sel_text())
                                     .background(theme::conn_list_sel_bg())

@@ -29,8 +29,9 @@ use schemaic_core::schema::{
 use schemaic_core::text::plural;
 
 use crate::consts::*;
+use crate::widgets;
 use crate::widgets::{
-    autohide, debounced, highlight_text, loading_dots, section_title, shift_hscroll,
+    autohide, debounced, highlight_text, loading_dots, row_menu_mark, section_title, shift_hscroll,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, favorite_star, icons, theme,
@@ -603,32 +604,23 @@ fn is_nav_selected(nav: Nav, key: &str) -> bool {
     nav.focused.get() && nav.selected.with(|s| s.as_deref() == Some(key))
 }
 
-/// The rule a row wears **while its context menu is open** — 1px above and below,
-/// in [`theme::row_menu_edge`]. The visible half of [`Nav::menu_row`]; called from
-/// a row's `.style()`, like [`is_nav_selected`].
+/// The tree's half of [`widgets::row_menu_mark`] — the rule a row wears **while
+/// its context menu is open**, keyed by [`Nav::menu_row`]. Called from a row's
+/// `.style()`, like [`is_nav_selected`]; the stroke itself, and the argument for
+/// a border over an `outline`, live in the shared helper.
 ///
-/// Borders and not an `outline`: floem strokes a per-side border *inside* the
-/// view's own rect (`paint_border` puts the top line at y = 0.5 and the bottom at
-/// height − 0.5), so nothing bleeds into the rows on either side and no `z_index`
-/// is needed to keep their hover backgrounds off it — an outline, which floem
-/// inflates *outward*, would have needed exactly that. And since taffy sizes the
-/// **border box**, a row's `height(tree_row_h())` is unchanged: the rule costs 2px of
-/// content box on a vertically centred row, and no layout shift.
+/// Nothing here gives the rule's 2px back, and nothing needs to: taffy sizes the
+/// **border box**, so a row's `height(tree_row_h())` is unchanged and the rule
+/// costs content box on a vertically centred row.
 ///
-/// "No layout shift" holds for a row's *flex* children only. An **absolutely
-/// positioned** child anchored with `inset_top(0.0)` is offset from the border
-/// box *plus* this border, so it moves down 1px the moment the rule appears —
-/// which is how right-clicking a table used to nudge its [`size_badge`]. An
-/// absolute child of a row that can wear this rule must centre itself
-/// (`align_self`) rather than anchor to the edge the rule sits on.
+/// That holds for a row's *flex* children only. An **absolutely positioned**
+/// child anchored with `inset_top(0.0)` is offset from the border box *plus*
+/// this border, so it moves down 1px the moment the rule appears — which is how
+/// right-clicking a table used to nudge its [`size_badge`]. An absolute child of
+/// a row that can wear this rule must centre itself (`align_self`) rather than
+/// anchor to the edge the rule sits on.
 fn menu_mark(s: floem::style::Style, nav: Nav, key: &str) -> floem::style::Style {
-    if nav.menu_row.with(|k| k.as_deref() == Some(key)) {
-        s.border_top(1.0)
-            .border_bottom(1.0)
-            .border_color(theme::row_menu_edge())
-    } else {
-        s
-    }
+    row_menu_mark(s, nav.menu_row.with(|k| k.as_deref() == Some(key)))
 }
 
 /// Wrap a row's [`CtxOpener`] so that raising the menu also **marks the row it
@@ -752,17 +744,9 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         cursor_menu: RwSignal::new(None),
         menu_row: RwSignal::new(None),
     };
-    // **The mark goes away with the menu**, however it went: Escape, a click
-    // outside, an action taken from it, or a second right-click somewhere the tree
-    // doesn't own. Derived from the menu's own state rather than cleared at each of
-    // those sites, because the last of them isn't the tree's code at all. The write
-    // is guarded so a menu-less tree doesn't re-notify every row on every close
-    // (`RwSignal::set` doesn't dedup).
-    create_effect(move |_| {
-        if context_menu.with(|m| m.is_none()) && nav.menu_row.with_untracked(|k| k.is_some()) {
-            nav.menu_row.set(None);
-        }
-    });
+    // The mark goes away with the menu, however it went — see
+    // `widgets::clear_row_mark_on_close`, which Manage Connections' list shares.
+    widgets::clear_row_mark_on_close(context_menu, nav.menu_row);
 
     let nav_tree_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
 

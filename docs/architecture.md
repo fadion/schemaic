@@ -2409,7 +2409,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     available at all — the Activity toggle on a SQLite connection, dimmed and inert rather than
     opening an explanation), `measure_text_px`, `jump_to_bottom_button`. Also `MenuId`/`MenuFlags` —
     the single list of the app's mutually-exclusive dropdowns, which every trigger closes the others
-    through (*Popup menus*).
+    through (*Popup menus*), and `row_menu_mark`/`row_menu_mark_pad`/`clear_row_mark_on_close` — the
+    rule a row wears while its own context menu is open, which lives here rather than in either list
+    because the schema tree and Manage Connections must wear the *same* mark and neither owns the
+    other (*Popup menus* again, for the 2px the caller has to give back).
     Also `focus_root` — the **one** way an overlay claims the keyboard (see the Floem gotcha on
     directed key dispatch): it takes focus on build *and* registers the view so Escape in a
     text field inside it hands focus back rather than dead-ending. Never spell out
@@ -2522,6 +2525,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     That is also what stopped opening the form from rewriting a `MariaDB` label to `MySQL` — the
     write used to be unconditional, and the picker has one name per engine where `db_type` has
     several.
+    A right-click in the list on the left **selects on the action taken, not on the click**: its
+    menu's Duplicate and Delete carry the connection id themselves, and selecting up front meant
+    merely *opening* the menu ran `draft.load` over every field the user had typed, with no undo and
+    no copy in the keyring. What answers "which connection is this menu
+    about" instead is the shared open-menu rule (`widgets::row_menu_mark`, *Popup menus*), keyed off
+    a `menu_row: RwSignal<Option<u64>>` created in the modal's **stable scope** beside `save_flash`
+    and `test_flash` and for the same reason — the clearing effect outlives the open/close
+    `dyn_container`, and a signal built inside it would be disposed out from under that effect.
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `activity_panel.rs` — the **Server Activity** right-column panel (`RightPanel::Activity`, the
     footer's pulse-line toggle): the sessions on the active *connection's* server, a counts line, a
@@ -5622,20 +5633,45 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   menu anchored to the box hugged the window edge. The indent that makes the tree a tree is the row's
   `padding_left`. Both geometry signals are read *inside* the cursor guard, so only the cursor row
   subscribes and a scroll that moves it refreshes the point.
-- **An open context menu marks the row it acts on** — `Nav::menu_row`, painted by
-  `schema_tree::menu_mark` as a 1px rule above and below in `theme::row_menu_edge`. A menu is a panel
-  floating clear of its row, and once the pointer is on the menu nothing on screen said which
-  database, table or column the Drop was about. Not the nav cursor's highlight: a right-click
-  deliberately does **not** move the cursor (`resume_cursor` — a cursor that exists is the user's), so
-  this is a second, shorter-lived mark. Set by `marking_opener`, which wraps the row's `CtxOpener`
-  where it is *built* rather than at the click, so the `Shift+F10` route marks too; cleared by an
-  effect watching `context_menu` go to `None`, which covers the closes the tree's own code never sees.
+- **An open context menu marks the row it acts on** — a 1px rule above and below in
+  `theme::row_menu_edge`, painted by `widgets::row_menu_mark(s, marked)` from the row's own `.style()`.
+  A menu is a panel floating clear of its row, and once the pointer is on the menu nothing on screen
+  said which database, table or column the Drop was about. Two lists wear it. The **schema tree**
+  (`Nav::menu_row`, `String` keys, through the one-line `schema_tree::menu_mark`) answered that
+  first; **Manage Connections'** list (a local `menu_row: RwSignal<Option<u64>>`) needed it for the
+  same reason and a sharper one — its menu's Duplicate and Delete carry the connection id
+  themselves, and a right-click there deliberately does **not** select, because selecting runs
+  `draft.load` and overwrites whatever is typed in the form. The helper therefore takes a plain
+  `bool` rather than a row identity: that is what lets one definition serve two lists that identify a
+  row differently, rather than the second one growing a lookalike that drifts. Neither mark is the
+  selection or the nav cursor's highlight — a right-click moves neither (`resume_cursor` — a cursor
+  that exists is the user's) — so this is a second, shorter-lived mark. The tree sets it in
+  `marking_opener`, which wraps the row's `CtxOpener` where it is *built* rather than at the click,
+  so the `Shift+F10` route marks too; the connections list has no keyboard menu route at all, so its
+  `on_secondary_click_stop` is the only place that marks. Both clear through
+  `widgets::clear_row_mark_on_close(menu, mark)`, an effect watching the menu channel go to `None`,
+  which covers the closes a list's own code never sees — generic over both halves because the two
+  keep the menu in **different channels** (the tree's `context_menu`, the connections list's
+  `popup_menu`). Its guard, `mark.with_untracked(|k| k.is_some())` before the `set`, is not a
+  micro-optimisation: `RwSignal::set` does not dedup, so an unguarded write re-notifies every row of
+  a mark-less list on every close of any menu in the app.
   Two details are load-bearing. It is a **border, not an `outline`**: floem strokes a per-side border
   *inside* the view's rect (`paint_border`: top at y = 0.5, bottom at height − 0.5), so nothing bleeds
   onto the neighbouring rows and no `z_index` is needed to keep their hover backgrounds off it, while
   an `outline` — which floem inflates outward — would have needed one; and taffy sizes the **border
-  box**, so `height(TREE_ROW_H)` is unchanged and the rule costs 2px of content box, not a layout
-  shift. That second half holds for a row's **flex** children only, and the gap in it shipped a bug:
+  box**, so `height(tree_row_h())` is unchanged and the rule costs 2px of content box, not a layout
+  shift. That second half is why **the 2px is the caller's problem — only the caller knows where to
+  take it from**. A connections row has no height at all: it is content plus
+  `padding_vert(scaled(11.0))`, so a border grows it and shoves every list row below it down 2px for
+  as long as the menu stands open, which is a list twitching under a right-click.
+  `widgets::row_menu_mark_pad(base, marked)` returns one pixel less per side while marked, floored at
+  0 — below 1px of base padding there is no pixel to give back, and a negative padding would take
+  height *off* the row, the same shift inverted. The border is added in a style helper and the pixel
+  is given back at the call site, so nothing but arithmetic says the two agree: `row_menu_mark_tests`
+  pins them, and its load-bearing case is `the_rule_costs_a_padding_sized_row_no_height`, which
+  asserts the *outer* box — padding ×2 plus border ×2 — is identical marked and unmarked, and was
+  watched failing against the uncompensated version.
+  The border-box half also holds for a row's **flex** children only, and the gap in it shipped a bug:
   taffy offsets a start-anchored *absolutely positioned* child from the border box plus the
   container's border on that side, so the 1px top rule moved `size_badge` — the tree's one absolute
   child — down by exactly 1px on right-click, and back when the menu closed, while the chevron, icon
