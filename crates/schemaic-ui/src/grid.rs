@@ -1555,7 +1555,12 @@ fn copy_selection(gs: GridState) {
     let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
     let formats = gs.formats.get_untracked();
     let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
-    let _ = floem::Clipboard::set_contents(cells.tsv(rect));
+    // Columns in the order they are drawn, not the order they are indexed: a
+    // frozen column is pinned to the left of the grid while its cells keep their
+    // absolute index, so a selection that crosses it reads one way on screen and
+    // another in the range. The clipboard's consumer is outside this grid and has
+    // only the order to go on.
+    let _ = floem::Clipboard::set_contents(cells.tsv(rect, gs.frozen.get_untracked()));
 }
 
 /// Paste the clipboard over the selection, staged as ordinary green edits.
@@ -1594,7 +1599,12 @@ fn paste_selection(gs: GridState) {
     // the two things this feature is for.
     let rows = nrows + gs.new_rows.with_untracked(Vec::len);
     let model = gs.edit_model.get_untracked();
-    let plan = schemaic_core::edit::plan_paste(&block, rect, rows, rs.col_count(), |ci| {
+    // `frozen` is what "the column beside the anchor" means: the grid draws the
+    // frozen column first while every cell keeps its absolute index, so a block
+    // walked in index order lands in columns the user never pointed at — and the
+    // far-left one is the column they were protecting by freezing it.
+    let frozen = gs.frozen.get_untracked();
+    let plan = schemaic_core::edit::plan_paste(&block, rect, rows, rs.col_count(), frozen, |ci| {
         model.editable(ci)
     });
     if plan.cells.is_empty() && plan.dropped == 0 && plan.read_only == 0 {
@@ -1660,7 +1670,11 @@ fn attached_rows(
     let (dirty, new_rows) = (gs.dirty.get_untracked(), gs.new_rows.get_untracked());
     let formats = gs.formats.get_untracked();
     let cells = grid_cells(&rs, &order, &formats, &dirty, &new_rows);
-    cells.attached(rect, schemaic_core::prompt::ATTACH_ROW_CAP)
+    cells.attached(
+        rect,
+        schemaic_core::prompt::ATTACH_ROW_CAP,
+        gs.frozen.get_untracked(),
+    )
 }
 
 /// How much of **this result's** connection the assistant may see.

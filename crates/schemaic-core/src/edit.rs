@@ -558,14 +558,23 @@ impl GridCells<'_> {
 
     /// The block `(r0, c0, r1, c1)` as TSV, for the clipboard. Raw values — see
     /// [`GridCells::text`]. [`parse_tsv_block`] is its exact inverse.
-    pub fn tsv(&self, (r0, c0, r1, c1): (usize, usize, usize, usize)) -> String {
+    ///
+    /// Columns in the order they are **drawn** ([`visual_cols`]), not in index
+    /// order: whoever receives the block reads it left to right, and under a
+    /// freeze the two disagree.
+    pub fn tsv(
+        &self,
+        (r0, c0, r1, c1): (usize, usize, usize, usize),
+        frozen: Option<usize>,
+    ) -> String {
+        let cols = selected_cols((c0, c1), self.rs.col_count(), frozen);
         let mut out = String::new();
         for i in r0..=r1 {
             if i > r0 {
                 out.push('\n');
             }
-            for ci in c0..=c1 {
-                if ci > c0 {
+            for (n, &ci) in cols.iter().enumerate() {
+                if n > 0 {
                     out.push('\t');
                 }
                 out.push_str(&self.text(i, ci, false));
@@ -581,13 +590,20 @@ impl GridCells<'_> {
     /// ([`crate::prompt::ATTACH_ROW_CAP`]) is about the context window, not
     /// about consent, so going over it is *reported* rather than silently
     /// applied.
+    /// Columns in the order they are **drawn** ([`visual_cols`]), for the same
+    /// reason [`GridCells::tsv`] is: the model reads the block as a table, and a
+    /// table whose columns are in an order the user never saw is answered about
+    /// as though it were the one on screen.
     pub fn attached(
         &self,
         (r0, c0, r1, c1): (usize, usize, usize, usize),
         cap: usize,
+        frozen: Option<usize>,
     ) -> (Vec<String>, Vec<Vec<String>>, usize) {
-        let columns: Vec<String> = (c0..=c1)
-            .map(|ci| {
+        let cols = selected_cols((c0, c1), self.rs.col_count(), frozen);
+        let columns: Vec<String> = cols
+            .iter()
+            .map(|&ci| {
                 self.rs
                     .columns
                     .get(ci)
@@ -598,7 +614,7 @@ impl GridCells<'_> {
         let (send, total) = attach_span(r0, r1, cap);
         let rows: Vec<Vec<String>> = (r0..=r1)
             .take(send)
-            .map(|i| (c0..=c1).map(|ci| self.text(i, ci, true)).collect())
+            .map(|i| cols.iter().map(|&ci| self.text(i, ci, true)).collect())
             .collect();
         (columns, rows, total)
     }
@@ -615,6 +631,55 @@ impl GridCells<'_> {
 pub fn attach_span(r0: usize, r1: usize, cap: usize) -> (usize, usize) {
     let total = r1.saturating_sub(r0) + 1;
     (total.min(cap), total)
+}
+
+/// The result's columns in the order they are **drawn**: the frozen column
+/// first, then every other column in index order.
+///
+/// A frozen column is pinned to the left of the grid in its own always-visible
+/// pane while the data pane renders `(0..ncols).filter(|ci| Some(*ci) != frozen)`
+/// — and the cells in it keep their **absolute** index, deliberately, so
+/// selection, sort and resize stay consistent. The consequence is that with
+/// `frozen = Some(f)`, `f > 0`, visual order is `[f, 0, 1, …, f-1, f+1, …]` and
+/// index order is unchanged, so anything that walks a column *range* is walking
+/// it in an order the user is not looking at.
+///
+/// That is fine for a rectangle's *membership* (which columns are selected) and
+/// wrong for everything that is about adjacency or reading order:
+///
+/// - a paste extends past the anchor into the columns drawn beside it, not the
+///   ones indexed beside it — otherwise a block pasted onto `email` writes into
+///   the frozen column at the far left, which the user never pointed at;
+/// - a clipboard or attachment block is read left to right by whoever receives
+///   it, so its columns have to be in the order they were on screen.
+///
+/// One list, because the two have to agree: the grid's own
+/// `scroll_active_into_view` already sums widths with the same filter, and a
+/// second spelling of the order is a second chance to disagree with it.
+///
+/// A `frozen` index at or past `ncols` is ignored — it cannot be drawn, so it
+/// does not move anything.
+pub fn visual_cols(ncols: usize, frozen: Option<usize>) -> Vec<usize> {
+    match frozen.filter(|f| *f < ncols) {
+        Some(f) => std::iter::once(f)
+            .chain((0..ncols).filter(move |c| *c != f))
+            .collect(),
+        None => (0..ncols).collect(),
+    }
+}
+
+/// The columns a selection rectangle covers, in the order they are drawn.
+///
+/// Membership is the absolute range `c0..=c1` — that is what the grid paints as
+/// highlighted, and which columns are selected is settled; only their order is
+/// in question here. `ncols` is widened to include `c1` so a rectangle reaching
+/// past the result's last column still yields the same positions it always did
+/// (the cells there read as empty rather than vanishing).
+fn selected_cols((c0, c1): (usize, usize), ncols: usize, frozen: Option<usize>) -> Vec<usize> {
+    visual_cols(ncols.max(c1 + 1), frozen)
+        .into_iter()
+        .filter(|ci| (c0..=c1).contains(ci))
+        .collect()
 }
 
 /// A clipboard block, parsed for pasting into the grid: rows of cell text.
@@ -705,11 +770,26 @@ pub struct PastePlan {
 /// answers per column; a cell over a read-only column is skipped **in place**,
 /// never shifted onto the next column, which would write the wrong data into a
 /// column that happens to accept it.
+///
+/// **`frozen` is what "extends" means.** A block extends into the columns drawn
+/// beside the anchor, which under a freeze are not the ones indexed beside it
+/// ([`visual_cols`]): with `ssn` frozen out of `(id, name, email, ssn, notes)`
+/// the grid draws `[ssn][id][name][email][notes]`, so a two-wide block dropped
+/// on `email` fills `email` and `notes`. Walking the index range instead put the
+/// second value into `ssn` — a column at the far *left* of the screen that the
+/// user never pointed at, and one `UPDATE … SET ssn = 'hello'` away from
+/// destroying it. The row half of the same walk has always converted display →
+/// data through `order`; this is the column half of that conversion.
+///
+/// The **single-value** case is the exception, and not one: it fills the
+/// selection, so its columns are the selected ones — the cells already painted
+/// as highlighted — and no translation applies.
 pub fn plan_paste(
     block: &[Vec<String>],
     (r0, c0, r1, c1): (usize, usize, usize, usize),
     rows: usize,
     cols: usize,
+    frozen: Option<usize>,
     editable: impl Fn(usize) -> bool,
 ) -> PastePlan {
     let mut plan = PastePlan::default();
@@ -734,6 +814,21 @@ pub fn plan_paste(
     } else {
         block.iter().map(Vec::len).sum()
     };
+    // The column the `dc`-th value of a row lands in. A single value fills the
+    // selection, so those are the selected columns; a block extends from the
+    // anchor in **draw** order, which is what the user pointed along.
+    let target_cols: Vec<usize> = if single {
+        (c0..=c1).collect()
+    } else {
+        let visual = visual_cols(cols, frozen);
+        match visual.iter().position(|&ci| ci == c0) {
+            Some(at) => visual[at..].to_vec(),
+            // The anchor is not a column of this result. Nothing lands, and the
+            // walk counts every value as dropped rather than sliding the block
+            // onto whatever column happens to be first.
+            None => Vec::new(),
+        }
+    };
     let mut seen = 0usize;
     'block: for dr in 0..span_r {
         for dc in 0..span_c {
@@ -754,7 +849,13 @@ pub fn plan_paste(
                 continue;
             };
             seen += 1;
-            let (row, col) = (r0 + dr, c0 + dc);
+            let row = r0 + dr;
+            let Some(&col) = target_cols.get(dc) else {
+                // Past the right edge of the grid — the same drop the index walk
+                // counted when `c0 + dc` ran off the end.
+                plan.dropped += 1;
+                continue;
+            };
             if row >= rows || col >= cols {
                 plan.dropped += 1;
                 continue;
@@ -1676,7 +1777,7 @@ mod tests {
         let (rs, order, formats) = cells_fixture();
         let (dirty, new_rows) = (HashMap::new(), Vec::new());
         let g = cells(&rs, &order, &formats, &dirty, &new_rows);
-        let (columns, rows, total) = g.attached((0, 0, 1, 1), 200);
+        let (columns, rows, total) = g.attached((0, 0, 1, 1), 200, None);
         assert_eq!(columns, vec!["placed_at", "note"]);
         assert_eq!(total, 2);
         // Display row 0 is data row 1 — `order` is not the identity here.
@@ -1697,7 +1798,69 @@ mod tests {
         let (rs, order, formats) = cells_fixture();
         let (dirty, new_rows) = (HashMap::new(), Vec::new());
         let g = cells(&rs, &order, &formats, &dirty, &new_rows);
-        assert_eq!(g.tsv((0, 0, 1, 1)), "1709380800\tsecond\n1709294400\tfirst");
+        assert_eq!(
+            g.tsv((0, 0, 1, 1), None),
+            "1709380800\tsecond\n1709294400\tfirst"
+        );
+    }
+
+    /// **Under a freeze, the clipboard reads left to right.** `note` frozen out
+    /// of `(placed_at, note)` draws as `[note][placed_at]`, so a selection over
+    /// both columns has to be written in that order: whoever receives the block
+    /// — a spreadsheet, another grid, a text file — has nothing but the order to
+    /// go on, and the columns are transposed against the screen without it.
+    #[test]
+    fn the_clipboard_writes_the_columns_in_the_order_they_are_drawn() {
+        let (rs, order, formats) = cells_fixture();
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(
+            g.tsv((0, 0, 1, 1), Some(1)),
+            "second\t1709380800\nfirst\t1709294400"
+        );
+        // The attachment says the same thing, names included — the model reads
+        // it as a table.
+        let (columns, rows, _) = g.attached((0, 0, 1, 1), 200, Some(1));
+        assert_eq!(columns, vec!["note", "placed_at"]);
+        assert_eq!(
+            rows[0],
+            vec!["second".to_string(), "2024-03-02 12:00:00".to_string()]
+        );
+        // Freezing the leftmost column changes nothing, and neither does a
+        // selection that doesn't reach the frozen one.
+        assert_eq!(
+            g.tsv((0, 0, 1, 1), Some(0)),
+            "1709380800\tsecond\n1709294400\tfirst"
+        );
+        assert_eq!(g.tsv((0, 0, 1, 0), Some(1)), "1709380800\n1709294400");
+    }
+
+    /// **The composition, which is where this bug lived.** Copy under a freeze
+    /// and paste it straight back: the values have to return to the columns they
+    /// came from. Both halves walk a column range, and either one alone reading
+    /// draw order (or index order) puts them back transposed — a half-applied
+    /// map is worse than none, so this is the test that holds the pair together.
+    #[test]
+    fn a_copy_and_a_paste_under_a_freeze_agree_on_the_columns() {
+        let (rs, order, formats) = cells_fixture();
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        // Display row 0, both columns, with `note` (abs 1) frozen and therefore
+        // drawn first.
+        let copied = g.tsv((0, 0, 0, 1), Some(1));
+        let block = parse_tsv_block(&copied);
+        // Pasted back onto the cell it was copied from: the anchor is the
+        // leftmost *drawn* column of the selection, which is the frozen one.
+        let plan = plan_paste(&block, (0, 1, 0, 1), 2, 2, Some(1), all_editable);
+        assert_eq!(
+            plan.cells,
+            vec![
+                (0, 1, "second".to_string()),
+                (0, 0, "1709380800".to_string()),
+            ],
+            "the round trip must restore `note` to `note` and `placed_at` to \
+             `placed_at`; copied block was {copied:?}"
+        );
     }
 
     /// A staged edit is on screen and uncommitted; both surfaces have to show
@@ -1714,9 +1877,9 @@ mod tests {
                 .into_iter()
                 .collect();
         let g = cells(&rs, &order, &formats, &dirty, &new_rows);
-        assert_eq!(g.tsv((0, 0, 1, 1)), "999\tsecond\n1709294400\tNULL");
+        assert_eq!(g.tsv((0, 0, 1, 1), None), "999\tsecond\n1709294400\tNULL");
         assert_eq!(
-            g.attached((0, 0, 1, 1), 200).1,
+            g.attached((0, 0, 1, 1), 200, None).1,
             vec![
                 vec!["999".to_string(), "second".to_string()],
                 vec!["2024-03-01 12:00:00".to_string(), "NULL".to_string()],
@@ -1754,7 +1917,7 @@ mod tests {
         let (rs, order, formats) = cells_fixture();
         let (dirty, new_rows) = (HashMap::new(), Vec::new());
         let g = cells(&rs, &order, &formats, &dirty, &new_rows);
-        let (_, rows, total) = g.attached((0, 0, 1, 1), 1);
+        let (_, rows, total) = g.attached((0, 0, 1, 1), 1, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(total, 2);
     }
@@ -1875,13 +2038,94 @@ mod tests {
         true
     }
 
+    // ── The frozen column: draw order vs index order ─────────────────────────
+
+    /// The list every surface that cares about adjacency or reading order shares
+    /// with the data pane's own `(0..ncols).filter(|ci| Some(*ci) != frozen)`.
+    #[test]
+    fn the_frozen_column_is_drawn_first_and_the_rest_keep_their_order() {
+        assert_eq!(visual_cols(5, Some(3)), vec![3, 0, 1, 2, 4]);
+        // Frozen at the left edge, or nothing frozen: index order *is* draw order.
+        assert_eq!(visual_cols(5, Some(0)), vec![0, 1, 2, 3, 4]);
+        assert_eq!(visual_cols(5, None), vec![0, 1, 2, 3, 4]);
+        // A column that cannot be drawn moves nothing.
+        assert_eq!(visual_cols(3, Some(7)), vec![0, 1, 2]);
+        assert_eq!(visual_cols(0, Some(0)), Vec::<usize>::new());
+    }
+
+    /// **The paste lands where the user pointed.** `(id, name, email, ssn,
+    /// notes)` with `ssn` (abs 3) frozen draws as `[ssn][id][name][email][notes]`;
+    /// a 1×2 block dropped on `email` must fill `email` and the column drawn to
+    /// its right, `notes` (abs 4) — not `ssn`, which is at the far left of the
+    /// screen and is the column the user froze to keep an eye on.
+    #[test]
+    fn a_paste_under_a_frozen_column_lands_where_the_user_pointed() {
+        let block = parse_tsv_block("a@b.com\thello");
+        let plan = plan_paste(&block, (0, 2, 0, 2), 4, 5, Some(3), all_editable);
+        assert_eq!(
+            plan.cells,
+            vec![(0, 2, "a@b.com".to_string()), (0, 4, "hello".to_string()),]
+        );
+        assert_eq!(plan.dropped, 0);
+        // Anchored *on* the frozen column, a 3-wide block fills the three
+        // leftmost columns on screen: `ssn`, then `id`, then `name`.
+        let block = parse_tsv_block("x\ty\tz");
+        let plan = plan_paste(&block, (0, 3, 0, 3), 4, 5, Some(3), all_editable);
+        assert_eq!(
+            plan.cells,
+            vec![
+                (0, 3, "x".to_string()),
+                (0, 0, "y".to_string()),
+                (0, 1, "z".to_string()),
+            ]
+        );
+        // And with nothing frozen the walk is the index walk, unchanged.
+        let plan = plan_paste(&block, (0, 1, 0, 1), 4, 5, None, all_editable);
+        assert_eq!(
+            plan.cells,
+            vec![
+                (0, 1, "x".to_string()),
+                (0, 2, "y".to_string()),
+                (0, 3, "z".to_string()),
+            ]
+        );
+    }
+
+    /// A block anchored near the right edge still drops what falls off it, and
+    /// counts the drop — the frozen column changes *which* columns are walked,
+    /// never how much is silently lost.
+    #[test]
+    fn a_paste_past_the_last_drawn_column_is_still_dropped_and_counted() {
+        let block = parse_tsv_block("x\ty\tz");
+        // Visual order `[3, 0, 1, 2, 4]`, anchored on abs 2 (drawn 4th): only
+        // `2` and `4` are left, so the third value has nowhere to go.
+        let plan = plan_paste(&block, (0, 2, 0, 2), 4, 5, Some(3), all_editable);
+        assert_eq!(
+            plan.cells,
+            vec![(0, 2, "x".to_string()), (0, 4, "y".to_string())]
+        );
+        assert_eq!(plan.dropped, 1);
+    }
+
+    /// **A single value fills the selection**, and the selection is what the
+    /// grid paints as highlighted — the absolute range. Extending it along the
+    /// draw order instead would write into cells that were never lit up.
+    #[test]
+    fn one_value_over_a_selection_that_crosses_the_freeze_fills_the_selection() {
+        let block = parse_tsv_block("x");
+        let plan = plan_paste(&block, (0, 1, 0, 3), 4, 5, Some(2), all_editable);
+        let mut cols: Vec<usize> = plan.cells.iter().map(|(_, c, _)| *c).collect();
+        cols.sort_unstable();
+        assert_eq!(cols, vec![1, 2, 3]);
+    }
+
     /// Copy a block out of the grid, paste it back: the same values, in the
     /// same places. The two functions are inverses and this is the assertion
     /// that says so — the property a reader of either one would assume.
     #[test]
     fn a_block_round_trips_through_the_clipboard_shape() {
         let block = parse_tsv_block("a\tb\tc\nd\te\tf");
-        let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, all_editable);
+        let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, None, all_editable);
         assert_eq!(plan.dropped, 0);
         assert_eq!(plan.cells.len(), 6);
         assert!(plan.cells.contains(&(0, 0, "a".to_string())));
@@ -1894,7 +2138,7 @@ mod tests {
     #[test]
     fn one_copied_cell_fills_the_whole_selection() {
         let block = parse_tsv_block("x");
-        let plan = plan_paste(&block, (1, 1, 3, 2), 10, 10, all_editable);
+        let plan = plan_paste(&block, (1, 1, 3, 2), 10, 10, None, all_editable);
         assert_eq!(plan.cells.len(), 6);
         for r in 1..=3 {
             for c in 1..=2 {
@@ -1910,8 +2154,8 @@ mod tests {
     fn a_multi_cell_block_ignores_the_selections_size() {
         let block = parse_tsv_block("a\tb\nc\td");
         // A single-cell selection, and a huge one, land the same four cells.
-        let from_one = plan_paste(&block, (0, 0, 0, 0), 10, 10, all_editable);
-        let from_many = plan_paste(&block, (0, 0, 9, 9), 10, 10, all_editable);
+        let from_one = plan_paste(&block, (0, 0, 0, 0), 10, 10, None, all_editable);
+        let from_many = plan_paste(&block, (0, 0, 9, 9), 10, 10, None, all_editable);
         assert_eq!(from_one, from_many);
         assert_eq!(from_one.cells.len(), 4);
     }
@@ -1922,7 +2166,7 @@ mod tests {
     fn cells_that_fall_off_the_grid_are_counted_not_dropped_quietly() {
         let block = parse_tsv_block("a\tb\tc\nd\te\tf");
         // A 3-column block anchored on the last column of a 2-column grid.
-        let plan = plan_paste(&block, (0, 1, 0, 1), 1, 2, all_editable);
+        let plan = plan_paste(&block, (0, 1, 0, 1), 1, 2, None, all_editable);
         assert_eq!(plan.cells, vec![(0, 1, "a".to_string())]);
         assert_eq!(plan.dropped, 5, "{plan:?}");
     }
@@ -1933,7 +2177,7 @@ mod tests {
     #[test]
     fn a_read_only_column_is_skipped_rather_than_shifted() {
         let block = parse_tsv_block("a\tb\tc");
-        let plan = plan_paste(&block, (0, 0, 0, 0), 5, 5, |ci| ci != 1);
+        let plan = plan_paste(&block, (0, 0, 0, 0), 5, 5, None, |ci| ci != 1);
         assert_eq!(plan.read_only, 1);
         assert!(plan.cells.contains(&(0, 0, "a".to_string())));
         assert!(plan.cells.contains(&(0, 2, "c".to_string())));
@@ -1945,7 +2189,7 @@ mod tests {
     #[test]
     fn a_short_row_leaves_the_cells_it_does_not_reach_alone() {
         let block = parse_tsv_block("a\tb\nc");
-        let plan = plan_paste(&block, (0, 0, 0, 0), 5, 5, all_editable);
+        let plan = plan_paste(&block, (0, 0, 0, 0), 5, 5, None, all_editable);
         assert_eq!(plan.dropped, 0);
         assert_eq!(plan.cells.len(), 3);
         assert!(!plan.cells.iter().any(|(r, c, _)| *r == 1 && *c == 1));
@@ -1966,7 +2210,7 @@ mod tests {
     fn a_selection_bigger_than_the_cap_stops_at_it_and_counts_the_rest() {
         let block = parse_tsv_block("x");
         let rows = PASTE_CELL_CAP + 10;
-        let plan = plan_paste(&block, (0, 0, rows - 1, 0), rows, 1, all_editable);
+        let plan = plan_paste(&block, (0, 0, rows - 1, 0), rows, 1, None, all_editable);
         assert_eq!(plan.cells.len(), PASTE_CELL_CAP, "staged up to the cap");
         assert_eq!(plan.capped, 10, "and the remainder is counted, not dropped");
         assert_eq!(plan.cells.len() + plan.capped, rows, "nothing unaccounted");
@@ -1980,7 +2224,7 @@ mod tests {
     #[test]
     fn a_paste_that_fits_is_not_capped() {
         let block = parse_tsv_block("a\tb\nc\td");
-        let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, all_editable);
+        let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, None, all_editable);
         assert_eq!(plan.capped, 0);
         assert_eq!(paste_report(plan.counts(), 0), PasteReport::Clean);
     }
@@ -1988,16 +2232,16 @@ mod tests {
     #[test]
     fn an_empty_block_or_an_empty_grid_plans_nothing() {
         assert_eq!(
-            plan_paste(&[], (0, 0, 0, 0), 5, 5, all_editable),
+            plan_paste(&[], (0, 0, 0, 0), 5, 5, None, all_editable),
             PastePlan::default()
         );
         let block = parse_tsv_block("a");
         assert_eq!(
-            plan_paste(&block, (0, 0, 0, 0), 0, 5, all_editable),
+            plan_paste(&block, (0, 0, 0, 0), 0, 5, None, all_editable),
             PastePlan::default()
         );
         assert_eq!(
-            plan_paste(&block, (0, 0, 0, 0), 5, 0, all_editable),
+            plan_paste(&block, (0, 0, 0, 0), 5, 0, None, all_editable),
             PastePlan::default()
         );
     }
