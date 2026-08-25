@@ -7579,6 +7579,15 @@ fn header_cell(
 /// In a pending new row Enter hops to the next editable cell (fast data entry),
 /// exactly as it does from the text input; in a real row it just closes.
 fn keep_cell_edit(gs: GridState, i: usize, data_idx: usize, ci: usize, pending: Option<usize>) {
+    // **Belt to the picker's `on_cleanup` brace**, and the same guard
+    // `drop_cell_edit` opens with two functions below. Every caller is a choice
+    // made in a menu on the *window-global* popup channel, which can still be on
+    // screen after this grid's scope is gone; `gs.stage` reads `edit_buf` and
+    // `rs` with `get_untracked`, i.e. `try_get_untracked().unwrap()`, so a stray
+    // click would panic rather than no-op.
+    if !gs.alive() {
+        return;
+    }
     if pending.is_some() {
         advance_edit(gs, i, ci, pending, true);
     } else {
@@ -7640,8 +7649,13 @@ fn cell_pick_editor(
     // Whether *we* put a menu up. Without it the closing effect below fires on
     // its first run — before the deferred open — and shuts the editor instantly.
     let opened = RwSignal::new(false);
+    // Where our menu is standing, if it is. A plain `Cell` and not a signal:
+    // `on_cleanup` below is the only reader, and reading a signal of the scope
+    // being disposed is the hazard the cleanup exists to prevent.
+    let standing: Rc<std::cell::Cell<Option<crate::PopupAnchor>>> = Rc::new(Default::default());
     let open = {
         let editor = editor.clone();
+        let standing = standing.clone();
         move || {
             // The option's *value*, which for a `SET` is the whole value with that
             // member toggled and for a boolean the engine's own spelling — see
@@ -7654,7 +7668,7 @@ fn cell_pick_editor(
             let width = gs
                 .widths
                 .with_untracked(|w| w.get(ci).copied().unwrap_or(cell_w()));
-            cell_editors::open_picker(ch, Some(anchor), width, entries);
+            standing.set(cell_editors::open_picker(ch, Some(anchor), width, entries));
         }
     };
     // One tick later: `layout_rect` is what the menu anchors to, and this view has
@@ -7680,6 +7694,14 @@ fn cell_pick_editor(
     // Clicking the face toggles the menu it opened — `open_picker` recognises
     // its own menu and closes it rather than reopening.
     .on_click_stop(move |_| (open)())
+    // **The menu cannot outlive the cell that opened it** — the same rule
+    // `cell_calendar_editor` states two functions below, and the same hazard: its
+    // entries are `Rc` closures over this grid's signals, and the only thing that
+    // clears the shared channel is a pointer-down. Ctrl+Tab or Ctrl+Enter
+    // disposed this scope with the list still on screen, and clicking a row then
+    // ran `keep_cell_edit` → `get_untracked` on a freed signal, which panics and
+    // takes every tab's uncommitted edits with it.
+    .on_cleanup(move || cell_editors::close_picker(ch, standing.get()))
     .into_any()
 }
 

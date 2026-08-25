@@ -120,12 +120,15 @@ pub(crate) fn pick_entries(
 /// **recomputed** rather than remembered: these controls sit in a scrolling
 /// panel, so with a menu up the control may have moved, and then the press
 /// reopens at the new position — which is the better answer anyway.
+/// Returns the anchor the caller's menu is now standing at, or `None` if this
+/// call **closed** one — see [`close_picker`], which is what the returned value
+/// is for.
 pub(crate) fn open_picker(
     ch: PopupChannel,
     anchor: Option<floem::ViewId>,
     width: f64,
     entries: Vec<MenuEntry>,
-) {
+) -> Option<PopupAnchor> {
     let here = anchor
         .map(|id| id.layout_rect())
         .map(|r| PopupAnchor::BelowBox(r.x0, r.x1, r.y0, r.y1));
@@ -137,7 +140,7 @@ pub(crate) fn open_picker(
         )
     }) {
         ch.menus.popup.set(None);
-        return;
+        return None;
     }
     // This trigger absorbs its own pointer-down, so the workspace root's
     // `close_except(None)` never runs for it and every *other* menu — the schema
@@ -150,6 +153,33 @@ pub(crate) fn open_picker(
     // a different control than the one that opened it.
     ch.width.set(width.max(theme::scaled(150.0)));
     ch.menus.popup.set(Some(entries));
+    here
+}
+
+/// Take down a picker's menu **if the one standing is that picker's** — the
+/// teardown half of [`open_picker`].
+///
+/// **A menu on the shared channel outlives the control that opened it.** Nothing
+/// but a pointer-down anywhere clears `menus.popup`: not a tab switch, not a
+/// re-run, not a scrolled-away row. The entries are `Rc` closures over the
+/// control's own state, so clicking one after its scope is gone reads a disposed
+/// signal — and `get_untracked` is `try_get_untracked().unwrap()`, which panics
+/// and takes the window, and every other tab's uncommitted edits, with it.
+///
+/// `mine` is the anchor `open_picker` returned, **remembered rather than
+/// recomputed**: a view's `layout_rect` is not something to ask about while its
+/// scope is being disposed, and getting the identity wrong here would take down
+/// somebody else's menu. It is a plain value for the same reason — a signal read
+/// inside `on_cleanup` is the hazard this function exists to prevent.
+pub(crate) fn close_picker(ch: PopupChannel, mine: Option<PopupAnchor>) {
+    let Some(mine) = mine else { return };
+    if crate::widgets::menu_anchored_at(
+        ch.menus.popup.get_untracked().is_some(),
+        ch.anchor.get_untracked(),
+        mine,
+    ) {
+        ch.menus.popup.set(None);
+    }
 }
 
 /// Width of a picker box in the row panel — wide enough for an enum's longest
@@ -194,13 +224,24 @@ pub(crate) fn pick_field(
     // Filled once the view below exists.
     let anchor_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
     let for_open = editor.clone();
-    let open = move || {
-        let entries = pick_entries(
-            &for_open,
-            &buf.get_untracked(),
-            Rc::new(move |v: &str| buf.set(v.to_string())),
-        );
-        open_picker(ch, anchor_id.get_untracked(), pick_field_w(), entries);
+    // See [`close_picker`]: where our menu is standing, held as a plain value so
+    // the cleanup below reads nothing reactive.
+    let standing: Rc<std::cell::Cell<Option<PopupAnchor>>> = Rc::new(Default::default());
+    let open = {
+        let standing = standing.clone();
+        move || {
+            let entries = pick_entries(
+                &for_open,
+                &buf.get_untracked(),
+                Rc::new(move |v: &str| buf.set(v.to_string())),
+            );
+            standing.set(open_picker(
+                ch,
+                anchor_id.get_untracked(),
+                pick_field_w(),
+                entries,
+            ));
+        }
     };
     let boxed = h_stack((
         dyn_container(
@@ -247,7 +288,13 @@ pub(crate) fn pick_field(
         crate::widgets::button_focus_ring(field_box(s), 6.0)
             .width(pick_field_w())
             .gap(theme::scaled(6.0))
-    });
+    })
+    // The milder half of the same defect the in-cell picker has: this `pick`
+    // only writes `buf`, so a click after the panel is gone no-ops rather than
+    // panicking — but the list is still stranded over the app, and a stranded
+    // `menu_panel` keeps its `focus_root` registered, which is how a new query
+    // tab ends up declining the keyboard (see the module doc).
+    .on_cleanup(move || close_picker(ch, standing.get()));
     anchor_id.set(Some(boxed.id()));
     focus_on_mount(autofocus, anchor_id);
     boxed.into_any()
