@@ -4858,6 +4858,16 @@ fn center(ui: Ui) -> impl IntoView {
     let commit_edits = ui.tab_actions.commit_edits.clone();
     let export_file = ui.tab_actions.export_file.clone();
     let export_cancel = ui.tab_actions.export_cancel.clone();
+    // **Created here, beside the action that cancels it, and not inside the
+    // per-active-tab render below.** The export's token is app-global, so a flag
+    // with a shorter life than the token is a Cancel that can vanish while the
+    // thing it stops is still running: switching tabs mid-export disposed this
+    // signal, switching back built a fresh empty one, and the stream went on for
+    // minutes with no control bound to it and every further `All rows` request
+    // refused. The tab that launched it rides *in* the value
+    // (`grid::ExportRun`), which is what keeps the bar off a tab that had
+    // nothing to do with it.
+    let exporting = RwSignal::new(None);
     let apply_view = ui.tab_actions.apply_view.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
@@ -5096,7 +5106,8 @@ fn center(ui: Ui) -> impl IntoView {
                     // export the user has navigated away from simply reports
                     // nowhere — the same thing a commit does, and the bar's
                     // established behaviour.
-                    exporting: RwSignal::new(false),
+                    exporting,
+                    tab_id: tab.id,
                     tx_holders: {
                         // Answered when a write has been waiting a while, not at
                         // build time: the user can open (or end) a transaction in
@@ -5207,6 +5218,7 @@ fn results_section(
     let commit_note = gctx.commit_note;
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let (exporting, export_cancel) = (gctx.exporting, gctx.export_cancel.clone());
+    let tab_id = gctx.tab_id;
     let view_err = gctx.view_err;
     // A Run-Everything statement's own error, which the bottom bar carries for the
     // same reason the editor's carries a single run's: a server error is one long
@@ -5225,6 +5237,7 @@ fn results_section(
         view_err,
         commit_wait,
         exporting,
+        tab_id,
     };
     // **The panel-level bars must not outlive the grid they describe.** All three
     // are mounted here, outside `body`, while their only writer lives inside

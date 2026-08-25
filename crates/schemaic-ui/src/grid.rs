@@ -383,7 +383,11 @@ struct GridState {
     /// grid it was started from (a re-run replaces the `GridState`), and a Cancel
     /// that vanished the moment the rows refreshed would be a Cancel the user
     /// cannot reach for exactly as long as it matters.
-    exporting: RwSignal<bool>,
+    exporting: RwSignal<Option<ExportRun>>,
+    /// The tab this grid belongs to — the other half of [`ExportRun`], and the
+    /// only thing that tells "an export is running" from "an export is running
+    /// *here*".
+    tab_id: usize,
     /// Update the tab's *canonical* result set after a splice, so a later grid
     /// rebuild (tab switch away/back) reflects the committed values. `None` for the
     /// multi-result path, which stays on the full-re-run commit flow. Present ⇒ the
@@ -480,6 +484,62 @@ struct GridState {
     edit_row_saving: RwSignal<bool>,
 }
 
+/// Which streamed export is running, and which tab launched it.
+///
+/// Two questions that used to be one `bool`, and each of them had a failure.
+///
+/// **`tab`** is why the flag can outlive a tab switch. The export's cancellation
+/// token is app-global (`main::export_token`), and the flag was created inside the
+/// per-active-tab-render `GridCtx`: switching away disposed it, switching back
+/// built a fresh `false`, and the running export was left with no Cancel anywhere
+/// on screen while the token stayed occupied — so it could be neither stopped nor
+/// replaced, for as long as the stream ran. The signal is created once for the
+/// window now, and the tab it names is what decides whose bar draws the Cancel.
+///
+/// **`id`** is why only the export that raised the flag can lower it. The tail of
+/// a finished request cleared the flag whenever *its own* scope was streamed —
+/// which is true of a second `All rows` request, the only kind the app refuses.
+/// Asking for one while a stream was running therefore tore down the running
+/// export's Cancel, which is the same failure the `streaming` guard had been added
+/// to fix, one case out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExportRun {
+    id: u64,
+    tab: usize,
+}
+
+impl ExportRun {
+    /// A fresh run for `tab`. The id is monotonic per process, so no two requests
+    /// can claim each other's flag — and it is a counter rather than a token
+    /// clone because the comparison is all that is wanted, and `ExportRun` has to
+    /// stay `Copy` for `BarSignals`' sake.
+    fn new(tab: usize) -> ExportRun {
+        thread_local! {
+            static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+        }
+        let id = NEXT.with(|n| {
+            let v = n.get();
+            n.set(v + 1);
+            v
+        });
+        ExportRun { id, tab }
+    }
+}
+
+/// What the flag should read once `finished` has reported.
+///
+/// `None` only when the run that reported is the run the flag is holding. Every
+/// other case leaves it exactly as it was — which covers both of the failures
+/// this replaced: a `Fetched` save (which raised no flag, so it matches nothing)
+/// and a second `All rows` request refused synchronously (which is `streaming`,
+/// and so cleared the flag under the export that was actually running).
+fn export_finished(current: Option<ExportRun>, finished: ExportRun) -> Option<ExportRun> {
+    match current {
+        Some(run) if run == finished => None,
+        other => other,
+    }
+}
+
 /// A result column's **real** name on its base table, from the wire provenance.
 /// Empty for an expression column, which is never written to.
 fn origin_column(rs: &ResultSet, ci: usize) -> String {
@@ -563,6 +623,7 @@ impl GridState {
             export_file: RwSignal::new(Some(gctx.export_file.clone())),
             conn_at_load: conn,
             exporting: gctx.exporting,
+            tab_id: gctx.tab_id,
             sync_canonical: RwSignal::new(gctx.sync_canonical.clone()),
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
@@ -2024,6 +2085,9 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
             _ => crate::ExportScope::Fetched,
         };
         let streaming = matches!(scope, crate::ExportScope::AllRows { .. });
+        // Claimed before the flag goes up, so the closure below can compare
+        // against it rather than against its own scope.
+        let run = ExportRun::new(gs.tab_id);
         if streaming {
             // Clear the bar's *stale* messages first: `Exporting` outranks a
             // note but not an error, so a failure left standing from an earlier
@@ -2040,7 +2104,7 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
             if gs.view_err.get_untracked().is_some() {
                 gs.view_err.set(None);
             }
-            gs.exporting.set(true);
+            gs.exporting.set(Some(run));
         }
         let shown = path.file_name().map(|n| n.to_string_lossy().into_owned());
         // `save_as` takes an `Fn`, so the snapshot is cloned rather than moved —
@@ -2104,14 +2168,16 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
                         gs.commit_err.try_update(|v| *v = Some(msg));
                     }
                 }
-                // **Only the export that raised the flag may lower it.** A
-                // `Fetched` save finishes in milliseconds, and clearing
-                // unconditionally meant one of those, taken while a stream was
-                // running, tore down that stream's Cancel and left no way to
-                // stop it.
-                if streaming {
-                    gs.exporting.try_update(|v| *v = false);
-                }
+                // **Only the export that raised the flag may lower it** — and
+                // now that is what the code does rather than what the comment
+                // said. Testing `streaming` tests *this request's* scope, which
+                // is `true` for a second `All rows` request too: the app refuses
+                // that one synchronously, and the refusal's own tail then cleared
+                // the **running** export's flag and took its Cancel away. The
+                // `Fetched` case the guard was added for is covered by the same
+                // comparison, since a `Fetched` request never raised a flag to
+                // match.
+                gs.exporting.try_update(|v| *v = export_finished(*v, run));
             }),
         );
     });
@@ -2526,8 +2592,13 @@ pub(crate) struct GridCtx {
     pub(crate) commit: crate::CommitFn,
     /// Write an export to disk off the UI thread (see [`crate::ExportFn`]).
     pub(crate) export_file: crate::ExportFn,
-    /// True while a streamed export is running — see [`GridState::exporting`].
-    pub(crate) exporting: RwSignal<bool>,
+    /// The streamed export running in this window, if any — see [`ExportRun`].
+    /// **Window-scoped**, so it outlives a tab switch the way its cancellation
+    /// token does.
+    pub(crate) exporting: RwSignal<Option<ExportRun>>,
+    /// Which tab this context belongs to, so an export can be told from an export
+    /// *here*.
+    pub(crate) tab_id: usize,
     /// Stop the running export (the app owns the cancellation token).
     pub(crate) export_cancel: Rc<dyn Fn()>,
     /// Splice sink: replace the tab's canonical result set (so a later rebuild is
@@ -2647,7 +2718,7 @@ pub(crate) fn grid_error_bar(
         commit_note,
         view_err,
         commit_wait,
-        exporting,
+        ..
     } = bars;
     // The batch error leads, because a failed statement has no grid mounted at
     // all: a commit error left over from another result tab's grid would be
@@ -2666,7 +2737,7 @@ pub(crate) fn grid_error_bar(
             // a problem, so an error or a stalled write outranks it; but it is
             // *live*, and the note it will itself be replaced by is not, so a
             // leftover note must not sit on top of a Cancel the user may need.
-            .or_else(|| exporting.get().then_some(BarState::Exporting))
+            .or_else(|| bars.exporting_here().then_some(BarState::Exporting))
             .or_else(|| commit_note.get().map(BarState::Note))
     };
     dyn_container(current, move |state| {
@@ -2777,7 +2848,11 @@ pub(crate) struct BarSignals {
     /// parameter of [`grid_error_bar`] beside `rollback_tx`, for the reason this
     /// struct is `Copy`: an `Rc` in here would cost every reader of `any_up` a
     /// clone.
-    pub(crate) exporting: RwSignal<bool>,
+    pub(crate) exporting: RwSignal<Option<ExportRun>>,
+    /// Which tab this bar belongs to, so [`BarSignals::exporting_here`] can tell
+    /// an export running *here* from one running in another tab. The signal is
+    /// window-wide; the bar is not.
+    pub(crate) tab_id: usize,
 }
 
 impl BarSignals {
@@ -2788,7 +2863,18 @@ impl BarSignals {
             || self.commit_note.with(Option::is_some)
             || self.view_err.with(Option::is_some)
             || self.commit_wait.with(Option::is_some)
-            || self.exporting.get()
+            || self.exporting_here()
+    }
+
+    /// Is a streamed export running **in this tab**?
+    ///
+    /// The signal outlives a tab switch on purpose — that is what keeps the Cancel
+    /// reachable — so every reader has to ask about its own tab rather than about
+    /// the window. Reading it any other way is how the flag came to be drawn on a
+    /// tab that had nothing to do with the export.
+    pub(crate) fn exporting_here(&self) -> bool {
+        let tab = self.tab_id;
+        self.exporting.with(|e| e.is_some_and(|r| r.tab == tab))
     }
 }
 
@@ -8665,6 +8751,63 @@ mod tests {
             type_name: ty.to_string(),
             origin: None,
         }
+    }
+
+    /// **A tab switch must not be able to lose a running export's Cancel, and a
+    /// second request must not be able to take it away.**
+    ///
+    /// Both used to be one `bool`. The flag lived in the per-active-tab-render
+    /// context while the export's cancellation token is app-global, so switching
+    /// tabs disposed it and switching back built a fresh `false` — the stream ran
+    /// on for minutes with no control bound to it and every further `All rows`
+    /// request refused. And the tail of a finished request cleared the flag
+    /// whenever *its own* scope was streamed, which is true of the second `All
+    /// rows` request the app refuses synchronously, so asking for one tore down
+    /// the running export's Cancel.
+    #[test]
+    fn only_the_export_that_raised_the_flag_can_lower_it() {
+        let a = ExportRun::new(7);
+        let b = ExportRun::new(7);
+        assert_ne!(a, b, "two runs in one tab are still two runs");
+
+        // The run that reported is the one holding the flag: it comes down.
+        assert_eq!(export_finished(Some(a), a), None);
+        // A different run reported — including a later one in the same tab, which
+        // is the refused second `All rows` request. The flag stays up.
+        assert_eq!(export_finished(Some(a), b), Some(a));
+        assert_eq!(export_finished(Some(b), a), Some(b));
+        // Nothing was running: a `Fetched` save's tail, which raised no flag.
+        assert_eq!(export_finished(None, a), None);
+    }
+
+    /// And the bar asks about *its own* tab, because the signal is window-wide on
+    /// purpose — reading it as a bare "is an export running" is how the Cancel got
+    /// drawn on a tab that had nothing to do with it.
+    #[test]
+    fn the_export_bar_belongs_to_the_tab_that_started_it() {
+        let exporting = RwSignal::new(None);
+        let bars = |tab_id: usize| BarSignals {
+            batch_err: create_memo(move |_| None),
+            commit_err: RwSignal::new(None),
+            commit_note: RwSignal::new(None),
+            view_err: RwSignal::new(None),
+            commit_wait: RwSignal::new(None),
+            exporting,
+            tab_id,
+        };
+        let here = bars(3);
+        let elsewhere = bars(4);
+        assert!(!here.exporting_here());
+        assert!(!here.any_up());
+
+        exporting.set(Some(ExportRun::new(3)));
+        assert!(here.exporting_here(), "the tab that started it");
+        assert!(here.any_up());
+        assert!(
+            !elsewhere.exporting_here(),
+            "a tab that had nothing to do with it"
+        );
+        assert!(!elsewhere.any_up());
     }
 
     /// Run `f` at `scale`, then put the scale back — the registry is a
