@@ -3646,10 +3646,18 @@ fn convert_row(row: &Row, columns: &[Column], binary: &[bool], bit: &[bool]) -> 
             // **A bit-field arrives as bytes and is a number.** Nothing in the
             // value says so — only the column's type does — and lossy-decoding
             // those bytes as text is how a `BIT(8)` holding 10 became a newline
-            // character. `bit_display` reads them the way MySQL wrote them and
-            // the way it takes them back.
+            // character. `bit_value` reads them the way MySQL wrote them and the
+            // way it takes them back.
+            //
+            // `UInt`, not `Str`: the number is the value, and a `Value::Str`
+            // carries a *quoted* literal into every export. `'10'` assigned to a
+            // `BIT` column is the raw bits of its two bytes — 12594 on a
+            // `BIT(16)`, "Data too long" on a `BIT(8)` — so the round trip that
+            // taking `BIT` off the binary list was meant to enable was writing
+            // wrong data instead of withholding it. The grid shows the same
+            // digits either way.
             Some(MyValue::Bytes(b)) if bit.get(i).copied().unwrap_or(false) => {
-                Value::Str(schemaic_core::model::bit_display(b))
+                schemaic_core::model::bit_cell(b)
             }
             Some(MyValue::Bytes(b)) => parse_typed(
                 String::from_utf8_lossy(b).into_owned(),

@@ -692,7 +692,20 @@ fn run_query(
         }
         cells.clear();
         for i in 0..ncols {
-            cells.push(value_of(row.get_ref(i).map_err(query_err)?));
+            let raw = row.get_ref(i).map_err(query_err)?;
+            // **The one moment anything knows this column holds bytes.** SQLite
+            // types values, not columns: `decl_type()` is an affinity or nothing
+            // (`CREATE TABLE files(id INTEGER PRIMARY KEY, data)` is legal, and a
+            // computed `zeroblob(4)` has no declared type at all) and `origin` is
+            // always `None` here, so every downstream reader that asked the
+            // column got "not binary" — and the export wrote `value_of`'s
+            // `<n bytes>` placeholder into CSV, JSON and SQL as though it were
+            // the data. `ValueRef::Blob` is not a guess, so it is recorded while
+            // it is in hand.
+            if matches!(raw, ValueRef::Blob(_)) {
+                builder.mark_binary(i);
+            }
+            cells.push(value_of(raw));
         }
         builder.push_row(&cells);
         // `flush_blocking`, not `flush`: this loop is inside a `spawn_blocking`,
@@ -3615,6 +3628,124 @@ mod tests {
 
         // …and what it hands back is the name to open, untouched.
         assert_eq!(open_target("C:/db.sqlite", false).unwrap(), "C:/db.sqlite");
+    }
+
+    /// **A backend's own cells, put through a real exporter.** Every other test
+    /// of the binary/bit decisions builds a `Column` by hand and substitutes the
+    /// answer the db layer would have given — which is precisely where the faults
+    /// were: the pure functions were right and their composition with the
+    /// backend was wrong. In-memory SQLite is the one place the house rules allow
+    /// a live database, so this is the seam test.
+    ///
+    /// Three columns, and only the first was ever handled:
+    ///
+    /// - `pic BLOB` — the declared type says bytes, so the two-signal rule
+    ///   already withheld it;
+    /// - `data` with **no declared type** — legal SQLite, and the ordinary shape
+    ///   for a blob store. `decl_type()` is `None` and `origin` is `None`, so
+    ///   `Column::is_binary()` was `false` and the `<n bytes>` placeholder went
+    ///   into CSV, JSON and SQL *as the data*;
+    /// - `note TEXT` holding a blob — SQLite permits it and still declares
+    ///   `TEXT`, so the type signal actively says the wrong thing.
+    #[tokio::test]
+    async fn a_sqlite_blob_never_reaches_an_export_as_its_placeholder() {
+        let (keeper, db) = shared_memory("export_blob_placeholder");
+        keeper
+            .execute_batch(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, pic BLOB, data, note TEXT);
+                 INSERT INTO files VALUES (1, x'0102', x'0304', x'050607');",
+            )
+            .unwrap();
+        let rs = db
+            .fetch_query(None, "SELECT * FROM files", 100, CancellationToken::new())
+            .await
+            .expect("the fetch");
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+
+        // What the grid shows — the placeholder is the honest *display*, and it
+        // is unchanged. The fault was only ever in what an export wrote.
+        assert_eq!(rs.cell(0, 2).expect("the untyped cell").text(), "<2 bytes>");
+        // All three columns are recognised as holding bytes, whatever they
+        // declared.
+        assert_eq!(rs.binary_columns, vec![1, 2, 3]);
+
+        let csv = schemaic_core::export::export_csv(&rs, &order);
+        assert_eq!(csv, "id,pic,data,note\n1,,,\n", "csv: {csv}");
+        let json = schemaic_core::export::export_json(&rs, &order);
+        for col in ["pic", "data", "note"] {
+            assert!(json.contains(&format!("\"{col}\": null")), "json: {json}");
+        }
+        let sql = schemaic_core::export::export_inserts(
+            &rs,
+            &order,
+            Some(("main", None, "files")),
+            schemaic_core::intel::SqlDialect::Sqlite,
+        );
+        assert!(
+            sql.contains("VALUES (1, NULL, NULL, NULL)"),
+            "the placeholder must not be a SQL literal: {sql}"
+        );
+        // …and the loss is disclosed, in the file for SQL and through the tally
+        // for the two formats with no comment syntax.
+        assert!(sql.contains("-- NOTE: binary columns"), "{sql}");
+        let mut buf = Vec::new();
+        let tally = schemaic_core::export::ExportFormat::Csv
+            .render_to(
+                &mut buf,
+                &rs,
+                &order,
+                None,
+                schemaic_core::intel::SqlDialect::Sqlite,
+            )
+            .expect("writing to a Vec cannot fail");
+        assert_eq!(tally.withheld, vec!["pic", "data", "note"]);
+
+        // **And the other direction.** The widening is per *column evidence*,
+        // not "blank anything placeholder-shaped": a column SQLite never handed a
+        // blob for keeps its text, including text that spells the placeholder
+        // exactly. That is the case the two-signal rule exists for, and it must
+        // survive the widening.
+        keeper
+            .execute_batch(
+                "CREATE TABLE notes (a TEXT, b TEXT);
+                 INSERT INTO notes VALUES ('<9 bytes>', 'plain text');",
+            )
+            .unwrap();
+        let rs = db
+            .fetch_query(None, "SELECT * FROM notes", 100, CancellationToken::new())
+            .await
+            .expect("the fetch");
+        assert!(
+            rs.binary_columns.is_empty(),
+            "no bytes in this table at all"
+        );
+        let csv = schemaic_core::export::export_csv(&rs, &[0]);
+        assert_eq!(csv, "a,b\n<9 bytes>,plain text\n", "csv: {csv}");
+
+        // Inside a column that **did** hand over bytes, the same text is
+        // withheld. Deliberate, and the same answer a declared `BLOB` column has
+        // always given: once a column has demonstrably carried raw bytes,
+        // `<n bytes>` in it reads as the placeholder, and writing it into a
+        // format Schemaic re-imports would store the text as the data. The cost
+        // is a contrived string in a blob column; the alternative is a blob
+        // written as its placeholder.
+        keeper
+            .execute_batch("INSERT INTO files VALUES (2, NULL, NULL, '<9 bytes>');")
+            .unwrap();
+        let rs = db
+            .fetch_query(
+                None,
+                "SELECT id, note FROM files ORDER BY id",
+                100,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the fetch");
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        assert_eq!(
+            schemaic_core::export::export_csv(&rs, &order),
+            "id,note\n1,\n2,\n"
+        );
     }
 
     /// **The export's whole promise: no cap, and never the table in memory.**

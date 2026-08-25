@@ -962,10 +962,22 @@ pub fn qualified_table(
 /// that text into an `INSERT` produces a script that *silently stores the
 /// placeholder* as the column's data on re-import. This is the pre-pass that
 /// finds it, and it deliberately requires **both** signals to agree: the
-/// column's type says bytes, and the cell's text is one this codebase
+/// column carries bytes, and the cell's text is one this codebase
 /// generated. Either alone is wrong in a way that loses data — a SQLite `BLOB`
 /// column is only an affinity and may hold ordinary text, and a user's prose
 /// can spell `<12 bytes>` without being a blob.
+///
+/// **"The column carries bytes" has two sources, and the second is why SQLite
+/// works here at all.** [`crate::model::Column::is_binary`] reads the type name
+/// and the wire origin, and on SQLite neither can answer: `origin` is
+/// unconditionally `None` and `decl_type()` is an affinity or nothing, so an
+/// untyped column — the ordinary shape for a blob store — said "not binary" and
+/// the placeholder went into CSV, JSON *and* SQL as though it were the data.
+/// [`ResultSet::binary_columns`] is the backend's own per-value assertion for
+/// that case. It **widens** the type signal rather than replacing it: the cell
+/// test still has to agree, so real text in a column that held a blob elsewhere
+/// is untouched.
+///
 /// Returns column *indices*, not names: two result columns can share a name
 /// (`SELECT a.data, b.data`) and only one of them may be the blob.
 ///
@@ -979,7 +991,7 @@ pub fn qualified_table(
 fn dropped_binary_columns(rs: &ResultSet, order: &[usize]) -> Vec<usize> {
     (0..rs.columns.len())
         .filter(|&ci| {
-            rs.columns[ci].is_binary()
+            (rs.columns[ci].is_binary() || rs.binary_columns.contains(&ci))
                 && order.iter().any(|&di| {
                     di < rs.row_count()
                         && rs
@@ -1973,6 +1985,51 @@ mod tests {
         assert!(export_json(&rs, &[0]).contains("<12 bytes>"));
         assert!(export_column_csv(&rs, &[0], 0).contains("<12 bytes>"));
         assert!(export_column_json(&rs, &[0], 0).contains("<12 bytes>"));
+    }
+
+    /// **A bit-field's number must reach SQL as a number.** `8ed98fe` took `BIT`
+    /// off the binary list on the stated grounds that a bit-field "has a lossless
+    /// text form (its number, which is also what MySQL accepts back)" — true of
+    /// the bare token `10`, false of `'10'`, which is the only thing an export can
+    /// emit for a `Value::Str`. MySQL's `Field_bit::store(const char*, …)` takes
+    /// the raw bits of a string's bytes, so `'10'` is `0x3132` = 12594 on a
+    /// `BIT(16)` and "Data too long" on a `BIT(8)`: the round trip that change
+    /// was made to enable wrote wrong data instead of withholding it.
+    ///
+    /// The composition, not the pieces: `bit_display` had a full table of tests
+    /// and was right all along, and `a_bit_fields_bytes_read_as_a_big_endian_number`
+    /// is green against this bug. What nothing asked was which `Value` the
+    /// loader wraps the number in.
+    #[test]
+    fn a_bit_field_exports_as_a_bare_number() {
+        use crate::model::bit_cell;
+        // What the MySQL loader stores for `BIT(16)` holding 10 …
+        let cell = bit_cell(&[0x00, 0x0A]);
+        // … reaches SQL unquoted, on every dialect.
+        for d in [MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(sql_literal(&cell, d), "10", "{d:?}");
+        }
+        // …and JSON as a number, not a string.
+        assert_eq!(value_to_json(&cell), serde_json::json!(10));
+        // The widest field there is, and the empty run a server should never
+        // send — both still numbers.
+        assert_eq!(
+            sql_literal(&bit_cell(&[0xFF; 8]), MySql),
+            u64::MAX.to_string()
+        );
+        assert_eq!(sql_literal(&bit_cell(&[]), MySql), "0");
+        // And it is still the same digits the grid shows.
+        let rs = {
+            let mut b = col("flags");
+            b.type_name = "BIT(16)".to_string();
+            ResultSet::from_rows(vec![b], vec![vec![bit_cell(&[0x00, 0x0A])]])
+        };
+        assert_eq!(export_csv(&rs, &[0]), "flags\n10\n");
+        assert!(
+            export_inserts(&rs, &[0], None, MySql).contains("VALUES (10)"),
+            "{}",
+            export_inserts(&rs, &[0], None, MySql)
+        );
     }
 
     // ── What the export says it could not carry ───────────────────────────
