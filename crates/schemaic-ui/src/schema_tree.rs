@@ -815,7 +815,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     db_favorites,
                     dialect,
                     nav,
-                    indent: 0.0,
+                    indent_levels: 0,
                 },
             )
         },
@@ -1206,10 +1206,27 @@ struct SchemaTreeCtx {
     /// double-click).
     open_table_col: Rc<dyn Fn(TableSource, String)>,
     active_table: RwSignal<Option<TableSource>>,
-    /// Extra left inset (px) for rows below the database level, so a table nested
-    /// under a PostgreSQL schema group sits one level deeper than a flat one. `0.0`
-    /// whenever tables hang off the database directly.
-    indent: f64,
+    /// How many extra levels of nesting rows below the database level sit at, so a
+    /// table under a PostgreSQL schema group is one step deeper than a flat one.
+    /// `0` whenever tables hang off the database directly.
+    ///
+    /// **A count, not a length.** It used to be pixels — `level_indent()`, read in
+    /// the `dyn_container` builder for `SchemaState::Loaded` and carried as an
+    /// `f64`. floem wraps only a `dyn_container`'s key closure in an effect and
+    /// calls the builder outside it, so that read subscribed nothing and the value
+    /// froze at the scale the tree was built at: every row's `padding_left` is
+    /// `col_pad() + indent`, and on a live change to 160% `col_pad()` re-ran and
+    /// grew while `indent` stayed at 16 instead of 26 — the children of a schema
+    /// group 10px left of where the same call site would put them, per level,
+    /// while their parent row (whose indent is reactive on both terms) moved
+    /// without them. The schema panel is mounted for the life of the window, so
+    /// nothing rebuilt it; it self-healed on a collapse/expand, which is what made
+    /// it read as a glitch rather than a layout.
+    ///
+    /// Multiplied by [`level_indent`] *inside* each style closure, which is what
+    /// makes the length reactive again — and a count cannot be frozen at a scale
+    /// because it does not know about one.
+    indent_levels: u32,
     active_db: Memo<Option<String>>,
     context_menu: RwSignal<Option<CtxMenu>>,
     /// The active connection id + the app-wide DB-colour store, for the identity
@@ -1400,7 +1417,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 SchemaState::Failed(e) => info_row(e, theme::error).into_any(),
                 SchemaState::Loaded(schema) => {
                     let db = database.clone();
-                    let child_ctx = |indent: f64| SchemaTreeCtx {
+                    let child_ctx = |indent_levels: u32| SchemaTreeCtx {
                         ui: node_ui.clone(),
                         expanded,
                         filter,
@@ -1415,7 +1432,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         db_favorites,
                         dialect,
                         nav,
-                        indent,
+                        indent_levels,
                     };
                     // More than one PostgreSQL namespace → group the tables under a
                     // schema row each. A single-schema (or MySQL) database keeps the
@@ -1431,13 +1448,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         }
                         // `schema` is already the `Arc` out of `SchemaState`.
                         return v_stack_from_iter(visible.into_iter().map(move |ns| {
-                            schema_node(
-                                db.clone(),
-                                ns,
-                                schema.clone(),
-                                db_hit,
-                                child_ctx(level_indent()),
-                            )
+                            schema_node(db.clone(), ns, schema.clone(), db_hit, child_ctx(1))
                         }))
                         .style(|s| s.flex_col())
                         .into_any();
@@ -1455,7 +1466,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         schema.clone(),
                         db_hit,
                         filt.clone(),
-                        child_ctx(0.0),
+                        child_ctx(0),
                     );
                     if tables.is_empty() {
                         // Hide the node's body entirely while filtering with no
@@ -1475,7 +1486,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         v_stack_from_iter(
                             tables
                                 .into_iter()
-                                .map(move |t| table_node(db.clone(), t, child_ctx(0.0))),
+                                .map(move |t| table_node(db.clone(), t, child_ctx(0))),
                         )
                         .style(|s| s.flex_col()),
                         objects,
@@ -1707,7 +1718,7 @@ fn object_group_node(
         nav,
         context_menu,
         dialect,
-        indent,
+        indent_levels,
         ..
     } = ctx;
     let scope = match &scope_ns {
@@ -1779,7 +1790,8 @@ fn object_group_node(
             // level a table does: under the database when the tree is flat, and
             // one step under the namespace row when it isn't. `row_pad() + indent`
             // put it *level with* the namespace it belongs to.
-            let s = tree_row(s, row_pad() + level_indent() + indent).gap(theme::scaled(6.0));
+            let s = tree_row(s, row_pad() + level_indent() * (indent_levels + 1) as f64)
+                .gap(theme::scaled(6.0));
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -1826,7 +1838,7 @@ fn object_group_node(
                     dialect,
                     term.clone(),
                     nav,
-                    indent,
+                    indent_levels,
                 )
             }))
             .style(|s| s.flex_col())
@@ -1849,7 +1861,7 @@ fn object_row(
     dialect: SqlDialect,
     term: Option<String>,
     nav: Nav,
-    indent: f64,
+    indent_levels: u32,
 ) -> impl IntoView {
     let scope = match &scope_ns {
         Some(ns) => TableScope::Namespace(ns.as_str()),
@@ -1930,7 +1942,9 @@ fn object_row(
     .style({
         let hl = nav_key.clone();
         move |s| {
-            let s = tree_row(s, col_pad() + indent);
+            // `level_indent()` is multiplied *inside* the closure, so the length
+            // follows the scale — carrying it in as pixels is what froze it.
+            let s = tree_row(s, col_pad() + level_indent() * indent_levels as f64);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -2065,7 +2079,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         context_menu,
         dialect,
         nav,
-        indent,
+        indent_levels,
         ..
     } = ctx;
     // The active filter term to highlight in the table + column names (the tree
@@ -2177,7 +2191,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     .style({
         let hl = key.clone();
         move |s| {
-            let s = tree_row(s, row_pad() + level_indent() + indent);
+            let s = tree_row(s, row_pad() + level_indent() * (indent_levels + 1) as f64);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else if active_table.get().as_ref() == Some(&hl_source) {
@@ -2202,7 +2216,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             if !open {
                 return empty().into_any();
             }
-            let counts = count_row(col_count, key_count, indent);
+            let counts = count_row(col_count, key_count, indent_levels);
             let csrc = col_source.clone();
             let key_source = col_source.clone();
             let otc = open_table_col.clone();
@@ -2230,7 +2244,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                     otc.clone(),
                     cterm.clone(),
                     nav,
-                    indent,
+                    indent_levels,
                 )
             }))
             .style(|s| s.flex_col());
@@ -2251,7 +2265,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                         fk.columns.len() == names.len() && fk.columns.iter().eq(names.iter())
                     })
                     .map(|fk| fk.name.clone());
-                key_row(ix, context_menu, key_src.clone(), fk, nav, indent)
+                key_row(ix, context_menu, key_src.clone(), fk, nav, indent_levels)
             }))
             .style(|s| s.flex_col());
             v_stack((counts, cols_block, keys_block))
@@ -2264,7 +2278,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
 }
 
 // The "N cols · M keys" capsule row shown directly under a table's header.
-fn count_row(cols: usize, keys: usize, indent: f64) -> impl IntoView {
+fn count_row(cols: usize, keys: usize, indent_levels: u32) -> impl IntoView {
     h_stack((
         capsule(format!("{cols} {}", plural(cols, "col", "cols"))),
         capsule(format!("{keys} {}", plural(keys, "key", "keys"))),
@@ -2272,7 +2286,7 @@ fn count_row(cols: usize, keys: usize, indent: f64) -> impl IntoView {
     .style(move |s| {
         s.flex_row()
             .gap(theme::scaled(5.0))
-            .padding_left(leaf_pad() + indent)
+            .padding_left(leaf_pad() + level_indent() * indent_levels as f64)
             .margin_top(theme::scaled(6.0))
             .margin_bottom(theme::scaled(6.0))
     })
@@ -2335,7 +2349,7 @@ fn column_row(
     open_table_col: Rc<dyn Fn(TableSource, String)>,
     term: Option<String>,
     nav: Nav,
-    indent: f64,
+    indent_levels: u32,
 ) -> impl IntoView {
     let name = c.name;
     let ty = c.type_name;
@@ -2400,7 +2414,9 @@ fn column_row(
     .style({
         let hl = nav_key.clone();
         move |s| {
-            let s = tree_row(s, col_pad() + indent);
+            // `level_indent()` is multiplied *inside* the closure, so the length
+            // follows the scale — carrying it in as pixels is what froze it.
+            let s = tree_row(s, col_pad() + level_indent() * indent_levels as f64);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -2424,7 +2440,7 @@ fn key_row(
     // `nav` only for the context-menu mark — a key row takes no part in keyboard
     // navigation (see the style at the end).
     nav: Nav,
-    indent: f64,
+    indent_levels: u32,
 ) -> impl IntoView {
     let (database, table) = (source.database.clone(), source.display());
     let (color, tag) = if ix.is_primary() {
@@ -2486,7 +2502,13 @@ fn key_row(
     // it never shows a selection highlight either — it opens nowhere. The
     // context-menu mark is not that highlight: the row has a menu like any other,
     // and while it is open it says so.
-    .style(move |s| menu_mark(tree_row_static(s, col_pad() + indent), nav, &mark_key))
+    .style(move |s| {
+        menu_mark(
+            tree_row_static(s, col_pad() + level_indent() * indent_levels as f64),
+            nav,
+            &mark_key,
+        )
+    })
 }
 
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right
