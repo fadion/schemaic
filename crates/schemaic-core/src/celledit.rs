@@ -78,31 +78,50 @@ pub enum CellEditor {
 /// rendered back in the session zone so the cell re-reads as correct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Zoned {
-    /// The column **resolves** an offset: PostgreSQL `timestamptz`, and MySQL's
-    /// `TIMESTAMP`, which since 8.0.19 accepts `[+-]hh:mm` in a datetime literal
-    /// and converts it to the session zone. Writing an instant here without one
-    /// leaves the server to guess which zone the wall clock was in, and it
-    /// guesses its own.
+    /// The column resolves an offset **and every server that spells its type
+    /// this way accepts one in a literal**: PostgreSQL `timestamptz`. Writing an
+    /// instant here without one leaves the server to guess which zone the wall
+    /// clock was in, and it guesses its own.
     Offset,
-    /// The column has nowhere to put one and no zone to resolve it against:
-    /// MySQL `DATETIME`, PostgreSQL `timestamp without time zone` (which parses
-    /// an offset and **discards** it), SQLite's text stamps. The literal is
-    /// stored as written, so the wall clock is the whole of the value and an
-    /// offset would be noise at best.
+    /// The literal is stored as the wall clock it reads, so an offset is noise at
+    /// best: MySQL `DATETIME`, PostgreSQL `timestamp without time zone` (which
+    /// parses an offset and **discards** it), SQLite's text stamps — and MySQL's
+    /// `TIMESTAMP`, which is the one entry here that is a *compromise* rather
+    /// than a property of the type. See [`zoned_for_type`].
     Naive,
 }
 
 /// Does a datetime column resolve a UTC offset, or store the wall clock as
 /// written?
 ///
-/// Type name **and** dialect, because the same word means different things: PG's
-/// bare `timestamp` is zone-less while MySQL's `TIMESTAMP` is an instant stored
-/// in UTC and rendered in the session zone. `base` is the leading type token,
-/// lower-cased, as [`editor_for_type`] has it.
-fn zoned_for_type(base: &str, dialect: SqlDialect) -> Zoned {
+/// The answer is in the **type name** alone: only PostgreSQL's `timestamptz`
+/// (and its verbose spelling) both resolves an offset and is guaranteed to read
+/// one out of a literal. `base` is the leading type token, lower-cased, as
+/// [`editor_for_type`] has it.
+///
+/// **MySQL's `TIMESTAMP` is the case this deliberately gets wrong**, and it is
+/// worth stating why, because the type *does* resolve an offset — it is stored
+/// in UTC and rendered in the session zone, so a bare wall clock written to it
+/// means whatever the server is set to, and an offset would pin the instant. It
+/// cannot be sent one: `[+-]hh:mm` inside a datetime literal is MySQL 8.0.19 and
+/// later, and **MariaDB accepts no spelling of it at all** — `+02:00`, `+02`, an
+/// ISO `T` separator and `Z` each answer
+/// `ERROR 1292 (22007) Incorrect datetime value` (verified against MariaDB
+/// 10.11.14). [`SqlDialect`] is one variant for both servers and carries no
+/// version, so this layer cannot tell which it is talking to, and the two
+/// failures are not symmetric: withholding the offset stores a wrong instant
+/// only when the session zone differs from the client's, while sending one
+/// **fails the edit outright** on every MariaDB and every MySQL before 8.0.19.
+///
+/// The offset is therefore withheld — the same call `alter_clauses` makes when it
+/// emits `DROP CONSTRAINT` rather than MySQL 8's `DROP CHECK`: where one spelling
+/// works on both servers on this dialect and the other works on one, the choice
+/// is not a coin toss. Closing the remaining gap is not this function's to do: it
+/// needs the server's own `@@session.time_zone`, read on connect and carried to
+/// the write path, so the wall clock can be *converted* rather than annotated.
+fn zoned_for_type(base: &str) -> Zoned {
     match base {
         "timestamptz" | "timestamp with time zone" => Zoned::Offset,
-        "timestamp" if dialect == SqlDialect::MySql => Zoned::Offset,
         _ => Zoned::Naive,
     }
 }
@@ -220,11 +239,11 @@ pub fn editor_for_type(declared: &str, dialect: SqlDialect) -> CellEditor {
         }
         "date" => return CellEditor::Date,
         "datetime" | "timestamp" | "timestamptz" => {
-            return CellEditor::DateTime(zoned_for_type(base.as_str(), dialect));
+            return CellEditor::DateTime(zoned_for_type(base.as_str()));
         }
         // PostgreSQL's verbose spellings, which `format_type` really does return.
         "timestamp without time zone" | "timestamp with time zone" => {
-            return CellEditor::DateTime(zoned_for_type(base.as_str(), dialect));
+            return CellEditor::DateTime(zoned_for_type(base.as_str()));
         }
         _ => {}
     }
@@ -887,8 +906,7 @@ mod tests {
         CellEditor::DateTime(Zoned::Naive)
     }
 
-    /// One that resolves a UTC offset — MySQL `TIMESTAMP`, PostgreSQL
-    /// `timestamptz`.
+    /// One that resolves a UTC offset — PostgreSQL `timestamptz`.
     fn zoned() -> CellEditor {
         CellEditor::DateTime(Zoned::Offset)
     }
@@ -903,8 +921,9 @@ mod tests {
         use CellEditor::DateTime;
         assert_eq!(editor_for_type("date", MySql), CellEditor::Date);
         assert_eq!(editor_for_type("DATE", Sqlite), CellEditor::Date);
-        // MySQL: `DATETIME` stores the wall clock as written; `TIMESTAMP`
-        // resolves an offset and needs one.
+        // MySQL: both store the wall clock as written, for different reasons —
+        // `DATETIME` has nowhere to put an offset, `TIMESTAMP` has nowhere to
+        // *send* one that both MySQL and MariaDB will read.
         assert_eq!(editor_for_type("datetime", MySql), DateTime(Zoned::Naive));
         assert_eq!(
             editor_for_type("datetime(6)", MySql),
@@ -912,9 +931,9 @@ mod tests {
         );
         assert_eq!(
             editor_for_type("timestamp", MySql),
-            DateTime(Zoned::Offset),
-            "a MySQL TIMESTAMP is rendered in the session zone, so a bare wall \
-             clock written to it means whatever the *server* is set to"
+            DateTime(Zoned::Naive),
+            "a MySQL TIMESTAMP does resolve an offset, but no offset can be put \
+             in a literal MariaDB will accept — see `zoned_for_type`"
         );
         // PostgreSQL: the distinction is in the type's own name.
         assert_eq!(
@@ -1156,17 +1175,17 @@ mod tests {
         );
     }
 
-    /// **The destination decides the offset, not the old text.** A MySQL
-    /// `TIMESTAMP` is rendered in the session zone and so never carries a tail —
-    /// which is exactly the column that must be given one. Asking the value
-    /// instead ("did the old text have an offset?") answered *no* here, so
-    /// **Now** sent a bare client wall clock: server at `+00:00`, client at
-    /// `+02`, and the stored instant is two hours in the future, rendered back in
-    /// the session zone so the cell re-reads as correct.
+    /// **The destination decides the offset, not the old text.** A `timestamptz`
+    /// read back through a client that renders it without a tail — or a cell that
+    /// held nothing at all — still needs one, because the gate is the column and
+    /// not the string. Asking the value instead ("did the old text have an
+    /// offset?") answered *no* here, so **Now** sent a bare client wall clock and
+    /// the server resolved it against its own zone: client at `+02`, server at
+    /// UTC, and the stored instant is two hours from the one the button names.
     #[test]
     fn stamping_now_offsets_a_column_that_resolves_one_however_the_value_reads() {
         for current in [
-            // A MySQL `TIMESTAMP`, as the server renders it: no tail at all.
+            // A stamp with no tail, as several renderings hand it back.
             "2020-05-05 10:00:00",
             // A NULL cell switched to a value, or a pending row's blank.
             "",
@@ -1179,6 +1198,32 @@ mod tests {
                 "current = {current:?}"
             );
         }
+    }
+
+    /// **A MySQL `TIMESTAMP` is written as a bare wall clock**, because the
+    /// offset a literal would carry is not a thing every server on this dialect
+    /// can read. `[+-]hh:mm` in a datetime literal is MySQL 8.0.19 and later;
+    /// **MariaDB rejects every spelling of it** — verified against MariaDB
+    /// 10.11.14, which answers `ERROR 1292 (22007) Incorrect datetime value`
+    /// for `+02:00`, `+02`, a `T` separator and `Z` alike — and `SqlDialect`
+    /// cannot tell the two servers apart. So the tail stays off, and the cost is
+    /// the divergence [`Zoned`] describes: a server whose session `time_zone`
+    /// differs from the client's reads the wall clock as its own.
+    #[test]
+    fn a_mysql_timestamp_takes_no_offset_because_the_dialect_cannot_promise_one() {
+        assert_eq!(
+            editor_for_type("timestamp", MySql),
+            CellEditor::DateTime(Zoned::Naive)
+        );
+        assert_eq!(
+            set_now(
+                &editor_for_type("timestamp", MySql),
+                "2020-05-05 10:00:00",
+                now_at(9, 0, 0, "+02:00")
+            ),
+            "2024-01-15 09:00:00",
+            "an offset here is a literal MariaDB refuses outright"
+        );
     }
 
     /// And the other half of the same rule: a column with nowhere to put an
