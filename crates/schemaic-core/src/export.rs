@@ -1093,25 +1093,57 @@ pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<Strin
     Some(s)
 }
 
-/// What a failed export says. `partial` is the file name when the destination
-/// had already been created, and `None` when the export never got that far.
+/// The scratch name an export writes to before it is finished: the destination
+/// with `.part` after it.
 ///
-/// **A failure is the case where the user is least likely to look**, and it is
-/// the one where the file at that path is a fragment: the write opens with
-/// `File::create`, which truncates, so a stream that dies ten minutes in has
-/// already destroyed whatever was there. The `Cancelled` arm has always said
-/// this ("`Export cancelled — orders.csv is incomplete`") with a comment calling
-/// a silent partial file the thing that path is careful about; the failure arm
-/// said only what the engine said.
+/// **The destination is not opened until the export has succeeded.** It used to be
+/// opened first — `File::create` truncates — so a stream that died ten minutes in
+/// had already destroyed whatever the user was overwriting, and all the bar could
+/// do was say so. Writing a sibling and renaming it over the target on success is
+/// the dance `persist` already does for every config file, and it is atomic on
+/// both platforms *because it is a sibling*: a rename within one directory never
+/// crosses a filesystem.
+///
+/// A visible, self-describing suffix rather than a hidden temp file, because when
+/// an export does fail the fragment is the one thing the user may still want —
+/// it is left behind and named in the message rather than swept away.
+pub fn part_path(name: &str) -> String {
+    format!("{name}.part")
+}
+
+/// What a failed export says. `partial` is the destination's file name when the
+/// write had begun, and `None` when the export never got that far.
+///
+/// **A failure is the case where the user is least likely to look.** What it needs
+/// to say has changed with [`part_path`]: the destination is no longer touched
+/// until the export succeeds, so the sentence is no longer "your file is a
+/// fragment" but "your file is untouched, and the rows that did arrive are in the
+/// sibling". Both halves matter — the first is the reassurance, the second is
+/// where the partial went.
 ///
 /// `None` is not a formality: an export refused before the write starts (no
-/// connection, one already running) must not claim a file it never touched is
-/// incomplete.
+/// connection, one already running) must not mention a file at all.
 pub fn export_failure_note(message: &str, partial: Option<&str>) -> String {
     match partial {
-        Some(name) => format!("{message} — {name} is incomplete"),
+        Some(name) => format!(
+            "{message} — {name} was not changed; the rows that were written are in {}",
+            part_path(name)
+        ),
         None => message.to_string(),
     }
+}
+
+/// What a **cancelled** export says.
+///
+/// The same two facts as [`export_failure_note`], in the voice the cancel arm has
+/// always used: stopping was the user's own doing, so this is a note rather than an
+/// error. It said `— {name} is incomplete`, which was true when the destination was
+/// truncated at `t = 0` and is now the opposite of true.
+pub fn export_cancel_note(name: &str) -> String {
+    format!(
+        "Export cancelled — {name} was not changed; the rows that were written are in {}",
+        part_path(name)
+    )
 }
 
 /// The `All rows` menu entry's label: the scope's size, and every way the file
@@ -2263,21 +2295,70 @@ mod tests {
         assert!(msg.contains("; body too large to hold in full"), "{msg}");
     }
 
-    /// A failure leaves the destination truncated — `File::create` opened it
-    /// before the first row — and a failure is the case where the user is least
-    /// likely to look. The `Cancelled` arm has always said this; the failure arm
-    /// said only what the engine said. And an export refused *before* the write
-    /// must not claim a file it never touched.
+    /// **A failure leaves the destination alone**, which is the sentence's whole
+    /// job now: the rows go to a `.part` sibling and it is renamed over the target
+    /// only when the export finished, so the file the user was overwriting is
+    /// intact — and the rows that did arrive are still somewhere they can be had.
+    ///
+    /// It used to say `— orders.csv is incomplete`, which was true when
+    /// `File::create` truncated the destination at `t = 0` and is now the opposite
+    /// of true. And an export refused *before* the write still must not mention a
+    /// file at all.
     #[test]
-    fn a_failed_write_says_the_file_is_incomplete() {
+    fn a_failed_write_says_the_destination_survived_and_where_the_rows_went() {
+        let msg = export_failure_note("Export failed: No space left on device", Some("orders.csv"));
         assert_eq!(
-            export_failure_note("Export failed: No space left on device", Some("orders.csv")),
-            "Export failed: No space left on device — orders.csv is incomplete"
+            msg,
+            "Export failed: No space left on device — orders.csv was not changed; \
+             the rows that were written are in orders.csv.part"
         );
+        // The two facts, named rather than pattern-matched, so a reworded sentence
+        // that drops one of them fails here.
+        assert!(msg.contains("was not changed"), "{msg}");
+        assert!(msg.contains("orders.csv.part"), "{msg}");
+        assert!(
+            !msg.contains("is incomplete"),
+            "the destination is not a fragment any more: {msg}"
+        );
+
         assert_eq!(
             export_failure_note("An export is already running.", None),
             "An export is already running."
         );
+    }
+
+    /// The cancel arm says the same two things, in the voice it has always used —
+    /// stopping was the user's own doing, so it is a note and not an error.
+    #[test]
+    fn a_cancelled_export_says_the_same_two_things() {
+        let msg = export_cancel_note("orders.csv");
+        assert_eq!(
+            msg,
+            "Export cancelled — orders.csv was not changed; \
+             the rows that were written are in orders.csv.part"
+        );
+        assert!(msg.starts_with("Export cancelled"), "{msg}");
+        assert!(!msg.contains("is incomplete"), "{msg}");
+    }
+
+    /// The sibling is the destination plus a suffix and nothing cleverer — a
+    /// rename inside one directory is what makes the publish atomic, so the name
+    /// must not move the file anywhere.
+    #[test]
+    fn the_part_file_is_a_sibling_of_the_destination() {
+        assert_eq!(part_path("orders.csv"), "orders.csv.part");
+        // Extensions and dots in the stem are left exactly alone: the suffix is
+        // appended, never substituted, so nothing can collide with a real file the
+        // user has by having its extension replaced.
+        assert_eq!(part_path("a.b.c.json"), "a.b.c.json.part");
+        assert_eq!(part_path("no-extension"), "no-extension.part");
+        // No separator is introduced, on either platform's spelling.
+        for name in ["orders.csv", "a.b.c.json", "no-extension"] {
+            let p = part_path(name);
+            assert!(p.starts_with(name), "{p}");
+            assert!(!p[name.len()..].contains('/'), "{p}");
+            assert!(!p[name.len()..].contains('\\'), "{p}");
+        }
     }
 
     /// **Every way the file will differ from the screen, at the point of
