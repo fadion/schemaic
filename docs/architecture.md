@@ -4780,8 +4780,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   `editor_area`): built-in bars hidden (zero-`Thickness` + transparent `Handle`), two `empty()`
   thumbs pinned to the border (`inset_right/bottom(3)`) with `autohide_state()`. Geometry from
   `ed.viewport` (offset `x0`/`y0` + visible `width()`/`height()`) vs. content (`ed.max_line_width()`,
-  `(ed.last_line()+1) * ed.line_height(0)`; `ScrollBeyondLastLine` = false), in `v_geo`/`h_geo`
-  shared by the style closure and drag handler. Thumb `.style()` reads `viewport.get()` **and**
+  `(ed.last_vline()+1) * ed.line_height(0)`), in `v_geo`/`h_geo` shared by the style closure and drag
+  handler. **The vertical content is taller than the text**: the editor sets `ScrollBeyondLastLine`,
+  so Floem lays it out as `max(text, viewport)` plus a bottom margin of `min(viewport, text) − one
+  line` — the virtual space that lets the last row be scrolled up to the top, which makes the maximum
+  scroll `text − one line` whether or not the document overflows. `scrollbar_geo` (tested) adds that
+  margin back; measured against the text alone the thumb bottomed out a viewport early, and a
+  document that merely *fits* showed no bar while the wheel still moved it. Thumb `.style()` reads `viewport.get()` **and**
   `query.get()` (content size isn't a signal). **Draggable**: `PointerDown` records grab offset +
   `id.request_active()` (pointer capture); each `PointerMove` sets `ed.scroll_to.set(Some(Vec2))`
   (it's `Option<Vec2>`, not `Point`). Thumbs use `scrollbar_hover()` + `CursorStyle::Default`.
