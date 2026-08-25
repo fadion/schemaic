@@ -305,14 +305,43 @@ pub fn type_is_bit(type_name: &str) -> bool {
 /// a NULL long before it reaches here, so the only caller of this with nothing to
 /// read is a server that sent nothing.
 pub fn bit_display(bytes: &[u8]) -> String {
+    bit_value(bytes).to_string()
+}
+
+/// [`bit_display`]'s answer **before** it becomes text — the number itself.
+///
+/// The distinction is not cosmetic. A `Value::Str("10")` and a `Value::UInt(10)`
+/// look identical in the grid and are different data everywhere else: the SQL
+/// export quotes every `Value::Str`, and `'10'` assigned to a MySQL `BIT`
+/// column is not the number 10 — `Field_bit::store(const char*, …)` takes the
+/// raw bits of the *bytes*, so `'10'` is `0x3132` = 12594 on a `BIT(16)` and
+/// "Data too long" on a `BIT(8)`. The claim in this module's own doc — that a
+/// bit-field has a lossless text form, "the form it takes back (`b = 10`
+/// assigns a `BIT(8)`)" — is true of the bare token `10` and false of `'10'`,
+/// which was the only thing an export could emit for a string.
+///
+/// So the conversion belongs at the wire, where the type is known, and the
+/// number carries from there: `Value::UInt` reaches `sql_literal` as a bare
+/// number, JSON as a number, and the grid as the same digits `bit_display`
+/// wrote.
+pub fn bit_value(bytes: &[u8]) -> u64 {
     let tail = if bytes.len() > 8 {
         &bytes[bytes.len() - 8..]
     } else {
         bytes
     };
-    tail.iter()
-        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
-        .to_string()
+    tail.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+}
+
+/// The [`Value`] a bit-field's bytes become — what the MySQL loader stores for a
+/// `BIT` column.
+///
+/// A named function rather than two words inside the loader's `match`, so the
+/// seam that broke is reachable from a test: the fault was never in
+/// [`bit_value`], which was right and had a table of tests, but in the *variant*
+/// its answer was wrapped in on the way to an exporter.
+pub fn bit_cell(bytes: &[u8]) -> Value {
+    Value::UInt(bit_value(bytes))
 }
 
 /// Does this SQL type name name a raw-bytes column, in any of the three engines?
@@ -553,6 +582,27 @@ pub struct ResultSet {
     /// about *rows* and says nothing about this: a user whose cells go empty at
     /// row 180,000 otherwise has no way to learn why.
     pub capped_columns: Vec<usize>,
+    /// Indices of columns the **backend saw raw bytes in**, whatever the column
+    /// claimed to be.
+    ///
+    /// The backend's assertion, not a guess from a type name, and it exists
+    /// because on one engine the type name cannot answer. A SQLite result column
+    /// carries `origin: None` and `decl_type()` — an *affinity*, or nothing at
+    /// all: `CREATE TABLE files(id INTEGER PRIMARY KEY, data)` is legal and is
+    /// the ordinary shape for a blob store, and a computed column
+    /// (`SELECT zeroblob(4)`) has no declared type either. So
+    /// [`Column::is_binary`] is `false` for it, the export's two-signal rule
+    /// degenerates to "never withhold", and the `<n bytes>` placeholder went into
+    /// CSV, JSON **and** SQL as though it were the data — the one place the
+    /// placeholder is certainly not a user's prose is exactly where the guard
+    /// refused to act.
+    ///
+    /// Set per value (`ValueRef::Blob` is not a heuristic) and reported per
+    /// *column*, since that is the grain everything downstream asks at. A column
+    /// marked here is still tested per cell against
+    /// [`is_binary_display`] before anything is withheld, so a row of real text
+    /// in a column that held a blob elsewhere is untouched.
+    pub binary_columns: Vec<usize>,
     /// For a statement that returns no result set (UPDATE/INSERT/DELETE/DDL),
     /// the number of rows the server reports affected. `None` for a row-
     /// returning result (a SELECT grid), so the UI can tell the two apart.
@@ -720,6 +770,9 @@ pub struct ResultBuilder {
     n_rows: usize,
     elapsed_ms: u128,
     truncated: bool,
+    /// Per column: has the backend put raw bytes in it? See
+    /// [`ResultSet::binary_columns`].
+    binary: Vec<bool>,
 }
 
 impl ResultBuilder {
@@ -732,11 +785,22 @@ impl ResultBuilder {
             .map(|_| ColumnData::with_capacity(rows))
             .collect();
         ResultBuilder {
+            binary: vec![false; columns.len()],
             columns,
             cols,
             n_rows: 0,
             elapsed_ms: 0,
             truncated: false,
+        }
+    }
+
+    /// Record that column `ci` carried raw bytes — the backend's own assertion,
+    /// made where the wire value is still in hand. See
+    /// [`ResultSet::binary_columns`] for why a type name cannot answer this on
+    /// every engine.
+    pub fn mark_binary(&mut self, ci: usize) {
+        if let Some(slot) = self.binary.get_mut(ci) {
+            *slot = true;
         }
     }
 
@@ -776,7 +840,14 @@ impl ResultBuilder {
     /// every N rows pays one allocation per column per chunk rather than growing
     /// from empty each time.
     pub fn take_chunk(&mut self, capacity: usize) -> ResultSet {
-        let next = ResultBuilder::with_capacity(self.columns.clone(), capacity);
+        let mut next = ResultBuilder::with_capacity(self.columns.clone(), capacity);
+        // **Carried forward, unlike `capped_columns`.** That one is a property of
+        // the chunk's own arena; this one is a property of the *column* — a blob
+        // in block 3 says the column holds bytes, and the placeholder text a
+        // later block writes for it must be withheld on the same grounds. The
+        // blocks already flushed keep their own answer, which is exactly how the
+        // SQL emitter treats a column that only starts dropping later.
+        next.binary = self.binary.clone();
         let mut done = std::mem::replace(self, next);
         // The elapsed time belongs to the whole load, not to a chunk of it; a
         // per-chunk figure would be meaningless and the caller stamps the total
@@ -803,8 +874,16 @@ impl ResultBuilder {
             .filter(|(_, c)| c.capped)
             .map(|(i, _)| i)
             .collect();
+        let binary_columns = self
+            .binary
+            .iter()
+            .enumerate()
+            .filter(|(_, seen)| **seen)
+            .map(|(i, _)| i)
+            .collect();
         ResultSet {
             capped_columns,
+            binary_columns,
             columns: self.columns,
             // One `Arc` per column, allocated once here at the end of the load —
             // see [`ResultSet`] for why the columns are shared individually.
