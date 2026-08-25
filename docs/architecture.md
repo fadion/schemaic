@@ -413,6 +413,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `a_real_key_still_wins_over_a_projected_implicit_one` and
     `refetch_template_keys_on_the_implicit_key` — the last because a read-only key column is still
     part of the row the splice re-reads.
+    **The staged-cells → `RowEdit` grouping is here for the same reason, and it is the step a paste
+    stresses.** `build_edits(model, rs, dirty)` folds a `DirtyCells` map — `(data row, result
+    column) → new value`, `None` being SQL NULL, the shape `GridState::dirty` holds — into one
+    `RowEdit` per (base table, data row) via `row_edit_for`, which builds the `SET` list and the
+    `WHERE` key off the row's *original* values; `origin_column` is the one reader of a result
+    column's real name on its base table. `GridState::build_edits` is now a thin wrapper over it. A
+    typed edit stages a single cell, so every fixture this family has ever had carried one `SET`
+    column and one key column, while a paste stages a rectangle — and grouping that rectangle is
+    exactly what stands between it and `GridWrite::plan`'s 1-row safety net. The grouping lived in
+    `GridState`, which no test can construct, so the chain paste → `dirty` → these edits → `plan` →
+    `one_row_verdict` was untested end to end. The `BTreeMap` and `row_edit_for`'s sorted `SET` list
+    are load-bearing rather than tidiness: a failing commit has to reproduce identically.
     **Three grid gestures resolve to a decision here rather than in the view.**
     `selected_data_rows(order, selection, pos)` is what a gutter gesture acts on: the highlighted
     range when the click landed inside it, otherwise the row it pointed at alone, mapped through the
@@ -548,9 +560,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     it once. Neither loss is an error — the file is written and the rows in it are real — so the one
     thing that must not happen is the caveat going unsaid, which is `export_note(tally, name,
     streaming)`'s job: silent for a clean non-streamed save, and never silent when there is a caveat.
-    `export_failure_note(message, partial)` is the same rule on the other side, appending
-    `— <name> is incomplete` when the destination had already been created (`File::create`
-    truncates) and saying nothing extra when the export was refused before the write started. And
+    `export_failure_note(message, partial)` is the same rule on the other side, and what it has to
+    say changed with `part_path`: the destination is no longer opened until the export succeeds, so
+    the sentence is not "your file is a fragment" but `— <name> was not changed; the rows that were
+    written are in <name>.part` — the reassurance and where the partial went, in one line — while a
+    `partial` of `None`, an export refused before the write started, still says nothing extra.
+    `export_cancel_note(name)` is the same two facts in the cancel arm's voice, a note rather than
+    an error because stopping was the user's own doing. And
     `all_rows_label(size, sorted, manual_tx)` is the Download menu's `All rows` entry, three
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
   - `import.rs` — the inverse of `export.rs`: CSV/TSV + JSON (array *or* NDJSON) → table. Format
@@ -1370,8 +1386,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ROLLBACK` gets out), MySQL survives a failed statement but silently commits on mid-transaction
     DDL. `implicit_commit` is that list, read through the shared `leading_keyword` lexer; a **miss
     is not harmless** — after one, a Rollback runs as a successful no-op and reports an undo that
-    never happened. `StmtOutcome::FailedIsolated` is what a `SAVEPOINT`-wrapped grid write reports,
-    and it must not poison PostgreSQL, or one bad cell edit would tell the user their whole
+    never happened. **For a statement that *failed*, the list is necessary but not sufficient**, and
+    `failure_committed(engine, sql, tx_alive)` is the pair: MySQL's implicit commit sits between the
+    parser and the executor, so a parsed-but-rejected `DROP TABLE nosuch` (`ERROR 1051`) has
+    committed while a syntax error over the same leading keyword (`ALTER TABLE t GARBAGE`,
+    `ERROR 1064`) has not — verified against MariaDB 10.11.14, where `@@in_transaction` reads `0`
+    and `1` respectively. Only the server can tell those apart, so the text is consulted first (the
+    round trip is paid only where the answer could matter) and `tx_alive` decides;
+    `None` — not asked, or the server could not answer — keeps the conservative reading that was
+    there before the probe, rather than trading a silent no-op Rollback for its mirror, a pill
+    saying *Idle* over a transaction whose next statement's `BEGIN` would commit it.
+    `StmtOutcome::FailedAndCommitted` is the confirmed case and the only outcome `failed_message`
+    appends its disclosure to, because that loss is otherwise invisible: the statements folded in are
+    already permanent, **Rollback** succeeds and undoes nothing, and the pill going quiet is the
+    only thing on screen that moved. `StmtOutcome::NotSent` is the opposite error — a run cancelled
+    (by the user or by the statement timeout) while still *queued* behind the tab's own connection,
+    which never reached the server at all. It is reported apart from `Cancelled`, which now means
+    strictly *dispatched and killed*, because the two have opposite consequences on PostgreSQL:
+    folding the second as the first put **Tx aborted — rollback to continue** over a healthy
+    transaction and offered discarding work as the only way on. `timeout_reached` is the same
+    distinction for the watchdog, which is armed around the whole run — connect, `BEGIN`, statement,
+    rows — deliberately, so its flag answers "did the clock run out" and not "what ran too long";
+    `not_sent_message` is what such a run says instead, and its load-bearing half is that the
+    transaction is untouched. `StmtOutcome::FailedIsolated` is what a `SAVEPOINT`-wrapped grid
+    write reports, and it must not poison PostgreSQL, or one bad cell edit would tell the user their whole
     transaction died. `pill_text` is the status-bar string. It also owns what the user is told
     while a write **waits**: `write_blocking_tabs` (which of our own tabs' transactions a grid
     write could be queued behind — same connection scope as `ddl_blocking_tabs`, but excluding
@@ -1703,10 +1741,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `toggle_set_member`, which re-emits a `SET` in **declaration order** because that is the order
     MySQL stores and returns one in.
     **An offset is a property of the destination, not text carried from the old value.**
-    `CellEditor::DateTime` carries `Zoned::{Offset, Naive}`, decided by type name *and* dialect
-    (`zoned_for_type`), because the same word means different things on two engines: a MySQL
-    `TIMESTAMP` and a PostgreSQL `timestamptz` resolve an offset, while a MySQL `DATETIME`,
-    PostgreSQL's bare `timestamp` (which parses one and *discards* it) and SQLite's text stamps have
+    `CellEditor::DateTime` carries `Zoned::{Offset, Naive}`, decided by the **type name alone**
+    (`zoned_for_type` takes no dialect): only PostgreSQL's `timestamptz` — and its verbose
+    spelling — resolves an offset, while a MySQL `DATETIME`, PostgreSQL's bare `timestamp` (which
+    parses one and *discards* it) and SQLite's text stamps have
     nowhere to put one. `set_now` asks the destination, where the gate used to be "did the old text
     carry a tail" — which reads `false` for exactly the column that most needs an offset, since a
     MySQL `TIMESTAMP` is rendered in the session zone with no tail at all. So **Now** sent a client
@@ -1716,10 +1754,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     this instant's. `set_date` drops the offset on **both** flavours of column, because an offset
     qualifies a particular instant: `+01` on a Berlin `timestamptz` is true in January and false in
     July, so carrying it onto a picked July day restates the time of day an hour out and changes the
-    one thing the user did not touch. **The assumption worth recording**: `[+-]hh:mm` inside a
-    datetime literal is MySQL 8.0.19+, so on MariaDB or an older MySQL a `TIMESTAMP` **Now** will now
-    fail loudly where it used to store a wrong instant silently. That is the intended trade, and it
-    is on the release's live-check list. The `ENUM`/`SET` member list is parsed off the type text
+    one thing the user did not touch. **MySQL's `TIMESTAMP` is the one entry this deliberately gets
+    wrong**, and it is `Zoned::Naive` on purpose: the type *does* resolve an offset — stored in UTC,
+    rendered in the session zone — but there is no offset it can be sent that every server on this
+    dialect reads. `[+-]hh:mm` inside a datetime literal is MySQL 8.0.19+, and **MariaDB accepts no
+    spelling of it at all**: `+02:00`, `+02`, an ISO `T` separator and `Z` each answer
+    `ERROR 1292 (22007) Incorrect datetime value` on MariaDB 10.11.14, and `SqlDialect` is one
+    variant for both servers with no version in it. The two failures are not symmetric — withholding
+    the offset stores a wrong instant only where the server's session zone differs from the
+    client's, while sending one *fails the edit outright* on every MariaDB — which is the same call
+    `alter_clauses` makes in emitting `DROP CONSTRAINT` over MySQL 8's `DROP CHECK`. The residual
+    divergence is the acknowledged cost, and closing it is not this layer's to do: it needs the
+    server's own `@@session.time_zone`, read on connect and carried to the write path, so the wall
+    clock can be *converted* rather than annotated
+    (`a_mysql_timestamp_takes_no_offset_because_the_dialect_cannot_promise_one` pins the choice).
+    The `ENUM`/`SET` member list is parsed off the type text
     through `sql::skip_noncode` — the one boundary lexer — and unescaped as the exact inverse of
     `export::sql_literal`, since splitting on commas loses a member containing one.
   - `date.rs` — civil dates, clock times, and the month grid a picker draws. `Date`/`Time` are
@@ -2232,6 +2281,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   plus `reloptions` for the storage params a replace would reset (`pg_view_options`) — all
   folded on *after* the shared `assemble_schema` (which both engines share and neither's
   extras belong in).
+  **One read reports one result set, and both engines now agree on that.** A PostgreSQL simple query
+  is one string and the server will happily run every statement in it — the MCP server hands one
+  straight through and nothing upstream splits it — so `pg::run_statement` counts the
+  `RowDescription` messages, the only boundary marker on that stream, and stops at the second. It
+  used to fall through the `_ => {}` arm that `SimpleQueryMessage`'s `#[non_exhaustive]` requires, so
+  the second set's rows were pushed through the *first* set's columns and cell kinds: reproduced live
+  through `Db::fetch_query`, a two-statement string came back as 3 rows under one column header, the
+  third being 1,282 characters of hex from a `bytea` read under set one's `INT4` — the case `pg_cell`
+  exists to prevent. That is the answer MySQL's `collect_rows` has always given by construction, and
+  breaking out is safe for the same reason the row cap's `break` is: the driver's connection task
+  keeps paging, so the connection stays reusable, which a Manual-mode tab depends on. The
+  non-exhaustive arm stays, and the question to ask of anything new arriving there is whether it
+  carries a boundary or a column list, because those are what the loop's state rests on. The
+  column-metadata `PREPARE` describes `sql::first_statement(sql, PG)` rather than the whole string
+  for the same reason: `Parse` takes a single command, so a multi-statement string cannot be prepared
+  at all, and a failed prepare leaves every `type_name` empty — an empty type name is an unknown
+  `CellKind`, which is how the `bytea` came to be read as text in the first place. For a single
+  statement it is the same string and the same one round trip, terminator included.
   `fetch_query`/`stream_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/
   `prepare_check`
   (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`fetch_table_stats`/
@@ -2333,7 +2400,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   atomicity**: PostgreSQL runs the whole plan in one transaction (transactional DDL), MySQL runs
   it sequentially and reports which statement failed *and how many already stuck*
   (`DdlError::applied`) — every MySQL DDL statement commits implicitly, so a transaction there
-  would be theatre. **SQLite's DDL is transactional too**, so `sqlite::run_ddl` wraps the whole
+  would be theatre. **`applied` counts what *applied*, which is not what succeeded**
+  (`ddl::applied_count` over `ddl::alters_the_database`, whose whole test is that the leading
+  keyword is not `SET`): a MySQL routine, trigger or event edit is emitted inside a session guard,
+  and every one of those wrapper statements sets a session variable on a connection the runner
+  disconnects a line later. Counting them had a rejected `ALTER EVENT` report *2 earlier statements
+  already applied and cannot be rolled back* when nothing had been — over the app's only disclosure
+  of a genuinely half-applied migration, which is the one number here that must never be inflated.
+  The decision is in `core::ddl` rather than a counter in the runner because it is a decision about
+  emitted SQL and the runner has only strings, which is exactly how the scaffolding came to be
+  counted; `a_session_guard_is_not_a_statement_that_applied_anything` composes it with the emitters,
+  so an emitter that starts producing a real `SET` fails there instead of quietly under-counting.
+  **`DdlError::at` deliberately did not change**: it stays an ordinal over the whole emitted plan,
+  scaffolding included, because that is the script the preview panel shows and a "statement 3" that
+  disagreed with what is on screen would be a second wrong number rather than a fix for the first.
+  **SQLite's DDL is transactional too**, so `sqlite::run_ddl` wraps the whole
   plan in one and rolls it back whole, which is why every `DdlError` from that backend carries
   `applied: 0` — a half-applied plan is a state this engine never leaves behind, so there is no
   partial progress for the report to admit to (`sqlite::ddl_tests`, over in-memory SQLite). That
@@ -2487,7 +2568,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `spawn_blocking` and opens its own connection there — which is not a compromise but exactly the
   one-connection-per-operation invariant, at microsecond cost on a local file; cancellation goes
   through `Connection::get_interrupt_handle`, the analogue of `KILL QUERY` that needs no second
-  connection. **Values are dynamically typed**: a declared type is an *affinity*, so `value_of`
+  connection. **A long read blocks a write here, and on neither other engine** — SQLite takes one
+  write lock over the whole file, so a whole-table export or import holds a write off until it
+  finishes. Measured against a real 53 MB file in rollback-journal mode (`journal_mode = delete`,
+  the default for a file not already in WAL): a `stream_query` over 400,000 rows drained slowly,
+  with an `UPDATE` on a second connection issued a quarter-second in, **waited 3,495 ms and then
+  succeeded** when the export finished inside the busy timeout and **failed after 5,536 ms** when it
+  did not. **How long a write waits is this app's number, not the driver's**: `open` sets
+  `busy_timeout` to 15 s explicitly, where rusqlite's own 5 s was an implementation detail the app's
+  behaviour rested on — both figures above are that default, and both move if it changes. Fifteen,
+  because the band between 5 and 15 is where a wait actually *resolves* (a chunk flush, a commit, an
+  import's transaction), while past it the blocker is a read as long as the table is big and waiting
+  minutes with no way to cancel is worse than a refusal that says why. That refusal is
+  `query_err` appending `LOCK_ADVICE` on `SQLITE_BUSY`/`SQLITE_LOCKED`, read off `ErrorCode` and
+  never matched in the message text (`is_lock_failure`) so a reworded SQLite build cannot quietly
+  drop it: the engine's own sentence is *database is locked*, which names neither the user's other
+  operation nor the way out, and someone who has only met two MVCC engines has no reason to connect a
+  failed cell edit to the export running in another tab. **WAL is named rather than applied** — the
+  advice spells out `PRAGMA journal_mode = WAL` and says Schemaic will not run it, because
+  `journal_mode` is a persistent property of the user's file, it adds `-wal`/`-shm` siblings, and it
+  is unavailable on some filesystems; changing someone's database as a side effect of a failed cell
+  edit is not this layer's call. `db::lock_wait_sql` answers the empty string here for the matching
+  reason: SQLite has no lock-timeout *setting*, the wait being this per-connection busy timeout, so
+  the failure that statement bounds elsewhere has no analogue. **Values are dynamically typed**: a declared type is an *affinity*, so `value_of`
   reads the storage class of the value in front of it rather than trusting the column, and a BLOB
   renders as its size, having no lossless text form. **Column provenance is not available from the
   driver at all** — SQLite's C API has `sqlite3_column_table_name`, but only under
@@ -2779,7 +2882,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Left-click is inert on purpose**: everything a row offers ends someone else's work, so
     both kills live in the right-click menu (with *Cancel query* dimmed rather than absent on a
     session with nothing running, so the menu keeps one shape), and the confirm is raised by the
-    *app*, not here, so no route to a kill can skip it. The clock in the title bar wears the same grey as
+    *app*, not here, so no route to a kill can skip it. **The lock-wait banner's Kill is the one that
+    answers the keyboard**, through `widgets::key_pressable` — navigable, Enter and Space press it —
+    because it is built by hand rather than through `widgets::action_button`, whose family is the
+    modal-footer one and needs a `FocusRing` this panel has none of. It carries the id it will kill in
+    its label: a button reading just *Kill* on a panel where several sessions are killable is the one
+    misread that cannot be undone. The **per-row** Kill and Cancel hang off a right-click menu with no
+    keyboard opener and are still pointer-only, which is why `README.md`'s accessibility sentence was
+    narrowed to claim only what is true. The clock in the title bar wears the same grey as
     the refresh icon beside it: it was tinted while polling, on the reasoning that "Off" and "every
     2s" look identical between ticks, but two icons a few pixels apart in different colours read as
     one of them being *active* in the toggle sense. The interval is stated where a state belongs —
@@ -3000,6 +3110,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     since it lies across the bottom edge of all three buttons and a 1px sibling on top of a control
     still ends the walk. That flag's usual objection (it takes the subtree with it) costs nothing
     on a view with no children.
+    **A press on the chrome hands the keyboard back**, deferred, after a title-bar drag and after a
+    caption press (`give_the_keyboard_back` → `widgets::hand_keyboard_back(None)`). Floem clears
+    focus at the top of *every* `PointerDown` dispatch and only a `keyboard_navigable` view re-takes
+    it during the walk that follows; the band and the caption buttons are neither navigable nor
+    inside anything that is, so a press on them left focus at `None`. Inside the app that is
+    invisible, since the window root's own listeners still see the key — over a **modal** it is not,
+    because the modal's `focus_root` requests focus once on build and nothing re-requests it, so the
+    panel went keyboard-dead: its ✕ and Cancel still worked, Tab recovered through the root's ring
+    backstop, and **Escape has no equivalent backstop**, so the one keyboard route out of the modal
+    was gone until the panel was clicked. `None` is the argument because that call already resolves
+    the innermost mounted focus root and falls back to the workspace's keyboard home, so the chrome
+    needs to know neither. Deferred because the clear happens *before* the listeners run, so a
+    request inside the same dispatch would be undone by it. **Close is excluded** — it is the one
+    press after which there is no window to hand a keyboard back to.
   - `trigger_editor.rs` — the **trigger** modal, over `core::ddl`'s
     `TriggerSetDraft`. Reached from the schema context menu's per-table
     **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
@@ -3094,6 +3218,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     shows the quotes. The Status dropdown offers Enabled and Disabled plus, for an event already in
     it, the replica state — offering `DISABLE ON SLAVE` freely would be offering a keyword MySQL
     8.4 has removed, while hiding it would show "Enabled" over an event that isn't.
+    **A dropdown that offers "the standard list, plus whatever this event already uses" has to read
+    the second half from what the *server* reported**, not from the draft: `status_choices` and
+    `interval_units` both take `ui.ddl.event`'s `target.current` alongside the draft value, because
+    the form is torn down and rebuilt whenever the preview opens or closes. Seeded from the draft
+    alone, moving a `SLAVESIDE_DISABLED` event to Enabled, editing its body, pressing Preview and
+    coming back left the list reading `Enabled / Disabled` — "Disabled on replica" gone, no other
+    producer of `EventStatus` in the view, and the only way back to the state the event is actually
+    in being Cancel and reopen, which throws away every edit made in the same sitting since `open`
+    replaces the draft wholesale. `interval_units` is fixed with it rather than left as the one found
+    next time (`EVENT_INTERVAL_UNITS` is exactly MySQL's documented fifteen, so nothing is reachable
+    through it today), and it compares case-insensitively — the server's spelling is its own, and a
+    duplicate differing only in case is a list with two identical-looking rows.
     **That state has two spellings and `EventStatus` keeps them apart** (`SlavesideDisabled` /
     `ReplicaDisabled`), because the word the server reported in
     `information_schema.EVENTS.STATUS` is the only signal for which keyword it will accept back:
@@ -3167,8 +3303,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     looks like it belongs on the other side of that line — it is a palette, and a click away
     closes it — and it is the reason the line is drawn where it is: mounted with the menus, its
     backdrop covered the title bar, and a press aimed at the caption buttons found the click-away
-    instead, so the only thing the window did was dismiss the palette. Its `FIND_TOP` is measured
-    from the top of the *window*, so the layer's `HEADER_H` comes off it where the margin is set.
+    instead, so the only thing the window did was dismiss the palette. Its `find_top()` is measured
+    from the top of the *window*, so the layer's `header_h()` comes off it where the margin is set —
+    and it is **scaled, because what it is subtracted from is**: as a literal `80` against a
+    `header_h()` that grows, the gap under the title bar ran 48 / 40 / 28 / 16px across the four
+    scales, shrinking as everything around it grew, which is the inversion no reader of the number
+    would predict. `menu_icon_tuck()` and `menu_edge_pad()` are functions for the same reason — an
+    offset frozen between two growing boxes is not an offset but a drift, and at 160% a 154px panel
+    tucked by a literal 30 landed its right edge ~18px inside the icon instead of flush past it.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav). The standalone objects hang off the same levels the tables do, in
     `Types`/`Domains`/`Sequences`/`Functions`/`Procedures` folders after them
@@ -3343,7 +3485,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **calendar** is a panel in the window's own overlay layer (`DatePick` →
     `overlays::date_pick_overlay`), placed by the pure `calendar_insets` against a `calendar_size`
     that is *computed, not measured* — which is what makes its edge flips exact rather than
-    estimated. Its `DatePick::anchor` carries **both** vertical edges of the control, unlike
+    estimated. **Every length in that computation is the same function the panel's own style calls**
+    — `calendar_pad`, `calendar_gap`, `calendar_band_h`, `calendar_headings_h`, `day_w`/`day_h` and
+    `CALENDAR_BORDER` — because both were literals in two places and a scale sweep moved only one of
+    them: the style call scaled and the measurement did not, so above Normal the panel was *declared
+    smaller than its own contents*, which does not clip but overflows the background and the border,
+    and makes the edge flip an under-estimate at the same time. The border is the one term that stays
+    a `const`, being a hairline at every scale — the same distinction `menu_panel_height` draws, and
+    `calendar_size` had it backwards, scaling its boxes and treating its air as the hairline. Its
+    `DatePick::anchor` carries **both** vertical edges of the control, unlike
     `PopupAnchor::BelowBox`'s three numbers, because it flips through `widgets::box_menu_inset`:
     down from the control's bottom, up from its **top**. The row panel is a strip at the bottom of
     the results area, so the flip is the common case there, and a panel measured from the bottom
@@ -4484,7 +4634,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`). Never hand-roll a second
   scanner — five drifting copies was the original bug. **It's dialect-aware:** `skip_noncode`/
-  `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`,
+  `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`/
+  `first_statement`,
   `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
   `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
   is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`; SQLite takes `"x"`,
@@ -4565,7 +4716,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   In-transaction writes nest under a `SAVEPOINT` (`TxScope`) so the 1-row guard can roll back its own
   batch without ending the user's transaction, and the transaction *state* is the pure, tested
   `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on
-  DDL) belongs there, not in UI conditionals.
+  DDL) belongs there, not in UI conditionals. **The one thing the session asks the server rather
+  than the statement text** is whether a failed statement left the transaction alive: `tx_alive`
+  (private to `session.rs`) tries `@@in_transaction` — MariaDB's, exact, no privilege needed, counts
+  a read-only transaction — and falls back to a scoped `information_schema.INNODB_TRX` count, which
+  both servers have and which needs the `PROCESS` privilege the Server Activity panel already
+  assumes. It misses a transaction that has done no InnoDB work, which is harmless here because one
+  with nothing in it has nothing to lose. Neither answering yields `None` and the conservative
+  reading; PostgreSQL is not asked at all, its DDL being transactional and its failure state already
+  exactly `Poisoned`. This is the wire-status answer `implicit_commit`'s own doc names as the thing
+  that would replace its keyword guess, so it is asked only where the guess is not good enough.
+  `Session::fetch_query` also checks the cancellation token **twice** — before taking the session
+  lock and again after — because the lock *is* the wait: a `commit_writes` or the re-fetch after one
+  can hold this connection for minutes, and a run queued behind it that the user or the statement
+  timeout cancels never reaches the server. That is what makes `StmtOutcome::NotSent` reachable, and
+  it also makes the outcome deterministic, since every arm below ends in a `tokio::select!` against
+  `cancelled()` and `select!` polls ready branches in **random order** — the same coin flip
+  `sqlite`'s `refuse_if_cancelled` documents from a real CI failure.
   **Schema-editing DDL is the case that fits neither half** — it is the tab's own work *and* a write,
   so it takes the fresh connection and then queues there behind the lock the tab's own uncommitted
   `SELECT` holds. Two things keep that from being an unexplained hang, and a new write path off the
@@ -4635,10 +4802,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   factor. One more exception is a *shape* rather than a name, and no textual sweep can find it: a
   `border_radius` that is **half a scaled box** is a circle or a pill, not a shape constant, so it
   has to move with the box — a `scaled(8.0)` dot with a fixed 4px radius is a rounded square at 160%,
-  in a list where the dot is the only colour cue. Five sites crate-wide: the connection colour dot,
-  the jump-to-bottom circle in `widgets.rs` and `properties.rs`'s
-  `bar_h() / 2.0` derive the radius from the box, while the connection-form swatch and
-  `settings::themed_toggle`'s track are both still a literal `9.0` over a `scaled(18.0)` box. It is
+  in a list where the dot is the only colour cue. Five sites crate-wide, and all five now derive the
+  radius from the box they round: the connection colour dot (`dot / 2.0`), the jump-to-bottom circle
+  in `widgets.rs`, `properties.rs`'s `bar_h() / 2.0`, `connection_form`'s colour swatches
+  (`box_w / 2.0` over a `scaled(18.0)` box) and `settings::themed_toggle`'s track
+  (`track_h / 2.0`) — the last two were a literal `9.0`, which is a rounded square at 160%. It is
   *not* the `SEGMENT_RADIUS` case (a shape inside a box that scales), and grepping for an unwrapped
   literal cannot tell the two apart.
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
@@ -4887,7 +5055,17 @@ Re-introducing the anti-patterns these guard against is a regression:
     `modal_h` for a fixed-height panel, `modal_body_h` for a scrolling body inside one. All three
     read `window_size()` inside the caller's style closure, so a resize re-runs them, and all three
     clamp their own floor to the window (a *scaled* floor passes 500px, and one wider than the
-    screen would clip through the guard meant to keep the panel usable).
+    screen would clip through the guard meant to keep the panel usable). **On the vertical axis the
+    extent is the modal *layer*, not the window** (`cap_to_window` measures `modal_layer_h()` — the
+    window less `header_h()`): since `07bda98` every modal hangs in a layer inset by exactly the
+    `scaled(40.0)` that is also `modal_h`'s reserve, so measured against the window the layer spent
+    the guard's whole budget before the panel was sized. On a roomy window the panel came out
+    *exactly* as tall as its container, flush under the title bar and flush against the window's
+    bottom; on a short one the floor — clamped to the window — made it taller than the container with
+    nothing to clip it back, putting the footer where Apply lives off the bottom edge. Only the
+    height needs the inset, the layer being full width
+    (`a_modal_fits_the_layer_it_is_centred_in_not_the_window`; three existing tests had asserted the
+    pre-`07bda98` geometry and were corrected with it).
     - Heights were left unscaled at first, on the grounds that 620px is already most of a laptop
       screen — but the type inside them grew, so at the 200% then offered an editor was three
       fields and a scrollbar.
@@ -4913,6 +5091,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   - **`set_ui_scale` bumps `ui_generation`** for the one place a size still can't be re-read: a text
     `Attrs` list built outside a reactive closure (`markdown.rs`). Views keyed on the generation
     rebuild.
+  - **A *structural* decision taken against a scaled measurement has to be in the container's
+    rebuild key**, because it is the one kind of answer a `.style` closure cannot give: whether to
+    attach a tooltip at all, or how wide a scroll range is, is not a property that re-runs.
+    `editor_pane`'s Ctrl+K / inline-AI key carries `theme::ui_generation()` because `diff_view`
+    measures `content_w` from the font at build time and bakes the diff's syntax colouring into a
+    text `Attrs` list — without it a live scale change left the rows rendering at 1.6× inside a
+    `min_width` computed at 100%, so the end of a long line could not be scrolled to. `tabs`' chip
+    key carries `theme::ui_scale()` **and the presence of the DB-identity dot**, for the same reason
+    from the other side: `truncated` is computed once at build and decides whether the chip gets a
+    tooltip, and all three terms of that comparison move — the measured title, `tab_title_avail()`,
+    and the `tab_dot_w()` the dot sheds from it — so assigning a colour to the open tab's database
+    narrowed the title enough to ellipsize it while `truncated` still said it fitted, and the one cue
+    that says what the clipped title is never arrived. The dot is read there as a *presence*, not a
+    colour: the swatch is an ordinary style read and only the width it costs is structural.
   - **A cursor menu's flipped arm pins a *trailing* inset; it never computes a leading one**
     (`widgets::cursor_menu_insets` → `MenuInset::Start`/`End`). Four arms per axis: after the cursor
     if it fits, before it if that fits, flush with the window's far edge when neither does, and the
@@ -5070,7 +5262,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   absolute children a zero box, so a modal left out of the layer's `modal_backdrop_up` predicate
   does not open half-right, it does not open at all. That is deliberate: the loud failure is the
   guard that keeps the layer and the predicate in step — and it is only loud to whoever *opens*
-  that modal, which is not the person adding it. **The event editor shipped absent from the
+  that modal, which is not the person adding it. **It also only covers one direction**, which is why
+  the claim no longer rests on it alone: a surface that paints a backdrop and is mounted *outside*
+  the layer resolves its `inset(0)` against the root, looks perfect, and silently restores the exact
+  bug the layer was written to fix — the backdrop over the title bar, the drag band never rising, and
+  a window that cannot be moved, minimised or closed with nothing on screen saying why. Three of the
+  layer's members are loose children with no group wrapper to remind anyone, so that is the shape the
+  next overlay will take. `lib::modal_backdrop_gate` asserts **which files** paint one, with
+  `window_chrome.rs` as the documented exception (`over_backdrop` paints the same scrim across the
+  title bar while a modal is up and is mounted in the workspace root, after the layer and before the
+  overlay menus). It is deliberately weak in the way its three siblings are — files, not counts,
+  because a count fails on an innocent refactor and a gate that cries wolf gets deleted, while the
+  failure worth catching is a backdrop appearing somewhere *new*, and a new place is nearly always a
+  new file. A second test pins the other direction on the *returned closure* rather than the
+  function — binding a predicate and then not `||`-ing it in is precisely the mistake, and it leaves
+  the binding's name in the body, so scanning the function would pass — asserting all six terms are
+  in the answer: the three grouped predicates (`ddl`/`workspace`/`settings`) and the three open
+  signals. A group added without joining it fails there instead of opening into a zero-sized box. **The event editor shipped absent from the
   predicate** and painted nothing at all, so the schema-editing half of that list is now
   `ddl_editors_up(DdlUi)`, split out of `ddl_modals_up(&Ui)` for the one reason that matters here:
   it can be tested. `ddl_preview::tests::every_editor_raises_the_group_that_gives_it_a_box` raises
@@ -5155,6 +5363,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   it properly needs a body signal per row, the way the routine editor got one; there is a note at the
   key saying so. The view editor took the memo safely for the opposite reason: `fetch_algorithm`
   patches a term in the diff and not a control, so its rebuild delivered nothing to the screen.
+  **And only the key closure is wrapped in an effect — the *builder* is called outside it**, so a
+  scaled metric read there subscribes nothing and freezes at the scale the view was built at. Two
+  sites paid for that. `schema_tree`'s `SchemaTreeCtx` therefore carries `indent_levels: u32`, a
+  **count and not a length**: it was `level_indent()` in pixels, read in the `Loaded` builder, so on a
+  live change to 160% every row's `padding_left` (`col_pad() + indent`) grew in its `col_pad()` term
+  while the indent stayed at 16 instead of 26 — a schema group's children 10px left of where the same
+  call site put their parent, per level, in a panel mounted for the life of the window and so never
+  rebuilt. It self-healed on a collapse/expand, which is what made it read as a glitch. The count is
+  multiplied by `level_indent()` *inside* each style closure, and a count cannot be frozen at a scale
+  because it does not know about one. The grid's stored column widths are the same fact where the
+  fix has to be an effect instead — see `rescale_widths` under *Data grid*.
 - **An effect that writes the signals it reads must read them untracked — and an outside write to
   them is then invisible, so it needs a generation counter.** The schema tree's size-column effect
   scans every `ConnNode::stats` slot for `Idle` and writes `Loading` into each one it fetches;
@@ -5614,7 +5833,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   viewport. The caret-anchored popups do it one step later: `completion::set_anchor` stores the
   caret line in content coords and `completion_popup`/`signature_popup` subtract the viewport
   *inside their style closures*, because those are placed once per edit and would otherwise stay
-  pinned to the scroll position the popup opened at. **`editor_area` also doesn't clip**, so an
+  pinned to the scroll position the popup opened at. The signature hint's own two placement
+  numbers are closures over `theme::scaled` for the same class of reason — it is lifted by its own
+  height (two lines of text plus padding, all of which scale) and nudged right of the caret by air,
+  and frozen at `48` the lift was correct at Normal only: from 130% the popup's bottom fell below
+  the caret's line top and covered the statement being typed, which is the one thing a hint about
+  that statement must not do. **`editor_area` also doesn't clip**, so an
   overlay must bound itself: a box wider than the visible code column paints straight out of the
   editor and over the panel beside it, which is what `statement_line_boxes_at` clamps against
   `vp.width()` (a zero width means "not laid out yet", so it clamps nothing rather than blanking the
@@ -5735,7 +5959,14 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   cursor. Only the width is a flat estimate (`SUBMENU_FLIP_W = 210` for a submenu; the popup uses the
   panel's real `min_width`); the height both ask for is `menu_panel_height`, which sums the entries
   that will actually be drawn — 30.5 per action row, 9 per separator, plus 14 — because counting
-  separators as full rows shoved an upward-flipped panel tens of px too high. Neither is measured
+  separators as full rows shoved an upward-flipped panel tens of px too high. **How that 30.5 is
+  split matters away from 100%**, because `scaled()` is applied to each term separately: it was
+  `MENU_LINE_H` 18.5 over a `MENU_ROW_PAD` of 6, while the estimate's own doc said 14 + 8 + 8 and
+  `menu_row` *drew* a `font_title()` line inside `padding_vert(scaled(8.0))` — three decompositions
+  of one row, all landing near 30.5 at Normal, which is why nothing caught it. The padding half is
+  now the drawn one (`MENU_ROW_PAD` is 8.0 and `menu_row` reads that very constant, so the estimate
+  and the row cannot state different numbers again) and `MENU_LINE_H` is 14.5, the residual of the
+  *measured* total rather than a line-height theory that disagrees with it. Neither is measured
   from a laid-out panel, so there's no open-then-flip flicker.
   A submenu's own flip is `submenu_insets`, which is a **pure function with tests** rather than four
   lines inside a style closure, because every way it can be wrong is silent — a sign slip or an `x1`
@@ -6116,7 +6347,27 @@ for keyboard nav.
 - **Column widths** (`gs.widths`) are estimated from content on load; the header's `col_resize_handle`
   drags to resize (moving-view trick) and double-clicks to auto-fit. Cells read `gs.widths` in
   `.style()` so resize is live. Every cell/header uses `flex_shrink(0)` so the row overflows (enabling
-  h-scroll) instead of squeezing.
+  h-scroll) instead of squeezing. **`cell_chrome_w()` is the one composition of what a cell spends on
+  itself** beyond the value — `2 · grid_pad_h() + GRID_CELL_DIVIDER`, the divider counting because it
+  is a *border* and so comes out of the content box too. Both estimators reserved a flat `22.0`,
+  which is a pixel generous at Normal and short by 6px at 130% and 11px at 160%: **auto-fit clipped
+  the value it exists to fit**. `numeric_edit_pad_left` composes the same three terms correctly,
+  which is what makes this a composition bug rather than a wrong constant.
+  **And stored widths are carried across a live scale change** (`rescale_widths` + `GridState::widths_at`,
+  which holds the `grid_char_w()` the current widths were measured at). They cannot follow the scale
+  the way everything else in the grid does, because they are pixels *stored* rather than read in a
+  style closure — floem wraps only a `dyn_container`'s key closure in an effect and calls the builder
+  outside it, so `init_widths`' `grid_char_w()` read subscribes nothing. Raising the scale with a
+  result open grew every cell's font, padding and row height while the columns stayed cut for the old
+  one, ellipsized across the board until the statement was re-run or every divider double-clicked;
+  lowering it left every column ~1.6× wider than its content. It is an **effect** and deliberately
+  not a scale term in the rebuild key: keying the grid would discard the child scope and take the
+  selection, the scroll position and every staged edit with it, where this recomputes one signal.
+  Every column is carried, **including one the user dragged** — a width chosen to fit that column's
+  content should still fit it when the content is 1.6× bigger, so there is no `dragged` set to
+  maintain — and `min_col_w()` is applied *after* the ratio, since the floor scales too (48px at
+  Normal is under the 77px floor at Huge). A `ratio` that is not positive and finite leaves the
+  widths alone: the old measurement beats a column collapsed to the floor.
 - **Selection**: click sets `active`+`anchor`; `PointerEnter` while `selecting` extends the range
   (drag-select, no capture); a gutter press selects the whole row and arms `row_selecting`, whose
   own `PointerEnter` extends by **rows** (`model::row_range_selection`) — a second flag, because
@@ -6131,10 +6382,19 @@ for keyboard nav.
   the write-back plan, the one-row safety net and Commit/Discard all apply unchanged — a paste is
   a batch of edits the user can still look at and throw away — staged through
   `stage_many`/`stage_new_many`, which are where the revert-to-original and
-  blank-means-default rules now live (`stage`/`stage_new` are one-element calls into
+  blank-cell rules now live (`stage`/`stage_new` are one-element calls into
   them) and which take **one** signal update for the whole paste: `dirty` and `new_rows` are read
   by the painter and by every derived view, so a per-cell update would invalidate the grid ten
-  thousand times for one gesture. The parse is
+  thousand times for one gesture. **What a blank means in a pending row is the caller's choice
+  rather than the function's** (`core::edit::BlankCell` + `pending_cell`): a *typed* clear is
+  `UnsetsIt` — clearing a field you typed into is an undo, so the column goes back to unset and the
+  `INSERT` omits it, letting the server's default fill it — while a **pasted** blank is
+  `IsAValue`, the empty string, because a paste is an assertion about values. That arm did not
+  exist: `stage_new_many` applied the typed reading to everything, three lines from a `stage_many`
+  that staged `''`, so one block wrote `''` above the pending-row boundary and the *server default*
+  below it — the same clipboard cell, two stored values, decided by a line the user cannot see — and
+  it discarded a value typed into a pending row whenever the cell pasted over it happened to be
+  blank. The parse is
   `core::edit::parse_tsv_block`, **the exact inverse of `GridCells::tsv`**: split on newlines and
   tabs, no quote interpretation. A CSV-style reader here would be the obvious mistake — the copy
   side emits no quoting, so there is none to undo, and unquoting would silently turn a cell whose
@@ -6156,7 +6416,14 @@ for keyboard nav.
   landed *nothing* is a `Failed` and earns the red fill. Both were errors, so "Pasted 5 cells,
   skipping 1 in read-only columns." was rendered indistinguishably from a write-back that failed.
   The counts are snapshotted through `PastePlan::counts` **before** staging drains the cell list,
-  which is what stops the report claiming every paste landed nothing. A read-only column is
+  which is what stops the report claiming every paste landed nothing. **What landed is counted by
+  the caller, after staging**, and handed over as `paste_report`'s `staged`: it used to be derived as
+  `planned - skipped_deleted`, which is what the plan *intended*, and staging drops entries the plan
+  cannot know about — `stage_many` un-stages a cell pasted back over its own original value, and
+  `stage_new_many` removes a column whose pasted cell is blank. So pasting a column's own values
+  over itself reported `Pasted N cells` while `dirty` gained nothing at all. The two `stage_*_many`
+  calls return what they changed and the caller sums them; `PasteCounts::planned` is gone, so no
+  reader can rebuild the figure that was wrong. A read-only column is
   skipped **in place**, never
   shifted, which would write one column's values into the next. Nothing is interpreted: a pasted
   cell reading `NULL` stages the four-character string, because that is what the copy side wrote
@@ -6313,6 +6580,23 @@ for keyboard nav.
     chips are a stop each because a row of independent toggles is what a checkbox group is. The
     contract is gated by a signature scan (`row_panel_focus_gate`) rather than trusted, since what
     went wrong was two parameters that were never passed.
+    **The layer above it has its own gate, because a wrapper can withhold the keyboard before any
+    control exists.** `nullable_field` and `json_field` each have a branch that builds no control at
+    all — a nullable column that is NULL in this row renders the `<null>` sentinel and a **Set
+    value** button — and both took `autofocus` only for the other branch, so a panel opened on a row
+    whose first editable column was NULL took no keyboard: the arrows went on moving the grid's
+    selection under an open panel, and reaching the first field cost a Tab walk or a click. All
+    three wrappers (`field_mini_btn` included) now take it through, and that button is
+    `widgets::key_pressable` + `cell_editors::focus_on_mount` — the first because Tab walking past a
+    button as though it were a label is the other half of the same complaint, the second because
+    focusable-on-mount and reachable-by-Tab are different properties. `grid::row_panel_null_gate`
+    pins both, a source scan in the family with `popup_anchor_gate` and `menu_trigger_gate` and for
+    the same reason: what went wrong was not a calculation but a parameter that never arrived.
+    `key_pressable` is `in_ring_button`'s no-`FocusRing` sibling — the row panel and the activity
+    panel join floem's own traversal, so the difference is only `keyboard_navigable` in place of
+    `in_focus_ring` — and Enter and Space press it while **every other key carries on**, so Tab still
+    walks past and the panel's Escape still reaches the panel. `focus_on_mount` is `pub(crate)` for
+    the same sharing.
   - **Dates keep the text input** in both places, with the calendar beside it: typing a date is
     often faster, a `TIMESTAMP`'s time of day has no calendar to come from, and a value no picker
     can represent still has to be editable (`0000-00-00` gets a plain field and no panel at all).
@@ -6406,7 +6690,12 @@ for keyboard nav.
   `results_section` reads the flag and the action off `GridCtx`, so `GridState` keeps no copy of the
   latter. On the writing side, `GridState::clear_bar` is the one way the bar comes down: seven
   identical copies of `if commit_err.is_some() { … }` were what a second signal would otherwise have
-  had to be added to seven times.
+  had to be added to seven times. **`discard_edits` takes the whole bar down, not just its error
+  surface** — Discard means "none of that is true any more", and the *note* surface is the one that
+  can hold a sentence about the edits just thrown away, so `Pasted 5 cells, skipping 1 in read-only
+  columns.` stood over five cells that no longer existed until some other path happened to clear it.
+  That site read `clear_if_any(gs.commit_err)` rather than the `is_some()` shape, which is why the
+  sweep that found the other two copies of this missed it.
 - **A result says which database it came from, and the answer lives on the result.** The grid's
   stats line leads with `ResultSet::database` (`world · 100 rows · 15 cols · 1 ms`), stamped by the
   loader that knows the scope — `Db::fetch_query`, `Session::fetch_query` (its *pinned* database,
@@ -6513,20 +6802,25 @@ for keyboard nav.
   half. A stalled write's note (`commit_wait`) is **live, not stale** — the Rollback it offers is the
   more urgent action, so it may sit on top of a running export for as long as the write is out. A
   batch statement's own failure (`batch_err`) means **no grid is mounted** to export from, so it
-  cannot coincide. `GridCtx::exporting` / `GridState::exporting` is **panel-level, not
-  per-result**, because an export outlives the `GridState` a re-run replaces and a Cancel that
-  vanished when the rows refreshed would be unreachable exactly when it matters. But it is created
-  **beside `commit_err`/`commit_note` in the `GridCtx` literal, per active-tab render — not once in
-  `center`**, and those two are the surfaces it turns into, so the three must share a lifetime.
-  Created once for the window, the flag was global while the note was per-render: starting an export
-  in tab A and switching to B drew `Exporting… Cancel` on a tab that had nothing to do with it,
-  while A's completion report landed on a disposed signal and vanished. The accepted cost is the
-  other side of the same coin — navigating away from a running export loses its Cancel and its
-  report, though the export itself finishes and the file is whole — and that is what a commit's own
-  note already does. **Only the export that raised the flag may lower it:** the done callback
-  clears `exporting` under the same `streaming` test that decides whether to raise it, because a
-  `Fetched` save finishes in milliseconds and one taken while a stream ran tore that stream's Cancel
-  down and left no way to stop it. `export_cancel` is a `TabsActions` action; the app owns the
+  cannot coincide. `GridCtx::exporting` / `GridState::exporting` is `Option<grid::ExportRun>` —
+  `{ id, tab }` — and it answers two questions that used to be one `bool`, each of which had its own
+  failure. **`tab` is why the flag may outlive a tab switch.** The export's cancellation token is
+  app-global (`main::export_token`), so a flag with a shorter life than the token is a Cancel that
+  can vanish while the thing it stops is still running: created per active-tab render, it was
+  disposed on switching away and rebuilt empty on switching back, and the stream ran on for minutes
+  with no control bound to it and every further `All rows` request refused. The signal is created
+  **once for the window, in `center` beside `export_cancel`**, the action that stops it, and the
+  launching tab rides *in* the value, which is what keeps the bar off a tab that had nothing to do
+  with it: `BarSignals` carries `tab_id` and every reader asks `exporting_here()` rather than asking
+  the window. **`id` is why only the export that raised the flag may lower it.** The tail of a
+  finished request used to clear it under the same `streaming` test that decides whether to raise
+  one — which is true of a second `All rows` request, the only kind the app refuses, so asking for
+  one while a stream ran tore down the running export's Cancel. `grid::export_finished(current,
+  finished)` clears only when the run reporting *is* the run the flag holds and otherwise leaves it
+  exactly as it was, which covers that case and the `Fetched` save that raised no flag at all. The
+  ids are monotonic per process, and a counter rather than a token clone because comparison is all
+  that is wanted and `ExportRun` has to stay `Copy` for `BarSignals`' sake.
+  `export_cancel` is a `TabsActions` action; the app owns the
   token, as it does for query runs and imports. The report
   is an `ExportOutcome` — `Done(export::ExportTally)`, `Cancelled`, `Failed { message, partial }` —
   three outcomes and not a
@@ -6547,16 +6841,24 @@ for keyboard nav.
   stats line uses, so the figure in the report agrees with the `1k of ~16k rows` directly above it —
   and the note shipped once as `Exported rows to employees.csv`, with no count at all, because
   `text::plural` returns the noun and nothing else and this call site simply never rendered the
-  number. Cancel is a note too, `Export cancelled — <name> is incomplete`, and **the failure arm now
-  says the same thing**: `Failed` carries `partial`, and `export::export_failure_note` appends
-  `— <name> is incomplete` when the destination had already been opened. The write opens with
-  `File::create`, which truncates, so a stream that dies ten minutes in has already destroyed
-  whatever was at that path, and the failure arm used to report only what the engine said. `partial`
-  is false — and the clause absent — for an export refused *before* the write starts (no connection,
-  one already running), which must not claim a file it never touched is incomplete.
-  **The partial file is left on disk on a cancel or a failure, and the message says so** — deleting
-  it is the one irreversible thing this path could do, and the save dialog may well have been aimed
-  at a file that already mattered.
+  number. **The destination is not opened until the export has succeeded.** Both scopes write a
+  `{name}.part` sibling (`export::part_path`) and `std::fs::rename` it over the target at the end,
+  the dance `persist` already does for every config file and atomic *because* it is a sibling — a
+  rename inside one directory never crosses a filesystem. It used to open the destination first, and
+  `File::create` truncates, so a stream that died ten minutes in had already destroyed whatever the
+  user was overwriting and all the bar could do was say so. The suffix is visible and
+  self-describing rather than a hidden temp name, because when an export does fail the fragment is
+  the one thing the user may still want: it is left behind and named in the message rather than
+  swept away, deleting it being the one irreversible thing this path could do. **The streaming
+  writer holds the cancellation token and refuses to publish when it is set** — a cancel reaches the
+  writer as an ordinary end of stream, so publishing first and letting the reader declare the cancel
+  afterwards would rename a truncated file over the user's own. Both notes say the two facts that
+  follow from all of this: cancel is `Export cancelled — <name> was not changed; the rows that were
+  written are in <name>.part` (`export_cancel_note`), and `export_failure_note` says the same in the
+  failure's voice, where it previously said `<name> is incomplete` — true when the destination was
+  truncated at `t = 0` and now the opposite of true. `Failed` carries `partial`, and `None` is not a
+  formality: an export refused *before* the write starts (no connection, one already running) must
+  not mention a file at all.
 - **The results strip shrinks its prose, never its controls.** It is one flex row — stats, the
   read-more offer, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
   flex row squeezes its children before it overflows, so whichever child refuses to shrink is the
