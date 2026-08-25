@@ -333,7 +333,29 @@ impl Session {
         row_cap: usize,
         cancel: CancellationToken,
     ) -> Outcome<ResultSet> {
+        // Nothing dispatched yet, so say that rather than reporting a killed
+        // statement. Checked here **and** after the lock, because the lock is the
+        // wait: the tab's own `commit_writes` or the re-fetch after one can hold
+        // this connection for minutes, and a run queued behind it that the user
+        // (or the statement timeout) cancels never reaches the server at all.
+        //
+        // It is also what makes the outcome deterministic. Every arm below ends in
+        // a `tokio::select!` against `cancel.cancelled()`, and `select!` polls its
+        // ready branches in **random order** — the same coin flip `sqlite`'s
+        // `refuse_if_cancelled` documents from a real CI failure.
+        if cancel.is_cancelled() {
+            return Outcome {
+                result: Err(DbError::Cancelled),
+                stmt: StmtOutcome::NotSent,
+            };
+        }
         let mut guard = self.inner.lock().await;
+        if cancel.is_cancelled() {
+            return Outcome {
+                result: Err(DbError::Cancelled),
+                stmt: StmtOutcome::NotSent,
+            };
+        }
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;

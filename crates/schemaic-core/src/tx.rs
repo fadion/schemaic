@@ -90,6 +90,20 @@ pub enum StmtOutcome {
     /// The connection itself died — idle-in-transaction timeout, server
     /// restart, network drop. Whatever was in the transaction is gone.
     ConnectionLost,
+    /// It **never reached the server**: the run's token was already cancelled
+    /// when the statement's turn came, so nothing was dispatched.
+    ///
+    /// The reachable case is the tab's own connection being busy — a
+    /// `commit_writes` or the re-fetch after one holds the session's lock, and
+    /// the run behind it is cancelled (by the user, or by the statement timeout)
+    /// while still waiting for it. Reported apart from [`StmtOutcome::Cancelled`]
+    /// because that variant means *the server was asked and the answer was
+    /// killed*, and the two have opposite consequences on PostgreSQL: a real
+    /// cancellation aborts the transaction, while a statement that was never sent
+    /// leaves it exactly where it was. Folding the second as the first is what put
+    /// **Tx aborted — rollback to continue** over a healthy transaction and told
+    /// the user their only way on was to discard work they had just saved.
+    NotSent,
 }
 
 /// Where a tab's transaction stands.
@@ -196,6 +210,13 @@ impl TxState {
                     // transaction is untouched on either engine — it just gains
                     // no statement.
                     StmtOutcome::FailedIsolated => TxState::Open { stmts },
+                    // Nothing was sent, so nothing happened to the transaction on
+                    // either engine — and there *is* one, because the session
+                    // opens it before the statement is attempted. `Open` rather
+                    // than `self` for that reason: the first statement of a
+                    // Manual tab arrives while this reads `Idle`, and its `BEGIN`
+                    // has already gone out.
+                    StmtOutcome::NotSent => TxState::Open { stmts },
                     StmtOutcome::ConnectionLost => unreachable!("handled above"),
                 }
             }
@@ -348,6 +369,41 @@ pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
         "{message}\n\nThe transaction this ran in is gone: MySQL commits before it \
          runs a DDL statement, so the statements already in it are permanent and \
          Rollback will not undo them."
+    )
+}
+
+/// Did the statement timeout stop the **statement**, or something before it?
+///
+/// The watchdog is armed around the whole run — connecting, opening the
+/// transaction, the statement, and pulling the rows back — deliberately, because
+/// a connection that never completes is as much a hang as a query that never
+/// returns. That makes its flag the right answer to "did the clock run out" and
+/// the wrong answer to "what ran too long": a run cancelled while it was still
+/// queued behind the tab's own connection reported *the statement ran longer than
+/// the 1 minute statement timeout* for a statement that was never sent.
+///
+/// [`StmtOutcome::NotSent`] is the one outcome that knows the difference, so the
+/// timeout's own message is reserved for the runs it can honestly describe.
+pub fn timeout_reached(stmt: Option<StmtOutcome>, timed_out: bool) -> bool {
+    timed_out && stmt != Some(StmtOutcome::NotSent)
+}
+
+/// What to say about a run whose statement never left the client.
+///
+/// It names the clock only when the clock is why (`timed_out`), and it says the
+/// two things the user cannot see from anywhere else: nothing ran, and the
+/// transaction is untouched. The second is the load-bearing half — the alternative
+/// this replaces put **Tx aborted** on the pill and pointed at Rollback.
+pub fn not_sent_message(timed_out: bool) -> String {
+    let why = if timed_out {
+        "The statement timeout fired while this run was still waiting for the tab's connection."
+    } else {
+        "This run was cancelled while it was still waiting for the tab's connection."
+    };
+    format!(
+        "{why} An earlier operation on it — a commit, or the re-fetch after one — \
+         had not finished, so the statement was never sent to the server. Nothing \
+         ran, and the transaction is exactly where it was."
     )
 }
 
@@ -1005,6 +1061,74 @@ mod tests {
         }
     }
 
+    /// A statement that never left the client leaves the transaction alone — on
+    /// **both** engines. PostgreSQL is the one that mattered: folding this as a
+    /// real cancellation poisoned a transaction the server had never aborted, and
+    /// the pill then read "Tx aborted — rollback to continue" over work the user
+    /// had just saved, with Rollback — the action that discards it — as the way
+    /// out it named.
+    #[test]
+    fn a_statement_that_was_never_sent_leaves_the_transaction_alone() {
+        for engine in [TxEngine::MySql, TxEngine::Postgres] {
+            assert_eq!(
+                TxState::Open { stmts: 4 }.on_statement(
+                    engine,
+                    "SELECT * FROM t",
+                    StmtOutcome::NotSent
+                ),
+                TxState::Open { stmts: 4 },
+                "{engine:?}"
+            );
+            // The first statement of a Manual tab: the pill still reads `Idle`
+            // when it is attempted, but `ensure_tx` has already put a `BEGIN` on
+            // the wire, so the transaction is open and empty rather than absent.
+            assert_eq!(
+                TxState::Idle.on_statement(engine, "SELECT * FROM t", StmtOutcome::NotSent),
+                TxState::Open { stmts: 0 },
+                "{engine:?}"
+            );
+        }
+        // Contrast, unchanged: a cancellation the server *did* see still poisons
+        // PostgreSQL.
+        assert_eq!(
+            TxState::Open { stmts: 4 }.on_statement(
+                TxEngine::Postgres,
+                "SELECT * FROM t",
+                StmtOutcome::Cancelled
+            ),
+            TxState::Poisoned { stmts: 4 }
+        );
+    }
+
+    /// And the message: the timeout may describe a run it stopped, but never a
+    /// statement that was never sent.
+    #[test]
+    fn the_timeout_only_describes_a_statement_that_was_dispatched() {
+        assert!(timeout_reached(Some(StmtOutcome::Cancelled), true));
+        assert!(timeout_reached(None, true));
+        assert!(!timeout_reached(Some(StmtOutcome::NotSent), true));
+        // And a run nobody timed out is never described by the clock, whatever
+        // else became of it.
+        for stmt in [
+            None,
+            Some(StmtOutcome::Cancelled),
+            Some(StmtOutcome::NotSent),
+        ] {
+            assert!(!timeout_reached(stmt, false), "{stmt:?}");
+        }
+
+        let timed = not_sent_message(true);
+        let plain = not_sent_message(false);
+        assert!(timed.contains("statement timeout fired"));
+        assert!(!plain.contains("timeout"));
+        for m in [&timed, &plain] {
+            assert!(m.contains("never sent"), "{m}");
+            assert!(m.contains("transaction is exactly where it was"), "{m}");
+            // The claim the old message made and could not support.
+            assert!(!m.contains("ran longer than"), "{m}");
+        }
+    }
+
     /// The disclosure, which is the only thing on screen that can say a
     /// transaction was spent — and which must not appear on any other outcome,
     /// because an unconfirmed failure leaves the transaction open and telling the
@@ -1020,6 +1144,7 @@ mod tests {
             StmtOutcome::FailedIsolated,
             StmtOutcome::Cancelled,
             StmtOutcome::ConnectionLost,
+            StmtOutcome::NotSent,
         ] {
             assert_eq!(
                 failed_message("ERROR 1064: syntax", stmt),
