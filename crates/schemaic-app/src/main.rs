@@ -1700,12 +1700,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     name,
                     abbrev: None,
                     body,
-                    // Scoped to the engine, not this connection: that is the
-                    // difference between a library and a log, and the row menu
-                    // is where a narrower scope will be chosen.
-                    scope: schemaic_core::snippet::Scope::Dialect(conn_dialect()),
+                    // **This connection**, which is the narrowest scope and the
+                    // one you can see: a snippet saved from the query in front
+                    // of you is usually about *this* database, and widening it
+                    // to the engine is one click in Show in. Saving it engine-wide
+                    // instead dropped a new row into the middle of a list of
+                    // other people's queries, which is where it was found to be
+                    // wrong.
+                    scope: schemaic_core::snippet::Scope::Conn(active_conn.get_untracked()),
                     source: schemaic_core::snippet::Source::User,
-                    last_used: None,
+                    // Stamped as used **now**, so the most-recently-used sort
+                    // puts it first in its band — the top row of the top band,
+                    // which is where the panel then scrolls. It is also true:
+                    // this snippet came from the statement the user is working
+                    // on, which is the most recent use there is.
+                    last_used: Some(snippet_now()),
                 })
             });
             (save_snippets)();

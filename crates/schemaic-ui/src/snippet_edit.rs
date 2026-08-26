@@ -1,16 +1,16 @@
-//! The snippet editor: the one place a saved query's **body** can be changed.
+//! The snippet editor: **the** place a saved snippet is changed — its name, its
+//! expansion shortcut and its body, together.
 //!
-//! The panel's inline fields cover the two one-word edits (a name, an abbrev)
-//! because those are the same act as renaming a tab. A body is not: it is SQL,
-//! it is multi-line, and a 300px panel row is the wrong shape for it. So the
-//! body gets the modal chrome every other editor here wears, with the name and
-//! abbrev alongside it — editing all three in one place is what someone who
-//! opened "Edit…" is asking for.
+//! It is one dialog rather than three menu entries on purpose. The panel used to
+//! offer Rename and an abbrev field inline as well, which meant three ways into
+//! the same three fields and a right-click menu you had to read to use. The one
+//! inline edit left is naming a **brand-new** snippet, because that one is part
+//! of saving rather than of editing.
 //!
-//! It commits through the same three per-field actions the panel's inline fields
-//! use (`rename` / `set_abbrev` / `set_body`), and only for the fields that
-//! actually changed. There is deliberately no fourth "save everything" action:
-//! two paths writing the same field is how the two drift.
+//! It commits through the same per-field actions the rest of the app uses
+//! (`rename` / `set_abbrev` / `set_body`), and only for the fields that actually
+//! changed. There is deliberately no fourth "save everything" action: two paths
+//! writing the same field is how the two drift.
 
 use std::rc::Rc;
 
@@ -30,6 +30,8 @@ const PANEL_H: f64 = 560.0;
 /// The body box's height before it scrolls. A snippet is usually shorter than a
 /// view's `SELECT`, and the name/abbrev rows sit above it.
 const BODY_ROWS: usize = 12;
+/// What it starts at, before the query grows it.
+const BODY_MIN_ROWS: usize = 3;
 
 // Opened by setting `OverlayUi::snippet_edit` — the app's `SnippetActions::edit`
 // is the one caller, and a second "open me" helper here would be a second way to
@@ -85,6 +87,10 @@ pub(crate) fn snippet_edit_overlay(ui: Ui) -> impl IntoView {
                         FieldCfg {
                             placeholder: "none",
                             mono: true,
+                            // An × to empty it: clearing the field is what
+                            // *removes* the shortcut, and "delete every
+                            // character" is not a discoverable way to say that.
+                            clearable: true,
                             focus: Some((ring.clone(), 20)),
                             ..Default::default()
                         },
@@ -100,6 +106,11 @@ pub(crate) fn snippet_edit_overlay(ui: Ui) -> impl IntoView {
                             no_wrap: true,
                             mono: true,
                             font_size: theme::font_body,
+                            // Three rows to start, growing with the query and
+                            // scrolling past `BODY_ROWS`. A one-row box reads as
+                            // a single-line input and says nothing about Enter
+                            // being allowed in it.
+                            min_rows: BODY_MIN_ROWS,
                             max_rows: Some(rows),
                             placeholder: "SELECT …",
                             focus: Some((ring.clone(), 30)),

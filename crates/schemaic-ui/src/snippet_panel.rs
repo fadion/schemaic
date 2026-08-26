@@ -30,15 +30,6 @@ use crate::widgets::{
 };
 use crate::{FieldCfg, OverlayUi, Ui, edit_field, icons, theme};
 
-/// Which of a row's two texts an inline field is editing.
-#[derive(Clone, Copy, PartialEq)]
-enum RowEdit {
-    Name,
-    /// The expansion trigger. Committing an empty one *removes* the abbrev,
-    /// which is the only way to take one back off a snippet.
-    Abbrev,
-}
-
 pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     let items = ui.snippets.items;
     let actions = ui.snippet_actions.clone();
@@ -65,12 +56,16 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     // re-opened, and the rename buffer belongs to this build of the list.
     let search_input = RwSignal::new(String::new());
     let search = debounced(search_input, Duration::from_millis(SEARCH_DEBOUNCE_MS));
-    // Which row is being edited inline, and which of its two texts. Inline
-    // rather than a modal because naming a saved query is the same act as
-    // renaming a tab, which is already inline — and there is no text-prompt
-    // modal in this codebase to reach for.
-    let renaming: RwSignal<Option<(u64, RowEdit)>> = RwSignal::new(None);
+    // The row whose name is being typed, right after a save — the one inline
+    // edit left, and the only one that has to be inline: a snippet arrives named
+    // after its tab, which is a placeholder rather than an answer. Everything
+    // else about a snippet is changed in the editor dialog.
+    let renaming: RwSignal<Option<u64>> = RwSignal::new(None);
     let rename_buf = RwSignal::new(String::new());
+    // Set to the top when a save lands, then cleared. `scroll_to` is **sticky**:
+    // a `Some` left standing re-scrolls on every later layout pass, which is how
+    // a list that follows its tail ends up refusing to be scrolled by hand.
+    let list_scroll: RwSignal<Option<floem::kurbo::Point>> = RwSignal::new(None);
 
     let groups = create_memo(move |_| {
         let conn = active_conn.get();
@@ -126,8 +121,8 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     })
     .style(|s| s.flex_col().width_full());
 
-    let scrolled =
-        autohide(scroll(list)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
+    let scrolled = autohide(scroll(list).scroll_to(move || list_scroll.get()))
+        .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
     // Title row: "SNIPPET LIBRARY" left, a + right — save what the editor holds.
     // Unlike the history panel's trash this destroys nothing, so it doesn't ask.
@@ -139,12 +134,21 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
         7.0,
         move || can_save.get(),
         move || {
-            if let Some(id) = (save_current)() {
-                // Straight into the rename field: a snippet arrives named after
-                // its tab, which is a placeholder rather than an answer.
-                rename_buf.set(String::new());
-                renaming.set(Some((id, RowEdit::Name)));
-            }
+            let Some(id) = (save_current)() else {
+                return;
+            };
+            // A new snippet is scoped to **this connection** and sorts first, so
+            // it lands in the topmost band's topmost row — which is only useful
+            // if that row is on screen. The list may be scrolled anywhere, so
+            // put it back at the top.
+            list_scroll.set(Some(floem::kurbo::Point::ZERO));
+            floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                list_scroll.set(None);
+            });
+            // Straight into the name field: the snippet arrived named after its
+            // tab, which is a placeholder rather than an answer.
+            rename_buf.set(String::new());
+            renaming.set(Some(id));
         },
     )
     .tooltip(|| text("Save the editor's SQL as a snippet").style(crate::widgets::tooltip_style));
@@ -247,7 +251,7 @@ fn snippet_row(
     term: Option<String>,
     dialect: SqlDialect,
     conn_id: u64,
-    renaming: RwSignal<Option<(u64, RowEdit)>>,
+    renaming: RwSignal<Option<u64>>,
     rename_buf: RwSignal<String>,
     overlay: OverlayUi,
     menus: crate::widgets::MenuFlags,
@@ -264,64 +268,31 @@ fn snippet_row(
         (_, Some(ts)) => schemaic_core::history::relative_time(ts, now_millis()),
         (_, None) => String::new(),
     };
-    // The abbrev: a chip when it has one, a field while it is being set, and
-    // nothing at all otherwise — an empty chip on every row would be noise on
-    // the many snippets that never want a trigger.
-    let abbrev_view = dyn_container(move || renaming.get() == Some((id, RowEdit::Abbrev)), {
-        let existing = snip.abbrev.clone();
-        let set_abbrev = actions.set_abbrev.clone();
-        move |editing: bool| {
-            if !editing {
-                let Some(a) = existing.clone().filter(|a| !a.is_empty()) else {
-                    return empty().into_any();
-                };
-                return h_stack((
-                    crate::icons::icon_wh(icons::KEYBOARD, 12.0, 0.0),
-                    text(a).style(|s| {
-                        s.font_family(MONO_FAMILY.to_string())
-                            .font_size(font_label())
-                    }),
-                ))
-                .style(|s| {
-                    s.items_center()
-                        .gap(theme::scaled(4.0))
-                        .color(theme::text_dim())
-                        .flex_shrink(0.0_f32)
-                })
-                .into_any();
-            }
-            let commit = {
-                let set_abbrev = set_abbrev.clone();
-                Rc::new(move || {
-                    let typed = rename_buf.get_untracked().trim().to_string();
-                    // Empty *removes* the abbrev — the only way to take a
-                    // trigger back off a snippet, and the reason this commits
-                    // an empty value where the name field refuses one.
-                    (set_abbrev)(id, (!typed.is_empty()).then_some(typed));
-                    renaming.set(None);
-                })
-            };
-            let on_escape = Rc::new(move || renaming.set(None));
-            edit_field(
-                rename_buf,
-                FieldCfg {
-                    placeholder: "abbrev",
-                    mono: true,
-                    autofocus: true,
-                    on_submit: Some(commit.clone()),
-                    on_blur: Some(commit),
-                    on_escape: Some(on_escape),
-                    ..Default::default()
-                },
-            )
-            .style(|s| s.width(theme::scaled(90.0)).flex_shrink(0.0_f32))
-            .into_any()
-        }
-    });
+    // The abbrev, when it has one — a chip and nothing else. Setting it lives in
+    // the editor dialog beside the body and the name; a row with an empty chip
+    // on it would be noise on the many snippets that never want a trigger.
+    let abbrev_view: floem::AnyView = match snip.abbrev.clone().filter(|a| !a.is_empty()) {
+        None => empty().into_any(),
+        Some(a) => h_stack((
+            crate::icons::icon_wh(icons::KEYBOARD, 12.0, 0.0),
+            text(a).style(|s| {
+                s.font_family(MONO_FAMILY.to_string())
+                    .font_size(font_label())
+            }),
+        ))
+        .style(|s| {
+            s.items_center()
+                .gap(theme::scaled(4.0))
+                .color(theme::text_dim())
+                .flex_shrink(0.0_f32)
+        })
+        .into_any(),
+    };
 
-    // Renaming this row: the name is replaced by a field, committed on Enter or
-    // blur. Same act as an inline tab rename, so it looks the same.
-    let name_view = dyn_container(move || renaming.get() == Some((id, RowEdit::Name)), {
+    // Naming a **brand-new** snippet: the row it was just saved into shows a
+    // field instead of its placeholder name. That is the only way in — the menu
+    // has no Rename, because *Edit* changes the name along with everything else.
+    let name_view = dyn_container(move || renaming.get() == Some(id), {
         let name = snip.name.clone();
         let term = term.clone();
         let rename = actions.rename.clone();
@@ -450,14 +421,9 @@ fn snippet_row(
             menus.close_except(Some(crate::widgets::MenuId::Popup));
             overlay.popup_anchor.set(None);
             overlay.popup_width.set(180.0);
-            overlay.popup_menu.set(Some(row_menu(
-                &menu_snip,
-                &menu_actions,
-                renaming,
-                rename_buf,
-                dialect,
-                conn_id,
-            )));
+            overlay
+                .popup_menu
+                .set(Some(row_menu(&menu_snip, &menu_actions, dialect, conn_id)));
         })
         .style(|s| {
             s.width_full()
@@ -470,56 +436,41 @@ fn snippet_row(
 }
 
 /// The row's right-click menu.
+///
+/// **The two ways to use a snippet come first**, in the order the row itself
+/// offers them: a click already inserts, and the entry says so for anyone who
+/// looked in the menu for it. Name and abbrev have no entries of their own —
+/// *Edit* changes both, along with the body, and a menu with three ways into one
+/// dialog is three things to read rather than one.
 fn row_menu(
     snip: &Snippet,
     actions: &Rc<crate::SnippetActions>,
-    renaming: RwSignal<Option<(u64, RowEdit)>>,
-    rename_buf: RwSignal<String>,
     dialect: SqlDialect,
     conn_id: u64,
 ) -> Vec<MenuEntry> {
     let id = snip.id;
-    let name = snip.name.clone();
-    let abbrev = snip.abbrev.clone().unwrap_or_default();
-    let has_abbrev = !abbrev.is_empty();
     let builtin = snip.source == Source::Builtin;
 
+    let insert = actions.insert.clone();
+    let insert_snip = snip.clone();
     let open = actions.open_in_tab.clone();
     let open_snip = snip.clone();
     let edit = actions.edit.clone();
     let duplicate = actions.duplicate.clone();
     let remove = actions.remove.clone();
 
-    let mut entries = vec![MenuEntry::action("Open in new tab", move || {
-        (open)(open_snip.clone())
-    })];
+    let mut entries = vec![
+        MenuEntry::action("Insert into editor", move || (insert)(insert_snip.clone())),
+        MenuEntry::action("Open in new tab", move || (open)(open_snip.clone())),
+    ];
     if !builtin {
-        // First of the editing entries: changing the SQL is the reason to open
-        // a snippet at all, and the two inline edits below are its shortcuts.
-        entries.push(MenuEntry::action("Edit…", move || {
-            (edit)(id);
-        }));
-        entries.push(MenuEntry::action("Rename…", move || {
-            rename_buf.set(name.clone());
-            renaming.set(Some((id, RowEdit::Name)));
-        }));
-        // Named for what it does rather than for the field: an abbrev is a thing
-        // you *type* to get the snippet, and "Set abbrev" says less than that.
-        let label = if has_abbrev {
-            "Change expansion shortcut…"
-        } else {
-            "Add expansion shortcut…"
-        };
-        entries.push(MenuEntry::action(label, move || {
-            rename_buf.set(abbrev.clone());
-            renaming.set(Some((id, RowEdit::Abbrev)));
-        }));
+        entries.push(MenuEntry::action("Edit", move || (edit)(id)));
         entries.push(scope_menu(snip, actions, dialect, conn_id));
     }
     entries.push(MenuEntry::action("Duplicate", move || (duplicate)(id)));
     if !builtin {
         entries.push(MenuEntry::Separator);
-        entries.push(MenuEntry::action("Delete…", move || (remove)(id)));
+        entries.push(MenuEntry::action("Delete", move || (remove)(id)));
     }
     entries
 }

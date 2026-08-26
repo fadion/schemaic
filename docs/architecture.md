@@ -3016,12 +3016,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     where a history row opens a new tab — a record of a past run wants its own tab, a snippet is
     something you compose *with*; "Open in new tab" is on the row's menu for when it isn't. The
     parameter chips under a body are read live from `params::names`, never stored, so they cannot
-    disagree with the body above them. Renaming is inline (an `edit_field` in place of the name),
-    matching the tab rename, because there is no text-prompt modal in this codebase and a saved
-    query's name is the same kind of act — and the row menu's *expansion shortcut* entry puts the
-    same field where the abbrev chip sits, where **committing an empty one removes the abbrev**,
-    the only way to take a trigger back off a snippet. The menu's **Show in** submenu is the scope
-    picker: its three choices are `snippet::scope_options` (narrowest first), so the order you pick
+    disagree with the body above them.
+    **A saved snippet is scoped to the connection it was saved on and stamped as just-used**, so it
+    lands in the topmost band's topmost row and the panel scrolls there — the first spelling (engine
+    scope, no stamp) dropped a new row into the middle of a long alphabetical list, where nobody
+    could find the thing they had just saved. Widening it afterwards is one click in *Show in*. The
+    scroll goes through a `scroll_to` signal **cleared on the next tick**: a `Some` left standing
+    re-scrolls on every later layout pass, which is the sticky-`scroll_to` trap that also shaped the
+    grid's tail-follow.
+    Naming that new snippet is inline (an `edit_field` in place of the name), matching the tab
+    rename, because there is no text-prompt modal here and naming a saved query is the same kind of
+    act. That is the **only** inline edit: the name and the abbrev both used to have menu entries
+    and inline fields of their own, which made three routes into the three fields `snippet_edit`
+    already owns — the menu now offers *Edit* and the dialog does the rest. The menu's **Show in**
+    submenu is the scope picker: its three choices are `snippet::scope_options` (narrowest first), so the order you pick
     from and the order of the bands a row can move to cannot drift apart — a test pins each choice
     to the band it lands under. The current one is tinted rather than ticked, the convention
     `cell_editors::pick_entries` set. A built-in offers none of the three: Duplicate is how you get
@@ -5230,6 +5238,13 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **No pointer cursor on buttons/icons** — native apps keep the arrow cursor; a pointer feels
   web-like. Use the default; reserve `CursorStyle::Text` for text inputs (a genuine hyperlink may
   keep `Pointer`).
+- **Menu labels carry no trailing ellipsis**, even when the entry opens a dialog. The platform
+  convention says a `…` means "this will ask you something first", but this app doesn't keep it:
+  of the ~110 menu labels in `schemaic-ui`, the only three that ever had one were added in a single
+  sitting and removed in the next. Follow the count, not the platform guideline — a menu where
+  three entries out of a hundred trail dots reads as an inconsistency, which is what it is. Written
+  down here because it was unwritten, and an unwritten convention costs a review round every time
+  somebody adds a menu.
 - **The footer's panel toggles: a control that can't act must not look like one, and when the user
   can fix that, say so.** Below their breakpoints the side panels are *force-hidden* — the schema
   tree at `panels_min_schema_w`, the right column at the wider `panels_min_full_w` — and the window

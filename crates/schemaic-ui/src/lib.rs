@@ -5885,6 +5885,14 @@ pub(crate) struct FieldCfg {
     /// `CHAT_MAX_ROWS`. A signal so the cap can follow a resizing container (the
     /// value viewer caps at the results-panel height).
     pub max_rows: Option<RwSignal<usize>>,
+    /// Multiline only: the **floor** the auto-grow box starts at, in rows.
+    /// Default `1`, which is what a box that grows purely with its content does.
+    ///
+    /// A snippet's body wants 3: at one row the field reads as a single-line
+    /// input and gives no sign that Enter is allowed in it. Clamped against
+    /// [`FieldCfg::max_rows`] at use, so a floor above the cap cannot invert the
+    /// two (`clamp` panics when `min > max`).
+    pub min_rows: usize,
     /// Multiline only: suppress soft word-wrap (long lines scroll horizontally
     /// instead). Keeps the box height a function of the *logical* line count, so
     /// content whose line count is constant (e.g. a row's JSON — one key per line)
@@ -5991,6 +5999,7 @@ impl Default for FieldCfg {
             read_only: false,
             height: None,
             max_rows: None,
+            min_rows: 1,
             no_wrap: false,
             text_color: None,
             placeholder_color: None,
@@ -6129,6 +6138,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         read_only,
         height,
         max_rows,
+        min_rows,
         no_wrap,
         text_color,
         placeholder_color,
@@ -6851,7 +6861,11 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 None => {
                     // Effective cap: a reactive `max_rows` (viewer) else the default.
                     let cap_n = max_rows.map(|m| m.get()).unwrap_or(cap).max(1);
-                    rows.get().clamp(1, cap_n) as f64 * line_h() + pad_v() * 2.0 + 3.0
+                    // The floor never exceeds the cap: `clamp` panics if it does,
+                    // and a caller asking for more rows than the box may show is
+                    // asking for the cap.
+                    let floor = min_rows.max(1).min(cap_n);
+                    rows.get().clamp(floor, cap_n) as f64 * line_h() + pad_v() * 2.0 + 3.0
                 }
             };
             // No flex_grow baked in: in a vertical stack that would stretch the box's
