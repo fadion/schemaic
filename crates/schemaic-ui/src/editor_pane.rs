@@ -44,8 +44,8 @@ use schemaic_core::text_ops::{
 };
 
 use crate::completion::{
-    Completion, accept_completion, completion_popup, recompute_completions, signature_popup,
-    types_a_character, update_signature_help,
+    Completion, CompletionCtx, accept_completion, completion_popup, recompute_completions,
+    signature_popup, types_a_character, update_signature_help,
 };
 use crate::consts::*;
 use crate::diff_view::diff_view;
@@ -1114,6 +1114,10 @@ pub(crate) struct QueryPaneParams {
     pub run_all: Rc<dyn Fn(Vec<String>)>,
     /// What the write guard is holding, if anything — rendered as the guard bar.
     pub run_guard: RwSignal<Option<crate::RunGuard>>,
+    /// The snippet library, for abbrev expansion in the completion popup, and
+    /// the connection its scopes are judged against.
+    pub snippets: RwSignal<Vec<schemaic_core::snippet::Snippet>>,
+    pub active_conn: RwSignal<u64>,
     /// This tab's `:name` parameter values — the parameters bar's store. The bar
     /// collects into it; the run action substitutes with it.
     /// See [`Tab::params`](crate::Tab::params).
@@ -1188,6 +1192,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         run,
         run_all,
         run_guard: guard,
+        snippets,
+        active_conn,
         params: tab_params,
         run_anyway,
         db_nodes,
@@ -1567,11 +1573,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 editor_sig.with_untracked(|e| {
                     recompute_completions(
                         e,
-                        db_nodes,
-                        hidden_dbs,
+                        CompletionCtx {
+                            db_nodes,
+                            hidden_dbs,
+                            active_db: adb.as_deref(),
+                            dialect: dialect.get_untracked(),
+                            snippets,
+                            conn_id: active_conn.get_untracked(),
+                        },
                         comp,
-                        adb.as_deref(),
-                        dialect.get_untracked(),
                         true,
                     )
                 });
@@ -2482,11 +2492,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let adb = active_db.get_untracked();
                     recompute_completions(
                         &ed,
-                        db_nodes,
-                        hidden_dbs,
+                        CompletionCtx {
+                            db_nodes,
+                            hidden_dbs,
+                            active_db: adb.as_deref(),
+                            dialect: dialect.get_untracked(),
+                            snippets,
+                            conn_id: active_conn.get_untracked(),
+                        },
                         comp,
-                        adb.as_deref(),
-                        dialect.get_untracked(),
                         false,
                     );
                 });
