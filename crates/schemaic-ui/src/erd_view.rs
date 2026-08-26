@@ -381,7 +381,11 @@ fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
                 .into_any()
         },
     )
-    .style(|s| s.absolute().inset_top(10.0).inset_right(10.0))
+    .style(|s| {
+        s.absolute()
+            .inset_top(crate::consts::float_inset())
+            .inset_right(crate::consts::float_inset())
+    })
 }
 
 /// The key role tint for a column, matching the schema panel / Find-Anywhere:
@@ -1636,7 +1640,7 @@ fn notice_bar(notice: RwSignal<Option<(String, bool)>>) -> impl IntoView {
     // span whatever its width.
     .style(|s| {
         s.absolute()
-            .inset_bottom(12.0)
+            .inset_bottom(crate::consts::float_inset())
             .inset_left(0.0)
             .inset_right(0.0)
             .justify_center()

@@ -2781,9 +2781,9 @@ pub(crate) fn grid_error_bar(
             // The height and the inset the selection summary lifts itself over —
             // `consts::grid_selection_lift` reads the same two.
             s.absolute()
-                .inset_left(crate::consts::GRID_BAR_INSET)
-                .inset_right(crate::consts::GRID_BAR_INSET)
-                .inset_bottom(crate::consts::GRID_BAR_INSET)
+                .inset_left(crate::consts::float_inset())
+                .inset_right(crate::consts::float_inset())
+                .inset_bottom(crate::consts::float_inset())
                 .height(crate::consts::grid_bar_h())
         } else {
             s
@@ -3090,7 +3090,11 @@ pub(crate) fn grid_find_bar(
                 .into_any()
         },
     )
-    .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
+    .style(|s| {
+        s.absolute()
+            .inset_top(crate::consts::float_inset())
+            .inset_right(crate::consts::float_inset())
+    })
 }
 
 /// The selection-aggregates bar: what the current multi-cell selection adds up
@@ -3144,7 +3148,7 @@ pub(crate) fn grid_selection_bar(
             // and both halves of that geometry are stated once, in
             // `consts::grid_selection_lift`, because the bar's height scales.
             s.absolute()
-                .inset_right(crate::consts::SELECTION_BAR_INSET)
+                .inset_right(crate::consts::float_inset())
                 .inset_bottom(crate::consts::grid_selection_lift(error_shown()))
         } else {
             s
@@ -3224,7 +3228,11 @@ pub(crate) fn grid_goto_bar(
             .into_any()
         },
     )
-    .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
+    .style(|s| {
+        s.absolute()
+            .inset_top(crate::consts::float_inset())
+            .inset_right(crate::consts::float_inset())
+    })
 }
 
 fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
@@ -4986,7 +4994,7 @@ fn seed_popover(gs: GridState) -> impl IntoView {
                 crate::widgets::panel_style(s)
                     .absolute()
                     .inset_top(crate::consts::seed_popover_top())
-                    .inset_right(8.0)
+                    .inset_right(crate::consts::float_inset())
                     .background(theme::bg_chrome())
                     .padding(theme::scaled(12.0))
                     .gap(theme::scaled(8.0))

@@ -4854,13 +4854,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   gets updated when it fails, and is proposed but not written). What it says today is that an
   unscaled length is a hairline, an editor-relative metric (the code font has its own size setting
   and the scale doesn't touch it), the seed for a persisted width the user dragged, an **icon base**,
-  `TERM_FONT_SIZES` (the terminal font, which the scale deliberately doesn't reach either), or the
-  **air a floating bar keeps from the panel edge** — `GRID_BAR_INSET` (5.0) and
-  `SELECTION_BAR_INSET` (8.0), which are the only two length `const`s in `consts.rs` that fit none
-  of the rest. Whether *those two* should scale is unsettled and is written down as unsettled: both
-  bars overlay the panel rather than spanning it and the gap between them is `grid_selection_lift`'s
-  arithmetic, which both have to read the same way — but the honest answer needs the app on screen
-  at 160%, so the doc records what the code does rather than defending it. The icon bases are the
+  or `TERM_FONT_SIZES` (the terminal font, which the scale deliberately doesn't reach either).
+  **The air a floating box keeps from a panel edge is no longer on that list**: it is
+  `consts::float_inset()`, it scales, and `consts::float_inset_gate` is the source gate — with the
+  exception list as *data* — that keeps a twelfth site from inventing a sixth number. That entry
+  used to read "`GRID_BAR_INSET` (5.0) and `SELECTION_BAR_INSET` (8.0), and whether those two should
+  scale is unsettled", because the honest answer needed the app on screen at 160% and no test can
+  see a gap. Looked at: the 10–12px gaps read correctly there and the 5–7px ones read tight against
+  surroundings that had all grown, so a base of 8 (→ 13 at 160%) replaced all five numbers. A
+  *second, gentler curve* was the other candidate — it would have kept 100% pixel-identical — and it
+  was rejected because `scale_at` is the only curve in the app (`scale_font_at` delegates rather than
+  being a second rounding rule) and a third category would make every future length a taste decision
+  between "scales", "doesn't" and "scales a bit". Five numbers for one gap is what that costs. The
+  trade taken instead is that 100% moves: the grid's bars loosen from 5, the ER diagram's tighten
+  from 10 and 12, and the selection summary — already 8 — is unmoved. The icon bases are the
   two-way trap: `icons::icon(markup, size)` takes a **base** size and scales it itself, so never hand
   it an already-scaled value, which is what `consts::COMPLETION_ICON_BASE` and
   `consts::SCHEMA_ICON_BASE` exist to spell out — and scaling the base constant too would square the
