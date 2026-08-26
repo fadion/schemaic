@@ -3192,87 +3192,6 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     .on_event_cont(EventListener::WindowLostFocus, move |_| {
         window_focused.set(false)
     })
-    // Panel toggles when focus is OUTSIDE the editor (the editor handles these
-    // in its own key handler and stops propagation; anything else that doesn't
-    // consume the key bubbles up here). Ctrl+Shift+E / Ctrl+Shift+A / Ctrl+`.
-    .on_event(EventListener::KeyDown, move |e| {
-        if let Event::KeyDown(ke) = e {
-            let m = ke.modifiers;
-            // Escape closing a control's popup has to be answered here, and only
-            // here: the popup takes the keyboard itself, so neither the control
-            // that owns it nor the modal around it is the focused view, and floem
-            // delivers a key to the focused view and then only to the root's
-            // listeners. Nothing open → falls through, and the modal's own
-            // Escape handles the layer below (see `widgets::dismiss_open_popup`).
-            if matches!(ke.key.logical_key, Key::Named(NamedKey::Escape))
-                && widgets::dismiss_open_popup()
-            {
-                return EventPropagation::Stop;
-            }
-            // The Tab trap's backstop, and the mirror of the Escape branch above:
-            // a plain Tab only gets this far when nothing in the overlay consumed
-            // it, which means focus is on a dropdown's popup list or on nothing at
-            // all (floem clears it silently when a focused view is removed, and a
-            // click on an unfocusable row leaves it cleared). Floem's own fallback
-            // walks the **whole window tree**, so from either state Tab left the
-            // modal for the workspace behind it — the one thing the ring exists to
-            // prevent. Step the innermost overlay's ring instead.
-            if matches!(ke.key.logical_key, Key::Named(NamedKey::Tab))
-                && !m.control()
-                && let Some((root, ring)) = widgets::innermost_ring_root()
-            {
-                ring.step_from(root, m.shift());
-                return EventPropagation::Stop;
-            }
-            if m.control() {
-                // Global nav (Ctrl+P/T/W/Tab/1-9) — also wired inside the editor,
-                // which stops KeyDown; here it catches every other focus (grid,
-                // schema, nothing) since those bubble unhandled keys up.
-                let is_tab = matches!(ke.key.logical_key, Key::Named(NamedKey::Tab));
-                let ch = match &ke.key.logical_key {
-                    Key::Character(c) => Some(c.as_str().to_ascii_lowercase()),
-                    _ => None,
-                };
-                if navkeys.handle(m.shift(), ch.as_deref(), is_tab) {
-                    return EventPropagation::Stop;
-                }
-                if let Key::Character(c) = &ke.key.logical_key {
-                    let c = c.as_str();
-                    if m.shift() && c.eq_ignore_ascii_case("e") {
-                        if schema_panel_allowed() {
-                            schema_visible.update(|v| *v = !*v);
-                        }
-                        return EventPropagation::Stop;
-                    }
-                    if m.shift() && c.eq_ignore_ascii_case("a") {
-                        if right_panel_allowed() {
-                            right_panel.update(|p| {
-                                *p = if matches!(*p, RightPanel::Ai) {
-                                    RightPanel::None
-                                } else {
-                                    RightPanel::Ai
-                                };
-                            });
-                        }
-                        return EventPropagation::Stop;
-                    }
-                    if c == "`" {
-                        if right_panel_allowed() {
-                            right_panel.update(|p| {
-                                *p = if matches!(*p, RightPanel::Terminal) {
-                                    RightPanel::None
-                                } else {
-                                    RightPanel::Terminal
-                                };
-                            });
-                        }
-                        return EventPropagation::Stop;
-                    }
-                }
-            }
-        }
-        EventPropagation::Continue
-    })
     // Any pointer-down anywhere closes an open schema context menu (OS-like:
     // a fresh right-click collapses the previous menu). The menu panel itself
     // stops pointer-downs, so this doesn't fire when interacting with it; and a
@@ -3394,7 +3313,105 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     // out here, so a press in the top corners still resizes rather than drags,
     // which is the order the frame already reads in.
     let [n, s, w, e, nw, ne, sw, se] = chrome.resize_zones();
-    stack((root, n, s, w, e, nw, ne, sw, se)).style(|s| s.size_full())
+    stack((root, n, s, w, e, nw, ne, sw, se))
+        // **The window's keyboard fallback, and it has to be on _this_ view.**
+        //
+        // Floem hands a `KeyDown` to the focused view; if nothing consumes it, the
+        // only other place it goes is `main_view.apply_event(…)` — and
+        // `ViewId::apply_event` reads the listeners on **that one id**, without
+        // walking children. `main_view` is precisely what the app's view function
+        // returned, which is this stack. The focus path is no help either: it
+        // dispatches *downward* from the focused view and never up through its
+        // ancestors, so an ancestor's listener is not a bubble target.
+        //
+        // It lived on `root` until this was found, and `root` is a child of this
+        // stack. `69fd7aa` put it there — the resize zones needed an outer wrapper
+        // and the handler stayed behind — so every branch below went dead whenever
+        // focus was outside the SQL editor, which answers the same keys in its own
+        // handler and hid it. `window_key_gate` is what keeps it here.
+        //
+        // What this answers, in order: Escape closing an open dropdown popup, the
+        // Tab-trap backstop, `NavKeys` (Ctrl+P/Shift+P/T/W/Tab/1-9, Ctrl+O/S), and
+        // the three panel toggles Ctrl+Shift+E / Ctrl+Shift+A / Ctrl+`.
+        .on_event(EventListener::KeyDown, move |e| {
+            if let Event::KeyDown(ke) = e {
+                let m = ke.modifiers;
+                // Escape closing a control's popup has to be answered here, and
+                // only here: the popup takes the keyboard itself, so neither the
+                // control that owns it nor the modal around it is the focused
+                // view. Nothing open → falls through, and the modal's own Escape
+                // handles the layer below (see `widgets::dismiss_open_popup`).
+                if matches!(ke.key.logical_key, Key::Named(NamedKey::Escape))
+                    && widgets::dismiss_open_popup()
+                {
+                    return EventPropagation::Stop;
+                }
+                // The Tab trap's backstop, and the mirror of the Escape branch
+                // above: a plain Tab only gets this far when nothing in the overlay
+                // consumed it, which means focus is on a dropdown's popup list or
+                // on nothing at all (floem clears it silently when a focused view
+                // is removed, and a click on an unfocusable row leaves it cleared).
+                // Floem's own fallback walks the **whole window tree**, so from
+                // either state Tab left the modal for the workspace behind it — the
+                // one thing the ring exists to prevent. Step the innermost
+                // overlay's ring instead.
+                if matches!(ke.key.logical_key, Key::Named(NamedKey::Tab))
+                    && !m.control()
+                    && let Some((ring_root, ring)) = widgets::innermost_ring_root()
+                {
+                    ring.step_from(ring_root, m.shift());
+                    return EventPropagation::Stop;
+                }
+                if m.control() {
+                    // Global nav (Ctrl+P/T/W/Tab/1-9) — also wired inside the
+                    // editor, which stops KeyDown; here it catches every other
+                    // focus (grid, schema, nothing).
+                    let is_tab = matches!(ke.key.logical_key, Key::Named(NamedKey::Tab));
+                    let ch = match &ke.key.logical_key {
+                        Key::Character(c) => Some(c.as_str().to_ascii_lowercase()),
+                        _ => None,
+                    };
+                    if navkeys.handle(m.shift(), ch.as_deref(), is_tab) {
+                        return EventPropagation::Stop;
+                    }
+                    if let Key::Character(c) = &ke.key.logical_key {
+                        let c = c.as_str();
+                        if m.shift() && c.eq_ignore_ascii_case("e") {
+                            if schema_panel_allowed() {
+                                schema_visible.update(|v| *v = !*v);
+                            }
+                            return EventPropagation::Stop;
+                        }
+                        if m.shift() && c.eq_ignore_ascii_case("a") {
+                            if right_panel_allowed() {
+                                right_panel.update(|p| {
+                                    *p = if matches!(*p, RightPanel::Ai) {
+                                        RightPanel::None
+                                    } else {
+                                        RightPanel::Ai
+                                    };
+                                });
+                            }
+                            return EventPropagation::Stop;
+                        }
+                        if c == "`" {
+                            if right_panel_allowed() {
+                                right_panel.update(|p| {
+                                    *p = if matches!(*p, RightPanel::Terminal) {
+                                        RightPanel::None
+                                    } else {
+                                        RightPanel::Terminal
+                                    };
+                                });
+                            }
+                            return EventPropagation::Stop;
+                        }
+                    }
+                }
+            }
+            EventPropagation::Continue
+        })
+        .style(|s| s.size_full())
 }
 
 // ── Header ────────────────────────────────────────────────────────────────
@@ -7790,5 +7807,73 @@ mod panel_toggle_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod window_key_gate {
+    use std::path::Path;
+
+    /// **A window-level key handler has to be on the view the app returns.**
+    ///
+    /// Floem delivers a `KeyDown` to the focused view; if nothing consumes it, the
+    /// only other place it goes is `WindowHandle::main_view.apply_event(…)`, and
+    /// `ViewId::apply_event` reads the listeners on **that one id** — it does not
+    /// walk children. `main_view` is exactly what the app's view function returned.
+    /// So a `KeyDown` listener attached to anything *inside* that view is never
+    /// reached: not by the focus path, which dispatches downward from the focused
+    /// view and never up through its ancestors, and not by the fallback.
+    ///
+    /// That is not hypothetical. `69fd7aa` wrapped `workspace`'s root in an outer
+    /// stack for the eight window resize zones and left this listener on the inner
+    /// `root`, which silently moved it off `main_view` — and every branch in it
+    /// went dead whenever focus was outside the SQL editor: Escape closing an open
+    /// dropdown, the Tab-trap backstop, `NavKeys` (Ctrl+P, Ctrl+Shift+P, Ctrl+T/W,
+    /// Ctrl+Tab, Ctrl+1..9, Ctrl+O/S) and the three panel toggles. It looked fine
+    /// because `editor_pane` answers the same keys itself, and the editor usually
+    /// has focus. It survived a release.
+    ///
+    /// The check is deliberately crude — where the listener sits relative to the
+    /// resize zones, which are built from `chrome.resize_zones()` on the line
+    /// before the returned stack. A precise one would need to parse the builder
+    /// chain; this one costs nothing and fails on exactly the mistake that was
+    /// made.
+    #[test]
+    fn the_window_key_handler_is_on_the_view_workspace_returns() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("lib.rs"),
+        )
+        .expect("lib.rs");
+        // This module quotes the names it looks for, so cut the tests off.
+        let body = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => &src[..],
+        };
+        let at = body
+            .find("pub fn workspace(")
+            .expect("`workspace` is gone — this gate is stale");
+        let end = body[at..]
+            .find("\n}")
+            .expect("`workspace`'s end — this gate is stale");
+        let f = &body[at..at + end];
+
+        let zones = f
+            .find("chrome.resize_zones()")
+            .expect("the resize zones are gone — this gate is stale");
+        let keys = f
+            .find("EventListener::KeyDown")
+            .expect("the window key handler is gone — this gate is stale");
+
+        assert!(
+            keys > zones,
+            "`workspace`'s KeyDown listener is attached before the resize zones are \
+             built, which means it is on the inner root rather than on the stack \
+             `workspace` returns. Floem hands an unconsumed key to the returned \
+             view's own listeners and to nothing else, so every branch in that \
+             handler is dead whenever focus is outside the SQL editor — which \
+             answers the same keys itself and hides it."
+        );
     }
 }
