@@ -11,8 +11,8 @@ use floem::prelude::*;
 
 use crate::consts::{TERM_FONT_SIZES, chat_pad_h};
 use crate::widgets::{
-    ActionKind, action_button, autohide, focus_root_with_ring, form_hint, form_label_style,
-    modal_title, panel_style,
+    ActionKind, MenuEntry, action_button, autohide, focus_root_with_ring, form_hint,
+    form_label_style, modal_title, panel_style,
 };
 use crate::{AiEffort, AiModel, FieldCfg, SchemaScope, TermCursor, Ui, edit_field, icons, theme};
 
@@ -138,8 +138,15 @@ fn term_font_label(n: u16) -> String {
     n.to_string()
 }
 
-/// A shell picker as a dropdown (bound to the selected index over the dynamic
-/// shell list). Picking one applies immediately (respawns the terminal).
+/// A shell picker (bound to the selected index over the dynamic shell list).
+/// Picking one applies immediately (respawns the terminal).
+///
+/// The one picker in the app whose rows carry a **detail line**
+/// ([`MenuEntry::action_detail`]): a shell's name does not always say which
+/// binary it is — "PowerShell 7" and "Windows PowerShell" differ by `pwsh.exe`
+/// against `powershell.exe`, and two WSL entries differ only by the `-d` that
+/// follows. The closed box shows the name alone, which is what the row of the
+/// modal has room for.
 fn shell_dropdown(
     shells: RwSignal<Vec<schemaic_term::ShellProfile>>,
     selected: RwSignal<usize>,
@@ -147,61 +154,42 @@ fn shell_dropdown(
     ring: crate::widgets::FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
-    use floem::views::dropdown::Dropdown;
-
-    let main = move |cur: usize| {
-        let name = shells
-            .get()
-            .get(cur)
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
-        h_stack((
-            text(name).style(|s| s.color(theme::text()).font_size(theme::font_body())),
-            empty().style(|s| s.flex_grow(1.0_f32)),
-            icons::icon(icons::CHEVRON_DOWN, 16.0)
-                .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
-        ))
-        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
-        .into_any()
-    };
-    // Popup row: shell name + its program/args, with the active row highlighted.
-    let row = move |i: usize| {
-        let (name, sub): (String, String) = shells
+    // Rebuilt per opening rather than captured: the shell list is detected
+    // asynchronously and the modal can be open before it lands.
+    let entries = move || {
+        let apply = apply.clone();
+        shells
             .get_untracked()
-            .get(i)
-            .map(|p| {
-                let sub = if p.args.is_empty() {
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let cmd = if p.args.is_empty() {
                     p.program.clone()
                 } else {
                     format!("{} {}", p.program, p.args.join(" "))
                 };
-                (p.name.clone(), sub)
+                let apply = apply.clone();
+                MenuEntry::action_detail(
+                    p.name.clone(),
+                    cmd,
+                    (selected.get_untracked() == i).then_some(theme::accent),
+                    move || (apply)(i),
+                )
             })
-            .unwrap_or_default();
-        v_stack((
-            text(name).style(|s| s.color(theme::text()).font_size(theme::font_body())),
-            text(sub).style(|s| s.color(theme::text_faint()).font_size(theme::font_label())),
-        ))
-        .style(move |s| {
-            let s = s
-                .width_full()
-                .padding_horiz(theme::scaled(12.0))
-                .padding_vert(theme::scaled(6.0))
-                .flex_col()
-                .gap(theme::scaled(2.0))
-                .hover(|s| s.background(theme::dropdown_hover()));
-            if selected.get() == i {
-                s.background(theme::dropdown_active())
-            } else {
-                s
-            }
-        })
-        .into_any()
+            .collect()
     };
-
-    let opts: Vec<usize> = (0..shells.get_untracked().len()).collect();
-    let dd = Dropdown::custom(move || selected.get(), main, opts, row).style(dropdown_box_style);
-    in_ring_dropdown(dd, ring, tabindex, move |i| (apply)(i))
+    in_ring_picker(
+        picker_box_content(move || {
+            shells
+                .get()
+                .get(selected.get())
+                .map(|p| p.name.clone())
+                .unwrap_or_default()
+        }),
+        entries,
+        ring,
+        tabindex,
+    )
 }
 
 /// A self-describing toggle row — title + hint on the left, switch on the right
@@ -240,82 +228,16 @@ pub(crate) fn focusable_toggle_row(
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
 
-// A themed `<select>`-style dropdown for the settings modal. The closed box
-// looks like an `edit_field` (dark surface, field border, chevron); the popup is
-// a floating menu styled via the dropdown's `ScrollClass` (bg_panel + border).
-// `active` is the source of truth; `label` renders each variant.
-/// A settings dropdown.
+/// The closed box every picker in the app wears: a dark field-like surface with
+/// a chevron, the same chrome an [`crate::edit_field`] draws, so a form of mixed
+/// controls reads as one set.
 ///
-/// `label` may return an owned `String`, so it can be *computed from the value*
-/// rather than looked up. Three of these label functions used to be `match`es
-/// with a `_` arm handing back the **default's** label, so any value outside the
-/// option list read as (say) "200,000" while the app used something else, and no
-/// popup row highlighted — the one modal whose job is to report settings
-/// accurately, asserting a setting that wasn't in effect. No such value is
-/// reachable today; the trap was the next ordinary edit to a list (adding a
-/// 24 px size, dropping the 1M row limit), which would have mislabelled the
-/// setting for every user who held the removed value.
-fn settings_dropdown<T, S>(
-    active: RwSignal<T>,
-    options: impl IntoIterator<Item = T> + Clone + 'static,
-    label: fn(T) -> S,
-) -> floem::views::dropdown::Dropdown<T>
-where
-    T: Copy + PartialEq + 'static,
-    // `&'static str` for the enums, whose labels are total over their variants
-    // by construction; `String` for the numeric settings, which have to compute
-    // theirs.
-    S: Into<String> + 'static,
-{
-    use floem::views::dropdown::Dropdown;
-
-    // Closed box: selected label on the left, chevron on the right.
-    let main = move |cur: T| {
-        h_stack((
-            text(label(cur).into()).style(|s| s.color(theme::text()).font_size(theme::font_body())),
-            empty().style(|s| s.flex_grow(1.0_f32)),
-            icons::icon(icons::CHEVRON_DOWN, 16.0)
-                .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
-        ))
-        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
-        .into_any()
-    };
-
-    // Popup row: the label fills the whole row and carries padding + hover +
-    // the resting highlight for the currently-active value. (Floem's list
-    // `selection` resets to None each open, so we key the highlight off `active`
-    // rather than the list's selected state. `ListItemClass` below is neutralised
-    // so this is the only styling.)
-    let row = move |item: T| {
-        text(label(item).into())
-            .style(move |s| {
-                let s = s
-                    .width_full()
-                    .padding_horiz(theme::scaled(12.0))
-                    .padding_vert(theme::scaled(6.0))
-                    .color(theme::text())
-                    .font_size(theme::font_body())
-                    .hover(|s| s.background(theme::dropdown_hover()));
-                if active.get() == item {
-                    s.background(theme::dropdown_active())
-                } else {
-                    s
-                }
-            })
-            .into_any()
-    };
-
-    Dropdown::custom(move || active.get(), main, options, row)
-        .on_accept(move |item| active.set(item))
-        .style(dropdown_box_style)
-}
-
-// The closed-box + floating-popup styling shared by every settings dropdown: a
-// dark field-like box with a chevron, and a `bg_panel` menu surface with Floem's
-// default list chrome neutralised (see `dropdown_item_style`).
+/// It used to carry the floating popup's styling too — a `ScrollClass` surface
+/// and three nested rules neutralising floem's default list chrome. All of that
+/// went with floem's `Dropdown` ([`in_ring_picker`] says why): the panel is now a
+/// [`crate::widgets::menu_panel`], which is themed where every other menu in the
+/// app is themed.
 pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style {
-    use floem::views::scroll::ScrollClass;
-    use floem::views::{ListClass, ListItemClass};
     s.width_full()
         .height(theme::scaled(32.0))
         .items_center()
@@ -330,59 +252,6 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
         // magenta ring belonging to no palette here.
         .focus(|s| s.border_color(theme::field_border_active()))
         .focus_visible(|s| s.outline(0.0))
-        // The floating popup (the dropdown's inner scroll) — a menu surface that
-        // clears the global scrollbar styling automatically.
-        .class(ScrollClass, move |s| {
-            s.background(theme::bg_panel())
-                .border(1.0)
-                .border_color(theme::border())
-                .border_radius(8.0)
-                .padding_vert(theme::scaled(4.0))
-                .min_width(theme::scaled(150.0))
-                // Override Floem's default list chrome. The item rule is nested
-                // under `ListClass` so it's inherited from the same nearest
-                // ancestor (the list) as the default's `ListClass > ListItemClass`
-                // rule and thus wins over it.
-                .class(ListClass, |s| {
-                    s.border(0.0)
-                        .outline(0.0)
-                        .focus_visible(|s| s.outline(0.0))
-                        .focus(|s| {
-                            s.outline(0.0)
-                                .border(0.0)
-                                .class(ListItemClass, dropdown_item_style)
-                        })
-                        .class(ListItemClass, dropdown_item_style)
-                })
-                .class(ListItemClass, dropdown_item_style)
-        })
-}
-
-// Neutralise Floem's built-in list-item chrome (side margin, padding, border,
-// default hover tint) so the row content is the only thing that styles the
-// option — see `settings_dropdown`'s `row`.
-//
-// **Except the selected state**, which is the keyboard's cursor through the
-// list: floem's list moves `selection` on Up/Down, and blanking it (as the rest
-// of this function does to floem's chrome) left arrowing through an open
-// dropdown with nothing to look at — you could count keypresses and press
-// Enter, but not see what you were about to choose. It paints the hover
-// background on purpose: the pointer and the keyboard are the same act of
-// pointing at a row, and the *resting* highlight for the value already in
-// effect is a separate, dimmer colour applied by the row builder.
-fn dropdown_item_style(s: floem::style::Style) -> floem::style::Style {
-    let transparent = floem::peniko::Color::TRANSPARENT;
-    s.margin(0.0)
-        .width_full()
-        .padding(0.0)
-        .border(0.0)
-        .border_radius(0.0)
-        .background(transparent)
-        .hover(|s| s.background(transparent))
-        .selected(move |s| {
-            s.background(theme::dropdown_hover())
-                .hover(|s| s.background(theme::dropdown_hover()))
-        })
 }
 
 // A small dim group heading inside the AI settings modal.
@@ -392,22 +261,24 @@ fn settings_group_label(t: &'static str) -> impl IntoView {
 
 /// The interface-scale picker: four segments, no popup.
 ///
-/// **Deliberately not a dropdown**, unlike the two theme pickers above it, and the
-/// reason is a floem bug rather than a taste. `OverlayView::paint` (floem 0.2,
-/// `window_handle.rs`) nudges an overlay back inside the window when it would
-/// overflow — `cx.offset((-x, -y))` — and that nudge is **paint only**: layout,
-/// and therefore hit-testing, stays where it was. So any `Dropdown` whose popup
-/// runs past the window's bottom edge paints its rows in one place and answers
-/// the pointer in another, and you have to hover the row *below* the one you
-/// want. Every dropdown in the app has that latent bug; this control hit it
-/// because it is the last row of the last group of the tallest modal — and it hit
-/// it *at the middle of the range* (150% then, 130% now), where the modal grows
-/// enough to push the popup past the edge but not enough for the body to scroll
-/// instead.
+/// **Where the floem overlay bug was found**, and the record is kept here because
+/// it is what [`in_ring_picker`] exists to answer. `OverlayView::paint` (floem
+/// 0.2, `window_handle.rs`) nudges an overlay back inside the window when it
+/// would overflow — `cx.offset((-x, -y))` — and that nudge is **paint only**:
+/// layout, and therefore hit-testing, stays where it was. So a floem `Dropdown`
+/// whose popup runs past the window's bottom edge painted its rows in one place
+/// and answered the pointer in another, and you had to hover the row *below* the
+/// one you wanted. This control hit it first because it is the last row of the
+/// last group of the tallest modal — and it hit it *at the middle of the range*
+/// (150% then, 130% now), where the modal grows enough to push the popup past the
+/// edge but not enough for the body to scroll instead.
 ///
-/// A segmented control has no overlay, so it cannot be wrong. It is also the
-/// better control here: four short options, all visible, one click each — which
-/// is how somebody choosing a scale actually behaves, trying them in turn.
+/// Every other dropdown in the app carried the same latent bug, and the class is
+/// now gone rather than the instances: nothing here is built on floem's
+/// `Dropdown` any more (`no_floem_dropdown_gate` keeps it that way). **This
+/// control stays segmented anyway** — it never needed a popup. Four short
+/// options, all visible, one click each, which is how somebody choosing a scale
+/// actually behaves, trying them in turn.
 ///
 /// The segments wear the percentage itself (`UiScale::label`) rather than a name
 /// like "Large": it is the number somebody opens this control to ask about, it
@@ -655,35 +526,20 @@ pub(crate) fn focusable_toggle(
     )
 }
 
-/// A [`settings_dropdown`] in a modal's Tab order.
+/// The settings modals' `<select>`: a value from a fixed list, bound to the
+/// signal that value lives in, in a modal's Tab order.
 ///
-/// Floem's `Dropdown` answers half the keyboard on its own — the popup list is
-/// keyboard-navigable in its own right, so Up/Down walk the options and Enter
-/// accepts — but **its own open/close is taken over here**, and the rest of this
-/// comment is why. Do not "simplify" by deleting the KeyDown handler and
-/// `disable_default_event` below on the strength of floem having an Enter/Space
-/// arm: that arm fires on *KeyUp*, and restoring it restores the bug this exists
-/// to fix.
-///
-/// Choosing an option hands focus **back to the box**. Floem's dropdown removes
-/// its popup without giving the keyboard to anything, and floem clears the focus
-/// of a removed view silently — no `FocusGained` lands anywhere — so picking a
-/// value with Enter dropped focus out of the modal entirely and the next Tab
-/// resumed from wherever the app happened to put it.
-///
-/// Hung off `on_accept` rather than `on_open(false)`, which fires on *every*
-/// close: closing by clicking another control would then yank focus back off the
-/// thing just clicked. The trade is that dismissing the popup without choosing
-/// still leaves focus adrift.
-///
-/// **Opening moves to KeyDown**, which is why the open state is driven from a
-/// signal here rather than left to floem. Floem toggles the dropdown on *KeyUp*,
-/// and the Enter that accepts an option is pressed in the popup and released
-/// over the box we have just refocused — so the release reopened the menu every
-/// time. `disable_default_event` takes that toggle out and `show_list` puts the
-/// state under our control; `on_open` mirrors floem's own opens and closes back
-/// into the signal, so a pointer click can't leave the two disagreeing. Arrow
-/// keys open it too, the reflex a `<select>` trains.
+/// The box, the menu and the keyboard are all [`in_ring_picker`]'s — this half
+/// only knows what the options are and what picking one does. `label` may return
+/// an owned `String`, so it can be *computed from the value* rather than looked
+/// up: three of these label functions used to be `match`es with a `_` arm handing
+/// back the **default's** label, so any value outside the option list read as
+/// (say) "200,000" while the app used something else, and no row was tinted — the
+/// one modal whose job is to report settings accurately, asserting a setting that
+/// wasn't in effect. No such value is reachable today; the trap was the next
+/// ordinary edit to a list (adding a 24 px size, dropping the 1M row limit),
+/// which would have mislabelled the setting for every user who held the removed
+/// value.
 pub(crate) fn focusable_dropdown<T, S>(
     active: RwSignal<T>,
     options: impl IntoIterator<Item = T> + Clone + 'static,
@@ -695,116 +551,196 @@ where
     T: Copy + PartialEq + 'static,
     S: Into<String> + 'static,
 {
-    in_ring_dropdown(
-        settings_dropdown(active, options, label),
+    let entries = move || {
+        options
+            .clone()
+            .into_iter()
+            .map(|item| {
+                let text: String = label(item).into();
+                let pick = move || active.set(item);
+                // The value already in effect is **tinted**, not given a filled
+                // background: the tint is this menu system's vocabulary for "you
+                // are holding this one" (`cell_editors::pick_entries` says the
+                // same thing the same way), and the fill is the *cursor*, which
+                // moves with the arrows. Two states, two treatments — the floem
+                // dropdown had to invent a dimmer fill to keep them apart.
+                match active.get_untracked() == item {
+                    true => MenuEntry::action_colored(text, theme::accent, pick),
+                    false => MenuEntry::action(text, pick),
+                }
+            })
+            .collect()
+    };
+    in_ring_picker(
+        picker_box_content(move || label(active.get()).into()),
+        entries,
         ring,
         tabindex,
-        move |item| active.set(item),
     )
 }
 
-/// Put an already-built [`Dropdown`](floem::views::dropdown::Dropdown) in a
-/// modal's Tab order, taking its open state over.
+/// The closed box's content: the current value on the left, a chevron on the
+/// right, both following the value reactively.
 ///
-/// The behaviour and every reason for it are documented on
-/// [`focusable_dropdown`]; this is the half that doesn't care what the options
-/// are, so the app's *other* picker — [`crate::table_designer::focusable_owned_dropdown`],
-/// which exists because a table name isn't `Copy` — joins the ring through the
-/// same code rather than a second copy of four floem work-arounds.
+/// A `dyn_container` keyed on the string rather than a captured one: the label
+/// is computed from a signal and every one of these boxes has to repaint when
+/// its setting changes from anywhere else — the theme modal's own preview does
+/// exactly that.
+pub(crate) fn picker_box_content(label: impl Fn() -> String + 'static) -> AnyView {
+    dyn_container(label, move |cur| {
+        h_stack((
+            text(cur).style(|s| {
+                s.color(theme::text())
+                    .font_size(theme::font_body())
+                    .text_ellipsis()
+                    .min_width(0.0)
+            }),
+            empty().style(|s| s.flex_grow(1.0_f32)),
+            icons::icon(icons::CHEVRON_DOWN, 16.0)
+                .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
+        ))
+        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
+        .into_any()
+    })
+    .style(|s| s.width_full().min_width(0.0))
+    .into_any()
+}
+
+/// A `<select>`-shaped box in a modal's Tab order that drops **the app's own
+/// popup menu**, not a floem [`Dropdown`](floem::views::dropdown::Dropdown).
 ///
-/// `on_accept` is passed in rather than left on the dropdown because floem keeps
-/// a **single** accept slot: whatever the builder set is replaced here, so the
-/// caller's action has to arrive with the ring.
-pub(crate) fn in_ring_dropdown<T>(
-    dd: floem::views::dropdown::Dropdown<T>,
+/// **Why it is not floem's.** `scale_picker`'s doc states the bug in full: floem
+/// 0.2 nudges an overlay that would overflow the window back inside during
+/// `paint` **only**, so layout and hit-testing stay where they were and the row
+/// that lights up under the pointer is not the row the pointer is over. Every
+/// dropdown in the app had that latent, and the interface scale is what makes it
+/// reachable — a `modal_h(620)` editor is 992px tall at 160%, so a field near its
+/// foot is within a popup's height of the window edge on any 1080p screen. No
+/// bounded fix exists inside floem's control: the popup is an `add_overlay` at a
+/// point the widget computes, and the nudge is `cx.offset((-x, -y))` against
+/// `parent_size - 5.0`, so a `max_height` cap would have to be ≤ 5px to
+/// guarantee no nudge. The app already owns a popup that places itself honestly
+/// — [`crate::widgets::menu_panel`] flips at an edge from a *predicted* height
+/// ([`crate::widgets::menu_panel_height`]) and lays out where it draws — so this
+/// routes every picker through that instead. Removing the class, not the
+/// instances.
+///
+/// **The box owns opening; the panel owns everything after.** A press (or Enter,
+/// Space, Up, Down — the reflexes a `<select>` trains) calls
+/// [`crate::widgets::open_picker`], which is also what closes it again on a
+/// second press, and the panel then takes the keyboard itself: arrows walk,
+/// Enter picks, Escape peels one layer. That is four floem work-arounds deleted
+/// rather than moved — `disable_default_event`, the mirrored `on_open`, the
+/// `show_list` signal and the single `on_accept` slot were all about floem's
+/// dropdown answering half the keyboard on `KeyUp`, and none of it has anything
+/// to answer here.
+///
+/// **Where focus goes when the menu closes** is still this box's problem, and it
+/// is handed over rather than remembered: [`crate::widgets::set_menu_return`] is
+/// taken by the panel as it builds, and calls `ring.focus_at(tabindex)` —
+/// resolved when it fires, not captured, because an accept can rebuild the very
+/// box it came from (the PG trigger editor's Function picker sits in a container
+/// keyed on the signal its own accept writes) and floem's focus request has no
+/// existence check. Set only when the opener was reached from the keyboard: after
+/// a click, moving focus here would take the arrows away from whatever had them.
+pub(crate) fn in_ring_picker(
+    main: AnyView,
+    entries: impl Fn() -> Vec<MenuEntry> + 'static,
     ring: crate::widgets::FocusRing,
     tabindex: u32,
-    on_accept: impl Fn(T) + 'static,
-) -> impl IntoView
-where
-    T: Clone + 'static,
-{
+) -> impl IntoView {
     use floem::event::{Event, EventListener, EventPropagation};
     use floem::keyboard::{Key, NamedKey};
-    use floem::reactive::create_effect;
 
-    let open = RwSignal::new(false);
-    // Where the keyboard goes once the popup is gone: the ring entry *now* at
-    // this tabindex, resolved when the focus request fires rather than the id
-    // captured here. An accept can rebuild the box it came from — the PG trigger
-    // editor's Function picker sits in a container keyed on the very signal its
-    // own accept writes — and floem's focus request has no existence check, so a
-    // captured id parked the keyboard on a removed view and killed the modal.
-    let refocus = {
+    // The box's own id, so the menu opens under the box rather than at the
+    // pointer — which is where it was left when the control was reached by Tab.
+    // Filled once the view below exists.
+    let anchor_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+    // See `widgets::close_picker`: where our menu is standing, held as a plain
+    // value so the cleanup below reads nothing reactive.
+    let standing: Rc<std::cell::Cell<Option<crate::PopupAnchor>>> = Rc::new(Default::default());
+    // One closure, shared by the press and the key: two copies would be two
+    // places for the "which of the four openings did you mean" answer to drift.
+    let open: Rc<dyn Fn()> = {
+        let standing = standing.clone();
         let ring = ring.clone();
-        move || {
-            let ring = ring.clone();
-            floem::action::exec_after(std::time::Duration::ZERO, move |_| ring.focus_at(tabindex));
-        }
-    };
-    // While the popup is up it holds the keyboard, so Escape reaches neither this
-    // box nor the enclosing modal — only the window root. Publish the way to
-    // close so the root can, and withdraw it the moment the popup goes. The slot
-    // is shared app-wide, so the entry is tagged: this dropdown must not clear
-    // another's, which is what the build-time run of this effect (`open` false,
-    // possibly while some other popup is up) would otherwise do.
-    let token = crate::widgets::popup_token();
-    create_effect({
-        let refocus = refocus.clone();
-        move |_| {
-            if open.get() {
-                let refocus = refocus.clone();
-                crate::widgets::set_open_popup(
-                    token,
-                    Rc::new(move || {
-                        open.set(false);
-                        refocus();
-                    }),
-                );
-            } else {
-                crate::widgets::clear_open_popup(token);
+        Rc::new(move || {
+            // `None` only outside a built workspace — a unit test holding this
+            // control on its own. A box that draws and declines to open is the
+            // honest answer there; a panic is not.
+            let Some(ch) = crate::widgets::menu_channel() else {
+                return;
+            };
+            if crate::widgets::keyboard_nav().get_untracked() {
+                let ring = ring.clone();
+                crate::widgets::set_menu_return(Rc::new(move || {
+                    let ring = ring.clone();
+                    // Deferred: the panel is removed during this same update
+                    // pass, and a focus request into it would be undone by the
+                    // removal.
+                    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                        ring.focus_at(tabindex)
+                    });
+                }));
             }
-        }
-    });
-    let dd = dd
-        .show_list(move || open.get())
-        // Mirror floem's own state changes (a pointer click, a click-away close)
-        // back into the signal. A redundant `OpenState` is a no-op inside the
-        // dropdown, so this can't loop.
-        .on_open(move |b| {
-            if open.get_untracked() != b {
-                open.set(b);
-            }
+            let id = anchor_id.get_untracked();
+            // **The box's measured width, not a number a caller guessed.** The
+            // panel is the same control opened out, so it lines its edges up with
+            // the box — and the box's width is whatever its container gave it,
+            // which is why the two used to disagree at every scale but one.
+            let w = id.map(|id| id.layout_rect().width()).unwrap_or(0.0);
+            standing.set(crate::widgets::open_picker(ch, id, w, entries()));
         })
-        .disable_default_event(|| (EventListener::KeyUp, true))
-        // `on_accept` is a single slot, so this replaces the one the builder set
-        // and has to carry the caller's action itself.
-        .on_accept(move |item| {
-            on_accept(item);
-            // Deferred: the popup is removed during this same update pass, and a
-            // focus request into it would be undone by the removal.
-            refocus();
-        });
-    // The extra cleanup goes *through* the ring helper: floem keeps one cleanup
-    // slot per view, so chaining a second one here would replace the ring's.
-    // Without it, a dropdown disposed with its popup still up (click the
-    // backdrop) left the global slot holding a closure over a dead scope, and
-    // the next Escape anywhere in the app was swallowed by it.
-    crate::widgets::in_focus_ring_with(dd, ring, tabindex, move || {
-        crate::widgets::clear_open_popup(token)
+    };
+    let key_open = open.clone();
+    let boxed = container(main)
+        // **Enter and Space arrive here, not at the KeyDown handler below**, and
+        // that division is load-bearing rather than incidental — see the handler.
+        .on_click_stop(move |_| open())
+        // Without this the workspace root's close-on-pointer-down fires first and
+        // the click then reopens: down closes, up reopens, and the box never
+        // toggles.
+        .on_event_stop(
+            EventListener::PointerDown,
+            crate::widgets::menu_trigger_press,
+        )
+        .style(dropdown_box_style);
+    anchor_id.set(Some(boxed.id()));
+    // The cleanup goes *through* the ring helper: floem keeps one cleanup slot
+    // per view, so chaining a second one here would replace the ring's. Without
+    // it, a picker disposed with its menu still up (click the backdrop) leaves a
+    // stranded `menu_panel` over the app — and a stranded panel keeps its
+    // `focus_root` registered, which is how a new query tab ends up declining
+    // the keyboard.
+    crate::widgets::in_focus_ring_with(boxed, ring, tabindex, move || {
+        if let Some(ch) = crate::widgets::menu_channel() {
+            crate::widgets::close_picker(ch, standing.get());
+        }
     })
+    // **The arrows only — Enter and Space must not be claimed here.** Floem
+    // synthesises a `Click` on the focused view for Enter and Space
+    // (`context.rs`, `is_keyboard_trigger`), and it does so **before** it runs
+    // this listener; worse, its listener loop is a `fold` that runs *every*
+    // handler and only then reports whether any of them processed the event, so
+    // returning `Stop` here cannot call the synthesised click off. Claiming Enter
+    // would therefore fire `open` twice for one press — and `open_picker`
+    // *toggles*, so the menu would open and shut in the same keystroke, looking
+    // exactly like a control that ignores the keyboard.
+    //
+    // The floem `Dropdown` this replaced was safe from that by accident: its
+    // handler did `open.set(true)`, which is idempotent, so the second call was a
+    // no-op. Moving to a toggle is what makes the division above mandatory.
+    // Arrows are not keyboard triggers, so they have no click to collide with and
+    // are claimed here.
     .on_event(EventListener::KeyDown, move |e| {
         let Event::KeyDown(ke) = e else {
             return EventPropagation::Continue;
         };
         if matches!(
             ke.key.logical_key,
-            Key::Named(NamedKey::Enter)
-                | Key::Named(NamedKey::Space)
-                | Key::Named(NamedKey::ArrowDown)
-                | Key::Named(NamedKey::ArrowUp)
+            Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp)
         ) {
-            open.set(true);
+            key_open();
             return EventPropagation::Stop;
         }
         EventPropagation::Continue
@@ -1608,5 +1544,85 @@ mod tests {
         assert_eq!(thousands(1_000), "1,000");
         assert_eq!(thousands(12_345), "12,345");
         assert_eq!(thousands(1_000_000), "1,000,000");
+    }
+}
+
+/// **Nothing in this crate may build a floem `Dropdown` again.**
+///
+/// `in_ring_picker` removed a *class* of bug, not twenty-four instances of it:
+/// floem 0.2's overlay nudge is paint-only (`scale_picker` states it in full), so
+/// every popup floem places for us answers the pointer where its rows used to be
+/// as soon as it nears a window edge — which the interface scale makes reachable
+/// in any modal taller than about half the screen. The fix is only durable if the
+/// next `<select>`-shaped control is built on the app's own menu, and the thing
+/// that makes it durable is this, not the prose.
+///
+/// A source scan rather than a type-level guard, because there is no type to
+/// remove: `floem::views::dropdown` is a public module of a dependency and
+/// nothing stops a future call to it but a reader who knows. `doc_coverage.rs`
+/// and `modal_backdrop_gate` are the same shape for the same reason.
+///
+/// **Comments are stripped**, or this gate would fail on the two doc paragraphs
+/// that name the type in order to say not to use it — including
+/// `in_ring_picker`'s own.
+#[cfg(test)]
+mod no_floem_dropdown_gate {
+    use std::path::{Path, PathBuf};
+
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// The file with its test module and every comment line cut off — a gate
+    /// that fires on prose about the thing it forbids gets deleted.
+    fn production_code(src: &str) -> String {
+        let body = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every spelling that reaches floem's dropdown: the path, the `use` that
+    /// shortens it, and the constructor a shortened one calls.
+    const SPELLINGS: &[&str] = &[
+        "views::dropdown",
+        "dropdown::Dropdown",
+        "Dropdown::custom",
+        "Dropdown::new",
+    ];
+
+    #[test]
+    fn no_view_in_this_crate_builds_a_floem_dropdown() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut files = 0usize;
+        for entry in std::fs::read_dir(src_dir()).expect("the crate's own src") {
+            let path = entry.expect("a dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            files += 1;
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let src = std::fs::read_to_string(&path).expect("a source file");
+            let code = production_code(&src);
+            for (i, line) in code.lines().enumerate() {
+                if let Some(hit) = SPELLINGS.iter().find(|p| line.contains(**p)) {
+                    offenders.push(format!(
+                        "{name}:{} reaches floem's dropdown (`{hit}`) — use \
+                         `settings::in_ring_picker`, which drops the app's own \
+                         menu and therefore places itself honestly at a window \
+                         edge",
+                        i + 1
+                    ));
+                }
+            }
+        }
+        // The scan has to still be reading something: a moved `src` would pass
+        // this test by finding no files at all.
+        assert!(files > 10, "only {files} source files scanned");
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
     }
 }

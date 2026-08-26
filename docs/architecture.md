@@ -2806,10 +2806,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Appearance**, the last holding the two theme pickers and the **interface scale**) **and the
     four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
-    floem's), `focusable_dropdown` and the picker-agnostic `in_ring_dropdown` under it (which owns
-    the four floem work-arounds a keyboard-operable dropdown needs). `themed_toggle` and
-    `settings_dropdown` are the un-ringed builders beneath, and are **private** on purpose: a
-    control nobody can Tab to is one left out of the modal's keyboard order by accident.
+    floem's), `focusable_dropdown` and the picker-agnostic **`in_ring_picker`** under it — the box
+    that drops the app's *own* popup menu, which is what every `<select>` in the app is now built
+    on (see **No floem `Dropdown`** below). `themed_toggle` is the un-ringed builder beneath, and
+    is **private** on purpose: a control nobody can Tab to is one left out of the modal's keyboard
+    order by accident.
     `log_row` is the General section's one non-toggle: it names the log's **full path** (`log_hint`,
     which is the pure half and is tested) and reveals the folder holding it through
     `Ui::open_config_dir`. The log had been written and rotated since `logging.rs` landed, and
@@ -3551,8 +3552,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     when a day or **Now** has been written and only then, so the row panel (whose field is what
     commits) leaves it `None` while the cell editor stages its edit there. Every path that writes the
     buffer inside `calendar_panel` leaves through the same `done` closure, which is what keeps
-    "closed" and "chose something" from drifting into one answer. `open_picker` is the one menu
-    opener: it anchors at the control's own
+    "closed" and "chose something" from drifting into one answer. `widgets::open_picker` is the one
+    menu opener — it lives there, not here, because every `<select>` in the app is one of these
+    pickers now (see **No floem `Dropdown`**); it anchors at the control's own
     `ViewId::layout_rect` (already in window coordinates), so a menu reached by Tab doesn't open
     wherever the pointer was left, recognises its own menu to toggle it closed, and closes every
     other menu — which it can because `PopupChannel` carries the whole `MenuFlags` rather than the
@@ -4812,7 +4814,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   **The mirror image is a callback that outlives the scope it reads**, and a window-global menu is
   the usual carrier: an entry on the shared popup channel is an `Rc` closure over a cell's signals,
   and nothing clears that channel when the cell goes away. Two defences and both are needed — the
-  control takes its **own** menu down in `on_cleanup` (`cell_editors::close_picker`, at the anchor
+  control takes its **own** menu down in `on_cleanup` (`widgets::close_picker`, at the anchor
   `open_picker` returned, held in a plain `Cell` because a signal read inside `on_cleanup` is the
   hazard the cleanup exists to prevent), and the actions those entries call open with
   `GridState::alive()`, which is `rs.try_get_untracked().is_some()`. Since `get_untracked` is
@@ -4944,6 +4946,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   one-click terminate all ask at the click, through the app-side `may_launch_destructive` re-export
   of the same function, and a refusal says why in the panel's `kill_error` line rather than doing
   nothing.
+- **No floem `Dropdown` — every `<select>` in the app drops the app's own menu.** A control that
+  offers a fixed list is built with `settings::in_ring_picker` (or one of its two thin wrappers,
+  `focusable_dropdown` and `table_designer::focusable_owned_dropdown`); nothing constructs a
+  `floem::views::dropdown::Dropdown`, and `settings::no_floem_dropdown_gate` scans the crate's own
+  source — comments stripped, so the paragraphs that name the type in order to forbid it don't trip
+  it — to keep that true. The reason is the paint-only overlay nudge under *Floem 0.2 gotchas*:
+  floem places its dropdown's popup as an overlay and, when that popup would overflow the window,
+  shifts it back inside **during paint only**, leaving layout and hit-testing where they were. Every
+  dropdown in the app carried that latently, and the interface scale is what made it reachable — a
+  `modal_h(620)` editor is 992px tall at 160%, so a field near its foot is within a popup's height
+  of the window edge on any 1080p screen. There is no bounded fix inside floem's control: the nudge
+  is `cx.offset((-x, -y))` against `parent_size - 5.0`, so a `max_height` cap would have to be ≤ 5px
+  to guarantee no nudge at all. The class is therefore removed rather than its instances — which is
+  cheap only because the app already owned the machinery: `widgets::menu_panel` flips at an edge
+  from a predicted height (`menu_panel_height`) rather than trusting an overlay to fit, and
+  `widgets::{PopupChannel, open_picker, close_picker}` is the trigger half the row panel's pickers
+  pioneered. **Don't reintroduce it for "just one more" control**, and don't reach for a floem popup
+  primitive without checking it against that gotcha first.
 - **One identifier quoter, as there is one boundary lexer.** Every path that quotes an identifier
   ends at `export::ident_sql` (unconditional — for SQL that is only executed) or its sibling
   `export::ident_if_needed` (only when a bare name would name something else — for SQL the user
@@ -5288,16 +5308,35 @@ Re-introducing the anti-patterns these guard against is a regression:
   - This reaches the app through **`floem::views::dropdown::Dropdown`**, whose popup is an overlay
     opened at `box_origin + box_height`: a dropdown low enough that its list runs past the window's
     bottom paints its rows shifted up while the pointer still lands on the row *below* the one you
-    see. Every dropdown in the app can hit it; the interface-scale picker did, because it was the
-    last row of the last group of the tallest modal — and only at 150% (130% now), the one scale
-    where that modal grows enough to push the popup off the bottom but not enough for its body to
-    scroll instead. Two rounds of plausible fixes (rebuilding the control, chasing a stale `window_origin`)
-    changed nothing, because nothing on our side was wrong.
-  - **So a control that can sit near the window's bottom edge should not be a `Dropdown`**, and the
-    interface scale is now a segmented control (`settings::scale_picker`) — no overlay, nothing to
-    mis-hit, and better for four short options anyway. Where a dropdown is kept, keep its option
-    list short and its row high in the modal, and read this entry first if selection ever seems
-    off by a row.
+    see. Every dropdown in the app could hit it; the interface-scale picker did first, because it
+    was the last row of the last group of the tallest modal — and only at 150% (130% now), the one
+    scale where that modal grows enough to push the popup off the bottom but not enough for its body
+    to scroll instead. Two rounds of plausible fixes (rebuilding the control, chasing a stale
+    `window_origin`) changed nothing, because nothing on our side was wrong.
+  - **So nothing in this app uses `floem::views::dropdown::Dropdown` any more** — see
+    **No floem `Dropdown`** under *Architecture invariants*. There is no bounded fix inside floem's
+    control (a `max_height` cap would have to be ≤ 5px to guarantee no nudge), so the class was
+    removed rather than the instances: every `<select>`-shaped control drops a `widgets::menu_panel`
+    through `settings::in_ring_picker`, and that panel is placed by the app's own arithmetic
+    (`menu_panel_height` predicts, `box_menu_inset` flips) and laid out where it is drawn. The
+    interface scale stays a segmented control (`settings::scale_picker`) because it never needed a
+    popup, not because dropdowns are still unsafe.
+- **Enter and Space arrive at a focused view as a synthesised `Click`, *before* its KeyDown
+  listeners run — and `Stop` cannot call it off.** `EventCx::unconditional_view_event`
+  (`floem-0.2.0/src/context.rs`) applies `EventListener::Click` on the focused view for any
+  `is_keyboard_trigger()` key (Enter, NumpadEnter, Space — matched on the **physical** key), and it
+  does so in the `match &event` block *above* the generic listener dispatch. Worse, that dispatch is
+  `handlers.iter().fold(false, |handled, h| handled | h(&event).is_processed())` — every handler
+  runs and only then is the result reported, so one returning `EventPropagation::Stop` neither skips
+  its siblings nor unwinds the click that already fired.
+  - So a control with both an `on_click` and an `on_event(KeyDown, …)` gets **two** calls for one
+    Enter. That is harmless when the action is idempotent (`open.set(true)`, which is what the old
+    floem-`Dropdown` wrapper did and why nobody noticed) and a live bug the moment it **toggles**:
+    `settings::in_ring_picker` opens through `widgets::open_picker`, which closes a menu already
+    standing, so claiming Enter there would open and shut the menu in one keystroke, which looks
+    exactly like a control that ignores the keyboard. It claims only Up/Down, which are not
+    keyboard triggers and so have no click to collide with, and lets the synthesised click carry
+    Enter and Space.
 - **A child that overflows *left* or *up* of its parent is painted but never hit-tested.** Floem
   hit-tests a subtree through `EventCx::should_send` (`floem-0.2.0/src/context.rs`), which builds the
   rect it tests as `id.layout_rect().with_origin(layout.location)` — it takes the **size** of the
@@ -5649,11 +5688,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   equal index rather than erroring — so the order fell out of which control happened to build
   first. A variable-length block therefore gets a decade of its own with nothing above it until the
   next hundred (`event_editor`'s `TAB_SCHED` 30–99, `TAB_OPT` 200–999), and
-  `event_editor::tests::no_two_controls_claim_the_same_tab_stop` is the pin. A dropdown joins through `settings::in_ring_dropdown`, which is the
-  whole four-work-around apparatus below in one place; `focusable_dropdown` (settings' `Copy`
-  picker) and `table_designer::focusable_owned_dropdown` (the designer/editors', since a table name
-  isn't `Copy`) are both thin wrappers over it, and neither has an un-focusable sibling left —
-  a second one would only be a way to leave a control out of the ring by accident.
+  `event_editor::tests::no_two_controls_claim_the_same_tab_stop` is the pin. A picker joins through
+  `settings::in_ring_picker`, which is the whole apparatus below in one place; `focusable_dropdown`
+  (settings' `Copy` picker) and `table_designer::focusable_owned_dropdown` (the designer/editors',
+  since a table name isn't `Copy`) are both thin wrappers over it, and neither has an un-focusable
+  sibling left — a second one would only be a way to leave a control out of the ring by accident.
   **The modal's root is what *enters* the ring**, via `widgets::focus_root_with_ring`. A key goes
   to the focused view and, unhandled, only to the window root — and a modal opens with focus on its
   own `focus_root`, which is also where Escape hands it back. Without a Tab handler there the ring
@@ -6073,7 +6112,14 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   cursor. Only the width is a flat estimate (`SUBMENU_FLIP_W = 210` for a submenu; the popup uses the
   panel's real `min_width`); the height both ask for is `menu_panel_height`, which sums the entries
   that will actually be drawn — 30.5 per action row, 9 per separator, plus 14 — because counting
-  separators as full rows shoved an upward-flipped panel tens of px too high. **How that 30.5 is
+  separators as full rows shoved an upward-flipped panel tens of px too high. A row carrying a
+  **detail** line (`MenuEntry::action_detail`, the faint second line the terminal picker's shells
+  wear so `pwsh.exe` and `powershell.exe` are told apart) is the one row that is not one line tall,
+  and both estimates know it: the height adds `MENU_DETAIL_LINE_H + MENU_DETAIL_GAP` and
+  `menu_panel_width` takes the **wider** of the two lines, measuring the detail at `font_label()`
+  where the label is measured at `font_title()`. Under-predicting is the dangerous direction — it
+  says a panel fits below its anchor when it does not — which is why both are pinned at Normal and
+  at Huge. **How that 30.5 is
   split matters away from 100%**, because `scaled()` is applied to each term separately: it was
   `MENU_LINE_H` 18.5 over a `MENU_ROW_PAD` of 6, while the estimate's own doc said 14 + 8 + 8 and
   `menu_row` *drew* a `font_title()` line inside `padding_vert(scaled(8.0))` — three decompositions
@@ -6184,7 +6230,8 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   which variant they use would each fail to recognise the other's menu.
 - **`popup_anchor` carries the menu's *identity*, not only its placement — so an opener must write
   it immediately before `popup_menu`.** One channel serves fifteen openers across ten files
-  (`activity_panel`, `cell_editors::open_picker`, `connection_form`, `editor_pane`, `erd_view`,
+  (`activity_panel`, `widgets::open_picker` — which is now every `<select>` in the app, not only the
+  cell editors' — `connection_form`, `editor_pane`, `erd_view`,
   `grid` ×6, `lib`'s status bar, `monitor_view`, `table_designer::suggest_chevron`, `tabs`) and nothing in it says who filled it, so the grid
   toolbar's AI / Copy / Save icons ran "dismiss, then open" unconditionally and a second press
   rebuilt an identical panel instead of closing it. The menus that already toggled could only half
@@ -6269,8 +6316,7 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   click-opened** — the grid's toolbar dropdowns, `table_designer::suggest_chevron`, the cell
   editors' pickers — because that id names a *channel* many controls share, so one
   `close_except(Some(MenuId::Popup))` anywhere would satisfy a check meant to hold each of them.
-  Each of those triggers still owes the call, and `cell_editors::open_picker` makes it for the
-  pickers; what is missing is a gate that can tell one from another. That list was written out three
+  Each of those triggers still owes the call, and `widgets::open_picker` makes it for every picker; what is missing is a gate that can tell one from another. That list was written out three
   times in three files, and the third one added a flag the other two never learned about: opening the
   activity clock's interval dropdown and then clicking the schema tree's eye left **both** on screen.
   A stranded dropdown is not merely visible — its `focus_root` stays registered, and

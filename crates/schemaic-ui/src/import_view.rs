@@ -23,9 +23,9 @@ use schemaic_core::import::{
 use schemaic_core::model::engine_is_transactional;
 
 use crate::consts::row_h;
-use crate::settings::{dropdown_box_style, focusable_dropdown, focusable_toggle_row};
+use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, action_gap, autohide,
+    ACTION_TAB, ActionKind, ExitAction, FocusRing, MenuEntry, action_button, action_gap, autohide,
     control_button, exit_action, focus_root_with_ring, form_gap, form_hint, form_section,
     form_separator, form_setting, modal_footer, modal_footer_split, modal_h, modal_pad_h,
     modal_title_owned, modal_w, panel_style, shift_hscroll,
@@ -388,8 +388,6 @@ fn target_label(target: &Target, table: &schemaic_core::schema::TableInfo) -> St
 /// signal — one source of truth, so re-proposing the mapping after a settings
 /// change is a single `set` and every row follows it.
 fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl IntoView {
-    use floem::views::dropdown::Dropdown;
-
     let i = ui.import;
     let Some(info) = i.target.get_untracked() else {
         return empty().into_any();
@@ -414,14 +412,18 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
     };
 
     let main_table = table.clone();
-    let main = move |t: Target| {
+    // The box, with `Skip` dimmed: a half-mapped file then reads at a glance
+    // rather than needing every row read. `picker_box_content` is the plain
+    // version, so this one is spelled out — the dimming is the whole difference.
+    let main = dyn_container(current, move |t| {
         let skipped = t == Target::Skip;
         let label = target_label(&t, &main_table);
         h_stack((
             text(label).style(move |s| {
-                let s = s.font_size(theme::font_body());
-                // A skipped column is dimmed, so a half-mapped file reads at a
-                // glance rather than needing every row read.
+                let s = s
+                    .font_size(theme::font_body())
+                    .text_ellipsis()
+                    .min_width(0.0);
                 if skipped {
                     s.color(theme::text_faint())
                 } else {
@@ -434,35 +436,41 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
         ))
         .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
         .into_any()
-    };
+    })
+    .style(|s| s.width_full().min_width(0.0))
+    .into_any();
 
     let row_table = table.clone();
-    let row = move |t: Target| {
-        let label = target_label(&t, &row_table);
-        let this = t.clone();
-        text(label)
-            .style(move |s| {
-                let s = s
-                    .width_full()
-                    .padding_horiz(theme::scaled(12.0))
-                    .padding_vert(theme::scaled(6.0))
-                    .color(theme::text())
-                    .font_size(theme::font_body())
-                    .hover(|s| s.background(theme::dropdown_hover()));
-                if current() == this {
-                    s.background(theme::dropdown_active())
-                } else {
-                    s
+    let pick = move |chosen: Target| {
+        i.mapping.update(|m| {
+            // One target per column: claiming a column frees it from whoever
+            // had it, so two file columns can't both write to the same place.
+            if let Target::Column(ci) = chosen {
+                for (j, t) in m.targets.iter_mut().enumerate() {
+                    if j != fi && *t == Target::Column(ci) {
+                        *t = Target::Skip;
+                    }
+                }
+            }
+            if let Some(slot) = m.targets.get_mut(fi) {
+                *slot = chosen;
+            }
+        });
+    };
+    let entries = move || {
+        options
+            .iter()
+            .map(|t| {
+                let label = target_label(t, &row_table);
+                let (t, held) = (t.clone(), current() == *t);
+                let act = move || pick(t.clone());
+                match held {
+                    true => MenuEntry::action_colored(label, theme::accent, act),
+                    false => MenuEntry::action(label, act),
                 }
             })
-            .into_any()
+            .collect()
     };
-
-    let picker = Dropdown::custom(current, main, options, row).style(|s| {
-        dropdown_box_style(s)
-            .width(theme::scaled(300.0))
-            .flex_shrink(0.0_f32)
-    });
     // One Tab stop per file column, in the order they appear, through the shared
     // constants rather than a hand-rolled base and stride.
     //
@@ -471,27 +479,13 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
     // of where fixed controls end — and whose stride was a literal beside a
     // named `ROW_TAB_STRIDE`. Nothing collided today; adding one fixed control
     // at ≥100 to this step would have made Tab order build order.
-    let picker = crate::settings::in_ring_dropdown(
-        picker,
+    let picker = container(crate::settings::in_ring_picker(
+        main,
+        entries,
         ring,
         crate::widgets::VALUE_TAB + fi as u32 * crate::widgets::ROW_TAB_STRIDE,
-        move |chosen: Target| {
-            i.mapping.update(|m| {
-                // One target per column: claiming a column frees it from whoever
-                // had it, so two file columns can't both write to the same place.
-                if let Target::Column(ci) = chosen {
-                    for (j, t) in m.targets.iter_mut().enumerate() {
-                        if j != fi && *t == Target::Column(ci) {
-                            *t = Target::Skip;
-                        }
-                    }
-                }
-                if let Some(slot) = m.targets.get_mut(fi) {
-                    *slot = chosen;
-                }
-            });
-        },
-    );
+    ))
+    .style(|s| s.width(theme::scaled(300.0)).flex_shrink(0.0_f32));
 
     h_stack((
         name,
