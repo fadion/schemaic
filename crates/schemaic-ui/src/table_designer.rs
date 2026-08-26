@@ -31,7 +31,7 @@ use schemaic_core::ddl::{
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, ServerFlavour};
 
-use crate::settings::{dropdown_box_style, focusable_toggle_row};
+use crate::settings::focusable_toggle_row;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, MenuEntry, action_button, action_gap, autohide,
     focus_root_with_ring, form_gap, form_hint, form_setting, modal_footer_split, modal_h,
@@ -720,14 +720,17 @@ fn bound_field_with_menu(
     .into_any()
 }
 
-/// A `<select>`-style dropdown over owned values (the settings one needs `Copy`,
+/// A `<select>`-style picker over owned values (the settings one needs `Copy`,
 /// and a table name isn't), in a modal's Tab order. Same chrome as the settings
 /// picker, so it reads as the same control.
 ///
-/// The keyboard handling — and the four floem behaviours it works around — is
-/// [`crate::settings::in_ring_dropdown`]'s, shared with that picker so the two
+/// The box, the menu it drops and the keyboard are all
+/// [`crate::settings::in_ring_picker`]'s, shared with that picker so the two
 /// can't drift. There is deliberately no un-focusable variant: every one of
 /// these is in a modal that has a ring.
+///
+/// An empty current value reads `—` rather than as a blank box, which is what
+/// most of these start as: a foreign-key target before a table is chosen.
 pub(crate) fn focusable_owned_dropdown(
     current: impl Fn() -> String + Copy + 'static,
     options: Vec<String>,
@@ -736,57 +739,35 @@ pub(crate) fn focusable_owned_dropdown(
     tabindex: u32,
     on_pick: impl Fn(String) + 'static,
 ) -> impl IntoView {
-    crate::settings::in_ring_dropdown(
-        owned_dropdown_box(current, options, width),
-        ring,
-        tabindex,
-        on_pick,
-    )
-}
-
-/// The dropdown itself, without an accept action — the shared half, since
-/// `on_accept` is a single slot and the ring has to own it.
-fn owned_dropdown_box(
-    current: impl Fn() -> String + Copy + 'static,
-    options: Vec<String>,
-    width: f64,
-) -> floem::views::dropdown::Dropdown<String> {
-    use floem::views::dropdown::Dropdown;
-    let main = move |cur: String| {
-        h_stack((
-            text(if cur.is_empty() {
-                "—".to_string()
-            } else {
-                cur
-            })
-            .style(|s| s.color(theme::text()).font_size(theme::font_body())),
-            empty().style(|s| s.flex_grow(1.0_f32)),
-            icons::icon(icons::CHEVRON_DOWN, 16.0)
-                .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
-        ))
-        .style(|s| s.items_center().width_full().gap(theme::scaled(8.0)))
-        .into_any()
-    };
-    let row = move |item: String| {
-        let this = item.clone();
-        text(item)
-            .style(move |s| {
-                let s = s
-                    .width_full()
-                    .padding_horiz(theme::scaled(12.0))
-                    .padding_vert(theme::scaled(6.0))
-                    .color(theme::text())
-                    .font_size(theme::font_body())
-                    .hover(|s| s.background(theme::dropdown_hover()));
-                if current() == this {
-                    s.background(theme::dropdown_active())
-                } else {
-                    s
+    let on_pick = Rc::new(on_pick);
+    let entries = move || {
+        options
+            .iter()
+            .map(|item| {
+                let (item, on_pick) = (item.clone(), on_pick.clone());
+                let held = current() == item;
+                let pick = {
+                    let item = item.clone();
+                    move || (on_pick)(item.clone())
+                };
+                match held {
+                    true => MenuEntry::action_colored(item, theme::accent, pick),
+                    false => MenuEntry::action(item, pick),
                 }
             })
-            .into_any()
+            .collect()
     };
-    Dropdown::custom(current, main, options, row).style(move |s| dropdown_box_style(s).width(width))
+    let box_content = crate::settings::picker_box_content(move || match current() {
+        s if s.is_empty() => "—".to_string(),
+        s => s,
+    });
+    container(crate::settings::in_ring_picker(
+        box_content,
+        entries,
+        ring,
+        tabindex,
+    ))
+    .style(move |s| s.width(width))
 }
 
 /// A toggle row bound to the draft, same shape as the settings modals'.

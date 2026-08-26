@@ -2258,6 +2258,16 @@ pub enum MenuEntry {
     Action {
         label: String,
         icon: Option<MenuIcon>,
+        /// A faint second line under the label, for a row whose name does not
+        /// say the whole thing — the terminal picker's shells, where the name is
+        /// "Windows PowerShell" and the detail is the command line that tells it
+        /// from "PowerShell 7".
+        ///
+        /// A row with one is **taller**, and both the height estimate and the
+        /// width measurement account for it ([`menu_panel_height`],
+        /// [`menu_panel_width`]) — a detail the estimate did not know about is
+        /// exactly the drift those two exist to prevent.
+        detail: Option<String>,
         /// Optional label tint (a `fn` so it follows theme switches); `None` uses
         /// the default text colour. Used to mark a selected option.
         label_color: Option<fn() -> floem::peniko::Color>,
@@ -2279,6 +2289,7 @@ impl MenuEntry {
         MenuEntry::Action {
             label: label.into(),
             icon: None,
+            detail: None,
             label_color: None,
             disabled: false,
             action: Rc::new(action),
@@ -2292,6 +2303,7 @@ impl MenuEntry {
         MenuEntry::Action {
             label: label.into(),
             icon: Some(icon),
+            detail: None,
             label_color: None,
             disabled: false,
             action: Rc::new(action),
@@ -2306,7 +2318,27 @@ impl MenuEntry {
         MenuEntry::Action {
             label: label.into(),
             icon: None,
+            detail: None,
             label_color: Some(color),
+            disabled: false,
+            action: Rc::new(action),
+        }
+    }
+    /// An action with a faint second line under its label — see
+    /// [`MenuEntry::Action::detail`]. `color` tints the label, so a row can be
+    /// both the current value and self-describing, which is what the terminal
+    /// picker's shell list needs.
+    pub(crate) fn action_detail(
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        color: Option<fn() -> floem::peniko::Color>,
+        action: impl Fn() + 'static,
+    ) -> Self {
+        MenuEntry::Action {
+            label: label.into(),
+            icon: None,
+            detail: Some(detail.into()),
+            label_color: color,
             disabled: false,
             action: Rc::new(action),
         }
@@ -2364,9 +2396,14 @@ pub(crate) fn menu_stops(entries: &[MenuEntry]) -> Vec<(usize, MenuAct)> {
 /// One menu row's content: `[icon] label [→]` (the chevron only for submenus).
 /// `label_color` tints the label (a `fn` so it follows theme switches); `None`
 /// uses the default text colour.
+///
+/// `detail` puts a faint second line under the label, in the same column — so a
+/// row with one is two lines tall and [`menu_panel_height`] adds
+/// [`MENU_DETAIL_LINE_H`] plus the gap for it.
 fn menu_row(
     icon: Option<MenuIcon>,
     label: String,
+    detail: Option<String>,
     label_color: Option<fn() -> floem::peniko::Color>,
     chevron: bool,
     disabled: bool,
@@ -2387,18 +2424,36 @@ fn menu_row(
                 .into_any(),
         );
     }
-    kids.push(
-        text(label)
-            .style(move |s| {
-                let c = if disabled {
-                    theme::text_muted().multiply_alpha(0.3)
-                } else {
-                    label_color.map(|c| c()).unwrap_or_else(theme::text)
-                };
-                s.color(c)
-            })
-            .into_any(),
-    );
+    let name = text(label).style(move |s| {
+        let c = if disabled {
+            theme::text_muted().multiply_alpha(0.3)
+        } else {
+            label_color.map(|c| c()).unwrap_or_else(theme::text)
+        };
+        s.color(c)
+    });
+    kids.push(match detail {
+        None => name.into_any(),
+        // A column, so the two lines share the row's one horizontal padding and
+        // the detail sits directly under the name it qualifies. The gap is a
+        // named constant because `menu_panel_height` adds the same one — the
+        // rule every part of this row follows.
+        Some(d) => v_stack((
+            name,
+            text(d).style(|s| {
+                s.color(theme::text_faint())
+                    .font_size(theme::font_label())
+                    .text_ellipsis()
+                    .min_width(0.0)
+            }),
+        ))
+        .style(|s| {
+            s.flex_col()
+                .gap(theme::scaled(MENU_DETAIL_GAP))
+                .min_width(0.0)
+        })
+        .into_any(),
+    });
     if chevron {
         kids.push(
             empty()
@@ -2464,10 +2519,11 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
         MenuEntry::Action {
             label,
             icon,
+            detail,
             label_color,
             disabled,
             action,
-        } => menu_row(icon, label, label_color, false, disabled, is_cursor)
+        } => menu_row(icon, label, detail, label_color, false, disabled, is_cursor)
             .on_click_stop(move |_| {
                 if disabled {
                     return; // inert; the stop keeps the menu open
@@ -2516,7 +2572,7 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
                     // opening. `menu_panel` clears when `open_sub` goes `None`.
                 });
             }
-            container(menu_row(icon, label, None, true, false, is_cursor))
+            container(menu_row(icon, label, None, None, true, false, is_cursor))
                 // The row's rect in window coordinates — `on_move` reports the
                 // window origin (fired during layout, not on pointer movement),
                 // `on_resize` the size. The layer needs both: it hangs the panel
@@ -2588,6 +2644,17 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
         .filter(|(keep, _)| *keep)
         .map(|(_, e)| match e {
             MenuEntry::Separator => SEPARATOR_RULE_H + theme::scaled(SEPARATOR_MARGIN) * 2.0,
+            // A detail line is a second line box in the same row, plus the gap
+            // `menu_row`'s column puts between the two — both scaled separately,
+            // for the reason `MENU_ROW_PAD` gives.
+            MenuEntry::Action {
+                detail: Some(_), ..
+            } => {
+                theme::scaled(MENU_LINE_H)
+                    + theme::scaled(MENU_ROW_PAD) * 2.0
+                    + theme::scaled(MENU_DETAIL_LINE_H)
+                    + theme::scaled(MENU_DETAIL_GAP)
+            }
             _ => theme::scaled(MENU_LINE_H) + theme::scaled(MENU_ROW_PAD) * 2.0,
         })
         .sum::<f64>()
@@ -2616,6 +2683,7 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
 /// the caller's own floor to win.
 pub(crate) fn menu_panel_width(entries: &[MenuEntry]) -> f64 {
     let font = theme::font_title();
+    let label_font = theme::font_label();
     let row_w = |label: &str, icon: bool, chevron: bool| {
         let mut w = theme::scaled(MENU_ROW_PAD_H) * 2.0 + measure_text_px_at(label, font);
         if icon {
@@ -2635,11 +2703,22 @@ pub(crate) fn menu_panel_width(entries: &[MenuEntry]) -> f64 {
         }
         w
     };
+    // A detail line sits in the same column as the label and can be the longer
+    // of the two — a shell named "Git Bash" whose command line is
+    // `bash.exe -i -l`. It is drawn at `font_label()`, so it is measured there.
+    let detail_w =
+        |d: &str| theme::scaled(MENU_ROW_PAD_H) * 2.0 + measure_text_px_at(d, label_font);
     entries
         .iter()
         .map(|e| match e {
             MenuEntry::Separator => 0.0,
-            MenuEntry::Action { label, icon, .. } => row_w(label, icon.is_some(), false),
+            MenuEntry::Action {
+                label,
+                icon,
+                detail,
+                ..
+            } => row_w(label, icon.is_some(), false)
+                .max(detail.as_deref().map(detail_w).unwrap_or(0.0)),
             MenuEntry::Sub { label, icon, .. } => row_w(label, icon.is_some(), true),
         })
         .fold(0.0_f64, f64::max)
@@ -2688,6 +2767,18 @@ const MENU_LINE_H: f64 = 14.5;
 /// over-predicted a sixteen-entry menu by ~190px at 200% and flipped menus that
 /// had room to open downwards.)
 const MENU_ROW_PAD: f64 = 8.0;
+/// A detail line's text line box at 100% — [`MENU_LINE_H`]'s smaller twin, the
+/// residual of a `font_label()` line where that one is a `font_title()` line.
+///
+/// Derived the same way and stated here for the same reason: `menu_row` draws it
+/// and [`menu_panel_height`] adds it, and the two must not be able to name
+/// different numbers. A row with a detail is the *only* row in this menu system
+/// that is not one line tall, so an estimate that missed it would under-predict
+/// every panel holding one — and under-prediction is the direction that opens a
+/// menu downward off the bottom of the window.
+const MENU_DETAIL_LINE_H: f64 = 12.5;
+/// The air between a row's label and its detail line, in `menu_row`'s column.
+const MENU_DETAIL_GAP: f64 = 2.0;
 /// A separator's rule. A hairline stays 1px at every scale — it is a rule, not a
 /// box — so unlike the margin below it, this one does not move.
 const SEPARATOR_RULE_H: f64 = 1.0;
@@ -3193,6 +3284,131 @@ pub(crate) fn menu_anchored_at(
     mine: crate::PopupAnchor,
 ) -> bool {
     open && anchor == Some(mine)
+}
+
+/// What a control needs to put a menu up: every menu flag in the app, where to
+/// anchor this one, and the panel's minimum width.
+///
+/// It carries the whole [`MenuFlags`] rather than just the channel it fills
+/// because a trigger owes two things, not one — fill `menus.popup`, and close
+/// everything else, since it swallows the press the workspace root would have
+/// closed them on (see [`MenuId`]). `Copy`, like the `GridState` it is built
+/// from.
+#[derive(Clone, Copy)]
+pub(crate) struct PopupChannel {
+    /// Reached as `menus.popup` — the field name is what
+    /// [`popup_anchor_gate`] scans for (`popup.set(Some(`), so this opener is on
+    /// its list too.
+    pub menus: MenuFlags,
+    pub anchor: RwSignal<Option<crate::PopupAnchor>>,
+    pub width: RwSignal<f64>,
+}
+
+thread_local! {
+    static MENU_CHANNEL: std::cell::Cell<Option<PopupChannel>> = const { std::cell::Cell::new(None) };
+}
+
+/// Publish the app's one popup-menu channel, so a control can open a menu
+/// without being handed the [`crate::Ui`] to find it in.
+///
+/// Called once by `workspace`, the way [`window_size`] is, and for the same
+/// reason: **the open menu is already a singleton**. One `popup_menu` signal
+/// serves every opener in the app, [`MenuFlags::close_except`] guarantees only
+/// one stands at a time, and [`set_open_popup`] is a one-slot registry over the
+/// same fact. A channel threaded as a parameter would be a second spelling of
+/// state the app has only one of — and the cost of that spelling is real: the
+/// dropdowns this exists for are built by helpers like `connection_form`'s
+/// `server_fields` and `routine_editor`'s `bound_choice`, none of which has a
+/// `Ui` and several of which are two calls deep from anything that does.
+///
+/// The slot is a plain [`Copy`] value rather than a signal: nothing reacts to
+/// the channel *changing*, because it never does.
+pub(crate) fn set_menu_channel(ch: PopupChannel) {
+    MENU_CHANNEL.with(|c| c.set(Some(ch)));
+}
+
+/// The published channel, or `None` before `workspace` has built.
+///
+/// Every caller is a view inside that workspace, so in the app it is always
+/// `Some` by the time a pointer or a key reaches one. `None` is what a unit test
+/// building a control in isolation sees, and the honest answer there is a
+/// control that draws and does nothing when pressed — not a panic.
+pub(crate) fn menu_channel() -> Option<PopupChannel> {
+    MENU_CHANNEL.with(|c| c.get())
+}
+
+/// Open (or close) a picker's menu under the control that raised it.
+///
+/// `anchor` is the control's **own** view id, whose `layout_rect` floem already
+/// keeps in window coordinates — the frame [`crate::PopupAnchor`] is stated in.
+/// Reached by Tab, a control has no cursor to open at, and the shared channel's
+/// fallback is `last_mouse`: without this the menu opened wherever the pointer
+/// was left.
+///
+/// A second press closes what the first opened, and the "is that mine?" test is
+/// **recomputed** rather than remembered: these controls sit in a scrolling
+/// panel, so with a menu up the control may have moved, and then the press
+/// reopens at the new position — which is the better answer anyway.
+/// Returns the anchor the caller's menu is now standing at, or `None` if this
+/// call **closed** one — see [`close_picker`], which is what the returned value
+/// is for.
+pub(crate) fn open_picker(
+    ch: PopupChannel,
+    anchor: Option<floem::ViewId>,
+    width: f64,
+    entries: Vec<MenuEntry>,
+) -> Option<crate::PopupAnchor> {
+    let here = anchor
+        .map(|id| id.layout_rect())
+        .map(|r| crate::PopupAnchor::BelowBox(r.x0, r.x1, r.y0, r.y1));
+    if here.is_some_and(|mine| {
+        menu_anchored_at(
+            ch.menus.popup.get_untracked().is_some(),
+            ch.anchor.get_untracked(),
+            mine,
+        )
+    }) {
+        ch.menus.popup.set(None);
+        return None;
+    }
+    // This trigger absorbs its own pointer-down, so the workspace root's
+    // `close_except(None)` never runs for it and every *other* menu — the schema
+    // tree's eye, a calendar, the connection switcher — would be left on screen
+    // beside this one. A stranded `menu_panel` keeps its `focus_root` registered,
+    // which is how a new query tab ends up declining the keyboard.
+    ch.menus.close_except(Some(MenuId::Popup));
+    ch.anchor.set(here);
+    // At least as wide as the control it drops from, so the menu doesn't read as
+    // a different control than the one that opened it.
+    ch.width.set(width.max(theme::scaled(150.0)));
+    ch.menus.popup.set(Some(entries));
+    here
+}
+
+/// Take down a picker's menu **if the one standing is that picker's** — the
+/// teardown half of [`open_picker`].
+///
+/// **A menu on the shared channel outlives the control that opened it.** Nothing
+/// but a pointer-down anywhere clears `menus.popup`: not a tab switch, not a
+/// re-run, not a scrolled-away row. The entries are `Rc` closures over the
+/// control's own state, so clicking one after its scope is gone reads a disposed
+/// signal — and `get_untracked` is `try_get_untracked().unwrap()`, which panics
+/// and takes the window, and every other tab's uncommitted edits, with it.
+///
+/// `mine` is the anchor [`open_picker`] returned, **remembered rather than
+/// recomputed**: a view's `layout_rect` is not something to ask about while its
+/// scope is being disposed, and getting the identity wrong here would take down
+/// somebody else's menu. It is a plain value for the same reason — a signal read
+/// inside `on_cleanup` is the hazard this function exists to prevent.
+pub(crate) fn close_picker(ch: PopupChannel, mine: Option<crate::PopupAnchor>) {
+    let Some(mine) = mine else { return };
+    if menu_anchored_at(
+        ch.menus.popup.get_untracked().is_some(),
+        ch.anchor.get_untracked(),
+        mine,
+    ) {
+        ch.menus.popup.set(None);
+    }
 }
 
 /// A reusable themed popup menu with nested submenus, `width` px wide. Returns the
@@ -5628,6 +5844,73 @@ mod menu_placement_tests {
         let two =
             menu_panel_height(&[MenuEntry::action("a", || {}), MenuEntry::action("b", || {})]);
         assert!((two - (row * 2.0 - 14.0)).abs() < 0.001);
+    }
+
+    /// **A detail row is the only row in this menu system that is not one line
+    /// tall**, so the estimate has to know about it — and the direction it would
+    /// be wrong in is the dangerous one. `menu_inset` flips a panel *upward* when
+    /// it would not fit below the anchor; under-predicting the height says it
+    /// fits when it does not, and the terminal picker's shell list opens off the
+    /// bottom of the window with its last shells unreachable.
+    ///
+    /// Both terms scale, and both are asserted at Huge as well as Normal, because
+    /// a term left literal beside scaled siblings is this file's recurring bug
+    /// (see `MENU_ROW_PAD`'s note about `scaled(30.5)`).
+    #[test]
+    fn a_row_with_a_detail_line_is_taller_than_a_plain_one() {
+        let plain = [MenuEntry::action("Git Bash", || {})];
+        let detailed = [MenuEntry::action_detail(
+            "Git Bash",
+            "bash.exe -i -l",
+            None,
+            || {},
+        )];
+        for scale in [crate::theme::UiScale::Normal, crate::theme::UiScale::Huge] {
+            crate::theme::set_ui_scale(scale);
+            let extra = theme::scaled(MENU_DETAIL_LINE_H) + theme::scaled(MENU_DETAIL_GAP);
+            assert!(extra > 0.0, "{scale:?}: the detail line has to cost height");
+            assert_eq!(
+                menu_panel_height(&detailed),
+                menu_panel_height(&plain) + extra,
+                "{scale:?}: a detail line is a second line box plus the gap"
+            );
+        }
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+    }
+
+    /// The horizontal twin, and the case that motivates it: the **detail is the
+    /// longer of the two lines**. A shell named "Git Bash" whose command line is
+    /// `bash.exe -i -l` would draw a panel wide enough for the command and be
+    /// measured for the name — which is exactly the "flip tested the floor, not
+    /// the width" bug `menu_panel_width` was written to end, reintroduced through
+    /// a row shape it did not know about.
+    #[test]
+    fn a_detail_line_widens_the_panel_when_it_is_the_longer_line() {
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        let short_name = menu_panel_width(&[MenuEntry::action("Git Bash", || {})]);
+        let with_long_detail = menu_panel_width(&[MenuEntry::action_detail(
+            "Git Bash",
+            "bash.exe --login --interactive --noprofile",
+            None,
+            || {},
+        )]);
+        assert!(
+            with_long_detail > short_name,
+            "the detail is the longer line: {with_long_detail} vs {short_name}"
+        );
+        // And a detail *shorter* than its label changes nothing — the row is as
+        // wide as its widest line, not as wide as the sum.
+        let short_detail = menu_panel_width(&[MenuEntry::action_detail(
+            "Windows PowerShell",
+            "pwsh",
+            None,
+            || {},
+        )]);
+        assert_eq!(
+            short_detail,
+            menu_panel_width(&[MenuEntry::action("Windows PowerShell", || {})]),
+            "a short detail must not widen the panel"
+        );
     }
 
     /// A submenu row is one row in the panel that hosts it — its children are

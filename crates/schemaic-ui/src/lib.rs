@@ -3068,6 +3068,17 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         }
     });
     let root_menus = widgets::MenuFlags::of(&ui);
+    // **Published once, here, before any view that opens a menu is built.** Every
+    // `<select>`-shaped control in the app drops the shared popup menu, and most
+    // of them are built by helpers two calls deep from anything holding a `Ui` —
+    // `connection_form::server_fields`, `routine_editor::bound_choice`. See
+    // `widgets::set_menu_channel` for why a singleton is published rather than
+    // threaded.
+    widgets::set_menu_channel(widgets::PopupChannel {
+        menus: root_menus,
+        anchor: ui.overlay.popup_anchor,
+        width: ui.overlay.popup_width,
+    });
     // Panel visibility is owned by the app (loaded from / saved to disk), so the
     // layout is restored on the next launch.
     let schema_visible = ui.layout.schema_visible;

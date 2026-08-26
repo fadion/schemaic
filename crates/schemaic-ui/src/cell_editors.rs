@@ -19,7 +19,11 @@
 //!   pointer where they used to be. The row panel is a strip at the *bottom* of
 //!   the results area, which is exactly where that lands — and the shared menu
 //!   channel already flips at the edges, walks with the arrow keys and dismisses
-//!   on Escape. A boolean is a two-row picker rather than a switch or a segmented
+//!   on Escape. This was the first control to move; **every** picker in the app
+//!   is one of these now (`settings::in_ring_picker`), so the trigger half it
+//!   pioneered — `widgets::{PopupChannel, open_picker, close_picker}` — has moved
+//!   to `widgets` where both families reach it. A boolean is a two-row picker
+//!   rather than a switch or a segmented
 //!   track for the same reason it is not a checkbox: the value has a **third**
 //!   state here, "nothing chosen yet", which an empty cell in a pending row is in.
 //! * **Set chips** — one per member, toggled in place, in the row panel. A menu
@@ -46,26 +50,11 @@ use floem::style::FlexWrap;
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::date::{self, Date};
 
-use crate::widgets::{MenuEntry, MenuFlags, MenuId, MenuInset, box_menu_inset};
+use crate::widgets::{
+    MenuEntry, MenuFlags, MenuId, MenuInset, PopupChannel, box_menu_inset, close_picker,
+    open_picker,
+};
 use crate::{DatePick, FieldCfg, PopupAnchor, edit_field, icons, theme};
-
-/// What a control needs to put a menu up: every menu flag in the app, where to
-/// anchor this one, and the panel's minimum width.
-///
-/// It carries the whole [`MenuFlags`] rather than just the channel it fills
-/// because a trigger owes two things, not one — fill `menus.popup`, and close
-/// everything else, since it swallows the press the workspace root would have
-/// closed them on (see [`MenuId`]). `Copy`, like the `GridState` it is built
-/// from.
-#[derive(Clone, Copy)]
-pub(crate) struct PopupChannel {
-    /// Reached as `menus.popup` — the field name is what
-    /// `widgets::popup_anchor_gate` scans for (`popup.set(Some(`), so this
-    /// opener is on its list too.
-    pub menus: MenuFlags,
-    pub anchor: RwSignal<Option<PopupAnchor>>,
-    pub width: RwSignal<f64>,
-}
 
 /// The field-like surface a picker box and the calendar toggle wear — the same
 /// chrome [`crate::edit_field`] draws, so a row of mixed controls reads as one
@@ -107,79 +96,6 @@ pub(crate) fn pick_entries(
             }
         })
         .collect()
-}
-
-/// Open (or close) a picker's menu under the control that raised it.
-///
-/// `anchor` is the control's **own** view id, whose `layout_rect` floem already
-/// keeps in window coordinates — the frame [`PopupAnchor`] is stated in. Reached
-/// by Tab, a control has no cursor to open at, and the shared channel's fallback
-/// is `last_mouse`: without this the menu opened wherever the pointer was left.
-///
-/// A second press closes what the first opened, and the "is that mine?" test is
-/// **recomputed** rather than remembered: these controls sit in a scrolling
-/// panel, so with a menu up the control may have moved, and then the press
-/// reopens at the new position — which is the better answer anyway.
-/// Returns the anchor the caller's menu is now standing at, or `None` if this
-/// call **closed** one — see [`close_picker`], which is what the returned value
-/// is for.
-pub(crate) fn open_picker(
-    ch: PopupChannel,
-    anchor: Option<floem::ViewId>,
-    width: f64,
-    entries: Vec<MenuEntry>,
-) -> Option<PopupAnchor> {
-    let here = anchor
-        .map(|id| id.layout_rect())
-        .map(|r| PopupAnchor::BelowBox(r.x0, r.x1, r.y0, r.y1));
-    if here.is_some_and(|mine| {
-        crate::widgets::menu_anchored_at(
-            ch.menus.popup.get_untracked().is_some(),
-            ch.anchor.get_untracked(),
-            mine,
-        )
-    }) {
-        ch.menus.popup.set(None);
-        return None;
-    }
-    // This trigger absorbs its own pointer-down, so the workspace root's
-    // `close_except(None)` never runs for it and every *other* menu — the schema
-    // tree's eye, a calendar, the connection switcher — would be left on screen
-    // beside this one. A stranded `menu_panel` keeps its `focus_root` registered,
-    // which is how a new query tab ends up declining the keyboard.
-    ch.menus.close_except(Some(MenuId::Popup));
-    ch.anchor.set(here);
-    // At least as wide as the control it drops from, so the menu doesn't read as
-    // a different control than the one that opened it.
-    ch.width.set(width.max(theme::scaled(150.0)));
-    ch.menus.popup.set(Some(entries));
-    here
-}
-
-/// Take down a picker's menu **if the one standing is that picker's** — the
-/// teardown half of [`open_picker`].
-///
-/// **A menu on the shared channel outlives the control that opened it.** Nothing
-/// but a pointer-down anywhere clears `menus.popup`: not a tab switch, not a
-/// re-run, not a scrolled-away row. The entries are `Rc` closures over the
-/// control's own state, so clicking one after its scope is gone reads a disposed
-/// signal — and `get_untracked` is `try_get_untracked().unwrap()`, which panics
-/// and takes the window, and every other tab's uncommitted edits, with it.
-///
-/// `mine` is the anchor `open_picker` returned, **remembered rather than
-/// recomputed**: a view's `layout_rect` is not something to ask about while its
-/// scope is being disposed, and getting the identity wrong here would take down
-/// somebody else's menu. It is a plain value for the same reason — a signal read
-/// inside `on_cleanup` is the hazard this function exists to prevent.
-pub(crate) fn close_picker(ch: PopupChannel, mine: Option<PopupAnchor>) {
-    let Some(mine) = mine else { return };
-    if crate::widgets::menu_anchored_at(
-        ch.menus.popup.get_untracked().is_some(),
-        ch.anchor.get_untracked(),
-        mine,
-    ) {
-        ch.menus.popup.set(None);
-    }
 }
 
 /// Width of a picker box in the row panel — wide enough for an enum's longest

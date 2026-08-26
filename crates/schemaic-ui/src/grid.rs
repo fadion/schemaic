@@ -5384,7 +5384,7 @@ fn typed_editor(
         // values are as listed as an enum's, and one control for both is one
         // thing to learn (and none to invent).
         editor @ (CellEditor::Bool(_) | CellEditor::Enum(_)) => {
-            let ch = cell_editors::PopupChannel {
+            let ch = crate::widgets::PopupChannel {
                 menus: gs.menus,
                 anchor: gs.popup_anchor,
                 width: gs.popup_width,
@@ -6512,7 +6512,8 @@ fn grid_toolbar(
     // menu the keyboard raised: after a *click*, taking focus to the icon would
     // take the arrow keys away from the grid's own cell navigation.
     //
-    // By tabindex and deferred, both for the reasons `in_ring_dropdown` gives:
+    // By tabindex and deferred, both for the reasons `settings::in_ring_picker`
+    // gives where it hands the same closure to `widgets::set_menu_return`:
     // the strip may have been rebuilt by the action just run, and floem's focus
     // request has no existence check, so a captured id can park the keyboard on a
     // removed view.
@@ -7895,7 +7896,7 @@ fn cell_pick_editor(
     pending: Option<usize>,
     editor: CellEditor,
 ) -> AnyView {
-    let ch = cell_editors::PopupChannel {
+    let ch = crate::widgets::PopupChannel {
         menus: gs.menus,
         anchor: gs.popup_anchor,
         width: gs.popup_width,
@@ -7924,7 +7925,12 @@ fn cell_pick_editor(
             let width = gs
                 .widths
                 .with_untracked(|w| w.get(ci).copied().unwrap_or(cell_w()));
-            standing.set(cell_editors::open_picker(ch, Some(anchor), width, entries));
+            standing.set(crate::widgets::open_picker(
+                ch,
+                Some(anchor),
+                width,
+                entries,
+            ));
         }
     };
     // One tick later: `layout_rect` is what the menu anchors to, and this view has
@@ -7957,7 +7963,7 @@ fn cell_pick_editor(
     // disposed this scope with the list still on screen, and clicking a row then
     // ran `keep_cell_edit` → `get_untracked` on a freed signal, which panics and
     // takes every tab's uncommitted edits with it.
-    .on_cleanup(move || cell_editors::close_picker(ch, standing.get()))
+    .on_cleanup(move || crate::widgets::close_picker(ch, standing.get()))
     .into_any()
 }
 
