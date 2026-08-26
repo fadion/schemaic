@@ -1940,6 +1940,15 @@ pub(crate) fn modal_h(base: f64) -> f64 {
 /// its own (Settings, Shortcuts, Query plan, Properties). The reserve is larger
 /// because the panel's title and footer are laid out around this box, and it is
 /// the box — not the panel — that would push them off screen.
+///
+/// **Modals only, and the floor is why.** It exists so a body squeezed between a
+/// title and a footer can't become a sliver — which means that on a short window
+/// it hands back something *larger* than the subtraction would. That is right for
+/// a centred panel and wrong for anything in a scroll: the AI panel's attachment
+/// preview was the one non-modal caller, and at 160% on a 400px window the floor
+/// gave it 64% of the screen. It has its own cap now
+/// (`ai_panel::attach_preview_cap`), a share of the window rather than a
+/// subtraction from it, because what surrounds it is more conversation.
 pub(crate) fn modal_body_h(base: f64) -> f64 {
     cap_to_window(
         theme::scaled(base),

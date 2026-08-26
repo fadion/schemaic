@@ -779,10 +779,7 @@ fn sent_attachment(
                             .color(theme::text_dim())
                     },
                 )))
-                .style(|s| {
-                    s.width_full()
-                        .max_height(crate::widgets::modal_body_h(220.0))
-                })
+                .style(|s| s.width_full().max_height(attach_preview_h()))
                 .into_any()
             }
         }
@@ -804,6 +801,48 @@ fn sent_attachment(
 /// own cap would matter for: this is only ever read by a person, and a value cut
 /// short here would misrepresent what was sent.
 const ATTACH_VIEW_CHARS: usize = 200;
+
+/// How tall an expanded attachment preview would like to be, at 100%.
+const ATTACH_PREVIEW_H: f64 = 220.0;
+
+/// The most of the window an expanded attachment preview may take.
+///
+/// A third, because the preview is a **peek** — the block it sits in is one
+/// message of a conversation that scrolls, and a preview taller than this pushes
+/// the message it belongs to, and the answer under it, off the screen. It is a
+/// share rather than a subtraction because there is no fixed chrome to subtract:
+/// what surrounds it is more conversation.
+const ATTACH_PREVIEW_WINDOW_SHARE: f64 = 3.0;
+
+/// The tallest an expanded attachment preview may grow, given the window height.
+///
+/// **Not [`crate::widgets::modal_body_h`]**, which is what this used to call and
+/// the only non-modal caller it had. That function caps a *modal's* scrolling
+/// body, and its floor exists so a panel with a title and a footer laid out
+/// around the body can't reduce the body to a sliver — a floor that makes no
+/// sense here, where the surrounding thing is a scroll. It also made the preview
+/// **larger** on exactly the windows with least room: at 160% the floor is 256px,
+/// so on a 400px-tall window the preview took 64% of it, which is the shape this
+/// function's own test refuses.
+///
+/// Pure, and separate from the signal read, so the arithmetic is testable — the
+/// rest of this file's sizes are style closures and none of them is.
+/// An unmeasured window (0) means "not yet" and takes the wanted size rather
+/// than guessing, the same answer [`crate::widgets::cap_to`] gives.
+fn attach_preview_cap(want: f64, win_h: f64) -> f64 {
+    if win_h <= 1.0 {
+        return want;
+    }
+    want.min(win_h / ATTACH_PREVIEW_WINDOW_SHARE)
+}
+
+/// [`attach_preview_cap`] at the live window height and interface scale.
+fn attach_preview_h() -> f64 {
+    attach_preview_cap(
+        theme::scaled(ATTACH_PREVIEW_H),
+        crate::widgets::window_size().get().1,
+    )
+}
 
 /// The staged-attachment chip: what the *next* question will carry, sitting
 /// directly over the message box.
@@ -1254,4 +1293,67 @@ fn truncate_result(r: &str) -> String {
     let mut out = lines[..MAX_LINES].join("\n");
     out.push_str(&format!("\n… (+{} more lines)", lines.len() - MAX_LINES));
     out
+}
+
+#[cfg(test)]
+mod attach_preview_tests {
+    use super::*;
+
+    /// **The defect, as arithmetic.** The preview used to be capped by
+    /// `widgets::modal_body_h`, whose floor keeps a *modal's* body from becoming
+    /// a sliver between a title and a footer. Applied to a block inside a
+    /// scrolling conversation, that floor does the opposite of what a cap is
+    /// for: it grows the preview on exactly the windows with least room. At 160%
+    /// the floor is 256px, so on a 400px-tall window the preview took 64% of the
+    /// screen and pushed the message it belongs to — and the answer under it —
+    /// out of sight.
+    ///
+    /// The property, over every window a person might actually have, at every
+    /// scale: **a peek is never more than a third of the window.**
+    #[test]
+    fn a_preview_never_takes_more_than_its_share_of_the_window() {
+        for scale in [
+            crate::theme::UiScale::Small,
+            crate::theme::UiScale::Normal,
+            crate::theme::UiScale::Large,
+            crate::theme::UiScale::Huge,
+        ] {
+            crate::theme::set_ui_scale(scale);
+            let want = theme::scaled(ATTACH_PREVIEW_H);
+            for win_h in [300.0, 400.0, 600.0, 768.0, 1080.0, 1440.0, 2160.0] {
+                let got = attach_preview_cap(want, win_h);
+                assert!(
+                    got <= win_h / ATTACH_PREVIEW_WINDOW_SHARE + 0.001,
+                    "{scale:?} at {win_h}px: preview capped at {got}, which is \
+                     more than a third of the window"
+                );
+                assert!(
+                    got <= want + 0.001,
+                    "{scale:?} at {win_h}px: {got} > {want}"
+                );
+            }
+        }
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+    }
+
+    /// On a window with room, the cap is simply what the preview asked for —
+    /// the share is a ceiling, not a target, so an ordinary screen is unaffected
+    /// by this change.
+    #[test]
+    fn a_tall_window_gets_the_height_the_preview_wanted() {
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        assert_eq!(attach_preview_cap(220.0, 1080.0), 220.0);
+        assert_eq!(attach_preview_cap(220.0, 660.0), 220.0);
+        // Exactly at the boundary, and one pixel under it.
+        assert_eq!(attach_preview_cap(220.0, 659.0), 659.0 / 3.0);
+    }
+
+    /// An unmeasured window means "not yet", not "zero" — the same answer
+    /// `widgets::cap_to` gives, so the first frame is not a collapsed block that
+    /// jumps open once a resize lands.
+    #[test]
+    fn an_unmeasured_window_takes_the_wanted_height() {
+        assert_eq!(attach_preview_cap(220.0, 0.0), 220.0);
+        assert_eq!(attach_preview_cap(220.0, 1.0), 220.0);
+    }
 }
