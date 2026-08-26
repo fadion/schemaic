@@ -2884,9 +2884,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     app root. Both handles are absolute children positioned from an **effective** (clamped or
     floored) edge rather than from the dimension they set: a width the window is too narrow to
     honour, or a height persisted under a lower floor, would otherwise leave the handle floating
-    away from the edge it drags. Both capture the pointer on press (`request_active`), and both
-    clear the drag state in `on_double_click_stop` themselves — the double-click eats the second
-    `PointerUp`, so without that the handle stays captured and keeps resizing on mouse-move.
+    away from the edge it drags. Both capture the pointer on press (`request_active`), and **both
+    undo the whole gesture inside `on_double_click_stop`** — the double-click eats the second
+    `PointerUp`, so that handler is the only one that runs and anything the `PointerUp` handler
+    would have cleared has to be cleared there. Two things qualify, found a year apart in the same
+    four lines: the drag state (`dragging` + `clear_active`, or the handle stays captured and keeps
+    resizing on mouse-move with no button down), and the **hover highlight**. The second is the
+    subtler one — `dim.set(default)` moves the handle out from under a pointer that has *not* moved,
+    so floem delivers no `PointerLeave` and nothing else ever turns the bar off: the divider
+    animated to its default still lit, and stayed lit there until the next mouse move happened to
+    trigger a leave. `hovered.leave()` also voids a pending arm, so a double-click *inside* the
+    hover delay cannot light the bar afterwards. `dividers::double_click_gate` asserts both calls
+    are present in **every** double-click handler in the file — the two handles are twins, so every
+    fix here is two edits, and it was watched failing on each of them in turn.
     **The dividers light up on a *rest*, not on a pass.** The bar is an affordance — this edge
     drags — and the dividers run the full height and width of the workspace, so answering on
     `PointerEnter` lit one every time the pointer crossed from the schema tree to the editor or from

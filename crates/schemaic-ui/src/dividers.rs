@@ -182,6 +182,14 @@ pub(crate) fn h_resize_handle(
             // handle stays captured/active and keeps resizing on mouse-move.
             dragging.set(false);
             id.clear_active();
+            // And darken the bar, for the same reason one step further on: the
+            // reset below moves the handle **out from under a pointer that has not
+            // moved**, so floem delivers no `PointerLeave` and nothing else would
+            // ever turn the highlight off. The divider animated to its default
+            // while still lit, and stayed lit there until the next mouse move
+            // happened to trigger the leave. `leave` also voids a pending arm, so
+            // a double-click inside the hover delay cannot light it afterwards.
+            hovered.leave();
             dim.set(default);
             on_commit();
         })
@@ -259,10 +267,94 @@ pub(crate) fn v_resize_handle(
             }
         })
         .on_double_click_stop(move |_| {
-            // See h_resize_handle: clear drag state the eaten PointerUp would have.
+            // See h_resize_handle: clear the drag state the eaten PointerUp would
+            // have, and darken the bar the reset moves out from under the pointer.
             dragging.set(false);
             id.clear_active();
+            hovered.leave();
             dim.set(default);
             on_commit();
         })
+}
+
+#[cfg(test)]
+mod double_click_gate {
+    use std::path::Path;
+
+    /// **A reset has to undo everything the gesture turned on**, and there are two
+    /// of those, discovered a year apart in the same four lines.
+    ///
+    /// The double-click's second `PointerUp` is consumed by `on_double_click_stop`
+    /// and never reaches the `PointerUp` handler, so anything that handler would
+    /// have cleared has to be cleared here instead. `dragging`/`clear_active` was
+    /// the first (the handle stayed captured and kept resizing on mouse-move).
+    /// `hovered` is the second, and it is subtler: `dim.set(default)` moves the
+    /// handle **out from under a pointer that never moved**, so floem delivers no
+    /// `PointerLeave` at all — the bar stayed lit at the divider's new position
+    /// until the next mouse move happened to trigger one.
+    ///
+    /// Deliberately weak, like the crate's four other source gates
+    /// (`modals::modal_backdrop_gate`, `widgets::popup_anchor_gate`,
+    /// `menu_trigger_gate`, `menu_panel_gate`): it asserts the two calls are
+    /// *present* in each handler, not what they do. What makes it worth having is
+    /// that these two handles are **twins** — every fix here is two edits, and
+    /// "fixed one twin, left the other" is the shape this codebase's reviews keep
+    /// catching. A third divider added later inherits the check for free.
+    #[test]
+    fn every_reset_darkens_the_divider_and_releases_the_pointer() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("dividers.rs"),
+        )
+        .expect("dividers.rs");
+        // This module quotes the calls it is looking for, so cut it off, and drop
+        // comment lines for the same reason.
+        let body = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => &src[..],
+        };
+        let body: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let handlers: Vec<&str> = body
+            .split(".on_double_click_stop(")
+            .skip(1)
+            .map(|rest| {
+                let end = rest
+                    .find("\n        })")
+                    .expect("a double-click handler that closes at the builder's indent");
+                &rest[..end]
+            })
+            .collect();
+
+        // The floor: a rename of the builder method would otherwise leave nothing
+        // to check and pass silently, which is what a source gate is most prone to.
+        assert!(
+            handlers.len() >= 2,
+            "found {} double-click handlers in dividers.rs — both dividers have one, \
+             so did `on_double_click_stop` get renamed?",
+            handlers.len()
+        );
+
+        for (i, h) in handlers.iter().enumerate() {
+            assert!(
+                h.contains("hovered.leave()"),
+                "double-click handler #{i} resets the divider without darkening it. \
+                 `dim.set(default)` moves the handle out from under a pointer that \
+                 has not moved, so no `PointerLeave` is delivered and the bar stays \
+                 lit at the new position until the user happens to move the mouse."
+            );
+            assert!(
+                h.contains("dragging.set(false)") && h.contains("clear_active()"),
+                "double-click handler #{i} does not release the pointer. The \
+                 double-click eats the second `PointerUp`, so this handler is the \
+                 only place that runs — without these the handle stays captured and \
+                 keeps resizing on mouse-move with no button down."
+            );
+        }
+    }
 }
