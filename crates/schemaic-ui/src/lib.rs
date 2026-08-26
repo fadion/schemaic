@@ -4289,7 +4289,7 @@ fn body(
         eff_schema_w,
         move || schema_visible.get() && schema_panel_allowed(),
         schema_dragging,
-        schema_min_w(),
+        schema_min_w,
         // Leave the center + the right panel's effective width.
         move || window_size().get().0 - center_min_w() - eff_right_w(),
         theme::SCHEMA_W,
@@ -4302,7 +4302,7 @@ fn body(
         eff_right_w,
         move || right_panel.get() != RightPanel::None && right_panel_allowed(),
         right_dragging,
-        right_min_w(),
+        right_min_w,
         // Leave the center + the schema panel at its minimum (it yields as needed).
         move || window_size().get().0 - center_min_w() - schema_min_w(),
         theme::AI_W,
@@ -4747,10 +4747,10 @@ fn center(ui: Ui) -> impl IntoView {
     // Ceiling leaves the results grid `results_min_h()` within the editor+results
     // region (window minus header/footer/tab-bar).
     let split_handle = v_resize_handle(
-        tab_bar_h(),
+        tab_bar_h,
         editor_h,
         move || effective_editor_h(editor_h.get(), editor_collapsed.get()),
-        query_min_h(),
+        query_min_h,
         move || {
             let wh = window_size().get().1;
             if wh < 1.0 {

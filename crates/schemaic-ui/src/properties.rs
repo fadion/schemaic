@@ -61,6 +61,10 @@ fn bar_h() -> f64 {
 fn row_gap() -> f64 {
     theme::scaled(4.0)
 }
+/// The Indexes section's wider row gap — see the note at its call site.
+fn index_row_gap() -> f64 {
+    row_gap() + theme::scaled(3.0)
+}
 /// Gap between an index's name and the facts about it. Wide enough to read as a
 /// separation rather than a run-on, without being the fixed gutter a column
 /// would impose — see [`index_row`].
@@ -603,11 +607,7 @@ fn index_section(stats: &TableStats) -> Option<AnyView> {
     // Looser than the detail lists above it: an index row is a name plus a run of
     // facts (and sometimes a second line under it), so at the shared 4px the rows
     // ran together into one block instead of reading as a list.
-    Some(section_with_gap(
-        "Indexes",
-        rows,
-        row_gap() + theme::scaled(3.0),
-    ))
+    Some(section_with_gap("Indexes", rows, index_row_gap))
 }
 
 fn index_row(idx: &IndexStats) -> AnyView {
@@ -686,15 +686,18 @@ fn freshness_note(stats: &TableStats) -> Option<AnyView> {
 /// heading (`widgets::form_section`), so a group here reads at the same weight as
 /// **General** in Settings rather than inventing a third heading style.
 fn section(title: &'static str, rows: Vec<AnyView>) -> AnyView {
-    section_with_gap(title, rows, row_gap())
+    section_with_gap(title, rows, row_gap)
 }
 
 /// [`section`] for a group whose rows need more air than the shared [`row_gap()`]
 /// — the index list, whose rows are taller and less uniform than a detail list's.
-fn section_with_gap(title: &'static str, rows: Vec<AnyView>, gap: f64) -> AnyView {
+/// `gap` is a `fn` rather than a number so the rows re-space when the interface
+/// scale changes — a captured length freezes at the scale the view was built at
+/// (see `dividers::scaled_arg_gate`, where the same shape was two visible bugs).
+fn section_with_gap(title: &'static str, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
     v_stack((
         crate::widgets::form_section(title),
-        v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap).width_full()),
+        v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap()).width_full()),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(7.0)).width_full())
     .into_any()
