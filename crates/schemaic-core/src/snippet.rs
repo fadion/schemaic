@@ -224,6 +224,137 @@ pub fn grouped(all: &[Snippet], dialect: SqlDialect, conn_id: u64, query: &str) 
         .collect()
 }
 
+/// Where built-in ids start. Everything at or above this is shipped with the
+/// app and lives in code; everything below it is the user's and lives in
+/// `snippets.json`.
+///
+/// The split is what lets built-ins stay *code*: they are merged in at read time
+/// by [`library`] rather than written into the user's file, so a later release
+/// can fix one, and nobody's file fills up with content the app owns. [`next_id`]
+/// refuses to allocate into this range, so a hand-edited file cannot collide
+/// with the pack either.
+pub const BUILTIN_ID_BASE: u64 = 1 << 32;
+
+/// The snippets shipped with the app for an engine.
+///
+/// Deliberately small and answering the questions a DBA opens a client to ask —
+/// what is running, what is big, what is unused, what is blocked. Every one of
+/// them is a plain `SELECT`: a starter pack is the worst possible place for a
+/// statement that changes something, and one that needed the write guard's
+/// confirmation would teach the wrong thing about what these rows do.
+///
+/// **MySQL and MariaDB are one dialect here**, so every MySQL entry has to run on
+/// both — which is why none of them reads `performance_schema` or `sys`, where
+/// the two diverge and where MariaDB's tables are off by default.
+pub fn builtins(dialect: SqlDialect) -> Vec<Snippet> {
+    let rows: &[(u64, &str, &str, &str)] = match dialect {
+        SqlDialect::MySql => &[
+            (
+                1,
+                "Running queries",
+                "ps",
+                "SELECT id, user, host, db, command, time, state,\n       LEFT(info, 200) AS query\nFROM information_schema.processlist\nWHERE command <> 'Sleep'\nORDER BY time DESC;",
+            ),
+            (
+                2,
+                "Table sizes",
+                "sizes",
+                "SELECT table_name,\n       table_rows,\n       ROUND((data_length + index_length) / 1024 / 1024, 1) AS size_mb\nFROM information_schema.tables\nWHERE table_schema = DATABASE()\nORDER BY data_length + index_length DESC;",
+            ),
+            (
+                3,
+                "Open transactions",
+                "trx",
+                "SELECT trx_id, trx_state, trx_started,\n       trx_mysql_thread_id AS thread_id,\n       trx_rows_modified,\n       LEFT(trx_query, 200) AS query\nFROM information_schema.innodb_trx\nORDER BY trx_started;",
+            ),
+            (
+                4,
+                "Indexes by table",
+                "idx",
+                "SELECT table_name, index_name,\n       GROUP_CONCAT(column_name ORDER BY seq_in_index) AS columns_in_order,\n       non_unique\nFROM information_schema.statistics\nWHERE table_schema = DATABASE()\nGROUP BY table_name, index_name, non_unique\nORDER BY table_name, index_name;",
+            ),
+        ],
+        SqlDialect::Postgres => &[
+            (
+                101,
+                "Running queries",
+                "ps",
+                "SELECT pid, usename, state,\n       now() - query_start AS running_for,\n       left(query, 200) AS query\nFROM pg_stat_activity\nWHERE state <> 'idle' AND pid <> pg_backend_pid()\nORDER BY running_for DESC;",
+            ),
+            (
+                102,
+                "Table sizes",
+                "sizes",
+                "SELECT relname AS table_name,\n       pg_size_pretty(pg_total_relation_size(relid)) AS total_size,\n       n_live_tup AS live_rows\nFROM pg_stat_user_tables\nORDER BY pg_total_relation_size(relid) DESC;",
+            ),
+            (
+                103,
+                "Unused indexes",
+                "idx",
+                "SELECT relname AS table_name,\n       indexrelname AS index_name,\n       idx_scan AS scans,\n       pg_size_pretty(pg_relation_size(indexrelid)) AS index_size\nFROM pg_stat_user_indexes\nWHERE idx_scan = 0\nORDER BY pg_relation_size(indexrelid) DESC;",
+            ),
+            (
+                104,
+                "Blocked queries",
+                "locks",
+                "SELECT blocked.pid AS blocked_pid,\n       left(blocked.query, 120) AS blocked_query,\n       blocking.pid AS blocking_pid,\n       left(blocking.query, 120) AS blocking_query,\n       blocking.state AS blocking_state\nFROM pg_stat_activity blocked\nJOIN pg_stat_activity blocking\n  ON blocking.pid = ANY (pg_blocking_pids(blocked.pid));",
+            ),
+        ],
+        SqlDialect::Sqlite => &[
+            (
+                201,
+                "Schema of everything",
+                "ddl",
+                "SELECT type, name, tbl_name, sql\nFROM sqlite_master\nWHERE sql IS NOT NULL\nORDER BY type, name;",
+            ),
+            (
+                202,
+                "Tables at a glance",
+                "tables",
+                "SELECT m.name AS table_name,\n       (SELECT COUNT(*) FROM pragma_table_info(m.name)) AS columns,\n       (SELECT COUNT(*) FROM pragma_index_list(m.name)) AS indexes\nFROM sqlite_master m\nWHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'\nORDER BY m.name;",
+            ),
+            (
+                203,
+                "Database size",
+                "size",
+                "SELECT page_count * page_size / 1024 AS size_kb,\n       page_count, page_size, freelist_count\nFROM pragma_page_count(), pragma_page_size(), pragma_freelist_count();",
+            ),
+            (
+                204,
+                "Indexes of a table",
+                "idx",
+                "SELECT il.name AS index_name,\n       il.\"unique\" AS is_unique,\n       group_concat(ii.name) AS columns_in_order\nFROM pragma_index_list(:table_name) il\nJOIN pragma_index_info(il.name) ii\nGROUP BY il.name, il.\"unique\"\nORDER BY il.name;",
+            ),
+        ],
+    };
+    rows.iter()
+        .map(|(n, name, abbrev, body)| Snippet {
+            id: BUILTIN_ID_BASE + n,
+            name: name.to_string(),
+            abbrev: Some(abbrev.to_string()),
+            body: body.to_string(),
+            scope: Scope::Dialect(dialect),
+            source: Source::Builtin,
+            // A shipped snippet has no "last used" to show — its row says
+            // `Built-in` where a saved one says `3d ago` — and nothing could
+            // record one anyway: it is not in the file that would remember it.
+            last_used: None,
+        })
+        .collect()
+}
+
+/// The whole library a connection sees: the user's snippets, then the built-ins
+/// for its engine.
+///
+/// **User first, deliberately.** [`by_abbrev`] breaks a tie on scope and then on
+/// order, so a user snippet abbreviated `ps` shadows the shipped one of the same
+/// spelling rather than the other way round.
+pub fn library(user: &[Snippet], dialect: SqlDialect) -> Vec<Snippet> {
+    let mut all = user.to_vec();
+    all.extend(builtins(dialect));
+    all
+}
+
 /// The scopes a snippet on this connection can be moved to, **narrowest first**
 /// — the same order [`grouped`] puts the bands in, so the choice a picker offers
 /// second lands under the heading that is second.
@@ -301,7 +432,15 @@ pub fn by_abbrev(
 /// sessions has to make this counter monotonic first — a `next_id` field on
 /// [`SnippetsFile`] — or it will eventually resolve to somebody else's query.
 pub fn next_id(all: &[Snippet]) -> u64 {
-    all.iter().map(|s| s.id).max().unwrap_or(0) + 1
+    all.iter()
+        .map(|s| s.id)
+        // Built-in ids are reserved and enormous; one that reached this list —
+        // a hand-edited file, or a caller passing `library`'s merged view —
+        // would otherwise push every future allocation into the pack's range.
+        .filter(|id| *id < BUILTIN_ID_BASE)
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 /// Record that a snippet was just used. No-op for an id that is gone.
@@ -538,6 +677,125 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].items.len(), 1);
         assert_eq!(groups[0].items[0].name, "orders");
+    }
+
+    // ── the built-in pack ───────────────────────────────────────────────────
+
+    const EVERY_DIALECT: [SqlDialect; 3] = [MY, PG, SqlDialect::Sqlite];
+
+    /// Every shipped statement has to *parse* in the dialect it is shipped for.
+    /// It cannot be run from here — there is no server in a unit test — so this
+    /// is the automatic half; the SQLite ones are executed for real in
+    /// `schemaic-db`, and the MySQL/PostgreSQL ones were run by hand against
+    /// MariaDB 10.11, MySQL 8.4 and PostgreSQL 16 when they were written.
+    #[test]
+    fn every_builtin_parses_in_its_own_dialect() {
+        for d in EVERY_DIALECT {
+            for s in builtins(d) {
+                // A body may hold `:name` placeholders; the parser accepts those
+                // in value positions and `neutralize` rescues the rest, which is
+                // exactly what the editor's diagnostics do with it.
+                let text = crate::params::neutralize(&s.body, d);
+                assert!(
+                    crate::intel::parses(&text, d),
+                    "{d:?} built-in {:?} does not parse:\n{}",
+                    s.name,
+                    s.body
+                );
+            }
+        }
+    }
+
+    /// A starter pack is the worst place for a statement that changes something:
+    /// the rows are meant to be clicked without reading them.
+    #[test]
+    fn no_builtin_writes_anything() {
+        for d in EVERY_DIALECT {
+            for s in builtins(d) {
+                assert!(
+                    !crate::sql::contains_write(&s.body, d),
+                    "{d:?} built-in {:?} is not a plain read",
+                    s.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builtins_are_marked_shipped_and_scoped_to_their_engine() {
+        for d in EVERY_DIALECT {
+            for s in builtins(d) {
+                assert_eq!(s.source, Source::Builtin, "{:?}", s.name);
+                assert_eq!(s.scope, Scope::Dialect(d), "{:?}", s.name);
+                assert!(s.last_used.is_none(), "{:?}", s.name);
+                assert!(s.id >= BUILTIN_ID_BASE, "{:?} is in the user range", s.name);
+            }
+        }
+    }
+
+    /// Ids have to be unique *across* the packs, not just within one: the merged
+    /// library of a MySQL connection and the palette's rows are keyed by them.
+    #[test]
+    fn no_two_builtins_share_an_id_or_a_name_within_an_engine() {
+        let mut ids: Vec<u64> = Vec::new();
+        for d in EVERY_DIALECT {
+            let pack = builtins(d);
+            let mut names: Vec<&str> = pack.iter().map(|s| s.name.as_str()).collect();
+            names.sort_unstable();
+            let before = names.len();
+            names.dedup();
+            assert_eq!(before, names.len(), "{d:?} ships two snippets of one name");
+            ids.extend(pack.iter().map(|s| s.id));
+        }
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "two built-ins share an id");
+    }
+
+    #[test]
+    fn the_library_is_the_users_snippets_then_the_engines_pack() {
+        let user = vec![snip(1, "mine", Scope::Global)];
+        let all = library(&user, MY);
+        assert_eq!(all[0].name, "mine");
+        assert_eq!(all.len(), 1 + builtins(MY).len());
+        assert!(all[1..].iter().all(|s| s.source == Source::Builtin));
+    }
+
+    /// The reason the user's snippets come first: `by_abbrev` breaks a
+    /// same-scope tie on order, and the shipped one must not shadow the one
+    /// somebody wrote.
+    #[test]
+    fn a_users_abbrev_wins_over_a_shipped_one() {
+        let mut mine = snip(1, "my own processlist", Scope::Dialect(MY));
+        mine.abbrev = Some("ps".to_string());
+        let all = library(&[mine], MY);
+        let hit = by_abbrev(&all, "ps", MY, 7).expect("something answers ps");
+        assert_eq!(hit.name, "my own processlist");
+    }
+
+    #[test]
+    fn a_builtin_id_is_never_allocated_to_a_user_snippet() {
+        // Even from a merged list, which is what a careless caller would pass.
+        let all = library(&[snip(4, "mine", Scope::Global)], MY);
+        assert_eq!(
+            next_id(&all),
+            5,
+            "the pack's ids must not raise the counter"
+        );
+    }
+
+    #[test]
+    fn the_packs_land_under_the_engine_band() {
+        let groups = grouped(&library(&[], MY), MY, 7, "");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].bucket, Bucket::Dialect(MY));
+        assert_eq!(groups[0].items.len(), builtins(MY).len());
+        // And a PostgreSQL pack is not offered on a MySQL connection.
+        assert!(
+            grouped(&builtins(PG), MY, 7, "").is_empty(),
+            "the other engine's pack must not show up here"
+        );
     }
 
     // ── scope_options ───────────────────────────────────────────────────────

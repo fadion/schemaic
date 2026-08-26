@@ -3363,7 +3363,7 @@ fn hint_item(primary: &str, secondary: &str, keys: Option<&'static str>) -> Pale
 /// snippets.
 #[derive(Clone)]
 struct SnippetSearch {
-    items: RwSignal<Vec<schemaic_core::snippet::Snippet>>,
+    items: Memo<Vec<schemaic_core::snippet::Snippet>>,
     dialect: schemaic_core::intel::SqlDialect,
     conn_id: u64,
     insert: Rc<dyn Fn(schemaic_core::snippet::Snippet)>,

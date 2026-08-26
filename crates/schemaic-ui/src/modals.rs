@@ -102,6 +102,10 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             stack((
                 error_modal_overlay(ui.clone()),
                 confirm_overlay(ui.clone()),
+                // Before the confirm in the tuple would be wrong: deleting a
+                // snippet asks, and the question has to paint over whatever
+                // raised it.
+                crate::snippet_edit::snippet_edit_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
                 table_designer::table_designer_overlay(ui.clone()),
                 view_editor::view_editor_overlay(ui.clone()),
@@ -209,12 +213,18 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let tx_prompt = ui.overlay.tx_prompt;
     let confirm = ui.overlay.confirm;
     let import_open = ui.import.target;
+    let snippet_edit = ui.overlay.snippet_edit;
     let editors = ddl_editors_up(ui.ddl);
     move || {
         err_open.get()
             || tx_prompt.get().is_some()
             || confirm.get().is_some()
             || import_open.get().is_some()
+            // The snippet editor is painted in this group, so it has to be in
+            // this list — the event editor shipped missing from exactly here and
+            // rendered nothing at all, because the wrapper's `inset(0)` resolved
+            // against a box this predicate was keeping at zero by zero.
+            || snippet_edit.get().is_some()
             || editors()
     }
 }
@@ -332,6 +342,9 @@ mod modal_backdrop_gate {
         "properties.rs",
         "routine_editor.rs",
         "settings.rs",
+        // In the layer's DDL group, raised by `ddl_modals_up`'s
+        // `snippet_edit.get().is_some()` arm.
+        "snippet_edit.rs",
         "table_designer.rs",
         "trigger_editor.rs",
         "view_editor.rs",

@@ -1391,6 +1391,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // The shared "are you sure?" channel (see `Confirm`) — one modal for every
     // destructive action, rather than one modal each.
     let confirm: RwSignal<Option<Confirm>> = RwSignal::new(None);
+    // Which snippet the snippet editor is open on — the modal itself lives in
+    // `schemaic-ui`; this is only the signal that raises it.
+    let snippet_edit_open: RwSignal<Option<u64>> = RwSignal::new(None);
 
     // Query-plan (EXPLAIN) modal signals.
     let plan_open = RwSignal::new(false);
@@ -1658,8 +1661,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
     };
-    let insert_snippet: Rc<dyn Fn(schemaic_core::snippet::Snippet)> = {
+    // "This was used just now", for the row's `3d ago` and the recently-used
+    // sort. A **built-in has nothing to record**: it lives in code, not in the
+    // file, so `touch` would find nothing and the save would rewrite the file
+    // for no change — on every insert of a shipped snippet.
+    let record_snippet_use: Rc<dyn Fn(u64)> = {
         let save_snippets = save_snippets.clone();
+        Rc::new(move |id: u64| {
+            if id >= schemaic_core::snippet::BUILTIN_ID_BASE {
+                return;
+            }
+            snippets.update(|v| schemaic_core::snippet::touch(v, id, snippet_now()));
+            (save_snippets)();
+        })
+    };
+    let insert_snippet: Rc<dyn Fn(schemaic_core::snippet::Snippet)> = {
+        let record_snippet_use = record_snippet_use.clone();
         Rc::new(move |snip: schemaic_core::snippet::Snippet| {
             let Some(tab) = active_tab() else {
                 return;
@@ -1668,8 +1685,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // owns the document, and writing the signal behind it loses the
             // insertion's undo step. See `Tab::insert_req`.
             tab.insert_req.set(Some(snip.body.clone()));
-            snippets.update(|v| schemaic_core::snippet::touch(v, snip.id, snippet_now()));
-            (save_snippets)();
+            (record_snippet_use)(snip.id);
         })
     };
     let save_snippet_current: Rc<dyn Fn() -> Option<u64>> = {
@@ -1696,6 +1712,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             Some(id)
         })
     };
+    // What every snippet surface reads: the user's list plus the built-in pack
+    // for the active connection's engine.
+    //
+    // **The merge happens exactly once, here.** The panel, the completion popup
+    // and the palette all read this memo, so none of them can be looking at a
+    // library the others aren't — and the *persisted* signal stays the user's
+    // alone, which is what keeps the pack in code where a later release can fix
+    // one, instead of copied into everybody's `snippets.json`.
+    let snippet_library = create_memo(move |_| {
+        let dialect = conn_dialect();
+        snippets.with(|user| schemaic_core::snippet::library(user, dialect))
+    });
     // Tracked, so the `+` un-dims as soon as the tab has text. It asks the same
     // question `editor_snippet_text` answers — is there anything to save — one
     // reactively and one at the moment of the click.
@@ -1729,6 +1757,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (save_snippets)();
         })
     };
+    let set_snippet_body: Rc<dyn Fn(u64, String)> = {
+        let save_snippets = save_snippets.clone();
+        Rc::new(move |id: u64, body: String| {
+            snippets.update(|v| {
+                if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                    s.body = body.clone();
+                }
+            });
+            (save_snippets)();
+        })
+    };
     let set_snippet_scope: Rc<dyn Fn(u64, schemaic_core::snippet::Scope)> = {
         let save_snippets = save_snippets.clone();
         Rc::new(move |id: u64, scope: schemaic_core::snippet::Scope| {
@@ -1743,7 +1782,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let duplicate_snippet: Rc<dyn Fn(u64)> = {
         let save_snippets = save_snippets.clone();
         Rc::new(move |id: u64| {
-            let Some(src) = snippets.with_untracked(|v| v.iter().find(|s| s.id == id).cloned())
+            // Looked up in the **merged** library: Duplicate exists mainly to
+            // get an editable copy of a built-in, and a built-in is not in the
+            // user's list to be found there.
+            let Some(src) =
+                snippet_library.with_untracked(|v| v.iter().find(|s| s.id == id).cloned())
             else {
                 return;
             };
@@ -5029,15 +5072,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // defined above this line and below those.
     let open_snippet_in_tab: Rc<dyn Fn(schemaic_core::snippet::Snippet)> = {
         let open_query = open_query.clone();
-        let save_snippets = save_snippets.clone();
+        let record_snippet_use = record_snippet_use.clone();
         Rc::new(move |snip: schemaic_core::snippet::Snippet| {
             // The tab the user is looking at decides the database, exactly as
             // an AI code block does: a brand-new tab would otherwise land on
             // whichever database a new tab starts on.
             let db = active_tab().and_then(|t| t.database.get_untracked());
             (open_query)(snip.body.clone(), db);
-            snippets.update(|v| schemaic_core::snippet::touch(v, snip.id, snippet_now()));
-            (save_snippets)();
+            (record_snippet_use)(snip.id);
         })
     };
 
@@ -8301,6 +8343,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             properties_counting,
             properties_count_err,
             run_guard,
+            snippet_edit: snippet_edit_open,
         },
         schema: SchemaUi {
             db_nodes,
@@ -8462,7 +8505,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             open: open_history,
         }),
         snippets: SnippetsUi {
-            items: snippets,
+            items: snippet_library,
             can_save: can_save_snippet,
         },
         snippet_actions: Rc::new(SnippetActions {
@@ -8471,7 +8514,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             save_current: save_snippet_current,
             rename: rename_snippet,
             set_abbrev: set_snippet_abbrev,
+            set_body: set_snippet_body,
             set_scope: set_snippet_scope,
+            edit: {
+                // The editor is a UI concern (the modal lives in `schemaic-ui`),
+                // so the app only flips the signal that opens it.
+                let overlay_snippet_edit = snippet_edit_open;
+                Rc::new(move |id: u64| overlay_snippet_edit.set(Some(id)))
+            },
             duplicate: duplicate_snippet,
             remove: remove_snippet,
         }),
