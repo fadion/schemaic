@@ -862,7 +862,7 @@ mod tests {
     fn every_editor_raises_the_group_that_gives_it_a_box() {
         let scope = Scope::new();
         let d = ddl_ui(scope);
-        let up = crate::ddl_editors_up(d);
+        let up = crate::modals::ddl_editors_up(d);
         assert!(!up(), "nothing open");
 
         // Plain `fn` pointers over the `Copy` bundle rather than boxed closures:
