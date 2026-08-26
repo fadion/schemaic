@@ -1107,6 +1107,188 @@ pub fn match_label(matches: &[NodeMatch]) -> String {
     }
 }
 
+/// Which of the diagram toolbar's optional groups are being shown.
+///
+/// Three of the toolbar's five groups can be dropped when the panel is too
+/// narrow to hold them all; the scope breadcrumb and the Fit/Reset pair cannot.
+/// Fit and Reset survive everything because they are the *recovery* controls —
+/// a diagram panned or zoomed off screen is unusable without them, and unlike
+/// the zoom stepper they have no pointer equivalent (scroll-to-zoom does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolbarFit {
+    /// The `N tables` / `N relationships` count pills.
+    pub counts: bool,
+    /// The `− 33% +` zoom stepper.
+    pub zoom: bool,
+    /// The export (download) button.
+    pub export: bool,
+}
+
+impl ToolbarFit {
+    /// Everything shown — the answer for a toolbar with room, and for one that
+    /// has not been measured yet.
+    pub const ALL: ToolbarFit = ToolbarFit {
+        counts: true,
+        zoom: true,
+        export: true,
+    };
+}
+
+/// Drop the toolbar's optional groups, **in priority order**, until what is left
+/// fits `avail`.
+///
+/// The order is counts → zoom → export, least useful first: the pills restate
+/// something the diagram itself shows, the zoom stepper duplicates scroll-to-zoom
+/// and the percentage is only a readout, and the export button is the one of the
+/// three with no other way to reach it. Everything not named here is fixed and is
+/// summed into `fixed` by the caller.
+///
+/// Each width is what the toolbar **loses by hiding that group** — the group plus
+/// the flex gap that goes with it — rather than the group's own width, so the
+/// caller states the gap accounting once instead of this function guessing at it.
+///
+/// An unmeasured toolbar (`avail` of 0) shows everything. Stripping the bar on the
+/// first frame and putting it back on the second is worse than one frame of
+/// overflow in a panel that opens at 80% of the window and is nearly always wide
+/// enough.
+pub fn fit_toolbar(avail: f64, fixed: f64, counts: f64, zoom: f64, export: f64) -> ToolbarFit {
+    if avail <= 1.0 || fixed + counts + zoom + export <= avail {
+        return ToolbarFit::ALL;
+    }
+    if fixed + zoom + export <= avail {
+        return ToolbarFit {
+            counts: false,
+            ..ToolbarFit::ALL
+        };
+    }
+    if fixed + export <= avail {
+        return ToolbarFit {
+            counts: false,
+            zoom: false,
+            export: true,
+        };
+    }
+    ToolbarFit {
+        counts: false,
+        zoom: false,
+        export: false,
+    }
+}
+
+#[cfg(test)]
+mod toolbar_fit_tests {
+    use super::*;
+
+    /// Room for everything.
+    #[test]
+    fn a_wide_toolbar_keeps_every_group() {
+        assert_eq!(
+            fit_toolbar(1000.0, 200.0, 150.0, 120.0, 40.0),
+            ToolbarFit::ALL
+        );
+        // Exactly enough is enough.
+        assert_eq!(
+            fit_toolbar(510.0, 200.0, 150.0, 120.0, 40.0),
+            ToolbarFit::ALL
+        );
+    }
+
+    /// **The order is the whole of it**, so it is walked one step at a time:
+    /// counts, then zoom, then export, and each step keeps what is left.
+    #[test]
+    fn groups_drop_in_priority_order() {
+        let (fixed, counts, zoom, export) = (200.0, 150.0, 120.0, 40.0);
+        let at = |avail| fit_toolbar(avail, fixed, counts, zoom, export);
+
+        // 509: one pixel short of everything — the pills go, and only the pills.
+        assert_eq!(
+            at(509.0),
+            ToolbarFit {
+                counts: false,
+                zoom: true,
+                export: true
+            }
+        );
+        // 359: short of fixed + zoom + export — the zoom goes too.
+        assert_eq!(
+            at(359.0),
+            ToolbarFit {
+                counts: false,
+                zoom: false,
+                export: true
+            }
+        );
+        // 239: short of fixed + export — everything optional is gone.
+        assert_eq!(
+            at(239.0),
+            ToolbarFit {
+                counts: false,
+                zoom: false,
+                export: false
+            }
+        );
+    }
+
+    /// A group never comes back while a lower-priority one is hidden: the result
+    /// is always a **prefix** of the drop order, never a hole in the middle.
+    #[test]
+    fn the_result_is_always_a_prefix_of_the_drop_order() {
+        let (fixed, counts, zoom, export) = (200.0, 150.0, 120.0, 40.0);
+        for avail in (0..1200).map(|n| n as f64) {
+            let f = fit_toolbar(avail, fixed, counts, zoom, export);
+            assert!(
+                !(f.counts && !f.zoom),
+                "{avail}: counts shown while zoom is hidden"
+            );
+            assert!(
+                !(f.zoom && !f.export),
+                "{avail}: zoom shown while export is hidden"
+            );
+        }
+    }
+
+    /// More room never shows *less*. A fit that wasn't monotone would flicker a
+    /// group in and out as the window is dragged.
+    #[test]
+    fn widening_the_toolbar_never_hides_a_group() {
+        let (fixed, counts, zoom, export) = (200.0, 150.0, 120.0, 40.0);
+        let shown = |f: ToolbarFit| f.counts as u8 + f.zoom as u8 + f.export as u8;
+        // From 2 up, so the unmeasured arm below isn't mistaken for a step down.
+        let mut last = 0;
+        for avail in (2..1200).map(|n| n as f64) {
+            let n = shown(fit_toolbar(avail, fixed, counts, zoom, export));
+            assert!(n >= last, "{avail}: went from {last} groups to {n}");
+            last = n;
+        }
+    }
+
+    /// An unmeasured toolbar shows everything rather than flashing a stripped
+    /// bar on the frame before the first layout lands.
+    #[test]
+    fn an_unmeasured_toolbar_shows_everything() {
+        assert_eq!(fit_toolbar(0.0, 200.0, 150.0, 120.0, 40.0), ToolbarFit::ALL);
+        assert_eq!(
+            fit_toolbar(1.0, 999.0, 999.0, 999.0, 999.0),
+            ToolbarFit::ALL
+        );
+    }
+
+    /// A toolbar narrower than its own fixed part still answers — everything
+    /// optional hidden — rather than going negative or panicking. The scope
+    /// breadcrumb ellipsizes from there; there is nothing left to drop.
+    #[test]
+    fn a_toolbar_narrower_than_its_fixed_part_drops_everything() {
+        assert_eq!(
+            fit_toolbar(50.0, 200.0, 150.0, 120.0, 40.0),
+            ToolbarFit {
+                counts: false,
+                zoom: false,
+                export: false
+            }
+        );
+    }
+}
+
 #[cfg(test)]
 mod search_tests {
     use super::*;
