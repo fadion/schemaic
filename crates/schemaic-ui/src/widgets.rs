@@ -690,6 +690,38 @@ pub(crate) fn list_step(len: usize, cur: usize, delta: isize) -> Option<usize> {
     (next != cur).then_some(next)
 }
 
+/// [`list_step`] over a list where some rows can't be activated — the arrow lands
+/// on the nearest row that *can* be, in the direction asked, or stays put.
+///
+/// Clamped like `list_step` and for the same reason: a list is not a ring. A run
+/// of dead rows at the end therefore parks the cursor on the last live one rather
+/// than jumping back to the top.
+///
+/// `cur` may be out of bounds or point at a disabled row — the list is rebuilt
+/// under the cursor on every keystroke, so both happen.
+pub(crate) fn list_step_enabled(enabled: &[bool], cur: usize, down: bool) -> Option<usize> {
+    let n = enabled.len();
+    if n == 0 {
+        return None;
+    }
+    if down {
+        // `cur + 1` and not `cur`, so a step never returns where it started —
+        // including from a disabled row, whose own index is never a landing.
+        (cur + 1..n).find(|&i| enabled[i])
+    } else {
+        (0..cur.min(n)).rev().find(|&i| enabled[i])
+    }
+}
+
+/// The row a freshly-built list starts on — the first that can be activated.
+///
+/// `0` when none can, which is not a landing so much as somewhere to point: with
+/// every row dead there is nothing to select, and `open_sel` refuses a disabled
+/// row anyway.
+pub(crate) fn first_enabled(enabled: &[bool]) -> usize {
+    enabled.iter().position(|&e| e).unwrap_or(0)
+}
+
 /// The Tab order over one modal's controls.
 ///
 /// Schemaic has to own this rather than use floem's. Floem *does* have
@@ -6776,5 +6808,85 @@ mod menu_panel_gate {
              dismissal tears them down before the row's click can land — the \
              menu opens and choosing an item does nothing: {missing:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod list_skip_tests {
+    use super::{first_enabled, list_step, list_step_enabled};
+
+    /// With everything live it must be `list_step(±1)` exactly — the skipping
+    /// version replaces that call, so any divergence here is a behaviour change
+    /// smuggled in with the feature.
+    #[test]
+    fn an_all_live_list_steps_exactly_as_list_step_does() {
+        let live = [true; 4];
+        for cur in 0..4 {
+            assert_eq!(list_step_enabled(&live, cur, true), list_step(4, cur, 1));
+            assert_eq!(list_step_enabled(&live, cur, false), list_step(4, cur, -1));
+        }
+    }
+
+    #[test]
+    fn a_dead_row_in_the_middle_is_stepped_over_both_ways() {
+        let rows = [true, false, true];
+        assert_eq!(list_step_enabled(&rows, 0, true), Some(2));
+        assert_eq!(list_step_enabled(&rows, 2, false), Some(0));
+    }
+
+    #[test]
+    fn a_run_of_dead_rows_is_stepped_over_in_one_press() {
+        let rows = [true, false, false, false, true];
+        assert_eq!(list_step_enabled(&rows, 0, true), Some(4));
+        assert_eq!(list_step_enabled(&rows, 4, false), Some(0));
+    }
+
+    /// Clamped, not wrapped: dead rows at the end park the cursor on the last
+    /// live row rather than sending it back to the top.
+    #[test]
+    fn dead_rows_at_the_end_stop_the_cursor_instead_of_wrapping() {
+        let rows = [true, true, false, false];
+        assert_eq!(list_step_enabled(&rows, 1, true), None);
+        let rows = [false, false, true, true];
+        assert_eq!(list_step_enabled(&rows, 2, false), None);
+    }
+
+    /// The list is rebuilt under the cursor on every keystroke, so the cursor can
+    /// be sitting on a row that has just gone dead. It must still be able to leave.
+    #[test]
+    fn a_cursor_on_a_dead_row_can_still_move_off_it() {
+        let rows = [true, false, true];
+        assert_eq!(list_step_enabled(&rows, 1, true), Some(2));
+        assert_eq!(list_step_enabled(&rows, 1, false), Some(0));
+    }
+
+    #[test]
+    fn a_list_with_nothing_live_never_moves() {
+        let rows = [false, false, false];
+        assert_eq!(list_step_enabled(&rows, 0, true), None);
+        assert_eq!(list_step_enabled(&rows, 2, false), None);
+        assert_eq!(first_enabled(&rows), 0, "somewhere to point, not a landing");
+    }
+
+    #[test]
+    fn an_empty_list_never_moves() {
+        assert_eq!(list_step_enabled(&[], 0, true), None);
+        assert_eq!(list_step_enabled(&[], 0, false), None);
+        assert_eq!(first_enabled(&[]), 0);
+    }
+
+    /// The list shrank under the cursor — a shorter rebuild leaves `cur` past the
+    /// end. Stepping must clamp rather than index out of bounds.
+    #[test]
+    fn a_cursor_past_the_end_lands_back_inside_without_panicking() {
+        let rows = [true, true];
+        assert_eq!(list_step_enabled(&rows, 9, true), None);
+        assert_eq!(list_step_enabled(&rows, 9, false), Some(1));
+    }
+
+    #[test]
+    fn a_fresh_list_starts_on_the_first_live_row() {
+        assert_eq!(first_enabled(&[true, true]), 0);
+        assert_eq!(first_enabled(&[false, false, true]), 2);
     }
 }

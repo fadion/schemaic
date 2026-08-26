@@ -22,8 +22,9 @@ use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton}
 use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
 use crate::widgets::{
     ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
-    dialog_button, focus_root, measure_text_px_at, menu_inset, menu_item_style, menu_panel,
-    menu_panel_height, menu_panel_width, modal_body_h, modal_w, panel_style, window_size,
+    dialog_button, first_enabled, focus_root, list_step_enabled, measure_text_px_at, menu_inset,
+    menu_item_style, menu_panel, menu_panel_height, menu_panel_width, modal_body_h, modal_w,
+    panel_style, window_size,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
@@ -2241,6 +2242,23 @@ struct PaletteItem {
     primary: String,
     secondary: String,
     activate: Rc<dyn Fn()>,
+    /// Can this row be activated at all? `false` dims it, refuses the click, and
+    /// takes it out of the arrow keys' path (`widgets::list_step_enabled`).
+    ///
+    /// **The palette's second answer to "unavailable", and the two are not
+    /// interchangeable.** The first is *omission*: Server Activity is left out of
+    /// the Toggle Panel list on an engine with no sessions, because that panel
+    /// does not exist for that connection and a row for it would be a route the
+    /// mouse refuses. This one is for a state the window is in right now — too
+    /// narrow for the panel — where the command is real, applies to this
+    /// connection, and will work again in a moment. Dropping those rows would
+    /// make the list's *length* jitter as the user drags a window edge; dimming
+    /// says "not now" and keeps the list still.
+    ///
+    /// No tooltip here, deliberately, unlike the footer's toggles: a palette row
+    /// is a list item, not a control with a hover affordance, and the row it sits
+    /// beside is the explanation.
+    enabled: bool,
     /// The full query string Tab completes to (and the ghost previews), or `None`
     /// for free-text/search rows with nothing to complete.
     complete: Option<String>,
@@ -2474,6 +2492,7 @@ fn object_result_item(
     PaletteItem {
         primary,
         secondary,
+        enabled: true,
         activate: Rc::new(move || {
             search_history.update(|v| {
                 schemaic_core::search_history::push(
@@ -2554,6 +2573,7 @@ fn search_result_item(
     PaletteItem {
         primary,
         secondary: source.database.clone(),
+        enabled: true,
         activate: Rc::new(move || {
             search_history.update(|v| {
                 schemaic_core::search_history::push(
@@ -2585,14 +2605,33 @@ fn search_result_item(
 
 /// Render `primary` with the first case-insensitive occurrence of `term` bolded +
 /// tinted (`match_highlight`). Plain text when there's no term / no match.
-fn highlighted_primary(primary: &str, term: &Option<String>) -> AnyView {
-    let seg = |t: &str, hit: bool| {
+/// How far a row that cannot be activated is faded.
+///
+/// Applied to whatever colour each cell already chose rather than replacing it,
+/// so a matched substring stays recognisably the highlight colour — just dimmer —
+/// and the row still reads as *this* row. Floem 0.2 has no opacity property, so
+/// there is no way to fade the row as a unit; every cell carries the same factor.
+///
+/// Lighter than the 0.3 the footer's disabled glyphs use, because this fades
+/// **text**, which stops being readable well before an icon stops being
+/// recognisable.
+const ROW_DEAD_ALPHA: f32 = 0.4;
+
+fn highlighted_primary(primary: &str, term: &Option<String>, live: bool) -> AnyView {
+    let fade = move |c: floem::peniko::Color| {
+        if live {
+            c
+        } else {
+            c.multiply_alpha(ROW_DEAD_ALPHA)
+        }
+    };
+    let seg = move |t: &str, hit: bool| {
         text(t.to_string()).style(move |s| {
             let s = s.font_size(theme::scaled_font(14.0));
             if hit {
-                s.color(theme::match_highlight()).font_bold()
+                s.color(fade(theme::match_highlight())).font_bold()
             } else {
-                s.color(theme::text())
+                s.color(fade(theme::text()))
             }
         })
     };
@@ -2615,6 +2654,8 @@ fn highlighted_primary(primary: &str, term: &Option<String>) -> AnyView {
 
 /// `() -> [(value, label)]` — an argument-command's choice list.
 type OptionsFn = Rc<dyn Fn() -> Vec<(String, String)>>;
+/// `value -> can it be taken right now` — an option list's availability probe.
+type LiveFn = Rc<dyn Fn(&str) -> bool>;
 /// `arg -> rows` — a free-text command's live results.
 type ItemsFn = Rc<dyn Fn(&str) -> Vec<PaletteItem>>;
 
@@ -2624,9 +2665,16 @@ enum CmdArg {
     /// No argument — runs on Enter.
     Instant(Rc<dyn Fn()>),
     /// Pick one of `(value, label)`; `run(value)`.
+    ///
+    /// `live` answers "can this option be taken *right now*" — `None` when
+    /// nothing about the list can go temporarily unavailable, which is every
+    /// command but Toggle Panel. A `false` row is dimmed and skipped rather than
+    /// dropped; see `PaletteItem::enabled` for why this is not the same as
+    /// leaving the option out of `list` in the first place.
     Options {
         list: OptionsFn,
         run: Rc<dyn Fn(String)>,
+        live: Option<LiveFn>,
     },
     /// A number clamped to `[min, max]`; `run(n)`. `empty` handles a missing arg.
     Number {
@@ -2749,10 +2797,27 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: "Toggle Panel",
             hint: "schema · ai · terminal · query history · server activity",
             arg: CmdArg::Options {
+                // **The window is too narrow for that panel right now.** Dimmed
+                // and skipped rather than dropped: this state changes as the user
+                // drags a window edge, and a list whose *length* jitters mid-drag
+                // is worse than one whose rows grey out. Reads the same two
+                // predicates the footer's toggles do, so the palette and the
+                // status bar can never offer different answers — and the schema
+                // tree's breakpoint is the narrower of the two, so in the band
+                // between them "Schema" stands while the other four are dim.
+                live: Some(Rc::new(|v: &str| {
+                    if v == "schema" {
+                        schema_panel_allowed()
+                    } else {
+                        right_panel_allowed()
+                    }
+                })),
                 // Built when the palette opens, not once: Server Activity is
                 // offered only on an engine that has sessions, which is the same
                 // answer the footer's dimmed toggle gives. Listing it on a SQLite
-                // connection would hand the keyboard a route the mouse refuses.
+                // connection would hand the keyboard a route the mouse refuses —
+                // and note this is *omission*, a different answer from `live`'s
+                // dimming, because that one is permanent for the connection.
                 list: Rc::new(move || {
                     let mut list = vec![
                         ("schema", "Schema"),
@@ -3008,6 +3073,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                 PaletteItem {
                                     primary: schemaic_core::history::preview(&entry.sql),
                                     secondary: entry.database.clone().unwrap_or_default(),
+                                    enabled: true,
                                     activate: Rc::new(move || {
                                         (hist_open)(entry.clone());
                                         (close)();
@@ -3047,6 +3113,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                     vec![PaletteItem {
                         primary: "Ask AI".to_string(),
                         secondary: prompt.clone(),
+                        enabled: true,
                         activate: Rc::new(move || {
                             crate::reveal_ai_panel(right_panel);
                             (ai_send)(prompt.clone());
@@ -3078,6 +3145,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                     vec![PaletteItem {
                         primary: "Run in Terminal".to_string(),
                         secondary: cmd.clone(),
+                        enabled: true,
                         activate: Rc::new(move || {
                             crate::reveal_panel(right_panel, RightPanel::Terminal);
                             (term_input)(format!("{cmd}\r").into_bytes());
@@ -3097,6 +3165,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: "UI Theme",
             hint: "light · dark",
             arg: CmdArg::Options {
+                live: None,
                 list: Rc::new(|| {
                     theme::UiThemeKind::ALL
                         .into_iter()
@@ -3117,6 +3186,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: "Editor Theme",
             hint: "<theme>",
             arg: CmdArg::Options {
+                live: None,
                 list: Rc::new(|| {
                     theme::EditorThemeKind::ALL
                         .into_iter()
@@ -3172,6 +3242,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: "Indent Style",
             hint: "tabs · spaces",
             arg: CmdArg::Options {
+                live: None,
                 list: Rc::new(|| {
                     vec![
                         ("spaces".to_string(), "Spaces".to_string()),
@@ -3215,6 +3286,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: "Switch Connection",
             hint: "<connection>",
             arg: CmdArg::Options {
+                live: None,
                 list: Rc::new(move || {
                     connections.with(|cs| {
                         cs.iter()
@@ -3270,6 +3342,10 @@ fn hint_item(primary: &str, secondary: &str, keys: Option<&'static str>) -> Pale
         keys,
         primary: primary.to_string(),
         secondary: secondary.to_string(),
+        // A hint row is inert by nature, but not *disabled*: it stays selectable
+        // so Tab can still complete from it, and dimming it would say something
+        // about availability that isn't true.
+        enabled: true,
         activate: Rc::new(|| {}),
         complete: None,
         match_term: None,
@@ -3418,6 +3494,7 @@ fn build_items(
                     PaletteItem {
                         primary: c.label.to_string(),
                         secondary: c.hint.to_string(),
+                        enabled: true,
                         activate,
                         complete: Some(complete),
                         match_term: Some(f.clone()),
@@ -3440,6 +3517,7 @@ fn build_items(
                 CmdArg::Instant(run) => vec![PaletteItem {
                     primary: c.label.to_string(),
                     secondary: String::new(),
+                    enabled: true,
                     activate: run.clone(),
                     complete: None,
                     match_term: None,
@@ -3447,7 +3525,7 @@ fn build_items(
                     right_icon: None,
                     keys: crate::shortcuts::command_keys(c.name),
                 }],
-                CmdArg::Options { list, run } => {
+                CmdArg::Options { list, run, live } => {
                     let a = arg.trim().to_lowercase();
                     list()
                         .into_iter()
@@ -3462,6 +3540,10 @@ fn build_items(
                             PaletteItem {
                                 primary: l.clone(),
                                 secondary: String::new(),
+                                // Most option lists have nothing that can go
+                                // temporarily unavailable, so `live` is `None` and
+                                // every row stands.
+                                enabled: live.as_ref().is_none_or(|f| f(&v)),
                                 activate: Rc::new(move || (run)(v2.clone())),
                                 // Tab fills the argument with the option as *shown*,
                                 // not the value behind it — that value is a config
@@ -3498,6 +3580,7 @@ fn build_items(
                             Some(e) => vec![PaletteItem {
                                 primary: c.label.to_string(),
                                 secondary: "↵".to_string(),
+                                enabled: true,
                                 activate: e.clone(),
                                 complete: None,
                                 match_term: None,
@@ -3515,6 +3598,7 @@ fn build_items(
                             vec![PaletteItem {
                                 primary: c.label.to_string(),
                                 secondary: format!("→ {clamped}"),
+                                enabled: true,
                                 activate: Rc::new(move || (run)(clamped)),
                                 complete: None,
                                 match_term: None,
@@ -3652,17 +3736,27 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     // Reset the cursor to the top for a new *query* only — a schema
                     // landing now re-runs this too, and it must not yank the
                     // selection out from under someone mid-arrow-key.
+                    //
+                    // The *first live* row, not row 0: a query whose best match is
+                    // a panel the window is currently too narrow for would
+                    // otherwise open with the cursor parked on a row Enter refuses.
                     if prev.as_deref() != Some(raw.as_str()) {
-                        selected.set(0);
+                        let live = items
+                            .with_untracked(|v| v.iter().map(|it| it.enabled).collect::<Vec<_>>());
+                        selected.set(first_enabled(&live));
                     }
                     raw
                 });
             }
 
-            // Activate the selected row (Enter or click).
+            // Activate the selected row (Enter or click). A disabled row has no
+            // action — the arrows never land on one, but the list is rebuilt on
+            // every keystroke and the window can narrow while the palette is open,
+            // so the cursor can be sitting on a row that has just gone dead.
             let open_sel: Rc<dyn Fn()> = Rc::new(move || {
                 let act = items.with_untracked(|v| {
                     v.get(selected.get_untracked())
+                        .filter(|it| it.enabled)
                         .map(|it| it.activate.clone())
                 });
                 if let Some(act) = act {
@@ -3681,14 +3775,17 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     caret_end.update(|n| *n += 1);
                 }
             });
-            let on_up: Rc<dyn Fn()> =
-                Rc::new(move || selected.update(|i| *i = i.saturating_sub(1)));
-            let on_down: Rc<dyn Fn()> = Rc::new(move || {
-                let n = items.with_untracked(|v| v.len());
-                if n > 0 {
-                    selected.update(|i| *i = (*i + 1).min(n - 1));
+            // The arrows walk live rows only, so a dimmed one is not somewhere the
+            // keyboard can stop. Clamped, not wrapped — see `list_step_enabled`.
+            let step = move |down: bool| {
+                let live =
+                    items.with_untracked(|v| v.iter().map(|it| it.enabled).collect::<Vec<_>>());
+                if let Some(next) = list_step_enabled(&live, selected.get_untracked(), down) {
+                    selected.set(next);
                 }
-            });
+            };
+            let on_up: Rc<dyn Fn()> = Rc::new(move || step(false));
+            let on_down: Rc<dyn Fn()> = Rc::new(move || step(true));
 
             let field = search_box(
                 query,
@@ -3767,21 +3864,34 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     let total = list.len();
                     v_stack_from_iter(list.into_iter().enumerate().map(move |(i, item)| {
                         let activate = item.activate.clone();
+                        // Every cell picks its own colour, and floem 0.2 has no
+                        // opacity property, so a row that can't be activated is
+                        // faded one cell at a time — see `ROW_DEAD_ALPHA`.
+                        let live = item.enabled;
+                        let fade = move |c: floem::peniko::Color| {
+                            if live {
+                                c
+                            } else {
+                                c.multiply_alpha(ROW_DEAD_ALPHA)
+                            }
+                        };
                         // Schema-style leading icon for table/column hits (commands
                         // carry none). Text keeps its normal colour.
                         let mut cells: Vec<AnyView> = Vec::new();
                         if let Some(ic) = item.icon {
                             cells.push(
                                 icons::icon(ic.glyph(), 16.0)
-                                    .style(move |s| s.color(ic.color()).flex_shrink(0.0_f32))
+                                    .style(move |s| s.color(fade(ic.color())).flex_shrink(0.0_f32))
                                     .into_any(),
                             );
                         }
-                        cells.push(highlighted_primary(&item.primary, &item.match_term).into_any());
+                        cells.push(
+                            highlighted_primary(&item.primary, &item.match_term, live).into_any(),
+                        );
                         cells.push(
                             text(item.secondary.clone())
-                                .style(|s| {
-                                    s.color(theme::text_muted())
+                                .style(move |s| {
+                                    s.color(fade(theme::text_muted()))
                                         .font_size(theme::scaled_font(14.0))
                                 })
                                 .into_any(),
@@ -3798,11 +3908,11 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                             // like itself wherever the app shows it.
                             cells.push(
                                 text(keys)
-                                    .style(|s| {
-                                        s.color(theme::text_muted())
+                                    .style(move |s| {
+                                        s.color(fade(theme::text_muted()))
                                             .font_size(theme::font_label())
                                             .font_family("IBM Plex Mono".to_string())
-                                            .background(theme::bg_deepest())
+                                            .background(fade(theme::bg_deepest()))
                                             .padding_horiz(theme::scaled(6.0))
                                             .padding_vert(theme::scaled(1.0))
                                             .border_radius(4.0)
@@ -3814,19 +3924,32 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         if let Some(ri) = item.right_icon {
                             cells.push(
                                 icons::icon(ri, 15.0)
-                                    .style(|s| s.color(theme::text_faint()).flex_shrink(0.0_f32))
+                                    .style(move |s| {
+                                        s.color(fade(theme::text_faint())).flex_shrink(0.0_f32)
+                                    })
                                     .into_any(),
                             );
                         }
                         let row = h_stack_from_iter(cells)
                             .on_click_stop(move |_| {
-                                selected.set(i);
-                                (activate)();
+                                // A dead row swallows the click rather than
+                                // ignoring it: `on_click_stop` keeps the press off
+                                // the backdrop below, so the palette does not close
+                                // under a click the user meant for a row.
+                                if live {
+                                    selected.set(i);
+                                    (activate)();
+                                }
                             })
                             .style(move |s| {
                                 // +3px over menu_item_style's 6px vertical padding.
                                 let s = menu_item_style(s).padding_vert(theme::scaled(9.0));
-                                if selected.get() == i {
+                                // No highlight on a dead row even if the cursor is
+                                // parked there: the list can rebuild under it (the
+                                // window narrows while the palette is open), and a
+                                // selected-looking row that Enter refuses is the
+                                // thing this whole change is about.
+                                if selected.get() == i && live {
                                     s.background(theme::row_selected())
                                 } else {
                                     s
