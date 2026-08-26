@@ -2878,6 +2878,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     a `menu_row: RwSignal<Option<u64>>` created in the modal's **stable scope** beside `save_flash`
     and `test_flash` and for the same reason — the clearing effect outlives the open/close
     `dyn_container`, and a signal built inside it would be disposed out from under that effect.
+  - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
+    panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
+    share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
+    app root. Both handles are absolute children positioned from an **effective** (clamped or
+    floored) edge rather than from the dimension they set: a width the window is too narrow to
+    honour, or a height persisted under a lower floor, would otherwise leave the handle floating
+    away from the edge it drags. Both capture the pointer on press (`request_active`), and both
+    clear the drag state in `on_double_click_stop` themselves — the double-click eats the second
+    `PointerUp`, so without that the handle stays captured and keeps resizing on mouse-move.
+    **The dividers light up on a *rest*, not on a pass.** The bar is an affordance — this edge
+    drags — and the dividers run the full height and width of the workspace, so answering on
+    `PointerEnter` lit one every time the pointer crossed from the schema tree to the editor or from
+    the editor to the results. `RESIZE_HOVER_DELAY` (200ms) is how long the pointer must settle
+    first — 500 was tried and is too long: it outlasts the gesture, so a pointer that has already
+    stopped on the divider reads as one the app has not noticed. Dragging is not delayed and the hit
+    band is never gated on the highlight: the delay is on the hint, never on the control. There is
+    no cancelling a floem timer, so the arm carries a **sequence number** and checks it with
+    `try_get_untracked` when it fires — one comparison that retires both the pointer having left
+    (`Some(newer)`) and the divider having been disposed inside the delay (`None`, since
+    `exec_after` timers outlive the scope that armed them). That second half is defensive and **not
+    currently reachable**: `v_resize_handle` is called once from `center`, itself built once in the
+    workspace shell, and the per-tab `dyn_container`s are its siblings rather than its parents, so
+    these signals live as long as the app does.
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `activity_panel.rs` — the **Server Activity** right-column panel (`RightPanel::Activity`, the
     footer's pulse-line toggle): the sessions on the active *connection's* server, a counts line, a
@@ -3829,9 +3852,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     asserted here, because a border carries no text and a legibility floor on it would mean nothing;
     `erd_view::tests::a_tinted_border_is_never_fainter_than_the_plain_one` holds it to the plain
     `border` it replaces instead.
-  - `lib.rs` (~7.9k lines; `grid.rs` at ~10.2k is the crate's largest) — the `Ui` struct + bundles,
+  - `lib.rs` (~7.6k lines; `grid.rs` at ~10.2k is the crate's largest) — the `Ui` struct + bundles,
     shared model/state
-    types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
+    types, `workspace`/`body`/`center`/`header`/`footer`, `edit_field`/`FieldCfg`,
     terminal panel. The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
@@ -3840,19 +3863,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the modal layer, its four predicates and `modal_backdrop_gate` with it, and `workspace` kept a
     single tuple entry plus the one `modal_backdrop_up` call the title-bar band also reads. Nothing
     about the types had to move, because the layer needs only `Ui` — which is the test for whether a
-    piece is ready to leave.
-    **The panel dividers light up on a *rest*, not on a pass** (`DelayedHover`, shared by
-    `h_resize_handle` and `v_resize_handle`). The bar is an affordance — this edge drags — and the
-    dividers run the full height and width of the workspace, so answering on `PointerEnter` lit one
-    every time the pointer crossed from the schema tree to the editor or from the editor to the
-    results. `RESIZE_HOVER_DELAY` (200ms) is how long the pointer must settle first — 500 was
-    tried and is too long: it outlasts the gesture, so a pointer that has already stopped on the
-    divider reads as one the app has not noticed. Dragging is
-    not delayed and the hit band is never gated on the highlight: the delay is on the hint, never
-    on the control. There is no cancelling a floem timer, so the arm carries a **sequence number**
-    and checks it with `try_get_untracked` when it fires — one comparison that retires both the
-    pointer having left (`Some(newer)`) and the divider having been disposed inside the delay
-    (`None`, since `exec_after` timers outlive the scope that armed them; closing a tab is enough).
+    piece is ready to leave. **`dividers.rs` is the second**, and it is the other kind: no invariant,
+    no test, purely a self-contained pair of views (~240 lines) that `body` and `center` call. Both
+    cuts left the shared types where they are, so the stall above is unchanged — the next cut still
+    has to answer it.
     **A first launch saves nothing and selects nothing.** `app_view` used to seed a "Local
     MariaDB" connection (127.0.0.1:3306, this repo's development credentials) whenever the loaded
     list came back empty, and write it to disk on the spot — so a fresh install opened onto a
