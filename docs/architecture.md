@@ -1317,6 +1317,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     equal to the default is still stored, or moving `DEFAULT_POLL_SECS` would silently move every
     connection someone had deliberately set to the old one.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
+  - `snippet.rs` — the snippet library: named saved queries, persisted to `snippets.json`.
+    `applies` answers whether a snippet may be offered on a connection, `grouped` builds the
+    panel's headings (**narrowest bucket first** — this connection, this engine, everywhere — each
+    snippet under exactly one, empty buckets omitted), `matches_query` is the panel's filter
+    (name/abbrev/body, the body whitespace-collapsed the way `history::matches_query` reads a
+    statement), `by_abbrev` is the completion trigger (whole-word, case-insensitive, narrowest
+    scope wins a shared spelling), plus `next_id`/`touch`/`remove`.
+    **Scope is `Global | Dialect | Conn`, not a `conn_id` like `history.rs` uses** — that is the
+    difference between a library and a log: a "running queries" snippet is wanted on every MySQL
+    connection, not on the one it was saved from. Nothing is capped or evicted, for the same
+    reason. A body's `:name` placeholders are not stored (they would go stale on the first edit)
+    and need no tab-stop syntax of their own — inserting the body hands them to `params`.
+    `Scope` is a **preserving** persisted enum: `Unknown(String)` keeps the text it didn't
+    recognise and the hand-written `Serialize` writes it back verbatim, the rule
+    `search_history::ObjectTag` states, because this file is rewritten whole on every change.
+    `next_id` is max-plus-one and therefore **reuses a deleted snippet's id**; that is safe only
+    while no id outlives the file, which is why snippet activations are not recorded in
+    `search_history.json` — a test pins the limit.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`. An entry is written in **two passes** — `push` when the run
     launches, `finish` when it lands (duration, rows, `Outcome`) — because the two moments
