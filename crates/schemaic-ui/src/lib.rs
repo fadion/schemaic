@@ -5850,7 +5850,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
                 .width_full()
                 .min_height(0.0)
                 .min_width(0.0)
-                .padding(theme::scaled(6.0))
+                .padding(term_pad())
                 .background(term_color(schemaic_term::DEFAULT_BG))
                 .cursor(CursorStyle::Text)
         })
@@ -5993,7 +5993,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
             let thumb_h = thumb_len((vr as f64 / total as f64) * track_h, track_h);
             // ratio: 1.0 at the live bottom (offset 0), 0.0 at the top of history.
             let ratio = (total - vr - sc.display_offset) as f64 / (total - vr) as f64;
-            let top = 6.0 + ratio * (track_h - thumb_h);
+            let top = term_pad() + ratio * (track_h - thumb_h);
             s.absolute()
                 .inset_right(3.0)
                 .inset_top(top)
@@ -6007,7 +6007,9 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     // Bar / underline cursor: a thin overlay at the reported cursor cell. (Block
     // is baked into the snapshot in `schemaic-term`.) `screen.cursor` is already
     // `None` when the cursor is hidden or blinked off, so this follows blink for
-    // free. Positions match the grid: the surface pads 6px, cells are cw×ch.
+    // free. Positions match the grid: the surface pads `term_pad()`, cells are
+    // cw×ch. The padding is scaled and this overlay is the surface's *sibling*,
+    // so it has to read the same metric rather than restate it.
     let cursor_overlay = empty()
         .style(move |s| {
             let sc = screen.get();
@@ -6016,15 +6018,15 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
             match (cursor_style.get(), sc.cursor) {
                 (TermCursor::Bar, Some((r, c))) => s
                     .absolute()
-                    .inset_left(6.0 + c as f64 * cw)
-                    .inset_top(6.0 + r as f64 * ch)
+                    .inset_left(term_pad() + c as f64 * cw)
+                    .inset_top(term_pad() + r as f64 * ch)
                     .width(2.0)
                     .height(ch)
                     .background(color),
                 (TermCursor::Underline, Some((r, c))) => s
                     .absolute()
-                    .inset_left(6.0 + c as f64 * cw)
-                    .inset_top(6.0 + r as f64 * ch + ch - 2.0)
+                    .inset_left(term_pad() + c as f64 * cw)
+                    .inset_top(term_pad() + r as f64 * ch + ch - 2.0)
                     .width(cw)
                     .height(2.0)
                     .background(color),

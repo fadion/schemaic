@@ -4983,7 +4983,7 @@ fn seed_popover(gs: GridState) -> impl IntoView {
             .style(|s| {
                 crate::widgets::panel_style(s)
                     .absolute()
-                    .inset_top(30.0) // just below the 28px toolbar
+                    .inset_top(crate::consts::seed_popover_top())
                     .inset_right(8.0)
                     .background(theme::bg_chrome())
                     .padding(theme::scaled(12.0))
@@ -6526,7 +6526,11 @@ fn grid_toolbar(
     // drifted by a pixel would leave the menu opening correctly and silently
     // refusing to toggle shut.
     let anchor_below = |o: Point| {
-        let sz = 16.0; // every toolbar glyph above
+        // The glyph's box as `icons::icon` actually draws it — the base *scaled*.
+        // `on_move` reports an origin, not a rect, so this is the one `BelowIcon`
+        // caller that reconstructs the box instead of measuring it, and a frozen
+        // base put the menu 10px into its own icon at 160%.
+        let sz = crate::consts::toolbar_icon_px();
         PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)
     };
     // Is the menu currently up the one this icon opened? The rule, and why the
@@ -6800,7 +6804,7 @@ fn grid_toolbar(
                 }
             };
             let commit = h_stack((
-                icons::icon(icons::CIRCLE_CHECK, 16.0)
+                icons::icon(icons::CIRCLE_CHECK, crate::consts::TOOLBAR_ICON_BASE)
                     .style(move |s| s.color(commit_color()).flex_shrink(0.0_f32)),
                 text(label).style(move |s| {
                     s.font_size(theme::font_label())
@@ -6833,14 +6837,16 @@ fn grid_toolbar(
                 text(t).style(crate::widgets::tooltip_style)
             });
             let discard_hov = RwSignal::new(false);
-            let discard = container(icons::icon(icons::CIRCLE_X, 16.0).style(move |s| {
-                let c = if discard_hov.get() {
-                    theme::grid_edit_discard_hover()
-                } else {
-                    theme::grid_edit_discard()
-                };
-                s.color(c).flex_shrink(0.0_f32)
-            }))
+            let discard = container(
+                icons::icon(icons::CIRCLE_X, crate::consts::TOOLBAR_ICON_BASE).style(move |s| {
+                    let c = if discard_hov.get() {
+                        theme::grid_edit_discard_hover()
+                    } else {
+                        theme::grid_edit_discard()
+                    };
+                    s.color(c).flex_shrink(0.0_f32)
+                }),
+            )
             .on_click_stop(move |_| discard_edits(gs))
             .on_event_cont(EventListener::PointerEnter, move |_| discard_hov.set(true))
             .on_event_cont(EventListener::PointerLeave, move |_| discard_hov.set(false))
@@ -7005,7 +7011,7 @@ fn grid_toolbar(
     });
     let copy_click = open_copy.clone();
     let copy_menu = container(
-        icons::icon(icons::COPY, 16.0)
+        icons::icon(icons::COPY, crate::consts::TOOLBAR_ICON_BASE)
             .on_move(move |p| follow_menu(copy_origin, p))
             .style(move |s| {
                 s.color(crate::widgets::menu_icon_color(
@@ -7060,7 +7066,7 @@ fn grid_toolbar(
     });
     let save_click = open_save.clone();
     let save_menu = container(
-        icons::icon(icons::DOWNLOAD, 16.0)
+        icons::icon(icons::DOWNLOAD, crate::consts::TOOLBAR_ICON_BASE)
             .on_move(move |p| follow_menu(save_origin, p))
             .style(move |s| {
                 s.color(crate::widgets::menu_icon_color(
@@ -7175,7 +7181,7 @@ fn grid_toolbar(
             });
             let ai_click = open_ai.clone();
             let face = container(
-                icons::icon(icons::SPARKLES, 16.0)
+                icons::icon(icons::SPARKLES, crate::consts::TOOLBAR_ICON_BASE)
                     .on_move(move |p| follow_menu(ai_origin, p))
                     .style(move |s| {
                         // Dimmed + inert while a request is in flight — that arm
@@ -7276,7 +7282,7 @@ fn grid_toolbar(
             .flex_row()
             .items_center()
             .gap(theme::scaled(6.0))
-            .height(theme::scaled(28.0))
+            .height(crate::consts::grid_toolbar_h())
             .flex_shrink(0.0_f32)
             .padding_left(theme::scaled(12.0))
             // Less right padding than left: the copy icon carries its own 5px hitbox

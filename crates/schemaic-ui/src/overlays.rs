@@ -23,7 +23,7 @@ use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
 use crate::widgets::{
     ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
     dialog_button, focus_root, measure_text_px_at, menu_inset, menu_item_style, menu_panel,
-    menu_panel_height, modal_body_h, modal_w, panel_style, window_size,
+    menu_panel_height, menu_panel_width, modal_body_h, modal_w, panel_style, window_size,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
@@ -2050,13 +2050,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
         // a row low in the tree runs its last entries off the bottom otherwise,
         // however the menu was raised.
         let from = menu.at.unwrap_or_else(|| last_mouse.get_untracked());
-        let h = menu_panel_height(&(build)(menu));
-        let (x, y) = cursor_menu_insets(
-            from,
-            (ctx_menu_w(), h),
-            window_size().get(),
-            CURSOR_MENU_GAP,
-        );
+        let entries = (build)(menu);
+        let h = menu_panel_height(&entries);
+        // `ctx_menu_w()` is the panel's `min_width`; a long entry (a table name in
+        // "Truncate <name>") draws wider, and the flip has to test what is drawn.
+        let w = ctx_menu_w().max(menu_panel_width(&entries));
+        let (x, y) = cursor_menu_insets(from, (w, h), window_size().get(), CURSOR_MENU_GAP);
         y.apply_y(x.apply_x(s.absolute()))
     })
 }
@@ -2144,13 +2143,21 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
         // ≈30.5px (14px line + 8px padding both sides − sub-pixel), a separator is
         // ≈9px (a 1px rule + 4px margins both sides) — because counting separators
         // as full rows shoved the flipped panel tens of px too high. `+14` = the
-        // panel's 6px vertical padding (both sides) + 1px border (both sides). These
-        // are placement estimates, not the flip *decision*, so being close matters.
-        let Some(ph) = popup.with(|p| p.as_ref().map(|e| menu_panel_height(e))) else {
+        // panel's 6px vertical padding (both sides) + 1px border (both sides). The
+        // *height* is a placement estimate, so being close matters; the width below
+        // decides a flip outright, which is why it is measured from the labels.
+        let Some((ph, content_w)) = popup.with(|p| {
+            p.as_ref()
+                .map(|e| (menu_panel_height(e), menu_panel_width(e)))
+        }) else {
             return s;
         };
         let (ww, wh) = window_size().get();
-        let pw = popup_width.get(); // matches the panel's min_width for edge flips
+        // The width the panel will actually draw at. `popup_width` is only the
+        // `min_width` the opener asked for — every row pushes past it as soon as a
+        // label doesn't fit, so testing the floor flipped the grid's cell menu
+        // about half a panel after it had already run off the window.
+        let pw = popup_width.get().max(content_w);
         match anchor.get() {
             // Status-bar segment menu: centre the panel horizontally on the anchor's
             // x-range and sit 5px above the status bar (FOOTER_H tall at the window
