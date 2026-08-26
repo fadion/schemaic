@@ -387,7 +387,7 @@ fn bound_choice<T: Clone + PartialEq + 'static>(
     focusable_owned_dropdown(
         move || sig.get(),
         labels,
-        field_w(),
+        field_w,
         ring,
         tabindex,
         move |label: String| {
@@ -531,7 +531,7 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
             focusable_owned_dropdown(
                 move || sig.get(),
                 langs,
-                field_w(),
+                field_w,
                 ring.clone(),
                 TAB_LANGUAGE,
                 move |v: String| {
