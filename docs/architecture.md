@@ -1323,7 +1323,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     snippet under exactly one, empty buckets omitted), `matches_query` is the panel's filter
     (name/abbrev/body, the body whitespace-collapsed the way `history::matches_query` reads a
     statement), `by_abbrev` is the completion trigger (whole-word, case-insensitive, narrowest
-    scope wins a shared spelling), plus `next_id`/`touch`/`remove`.
+    scope wins a shared spelling), `scope_options` is the scope picker's three choices **in the
+    bands' own order** — a test pins each choice to the heading a row moves to when it is picked,
+    so the picker and `grouped` cannot drift — plus `next_id`/`touch`/`remove`.
     **Scope is `Global | Dialect | Conn`, not a `conn_id` like `history.rs` uses** — that is the
     difference between a library and a log: a "running queries" snippet is wanted on every MySQL
     connection, not on the one it was saved from. Nothing is capped or evicted, for the same
@@ -3007,8 +3009,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     matching the tab rename, because there is no text-prompt modal in this codebase and a saved
     query's name is the same kind of act — and the row menu's *expansion shortcut* entry puts the
     same field where the abbrev chip sits, where **committing an empty one removes the abbrev**,
-    the only way to take a trigger back off a snippet. A built-in offers neither: Duplicate is how
-    you get an editable copy of one.
+    the only way to take a trigger back off a snippet. The menu's **Show in** submenu is the scope
+    picker: its three choices are `snippet::scope_options` (narrowest first), so the order you pick
+    from and the order of the bands a row can move to cannot drift apart — a test pins each choice
+    to the band it lands under. The current one is tinted rather than ticked, the convention
+    `cell_editors::pick_entries` set. A built-in offers none of the three: Duplicate is how you get
+    an editable copy of one.
   - `activity_panel.rs` — the **Server Activity** right-column panel (`RightPanel::Activity`, the
     footer's pulse-line toggle): the sessions on the active *connection's* server, a counts line, a
     lock-wait banner and a search box, over the same chrome as the History panel. It paints

@@ -1729,6 +1729,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (save_snippets)();
         })
     };
+    let set_snippet_scope: Rc<dyn Fn(u64, schemaic_core::snippet::Scope)> = {
+        let save_snippets = save_snippets.clone();
+        Rc::new(move |id: u64, scope: schemaic_core::snippet::Scope| {
+            snippets.update(|v| {
+                if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                    s.scope = scope.clone();
+                }
+            });
+            (save_snippets)();
+        })
+    };
     let duplicate_snippet: Rc<dyn Fn(u64)> = {
         let save_snippets = save_snippets.clone();
         Rc::new(move |id: u64| {
@@ -8460,6 +8471,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             save_current: save_snippet_current,
             rename: rename_snippet,
             set_abbrev: set_snippet_abbrev,
+            set_scope: set_snippet_scope,
             duplicate: duplicate_snippet,
             remove: remove_snippet,
         }),
