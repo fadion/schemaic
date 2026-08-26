@@ -1963,6 +1963,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware (no backtick on PG).
+  - `params.rs` — `:name` query parameters: `scan`/`names` (every placeholder and its byte range,
+    built on `skip_noncode` so a `:id` inside a string, comment, dollar-quoted body or quoted
+    identifier is not one), `bindings_for` (the parameters bar's rows, re-derived from the SQL on
+    every edit and carrying across the values already typed), `substitute` (the statement that
+    actually runs) and `neutralize` (the same text with each `:` rewritten to `_`, byte offsets
+    preserved, so `intel` can parse a statement mid-parameterisation and only the placeholder ranges
+    lose their diagnostics). **Named placeholders only** — `?` is a live PostgreSQL JSON operator and
+    `$1` collides with dollar-quoting. **Substitution is textual, not driver binding**, because
+    `ORDER BY :col`/`LIMIT :n` are what the feature is for and no driver binds those; values are
+    quoted through `export::sql_literal`, and `ParamValue::Raw` is emitted verbatim by design.
+    That last point is why **the run guard must be given the *substituted* statement** — a `Raw`
+    value otherwise carries a write past a `run_verdict` that read a statement the engine never
+    receives. `ParamValue` is deliberately not `Serialize`: a value is session-only and never
+    reaches `tabs.json`. Three lookalikes have named regression tests, since each is one missing
+    line from a false positive: PostgreSQL's `::` cast (consumed whole — skipping one byte leaves
+    the shape of a placeholder), MySQL's `:=`, and a PostgreSQL array slice `arr[lo:hi]`.
+    Pure + unit-tested; the parameters bar and the run wiring are not built yet.
   - `sqlfile.rs` — the pure half of opening and saving a tab's SQL as a `.sql` file on disk: what a
     file's bytes become in the editor (`decode`), what the editor's text becomes on the way back
     (`encode`), what the tab is called once it has a file (`tab_title` — the file name *with* its

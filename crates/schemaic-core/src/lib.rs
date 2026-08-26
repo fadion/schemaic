@@ -32,6 +32,7 @@ pub mod model;
 pub mod monitor;
 pub mod pairs;
 pub mod palette;
+pub mod params;
 pub mod persist;
 pub mod plan;
 pub mod prompt;
