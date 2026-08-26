@@ -202,10 +202,10 @@ fn pick_field_w() -> f64 {
 /// Three parts to that, none of them optional:
 ///
 /// * `keyboard_navigable`, which puts it in floem's own Tab walk **and** is what
-///   makes Enter/Space work: floem fires [`EventListener::Click`] on the focused
-///   view for either key (`context.rs`), so the same handler the pointer uses
-///   opens the menu. Once open, the menu takes the keyboard itself and walks with
-///   the arrows.
+///   makes Enter/Space work: floem fires [`floem::event::EventListener::Click`]
+///   on the focused view for either key (`context.rs`), so the same handler the
+///   pointer uses opens the menu. Once open, the menu takes the keyboard itself
+///   and walks with the arrows.
 /// * `autofocus`, because the row panel focuses its first editable field on open,
 ///   and a panel whose first column is an `ENUM` opened with the keyboard
 ///   *nowhere* — the arrows still driving the grid behind it.

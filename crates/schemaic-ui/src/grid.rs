@@ -7957,7 +7957,7 @@ fn cell_pick_editor(
 /// Is the **cell editor's own** calendar up?
 ///
 /// One channel serves every date control in the app and it carries no tag saying
-/// who filled it, so the buffer is the identity ([`DatePick`]) — and the buffer a
+/// who filled it, so the buffer is the identity ([`crate::DatePick`]) — and the buffer a
 /// cell editor binds to is always `edit_buf`, which no row-panel field ever is.
 fn cell_calendar_up(gs: GridState) -> bool {
     gs.menus

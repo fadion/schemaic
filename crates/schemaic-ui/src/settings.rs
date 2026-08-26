@@ -414,12 +414,12 @@ fn settings_group_label(t: &'static str) -> impl IntoView {
 /// is short enough that four of them fit the row at every scale, and it cannot
 /// drift from the factor it selects.
 ///
-/// One Tab stop with Left/Right inside it ([`nav_group`], the rule the colour
-/// swatches and the designer's item list follow), and the arrows *apply* as they
-/// move: every option is visible instantly and reversible by the next press, so
-/// there is nothing to confirm. The step clamps rather than wraps — this is a
-/// selection, and rolling from the largest back to the smallest would only be a
-/// surprise.
+/// One Tab stop with Left/Right inside it ([`crate::widgets::nav_group`], the
+/// rule the colour swatches and the designer's item list follow), and the arrows
+/// *apply* as they move: every option is visible instantly and reversible by the
+/// next press, so there is nothing to confirm. The step clamps rather than wraps
+/// — this is a selection, and rolling from the largest back to the smallest would
+/// only be a surprise.
 fn scale_picker(
     scale: RwSignal<theme::UiScale>,
     ring: crate::widgets::FocusRing,

@@ -2376,7 +2376,7 @@ fn pg_type_name(t: &Type) -> String {
 /// `Type` (via [`pg_type_name`]) and the schema panel feeds it `udt_name`, so the
 /// two always agree (rather than the grid showing `VARCHAR` while the schema panel
 /// shows the verbose `information_schema.data_type` "character varying"). Integer/
-/// float names are chosen so [`parse_typed`] recognizes them (its `starts_with`
+/// float names are chosen so [`crate::parse_typed`] recognizes them (its `starts_with`
 /// checks key off `INT`/`SMALLINT`/`BIGINT` and `FLOAT`/`DOUBLE`); `NUMERIC` stays a
 /// string so it's never coerced to a lossy float. `timestamp`/`timestamptz` keep
 /// Postgres's own short aliases (the no-tz form is plain `TIMESTAMP`, the tz form
