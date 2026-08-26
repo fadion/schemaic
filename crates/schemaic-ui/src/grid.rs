@@ -1667,10 +1667,12 @@ fn copy_selection(gs: GridState) {
 /// throw away, not a write.
 ///
 /// Deliberately **not** interpreted: the block is split on tabs and newlines and
-/// nothing else (see `core::edit::parse_tsv_block`), and a cell reading `NULL`
-/// stages the four-character string, because that is what the copy side wrote
-/// and a paste that quietly turned text into SQL `NULL` would be editing the
-/// user's data on their behalf.
+/// nothing else (see `core::edit::parse_tsv_block`). The **one** exception is the
+/// literal `NULL`, which resolves to SQL NULL (`core::edit::pasted_value`) — it
+/// is what the copy side writes for a NULL cell, so reading it as text made a
+/// copied nullable column come back with every NULL in it replaced by a string.
+/// The plan carries the resolution, so a staged value arrives here already an
+/// `Option` and nothing on this path can spell it a second way.
 fn paste_selection(gs: GridState) {
     // An open inline editor owns Ctrl+V — it is a text field, and pasting into
     // the *grid* from inside one would replace the cell being typed into (and
@@ -1717,7 +1719,7 @@ fn paste_selection(gs: GridState) {
     let (mut real, mut pending) = (Vec::new(), Vec::new());
     for (row, ci, value) in plan.cells {
         if row >= nrows {
-            pending.push((row - nrows, ci, Some(value)));
+            pending.push((row - nrows, ci, value));
             continue;
         }
         let di = order.get(row).copied().unwrap_or(row);
@@ -1728,7 +1730,7 @@ fn paste_selection(gs: GridState) {
             skipped_deleted += 1;
             continue;
         }
-        real.push((di, ci, Some(value)));
+        real.push((di, ci, value));
     }
     // **What landed, summed from the two halves** — not what the plan held. Each
     // returns the entries it really changed: `stage_many` un-stages a cell pasted
@@ -5293,10 +5295,15 @@ fn cell_shape(editor: CellEditor, buf: &str) -> CellShape {
 /// style closure. The fifth is the reason this is a function: a staged SQL NULL
 /// and a staged four-character string reading `NULL` went through the *same* arm,
 /// so `middle_name = NULL` and `middle_name = 'NULL'` were pixel-identical before
-/// the Commit that writes one of them. Copy a NULL cell and paste it (the
-/// clipboard carries the display text, uninterpreted — deliberately) and the
-/// grid had nothing to audit: `WHERE middle_name IS NULL` stops matching a row
-/// that looks exactly like the ones it does match.
+/// the Commit that writes one of them, and the grid had nothing to audit:
+/// `WHERE middle_name IS NULL` stops matching a row that looks exactly like the
+/// ones it does match.
+///
+/// A **paste** no longer produces the second of those — the clipboard's four
+/// characters resolve back to SQL NULL (`core::edit::pasted_value`) — but typing
+/// `NULL` into a cell still means the string, deliberately, and that is the
+/// escape hatch the ruling left. So the two writes remain reachable from one
+/// keyboard, and telling them apart is still the grid's job.
 ///
 /// The italic is not a new vocabulary: it is the treatment a NULL *original* has
 /// always had, which is the point — "there is no value here" reads the same
@@ -9230,9 +9237,9 @@ mod tests {
     }
 
     /// **A staged SQL NULL and a staged string spelling `NULL` are different
-    /// writes, so they cannot paint the same.** Copy a NULL cell and paste it and
-    /// the clipboard's display text comes back as the four characters — by
-    /// design, since nothing may reinterpret a block that came from outside — so
+    /// writes, so they cannot paint the same.** A paste no longer makes the
+    /// second by accident, but *typing* `NULL` into a cell still does — that is
+    /// the escape hatch `core::edit::pasted_value` deliberately leaves open — so
     /// the grid is where the difference has to be visible, before the Commit that
     /// writes `middle_name = 'NULL'` into a column where `IS NULL` will then never
     /// match it again.
