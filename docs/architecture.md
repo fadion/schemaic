@@ -5152,6 +5152,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   pre-existing and both accepted: a database with `limit` *table-name* matches can still starve its
   objects (a name match is rare where a column match is not), and the cap is **global across
   databases**, so a wide first database still contributes everything and later ones nothing.
+  **Snippets are a fourth category, appended after all three** (`overlays::snippet_items`), and they
+  sit outside that cap because they come from `snippets.json` rather than from the schema passes:
+  the palette is a way to reach the database, and a saved query is a thing you wrote *about* it.
+  Activating one inserts it at the caret, as its library row does — and it is **not recorded in the
+  search history**, which is what lets it be here at all: a `SearchEntry` resolves against the live
+  catalogue, and a snippet is not a catalogue object, so remembering one would mean teaching the
+  persisted `ObjectTag` about a thing no schema can confirm (and `snippet::next_id` reuses a
+  deleted id, so a remembered one could later name a different query).
 - **The Find-Anywhere query is not debounced.** Unlike the schema tree's filter box
   (`debounced(filter_input, SEARCH_DEBOUNCE_MS)`), the palette's effect re-runs on every keystroke,
   over every loaded database. So anything it calls per-database is on a per-character path: that is
