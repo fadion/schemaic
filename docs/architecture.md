@@ -2763,6 +2763,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
     `dismiss_open_popup` slot. A field joins through `FieldCfg::focus` instead, since nothing
     outside floem's editor can see a key it has.
+  - `modals.rs` — **the modal layer** (`modal_layer`) and the four predicates that raise it
+    (`ddl_modals_up`, `ddl_editors_up`, `workspace_modals_up`, `settings_modals_up`,
+    `modal_backdrop_up`), plus the `modal_backdrop_gate` tests. It mounts no modal of its own and
+    paints no scrim: every member view lives in its own module, and this one decides *which box they
+    resolve their `inset(0)` against* and *in what order they paint*. Both are policy — the layer's
+    box stops at `header_h()` so the title-bar band has somewhere to go, and each paint-order rule in
+    the tuple was bought with a bug (a confirm behind Manage Connections, a transaction prompt behind
+    the DDL preview, a popup menu behind the panel that opened it). `modal_up` is a *parameter*
+    rather than a local, because `workspace` needs the identical answer for the band and the two
+    must not be able to disagree. The group wrappers exist to fit floem's 16-arity `ViewTuple` limit
+    and are load-bearing anyway: a group's wrapper fills the layer only while one of its members is
+    open, since an always-full-window box would eat every click beneath it. See the absolute-child
+    invariant for the full argument and for what the gate holds up.
   - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). A code
     block carries a **standing** 24px header — the language on the left, `Copy` and (for SQL only)
     `Insert` / `Run` on the right, as words rather than icons, since a permanent icon row over every
@@ -3299,7 +3312,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     strip that would clip it), Find-Anywhere, error modal. **What separates the two kinds here is
     the backdrop, not the name.** The menus are shrink-wrapped to their panel; Find-Anywhere and
     the error/confirm/transaction prompts paint `modal_backdrop()` over the window, which puts
-    them in `workspace`'s modal layer with the rest of the modals. Find-Anywhere is the one that
+    them in `modals::modal_layer` with the rest of the modals. Find-Anywhere is the one that
     looks like it belongs on the other side of that line — it is a palette, and a click away
     closes it — and it is the reason the line is drawn where it is: mounted with the menus, its
     backdrop covered the title bar, and a press aimed at the caption buttons found the click-away
@@ -3816,11 +3829,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     asserted here, because a border carries no text and a legibility floor on it would mean nothing;
     `erd_view::tests::a_tinted_border_is_never_fainter_than_the_plain_one` holds it to the plain
     `border` it replaces instead.
-  - `lib.rs` (~5.6k lines; `grid.rs` at ~6.3k is the crate's largest) — the `Ui` struct + bundles, shared model/state
+  - `lib.rs` (~7.9k lines; `grid.rs` at ~10.2k is the crate's largest) — the `Ui` struct + bundles,
+    shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
     terminal panel. The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
+    **`modals.rs` is the first cut that did move**, and it is the shape the rest should follow: not
+    the biggest view builder, but the one piece of `workspace` with an *invariant* attached. It took
+    the modal layer, its four predicates and `modal_backdrop_gate` with it, and `workspace` kept a
+    single tuple entry plus the one `modal_backdrop_up` call the title-bar band also reads. Nothing
+    about the types had to move, because the layer needs only `Ui` — which is the test for whether a
+    piece is ready to leave.
     **The panel dividers light up on a *rest*, not on a pass** (`DelayedHover`, shared by
     `h_resize_handle` and `v_resize_handle`). The bar is an affordance — this edge drags — and the
     dividers run the full height and width of the workspace, so answering on `PointerEnter` lit one
@@ -4998,6 +5018,16 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Splitting `lib.rs` / `main.rs`:** grep the line range for interleaved unrelated `fn`s first; a
   helper still used by code that stays goes to `widgets.rs` (glob-imported), not the new leaf
   module; mark cross-called items `pub(crate)`; build + `cargo fmt` + smoke-launch each step.
+  **Cut where an invariant is, not where the line count is.** `modals.rs` is the worked example:
+  the modal layer was not the largest thing in `lib.rs`, it was the thing whose *tuple order was
+  policy* and whose gate could then sit beside what it guards. Two things make such a cut checkable
+  in a diff nobody can read line by line — and this is a move whose whole risk is that. First,
+  **strip comments and blank lines from both sides and diff the code**; a move that is right shows
+  only the new scaffolding (imports, the signature, the bindings) and the handful of edits you
+  meant. Second, **prove the moved tests still bite in their new home**: a source-scanning gate that
+  reads a file by name passes vacuously the moment the name is wrong, so break a term, watch it
+  fail, and put it back. Both were done for this cut, and the second is the one that would have
+  caught a gate left pointing at `lib.rs`.
 
 ## UI conventions
 
@@ -5246,7 +5276,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   Floem does not look for a nearest *positioned* ancestor the way CSS does: an
   `absolute().inset(0)` child fills whichever box its parent happens to be. Every modal backdrop in
   the app is written that way, so what they cover is decided entirely by the wrapper they are
-  mounted in — and `workspace` uses that to hold all of them in **one modal layer inset
+  mounted in — and `modals::modal_layer` uses that to hold all of them in **one modal layer inset
   `HEADER_H` from the top** (*all*: the membership test is "does this view paint
   `modal_backdrop()`", which is why the Find Anywhere palette is in there beside the DDL editors),
   which is what leaves the title bar free for
@@ -5268,10 +5298,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   bug the layer was written to fix — the backdrop over the title bar, the drag band never rising, and
   a window that cannot be moved, minimised or closed with nothing on screen saying why. Three of the
   layer's members are loose children with no group wrapper to remind anyone, so that is the shape the
-  next overlay will take. `lib::modal_backdrop_gate` asserts **which files** paint one, with
+  next overlay will take. `modals::modal_backdrop_gate` asserts **which files** paint one, with
   `window_chrome.rs` as the documented exception (`over_backdrop` paints the same scrim across the
   title bar while a modal is up and is mounted in the workspace root, after the layer and before the
-  overlay menus). It is deliberately weak in the way its three siblings are — files, not counts,
+  overlay menus). Only `theme.rs`/`themes.rs` are skipped, as the colour's own definition:
+  **`lib.rs` came off that skip-list when the layer moved out of it**, since it was there for prose
+  the scan already strips and it was blinding the gate to the file holding the root tuple — the one
+  place a stray modal would most plausibly be mounted as a *sibling* of the layer rather than inside
+  it. It is deliberately weak in the way its three siblings are — files, not counts,
   because a count fails on an innocent refactor and a gate that cries wolf gets deleted, while the
   failure worth catching is a backdrop appearing somewhere *new*, and a new place is nearly always a
   new file. A second test pins the other direction on the *returned closure* rather than the
