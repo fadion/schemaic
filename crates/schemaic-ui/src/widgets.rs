@@ -1760,6 +1760,38 @@ pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
         .box_shadow_color(theme::tooltip_shadow())
 }
 
+/// A tooltip that appears only while `tip` has something to say — and, unlike a
+/// plain `.tooltip()`, one whose answer can change while the app runs.
+///
+/// Both halves of that need explaining, because floem gives neither directly.
+///
+/// **Why not a build-time branch.** The two existing conditional tips (a
+/// truncated ERD header, a tab's path) decide *once*, at build, and an `AnyView`
+/// branch is right for them. This one's condition is the window width, which the
+/// user is dragging — so it has to be answered later than build. It is:
+/// `Tooltip::update` calls the tip closure at the moment the hover delay fires,
+/// so a signal read in here is read fresh on every hover, with no rebuild of the
+/// view underneath.
+///
+/// **Why `hide()` rather than an empty tip.** Floem's tooltip has no "not now" —
+/// once the delay fires it always adds the overlay. Returning an empty view is
+/// therefore *not* nothing: `TooltipClass` paints the panel chrome (background,
+/// border, padding, shadow) on whatever root it is handed, so an empty tip is a
+/// small empty box on screen. A `display: none` root is the one thing that chrome
+/// cannot override, and not by luck — floem hands **each** `.style()` closure a
+/// fresh `Style` and merges the results per property by push order, and
+/// [`tooltip_style`] sets no `display`. So the overlay is still created and is
+/// simply never laid out or painted.
+pub(crate) fn tip_when(
+    view: impl IntoView + 'static,
+    tip: impl Fn() -> Option<&'static str> + 'static,
+) -> impl IntoView {
+    view.tooltip(move || match tip() {
+        Some(t) => text(t).into_any(),
+        None => empty().style(|s| s.hide()).into_any(),
+    })
+}
+
 /// A toolbar / title-bar icon button with a **padded hitbox** (5px horiz / 3px
 /// vert). Hover (dim→bright) is driven from a signal via `PointerEnter`/`Leave`
 /// on the padded container, so the *whole* box — not just the 16px glyph —
@@ -4084,29 +4116,24 @@ pub(crate) fn loading_dots(
     )
 }
 
-// A status-bar panel toggle rendered as a 16px icon: `chip_active` when its
-// panel is open, `chip_idle` (brightening on hover) when closed.
-pub(crate) fn toggle_icon(
-    glyph: &'static str,
-    active: impl Fn() -> bool + 'static,
-    on_click: impl Fn() + 'static,
-) -> floem::views::Container {
-    toggle_icon_gated(glyph, || true, active, on_click)
-}
-
-/// [`toggle_icon`] whose panel isn't always available — dimmed to 30% and inert
-/// while `enabled` is false, the same disabled face [`toolbar_icon`] wears.
+/// A status-bar panel toggle rendered as a 16px icon: `chip_active` when its
+/// panel is open, `chip_idle` (brightening on hover) when closed — and dimmed to
+/// 30% and inert while `enabled` is false, the same disabled face
+/// [`toolbar_icon`] wears.
 ///
-/// For the Server Activity toggle on a SQLite connection: the panel behind it has
-/// nothing to show for that engine, and a toggle that opens an explanation is a
-/// worse answer than one that visibly isn't offered.
-pub(crate) fn toggle_icon_gated(
+/// **`enabled` used to be optional and no longer is**, because every panel
+/// toggle in the footer turned out to need it: below its breakpoint a panel is
+/// force-hidden and its toggle can do nothing, so the ungated shims that passed
+/// `|| true` were only ever hiding that. Pair this with [`tip_when`] when the
+/// disabled state is one the user can act on — `panel_toggle` in the crate root
+/// answers both from one call so the face and the explanation cannot disagree.
+pub(crate) fn toggle_icon(
     glyph: &'static str,
     enabled: impl Fn() -> bool + Copy + 'static,
     active: impl Fn() -> bool + 'static,
     on_click: impl Fn() + 'static,
 ) -> floem::views::Container {
-    toggle_icon_view_gated(
+    toggle_icon_view(
         icons::icon(glyph, 16.0).style(|s| s.flex_shrink(0.0_f32)),
         enabled,
         active,
@@ -4114,18 +4141,9 @@ pub(crate) fn toggle_icon_gated(
     )
 }
 
-/// Like [`toggle_icon`] but takes a pre-built icon view — for non-square glyphs
+/// [`toggle_icon`]'s body, taking a pre-built icon view — for non-square glyphs
 /// (e.g. the footer AI wordmark) that can't go through `icons::icon`'s square size.
 pub(crate) fn toggle_icon_view(
-    icon: impl IntoView + 'static,
-    active: impl Fn() -> bool + 'static,
-    on_click: impl Fn() + 'static,
-) -> floem::views::Container {
-    toggle_icon_view_gated(icon, || true, active, on_click)
-}
-
-/// The body of both — see [`toggle_icon_gated`] for what `enabled` is for.
-pub(crate) fn toggle_icon_view_gated(
     icon: impl IntoView + 'static,
     enabled: impl Fn() -> bool + Copy + 'static,
     active: impl Fn() -> bool + 'static,

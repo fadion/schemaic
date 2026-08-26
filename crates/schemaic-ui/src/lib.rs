@@ -4037,6 +4037,58 @@ pub(crate) fn right_panel_allowed() -> bool {
     right_panel_fits(window_size().get().0)
 }
 
+/// The one sentence a panel toggle says when the window has taken its panel away.
+///
+/// Worded as the way *out*, not as a diagnosis: the state is transient and the
+/// user fixes it by dragging an edge, so the tip names that rather than the
+/// breakpoint arithmetic behind it.
+pub(crate) const PANEL_NARROW_TIP: &str = "The window is too narrow for this panel — widen it to \
+                                           bring the panel back.";
+
+/// How a footer panel toggle should look and behave right now.
+///
+/// **Both halves from one call, because they are the same fact.** A toggle is
+/// inert exactly when its panel cannot be shown, and the tooltip exists to say
+/// why — so asking two predicates is asking one question twice, and the two ways
+/// they drift are both bad: a dimmed toggle that explains nothing, and a live
+/// toggle claiming the window is too narrow. Computed together, neither is
+/// reachable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PanelToggle {
+    /// Does the click do anything — and is the glyph drawn at full strength?
+    pub enabled: bool,
+    /// Why not, when there is something worth saying. `None` for every enabled
+    /// state *and* for the permanently-unavailable one, which is a separate
+    /// decision — see below.
+    pub tip: Option<&'static str>,
+}
+
+/// `fits` — is the window wide enough for this panel's column?
+/// `offered` — does the panel have anything behind it at all (Server Activity on
+/// an engine with no sessions is the only `false` today).
+///
+/// **Only the narrow case gets a tip, and that asymmetry is deliberate.** A
+/// window too narrow is transient and the user is one drag from fixing it, so the
+/// sentence is worth showing. An engine with no server sessions is permanent, and
+/// `toggle_icon`'s own doc already took that call: *"a toggle that opens an
+/// explanation is a worse answer than one that visibly isn't offered."* This
+/// function does not reopen it — it only makes sure the two disabled states can't
+/// be confused, since a narrow window silences nothing.
+///
+/// Narrow wins when both apply: it is the half the user can act on.
+pub(crate) fn panel_toggle(fits: bool, offered: bool) -> PanelToggle {
+    if !fits {
+        return PanelToggle {
+            enabled: false,
+            tip: Some(PANEL_NARROW_TIP),
+        };
+    }
+    PanelToggle {
+        enabled: offered,
+        tip: None,
+    }
+}
+
 pub use widgets::may_launch_destructive;
 
 /// [`right_panel_allowed`] for the app crate.
@@ -6914,18 +6966,31 @@ fn footer(ui: Ui) -> impl IntoView {
     // opening the panel that lives on the left. Right edge: AI / History / Terminal
     // toggles, likewise under their right-column panels.
     // Active state reflects *effective* visibility (intent AND the window is wide
-    // enough), so a panel locked away by a narrow window reads as inactive; its
-    // toggle is a no-op until the window grows back.
-    let schema_icon = toggle_icon(
-        icons::FOLDER_TREE,
-        move || schema_visible.get() && schema_panel_allowed(),
-        move || {
-            if schema_panel_allowed() {
-                schema_visible.update(|v| *v = !*v);
-            }
-        },
-    )
-    .style(|s| s.margin_left(theme::scaled(5.0)));
+    // enough), so a panel locked away by a narrow window reads as inactive.
+    //
+    // **And it now looks inert, because it is.** Below its breakpoint a panel is
+    // force-hidden and its toggle could do nothing — but it went on reading as a
+    // live control, so a click that changed a signal nothing renders was
+    // indistinguishable from a broken button. `panel_toggle` answers the disabled
+    // face and the tooltip from one call, and `tip_when` shows that tooltip only
+    // while there is something to say. Each toggle reads the predicate for the
+    // panel *it* opens — the schema tree has a narrower breakpoint than the right
+    // column, so the two disable at different widths.
+    let schema_toggle = move || panel_toggle(schema_panel_allowed(), true);
+    let schema_icon = tip_when(
+        toggle_icon(
+            icons::FOLDER_TREE,
+            move || schema_toggle().enabled,
+            move || schema_visible.get() && schema_panel_allowed(),
+            move || {
+                if schema_panel_allowed() {
+                    schema_visible.update(|v| *v = !*v);
+                }
+            },
+        )
+        .style(|s| s.margin_left(theme::scaled(5.0))),
+        move || schema_toggle().tip,
+    );
     // Does the *active connection's* engine have server sessions to show? The
     // Activity panel is a property of the connection, not of the focused tab, so
     // this reads `active_conn` rather than the tab's dialect the way `read_only`
@@ -6943,37 +7008,66 @@ fn footer(ui: Ui) -> impl IntoView {
     // collapses against — it's the leftmost thing in the right-pinned group, so it
     // marches left as the window narrows.
     let ai_x = RwSignal::new(0.0_f64);
-    let right_group = h_stack((
-        toggle_icon_view(
-            icons::icon_wh(icons::AI_LOGO, 16.0, 10.0).style(|s| s.flex_shrink(0.0_f32)),
-            move || right_panel.get() == RightPanel::Ai && right_panel_allowed(),
-            move || set_right(RightPanel::Ai),
+    // The three plain right-column toggles share one answer: the only thing that
+    // can take their panel away is the window.
+    let right_toggle = move || panel_toggle(right_panel_allowed(), true);
+    // Server Activity has a second reason to be inert, and `panel_toggle` is what
+    // keeps the two from being confused: the engine gate stops the panel being
+    // *opened* where it has nothing to show — never its being closed, since a
+    // panel left open by a connection switch (or restored from the last session)
+    // has to stay dismissable from its own icon, the one place anyone looks. A
+    // narrow window overrides both, because that is the reason the user can act on.
+    let activity_toggle = move || {
+        panel_toggle(
+            right_panel_allowed(),
+            activity_ok.get() || right_panel.get() == RightPanel::Activity,
         )
-        .on_move(move |p| ai_x.set(p.x)),
-        toggle_icon(
-            icons::TIMELINE,
-            move || right_panel.get() == RightPanel::History && right_panel_allowed(),
-            move || set_right(RightPanel::History),
+    };
+    let right_group = h_stack((
+        tip_when(
+            toggle_icon_view(
+                icons::icon_wh(icons::AI_LOGO, 16.0, 10.0).style(|s| s.flex_shrink(0.0_f32)),
+                move || right_toggle().enabled,
+                move || right_panel.get() == RightPanel::Ai && right_panel_allowed(),
+                move || set_right(RightPanel::Ai),
+            )
+            // Before the tooltip wrapper, so the x published here stays the
+            // icon's own — `.tooltip()` allocates a fresh `ViewId` around it.
+            .on_move(move |p| ai_x.set(p.x)),
+            move || right_toggle().tip,
+        ),
+        tip_when(
+            toggle_icon(
+                icons::TIMELINE,
+                move || right_toggle().enabled,
+                move || right_panel.get() == RightPanel::History && right_panel_allowed(),
+                move || set_right(RightPanel::History),
+            ),
+            move || right_toggle().tip,
         ),
         // Server Activity. Inert on a connection whose engine has no sessions —
         // the toggle is the panel's front door, and a SQLite connection has
-        // nothing behind it (`activity::supports_activity`).
-        toggle_icon_gated(
-            icons::ACTIVITY_SQUARE,
-            // The gate stops the panel being *opened* on an engine with no
-            // sessions — never its being closed. A panel left open by a
-            // connection switch (or restored from the last session) has to stay
-            // dismissable from its own icon, which is the one place anyone looks.
-            move || activity_ok.get() || right_panel.get() == RightPanel::Activity,
-            move || right_panel.get() == RightPanel::Activity && right_panel_allowed(),
-            move || set_right(RightPanel::Activity),
+        // nothing behind it (`activity::supports_activity`). That case stays
+        // silent on purpose; see `panel_toggle`.
+        tip_when(
+            toggle_icon(
+                icons::ACTIVITY_SQUARE,
+                move || activity_toggle().enabled,
+                move || right_panel.get() == RightPanel::Activity && right_panel_allowed(),
+                move || set_right(RightPanel::Activity),
+            ),
+            move || activity_toggle().tip,
         ),
-        toggle_icon(
-            icons::TERMINAL,
-            move || right_panel.get() == RightPanel::Terminal && right_panel_allowed(),
-            move || set_right(RightPanel::Terminal),
-        )
-        .style(|s| s.margin_right(theme::scaled(5.0))),
+        tip_when(
+            toggle_icon(
+                icons::TERMINAL,
+                move || right_toggle().enabled,
+                move || right_panel.get() == RightPanel::Terminal && right_panel_allowed(),
+                move || set_right(RightPanel::Terminal),
+            )
+            .style(|s| s.margin_right(theme::scaled(5.0))),
+            move || right_toggle().tip,
+        ),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(10.0)));
 
@@ -7641,6 +7735,60 @@ mod field_key_tests {
             NamedKey::Tab,
         ] {
             assert!(!is_modifier_key(&Key::Named(k)), "{k:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod panel_toggle_tests {
+    use super::{PANEL_NARROW_TIP, panel_toggle};
+
+    #[test]
+    fn a_panel_that_fits_and_is_offered_is_live_and_silent() {
+        let t = panel_toggle(true, true);
+        assert!(t.enabled);
+        assert_eq!(t.tip, None, "nothing to explain about a working button");
+    }
+
+    #[test]
+    fn a_window_too_narrow_disables_the_toggle_and_says_why() {
+        let t = panel_toggle(false, true);
+        assert!(!t.enabled);
+        assert_eq!(t.tip, Some(PANEL_NARROW_TIP));
+    }
+
+    /// The pre-existing decision, kept: Server Activity on an engine with no
+    /// sessions is dim and says nothing, because the state is permanent and a
+    /// toggle that opens an explanation is worse than one visibly not offered.
+    #[test]
+    fn a_panel_the_engine_does_not_offer_is_disabled_but_silent() {
+        let t = panel_toggle(true, false);
+        assert!(!t.enabled);
+        assert_eq!(t.tip, None);
+    }
+
+    /// Both reasons at once — the actionable one is the one shown, because
+    /// widening the window is a thing the user can do and changing engines is not.
+    #[test]
+    fn narrow_speaks_even_when_the_panel_is_also_unoffered() {
+        let t = panel_toggle(false, false);
+        assert!(!t.enabled);
+        assert_eq!(t.tip, Some(PANEL_NARROW_TIP));
+    }
+
+    /// **The invariant the single call exists to hold**, over every input: a tip
+    /// never accompanies a live toggle. That is the drift worth pinning — a
+    /// button that works while insisting the window is too narrow for it.
+    #[test]
+    fn a_tip_never_appears_on_an_enabled_toggle() {
+        for fits in [true, false] {
+            for offered in [true, false] {
+                let t = panel_toggle(fits, offered);
+                assert!(
+                    !(t.enabled && t.tip.is_some()),
+                    "fits={fits} offered={offered} produced {t:?}"
+                );
+            }
         }
     }
 }

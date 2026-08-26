@@ -2737,9 +2737,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     to be compact says so with this metric and never with a literal.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
-    `section_title`/`centered_msg`/`toggle_icon` (and `toggle_icon_gated`, whose panel may not be
-    available at all — the Activity toggle on a SQLite connection, dimmed and inert rather than
-    opening an explanation), `measure_text_px`, `jump_to_bottom_button`. Also `MenuId`/`MenuFlags` —
+    `section_title`/`centered_msg`/`toggle_icon` (whose `enabled` is **not optional**: every panel
+    toggle in the footer needs it, so the ungated shims that passed `|| true` were only hiding the
+    fact — see *The footer's panel toggles* below), `tip_when`, `measure_text_px`,
+    `jump_to_bottom_button`. Also `MenuId`/`MenuFlags` —
     the single list of the app's mutually-exclusive dropdowns, which every trigger closes the others
     through (*Popup menus*), and `row_menu_mark`/`row_menu_mark_pad`/`clear_row_mark_on_close` — the
     rule a row wears while its own context menu is open, which lives here rather than in either list
@@ -5058,6 +5059,36 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **No pointer cursor on buttons/icons** — native apps keep the arrow cursor; a pointer feels
   web-like. Use the default; reserve `CursorStyle::Text` for text inputs (a genuine hyperlink may
   keep `Pointer`).
+- **The footer's panel toggles: a control that can't act must not look like one, and when the user
+  can fix that, say so.** Below their breakpoints the side panels are *force-hidden* — the schema
+  tree at `panels_min_schema_w`, the right column at the wider `panels_min_full_w` — and the window
+  narrowing past one is something the user does by dragging an edge, not a rare state. Every guard
+  for it was already in place (`schema_panel_allowed`/`right_panel_allowed`, read by `body`, the
+  dividers and each toggle's `active`), so the toggles were *correct* and silently did nothing: five
+  status-bar icons at full brightness whose clicks changed a signal nothing renders, which reads as
+  a broken button rather than as a consequence of the window size. They now wear
+  `toggle_icon`'s disabled face and carry a tooltip saying to widen the window.
+  **`panel_toggle(fits, offered)` answers the face and the tooltip in one call**, and that is the
+  point of it rather than a convenience: they are the same fact, so two predicates could disagree in
+  two bad ways — a dimmed toggle explaining nothing, and a live toggle insisting the window is too
+  narrow for it. Unit-tested over every input, including the invariant that a tip never accompanies
+  an enabled toggle. **Only the narrow case gets a tip**, deliberately: it is transient and
+  actionable, while Server Activity on an engine with no sessions is permanent and keeps
+  `toggle_icon`'s original ruling that *a toggle which opens an explanation is a worse answer than
+  one that visibly isn't offered*. When both apply the narrow one speaks, being the half the user
+  can act on. The same silent no-op still exists on **Find-Anywhere's panel commands**
+  (`overlays.rs`), which is a different affordance — a palette list has no dim-and-explain idiom —
+  and is left as an open question rather than answered by analogy.
+- **A tooltip that appears only sometimes needs `widgets::tip_when`, not a branch.** Floem's
+  `.tooltip()` has no "not now": once the hover delay fires it always adds the overlay, and an empty
+  tip is a small empty box because `TooltipClass` paints its chrome on whatever root it is handed.
+  The two older conditional tips (a truncated ERD header, a tab's path) decide **once, at build**,
+  and an `AnyView` branch is right for them. A condition that changes while the app runs — a window
+  width — cannot use that shape, and does not need to: floem calls the tip closure at the moment the
+  delay fires, so a signal read there is read fresh on every hover with no rebuild underneath. What
+  it returns when there is nothing to say is a `display: none` root, which the chrome cannot
+  override — floem hands each `.style()` closure a fresh `Style` and merges results per property by
+  push order, and `tooltip_style` sets no `display`.
 - **Labels aren't selectable** — Floem's `Selectable` defaults to *true*, so every caption/header/tree
   row would drag-highlight like a web page. The workspace root sets `.class(LabelClass, |s|
   s.selectable(false))`, which cascades to the whole tree (and, via the captured context style, into
