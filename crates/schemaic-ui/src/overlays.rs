@@ -3355,6 +3355,64 @@ fn hint_item(primary: &str, secondary: &str, keys: Option<&'static str>) -> Pale
     }
 }
 
+/// What the palette needs to offer snippets: the library, the connection its
+/// scopes are judged against, and what activating one does.
+///
+/// One bundle because they are only meaningful together — the library filtered
+/// against a different connection's dialect would silently offer the wrong
+/// snippets.
+#[derive(Clone)]
+struct SnippetSearch {
+    items: RwSignal<Vec<schemaic_core::snippet::Snippet>>,
+    dialect: schemaic_core::intel::SqlDialect,
+    conn_id: u64,
+    insert: Rc<dyn Fn(schemaic_core::snippet::Snippet)>,
+}
+
+/// Snippet rows for the palette — the **fourth** category, after names, objects
+/// and columns, and deliberately last: the palette is a way to reach the
+/// database, and a saved query is a thing you wrote about it.
+///
+/// Activating one inserts it at the caret, exactly as clicking its library row
+/// does. **It is not recorded in the search history**, and that is the reason
+/// snippets can be here at all: a `SearchEntry` resolves against the live
+/// catalogue, and a snippet is not a catalogue object — recording one would mean
+/// teaching the persisted `ObjectTag` about a thing no schema can confirm.
+fn snippet_items(search: &SnippetSearch, q: &str, close: &Rc<dyn Fn()>) -> Vec<PaletteItem> {
+    use schemaic_core::snippet;
+    search.items.with_untracked(|all| {
+        all.iter()
+            .filter(|s| snippet::applies(s, search.dialect, search.conn_id))
+            .filter(|s| snippet::matches_query(s, q))
+            .map(|s| {
+                let snip = s.clone();
+                let insert = search.insert.clone();
+                let close = close.clone();
+                PaletteItem {
+                    primary: s.name.clone(),
+                    // Says what the row *is*, since a snippet's name looks like
+                    // nothing else in the list and would otherwise read as a
+                    // table nobody can find.
+                    secondary: match &s.abbrev {
+                        Some(a) if !a.is_empty() => format!("snippet · {a}"),
+                        _ => "snippet".to_string(),
+                    },
+                    enabled: true,
+                    activate: Rc::new(move || {
+                        (insert)(snip.clone());
+                        (close)();
+                    }),
+                    complete: Some(s.name.clone()),
+                    match_term: Some(q.to_string()),
+                    icon: None,
+                    right_icon: None,
+                    keys: None,
+                }
+            })
+            .collect()
+    })
+}
+
 /// Turn a parsed query into the list of rows to show. `caret_end` is pulsed by a
 /// command→argument transition so the caret jumps to the end of the inserted text.
 #[allow(clippy::too_many_arguments)]
@@ -3371,6 +3429,7 @@ fn build_items(
     close: &Rc<dyn Fn()>,
     query: RwSignal<String>,
     caret_end: RwSignal<u64>,
+    snippets: &SnippetSearch,
 ) -> Vec<PaletteItem> {
     use schemaic_core::palette::Parsed;
     match parsed {
@@ -3454,6 +3513,7 @@ fn build_items(
                         close.clone(),
                     ),
                 })
+                .chain(snippet_items(snippets, &q, close))
                 .collect()
         }
         // Command mode, still choosing: filter the command list. Instant commands
@@ -3656,6 +3716,22 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     let active_conn = ui.conn.active_conn;
     let search_history = ui.overlay.search_history;
     let ui_reg = ui.clone(); // for building the command registry per open
+    // Snippets are the palette's fourth category. The dialect comes from the
+    // active connection, like the library panel's, so the scopes are judged
+    // against the connection whose objects the rest of the list is about.
+    let snippet_items_sig = ui.snippets.items;
+    let insert_snippet = ui.snippet_actions.insert.clone();
+    let connections_for_dialect = ui.conn.connections;
+    let snippet_dialect = floem::reactive::create_memo(move |_| {
+        let cid = active_conn.get();
+        connections_for_dialect
+            .with(|cs| {
+                cs.iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| schemaic_core::intel::SqlDialect::from_db_type(&c.db_type))
+            })
+            .unwrap_or_default()
+    });
     // Activating a type / domain / sequence opens the object editor — the same
     // action its schema-tree row takes. Built here rather than on an actions
     // bundle because the editor lives in this crate; the palette needs no help
@@ -3675,6 +3751,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             }
             let open_table = open_table.clone();
             let ui_reg = ui_reg.clone();
+            let insert_snippet = insert_snippet.clone();
             // Custom box (not `text_input`) so we control Escape → close. Closing
             // also clears the query, so reopening Find starts blank and a stale
             // result list never flashes.
@@ -3733,6 +3810,12 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         &close,
                         query,
                         caret_end,
+                        &SnippetSearch {
+                            items: snippet_items_sig,
+                            dialect: snippet_dialect.get_untracked(),
+                            conn_id: active_conn.get_untracked(),
+                            insert: insert_snippet.clone(),
+                        },
                     ));
                     // Reset the cursor to the top for a new *query* only — a schema
                     // landing now re-runs this too, and it must not yank the
