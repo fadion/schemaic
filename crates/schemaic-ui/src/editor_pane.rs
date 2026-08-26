@@ -1099,6 +1099,9 @@ pub(crate) struct QueryPaneParams {
     /// See [`Tab::format_req`](crate::Tab::format_req) for why it comes through
     /// the pane instead of being written straight into `query`.
     pub format_req: RwSignal<bool>,
+    /// When set, insert this text at the caret and clear it — the snippet
+    /// library. See [`Tab::insert_req`](crate::Tab::insert_req).
+    pub insert_req: RwSignal<Option<String>>,
     /// Where this pane publishes its (debounced) offline diagnostics. Lives on
     /// the tab so the status bar reads the analysis rather than repeating it —
     /// see [`Tab::diagnostics`](crate::Tab::diagnostics).
@@ -1179,6 +1182,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         goto_open,
         jump_offset,
         format_req,
+        insert_req,
         syntax,
         results,
         run,
@@ -2089,6 +2093,46 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         format_editor(&ed_fmt_req, comp, dialect.get_untracked());
         format_req.set(false);
     });
+
+    // Insert text at the caret on request (the snippet library), then clear —
+    // the same shape again. It goes through `edit_untyped` rather than `query`
+    // for the reason `format_req` does: the mounted editor owns the document,
+    // and a caller that rewrites the signal is writing behind it.
+    {
+        let ed_ins = ed_fmt.clone();
+        create_effect(move |_| {
+            let Some(body) = insert_req.get() else {
+                return;
+            };
+            insert_req.set(None);
+            if body.is_empty() {
+                return;
+            }
+            // Over the selection when there is one — inserting a snippet with
+            // text selected means "replace this with it", as typing would.
+            let (a, b) = ed_ins
+                .cursor
+                .get_untracked()
+                .get_selection()
+                .unwrap_or_else(|| {
+                    let off = ed_ins.cursor.get_untracked().offset();
+                    (off, off)
+                });
+            let (lo, hi) = (a.min(b), a.max(b));
+            edit_untyped(
+                &ed_ins,
+                comp,
+                Selection::region(lo, hi),
+                &body,
+                EditType::Other,
+            );
+            // Caret after the inserted text, so typing continues where the
+            // snippet left off rather than in front of it.
+            ed_ins
+                .cursor
+                .update(|cc| cc.set_offset(lo + body.len(), false, false));
+        });
+    }
 
     // Builds the right-click menu entries (Ask AI… / Explain / Optimize) for the
     // app-wide `popup_menu` overlay. Rebuilt per right-click; each action reads

@@ -150,9 +150,9 @@ use schemaic_ui::{
     ActivityActions, ActivityState, ActivityUi, AiActions, AiEffort, AiModel, AiUi, ChatMessage,
     Confirm, ConnActions, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals, HistoryActions,
     HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry, OverlayUi, PendingRun,
-    PlanState, ResultPanel, RightPanel, Role, RunGuard, SchemaActions, SchemaScope, SchemaUi, Tab,
-    TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, TxChoice, TxPrompt, Ui,
-    pick_connection_color,
+    PlanState, ResultPanel, RightPanel, Role, RunGuard, SchemaActions, SchemaScope, SchemaUi,
+    SnippetActions, SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi,
+    TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -1593,6 +1593,175 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     entries: history_entries.get_untracked(),
                 },
             );
+        })
+    };
+
+    // ── The snippet library ─────────────────────────────────────────────────
+    //
+    // One persisted list across every connection; which of them a connection may
+    // see is `snippet::grouped`'s decision, in the core with tests. Saving,
+    // renaming, duplicating and deleting all write the whole file, as every
+    // other small store here does.
+    let snippets = RwSignal::new(
+        persist::load_json::<schemaic_core::snippet::SnippetsFile>("snippets.json").snippets,
+    );
+    let save_snippets: Rc<dyn Fn()> = Rc::new(move || {
+        persist::save_json(
+            "snippets.json",
+            &schemaic_core::snippet::SnippetsFile {
+                snippets: snippets.get_untracked(),
+            },
+        );
+    });
+    // The active tab, for the actions that read or write one.
+    let active_tab = move || {
+        let id = active.get_untracked();
+        tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+    };
+    // The dialect of the **active connection** — what a newly saved snippet is
+    // scoped to. The panel groups by the same one.
+    let conn_dialect = move || {
+        let cid = active_conn.get_untracked();
+        connections
+            .with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| SqlDialect::from_db_type(&c.db_type))
+            })
+            .unwrap_or_default()
+    };
+    // What the editor would contribute to a snippet: the selection if there is
+    // one, else the whole buffer. The same rule Format follows, and the same
+    // `selected_text` that degrades to `None` when the mirrored range has
+    // drifted a keystroke out of step with the text.
+    // A selection that is only whitespace falls back to the whole buffer rather
+    // than saving nothing: otherwise `can_save` (which asks whether the *tab*
+    // has text) and this (which asks what to save) disagree, and the `+` is
+    // enabled for a click that does nothing.
+    let editor_snippet_text = move || {
+        let tab = active_tab()?;
+        let sql = tab.query.get_untracked();
+        let selected = tab
+            .selection
+            .get_untracked()
+            .and_then(|range| schemaic_core::text_ops::selected_text(&sql, Some(range)))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let picked = selected.unwrap_or_else(|| sql.trim().to_string());
+        (!picked.is_empty()).then_some(picked)
+    };
+    // Wall-clock millis, for "last used". The same reading `record_history`
+    // takes, and the same reason: it is when the user did the thing.
+    let snippet_now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
+    let insert_snippet: Rc<dyn Fn(schemaic_core::snippet::Snippet)> = {
+        let save_snippets = save_snippets.clone();
+        Rc::new(move |snip: schemaic_core::snippet::Snippet| {
+            let Some(tab) = active_tab() else {
+                return;
+            };
+            // Through the tab's request signal, not `query`: the mounted editor
+            // owns the document, and writing the signal behind it loses the
+            // insertion's undo step. See `Tab::insert_req`.
+            tab.insert_req.set(Some(snip.body.clone()));
+            snippets.update(|v| schemaic_core::snippet::touch(v, snip.id, snippet_now()));
+            (save_snippets)();
+        })
+    };
+    let save_snippet_current: Rc<dyn Fn() -> Option<u64>> = {
+        let save_snippets = save_snippets.clone();
+        Rc::new(move || {
+            let body = editor_snippet_text()?;
+            let id = snippets.with_untracked(|v| schemaic_core::snippet::next_id(v));
+            let name = active_tab().map_or_else(|| "Snippet".to_string(), |t| t.title());
+            snippets.update(|v| {
+                v.push(schemaic_core::snippet::Snippet {
+                    id,
+                    name,
+                    abbrev: None,
+                    body,
+                    // Scoped to the engine, not this connection: that is the
+                    // difference between a library and a log, and the row menu
+                    // is where a narrower scope will be chosen.
+                    scope: schemaic_core::snippet::Scope::Dialect(conn_dialect()),
+                    source: schemaic_core::snippet::Source::User,
+                    last_used: None,
+                })
+            });
+            (save_snippets)();
+            Some(id)
+        })
+    };
+    // Tracked, so the `+` un-dims as soon as the tab has text. It asks the same
+    // question `editor_snippet_text` answers — is there anything to save — one
+    // reactively and one at the moment of the click.
+    let can_save_snippet = create_memo(move |_| {
+        let id = active.get();
+        tabs.with(|v| {
+            v.iter()
+                .find(|t| t.id == id)
+                .is_some_and(|t| !t.query.get().trim().is_empty())
+        })
+    });
+    let rename_snippet: Rc<dyn Fn(u64, String)> = {
+        let save_snippets = save_snippets.clone();
+        Rc::new(move |id: u64, name: String| {
+            snippets.update(|v| {
+                if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                    s.name = name.clone();
+                }
+            });
+            (save_snippets)();
+        })
+    };
+    let duplicate_snippet: Rc<dyn Fn(u64)> = {
+        let save_snippets = save_snippets.clone();
+        Rc::new(move |id: u64| {
+            let Some(src) = snippets.with_untracked(|v| v.iter().find(|s| s.id == id).cloned())
+            else {
+                return;
+            };
+            let new_id = snippets.with_untracked(|v| schemaic_core::snippet::next_id(v));
+            snippets.update(|v| {
+                v.push(schemaic_core::snippet::Snippet {
+                    id: new_id,
+                    name: format!("{} copy", src.name),
+                    // The copy is a user snippet even when the original is
+                    // shipped — that is what Duplicate is *for*, on a built-in
+                    // that can't be edited in place.
+                    source: schemaic_core::snippet::Source::User,
+                    last_used: None,
+                    // An abbrev is a trigger, and two snippets answering to one
+                    // spelling is a coin toss; the copy starts without it.
+                    abbrev: None,
+                    ..src
+                })
+            });
+            (save_snippets)();
+        })
+    };
+    let remove_snippet: Rc<dyn Fn(u64)> = {
+        let save_snippets = save_snippets.clone();
+        Rc::new(move |id: u64| {
+            let Some(snip) = snippets.with_untracked(|v| v.iter().find(|s| s.id == id).cloned())
+            else {
+                return;
+            };
+            let save_snippets = save_snippets.clone();
+            confirm.set(Some(Confirm {
+                title: "Delete snippet".to_string(),
+                message: format!("Delete “{}”? This can't be undone.", snip.name),
+                resolve: Rc::new(move |yes| {
+                    if yes {
+                        snippets.update(|v| schemaic_core::snippet::remove(v, id));
+                        (save_snippets)();
+                    }
+                }),
+            }));
         })
     };
 
@@ -4833,6 +5002,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // `conn_id`/`database` and its originating tab name — all recorded on the
     // entry. The history panel is per-connection, so `conn_id` is the active
     // (valid) connection. Does NOT run the query.
+    // The snippet library's "Open in new tab" — down here rather than with the
+    // rest of the snippet actions because it needs `open_query`, which is
+    // defined above this line and below those.
+    let open_snippet_in_tab: Rc<dyn Fn(schemaic_core::snippet::Snippet)> = {
+        let open_query = open_query.clone();
+        let save_snippets = save_snippets.clone();
+        Rc::new(move |snip: schemaic_core::snippet::Snippet| {
+            // The tab the user is looking at decides the database, exactly as
+            // an AI code block does: a brand-new tab would otherwise land on
+            // whichever database a new tab starts on.
+            let db = active_tab().and_then(|t| t.database.get_untracked());
+            (open_query)(snip.body.clone(), db);
+            snippets.update(|v| schemaic_core::snippet::touch(v, snip.id, snippet_now()));
+            (save_snippets)();
+        })
+    };
+
     let open_history: Rc<dyn Fn(schemaic_core::history::HistoryEntry)> = {
         let next_id = next_id.clone();
         let place_tab = place_tab.clone();
@@ -8252,6 +8438,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         history_actions: Rc::new(HistoryActions {
             clear: clear_history,
             open: open_history,
+        }),
+        snippets: SnippetsUi {
+            items: snippets,
+            can_save: can_save_snippet,
+        },
+        snippet_actions: Rc::new(SnippetActions {
+            insert: insert_snippet,
+            open_in_tab: open_snippet_in_tab,
+            save_current: save_snippet_current,
+            rename: rename_snippet,
+            duplicate: duplicate_snippet,
+            remove: remove_snippet,
         }),
         activity: ActivityUi {
             state: activity_state,

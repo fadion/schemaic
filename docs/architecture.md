@@ -2993,6 +2993,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     workspace shell, and the per-tab `dyn_container`s are its siblings rather than its parents, so
     these signals live as long as the app does.
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
+  - `snippet_panel.rs` — the **Snippet Library** right-column panel (`RightPanel::Snippets`, the
+    toolbar's bookmark toggle): the saved queries that apply to the active connection, under the
+    scope bands `core::snippet::grouped` returns, over the History panel's chrome. It decides
+    nothing — which snippets apply, how they group and sort, and what the filter matches are all
+    `core::snippet`'s answers, under test. Its **dialect comes from the active connection**, not
+    the active tab: a tab keeps the connection it was opened on, while the library sits under the
+    connection selected above it. **A row click inserts the body at the caret** (`Tab::insert_req`),
+    where a history row opens a new tab — a record of a past run wants its own tab, a snippet is
+    something you compose *with*; "Open in new tab" is on the row's menu for when it isn't. The
+    parameter chips under a body are read live from `params::names`, never stored, so they cannot
+    disagree with the body above them. Renaming is inline (an `edit_field` in place of the name),
+    matching the tab rename, because there is no text-prompt modal in this codebase and a saved
+    query's name is the same kind of act.
   - `activity_panel.rs` — the **Server Activity** right-column panel (`RightPanel::Activity`, the
     footer's pulse-line toggle): the sessions on the active *connection's* server, a counts line, a
     lock-wait banner and a search box, over the same chrome as the History panel. It paints

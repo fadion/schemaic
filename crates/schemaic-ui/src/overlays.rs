@@ -2854,6 +2854,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                     let target = match other {
                                         "terminal" => RightPanel::Terminal,
                                         "history" => RightPanel::History,
+                                        "snippets" => RightPanel::Snippets,
                                         "activity" => RightPanel::Activity,
                                         _ => RightPanel::Ai,
                                     };

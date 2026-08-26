@@ -43,6 +43,7 @@ pub enum RightPanelState {
     Ai,
     Terminal,
     History,
+    Snippets,
     Activity,
 }
 
@@ -71,6 +72,7 @@ enum RightPanelRaw {
     Ai,
     Terminal,
     History,
+    Snippets,
     Activity,
     #[serde(other)]
     Unknown,
@@ -83,6 +85,7 @@ impl From<RightPanelRaw> for RightPanelState {
             RightPanelRaw::Ai => RightPanelState::Ai,
             RightPanelRaw::Terminal => RightPanelState::Terminal,
             RightPanelRaw::History => RightPanelState::History,
+            RightPanelRaw::Snippets => RightPanelState::Snippets,
             RightPanelRaw::Activity => RightPanelState::Activity,
             RightPanelRaw::Unknown => RightPanelState::default(),
         }
@@ -1232,6 +1235,7 @@ mod tests {
             RightPanelState::Ai,
             RightPanelState::Terminal,
             RightPanelState::History,
+            RightPanelState::Snippets,
             RightPanelState::Activity,
         ] {
             let json = serde_json::to_string(&p).expect("serializes");

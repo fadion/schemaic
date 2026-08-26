@@ -41,6 +41,7 @@ mod schema_tree;
 pub use schema_tree::{column_key_named, db_key, table_key_named, table_key_prefix};
 mod settings;
 mod shortcuts;
+mod snippet_panel;
 pub mod sql_highlight;
 mod table_designer;
 mod tabs;
@@ -986,6 +987,14 @@ pub struct Tab {
     /// degrades to `None` when the mirror has drifted a keystroke out of step
     /// with `query`.
     pub selection: RwSignal<Option<(usize, usize)>>,
+    /// Text the editor should insert at the caret, then clear — the same
+    /// request-and-clear shape as [`Tab::jump_offset`] and [`Tab::format_req`],
+    /// and for the same reason: the pane owns the `Editor`, so a caller that
+    /// rewrote `query` directly would fight the editor's own document and lose
+    /// the undo history with it.
+    ///
+    /// Set by the snippet library (inserting a body) and cleared by the pane.
+    pub insert_req: RwSignal<Option<String>>,
     /// What this tab's `:name` query parameters are set to — the parameters
     /// bar's store, and what `TabsActions::run` substitutes with.
     ///
@@ -1141,6 +1150,7 @@ impl Tab {
             edit_buf: cx.create_rw_signal(String::new()),
             cursor_offset: cx.create_rw_signal(0),
             selection: cx.create_rw_signal(None),
+            insert_req: cx.create_rw_signal(None),
             params: cx.create_rw_signal(Vec::new()),
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
@@ -2350,6 +2360,40 @@ pub struct HistoryUi {
     pub entries: RwSignal<Vec<HistoryEntry>>,
 }
 
+/// The snippet library's state (Copy bundle).
+#[derive(Clone, Copy)]
+pub struct SnippetsUi {
+    /// Every saved snippet, across every scope — the panel narrows them to the
+    /// active connection itself (`snippet::grouped`), because which ones apply
+    /// is a decision, and it lives in the core with tests.
+    pub items: RwSignal<Vec<schemaic_core::snippet::Snippet>>,
+    /// Whether [`SnippetActions::save_current`] would save anything — the `+` is
+    /// dimmed rather than offering a click that does nothing. A memo, not a
+    /// predicate closure: it has to re-run as the editor's text changes, and the
+    /// toolbar icon takes a `Copy` reader.
+    pub can_save: Memo<bool>,
+}
+
+/// Snippet-library callbacks (owned by the app).
+pub struct SnippetActions {
+    /// Insert a snippet's body at the caret of the active tab, and record the
+    /// use. The click action of a library row.
+    pub insert: Rc<dyn Fn(schemaic_core::snippet::Snippet)>,
+    /// Open the body in a new tab instead — the row menu's entry, for a snippet
+    /// you want beside what you are writing rather than inside it.
+    pub open_in_tab: Rc<dyn Fn(schemaic_core::snippet::Snippet)>,
+    /// Save the active tab's selection (or its whole buffer) as a new snippet,
+    /// returning the new id so the panel can open its name for editing. `None`
+    /// when there was nothing to save.
+    pub save_current: Rc<dyn Fn() -> Option<u64>>,
+    /// Rename a snippet (persists).
+    pub rename: Rc<dyn Fn(u64, String)>,
+    /// Copy a snippet to a new one — the only way to edit a built-in.
+    pub duplicate: Rc<dyn Fn(u64)>,
+    /// Delete a snippet, behind the shared confirm.
+    pub remove: Rc<dyn Fn(u64)>,
+}
+
 /// Query-history callbacks (owned by the app).
 pub struct HistoryActions {
     /// Clear the history for the currently-active connection (persists).
@@ -2799,6 +2843,10 @@ pub struct Ui {
     // Query history — grouped.
     pub history: HistoryUi,
     pub history_actions: Rc<HistoryActions>,
+    // The snippet library — grouped like history, and beside it in the panel
+    // column.
+    pub snippets: SnippetsUi,
+    pub snippet_actions: Rc<SnippetActions>,
     // Server activity (the sessions on the connected server) — grouped.
     pub activity: ActivityUi,
     pub activity_actions: Rc<ActivityActions>,
@@ -2866,6 +2914,7 @@ pub enum RightPanel {
     Ai,
     Terminal,
     History,
+    Snippets,
     Activity,
 }
 
@@ -2878,6 +2927,7 @@ impl From<schemaic_core::persist::RightPanelState> for RightPanel {
             S::Ai => RightPanel::Ai,
             S::Terminal => RightPanel::Terminal,
             S::History => RightPanel::History,
+            S::Snippets => RightPanel::Snippets,
             S::Activity => RightPanel::Activity,
         }
     }
@@ -2890,6 +2940,7 @@ impl From<RightPanel> for schemaic_core::persist::RightPanelState {
             RightPanel::Ai => S::Ai,
             RightPanel::Terminal => S::Terminal,
             RightPanel::History => S::History,
+            RightPanel::Snippets => S::Snippets,
             RightPanel::Activity => S::Activity,
         }
     }
@@ -4279,6 +4330,9 @@ fn body(
         move |panel| match panel {
             RightPanel::Terminal => terminal_panel(ui_right.clone()).into_any(),
             RightPanel::History => history_panel(ui_right.clone()).into_any(),
+            RightPanel::Snippets => {
+                crate::snippet_panel::snippet_panel(ui_right.clone()).into_any()
+            }
             RightPanel::Activity => activity_panel(ui_right.clone()).into_any(),
             _ => ai_panel(ui_right.clone()).into_any(),
         },
@@ -4580,6 +4634,7 @@ fn center(ui: Ui) -> impl IntoView {
                     goto_open: tab.goto_open,
                     jump_offset: tab.jump_offset,
                     format_req: tab.format_req,
+                    insert_req: tab.insert_req,
                     syntax: tab.diagnostics,
                     results: tab.results,
                     run: run.clone(),
@@ -7085,6 +7140,17 @@ fn footer(ui: Ui) -> impl IntoView {
                 move || right_toggle().enabled,
                 move || right_panel.get() == RightPanel::History && right_panel_allowed(),
                 move || set_right(RightPanel::History),
+            ),
+            move || right_toggle().tip,
+        ),
+        // The snippet library, next to the history it is the counterpart of: one
+        // is what ran, the other is what you keep.
+        tip_when(
+            toggle_icon(
+                icons::BOOKMARK,
+                move || right_toggle().enabled,
+                move || right_panel.get() == RightPanel::Snippets && right_panel_allowed(),
+                move || set_right(RightPanel::Snippets),
             ),
             move || right_toggle().tip,
         ),
