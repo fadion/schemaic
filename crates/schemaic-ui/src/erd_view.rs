@@ -1517,6 +1517,57 @@ fn node_card(
 /// spec's #C2C4D2), and everything in the toolbar is 13px.
 use crate::widgets::{control_surface as toolbar_surface, toolbar_font};
 
+// ── Toolbar metrics ─────────────────────────────────────────────────────────
+//
+// **Read by the widgets that draw and by the fit that predicts.** The toolbar
+// hides groups when the panel is too narrow (`erd::fit_toolbar`), which means
+// something has to know how wide each group *would* be before it is laid out —
+// and a second set of numbers for that is how `menu_panel_height` came to state
+// a row three different ways. One constant per measurement, read from both
+// sides; each is a base, scaled at the point of use.
+
+/// Horizontal padding inside a chip or a control button.
+const TOOLBAR_PAD_H: f64 = 10.0;
+/// Vertical padding, likewise.
+const TOOLBAR_PAD_V: f64 = 5.0;
+/// A control's icon **base** — `icons::icon` scales it itself.
+const TOOLBAR_ICON: f64 = 16.0;
+/// `control_surface`'s border, both sides. A hairline, so it does not scale.
+const TOOLBAR_BORDER: f64 = 1.0;
+/// The zoom percentage's fixed box — wide enough for "300%", so the label does
+/// not reflow at two digits.
+const ZOOM_PCT_W: f64 = 48.0;
+/// The gap between the toolbar's own groups, and between the controls in the
+/// right-hand one.
+const TOOLBAR_GAP: f64 = 10.0;
+/// The tighter gap between count pills.
+const CHIP_GAP: f64 = 8.0;
+/// The gap between the word "Scope" and the scope itself.
+const SCOPE_GAP: f64 = 6.0;
+/// The toolbar's own left and right padding.
+const TOOLBAR_PAD_LEFT: f64 = 16.0;
+const TOOLBAR_PAD_RIGHT: f64 = 10.0;
+
+/// The rendered width of a [`count_chip`] holding `label`.
+fn chip_w(label: &str) -> f64 {
+    crate::widgets::measure_text_px_at(label, toolbar_font())
+        + theme::scaled(TOOLBAR_PAD_H) * 2.0
+        + TOOLBAR_BORDER * 2.0
+}
+
+/// The rendered width of a [`control_button`] / [`menu_button`] — an icon in its
+/// padding. Every one of them is the same width, icons being square.
+fn icon_button_w() -> f64 {
+    theme::scaled(TOOLBAR_ICON) + theme::scaled(TOOLBAR_PAD_H) * 2.0 + TOOLBAR_BORDER * 2.0
+}
+
+/// The rendered width of the [`zoom_unit`]: two icon steps (no border of their
+/// own — the unit carries it), two hairline separators, and the percentage box.
+fn zoom_unit_w() -> f64 {
+    let step = theme::scaled(TOOLBAR_ICON) + theme::scaled(TOOLBAR_PAD_H) * 2.0;
+    step * 2.0 + 2.0 + theme::scaled(ZOOM_PCT_W) + TOOLBAR_BORDER * 2.0
+}
+
 /// A read-only count pill (e.g. "3 tables"), styled like the buttons.
 fn count_chip(label: String) -> AnyView {
     text(label)
@@ -1524,22 +1575,22 @@ fn count_chip(label: String) -> AnyView {
             toolbar_surface(s)
                 .font_size(toolbar_font())
                 .color(theme::text())
-                .padding_horiz(theme::scaled(10.0))
-                .padding_vert(theme::scaled(5.0))
+                .padding_horiz(theme::scaled(TOOLBAR_PAD_H))
+                .padding_vert(theme::scaled(TOOLBAR_PAD_V))
         })
         .into_any()
 }
 
 /// A standalone icon button (Fit, Reset layout), brightening on hover.
 fn control_button(glyph: &'static str, action: Rc<dyn Fn()>) -> AnyView {
-    container(icons::icon(glyph, 16.0).style(|s| s.color(theme::text())))
+    container(icons::icon(glyph, TOOLBAR_ICON as f32).style(|s| s.color(theme::text())))
         .on_click_stop(move |_| (action)())
         .style(|s| {
             toolbar_surface(s)
                 .items_center()
                 .justify_center()
-                .padding_horiz(theme::scaled(10.0))
-                .padding_vert(theme::scaled(5.0))
+                .padding_horiz(theme::scaled(TOOLBAR_PAD_H))
+                .padding_vert(theme::scaled(TOOLBAR_PAD_V))
                 .hover(|s| s.background(theme::erd_node_bg()))
         })
         .into_any()
@@ -1564,7 +1615,7 @@ fn menu_button(
     at: RwSignal<floem::kurbo::Rect>,
     action: Rc<dyn Fn()>,
 ) -> AnyView {
-    container(icons::icon(glyph, 16.0).style(|s| s.color(theme::text())))
+    container(icons::icon(glyph, TOOLBAR_ICON as f32).style(|s| s.color(theme::text())))
         // `on_move` reports the view's window origin — floem fires it during
         // layout, not on pointer movement — so this is right however the menu is
         // raised, including from the keyboard. `on_resize` carries the size.
@@ -1581,8 +1632,8 @@ fn menu_button(
             toolbar_surface(s)
                 .items_center()
                 .justify_center()
-                .padding_horiz(theme::scaled(10.0))
-                .padding_vert(theme::scaled(5.0))
+                .padding_horiz(theme::scaled(TOOLBAR_PAD_H))
+                .padding_vert(theme::scaled(TOOLBAR_PAD_V))
                 .hover(|s| s.background(theme::erd_node_bg()))
         })
         .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
@@ -1654,13 +1705,13 @@ fn notice_bar(notice: RwSignal<Option<(String, bool)>>) -> impl IntoView {
 fn zoom_unit(zoom: RwSignal<f64>, zoom_out: Rc<dyn Fn()>, zoom_in: Rc<dyn Fn()>) -> AnyView {
     // An icon step inside the unit — no border of its own (the unit carries it).
     let step = |glyph: &'static str, action: Rc<dyn Fn()>| {
-        container(icons::icon(glyph, 16.0).style(|s| s.color(theme::text())))
+        container(icons::icon(glyph, TOOLBAR_ICON as f32).style(|s| s.color(theme::text())))
             .on_click_stop(move |_| (action)())
             .style(|s| {
                 s.items_center()
                     .justify_center()
-                    .padding_horiz(theme::scaled(10.0))
-                    .padding_vert(theme::scaled(5.0))
+                    .padding_horiz(theme::scaled(TOOLBAR_PAD_H))
+                    .padding_vert(theme::scaled(TOOLBAR_PAD_V))
                     .hover(|s| s.background(theme::erd_node_bg()))
             })
             .into_any()
@@ -1686,7 +1737,11 @@ fn zoom_unit(zoom: RwSignal<f64>, zoom_out: Rc<dyn Fn()>, zoom_in: Rc<dyn Fn()>)
                 .into_any()
         },
     )
-    .style(|s| s.width(theme::scaled(48.0)).items_center().justify_center())
+    .style(|s| {
+        s.width(theme::scaled(ZOOM_PCT_W))
+            .items_center()
+            .justify_center()
+    })
     .into_any();
     let plus = step(icons::PLUS, zoom_in);
     h_stack((minus, sep(), percent, sep(), plus))
@@ -1735,16 +1790,8 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     theme::text_dim,
                 )
                 .into_any();
-                return modal_frame(
-                    win,
-                    close,
-                    "—".to_string(),
-                    Vec::new(),
-                    Vec::new(),
-                    body,
-                    None,
-                )
-                .into_any();
+                return modal_frame(win, close, "—".to_string(), Vec::new(), None, body, None)
+                    .into_any();
             };
 
             let graph = erd::build_graph(&schema, &target.database, &target.seed);
@@ -1758,8 +1805,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 let body =
                     centered_msg("No foreign-key relationships to diagram.", theme::text_dim)
                         .into_any();
-                return modal_frame(win, close, scope, chips(&graph), Vec::new(), body, None)
-                    .into_any();
+                return modal_frame(win, close, scope, chips(&graph), None, body, None).into_any();
             }
 
             let (placed, collapsed_defaults) = build_placed(&graph);
@@ -2148,17 +2194,19 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // Right-side controls, left→right: zoom unit, Fit, Reset layout. Keep a
             // clone of `fit` for the one-shot fit-on-open below.
             let fit_on_open = fit.clone();
-            let controls: Vec<AnyView> = vec![
-                zoom_unit(zoom, zoom_out, zoom_in),
-                control_button(icons::SCAN_SQUARE, fit),
-                control_button(icons::ROTATE_CCW, reset),
-                menu_button(
+            // Named rather than a `Vec`, because the toolbar drops them one at a
+            // time as the panel narrows — see `erd::fit_toolbar`.
+            let controls = Controls {
+                zoom: zoom_unit(zoom, zoom_out, zoom_in),
+                fit: control_button(icons::SCAN_SQUARE, fit),
+                reset: control_button(icons::ROTATE_CCW, reset),
+                export: menu_button(
                     icons::DOWNLOAD,
                     "Export the diagram…",
                     export_at,
                     open_export,
                 ),
-            ];
+            };
             // Fit-on-open runs once, the first time the canvas reports its real size.
             let did_autofit = RwSignal::new(false);
 
@@ -2432,7 +2480,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 close,
                 scope,
                 counts,
-                controls,
+                Some(controls),
                 canvas.into_any(),
                 Some(find),
             )
@@ -2448,24 +2496,35 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
-/// The toolbar's stat chips for a graph.
-fn chips(graph: &DiagramGraph) -> Vec<AnyView> {
+/// The toolbar's stat chips for a graph, as **labels**.
+///
+/// Text rather than views, because the toolbar has to know how wide they would
+/// be before it decides whether to draw them at all (`chip_w`), and a `Vec` of
+/// built views cannot be measured without laying it out.
+fn chips(graph: &DiagramGraph) -> Vec<String> {
     let tables = graph
         .nodes
         .iter()
         .filter(|n| n.kind != NodeKind::Stub)
         .count();
     let mut v = vec![
-        count_chip(format!("{tables} tables")),
-        count_chip(format!("{} relationships", graph.edges.len())),
+        format!("{tables} tables"),
+        format!("{} relationships", graph.edges.len()),
     ];
     if !graph.hidden_islands.is_empty() {
-        v.push(count_chip(format!(
-            "{} unrelated hidden",
-            graph.hidden_islands.len()
-        )));
+        v.push(format!("{} unrelated hidden", graph.hidden_islands.len()));
     }
     v
+}
+
+/// The toolbar's right-hand controls, held apart rather than in one `Vec`
+/// because the toolbar hides them **individually** as it runs out of room —
+/// see [`schemaic_core::erd::fit_toolbar`] for the order and why.
+struct Controls {
+    zoom: AnyView,
+    fit: AnyView,
+    reset: AnyView,
+    export: AnyView,
 }
 
 /// Assemble the modal: backdrop + panel (header, toolbar, body). `body` is the
@@ -2478,39 +2537,146 @@ fn modal_frame(
     win: RwSignal<(f64, f64)>,
     close: Rc<dyn Fn()>,
     scope: String,
-    counts: Vec<AnyView>,
-    controls: Vec<AnyView>,
+    counts: Vec<String>,
+    controls: Option<Controls>,
     body: AnyView,
     find: Option<Find>,
 ) -> impl IntoView {
+    // **The toolbar's own measured width**, not the panel's arithmetic. The
+    // toolbar is `width_full`, so its width is its parent's and does not depend
+    // on the children below — which is what keeps hiding one from changing the
+    // number that decided to hide it. Starts at 0, which `fit_toolbar` reads as
+    // "not measured" and answers with everything shown.
+    let avail = RwSignal::new(0.0_f64);
+    let has_controls = controls.is_some();
+    let scope_text = scope.clone();
+    // Cloned for the fit closure, which outlives the pill construction below.
+    let count_labels = counts.clone();
+    // What the toolbar loses by dropping each optional group: the group itself
+    // **plus the flex gap that goes with it**. A hidden child really does take
+    // its gap — taffy filters `Display::None` out in
+    // `generate_anonymous_flex_items`, before the line the gaps are distributed
+    // over is built — so counting the gap here is right rather than
+    // conservative. Stated once, here, rather than guessed at inside the fit.
+    let fit: Rc<dyn Fn() -> erd::ToolbarFit> = Rc::new(move || {
+        let counts_w = |labels: &[String]| match labels.is_empty() {
+            true => 0.0,
+            false => {
+                labels.iter().map(|l| chip_w(l)).sum::<f64>()
+                    + theme::scaled(CHIP_GAP) * (labels.len() - 1) as f64
+                    + theme::scaled(TOOLBAR_GAP)
+            }
+        };
+        // Fixed: the paddings, the toolbar's two own gaps, the scope group, and
+        // the Fit/Reset pair with the gap between them.
+        let scope_w = crate::widgets::measure_text_px_at("Scope", toolbar_font())
+            + theme::scaled(SCOPE_GAP)
+            + crate::widgets::measure_text_px_at(&scope_text, toolbar_font());
+        let mut fixed = theme::scaled(TOOLBAR_PAD_LEFT)
+            + theme::scaled(TOOLBAR_PAD_RIGHT)
+            + theme::scaled(TOOLBAR_GAP) * 2.0
+            + scope_w;
+        if has_controls {
+            fixed += icon_button_w() * 2.0 + theme::scaled(TOOLBAR_GAP);
+        }
+        let (zoom_w, export_w) = match has_controls {
+            true => (
+                zoom_unit_w() + theme::scaled(TOOLBAR_GAP),
+                icon_button_w() + theme::scaled(TOOLBAR_GAP),
+            ),
+            false => (0.0, 0.0),
+        };
+        erd::fit_toolbar(
+            avail.get(),
+            fixed,
+            counts_w(&count_labels),
+            zoom_w,
+            export_w,
+        )
+    });
+
+    let count_pills = h_stack_from_iter(counts.into_iter().map(count_chip)).style({
+        let fit = fit.clone();
+        move |s| {
+            let s = s.items_center().gap(theme::scaled(CHIP_GAP));
+            s.apply_if(!fit().counts, |s| s.hide())
+        }
+    });
+    let control_row = match controls {
+        None => empty().into_any(),
+        Some(c) => h_stack((
+            c.zoom.style({
+                let fit = fit.clone();
+                move |s| s.apply_if(!fit().zoom, |s| s.hide())
+            }),
+            c.fit,
+            c.reset,
+            c.export
+                .style(move |s| s.apply_if(!fit().export, |s| s.hide())),
+        ))
+        .style(|s| s.items_center().gap(theme::scaled(TOOLBAR_GAP)))
+        .into_any(),
+    };
+
     let toolbar = h_stack((
         // Left: scope breadcrumb (label + value grouped) then the count pills 10px
         // to its right.
         h_stack((
             h_stack((
-                text("Scope").style(|s| s.font_size(toolbar_font()).color(theme::text_muted())),
-                text(scope).style(|s| s.font_size(toolbar_font()).color(theme::text())),
+                text("Scope").style(|s| {
+                    s.font_size(toolbar_font())
+                        .color(theme::text_muted())
+                        .flex_shrink(0.0_f32)
+                }),
+                // **The one variable-length thing in the bar**, so it is the one
+                // allowed to truncate. Nothing above ever hides it — a diagram
+                // whose scope you can't read is worse than one with no pills —
+                // but a scope longer than the whole panel has to stop somewhere,
+                // and by then every optional group is already gone.
+                text(scope).style(|s| {
+                    s.font_size(toolbar_font())
+                        .color(theme::text())
+                        .text_ellipsis()
+                        .min_width(0.0)
+                }),
             ))
-            .style(|s| s.items_center().gap(theme::scaled(6.0))),
-            h_stack_from_iter(counts).style(|s| s.items_center().gap(theme::scaled(8.0))),
+            .style(|s| {
+                s.items_center()
+                    .gap(theme::scaled(SCOPE_GAP))
+                    .min_width(0.0)
+            }),
+            count_pills,
         ))
-        .style(|s| s.items_center().gap(theme::scaled(10.0))),
+        .style(|s| {
+            s.items_center()
+                .gap(theme::scaled(TOOLBAR_GAP))
+                .min_width(0.0)
+        }),
         empty().style(|s| s.flex_grow(1.0_f32)),
-        // Right: zoom unit / Fit / Reset, 10px apart; last is 10px from the edge.
-        h_stack_from_iter(controls).style(|s| s.items_center().gap(theme::scaled(10.0))),
+        // Right: zoom unit / Fit / Reset / Export, 10px apart; last is 10px from
+        // the edge. `flex_shrink(0)` so the controls never compress — they are
+        // hidden whole or drawn whole, which is what makes the fit above the only
+        // thing deciding what is on screen.
+        control_row.style(|s| s.flex_shrink(0.0_f32)),
     ))
+    .on_resize(move |b| {
+        let w = b.size().width;
+        if avail.get_untracked() != w {
+            avail.set(w);
+        }
+    })
     .style(|s| {
         // `flex_shrink(0)`: keep the toolbar's fixed height in the panel's column
         // flex. Without it the toolbar competes for negative space with the body as
         // the (zoomed) canvas content grows, and gets progressively compressed.
         // 1px top+bottom border in `erd_toolbar_border`.
         s.items_center()
-            .gap(theme::scaled(10.0))
+            .gap(theme::scaled(TOOLBAR_GAP))
             .width_full()
             .height(theme::scaled(48.0))
             .flex_shrink(0.0_f32)
-            .padding_left(theme::scaled(16.0))
-            .padding_right(theme::scaled(10.0))
+            .padding_left(theme::scaled(TOOLBAR_PAD_LEFT))
+            .padding_right(theme::scaled(TOOLBAR_PAD_RIGHT))
             .border_top(1.0)
             .border_bottom(1.0)
             .border_color(theme::erd_toolbar_border())
@@ -3041,5 +3207,107 @@ mod tests {
         let min_x = poly.iter().fold(f64::MAX, |m, p| m.min(p.x));
         assert!(max_x > w + EDGE_STUB, "loop bulges past the right stub");
         assert!(min_x >= w, "loop stays on the right side of the card");
+    }
+}
+
+/// **The predicted widths and the drawn widgets must not be able to disagree.**
+///
+/// `erd::fit_toolbar` decides what the toolbar shows from numbers computed
+/// *before* anything is laid out, so a control whose padding changed without its
+/// predictor following would hide a group too early — or, worse, too late, which
+/// is the overflow the fit exists to prevent. The two sides read the same
+/// constants, and these pin that they do.
+///
+/// The same discipline `MENU_ROW_PAD` is under next door, and for the same
+/// reason: three decompositions of one row all landed near the right answer at
+/// 100% and disagreed at every other scale.
+#[cfg(test)]
+mod toolbar_width_tests {
+    use super::*;
+    use crate::theme::UiScale;
+
+    /// At Normal the widths are the sums written out by hand — not derived from
+    /// the same constants the code uses, which would pass even if every term
+    /// moved together.
+    #[test]
+    fn the_control_widths_at_normal_are_the_boxes_the_app_draws() {
+        crate::theme::set_ui_scale(UiScale::Normal);
+        // icon 16 + padding 10 both sides + border 1 both sides.
+        assert_eq!(icon_button_w(), 38.0);
+        // two steps (16 + 10 both sides, no border of their own), two hairline
+        // separators, the 48px percentage box, and the unit's own border.
+        assert_eq!(zoom_unit_w(), 36.0 * 2.0 + 2.0 + 48.0 + 2.0);
+    }
+
+    /// Every predicted width moves with the interface scale — except the
+    /// hairline borders, which are rules and stay 1px. A width that froze would
+    /// under-predict at 160% and let the toolbar overflow at exactly the scale
+    /// it is most likely to.
+    #[test]
+    fn every_predicted_width_grows_with_the_scale() {
+        crate::theme::set_ui_scale(UiScale::Normal);
+        let (btn, zoom, chip) = (icon_button_w(), zoom_unit_w(), chip_w("5 tables"));
+        crate::theme::set_ui_scale(UiScale::Huge);
+        let (btn_h, zoom_h, chip_h) = (icon_button_w(), zoom_unit_w(), chip_w("5 tables"));
+        crate::theme::set_ui_scale(UiScale::Normal);
+        assert!(btn_h > btn, "icon button: {btn} → {btn_h}");
+        assert!(zoom_h > zoom, "zoom unit: {zoom} → {zoom_h}");
+        assert!(chip_h > chip, "chip: {chip} → {chip_h}");
+    }
+
+    /// A chip is its text plus its padding, so a longer label is a wider chip —
+    /// the property the count group's total rests on.
+    #[test]
+    fn a_longer_label_is_a_wider_chip() {
+        crate::theme::set_ui_scale(UiScale::Normal);
+        let short = chip_w("5 tables");
+        let long = chip_w("128 relationships");
+        assert!(long > short, "{long} should exceed {short}");
+        // And even an empty label carries its padding and border.
+        assert!(chip_w("") >= 22.0);
+    }
+
+    /// **The toolbar as it actually opens keeps everything.** The panel is 80% of
+    /// the window, so this is the case every user sees on a normal screen, and a
+    /// predictor that over-counted would strip the bar for no reason.
+    #[test]
+    fn a_normal_window_shows_the_whole_toolbar() {
+        for (scale, win_w) in [
+            (UiScale::Normal, 1280.0),
+            (UiScale::Normal, 1920.0),
+            (UiScale::Large, 1920.0),
+            (UiScale::Huge, 2560.0),
+        ] {
+            crate::theme::set_ui_scale(scale);
+            let avail =
+                win_w * 0.8 - theme::scaled(TOOLBAR_PAD_LEFT) - theme::scaled(TOOLBAR_PAD_RIGHT);
+            let labels = ["5 tables".to_string(), "4 relationships".to_string()];
+            let counts = labels.iter().map(|l| chip_w(l)).sum::<f64>()
+                + theme::scaled(CHIP_GAP)
+                + theme::scaled(TOOLBAR_GAP);
+            let scope = crate::widgets::measure_text_px_at("Scope", toolbar_font())
+                + theme::scaled(SCOPE_GAP)
+                + crate::widgets::measure_text_px_at("employees.employees", toolbar_font());
+            let fixed = theme::scaled(TOOLBAR_PAD_LEFT)
+                + theme::scaled(TOOLBAR_PAD_RIGHT)
+                + theme::scaled(TOOLBAR_GAP) * 2.0
+                + scope
+                + icon_button_w() * 2.0
+                + theme::scaled(TOOLBAR_GAP);
+            let got = erd::fit_toolbar(
+                avail,
+                fixed,
+                counts,
+                zoom_unit_w() + theme::scaled(TOOLBAR_GAP),
+                icon_button_w() + theme::scaled(TOOLBAR_GAP),
+            );
+            crate::theme::set_ui_scale(UiScale::Normal);
+            assert_eq!(
+                got,
+                erd::ToolbarFit::ALL,
+                "{scale:?} at {win_w}px: the toolbar stripped itself on a window \
+                 with room"
+            );
+        }
     }
 }

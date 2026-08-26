@@ -1108,6 +1108,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
     table's one-hop neighbourhood). A cross-database FK target can't be enumerated from one
     `DbSchema`, so it becomes an unexpandable `NodeKind::Stub` rather than a missing edge.
+    `fit_toolbar` is the diagram **toolbar's responsive rule**, and it is here rather than in the
+    view because it is arithmetic over widths: given the room available and what each optional
+    group costs, it drops them in a fixed priority order — the count pills, then the zoom stepper,
+    then the export button — and returns a `ToolbarFit`. The order is least-useful-first: the pills
+    restate what the diagram already shows, the zoom stepper duplicates Ctrl+wheel and its
+    percentage is only a readout, and export is the one of the three with no other way to reach it.
+    The scope breadcrumb and the Fit/Reset pair never drop — those two are the *recovery* controls,
+    and a diagram panned off screen is unusable without them. Each width the caller passes is what
+    the toolbar **loses by hiding that group**, the flex gap included, since taffy drops a
+    `Display::None` child before the line the gaps are distributed over is built. An unmeasured
+    toolbar (0) shows everything, so the first frame is one of overflow rather than a stripped bar
+    that fills in. Four properties are pinned: the drop order, that the result is always a *prefix*
+    of it (never a hole), that widening never hides a group (a non-monotone fit would flicker one
+    in and out under a window drag), and the unmeasured arm.
     `should_collapse`/`collapsed_visible` decide per-card density (a wide or crowded table collapses
     to a pinned PK/FK subset) and `column_row_offset` is what still anchors an FK edge to the right
     row on a collapsed card. `layout`/`place` are a deterministic layered auto-layout (nodes layered
@@ -3601,6 +3615,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     zoom. The surface is an infinite free pan (not a scroll view) — drag/middle-drag pans, Ctrl+wheel
     zooms about the cursor, plain/Shift+wheel pans — and hit-testing maps cursor → logical space via
     `(p − pan) / z`.
+    **The toolbar is responsive**, and the decision is `core::erd::fit_toolbar`'s while the
+    measurement is this module's: `chip_w` / `icon_button_w` / `zoom_unit_w` predict each group's
+    width *before* layout, from the same `TOOLBAR_*` constants the widgets are drawn with — the
+    `MENU_ROW_PAD` discipline, for the reason that one records. The toolbar reads its **own**
+    measured width via `on_resize` rather than re-deriving the panel's `ww * 0.8`; it is
+    `width_full`, so its width does not depend on the children being hidden and there is no
+    measure-hide-measure loop. The scope breadcrumb is the one variable-length item and so the one
+    that ellipsizes, and it does so only after every optional group has already gone.
     A table carrying a `db_color` identity colour has its card **header** tinted with it: `header_bg`
     composites the colour over `theme::erd_node_header` at `HEADER_TINT_ALPHA` (0.22) and is called
     *inside* the header's style closure, so the themable half follows a live theme switch while the
