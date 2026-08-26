@@ -2579,6 +2579,25 @@ fn tree_row_min_w() -> f64 {
 // Rows fill the panel width (so hover/selection highlight spans it) via a live
 // `min_width`; long content still overflows and the sidebar gains a horizontal
 // scrollbar.
+//
+// **Measured, and deliberately not memoised.** Every row's style closure makes
+// about eleven thread-local and signal reads through here — `tree_row_min_w`
+// (which reads `schema_panel_w`), `tree_row_h`, two scaled lengths, a font size
+// and two theme colours, plus `col_pad`/`level_indent` at the call site — and on
+// an unvirtualized tree that is per row, every restyle. It looked like a memo
+// wanted writing.
+//
+// It doesn't. Timed against a 2,000-object schema's worth of rows: **~600 ns per
+// row inside a reactive scope** (so with the subscription bookkeeping a bare loop
+// would miss), which is ~1.2 ms to restyle the whole tree — and a restyle is a
+// theme switch, a scale change or a panel resize, not a frame. A memo here would
+// have to invalidate on all four of those *and* on the nav selection; one missed
+// dependency is a stale row width or a highlight that doesn't move, which is a
+// real bug traded for a millisecond nobody can perceive.
+//
+// If this is reopened, reopen it with a **profile of the app**, not a re-reading
+// of the closure: the reads are not what costs, and the number above is what has
+// to be beaten.
 fn tree_row(s: floem::style::Style, pad_left: f64) -> floem::style::Style {
     tree_row_static(s, pad_left).hover(|s| s.background(theme::row_hover()))
 }
