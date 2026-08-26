@@ -484,17 +484,15 @@ pub enum ColKind {
 /// Matches the *base* type name, not a substring: `interval` and `point` both
 /// contain "int", and treating them as integers would reject every valid value
 /// they hold.
+///
+/// The split is [`crate::typename`]'s, which is where all three readings of a
+/// declared type now live. This one wants the **leading word** — `timestamp`
+/// out of `timestamp without time zone`, `double` out of `double precision` —
+/// because it matches a fixed list of scalar keywords, where `ddl` wants the
+/// whole base to decide whether two types are the same.
 pub fn classify(type_name: &str) -> ColKind {
-    let lower = type_name.to_ascii_lowercase();
-    let unsigned = lower.contains("unsigned");
-    // Strip the parameter list and any trailing modifiers: `int(10) unsigned`,
-    // `decimal(10,2)`, `timestamp with time zone`.
-    let base = lower
-        .split(['(', ' '])
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let unsigned = crate::typename::is_unsigned(type_name);
+    let base = crate::typename::leading_word(type_name);
     match base.as_str() {
         "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "int2" | "int4"
         | "int8" | "serial" | "bigserial" | "smallserial" => {

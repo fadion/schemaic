@@ -53,6 +53,7 @@ pub mod text;
 pub mod text_ops;
 pub mod transcript;
 pub mod tx;
+pub mod typename;
 pub mod update;
 pub mod window_chrome;
 

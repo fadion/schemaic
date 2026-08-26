@@ -5210,22 +5210,12 @@ struct TypeParts {
 /// `("timestamp without time zone", [3])`, `enum('a','b')` →
 /// `("enum", [], Some("'a','b'"))`.
 fn split_type(t: &str) -> TypeParts {
-    let t = t.trim();
-    let (head, rest) = match t.find('(') {
-        Some(i) => (&t[..i], &t[i + 1..]),
-        None => (t, ""),
-    };
-    // The *last* `)`, not the first: an ENUM value may contain one.
-    let (args, tail) = match rest.rfind(')') {
-        Some(j) => (&rest[..j], &rest[j + 1..]),
-        None => ("", ""),
-    };
-    let base = format!("{} {}", head.trim(), tail.trim())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    let args = args.trim();
+    // Where the parentheses are is `crate::typename`'s answer, not this
+    // function's — three parts of the app asked it and got three answers.
+    // What is left here is the part only type *equivalence* cares about:
+    // integer parameters compared numerically, everything else as text.
+    let base = crate::typename::base(t);
+    let args = crate::typename::args(t);
     let params: Vec<i64> = args
         .split(',')
         .filter_map(|p| p.trim().parse::<i64>().ok())
