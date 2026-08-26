@@ -137,9 +137,10 @@ type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
 type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)], &[u64])>;
 use schemaic_core::filter::{BrowseKey, Order, table_query};
 use schemaic_core::intel::SqlDialect;
+use schemaic_core::params;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::{SchemaState, TableSource};
-use schemaic_core::sql::{GuardPolicy, RunVerdict, run_verdict};
+use schemaic_core::sql::{GuardPolicy, RunVerdict};
 use schemaic_core::tx::{
     self, StmtOutcome, TabTx, TxEngine, TxMode, TxState, ddl_blocking_tabs, session_still_wanted,
 };
@@ -5337,10 +5338,40 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let gated_run = gate1(&with_conn, &run);
     let gated_run_all = gate1(&with_conn, &run_all);
 
+    // The active tab's parameter values, for the substitution that precedes the
+    // guard. Untracked: this reads at the moment of a run, not reactively.
+    let tab_bindings = move || {
+        let id = active.get_untracked();
+        tabs.with_untracked(|v| {
+            v.iter()
+                .find(|t| t.id == id)
+                .map(|t| t.params.get_untracked())
+                .unwrap_or_default()
+        })
+    };
     let guarded_run: Rc<dyn Fn(String)> = {
         let gated_run = gated_run.clone();
-        Rc::new(
-            move |sql: String| match run_verdict(std::slice::from_ref(&sql), guard_policy()) {
+        Rc::new(move |sql: String| {
+            // Substitute, *then* guard — `params::prepare_run` is the pair, and
+            // what comes back is what runs. A `Raw` value expands to arbitrary
+            // SQL, so a guard shown the template would be judging a statement
+            // the engine never receives.
+            let prepared =
+                params::prepare_run(std::slice::from_ref(&sql), &tab_bindings(), guard_policy());
+            let (mut stmts, verdict) = match prepared {
+                Ok(pair) => pair,
+                // A parameter with no value is a hard hold: there is nothing to
+                // run yet, so the bar offers no "Run anyway".
+                Err(e) => {
+                    run_guard.set(Some(RunGuard {
+                        message: e.to_string(),
+                        pending: None,
+                    }));
+                    return;
+                }
+            };
+            let sql = stmts.pop().unwrap_or(sql);
+            match verdict {
                 RunVerdict::Allow => (gated_run)(sql),
                 RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
                     message,
@@ -5348,15 +5379,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 })),
                 RunVerdict::Confirm(message) => run_guard.set(Some(RunGuard {
                     message,
+                    // The *substituted* statement is parked, so "Run anyway"
+                    // replays what was judged rather than re-deriving it.
                     pending: Some(PendingRun::Single(sql)),
                 })),
-            },
-        )
+            }
+        })
     };
     let guarded_run_all: Rc<dyn Fn(Vec<String>)> = {
         let gated_run_all = gated_run_all.clone();
-        Rc::new(
-            move |stmts: Vec<String>| match run_verdict(&stmts, guard_policy()) {
+        Rc::new(move |stmts: Vec<String>| {
+            let (stmts, verdict) =
+                match params::prepare_run(&stmts, &tab_bindings(), guard_policy()) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        run_guard.set(Some(RunGuard {
+                            message: e.to_string(),
+                            pending: None,
+                        }));
+                        return;
+                    }
+                };
+            match verdict {
                 RunVerdict::Allow => (gated_run_all)(stmts),
                 RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
                     message,
@@ -5366,8 +5410,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     message,
                     pending: Some(PendingRun::Batch(stmts)),
                 })),
-            },
-        )
+            }
+        })
     };
     // A held-back run belongs to the tab it was raised in. The guard bar used to
     // be per-pane and vanished when the pane was rebuilt on a tab switch; now

@@ -1979,7 +1979,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     reaches `tabs.json`. Three lookalikes have named regression tests, since each is one missing
     line from a false positive: PostgreSQL's `::` cast (consumed whole — skipping one byte leaves
     the shape of a placeholder), MySQL's `:=`, and a PostgreSQL array slice `arr[lo:hi]`.
-    Pure + unit-tested; the parameters bar and the run wiring are not built yet.
+    `prepare_run` is the pair the run action calls — substitute, then `sql::run_verdict` on the
+    result — so the ordering is structural rather than a rule a caller has to remember, and
+    `strip_param_diagnostics` drops the reports `neutralize`'s own rewrite caused. Pure +
+    unit-tested.
+    The UI half: `Tab::params` is the bar's store (session-only — no `SavedTab` field, and
+    `ParamValue` has no `Serialize` derive), `editor_pane::params_bar` renders one row per distinct
+    name under the editor, and `guarded_run`/`guarded_run_all` in `schemaic-app` substitute with it.
+    Rows are keyed by **name**, not value, so typing into a field never rebuilds the field being
+    typed into. **Tier-2 live validation is skipped for a statement holding a placeholder**, and
+    `intel::parses` does not cover that: `sqlparser` accepts `:id` as a placeholder in all three
+    dialects, so the statement parses, the round-trip happens, and the squiggle is the *server*
+    complaining about text the user is still filling in. A placeholder in an identifier position
+    (`FROM :tbl`) is the case that does not parse — which is what `neutralize` exists to rescue.
   - `sqlfile.rs` — the pure half of opening and saving a tab's SQL as a `.sql` file on disk: what a
     file's bytes become in the editor (`decode`), what the editor's text becomes on the way back
     (`encode`), what the tab is called once it has a file (`tab_title` — the file name *with* its
@@ -4677,6 +4689,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   in `ui.overlay.run_guard` and execute **nothing**. The unguarded actions never leave
   `schemaic-app`; `TabsActions::run_anyway` is the only way back to them, and it replays only what
   the guard parked. The editor pane renders the bar — it does not own the guard.
+  **What the guard judges is the statement after parameter substitution**, never the template the
+  editor holds. The pair call `params::prepare_run`, which substitutes and *then* asks
+  `run_verdict`, and hand back both halves — so the statements that run, the ones parked for "Run
+  anyway", and the ones the verdict was formed about are one and the same text. A
+  `params::ParamValue::Raw` expands to arbitrary SQL, so a guard shown `SELECT … WHERE x = :p`
+  would be reading a statement the engine never receives while `…; DELETE FROM t` is the one it
+  does. A parameter with no value stops the run before the guard is consulted at all, as a hard
+  hold with no "Run anyway": there is nothing to judge yet.
   This is written down because the guard used to be two closures inside `editor_pane.rs`'s *view
   body*, so it protected exactly one caller: the command palette's `>run` and the AI chat's
   **Insert & Run** both reached the raw action and ran writes past all three protections — the

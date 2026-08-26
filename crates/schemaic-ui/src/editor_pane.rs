@@ -36,6 +36,7 @@ use schemaic_core::diff::{DiffTag, build_diff_rows, line_diff};
 use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
 use schemaic_core::model::QueryState;
 use schemaic_core::pairs::{self, PairAction};
+use schemaic_core::params;
 use schemaic_core::sql::{statement_range, statement_ranges};
 use schemaic_core::text_ops::{
     find_matches, matches_at, move_line, offset_of_line, replace_all, soft_tab_indent,
@@ -626,6 +627,150 @@ struct CmdK {
 // could run writes past all three protections: a guard in one caller of a shared
 // action is a guard the next caller opts out of by omission. Don't move it back.
 
+// ── Query parameters bar ─────────────────────────────────────────────────────
+//
+// One row per distinct `:name` in the tab's SQL, under the editor and above the
+// results. It is a *bar*, not a modal asking on every run: values stay put while
+// you re-run, which is the whole difference between this and the dialog other
+// clients pop up each time.
+//
+// Like the guard bar, the decision isn't here — `params::prepare_run` on the run
+// action substitutes and judges. This view only collects values into the tab's
+// store.
+
+/// The parameters bar for a tab, or nothing when its SQL has no placeholders.
+fn params_bar(
+    query: RwSignal<String>,
+    store: RwSignal<Vec<params::Binding>>,
+    dialect: Memo<SqlDialect>,
+) -> impl IntoView {
+    // Rows follow the **names**, not the values. A memo over the values would
+    // rebuild the row being typed into on every keystroke, and floem takes the
+    // focus and the caret with a rebuilt view.
+    let names = create_memo(move |_| query.with(|q| params::names(q, dialect.get())));
+    let list = dyn_stack(
+        move || names.get(),
+        |name: &String| name.clone(),
+        move |name| param_row(name, store),
+    )
+    .style(|s| s.flex_row().items_center().gap(theme::scaled(14.0)));
+
+    // One view, styled away when there is nothing to show, rather than a
+    // `dyn_container` that rebuilds the whole bar — and with it every value
+    // field — each time the query gains or loses its last placeholder.
+    container(autohide(scroll(list).style(|s| s.width_full()))).style(move |s| {
+        if names.get().is_empty() {
+            return s.height(0.0).width_full();
+        }
+        s.width_full()
+            .height(theme::scaled(36.0))
+            .flex_shrink(0.0_f32)
+            .items_center()
+            .padding_horiz(theme::scaled(13.0))
+            .background(theme::bg_panel())
+            .border_top(1.0)
+            .border_color(theme::border())
+    })
+}
+
+/// One parameter: its name, a value field, and the kind chip that says how the
+/// value reaches the SQL.
+fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoView {
+    // Seeded once, from whatever the store already holds for this name — the
+    // `bound_signal` shape the table designer uses. Seeding through the effect
+    // would write the store back to the value it already has, and `set` never
+    // dedups.
+    let existing = store.with_untracked(|s| {
+        s.iter()
+            .find(|b| b.name == name)
+            .and_then(|b| b.value.clone())
+    });
+    let kind = RwSignal::new(
+        existing
+            .as_ref()
+            .map_or_else(Default::default, |v| v.kind()),
+    );
+    let value = RwSignal::new(
+        existing
+            .as_ref()
+            .map_or_else(String::new, |v| v.text().to_string()),
+    );
+    // An untouched row writes nothing, and *that* — no entry in the store — is
+    // what holds the run. An empty string can't be the test for an unanswered
+    // row, because `''` is a legitimate value someone may mean.
+    let write_name = name.clone();
+    create_effect(move |prev: Option<(String, params::ParamKind)>| {
+        let now = (value.get(), kind.get());
+        if prev.is_some_and(|p| p != now) {
+            let bound = params::ParamValue::of(now.1, &now.0);
+            store.update(|s| params::set_value(s, &write_name, Some(bound)));
+        }
+        now
+    });
+
+    let name_label = text(format!(":{name}")).style(|s| {
+        s.font_family(MONO_FAMILY.to_string())
+            .font_size(theme::font_body())
+            .color(theme::text_dim())
+            .flex_shrink(0.0_f32)
+    });
+
+    // `NULL` has no text of its own, so the field is replaced rather than left
+    // holding a value that no longer reaches the SQL.
+    let value_view = dyn_container(
+        move || kind.get(),
+        move |k| {
+            if !k.takes_text() {
+                return text("NULL")
+                    .style(|s| {
+                        s.font_family(MONO_FAMILY.to_string())
+                            .font_size(theme::font_body())
+                            .color(theme::text_faint())
+                            .width(theme::scaled(140.0))
+                    })
+                    .into_any();
+            }
+            edit_field(
+                value,
+                FieldCfg {
+                    placeholder: "value",
+                    // A `Raw` value is SQL and reads as code; the other two are
+                    // data. Same rule the DDL preview's fields follow.
+                    mono: matches!(k, params::ParamKind::Raw),
+                    height: Some(field_input_h),
+                    ..Default::default()
+                },
+            )
+            .style(|s| s.width(theme::scaled(140.0)))
+            .into_any()
+        },
+    );
+
+    let chip = label(move || kind.get().label().to_string())
+        .on_click_stop(move |_| kind.update(|k| *k = k.next()))
+        .style(|s| {
+            s.font_family(MONO_FAMILY.to_string())
+                .font_size(theme::font_label())
+                .color(theme::text_muted())
+                .padding_horiz(theme::scaled(6.0))
+                .height(theme::scaled(18.0))
+                .items_center()
+                .border(1.0)
+                .border_color(theme::border())
+                .border_radius(4.0)
+                .cursor(CursorStyle::Pointer)
+                .hover(|s| s.color(theme::text()).border_color(theme::text_faint()))
+        })
+        .tooltip(|| text("Text, number, NULL, or raw SQL — click to change").style(tooltip_style));
+
+    h_stack((name_label, value_view, chip)).style(|s| {
+        s.flex_row()
+            .items_center()
+            .gap(theme::scaled(7.0))
+            .flex_shrink(0.0_f32)
+    })
+}
+
 // ── Diagnostics (catalog-aware) ──────────────────────────────────────────────
 
 /// Compute the editor's diagnostics for `sql`: catalog-aware unknown-table /
@@ -643,7 +788,18 @@ pub(crate) fn compute_diagnostics(
     dialect: SqlDialect,
 ) -> Vec<Diagnostic> {
     let catalog = crate::completion::build_catalog(db_nodes, active_db);
-    intel::diagnostics(sql, &catalog, dialect)
+    // A `:name` is a syntax error to the parser, and one of those blanks the
+    // diagnostics for the whole statement — so the analysis reads a neutralised
+    // copy (`:id` → `_id`, byte offsets intact) and the reports that land on the
+    // placeholders themselves are dropped again. Everything else in the
+    // statement is still checked while the query is parameterised.
+    let refs = params::scan(sql, dialect);
+    if refs.is_empty() {
+        return intel::diagnostics(sql, &catalog, dialect);
+    }
+    let analysable = params::neutralize(sql, dialect);
+    let diagnostics = intel::diagnostics(&analysable, &catalog, dialect);
+    params::strip_param_diagnostics(diagnostics, &refs)
 }
 
 /// An inline SVG wavy line `width` px wide and [`WAVE_H`] tall — a smooth sine
@@ -955,6 +1111,10 @@ pub(crate) struct QueryPaneParams {
     pub run_all: Rc<dyn Fn(Vec<String>)>,
     /// What the write guard is holding, if anything — rendered as the guard bar.
     pub run_guard: RwSignal<Option<crate::RunGuard>>,
+    /// This tab's `:name` parameter values — the parameters bar's store. The bar
+    /// collects into it; the run action substitutes with it.
+    /// See [`Tab::params`](crate::Tab::params).
+    pub params: RwSignal<Vec<params::Binding>>,
     /// The guard bar's "Run anyway" ([`crate::TabsActions::run_anyway`]).
     pub run_anyway: Rc<dyn Fn()>,
     pub db_nodes: RwSignal<Vec<ConnNode>>,
@@ -1024,6 +1184,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         run,
         run_all,
         run_guard: guard,
+        params: tab_params,
         run_anyway,
         db_nodes,
         hidden_dbs,
@@ -2331,6 +2492,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     };
                     let (lo, hi) = statement_range(&text2, caret, dialect.get_untracked());
                     if lo >= hi || !intel::parses(&text2[lo..hi], dia) {
+                        return;
+                    }
+                    // A statement with an unfilled `:name` is a *template*, and
+                    // there is nothing to validate: the engine has never seen it
+                    // and would answer with a syntax error about the placeholder.
+                    // `intel::parses` does not stop this — `sqlparser` accepts
+                    // `:id` as a placeholder in every dialect we speak, so the
+                    // round-trip would happen and the squiggle would be the
+                    // server's complaint about text the user is still filling in.
+                    if !params::scan(&text2[lo..hi], dia).is_empty() {
                         return;
                     }
                     let vgen2 = vgen.clone();
@@ -3909,10 +4080,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             .padding_right(theme::scaled(14.0))
     });
 
+    // Under the editor and above the results: the parameters bar takes its
+    // height out of the editor pane's own region rather than the grid's, so a
+    // query that grows a placeholder doesn't shrink the results.
+    let params_row = params_bar(query, tab_params, dialect);
+
     // Non-shrinking, resizable height (the `editor_h` divider): fixed so the
     // flexbox can't collapse the bar under the grid's huge intrinsic height, and
     // the results grid below flex-grows into the remaining space.
-    v_stack((toolbar, editor_wrap)).style(move |s| {
+    v_stack((toolbar, editor_wrap, params_row)).style(move |s| {
         // Collapsed → height 0 so the RESULTS grid takes the whole region (instant,
         // no animation). `editor_h` is unchanged — the restore height for
         // un-collapse — and the floor is applied here rather than written back to
