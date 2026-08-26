@@ -45,6 +45,9 @@ use crate::date::{Date, Stamp, Time};
 use crate::intel::SqlDialect;
 use crate::schema::DbSchema;
 use crate::sql::skip_noncode;
+// The one splitter. `base_type`/`type_args` were a line-for-line copy of
+// `ddl::split_type`'s opening; see `crate::typename`.
+use crate::typename::{args as type_args, base as base_type};
 
 /// The control a column's cells are edited with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -513,48 +516,24 @@ pub fn set_now(editor: &CellEditor, current: &str, now: (Date, Time, &str)) -> S
 
 /// The day a value stands on, if it stands on one — the cell a calendar paints
 /// as the current selection, and `None` for anything it cannot point at.
+///
+/// **One parse, not two.** A `Date::parse` fallback used to sit under this, and
+/// it could never run: `Stamp::parse` answers a date-only string from its own
+/// first branch (`rest.is_empty()` → a `Stamp` with no time), and it returns
+/// `None` only where `Date::parse` returns `None` too — either `take_date`
+/// failed, or there was trailing text, which `Date::parse` refuses outright.
+/// `stamp_parse_subsumes_date_parse` is the pin, and it is not a formality: the
+/// BC-suffix fix has already tightened `Stamp::parse` once, and a future
+/// tightening that reached the date-only branch would silently take date-only
+/// values away from every calendar in the app.
 pub fn value_date(current: &str) -> Option<Date> {
-    Stamp::parse(current)
-        .map(|s| s.date())
-        .or_else(|| Date::parse(current))
+    Stamp::parse(current).map(|s| s.date())
 }
 
 /// The date a picker should open on for a cell holding `current`: the value's own
 /// day when it has one, else `today`. (The month grid is [`crate::date::month_cells`].)
 pub fn picker_focus(current: &str, today: Date) -> Date {
     value_date(current).unwrap_or(today)
-}
-
-/// The leading type keyword of a declared type, lower-cased: `varchar(45)` →
-/// `varchar`, `timestamp(3) without time zone` → `timestamp without time zone`,
-/// `int unsigned` → `int unsigned`.
-///
-/// The parenthesised part is dropped **and the words after it kept**, which is
-/// what makes PostgreSQL's `timestamp(3) with time zone` reachable from the same
-/// match arm as its unparameterised spelling.
-fn base_type(t: &str) -> String {
-    let (head, tail) = match (t.find('('), t.rfind(')')) {
-        // The *last* `)`, not the first: an ENUM member may contain one.
-        (Some(i), Some(j)) if j > i => (&t[..i], &t[j + 1..]),
-        _ => (t, ""),
-    };
-    format!("{} {}", head.trim(), tail.trim())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
-/// What is between a declared type's parentheses (`enum('a','b')` → `'a','b'`,
-/// `tinyint(1)` → `1`), or the empty string.
-fn type_args(t: &str) -> &str {
-    let Some(i) = t.find('(') else {
-        return "";
-    };
-    let Some(j) = t.rfind(')') else {
-        return "";
-    };
-    if j <= i { "" } else { t[i + 1..j].trim() }
 }
 
 /// The values of an `ENUM`/`SET` parameter list — `'a','b''c'` → `["a", "b'c"]`.
@@ -1307,6 +1286,44 @@ mod tests {
         assert_eq!(value_date(""), None);
         assert_eq!(value_date("0000-00-00"), None);
         assert_eq!(value_date("not a date"), None);
+    }
+
+    /// **The premise [`value_date`] dropped a branch on**, pinned rather than
+    /// reasoned: whatever `Date::parse` accepts, `Stamp::parse` accepts, and it
+    /// reports the same day.
+    ///
+    /// Worth a test rather than a comment because `Stamp::parse` is the one of
+    /// the pair that gets *tightened* — the BC-suffix fix already added a check
+    /// to it. A future tightening that reached the date-only branch would take
+    /// `2020-05-05` away from every calendar in the app, and nothing else here
+    /// asks the two parsers the same question.
+    ///
+    /// The inputs are both halves: real dates in the spellings `take_date`
+    /// accepts, and the near-misses either parser must refuse together.
+    #[test]
+    fn stamp_parse_subsumes_date_parse() {
+        for text in [
+            "2020-05-05",
+            "  2020-05-05  ",
+            "0001-01-01",
+            "9999-12-31",
+            "2024-02-29",
+            // Refused by both, and for the same reason.
+            "",
+            "0000-00-00",
+            "2020-13-01",
+            "2020-05-05 ", // trailing text after the trim is still a date
+            "2020-05-05x",
+            "not a date",
+        ] {
+            let via_date = Date::parse(text);
+            let via_stamp = Stamp::parse(text).map(|s| s.date());
+            assert_eq!(
+                via_date, via_stamp,
+                "{text:?}: Date::parse and Stamp::parse disagree, so \
+                 `value_date` has lost the branch that covered the difference"
+            );
+        }
     }
 
     #[test]
