@@ -553,6 +553,27 @@ pub fn copy_scope(
 /// The cell paints it, so the clipboard and an attachment say it too.
 const STAGED_NULL: &str = "NULL";
 
+/// What a **pasted** cell's text means as a staged value: [`STAGED_NULL`] is SQL
+/// NULL, everything else is the text itself.
+///
+/// **This is the paste's ruling, not the editor's.** A NULL cell — stored or
+/// staged — copies as the four characters [`GridCells::text`] paints, so a paste
+/// that read them as text turned every NULL of a copied column into the *string*
+/// `NULL` the moment it went back into the grid: a change nobody sees until
+/// Commit, after which `WHERE note IS NULL` no longer matches the row. The round
+/// trip has to be faithful, and the clipboard carries no way to say "NULL, the
+/// value" that a spreadsheet could also read — so the literal is the whole of
+/// the signal, and this is the one place it is interpreted.
+///
+/// What it costs, stated rather than hidden: a column that legitimately holds the
+/// word `NULL` cannot be *pasted* back as that word. Typing it into a cell still
+/// means the string, on both the inline editor's path and the row panel's, and
+/// that is the escape hatch. The match is exact — `null`, `Null` and `NULL ` are
+/// text, because they are not what the copy side writes.
+pub fn pasted_value(text: String) -> Option<String> {
+    (text != STAGED_NULL).then_some(text)
+}
+
 /// The grid's cell values as plain data: what the view's signals hold, borrowed
 /// for one read.
 ///
@@ -833,8 +854,9 @@ pub const PASTE_VISIT_CAP: usize = 4 * PASTE_CELL_CAP;
 /// Where a pasted block lands, and what of it doesn't.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PastePlan {
-    /// `(display row, column, value)` for every cell that will be staged.
-    pub cells: Vec<(usize, usize, String)>,
+    /// `(display row, column, value)` for every cell that will be staged, with
+    /// the value already resolved through [`pasted_value`] — `None` is SQL NULL.
+    pub cells: Vec<(usize, usize, Option<String>)>,
     /// Cells the block carried that fell off the bottom or right of the grid.
     /// **Reported, never silent**: a paste that quietly discarded half a
     /// spreadsheet would look like it worked.
@@ -882,6 +904,10 @@ pub struct PastePlan {
 /// The **single-value** case is the exception, and not one: it fills the
 /// selection, so its columns are the selected ones — the cells already painted
 /// as highlighted — and no translation applies.
+///
+/// Every value that lands goes through [`pasted_value`], so the plan's cells are
+/// already `Option<String>` and the literal `NULL` is SQL NULL by the time any
+/// caller sees it.
 pub fn plan_paste(
     block: &[Vec<String>],
     (r0, c0, r1, c1): (usize, usize, usize, usize),
@@ -973,7 +999,11 @@ pub fn plan_paste(
             } else {
                 block[dr][dc].clone()
             };
-            plan.cells.push((row, col, value));
+            // **Resolved here, not at the staging call.** Every caller of a plan
+            // stages what it holds, so a resolution left to the caller is one
+            // each new caller can forget; the cell type says `Option` and there
+            // is one place that decides which arm it takes.
+            plan.cells.push((row, col, pasted_value(value)));
         }
     }
     plan
@@ -1035,9 +1065,9 @@ pub struct PasteCounts {
 ///   user cannot see. It also discarded a value the user had typed into a pending
 ///   row when the pasted cell over it happened to be empty.
 ///
-/// NULL is a separate question and is not this one's: a pasted cell reading `NULL`
-/// stages the four-character string, deliberately, and whether it should is the
-/// product decision `S5-L1-01` carries.
+/// NULL is a separate question and is not this one's: it is answered earlier, in
+/// [`pasted_value`], so a pasted `NULL` reaches here as `None` — explicit on
+/// either reading of a blank, and never an undo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlankCell {
     /// A blank clears the cell back to "let the server decide".
@@ -2161,8 +2191,8 @@ mod tests {
         assert_eq!(
             plan.cells,
             vec![
-                (0, 1, "second".to_string()),
-                (0, 0, "1709380800".to_string()),
+                (0, 1, Some("second".to_string())),
+                (0, 0, Some("1709380800".to_string())),
             ],
             "the round trip must restore `note` to `note` and `placed_at` to \
              `placed_at`; copied block was {copied:?}"
@@ -2370,7 +2400,10 @@ mod tests {
         let plan = plan_paste(&block, (0, 2, 0, 2), 4, 5, Some(3), all_editable);
         assert_eq!(
             plan.cells,
-            vec![(0, 2, "a@b.com".to_string()), (0, 4, "hello".to_string()),]
+            vec![
+                (0, 2, Some("a@b.com".to_string())),
+                (0, 4, Some("hello".to_string())),
+            ]
         );
         assert_eq!(plan.dropped, 0);
         // Anchored *on* the frozen column, a 3-wide block fills the three
@@ -2380,9 +2413,9 @@ mod tests {
         assert_eq!(
             plan.cells,
             vec![
-                (0, 3, "x".to_string()),
-                (0, 0, "y".to_string()),
-                (0, 1, "z".to_string()),
+                (0, 3, Some("x".to_string())),
+                (0, 0, Some("y".to_string())),
+                (0, 1, Some("z".to_string())),
             ]
         );
         // And with nothing frozen the walk is the index walk, unchanged.
@@ -2390,9 +2423,9 @@ mod tests {
         assert_eq!(
             plan.cells,
             vec![
-                (0, 1, "x".to_string()),
-                (0, 2, "y".to_string()),
-                (0, 3, "z".to_string()),
+                (0, 1, Some("x".to_string())),
+                (0, 2, Some("y".to_string())),
+                (0, 3, Some("z".to_string())),
             ]
         );
     }
@@ -2408,7 +2441,7 @@ mod tests {
         let plan = plan_paste(&block, (0, 2, 0, 2), 4, 5, Some(3), all_editable);
         assert_eq!(
             plan.cells,
-            vec![(0, 2, "x".to_string()), (0, 4, "y".to_string())]
+            vec![(0, 2, Some("x".to_string())), (0, 4, Some("y".to_string()))]
         );
         assert_eq!(plan.dropped, 1);
     }
@@ -2434,8 +2467,76 @@ mod tests {
         let plan = plan_paste(&block, (0, 0, 0, 0), 10, 10, None, all_editable);
         assert_eq!(plan.dropped, 0);
         assert_eq!(plan.cells.len(), 6);
-        assert!(plan.cells.contains(&(0, 0, "a".to_string())));
-        assert!(plan.cells.contains(&(1, 2, "f".to_string())));
+        assert!(plan.cells.contains(&(0, 0, Some("a".to_string()))));
+        assert!(plan.cells.contains(&(1, 2, Some("f".to_string()))));
+    }
+
+    /// **A NULL round-trips as NULL.** The grid writes the four characters
+    /// `NULL` for a NULL cell — stored or staged — so the paste side has to read
+    /// them back as SQL NULL. Reading them as text meant copying a nullable
+    /// column and pasting it one row down replaced every NULL in it with the
+    /// *string* `NULL`: invisible until Commit, and `WHERE note IS NULL` stops
+    /// matching the row afterwards.
+    ///
+    /// **The composition, not [`pasted_value`] alone.** Both halves spell the
+    /// literal through the same constant, and a test of either one on its own
+    /// passes while the two disagree — which is exactly how the string got
+    /// written in the first place.
+    #[test]
+    fn a_copied_null_comes_back_as_sql_null() {
+        let rs = ResultSet::from_rows(
+            vec![Column {
+                name: "note".into(),
+                type_name: "VARCHAR".into(),
+                origin: None,
+            }],
+            vec![
+                vec![Value::Null],
+                // The cost of the ruling, asserted rather than left implicit: a
+                // cell that genuinely holds the word `NULL` copies as the same
+                // four characters and cannot be pasted back as text.
+                vec![Value::Str("NULL".into())],
+                vec![Value::Str("keep".into())],
+            ],
+        );
+        let (order, formats) = (vec![0, 1, 2], vec![crate::format::ColumnFormat::None]);
+        // Row 2 carries a *staged* NULL over its value — it paints as `NULL` and
+        // copies as `NULL`, so it must come back the same way a stored one does.
+        let dirty = HashMap::from([((2, 0), None)]);
+        let new_rows = Vec::new();
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        let copied = g.tsv((0, 0, 2, 0), None);
+        assert_eq!(copied, "NULL\nNULL\nNULL", "all three copy alike");
+        let block = parse_tsv_block(&copied);
+        let plan = plan_paste(&block, (0, 0, 2, 0), 3, 1, None, all_editable);
+        assert_eq!(plan.cells, vec![(0, 0, None), (1, 0, None), (2, 0, None)]);
+        // And an ordinary value is still itself: only the literal is resolved.
+        let plan = plan_paste(
+            &parse_tsv_block("keep"),
+            (0, 0, 0, 0),
+            3,
+            1,
+            None,
+            all_editable,
+        );
+        assert_eq!(plan.cells, vec![(0, 0, Some("keep".to_string()))]);
+    }
+
+    /// The escape hatch, and its width: **only** the literal the grid writes is
+    /// resolved. Anything a spreadsheet or a text editor produced — a different
+    /// case, a stray space, a longer word — is the text it looks like, and
+    /// *typing* `NULL` into a cell stays the string on every path (the resolution
+    /// is the paste's, not the editor's).
+    #[test]
+    fn only_the_literal_the_grid_writes_is_a_pasted_null() {
+        assert_eq!(pasted_value(STAGED_NULL.to_string()), None);
+        for text in ["null", "Null", "nUlL", " NULL", "NULL ", "NULLS", "", "0"] {
+            assert_eq!(
+                pasted_value(text.to_string()),
+                Some(text.to_string()),
+                "{text:?}"
+            );
+        }
     }
 
     /// Setting a whole column to one value is the reason this case exists; a
@@ -2448,7 +2549,10 @@ mod tests {
         assert_eq!(plan.cells.len(), 6);
         for r in 1..=3 {
             for c in 1..=2 {
-                assert!(plan.cells.contains(&(r, c, "x".to_string())), "({r},{c})");
+                assert!(
+                    plan.cells.contains(&(r, c, Some("x".to_string()))),
+                    "({r},{c})"
+                );
             }
         }
     }
@@ -2473,7 +2577,7 @@ mod tests {
         let block = parse_tsv_block("a\tb\tc\nd\te\tf");
         // A 3-column block anchored on the last column of a 2-column grid.
         let plan = plan_paste(&block, (0, 1, 0, 1), 1, 2, None, all_editable);
-        assert_eq!(plan.cells, vec![(0, 1, "a".to_string())]);
+        assert_eq!(plan.cells, vec![(0, 1, Some("a".to_string()))]);
         assert_eq!(plan.dropped, 5, "{plan:?}");
     }
 
@@ -2485,8 +2589,8 @@ mod tests {
         let block = parse_tsv_block("a\tb\tc");
         let plan = plan_paste(&block, (0, 0, 0, 0), 5, 5, None, |ci| ci != 1);
         assert_eq!(plan.read_only, 1);
-        assert!(plan.cells.contains(&(0, 0, "a".to_string())));
-        assert!(plan.cells.contains(&(0, 2, "c".to_string())));
+        assert!(plan.cells.contains(&(0, 0, Some("a".to_string()))));
+        assert!(plan.cells.contains(&(0, 2, Some("c".to_string()))));
         assert!(!plan.cells.iter().any(|(_, c, _)| *c == 1));
     }
 
@@ -2597,7 +2701,7 @@ mod tests {
     /// case where everything the plan held was staged.
     fn planned(cells: usize, dropped: usize, read_only: usize) -> (PasteCounts, usize) {
         let plan = PastePlan {
-            cells: (0..cells).map(|i| (i, 0, String::new())).collect(),
+            cells: (0..cells).map(|i| (i, 0, Some(String::new()))).collect(),
             dropped,
             read_only,
             capped: 0,
@@ -2610,7 +2714,7 @@ mod tests {
     /// something about the data.
     fn planned_over(cells: usize, capped: usize) -> (PasteCounts, usize) {
         let plan = PastePlan {
-            cells: (0..cells).map(|i| (i, 0, String::new())).collect(),
+            cells: (0..cells).map(|i| (i, 0, Some(String::new()))).collect(),
             capped,
             ..PastePlan::default()
         };

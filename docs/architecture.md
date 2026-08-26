@@ -6539,16 +6539,24 @@ for keyboard nav.
   calls return what they changed and the caller sums them; `PasteCounts::planned` is gone, so no
   reader can rebuild the figure that was wrong. A read-only column is
   skipped **in place**, never
-  shifted, which would write one column's values into the next. Nothing is interpreted: a pasted
-  cell reading `NULL` stages the four-character string, because that is what the copy side wrote
-  and turning text into SQL `NULL` would be editing the user's data on their behalf. **The two are
-  at least distinguishable before the Commit now**: `grid::cell_ink` → `CellInk` replaced the
-  painter's `if` chain, and a staged `None` renders in the same italic a NULL *original* has always
-  had (white on the same green fill), where the two used to share one arm and `middle_name = NULL`
-  was pixel-identical to `middle_name = 'NULL'` right up to the write. The italic is deliberately
-  not a new vocabulary — "there is no value here" reads the same whether the emptiness is stored or
-  staged. The clipboard still carries the display text uninterpreted, and what a pasted `NULL`
-  *should* mean remains an open product decision. An open
+  shifted, which would write one column's values into the next. **One thing is interpreted, and
+  exactly one**: the literal `NULL` resolves to SQL NULL (`edit::pasted_value`, applied inside
+  `plan_paste`, so `PastePlan::cells` carries `Option<String>` and a value reaches the grid already
+  an `Option`). It is what the copy side writes for a NULL cell — stored or staged — so reading it
+  as text made a copied nullable column come back with every NULL in it replaced by the *string*
+  `NULL`, invisible until the Commit after which `WHERE x IS NULL` no longer matched the row. The
+  resolution sits in the plan rather than at the two staging calls because those are the seam
+  `BlankCell` exists for: one of the pair got a rule and the other did not, and both compiled. The
+  match is **exact** — `null`, `Null`, `NULL ` are text — and *typing* `NULL` into a cell still
+  stages the string on every path, which is the escape hatch the ruling leaves and the reason a
+  column legitimately holding the word `NULL` can still be written, just not pasted. The two writes
+  therefore remain reachable from one keyboard, and `grid::cell_ink` → `CellInk` is what keeps them
+  apart on screen: it replaced the painter's `if` chain, and a staged `None` renders in the same
+  italic a NULL *original* has always had (white on the same green fill), where the two used to
+  share one arm and `middle_name = NULL` was pixel-identical to `middle_name = 'NULL'` right up to
+  the write. The italic is deliberately not a new vocabulary — "there is no value here" reads the
+  same whether the emptiness is stored or staged. The **copy** side is unchanged: the clipboard
+  carries the display text, so a spreadsheet still receives four readable characters. An open
   inline editor takes Ctrl+V back — `paste_selection` returns early while `edit_cell` is set,
   explicitly rather than trusting the text field to swallow the key first, because being wrong
   about the dispatch order costs a block overwrite instead of a caret insertion.
@@ -6568,7 +6576,8 @@ for keyboard nav.
   reason for existing. **How a cell is *weighted* is a decision too**, and it is `grid::cell_ink` →
   `CellInk` (`Staged`, `StagedNull`, `Absent`, `Fk`, `Plain`) rather than an `if` chain inside the
   style closure — the fifth case is why: a staged SQL NULL and a staged four-character `NULL` went
-  through one arm and painted identically (see the paste rules above).
+  through one arm and painted identically. A paste no longer produces the second by accident, but a
+  *typed* `NULL` still does, so the distinction stays load-bearing (see the paste rules above).
 - **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers `Copy › CSV / JSON`
   of that column's values (`export_column_csv`/`_json`); a data cell offers `View`, `Edit` (editable
   cells only), a Copy entry whose scope and wording come from `edit::copy_scope` (**Copy** for the
