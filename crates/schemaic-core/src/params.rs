@@ -74,6 +74,97 @@ pub enum ParamValue {
     Raw(String),
 }
 
+/// Which of the four [`ParamValue`] shapes a bar row is set to, without its
+/// text — what the row's kind chip cycles through.
+///
+/// Split out so the bar can change the kind while the typed text stays put:
+/// a value typed as `Text` and then switched to `Raw` is the same string, and
+/// re-typing it to change how it is quoted would be the wrong instrument.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParamKind {
+    #[default]
+    Text,
+    Number,
+    Null,
+    Raw,
+}
+
+impl ParamKind {
+    /// The chip's label. Short enough to sit in a row that is mostly input.
+    pub fn label(self) -> &'static str {
+        match self {
+            ParamKind::Text => "abc",
+            ParamKind::Number => "123",
+            ParamKind::Null => "NULL",
+            ParamKind::Raw => "SQL",
+        }
+    }
+
+    /// The next kind, for the chip's click. Ordered by how often each is
+    /// wanted, with the unquoted one last.
+    pub fn next(self) -> ParamKind {
+        match self {
+            ParamKind::Text => ParamKind::Number,
+            ParamKind::Number => ParamKind::Null,
+            ParamKind::Null => ParamKind::Raw,
+            ParamKind::Raw => ParamKind::Text,
+        }
+    }
+
+    /// Does this kind have text of its own? `NULL` does not, so the row's field
+    /// is inert rather than empty-and-editable.
+    pub fn takes_text(self) -> bool {
+        !matches!(self, ParamKind::Null)
+    }
+}
+
+impl ParamValue {
+    /// The value a kind plus the row's text makes.
+    pub fn of(kind: ParamKind, text: &str) -> ParamValue {
+        match kind {
+            ParamKind::Text => ParamValue::Text(text.to_string()),
+            ParamKind::Number => ParamValue::Number(text.to_string()),
+            ParamKind::Null => ParamValue::Null,
+            ParamKind::Raw => ParamValue::Raw(text.to_string()),
+        }
+    }
+
+    /// Which kind this is.
+    pub fn kind(&self) -> ParamKind {
+        match self {
+            ParamValue::Text(_) => ParamKind::Text,
+            ParamValue::Number(_) => ParamKind::Number,
+            ParamValue::Null => ParamKind::Null,
+            ParamValue::Raw(_) => ParamKind::Raw,
+        }
+    }
+
+    /// The text the row's field shows. Empty for `NULL`, which has none.
+    pub fn text(&self) -> &str {
+        match self {
+            ParamValue::Text(s) | ParamValue::Number(s) | ParamValue::Raw(s) => s,
+            ParamValue::Null => "",
+        }
+    }
+}
+
+/// Set (or clear) one name's value in a bar's store, leaving the rest alone.
+///
+/// Appends a name the store hasn't seen. A name the *query* no longer contains
+/// is deliberately left in place: [`bindings_for`] decides which rows are shown,
+/// and dropping the value here would mean an edit that briefly removes a
+/// placeholder — a retyped `WHERE`, an undo — throws away what was typed into
+/// it.
+pub fn set_value(store: &mut Vec<Binding>, name: &str, value: Option<ParamValue>) {
+    match store.iter_mut().find(|b| b.name == name) {
+        Some(b) => b.value = value,
+        None => store.push(Binding {
+            name: name.to_string(),
+            value,
+        }),
+    }
+}
+
 /// One row of the parameters bar: a name the SQL asks for, and what the user has
 /// put in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +341,56 @@ fn render(name: &str, value: &ParamValue, dialect: SqlDialect) -> Result<String,
             trimmed.to_string()
         }
     })
+}
+
+/// Drop the diagnostics that [`neutralize`]'s rewrite is responsible for.
+///
+/// `_id` is a perfectly good identifier and names nothing, so the analysis
+/// reports it as an unknown column — a squiggle under text the user wrote
+/// correctly. Anything overlapping a placeholder's range goes; everything else
+/// in the statement survives, which is the point of neutralising rather than
+/// skipping analysis altogether.
+pub fn strip_param_diagnostics(
+    diagnostics: Vec<crate::intel::Diagnostic>,
+    refs: &[ParamRef],
+) -> Vec<crate::intel::Diagnostic> {
+    if refs.is_empty() {
+        return diagnostics;
+    }
+    diagnostics
+        .into_iter()
+        .filter(|d| {
+            !refs
+                .iter()
+                .any(|r| d.range.0 < r.end && r.start < d.range.1)
+        })
+        .collect()
+}
+
+/// Substitute a whole run's statements, then ask the write guard about the
+/// **result** — the one entry point a run action should use.
+///
+/// The ordering is the point, and it is structural here rather than a rule
+/// stated in a comment somewhere upstream. A [`ParamValue::Raw`] expands to
+/// arbitrary SQL, so a guard shown the *template* is reading a statement the
+/// engine will never receive: `:action FROM t` carries no write, and
+/// `DELETE FROM t` — which is what runs — carries one. Substituting first and
+/// handing back both halves means a caller cannot get a verdict without also
+/// getting the statements it was reached for.
+///
+/// `Err` is a parameter problem, and it stops the run *before* the guard is
+/// consulted: there is nothing to judge yet.
+pub fn prepare_run(
+    stmts: &[String],
+    bindings: &[Binding],
+    policy: crate::sql::GuardPolicy,
+) -> Result<(Vec<String>, crate::sql::RunVerdict), ParamError> {
+    let prepared = stmts
+        .iter()
+        .map(|s| substitute(s, bindings, policy.dialect))
+        .collect::<Result<Vec<_>, _>>()?;
+    let verdict = crate::sql::run_verdict(&prepared, policy);
+    Ok((prepared, verdict))
 }
 
 /// Is `s` a plain numeric literal — optional sign, digits with at most one
@@ -661,6 +802,197 @@ mod tests {
         assert_eq!(
             rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             ["a", "b"]
+        );
+    }
+
+    // ── kinds and the bar's store ───────────────────────────────────────────
+
+    #[test]
+    fn a_kind_round_trips_through_a_value() {
+        for kind in [
+            ParamKind::Text,
+            ParamKind::Number,
+            ParamKind::Null,
+            ParamKind::Raw,
+        ] {
+            assert_eq!(ParamValue::of(kind, "7").kind(), kind);
+        }
+    }
+
+    #[test]
+    fn switching_kind_keeps_the_typed_text() {
+        let typed = "created_at DESC";
+        let as_text = ParamValue::of(ParamKind::Text, typed);
+        let as_raw = ParamValue::of(as_text.kind().next().next().next(), as_text.text());
+        assert_eq!(as_raw, ParamValue::Raw(typed.to_string()));
+    }
+
+    #[test]
+    fn null_carries_no_text() {
+        assert_eq!(ParamValue::of(ParamKind::Null, "ignored"), ParamValue::Null);
+        assert_eq!(ParamValue::Null.text(), "");
+        assert!(!ParamKind::Null.takes_text());
+        assert!(ParamKind::Text.takes_text());
+    }
+
+    #[test]
+    fn cycling_a_kind_four_times_returns_to_it() {
+        let mut kind = ParamKind::Text;
+        for _ in 0..4 {
+            kind = kind.next();
+        }
+        assert_eq!(kind, ParamKind::Text);
+    }
+
+    #[test]
+    fn setting_a_value_updates_in_place_or_appends() {
+        let mut store = vec![bound("a", ParamValue::Null)];
+        set_value(&mut store, "a", Some(ParamValue::Number("1".to_string())));
+        set_value(&mut store, "b", Some(ParamValue::Null));
+        assert_eq!(
+            store,
+            vec![
+                bound("a", ParamValue::Number("1".to_string())),
+                bound("b", ParamValue::Null),
+            ]
+        );
+    }
+
+    /// A placeholder that momentarily leaves the query — a retyped `WHERE`, an
+    /// undo — must not take the typed value with it.
+    #[test]
+    fn a_value_survives_the_placeholder_leaving_and_returning() {
+        let mut store: Vec<Binding> = Vec::new();
+        set_value(&mut store, "id", Some(ParamValue::Number("7".to_string())));
+        // The query loses the placeholder: the row goes, the store doesn't.
+        assert!(bindings_for("SELECT 1", MY, &store).is_empty());
+        assert_eq!(bindings_for("SELECT :id", MY, &store), store);
+    }
+
+    // ── strip_param_diagnostics ─────────────────────────────────────────────
+
+    fn diag(range: (usize, usize)) -> crate::intel::Diagnostic {
+        crate::intel::Diagnostic {
+            range,
+            severity: crate::intel::Severity::Error,
+            message: "unknown column".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_over_a_placeholder_is_dropped() {
+        let sql = "SELECT * FROM t WHERE id = :id";
+        let refs = scan(sql, MY);
+        let kept = strip_param_diagnostics(vec![diag((27, 30))], &refs);
+        assert!(kept.is_empty(), "the `_id` the analysis saw is ours");
+    }
+
+    #[test]
+    fn a_diagnostic_elsewhere_in_the_statement_survives() {
+        let sql = "SELECT nope FROM t WHERE id = :id";
+        let refs = scan(sql, MY);
+        let kept = strip_param_diagnostics(vec![diag((7, 11))], &refs);
+        assert_eq!(
+            kept.len(),
+            1,
+            "an unknown column is still an unknown column"
+        );
+    }
+
+    /// A statement-wide diagnostic (a syntax error spanning the whole thing)
+    /// overlaps the placeholder, so it goes with it — the alternative is a
+    /// permanent error on a statement the user has not finished parameterising.
+    #[test]
+    fn a_diagnostic_overlapping_a_placeholder_is_dropped() {
+        let sql = "SELECT * FROM t WHERE id = :id";
+        let refs = scan(sql, MY);
+        assert!(strip_param_diagnostics(vec![diag((0, sql.len()))], &refs).is_empty());
+    }
+
+    #[test]
+    fn without_placeholders_every_diagnostic_survives() {
+        let kept = strip_param_diagnostics(vec![diag((0, 5)), diag((7, 9))], &[]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    // ── prepare_run ─────────────────────────────────────────────────────────
+
+    fn policy(read_only: bool) -> crate::sql::GuardPolicy {
+        crate::sql::GuardPolicy {
+            read_only,
+            confirm_writes: false,
+            dialect: MY,
+            no_database: false,
+        }
+    }
+
+    /// The reason this function exists. The guard has to judge what the engine
+    /// will receive, not the template: a `Raw` value expands to arbitrary SQL,
+    /// so a plain `SELECT` template can arrive at the engine carrying a `DELETE`
+    /// the guard was never shown.
+    ///
+    /// A `Raw` value is the user's own text, so this is not an injection guard —
+    /// it is the read-only connection meaning what it says.
+    #[test]
+    fn a_raw_value_that_turns_a_read_into_a_write_is_blocked() {
+        let stmts = vec!["SELECT * FROM t WHERE x = :p".to_string()];
+        let bindings = vec![bound("p", ParamValue::Raw("1; DELETE FROM t".to_string()))];
+
+        // The guard on its own, asked about the template, allows it.
+        assert_eq!(
+            crate::sql::run_verdict(&stmts, policy(true)),
+            crate::sql::RunVerdict::Allow,
+            "the template really does look harmless — that is the trap"
+        );
+
+        let (prepared, verdict) = prepare_run(&stmts, &bindings, policy(true)).expect("bound");
+        assert_eq!(
+            prepared,
+            vec!["SELECT * FROM t WHERE x = 1; DELETE FROM t".to_string()]
+        );
+        assert!(
+            matches!(verdict, crate::sql::RunVerdict::Block(_)),
+            "the guard must see the substituted statement, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn the_statements_handed_back_are_the_substituted_ones() {
+        let stmts = vec![
+            "SELECT * FROM t WHERE id = :id".to_string(),
+            "SELECT :id".to_string(),
+        ];
+        let bindings = vec![bound("id", ParamValue::Number("7".to_string()))];
+        let (prepared, verdict) = prepare_run(&stmts, &bindings, policy(false)).expect("bound");
+        assert_eq!(
+            prepared,
+            vec![
+                "SELECT * FROM t WHERE id = 7".to_string(),
+                "SELECT 7".to_string(),
+            ]
+        );
+        assert_eq!(verdict, crate::sql::RunVerdict::Allow);
+    }
+
+    #[test]
+    fn an_unfilled_parameter_stops_the_run_before_the_guard() {
+        let stmts = vec!["DELETE FROM t WHERE id = :id".to_string()];
+        let out = prepare_run(&stmts, &[], policy(true));
+        assert_eq!(
+            out,
+            Err(ParamError::Missing(vec!["id".to_string()])),
+            "the parameter is reported, not the read-only block behind it"
+        );
+    }
+
+    #[test]
+    fn a_run_without_parameters_is_the_guards_own_answer() {
+        let stmts = vec!["DELETE FROM t".to_string()];
+        let (prepared, verdict) = prepare_run(&stmts, &[], policy(false)).expect("no parameters");
+        assert_eq!(prepared, stmts);
+        assert!(
+            matches!(verdict, crate::sql::RunVerdict::Confirm(_)),
+            "an unguarded DELETE with no WHERE still confirms, got {verdict:?}"
         );
     }
 

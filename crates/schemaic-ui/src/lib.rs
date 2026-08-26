@@ -986,6 +986,19 @@ pub struct Tab {
     /// degrades to `None` when the mirror has drifted a keystroke out of step
     /// with `query`.
     pub selection: RwSignal<Option<(usize, usize)>>,
+    /// What this tab's `:name` query parameters are set to — the parameters
+    /// bar's store, and what `TabsActions::run` substitutes with.
+    ///
+    /// **Session-only, deliberately.** It is not in `SavedTab` and never reaches
+    /// `tabs.json`: a parameter value is often an id and sometimes an email or a
+    /// token pasted into a `WHERE`, and `schemaic_core::params::ParamValue`
+    /// carries no `Serialize` derive to make that hard to undo by accident.
+    ///
+    /// The *rows* are not stored — they are derived from `query` on every edit
+    /// through `params::bindings_for`, so they cannot drift from the statement
+    /// they belong to. This holds only the values, including ones for names the
+    /// query has momentarily lost.
+    pub params: RwSignal<Vec<schemaic_core::params::Binding>>,
     /// Opens this tab's Go-to-line popup. Set by Ctrl+G in the editor or by
     /// clicking the Ln/Col segment in the status bar; the editor pane owns the view.
     pub goto_open: RwSignal<bool>,
@@ -1128,6 +1141,7 @@ impl Tab {
             edit_buf: cx.create_rw_signal(String::new()),
             cursor_offset: cx.create_rw_signal(0),
             selection: cx.create_rw_signal(None),
+            params: cx.create_rw_signal(Vec::new()),
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
             format_req: cx.create_rw_signal(false),
@@ -4571,6 +4585,7 @@ fn center(ui: Ui) -> impl IntoView {
                     run: run.clone(),
                     run_all: run_all.clone(),
                     run_guard,
+                    params: tab.params,
                     run_anyway: run_anyway.clone(),
                     db_nodes,
                     hidden_dbs: ui.schema.hidden_dbs,
