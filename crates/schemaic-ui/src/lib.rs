@@ -2388,6 +2388,9 @@ pub struct SnippetActions {
     pub save_current: Rc<dyn Fn() -> Option<u64>>,
     /// Rename a snippet (persists).
     pub rename: Rc<dyn Fn(u64, String)>,
+    /// Set or clear a snippet's expansion abbrev — `None` removes it, which is
+    /// the only way to take a trigger back off a snippet.
+    pub set_abbrev: Rc<dyn Fn(u64, Option<String>)>,
     /// Copy a snippet to a new one — the only way to edit a built-in.
     pub duplicate: Rc<dyn Fn(u64)>,
     /// Delete a snippet, behind the shared confirm.
@@ -4640,6 +4643,8 @@ fn center(ui: Ui) -> impl IntoView {
                     run: run.clone(),
                     run_all: run_all.clone(),
                     run_guard,
+                    snippets: ui.snippets.items,
+                    active_conn: ui.conn.active_conn,
                     params: tab.params,
                     run_anyway: run_anyway.clone(),
                     db_nodes,

@@ -30,6 +30,15 @@ use crate::widgets::{
 };
 use crate::{FieldCfg, OverlayUi, Ui, edit_field, icons, theme};
 
+/// Which of a row's two texts an inline field is editing.
+#[derive(Clone, Copy, PartialEq)]
+enum RowEdit {
+    Name,
+    /// The expansion trigger. Committing an empty one *removes* the abbrev,
+    /// which is the only way to take one back off a snippet.
+    Abbrev,
+}
+
 pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     let items = ui.snippets.items;
     let actions = ui.snippet_actions.clone();
@@ -56,10 +65,11 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     // re-opened, and the rename buffer belongs to this build of the list.
     let search_input = RwSignal::new(String::new());
     let search = debounced(search_input, Duration::from_millis(SEARCH_DEBOUNCE_MS));
-    // The snippet whose name is being edited inline, and its buffer. Inline
+    // Which row is being edited inline, and which of its two texts. Inline
     // rather than a modal because naming a saved query is the same act as
-    // renaming a tab, which is already inline.
-    let renaming: RwSignal<Option<u64>> = RwSignal::new(None);
+    // renaming a tab, which is already inline — and there is no text-prompt
+    // modal in this codebase to reach for.
+    let renaming: RwSignal<Option<(u64, RowEdit)>> = RwSignal::new(None);
     let rename_buf = RwSignal::new(String::new());
 
     let groups = create_memo(move |_| {
@@ -131,7 +141,7 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
                 // Straight into the rename field: a snippet arrives named after
                 // its tab, which is a placeholder rather than an answer.
                 rename_buf.set(String::new());
-                renaming.set(Some(id));
+                renaming.set(Some((id, RowEdit::Name)));
             }
         },
     )
@@ -239,7 +249,7 @@ fn snippet_row(
     actions: Rc<crate::SnippetActions>,
     term: Option<String>,
     dialect: SqlDialect,
-    renaming: RwSignal<Option<u64>>,
+    renaming: RwSignal<Option<(u64, RowEdit)>>,
     rename_buf: RwSignal<String>,
     overlay: OverlayUi,
     menus: crate::widgets::MenuFlags,
@@ -256,26 +266,64 @@ fn snippet_row(
         (_, Some(ts)) => schemaic_core::history::relative_time(ts, now_millis()),
         (_, None) => String::new(),
     };
-    let abbrev_chip: Option<floem::AnyView> = snip.abbrev.clone().map(|a| {
-        h_stack((
-            crate::icons::icon_wh(icons::KEYBOARD, 12.0, 0.0),
-            text(a).style(|s| {
-                s.font_family(MONO_FAMILY.to_string())
-                    .font_size(font_label())
-            }),
-        ))
-        .style(|s| {
-            s.items_center()
-                .gap(theme::scaled(4.0))
-                .color(theme::text_dim())
-                .flex_shrink(0.0_f32)
-        })
-        .into_any()
+    // The abbrev: a chip when it has one, a field while it is being set, and
+    // nothing at all otherwise — an empty chip on every row would be noise on
+    // the many snippets that never want a trigger.
+    let abbrev_view = dyn_container(move || renaming.get() == Some((id, RowEdit::Abbrev)), {
+        let existing = snip.abbrev.clone();
+        let set_abbrev = actions.set_abbrev.clone();
+        move |editing: bool| {
+            if !editing {
+                let Some(a) = existing.clone().filter(|a| !a.is_empty()) else {
+                    return empty().into_any();
+                };
+                return h_stack((
+                    crate::icons::icon_wh(icons::KEYBOARD, 12.0, 0.0),
+                    text(a).style(|s| {
+                        s.font_family(MONO_FAMILY.to_string())
+                            .font_size(font_label())
+                    }),
+                ))
+                .style(|s| {
+                    s.items_center()
+                        .gap(theme::scaled(4.0))
+                        .color(theme::text_dim())
+                        .flex_shrink(0.0_f32)
+                })
+                .into_any();
+            }
+            let commit = {
+                let set_abbrev = set_abbrev.clone();
+                Rc::new(move || {
+                    let typed = rename_buf.get_untracked().trim().to_string();
+                    // Empty *removes* the abbrev — the only way to take a
+                    // trigger back off a snippet, and the reason this commits
+                    // an empty value where the name field refuses one.
+                    (set_abbrev)(id, (!typed.is_empty()).then_some(typed));
+                    renaming.set(None);
+                })
+            };
+            let on_escape = Rc::new(move || renaming.set(None));
+            edit_field(
+                rename_buf,
+                FieldCfg {
+                    placeholder: "abbrev",
+                    mono: true,
+                    autofocus: true,
+                    on_submit: Some(commit.clone()),
+                    on_blur: Some(commit),
+                    on_escape: Some(on_escape),
+                    ..Default::default()
+                },
+            )
+            .style(|s| s.width(theme::scaled(90.0)).flex_shrink(0.0_f32))
+            .into_any()
+        }
     });
 
     // Renaming this row: the name is replaced by a field, committed on Enter or
     // blur. Same act as an inline tab rename, so it looks the same.
-    let name_view = dyn_container(move || renaming.get() == Some(id), {
+    let name_view = dyn_container(move || renaming.get() == Some((id, RowEdit::Name)), {
         let name = snip.name.clone();
         let term = term.clone();
         let rename = actions.rename.clone();
@@ -296,6 +344,8 @@ fn snippet_row(
                 let rename = rename.clone();
                 Rc::new(move || {
                     let typed = rename_buf.get_untracked().trim().to_string();
+                    // An empty name is refused rather than committed: a row with
+                    // no name is unfindable, and the snippet already has one.
                     if !typed.is_empty() {
                         (rename)(id, typed);
                     }
@@ -321,8 +371,7 @@ fn snippet_row(
     .style(|s| s.min_width(0.0).flex_grow(1.0_f32));
 
     let heading = {
-        let mut cells: Vec<floem::AnyView> = vec![name_view.into_any()];
-        cells.extend(abbrev_chip);
+        let mut cells: Vec<floem::AnyView> = vec![name_view.into_any(), abbrev_view.into_any()];
         cells.push(
             text(right)
                 .style(|s| {
@@ -424,11 +473,13 @@ fn snippet_row(
 fn row_menu(
     snip: &Snippet,
     actions: &Rc<crate::SnippetActions>,
-    renaming: RwSignal<Option<u64>>,
+    renaming: RwSignal<Option<(u64, RowEdit)>>,
     rename_buf: RwSignal<String>,
 ) -> Vec<MenuEntry> {
     let id = snip.id;
     let name = snip.name.clone();
+    let abbrev = snip.abbrev.clone().unwrap_or_default();
+    let has_abbrev = !abbrev.is_empty();
     let builtin = snip.source == Source::Builtin;
 
     let open = actions.open_in_tab.clone();
@@ -442,7 +493,18 @@ fn row_menu(
     if !builtin {
         entries.push(MenuEntry::action("Rename…", move || {
             rename_buf.set(name.clone());
-            renaming.set(Some(id));
+            renaming.set(Some((id, RowEdit::Name)));
+        }));
+        // Named for what it does rather than for the field: an abbrev is a thing
+        // you *type* to get the snippet, and "Set abbrev" says less than that.
+        let label = if has_abbrev {
+            "Change expansion shortcut…"
+        } else {
+            "Add expansion shortcut…"
+        };
+        entries.push(MenuEntry::action(label, move || {
+            rename_buf.set(abbrev.clone());
+            renaming.set(Some((id, RowEdit::Abbrev)));
         }));
     }
     entries.push(MenuEntry::action("Duplicate", move || (duplicate)(id)));

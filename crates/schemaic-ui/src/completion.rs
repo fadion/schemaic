@@ -26,6 +26,7 @@ use floem::views::editor::core::selection::Selection;
 
 use schemaic_core::intel::{self, ClauseCtx, SqlDialect};
 use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type, db_contributes};
+use schemaic_core::snippet;
 use schemaic_core::sql::statement_range;
 
 use crate::schema_tree::column_type_icon;
@@ -93,6 +94,9 @@ pub(crate) enum SuggestKind {
     Table,
     Column,
     Database,
+    /// A saved snippet, offered by its abbrev. Its row inserts the snippet's
+    /// *body*, not the abbrev — the `insert` override every FK-JOIN row uses.
+    Snippet,
 }
 
 /// Whether a column suggestion participates in a key — tints its leading icon gold
@@ -659,15 +663,38 @@ pub(crate) fn popup_may_open(force: bool, already_open: bool, typed: bool) -> bo
 /// start), then functions/keywords; within a tier, best fuzzy match wins. Empty
 /// prefix closes the popup unless `force` (Ctrl+Space) or the caret is right
 /// after a `.`.
+/// Everything the suggestion engine knows about *where* the caret is — the
+/// catalogue it can name things from, the dialect it parses in, and the snippet
+/// library with the connection its scopes are judged against.
+///
+/// One argument rather than six because they are only meaningful together: a
+/// call that passed the schema of one connection and the snippets of another
+/// would be a bug no signature could catch, and the list had grown past what a
+/// reader can check at a call site.
+#[derive(Clone, Copy)]
+pub(crate) struct CompletionCtx<'a> {
+    pub(crate) db_nodes: RwSignal<Vec<ConnNode>>,
+    pub(crate) hidden_dbs: Memo<HashSet<String>>,
+    pub(crate) active_db: Option<&'a str>,
+    pub(crate) dialect: SqlDialect,
+    pub(crate) snippets: RwSignal<Vec<snippet::Snippet>>,
+    pub(crate) conn_id: u64,
+}
+
 pub(crate) fn recompute_completions(
     ed: &Editor,
-    db_nodes: RwSignal<Vec<ConnNode>>,
-    hidden_dbs: Memo<HashSet<String>>,
+    ctx: CompletionCtx<'_>,
     comp: Completion,
-    active_db: Option<&str>,
-    dialect: SqlDialect,
     force: bool,
 ) {
+    let CompletionCtx {
+        db_nodes,
+        hidden_dbs,
+        active_db,
+        dialect,
+        snippets,
+        conn_id,
+    } = ctx;
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
     // A `.` just typed is a qualifier trigger — reveal the qualifier's members even
@@ -876,6 +903,49 @@ pub(crate) fn recompute_completions(
                 .unwrap_or_default(),
         }
     };
+    // Snippet abbrevs, in the top tier and ahead of the keyword continuations: an
+    // abbrev is a name its owner chose *in order to type it*, so when one matches
+    // what is being typed it is not a guess the way a ranked keyword is.
+    //
+    // Not offered after a `qualifier.` — there the only sensible answers are that
+    // table's columns — and one row per distinct spelling, resolved through
+    // `snippet::by_abbrev` so the narrowest scope wins a shared abbrev by the
+    // same rule everywhere rather than by whichever the list happened to reach
+    // first.
+    if !qualified {
+        let all = snippets.get_untracked();
+        let mut spellings: Vec<String> = Vec::new();
+        for s in all.iter().filter(|s| snippet::applies(s, dialect, conn_id)) {
+            if let Some(a) = s.abbrev.as_deref().filter(|a| !a.is_empty()) {
+                let lower = a.to_ascii_lowercase();
+                if !spellings.iter().any(|s| s.eq_ignore_ascii_case(&lower)) {
+                    spellings.push(a.to_string());
+                }
+            }
+        }
+        for spelling in spellings {
+            let Some(s) = snippet::by_abbrev(&all, &spelling, dialect, conn_id) else {
+                continue;
+            };
+            let tl = spelling.to_ascii_lowercase();
+            if !seen.insert(tl) {
+                continue;
+            }
+            cands.push(Cand {
+                text: spelling,
+                kind: SuggestKind::Snippet,
+                detail: s.name.clone(),
+                table: String::new(),
+                alias: String::new(),
+                icon: kind_icon(SuggestKind::Snippet),
+                key: KeyKind::None,
+                tier: 0,
+                // The row shows the abbrev and inserts the query.
+                insert: Some(s.body.clone()),
+                replace: None,
+            });
+        }
+    }
     // Expected clause-keyword continuations go in the *top* tier (above columns,
     // functions, and — after a complete table ref — schema table names), so the
     // legal next keyword the grammar predicts wins ties. Added before the
@@ -1242,6 +1312,7 @@ fn suggest_color(kind: SuggestKind) -> floem::peniko::Color {
         SuggestKind::Function => theme::suggest_function(),
         SuggestKind::Table => theme::suggest_table(),
         SuggestKind::Database => theme::suggest_database(),
+        SuggestKind::Snippet => theme::suggest_table(),
         SuggestKind::Column => theme::text(),
     }
 }
@@ -1253,6 +1324,7 @@ fn kind_icon(kind: SuggestKind) -> &'static str {
         SuggestKind::Keyword | SuggestKind::Function => icons::SQUARE_FUNCTION,
         SuggestKind::Table => icons::TABLE,
         SuggestKind::Database => icons::DATABASE,
+        SuggestKind::Snippet => icons::BOOKMARK,
         SuggestKind::Column => icons::TYPE,
     }
 }
@@ -1274,6 +1346,7 @@ fn suggest_icon_color(kind: SuggestKind, key: KeyKind) -> floem::peniko::Color {
         SuggestKind::Database => theme::db_icon(),
         SuggestKind::Keyword => theme::text_muted(),
         SuggestKind::Function => theme::suggest_function(),
+        SuggestKind::Snippet => theme::suggest_table(),
     }
 }
 

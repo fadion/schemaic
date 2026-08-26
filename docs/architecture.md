@@ -3005,7 +3005,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     parameter chips under a body are read live from `params::names`, never stored, so they cannot
     disagree with the body above them. Renaming is inline (an `edit_field` in place of the name),
     matching the tab rename, because there is no text-prompt modal in this codebase and a saved
-    query's name is the same kind of act.
+    query's name is the same kind of act — and the row menu's *expansion shortcut* entry puts the
+    same field where the abbrev chip sits, where **committing an empty one removes the abbrev**,
+    the only way to take a trigger back off a snippet. A built-in offers neither: Duplicate is how
+    you get an editable copy of one.
   - `activity_panel.rs` — the **Server Activity** right-column panel (`RightPanel::Activity`, the
     footer's pulse-line toggle): the sessions on the active *connection's* server, a counts line, a
     lock-wait banner and a search box, over the same chrome as the History panel. It paints
@@ -3571,7 +3574,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       SQLite tables is worse than a blank.
     `completion.rs` — SQL autocomplete: the ranking + popup layer
     (`recompute_completions`/`accept_completion`/`completion_popup` + `SchemaIndex`/`fuzzy_score`)
-    over `schemaic_core::intel`'s scope/context engine.
+    over `schemaic_core::intel`'s scope/context engine. Its inputs travel as one `CompletionCtx`
+    (catalogue + dialect + snippet library + connection): they are only meaningful together, and a
+    call pairing one connection's schema with another's snippets is a bug no longer signature could
+    catch. **Snippet abbrevs are a suggestion tier**, above the keyword continuations and skipped
+    after a `qualifier.` — an abbrev is a name its owner chose *in order to type it*, so a match on
+    one is not the guess a ranked keyword is. One row per distinct spelling, each resolved through
+    `snippet::by_abbrev` so the narrowest scope wins by the same rule everywhere; the row shows the
+    abbrev and inserts the **body**, through the same `Suggestion::insert` override an FK-JOIN row
+    uses.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
     reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
