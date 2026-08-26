@@ -6197,7 +6197,7 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   kind of row — and each arm emits the same five groups in the same order, separated by
   `MenuEntry::Separator`, so an action sits in the same place whatever was right-clicked:
   **Open** (what a double-click would have done), **Read** (`Copy name`, `Copy qualified name`,
-  then what the node can *show* you — `Properties`, `Live monitor`, `Show diagram`, `Generate DDL` —
+  then what the node can *show* you — `Properties`, `Live monitor`, `ER Diagram`, `Generate DDL` —
   closing with
   `Refresh`), **Tree state** (`Favorite`, `Colour ▸`, `Hide`, which act on the row and not on the
   object), **Write** (`Create`/`Edit`/`Import`/`Triggers`, with the entries that can't be taken
