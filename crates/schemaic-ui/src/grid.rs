@@ -1602,8 +1602,12 @@ fn compute_window(vp: Rect, widths: &[f64], data_cols: &[usize], overscan: usize
 
 /// A zero-content filler of a fixed width — stands in for the columns hidden on
 /// either side of the visible window so the row keeps its full scrollable width.
-fn col_spacer(w: f64, h: f64) -> impl IntoView {
-    empty().style(move |s| s.width(w).height(h).flex_shrink(0.0_f32))
+/// `w` is computed layout data (a column's padding) and is a number; `h` is a
+/// **scaled metric** and is a `fn`, so the spacer follows the interface scale
+/// instead of freezing at the one it was built at — see
+/// `dividers::scaled_arg_gate`.
+fn col_spacer(w: f64, h: fn() -> f64) -> impl IntoView {
+    empty().style(move |s| s.width(w).height(h()).flex_shrink(0.0_f32))
 }
 
 /// Nudge the body scroll so `(i, ci)` is visible (keyboard nav).
@@ -3566,13 +3570,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 move || win.get(),
                 move |w| {
                     let mut kids: Vec<AnyView> =
-                        vec![col_spacer(w.left_pad, grid_header_h()).into_any()];
+                        vec![col_spacer(w.left_pad, grid_header_h).into_any()];
                     for k in w.start..w.end {
                         kids.push(
                             header_cell(gs, hdr_cols[k], sort_val, sort, km.clone()).into_any(),
                         );
                     }
-                    kids.push(col_spacer(w.right_pad, grid_header_h()).into_any());
+                    kids.push(col_spacer(w.right_pad, grid_header_h).into_any());
                     h_stack_from_iter(kids)
                         .style(|s| s.flex_row().background(theme::bg_header_row()))
                         .into_any()
@@ -7559,11 +7563,11 @@ fn data_row(
     dyn_container(
         move || win.get(),
         move |w| {
-            let mut kids: Vec<AnyView> = vec![col_spacer(w.left_pad, row_h()).into_any()];
+            let mut kids: Vec<AnyView> = vec![col_spacer(w.left_pad, row_h).into_any()];
             for k in w.start..w.end {
                 kids.push(cell_at(gs, pos, data_idx, cols[k], pending).into_any());
             }
-            kids.push(col_spacer(w.right_pad, row_h()).into_any());
+            kids.push(col_spacer(w.right_pad, row_h).into_any());
             h_stack_from_iter(kids)
                 .style(move |s| zebra_bg(s.flex_row().height(row_h()).items_center(), pos))
                 .into_any()

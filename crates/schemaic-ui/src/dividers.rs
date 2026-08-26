@@ -98,9 +98,12 @@ pub(crate) fn h_resize_handle(
     // dragging (the transition is for the collapse slide; during a resize it just
     // makes the width lag the pointer).
     dragging: RwSignal<bool>,
-    // Drag clamp: floor `min_w`, ceiling `max_w()` (reactive — leaves the center +
-    // the opposite panel their minimums).
-    min_w: f64,
+    // Drag clamp: floor `min_w()`, ceiling `max_w()` — both reactive, leaving the
+    // center + the opposite panel their minimums. **A `fn`, not a number**: it is
+    // `schema_min_w()`/`right_min_w()`, which are `scaled`, and a captured one
+    // froze the floor at whatever scale the view was last built at. See
+    // `scaled_arg_gate`.
+    min_w: fn() -> f64,
     max_w: impl Fn() -> f64 + Copy + 'static,
     // Double-click resets `dim` to this default (animated, since not dragging).
     default: f64,
@@ -160,8 +163,11 @@ pub(crate) fn h_resize_handle(
                     let d = if from_right { -d } else { d };
                     // Floor at `min_w`; ceiling `max_w()` keeps the center (and the
                     // opposite panel) at their minimums so a drag can't swallow them.
-                    let hi = max_w().max(min_w);
-                    dim.update(|w| *w = (*w + d).clamp(min_w, hi));
+                    // Both read **here**, inside the gesture, so a scale change
+                    // between build and drag moves the floor with everything else.
+                    let lo = min_w();
+                    let hi = max_w().max(lo);
+                    dim.update(|w| *w = (*w + d).clamp(lo, hi));
                 }
                 EventPropagation::Stop
             } else {
@@ -199,16 +205,20 @@ pub(crate) fn h_resize_handle(
 // up/down). `base_top` offsets past the tab bar to the editor's bottom edge; `dim`
 // is the editor height. Always shown (both areas are always present).
 pub(crate) fn v_resize_handle(
-    base_top: f64,
+    // **A `fn`, not a number**: `tab_bar_h()` is `scaled`, and a captured one left
+    // the divider drawing at the previous scale's tab-bar height — ~20px low, over
+    // the results toolbar, after 160% → 100%. See `scaled_arg_gate`.
+    base_top: fn() -> f64,
     dim: RwSignal<f64>,
     // Effective (floored) editor height → where the handle sits. May be more than
     // `dim` when a height persisted under a lower floor is being rendered against
     // a higher one, which is why the handle can't position from `dim` itself: it
     // would float inside the grid, away from the edge it drags.
     edge: impl Fn() -> f64 + Copy + 'static,
-    // Drag clamp: floor `min_h` (query editor min), ceiling `max_h()` (reactive —
-    // leaves the results grid its minimum height).
-    min_h: f64,
+    // Drag clamp: floor `min_h()` (query editor min), ceiling `max_h()` — both
+    // reactive, leaving the results grid its minimum height. A `fn` for the same
+    // reason `min_w` is.
+    min_h: fn() -> f64,
     max_h: impl Fn() -> f64 + Copy + 'static,
     default: f64,
     on_commit: Rc<dyn Fn()>,
@@ -233,7 +243,7 @@ pub(crate) fn v_resize_handle(
                 .justify_center()
                 .cursor(CursorStyle::RowResize)
                 .height(resize_hit())
-                .inset_top(base_top + edge() - resize_hit() / 2.0)
+                .inset_top(base_top() + edge() - resize_hit() / 2.0)
         })
         .on_event(EventListener::PointerEnter, move |_| {
             hovered.enter();
@@ -251,7 +261,9 @@ pub(crate) fn v_resize_handle(
             if dragging.get_untracked() {
                 if let Event::PointerMove(pe) = e {
                     let d = pe.pos.y - resize_hit() / 2.0;
-                    dim.update(|h| *h = (*h + d).clamp(min_h, max_h().max(min_h)));
+                    // Read here, inside the gesture — see `min_w`'s twin above.
+                    let lo = min_h();
+                    dim.update(|h| *h = (*h + d).clamp(lo, max_h().max(lo)));
                 }
                 EventPropagation::Stop
             } else {
@@ -354,6 +366,122 @@ mod double_click_gate {
                  double-click eats the second `PointerUp`, so this handler is the \
                  only place that runs — without these the handle stays captured and \
                  keeps resizing on mouse-move with no button down."
+            );
+        }
+    }
+}
+
+/// **A length a handle is *given* must be a `fn`, not a number** — unless it is
+/// on the list below with a reason.
+///
+/// Both dividers took their clamp floors and the editor's top offset as plain
+/// `f64`, resolved by the caller at build time. Every one of them is a
+/// `theme::scaled` metric, so every one froze at whatever the interface scale was
+/// when the view was last built, and two visible bugs came out of the same three
+/// parameters:
+///
+/// * `base_top` (`tab_bar_h()`) froze, so after 160% → 100% the query/results
+///   divider drew ~20px low — over the results toolbar — because the style
+///   closure re-ran with a stale offset baked into it.
+/// * `min_w` (`schema_min_w()` / `right_min_w()`) froze, so after 160% → 100% the
+///   schema and AI panels could not be dragged below **400px** — 250 scaled by
+///   1.6 — and only relaunching the app cleared it. The *render* clamp was never
+///   wrong: `effective_schema_w` calls `schema_min_w()` inside itself. Only the
+///   drag floor was.
+///
+/// `min_h` was the same defect on the third parameter and had simply not been
+/// noticed yet.
+///
+/// A source gate rather than a unit test, and that is not a compromise: the
+/// arithmetic (`clamp(min, max)`) was correct throughout. What was wrong was
+/// **when the number was read**, which no test of a pure function can see — the
+/// same reason `theme::scaled`'s own doc says to call it inside the style closure.
+/// The sibling parameters (`edge`, `max_w`, `visible`) were always `impl Fn`,
+/// which is why nobody noticed the other three were not.
+#[cfg(test)]
+mod scaled_arg_gate {
+    use std::path::Path;
+
+    /// `(parameter, why a plain `f64` is right for it)`. Everything else in a
+    /// handle's signature must be a `fn() -> f64` or a signal.
+    const EXEMPT: &[(&str, &str)] = &[(
+        "default",
+        "the double-click reset target — `theme::SCHEMA_W` / `AI_W` / `EDITOR_H`, \
+         which are seeds for a persisted user-dragged size and are deliberately \
+         unscaled (see `consts.rs`'s exception list). A scale change must not \
+         move where a reset lands, or the same double-click would give a \
+         different width at each scale.",
+    )];
+
+    #[test]
+    fn no_handle_takes_a_length_it_cannot_re_read() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("dividers.rs"),
+        )
+        .expect("dividers.rs");
+        let body = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => &src[..],
+        };
+
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, sig) in body
+            .split("pub(crate) fn ")
+            .skip(1)
+            .filter_map(|rest| {
+                let name = rest.split('(').next()?.trim().to_string();
+                let end = rest.find(") -> impl IntoView")?;
+                Some((name, rest[..end].to_string()))
+            })
+            .filter(|(n, _)| n.ends_with("_resize_handle"))
+        {
+            checked += 1;
+            for line in sig.lines() {
+                let line = line.trim();
+                if line.starts_with("//") {
+                    continue;
+                }
+                let Some(param) = line.strip_suffix(": f64,").or(line.strip_suffix(": f64")) else {
+                    continue;
+                };
+                if EXEMPT.iter().any(|(p, _)| *p == param) {
+                    continue;
+                }
+                offenders.push(format!(
+                    "{name}: `{param}: f64` is resolved at build time, so it \
+                     freezes at the interface scale the view was last built at. \
+                     Take it as `fn() -> f64` and call it where it is used. If it \
+                     is genuinely not a scaled length, add it to EXEMPT with the \
+                     reason."
+                ));
+            }
+        }
+        assert_eq!(
+            checked, 2,
+            "expected both resize handles; found {checked} — did one get renamed?"
+        );
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
+    /// An exemption that no longer names a real parameter is a stale licence the
+    /// next `f64` at that spelling would inherit.
+    #[test]
+    fn every_exemption_still_names_a_real_parameter() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("dividers.rs"),
+        )
+        .expect("dividers.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        for (param, why) in EXEMPT {
+            assert!(
+                body.contains(&format!("{param}: f64")),
+                "EXEMPT licenses `{param}: f64` ({why}), but no handle takes it \
+                 any more — drop the entry"
             );
         }
     }
