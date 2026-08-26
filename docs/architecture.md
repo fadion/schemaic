@@ -5570,7 +5570,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   rename, find/replace).
 - **A key event goes to the focused view and, if consumed, to *nobody* else.** The dispatch is
   `directed` — no bubbling to ancestors, and with focus on nothing only the root view's own
-  listeners run. Floem's editor consumes every `KeyDown`, so a focused `edit_field` used to swallow
+  listeners run.
+  **"The root view" means the view the app's view function *returned*, and nothing inside it.**
+  That distinction is the whole of a bug this survived a release with. `WindowHandle` keeps
+  `main_view` = `view_fn(window_id).id()`, and the unconsumed-key fallback is
+  `main_view.apply_event(listener, event)` — `ViewId::apply_event` reads the listeners registered on
+  **that one id** and never walks children. The focus path is no help either: it dispatches
+  *downward* from the focused view, so an ancestor is not a bubble target. `69fd7aa` wrapped
+  `workspace`'s root in an outer stack to hold the eight window resize zones and left the KeyDown
+  listener on the inner `root` — one level down, and therefore unreachable. Every branch in it went
+  dead whenever focus was outside the SQL editor: Escape closing an open dropdown, the Tab-trap
+  backstop, `NavKeys` (Ctrl+P, Ctrl+Shift+P, Ctrl+T/W, Ctrl+Tab, Ctrl+1-9, Ctrl+O/S) and the three
+  panel toggles. **It looked fine because `editor_pane` answers the same keys in its own handler
+  and the editor usually has focus** — the app's most-used surface masking the failure everywhere
+  else. `lib::window_key_gate` now asserts the listener is attached after `chrome.resize_zones()`,
+  i.e. onto the returned stack; it is crude on purpose (a precise check would have to parse the
+  builder chain) and fails on exactly the mistake that was made.
+  Floem's editor consumes every `KeyDown`, so a focused `edit_field` used to swallow
   Escape and leave the enclosing modal unclosable from the keyboard. The fix is a two-step the user
   can see: Escape in a field with no `on_escape` of its own blurs it and hands focus back to the
   innermost mounted `widgets::focus_root`, and the *next* Escape reaches that overlay's handler.
