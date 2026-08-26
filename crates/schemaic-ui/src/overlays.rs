@@ -1043,7 +1043,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     //
     //   1. Open        — what a double-click would have done
     //   2. Read        — Copy name, Copy qualified name, then what the node can
-    //                    show you (Properties, Show diagram, Generate DDL),
+    //                    show you (Properties, ER Diagram, Generate DDL),
     //                    closing with Refresh
     //   3. Tree state  — Favorite, Colour, Hide: the row, not the object
     //   4. Write       — Create / Edit / Import / Triggers, with the entries
@@ -1095,7 +1095,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                     // ER diagram of the whole database (every related table).
                     let edb = menu.name.clone();
-                    entries.push(MenuEntry::action("Show diagram", move || {
+                    entries.push(MenuEntry::action("ER Diagram", move || {
                         erd.set(Some(crate::ErdTarget {
                             conn_id: active_conn.get_untracked(),
                             database: edb.clone(),
@@ -1479,7 +1479,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // name — so a table outside `public` seeds `sales.orders`
                         // and can't be confused with a same-named one elsewhere.
                         let seed_id = source.display();
-                        entries.push(MenuEntry::action("Show diagram", move || {
+                        entries.push(MenuEntry::action("ER Diagram", move || {
                             erd.set(Some(crate::ErdTarget {
                                 conn_id: active_conn.get_untracked(),
                                 database: db.clone(),
@@ -5575,7 +5575,7 @@ mod menu_order_gate {
             | "Copy qualified name"
             | "Properties"
             | "Live monitor"
-            | "Show diagram"
+            | "ER Diagram"
             // One node, two spellings, same slot: a table has four things to
             // generate and gets the submenu, a view has one and keeps the flat
             // entry rather than spending a hover on a lone child.
