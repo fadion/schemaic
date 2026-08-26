@@ -5076,9 +5076,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   actionable, while Server Activity on an engine with no sessions is permanent and keeps
   `toggle_icon`'s original ruling that *a toggle which opens an explanation is a worse answer than
   one that visibly isn't offered*. When both apply the narrow one speaks, being the half the user
-  can act on. The same silent no-op still exists on **Find-Anywhere's panel commands**
-  (`overlays.rs`), which is a different affordance — a palette list has no dim-and-explain idiom —
-  and is left as an open question rather than answered by analogy.
+  can act on.
+  **Find-Anywhere's Toggle Panel rows answer the same state, in the palette's own idiom:** dimmed
+  and skipped, with no tooltip — a list row is not a control with a hover affordance, and the rows
+  beside it are the explanation. They read the same two predicates, so the palette and the status
+  bar can never offer different answers. Note the palette now has **two** answers to "unavailable"
+  and they are not interchangeable: *omission* for Server Activity on an engine with no sessions,
+  because that panel does not exist for the connection and a row would be a route the mouse
+  refuses; *dimming* for a window that is too narrow, because the command is real and will work
+  again in a moment — and dropping those rows would make the list's length jitter while the user
+  drags a window edge. `PaletteItem::enabled` carries it, `widgets::list_step_enabled` and
+  `first_enabled` keep the arrow keys off dead rows (unit-tested, including a cursor left on a row
+  that has just gone dead), and `open_sel` refuses one that Enter still reaches.
 - **A tooltip that appears only sometimes needs `widgets::tip_when`, not a branch.** Floem's
   `.tooltip()` has no "not now": once the hover delay fires it always adds the overlay, and an empty
   tip is a small empty box because `TooltipClass` paints its chrome on whatever root it is handed.
