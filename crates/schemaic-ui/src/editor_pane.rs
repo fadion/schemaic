@@ -593,8 +593,8 @@ fn cmdk_popup(
             // `p.y` = the caret line's bottom edge; +8 clears the line, inset 10
             // from the editor edges — matching the pre-animation compact box.
             let p = cmdk.point.get();
-            s.inset_left(10.0)
-                .inset_right(10.0)
+            s.inset_left(float_inset())
+                .inset_right(float_inset())
                 .inset_top(p.y + 8.0)
                 .height(theme::scaled(42.0))
         }
@@ -2764,9 +2764,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .style(move |s| {
             if matches!(results.get(), QueryState::Failed(_)) {
                 s.absolute()
-                    .inset_left(5.0)
-                    .inset_right(5.0)
-                    .inset_bottom(5.0)
+                    .inset_left(float_inset())
+                    .inset_right(float_inset())
+                    .inset_bottom(float_inset())
                     .height(theme::scaled(35.0))
             } else {
                 s
@@ -2826,9 +2826,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .style(move |s| {
             if guard.get().is_some() {
                 s.absolute()
-                    .inset_left(5.0)
-                    .inset_right(5.0)
-                    .inset_bottom(5.0)
+                    .inset_left(float_inset())
+                    .inset_right(float_inset())
+                    .inset_bottom(float_inset())
                     .height(theme::scaled(35.0))
             } else {
                 s
@@ -3259,8 +3259,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .style(move |s| {
             let s = s
                 .absolute()
-                .inset_right(7.0)
-                .inset_bottom(7.0)
+                .inset_right(float_inset())
+                .inset_bottom(float_inset())
                 .items_center()
                 .justify_center()
                 .padding_left(theme::scaled(10.0))
@@ -3648,7 +3648,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     .into_any()
             },
         )
-        .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
+        .style(|s| {
+            s.absolute()
+                .inset_top(float_inset())
+                .inset_right(float_inset())
+        })
     };
 
     // Go-to-line popup: styled like the find bar (same panel + position), one row —
@@ -3709,7 +3713,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .into_any()
             },
         )
-        .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
+        .style(|s| {
+            s.absolute()
+                .inset_top(float_inset())
+                .inset_right(float_inset())
+        })
     };
 
     // Order: editor, syntax squiggles, statement highlight, run overlay, then the

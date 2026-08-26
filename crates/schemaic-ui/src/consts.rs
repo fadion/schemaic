@@ -28,14 +28,6 @@
 //!   • **Icon bases** (`SCHEMA_ICON_BASE`, `COMPLETION_ICON_BASE`) — the
 //!     unscaled figure a `scaled()` is *applied to* at the call site, so scaling
 //!     the constant too would square the factor.
-//!   • **The air a floating bar keeps from the panel edge** — `GRID_BAR_INSET`
-//!     and `SELECTION_BAR_INSET`, and those two only. Both bars overlay the
-//!     panel rather than spanning it, and the gap between them is arithmetic
-//!     (`grid_selection_lift`) that both have to read the same way; a scale that
-//!     moved one and not the other is the overlap that lift exists to prevent.
-//!     **Whether they should scale at all is an open question** (the review's
-//!     `R2-L8-04`): the honest answer needs the app on screen at 160%, so what is
-//!     written down here is what the code does, not a defence of it.
 //!   • **The terminal's own font ladder** (`TERM_FONT_SIZES`) — the terminal
 //!     font has its own size setting, like the editor's, and the interface scale
 //!     deliberately doesn't touch either.
@@ -591,13 +583,34 @@ pub(crate) fn grid_toolbar_h() -> f64 {
 pub(crate) fn seed_popover_top() -> f64 {
     grid_toolbar_h() + scaled(2.0)
 }
-/// The inset both floating bars keep from the panel edge. Not scaled — it is the
-/// air a floating bar keeps, which is its own bullet on the module doc's
-/// exception list and covers exactly this constant and [`SELECTION_BAR_INSET`].
-/// ("Every other `padding` still literal here", which this comment used to point
-/// at, was an empty set.) Both bars have to read it the *same* way or the gap
-/// between them is decided twice.
-pub(crate) const GRID_BAR_INSET: f64 = 5.0;
+/// **The air a floating box keeps from the edge of the panel it floats over** —
+/// every find bar, the error and write-guard bars, the run pill, the Ctrl+K box,
+/// the ER diagram's two bars, the Seed popover and the grid's selection summary.
+/// One number for one thing.
+///
+/// It used to be five numbers — 5, 7, 8, 10 and 12 across eleven sites, plus two
+/// named `const`s — and none of them was a decision: they were written at
+/// different times and never compared. The set was also **unscaled**, which was
+/// recorded here as deliberate with the review's `R2-L8-04` open against it,
+/// because the honest answer needed the app on screen at 160% and no test can see
+/// a gap. Looked at, at 160%: the 10–12 group read correctly and the 5–7 group
+/// read tight against surroundings that had all grown. So the air scales, and 8
+/// is the base that puts it at 13 at 160% — inside the range that looked right —
+/// and at 10 at 130%.
+///
+/// **Full rate, not half.** A second, gentler curve was the obvious way to keep
+/// 100% pixel-identical, and it was rejected: `scale_at` is the only curve in the
+/// app (`scale_font_at` delegates to it rather than being a second rounding rule),
+/// and a third category would make every future length a taste decision between
+/// "scales", "doesn't" and "scales a bit". Five numbers for one gap is what that
+/// costs. The base moved instead.
+///
+/// The 100% appearance does change, and that was the trade: the grid's bars
+/// loosen from 5, the ER diagram's tighten from 10 and 12. The selection
+/// summary — which was already 8 — is unmoved at 100%.
+pub(crate) fn float_inset() -> f64 {
+    scaled(8.0)
+}
 /// How far off the bottom the selection summary sits: clear of the error bar when
 /// that one is up, at the edge otherwise.
 ///
@@ -606,17 +619,20 @@ pub(crate) const GRID_BAR_INSET: f64 = 5.0;
 /// it had been derived as (`35 + 5 + 5`), so from Large upward the summary painted
 /// *on top of* the bar it exists to sit above — the overlap the shared `any_up`
 /// predicate is there to prevent.
+///
+/// Both terms are [`float_inset`] now. The two bars used to keep *different* air
+/// (5 and 8), on the stated ground that one spans the panel and the other floats
+/// over the cells — a distinction retired with the rest of them, since it is the
+/// same gap doing the same job and one number is what keeps this arithmetic from
+/// being decided twice.
 pub(crate) fn grid_selection_lift(error_up: bool) -> f64 {
     if error_up {
         // The bar's top edge (its own inset + its height), plus this one's gap.
-        grid_bar_h() + GRID_BAR_INSET * 2.0
+        grid_bar_h() + float_inset() * 2.0
     } else {
-        SELECTION_BAR_INSET
+        float_inset()
     }
 }
-/// The selection summary's own inset at the panel edge — wider than
-/// [`GRID_BAR_INSET`] because it floats over the cells rather than spanning them.
-pub(crate) const SELECTION_BAR_INSET: f64 = 8.0;
 // Trailing-debounce delay for the schema-tree + query-history search boxes: the
 // input stays live, but the expensive re-filter/re-expand fires once the typing
 // pauses this long — so a single keystroke doesn't churn a large schema/history.
@@ -926,22 +942,24 @@ mod scale_tests {
     #[test]
     fn the_selection_summary_clears_the_error_bar_at_every_scale() {
         at(UiScale::Normal, || {
-            assert_eq!(
-                grid_selection_lift(true),
-                45.0,
-                "the number the app shipped with"
-            );
+            // **51, not the 45 the app shipped with**, and the change is the
+            // point rather than a regression: the bar's air went from a literal
+            // 5 to `float_inset()`'s 8, so its top edge is `35 + 8 + 8`. Written
+            // out rather than derived, for the reason the neighbouring identity
+            // tests give — comparing against the formula would pass even if
+            // every term moved.
+            assert_eq!(grid_selection_lift(true), 51.0);
         });
         for scale in UiScale::ALL {
             at(scale, || {
                 assert!(
-                    grid_selection_lift(true) > GRID_BAR_INSET + grid_bar_h(),
+                    grid_selection_lift(true) > float_inset() + grid_bar_h(),
                     "{}: the summary is inside the bar it sits above",
                     scale.label()
                 );
                 assert_eq!(
                     grid_selection_lift(false),
-                    SELECTION_BAR_INSET,
+                    float_inset(),
                     "{}: with no bar up it sits at the edge",
                     scale.label()
                 );
@@ -1244,5 +1262,159 @@ mod virtual_space_tests {
         let h = body_scroll_h(200.0 * 26.0, 600.0, 26.0);
         assert_eq!(h, 5200.0 + 600.0 - 26.0);
         assert_eq!(h - 600.0, 5200.0 - 26.0);
+    }
+}
+
+/// **The air a floating box keeps from a panel edge is [`float_inset`], not a
+/// number typed at the site.**
+///
+/// This is the gate the `R2-L8-04` answer needs to stay answered. Eleven sites
+/// had drifted to five different gaps — 5, 7, 8, 10, 12 — none of them a
+/// decision, because nothing compares two numbers written a month apart in
+/// different files, and no test can see a gap. The next one would be a sixth.
+///
+/// The exception list is **data, not prose**, and every entry names the thing it
+/// exempts. A scrollbar thumb is the whole of it: its offset is measured from the
+/// track it rides in, which is code-font-relative, so it is not panel air and
+/// does not follow the interface scale.
+///
+/// A literal `0.0` is exempt without an entry — zero has no scale, and
+/// `inset_left(0.0)` is the flex idiom for "pin to this edge" rather than a gap.
+#[cfg(test)]
+mod float_inset_gate {
+    use std::path::{Path, PathBuf};
+
+    /// `(file, the exact call, why it is not panel air)`. Empty is the healthy
+    /// state for everything that *is*.
+    const EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "editor_pane.rs",
+            "inset_right(3.0)",
+            "the editor's vertical scrollbar thumb — offset within a \
+             code-font-relative track, not air at a panel edge",
+        ),
+        (
+            "editor_pane.rs",
+            "inset_bottom(3.0)",
+            "the editor's horizontal scrollbar thumb — same track",
+        ),
+        (
+            "lib.rs",
+            "inset_right(3.0)",
+            "the terminal's scrollbar thumb — the terminal font has its own size \
+             setting, which the interface scale deliberately doesn't touch",
+        ),
+        (
+            "overlays.rs",
+            "inset_top(1.0 + chat_pad_v())",
+            "a hairline border offset added to a scaled padding — the scaling \
+             term is there, and a 1px rule is 1px at every scale",
+        ),
+    ];
+
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// The file with its test module and comment lines cut off — a gate that
+    /// fires on prose about the thing it forbids gets deleted.
+    fn production_code(src: &str) -> String {
+        let body = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every `inset_*(…)` call on a line, with its argument text.
+    fn inset_calls(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for side in ["inset_top(", "inset_bottom(", "inset_left(", "inset_right("] {
+            let mut from = 0usize;
+            while let Some(i) = line[from..].find(side) {
+                let start = from + i;
+                let open = start + side.len();
+                // Balance to the matching `)`, so a nested call comes along whole.
+                let (mut depth, mut end) = (1usize, open);
+                for (k, c) in line[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + k;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push(line[start..=end].to_string());
+                from = end.max(open);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_floating_box_writes_its_own_inset() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut files = 0usize;
+        for entry in std::fs::read_dir(src_dir()).expect("the crate's own src") {
+            let path = entry.expect("a dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            files += 1;
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let src = std::fs::read_to_string(&path).expect("a source file");
+            for line in production_code(&src).lines() {
+                for call in inset_calls(line) {
+                    // The argument, between the first `(` and the last `)`.
+                    let arg = call[call.find('(').unwrap() + 1..call.len() - 1].trim();
+                    // Not a literal at all: a call, a variable, arithmetic over
+                    // them. Only a bare number is this gate's business.
+                    if !arg.starts_with(|c: char| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    if arg == "0.0" || arg == "0" {
+                        continue;
+                    }
+                    if EXEMPT
+                        .iter()
+                        .any(|(f, c, _)| *f == name.as_str() && *c == call.as_str())
+                    {
+                        continue;
+                    }
+                    offenders.push(format!(
+                        "{name}: `{call}` — the air a floating box keeps from a \
+                         panel edge is `consts::float_inset()`. If this one is \
+                         genuinely not panel air, add it to EXEMPT with the \
+                         reason."
+                    ));
+                }
+            }
+        }
+        assert!(files > 10, "only {files} source files scanned");
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
+    /// The exemptions have to still *be* there — an entry naming a call that no
+    /// longer exists is a stale licence, and the next literal at that spelling
+    /// would inherit it.
+    #[test]
+    fn every_exemption_still_names_a_real_call() {
+        for (file, call, why) in EXEMPT {
+            let src = std::fs::read_to_string(src_dir().join(file))
+                .unwrap_or_else(|_| panic!("EXEMPT names {file}, which does not exist"));
+            assert!(
+                production_code(&src).contains(call),
+                "EXEMPT still licenses `{call}` in {file} ({why}), but no such \
+                 call is there any more — drop the entry"
+            );
+        }
     }
 }
