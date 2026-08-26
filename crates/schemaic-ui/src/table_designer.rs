@@ -92,6 +92,37 @@ fn row_h() -> f64 {
 fn field_w() -> f64 {
     theme::scaled(260.0)
 }
+/// **The four widths derived from [`field_w`], named rather than multiplied at
+/// the call site.**
+///
+/// Every one of these is passed *into* a field builder, and a builder takes a
+/// `fn() -> f64` rather than an `f64` for the reason `theme::scaled` states: a
+/// captured number cannot re-run when the interface scale changes, so the box
+/// keeps its old width while the text inside it grows. An expression at the call
+/// site cannot be a `fn`, so each ratio has a name — which is worth having
+/// anyway, since `field_w() * 1.4` said nothing about why *this* field is wider.
+///
+/// A **sentence**: a table comment, a check-expression. Capped at the form's own
+/// width, because the form is what it has to fit inside.
+fn sentence_field_w() -> f64 {
+    (field_w() * 1.6).min(form_w())
+}
+/// A **column list or a predicate** — `id, name`, `qty > 0`: longer than a name,
+/// shorter than a sentence.
+fn list_field_w() -> f64 {
+    field_w() * 1.4
+}
+/// A **short column list** — a foreign key's own columns and the ones it points
+/// at, which are usually one or two names.
+fn key_field_w() -> f64 {
+    field_w() * 1.2
+}
+/// A **single word**: an index method (`btree`), a foreign-key action
+/// (`CASCADE`). It was a literal `180.0` at three call sites — a length that
+/// never scaled at all, which is the same defect one step worse.
+fn word_field_w() -> f64 {
+    theme::scaled(180.0)
+}
 /// The item list's place in the Tab order: ahead of the form it feeds, because
 /// it sits to the left of it and choosing *what* to edit comes before editing it.
 /// Shared by all four sections — only one list is mounted at a time — and by the
@@ -511,7 +542,7 @@ fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
 fn bound_field(
     ui: &Ui,
     initial: String,
-    width: f64,
+    width: fn() -> f64,
     placeholder: &'static str,
     ring: FocusRing,
     tabindex: u32,
@@ -535,7 +566,7 @@ fn bound_field(
 fn sql_field(
     ui: &Ui,
     initial: String,
-    width: f64,
+    width: fn() -> f64,
     placeholder: &'static str,
     ring: FocusRing,
     tabindex: u32,
@@ -574,7 +605,7 @@ fn bound_signal(
 
 fn field_view(
     sig: RwSignal<String>,
-    width: f64,
+    width: fn() -> f64,
     placeholder: &'static str,
     mono: bool,
     ring: FocusRing,
@@ -589,7 +620,15 @@ fn field_view(
             ..Default::default()
         },
     )
-    .style(move |s| s.width(width))
+    // **Called inside the closure, not resolved into it.** `width` is a `fn`
+    // rather than an `f64` for the reason `theme::scaled` states and
+    // `cell_editors::pick_field_w` was written up for: a captured number cannot
+    // re-run when the interface scale changes, so the box kept its old width
+    // while the type inside it grew. Every one of these is `field_w`, which is
+    // `scaled(…)` — so every one of them was frozen, and they would all have
+    // frozen together the first time the scale became reachable from anywhere
+    // but the settings modal.
+    .style(move |s| s.width(width()))
     .into_any()
 }
 
@@ -703,7 +742,7 @@ pub(crate) fn suggest_chevron(
 fn bound_field_with_menu(
     ui: &Ui,
     initial: String,
-    width: f64,
+    width: fn() -> f64,
     placeholder: &'static str,
     mono: bool,
     options: Vec<String>,
@@ -734,7 +773,7 @@ fn bound_field_with_menu(
 pub(crate) fn focusable_owned_dropdown(
     current: impl Fn() -> String + Copy + 'static,
     options: Vec<String>,
-    width: f64,
+    width: fn() -> f64,
     ring: crate::widgets::FocusRing,
     tabindex: u32,
     on_pick: impl Fn(String) + 'static,
@@ -767,7 +806,8 @@ pub(crate) fn focusable_owned_dropdown(
         ring,
         tabindex,
     ))
-    .style(move |s| s.width(width))
+    // Inside the closure — see `field_view`.
+    .style(move |s| s.width(width()))
 }
 
 /// A toggle row bound to the draft, same shape as the settings modals'.
@@ -1078,7 +1118,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         bound_field(
             &ui,
             draft.name.clone(),
-            field_w(),
+            field_w,
             "table_name",
             ring.clone(),
             10,
@@ -1094,7 +1134,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 draft.comment.clone().unwrap_or_default(),
-                (field_w() * 1.6).min(form_w()),
+                sentence_field_w,
                 "What this table is for",
                 ring.clone(),
                 20,
@@ -1116,7 +1156,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field_with_menu(
                     &ui,
                     draft.engine.clone().unwrap_or_default(),
-                    field_w(),
+                    field_w,
                     "InnoDB",
                     // A storage-engine name isn't SQL text the way a type is.
                     false,
@@ -1131,7 +1171,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field(
                     &ui,
                     draft.collation.clone().unwrap_or_default(),
-                    field_w(),
+                    field_w,
                     "utf8mb4_general_ci",
                     ring,
                     40,
@@ -1240,7 +1280,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         bound_field(
             &ui,
             c.name.clone(),
-            field_w(),
+            field_w,
             "column_name",
             ring.clone(),
             10,
@@ -1253,7 +1293,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field_with_menu(
                 &ui,
                 c.type_name.clone(),
-                field_w(),
+                field_w,
                 "varchar(255)",
                 true,
                 ddl::common_types(target.dialect)
@@ -1321,7 +1361,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             sql_field(
                 &ui,
                 c.default.clone().unwrap_or_default(),
-                field_w(),
+                field_w,
                 "",
                 ring.clone(),
                 60,
@@ -1340,7 +1380,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             sql_field(
                 &ui,
                 c.generated.clone().unwrap_or_default(),
-                field_w(),
+                field_w,
                 "",
                 ring.clone(),
                 70,
@@ -1359,7 +1399,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 c.comment.clone().unwrap_or_default(),
-                field_w(),
+                field_w,
                 "",
                 ring.clone(),
                 100,
@@ -1379,7 +1419,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         bound_field(
             &ui,
             c.collation.clone().unwrap_or_default(),
-            field_w(),
+            field_w,
             "",
             ring.clone(),
             80,
@@ -1400,7 +1440,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 c.on_update.clone().unwrap_or_default(),
-                field_w(),
+                field_w,
                 "CURRENT_TIMESTAMP",
                 ring,
                 90,
@@ -1518,7 +1558,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                     bound_field(
                         &ui,
                         ix.method.clone().unwrap_or_default(),
-                        180.0,
+                        word_field_w,
                         "btree",
                         ring.clone(),
                         40,
@@ -1538,7 +1578,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                     bound_field(
                         &ui,
                         ix.predicate.clone().unwrap_or_default(),
-                        field_w() * 1.4,
+                        list_field_w,
                         "",
                         ring.clone(),
                         50,
@@ -1565,7 +1605,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 ix.name.clone(),
-                field_w(),
+                field_w,
                 "index_name",
                 ring.clone(),
                 10,
@@ -1582,7 +1622,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field(
                     &ui,
                     key_list_text(&ix.columns),
-                    field_w() * 1.4,
+                    list_field_w,
                     "id, name",
                     ring.clone(),
                     20,
@@ -1710,7 +1750,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 })
             },
             tables,
-            field_w(),
+            field_w,
             ring.clone(),
             30,
             move |v| {
@@ -1736,7 +1776,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 })
             },
             actions.clone(),
-            180.0,
+            word_field_w,
             ring.clone(),
             50,
             move |v| {
@@ -1761,7 +1801,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 })
             },
             actions,
-            180.0,
+            word_field_w,
             ring.clone(),
             60,
             move |v| {
@@ -1780,7 +1820,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 fk.name.clone(),
-                field_w(),
+                field_w,
                 "fk_name",
                 ring.clone(),
                 10,
@@ -1797,7 +1837,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
                 bound_field(
                     &ui,
                     fk.columns.join(", "),
-                    field_w() * 1.2,
+                    key_field_w,
                     "customer_id",
                     ring.clone(),
                     20,
@@ -1816,7 +1856,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             bound_field(
                 &ui,
                 fk.ref_columns.join(", "),
-                field_w() * 1.2,
+                key_field_w,
                 "id",
                 ring,
                 40,
@@ -1918,7 +1958,7 @@ fn check_form(
         bound_field(
             &ui,
             ck.name.clone(),
-            field_w(),
+            field_w,
             "qty_positive",
             ring.clone(),
             10,
@@ -1935,7 +1975,7 @@ fn check_form(
             bound_field(
                 &ui,
                 ck.expression.clone(),
-                (field_w() * 1.6).min(form_w()),
+                sentence_field_w,
                 "qty > 0",
                 ring.clone(),
                 20,
@@ -2380,5 +2420,73 @@ mod tests {
     fn a_selection_past_the_end_declines_rather_than_panicking() {
         assert_eq!(swap_target(3, 7, -1), None);
         assert_eq!(swap_target(3, 7, 1), None);
+    }
+}
+
+/// **Every width a field builder is handed must move with the interface scale.**
+///
+/// The builders take a `fn() -> f64` so the number is computed *inside* the
+/// style closure, and that is only half the fix — a `fn` that returns a literal
+/// is as frozen as a captured one. Three call sites here passed a bare `180.0`,
+/// which never scaled at any point in its life; nothing looked wrong, because a
+/// field that is 180px at every scale is merely a bit narrow at 160% rather than
+/// visibly broken.
+///
+/// A test rather than a rule in a comment, because that is exactly the failure
+/// mode: invisible, and reintroduced by the next person who writes a width at a
+/// call site.
+#[cfg(test)]
+mod width_scale_tests {
+    use super::*;
+    use crate::theme::UiScale;
+
+    /// A width function and the name to report it under.
+    type NamedWidth = (&'static str, fn() -> f64);
+
+    /// Every width this module hands to a field builder, by name.
+    fn widths() -> Vec<NamedWidth> {
+        vec![
+            ("field_w", field_w as fn() -> f64),
+            ("sentence_field_w", sentence_field_w),
+            ("list_field_w", list_field_w),
+            ("key_field_w", key_field_w),
+            ("word_field_w", word_field_w),
+        ]
+    }
+
+    #[test]
+    fn every_form_width_grows_with_the_interface_scale() {
+        for (name, w) in widths() {
+            crate::theme::set_ui_scale(UiScale::Normal);
+            let normal = w();
+            crate::theme::set_ui_scale(UiScale::Huge);
+            let huge = w();
+            crate::theme::set_ui_scale(UiScale::Normal);
+            assert!(
+                huge > normal,
+                "{name}: {normal} at Normal and {huge} at Huge — a width that \
+                 does not move is a field that keeps its size while the text \
+                 inside it grows"
+            );
+        }
+    }
+
+    /// The derived widths keep their order, at every scale: a word is narrower
+    /// than a key list, which is narrower than a column list, which is narrower
+    /// than a sentence. A ratio applied to an unscaled base would cross them.
+    #[test]
+    fn the_derived_widths_keep_their_order() {
+        for scale in [
+            UiScale::Small,
+            UiScale::Normal,
+            UiScale::Large,
+            UiScale::Huge,
+        ] {
+            crate::theme::set_ui_scale(scale);
+            let (word, key, list) = (word_field_w(), key_field_w(), list_field_w());
+            crate::theme::set_ui_scale(UiScale::Normal);
+            assert!(word < key, "{scale:?}: word {word} >= key {key}");
+            assert!(key < list, "{scale:?}: key {key} >= list {list}");
+        }
     }
 }

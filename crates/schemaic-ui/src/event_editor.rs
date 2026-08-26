@@ -61,6 +61,15 @@ const PANEL_H: f64 = 620.0;
 fn field_w() -> f64 {
     theme::scaled(260.0)
 }
+/// The interval-unit picker beside the "every N" box: one word (`SECOND`,
+/// `DAY`), so it takes less than a field.
+///
+/// Named rather than written as `field_w() * 0.7` at the call site because the
+/// builder takes a `fn() -> f64` — a captured number cannot re-run when the
+/// interface scale changes, and an expression cannot be a `fn`.
+fn unit_field_w() -> f64 {
+    field_w() * 0.7
+}
 /// The body box's height before it scrolls.
 const BODY_ROWS: usize = 12;
 
@@ -346,7 +355,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
             focusable_owned_dropdown(
                 move || sig.get(),
                 vec![SCHED_EVERY.to_string(), SCHED_AT.to_string()],
-                field_w(),
+                field_w,
                 ring.clone(),
                 TAB_SHAPE,
                 move |label: String| {
@@ -481,7 +490,7 @@ fn schedule_form(ui: Ui, ring: FocusRing) -> AnyView {
                     focusable_owned_dropdown(
                         move || unit_sig.get(),
                         units,
-                        field_w() * 0.7,
+                        unit_field_w,
                         ring.clone(),
                         TAB_SCHED + 10,
                         move |v: String| {
@@ -673,7 +682,7 @@ fn event_form(ui: Ui, ring: FocusRing) -> AnyView {
                 focusable_owned_dropdown(
                     move || sig.get(),
                     labels,
-                    field_w(),
+                    field_w,
                     ring.clone(),
                     TAB_OPT,
                     move |label: String| {

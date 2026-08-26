@@ -828,7 +828,7 @@ fn sequence_form(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
-                field_w(),
+                field_w,
                 ring.clone(),
                 20,
                 move |v: String| {

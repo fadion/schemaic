@@ -410,7 +410,7 @@ fn bound_choice(
     focusable_owned_dropdown(
         move || sig.get(),
         options,
-        field_w(),
+        field_w,
         ring,
         tabindex,
         move |v: String| {
@@ -991,7 +991,7 @@ fn pg_action(
             focusable_owned_dropdown(
                 move || sel.get(),
                 options,
-                field_w(),
+                field_w,
                 picker_ring.clone(),
                 60,
                 move |v: String| {

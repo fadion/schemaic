@@ -202,9 +202,15 @@ fn probe(ui: Ui, sniff: bool) {
     );
 }
 
+/// The delimiter box: one or two characters, so it is sized to its content
+/// rather than to the form's field column.
+///
+/// `width` is a `fn` rather than an `f64` for the reason `theme::scaled` states —
+/// a captured number cannot re-run when the interface scale changes, and the box
+/// would keep its old width while the character inside it grew.
 fn small_field(
     value: RwSignal<String>,
-    width: f64,
+    width: fn() -> f64,
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
@@ -215,7 +221,12 @@ fn small_field(
             ..Default::default()
         },
     )
-    .style(move |s| s.width(width))
+    .style(move |s| s.width(width()))
+}
+
+/// The delimiter box's width — two characters of the form font plus its padding.
+fn delimiter_w() -> f64 {
+    theme::scaled(96.0)
 }
 
 /// Step 1 — the file and how to read it.
@@ -288,7 +299,7 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                 form_section("Reading"),
                 form_setting(
                     "Delimiter",
-                    small_field(i.delimiter, 96.0, ring.clone(), 20),
+                    small_field(i.delimiter, delimiter_w, ring.clone(), 20),
                 ),
                 focusable_toggle_row(
                     "First row is a header",

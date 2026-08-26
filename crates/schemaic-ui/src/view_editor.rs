@@ -241,7 +241,7 @@ fn bound_choice(
     focusable_owned_dropdown(
         move || sig.get(),
         options,
-        field_w(),
+        field_w,
         ring,
         tabindex,
         move |v: String| {
