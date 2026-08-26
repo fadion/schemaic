@@ -2391,6 +2391,10 @@ pub struct SnippetActions {
     /// Set or clear a snippet's expansion abbrev — `None` removes it, which is
     /// the only way to take a trigger back off a snippet.
     pub set_abbrev: Rc<dyn Fn(u64, Option<String>)>,
+    /// Move a snippet to another scope — which connections it is offered on.
+    /// The choices come from `snippet::scope_options`, so the picker's order and
+    /// the panel's bands cannot drift apart.
+    pub set_scope: Rc<dyn Fn(u64, schemaic_core::snippet::Scope)>,
     /// Copy a snippet to a new one — the only way to edit a built-in.
     pub duplicate: Rc<dyn Fn(u64)>,
     /// Delete a snippet, behind the shared confirm.

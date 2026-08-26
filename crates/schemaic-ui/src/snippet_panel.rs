@@ -81,6 +81,7 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
     let list = dyn_container(move || groups.get(), {
         let actions = actions.clone();
         move |groups: Vec<snippet::Group>| {
+            let conn = active_conn.get_untracked();
             if groups.is_empty() {
                 return empty_state(items.with_untracked(|v| v.is_empty())).into_any();
             }
@@ -106,6 +107,7 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
                                     actions.clone(),
                                     term.clone(),
                                     dialect.get_untracked(),
+                                    conn,
                                     renaming,
                                     rename_buf,
                                     overlay,
@@ -249,6 +251,7 @@ fn snippet_row(
     actions: Rc<crate::SnippetActions>,
     term: Option<String>,
     dialect: SqlDialect,
+    conn_id: u64,
     renaming: RwSignal<Option<(u64, RowEdit)>>,
     rename_buf: RwSignal<String>,
     overlay: OverlayUi,
@@ -457,6 +460,8 @@ fn snippet_row(
                 &menu_actions,
                 renaming,
                 rename_buf,
+                dialect,
+                conn_id,
             )));
         })
         .style(|s| {
@@ -475,6 +480,8 @@ fn row_menu(
     actions: &Rc<crate::SnippetActions>,
     renaming: RwSignal<Option<(u64, RowEdit)>>,
     rename_buf: RwSignal<String>,
+    dialect: SqlDialect,
+    conn_id: u64,
 ) -> Vec<MenuEntry> {
     let id = snip.id;
     let name = snip.name.clone();
@@ -506,6 +513,7 @@ fn row_menu(
             rename_buf.set(abbrev.clone());
             renaming.set(Some((id, RowEdit::Abbrev)));
         }));
+        entries.push(scope_menu(snip, actions, dialect, conn_id));
     }
     entries.push(MenuEntry::action("Duplicate", move || (duplicate)(id)));
     if !builtin {
@@ -513,6 +521,48 @@ fn row_menu(
         entries.push(MenuEntry::action("Delete…", move || (remove)(id)));
     }
     entries
+}
+
+/// The **Show in** submenu: which connections this snippet is offered on.
+///
+/// The three choices come from `snippet::scope_options`, narrowest first — the
+/// same order the panel's bands are in, so the choice you pick second is the
+/// heading the row moves to second. The current one is tinted rather than
+/// ticked, the convention the cell editors' value pickers already use.
+///
+/// Named "Show in" rather than "Scope": the row is answering *where does this
+/// appear*, which is the question someone right-clicking has, and "scope" is a
+/// word from the storage model rather than from the panel.
+fn scope_menu(
+    snip: &Snippet,
+    actions: &Rc<crate::SnippetActions>,
+    dialect: SqlDialect,
+    conn_id: u64,
+) -> MenuEntry {
+    let id = snip.id;
+    let current = snip.scope.clone();
+    let children = snippet::scope_options(dialect, conn_id)
+        .into_iter()
+        .map(|scope| {
+            let label = match &scope {
+                // Not the connection's *name*: the panel is already scoped to
+                // the active connection, and the band this choice moves the row
+                // to says "THIS CONNECTION" too.
+                snippet::Scope::Conn(_) => "This connection".to_string(),
+                snippet::Scope::Dialect(d) => format!("Every {} connection", d.engine_label()),
+                _ => "All connections".to_string(),
+            };
+            let held = scope == current;
+            let set_scope = actions.set_scope.clone();
+            let act = move || (set_scope)(id, scope.clone());
+            if held {
+                MenuEntry::action_colored(label, theme::accent, act)
+            } else {
+                MenuEntry::action(label, act)
+            }
+        })
+        .collect();
+    MenuEntry::sub("Show in", children)
 }
 
 /// Current wall-clock time, unix millis — for the "3d ago" label, exactly as the

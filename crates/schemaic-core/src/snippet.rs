@@ -224,6 +224,16 @@ pub fn grouped(all: &[Snippet], dialect: SqlDialect, conn_id: u64, query: &str) 
         .collect()
 }
 
+/// The scopes a snippet on this connection can be moved to, **narrowest first**
+/// — the same order [`grouped`] puts the bands in, so the choice a picker offers
+/// second lands under the heading that is second.
+///
+/// A [`Scope::Unknown`] is not among them and never needs to be: it is offered
+/// nowhere, so there is no row to pick from in the first place.
+pub fn scope_options(dialect: SqlDialect, conn_id: u64) -> Vec<Scope> {
+    vec![Scope::Conn(conn_id), Scope::Dialect(dialect), Scope::Global]
+}
+
 /// Which heading a snippet belongs under. Its own scope decides — a snippet is
 /// in exactly one bucket, so a global one never also appears under the engine.
 fn in_bucket(snippet: &Snippet, bucket: Bucket) -> bool {
@@ -528,6 +538,44 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].items.len(), 1);
         assert_eq!(groups[0].items[0].name, "orders");
+    }
+
+    // ── scope_options ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_scope_choices_are_offered_narrowest_first() {
+        assert_eq!(
+            scope_options(MY, 7),
+            vec![Scope::Conn(7), Scope::Dialect(MY), Scope::Global]
+        );
+    }
+
+    /// The picker's order and the panel's bands are the same order, and this is
+    /// what keeps them so: a row moved to the second choice must land under the
+    /// second heading, not somewhere else in the list.
+    #[test]
+    fn the_scope_choices_match_the_band_order() {
+        let all: Vec<Snippet> = scope_options(MY, 7)
+            .into_iter()
+            .enumerate()
+            .map(|(i, scope)| snip(i as u64 + 1, &format!("s{i}"), scope))
+            .collect();
+        let bands: Vec<Bucket> = grouped(&all, MY, 7, "")
+            .into_iter()
+            .map(|g| g.bucket)
+            .collect();
+        assert_eq!(
+            bands,
+            vec![Bucket::Conn(7), Bucket::Dialect(MY), Bucket::Global]
+        );
+        for (choice, band) in scope_options(MY, 7).into_iter().zip(bands) {
+            let one = vec![snip(1, "x", choice.clone())];
+            assert_eq!(
+                grouped(&one, MY, 7, "")[0].bucket,
+                band,
+                "{choice:?} must land under {band:?}"
+            );
+        }
     }
 
     // ── by_abbrev ───────────────────────────────────────────────────────────
