@@ -677,7 +677,7 @@ pub(crate) struct CompletionCtx<'a> {
     pub(crate) hidden_dbs: Memo<HashSet<String>>,
     pub(crate) active_db: Option<&'a str>,
     pub(crate) dialect: SqlDialect,
-    pub(crate) snippets: RwSignal<Vec<snippet::Snippet>>,
+    pub(crate) snippets: Memo<Vec<snippet::Snippet>>,
     pub(crate) conn_id: u64,
 }
 

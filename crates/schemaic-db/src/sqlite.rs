@@ -7592,4 +7592,54 @@ mod designer_path_tests {
             0
         );
     }
+
+    /// **The shipped SQLite snippets are executed, not just parsed.**
+    ///
+    /// `core::snippet`'s own test can only ask whether they parse — there is no
+    /// server in a unit test — and a statement that parses can still name a
+    /// pragma function that doesn't exist or a column that was renamed between
+    /// SQLite versions. SQLite is the one engine whose server we *have* here, so
+    /// its pack is answered by real SQLite rather than by a model of it. The
+    /// MySQL and PostgreSQL packs have no equivalent and were run by hand
+    /// against MariaDB 10.11, MySQL 8.4 and PostgreSQL 16 instead.
+    #[test]
+    fn every_sqlite_builtin_snippet_runs() {
+        use schemaic_core::params::{Binding, ParamValue};
+        use schemaic_core::{params, snippet};
+
+        // Its own fixture rather than another module's: what these statements
+        // need is a table with an index on it, and nothing else.
+        let conn = SqliteConn::open_in_memory().expect("open");
+        conn.execute_batch(
+            "CREATE TABLE album (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+             CREATE UNIQUE INDEX album_title ON album(title);
+             INSERT INTO album (title) VALUES ('One');",
+        )
+        .expect("seed");
+        for snip in snippet::builtins(SqlDialect::Sqlite) {
+            // A body may ask for a parameter; fill it the way the parameters bar
+            // would, so what runs here is what runs in the app — including the
+            // quoting, which is `export::sql_literal`'s either way.
+            let bindings: Vec<Binding> = params::names(&snip.body, SqlDialect::Sqlite)
+                .into_iter()
+                .map(|name| Binding {
+                    name,
+                    value: Some(ParamValue::Text("album".to_string())),
+                })
+                .collect();
+            let sql = params::substitute(&snip.body, &bindings, SqlDialect::Sqlite)
+                .unwrap_or_else(|e| panic!("{:?} could not be bound: {e}", snip.name));
+            // `prepare` + one step: enough to reach every name the statement
+            // uses, without depending on how many rows this fixture happens to
+            // hold.
+            let mut stmt = conn
+                .prepare(&sql)
+                .unwrap_or_else(|e| panic!("{:?} did not prepare: {e}\n{sql}", snip.name));
+            let mut rows = stmt
+                .query([])
+                .unwrap_or_else(|e| panic!("{:?} did not run: {e}\n{sql}", snip.name));
+            rows.next()
+                .unwrap_or_else(|e| panic!("{:?} failed mid-scan: {e}\n{sql}", snip.name));
+        }
+    }
 }

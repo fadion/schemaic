@@ -41,6 +41,7 @@ mod schema_tree;
 pub use schema_tree::{column_key_named, db_key, table_key_named, table_key_prefix};
 mod settings;
 mod shortcuts;
+mod snippet_edit;
 mod snippet_panel;
 pub mod sql_highlight;
 mod table_designer;
@@ -2363,10 +2364,16 @@ pub struct HistoryUi {
 /// The snippet library's state (Copy bundle).
 #[derive(Clone, Copy)]
 pub struct SnippetsUi {
-    /// Every saved snippet, across every scope — the panel narrows them to the
-    /// active connection itself (`snippet::grouped`), because which ones apply
-    /// is a decision, and it lives in the core with tests.
-    pub items: RwSignal<Vec<schemaic_core::snippet::Snippet>>,
+    /// The whole library this connection sees: the user's snippets **plus the
+    /// built-in pack for its engine** (`snippet::library`, merged once in the
+    /// app). The panel narrows them further itself through `snippet::grouped`,
+    /// because which ones apply is a decision and it lives in the core with
+    /// tests.
+    ///
+    /// A `Memo`, not the persisted signal: writing a built-in into the user's
+    /// `snippets.json` would freeze it there, where a later release could not
+    /// fix it.
+    pub items: Memo<Vec<schemaic_core::snippet::Snippet>>,
     /// Whether [`SnippetActions::save_current`] would save anything — the `+` is
     /// dimmed rather than offering a click that does nothing. A memo, not a
     /// predicate closure: it has to re-run as the editor's text changes, and the
@@ -2391,6 +2398,10 @@ pub struct SnippetActions {
     /// Set or clear a snippet's expansion abbrev — `None` removes it, which is
     /// the only way to take a trigger back off a snippet.
     pub set_abbrev: Rc<dyn Fn(u64, Option<String>)>,
+    /// Replace a snippet's SQL — the snippet editor's only reason to exist.
+    pub set_body: Rc<dyn Fn(u64, String)>,
+    /// Open the snippet editor on a snippet (name, abbrev and body together).
+    pub edit: Rc<dyn Fn(u64)>,
     /// Move a snippet to another scope — which connections it is offered on.
     /// The choices come from `snippet::scope_options`, so the picker's order and
     /// the panel's bands cannot drift apart.
@@ -2772,6 +2783,9 @@ pub struct OverlayUi {
     pub properties_state: RwSignal<PropertiesState>,
     pub properties_counting: RwSignal<bool>,
     pub properties_count_err: RwSignal<Option<String>>,
+    /// The snippet whose body is being edited, or `None`. One at a time, like
+    /// every other editor here.
+    pub snippet_edit: RwSignal<Option<u64>>,
     /// A run the write guard held back, or `None`. Set by
     /// [`TabsActions::run`]/[`TabsActions::run_all`] — which *are* the guarded
     /// run path — and rendered as the editor's guard bar. It lives here, not in

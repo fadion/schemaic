@@ -1116,7 +1116,7 @@ pub(crate) struct QueryPaneParams {
     pub run_guard: RwSignal<Option<crate::RunGuard>>,
     /// The snippet library, for abbrev expansion in the completion popup, and
     /// the connection its scopes are judged against.
-    pub snippets: RwSignal<Vec<schemaic_core::snippet::Snippet>>,
+    pub snippets: Memo<Vec<schemaic_core::snippet::Snippet>>,
     pub active_conn: RwSignal<u64>,
     /// This tab's `:name` parameter values — the parameters bar's store. The bar
     /// collects into it; the run action substitutes with it.

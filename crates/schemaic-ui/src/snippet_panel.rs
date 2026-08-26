@@ -83,7 +83,7 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
         move |groups: Vec<snippet::Group>| {
             let conn = active_conn.get_untracked();
             if groups.is_empty() {
-                return empty_state(items.with_untracked(|v| v.is_empty())).into_any();
+                return empty_state().into_any();
             }
             let term = {
                 let t = search.get_untracked();
@@ -192,16 +192,11 @@ fn snippet_search(filter: RwSignal<String>) -> impl IntoView {
     })
 }
 
-/// Nothing to show: either the library is empty, or the filter matched nothing.
-/// Two different sentences, because "no snippets" under a filter reads as data
-/// loss.
-fn empty_state(library_empty: bool) -> impl IntoView {
-    let msg = if library_empty {
-        "No snippets yet — save one with + above."
-    } else {
-        "No snippet matches."
-    };
-    container(text(msg).style(|s| {
+/// Nothing to show, which — since every engine ships a built-in pack — can only
+/// mean the filter matched nothing. There is no "library is empty" state to
+/// write: `snippet::library` always has the pack in it.
+fn empty_state() -> impl IntoView {
+    container(text("No snippet matches.").style(|s| {
         s.font_size(font_label())
             .color(theme::text_faint())
             .padding_horiz(theme::scaled(12.0))
@@ -491,6 +486,7 @@ fn row_menu(
 
     let open = actions.open_in_tab.clone();
     let open_snip = snip.clone();
+    let edit = actions.edit.clone();
     let duplicate = actions.duplicate.clone();
     let remove = actions.remove.clone();
 
@@ -498,6 +494,11 @@ fn row_menu(
         (open)(open_snip.clone())
     })];
     if !builtin {
+        // First of the editing entries: changing the SQL is the reason to open
+        // a snippet at all, and the two inline edits below are its shortcuts.
+        entries.push(MenuEntry::action("Edit…", move || {
+            (edit)(id);
+        }));
         entries.push(MenuEntry::action("Rename…", move || {
             rename_buf.set(name.clone());
             renaming.set(Some((id, RowEdit::Name)));
