@@ -209,6 +209,15 @@ fn cmdk_popup(
     // the editor (else focus is left dangling after the input is torn down).
     let editor_view_id = ed.editor_view_id;
 
+    // The expanded overlay's chrome, measured. These sit OUT here because the
+    // views that report them are rebuilt by the `dyn_container` below on every
+    // state change, and a signal owned inside it would be disposed with them —
+    // taking the last measurement with it and collapsing the diff on the frame
+    // after every rebuild. Zero means "not laid out yet" and
+    // `cmdk_diff_h_measured` falls back to the estimate for that one frame.
+    let input_h = RwSignal::new(0.0_f64);
+    let buttons_h = RwSignal::new(0.0_f64);
+
     // These three all mutate the state that drives the overlay's `dyn_container`,
     // which tears the prompt field down. Since they're invoked from INSIDE the
     // editor's key handler (Enter/Escape), doing that synchronously would dispose
@@ -349,7 +358,11 @@ fn cmdk_popup(
                     ..Default::default()
                 },
             )
-            .style(|s| s.width_full().min_width(0.0).flex_shrink(0.0_f32));
+            .style(|s| s.width_full().min_width(0.0).flex_shrink(0.0_f32))
+            // Measured, not predicted — see `consts::cmdk_diff_h_measured`. The
+            // field states its own height (`scaled(40)`), but the button row below
+            // is text plus padding and only layout knows how tall that is.
+            .on_resize(move |r| input_h.set(r.height()));
 
             let body = match state {
                 InlineAiState::Idle => empty().into_any(),
@@ -435,9 +448,13 @@ fn cmdk_popup(
                                     // re-sizes the diff instead of leaving it sized
                                     // for the pane the overlay opened in.
                                     move |s| {
-                                        s.height(cmdk_diff_h(area_h.get()))
-                                            .width_full()
-                                            .min_width(0.0)
+                                        s.height(cmdk_diff_h_measured(
+                                            area_h.get(),
+                                            input_h.get(),
+                                            buttons_h.get(),
+                                        ))
+                                        .width_full()
+                                        .min_width(0.0)
                                     },
                                 ))
                                 .style(|s| s.width_full().border_radius(5.0))
@@ -504,7 +521,11 @@ fn cmdk_popup(
                                 .flex_shrink(0.0_f32)
                                 .padding_horiz(theme::scaled(5.0))
                                 .padding_bottom(theme::scaled(5.0))
-                        }),
+                        })
+                        // The other half of the measurement: this row is text plus
+                        // padding, so its height depends on the font, not on a
+                        // number anyone can write down.
+                        .on_resize(move |r| buttons_h.set(r.height())),
                     ))
                     .style(|s| s.flex_col().width_full().min_width(0.0))
                     .into_any()

@@ -1689,11 +1689,14 @@ pub(crate) fn modal_footer_split(
 }
 
 pub(crate) fn menu_item_style(s: floem::style::Style) -> floem::style::Style {
+    // The gap and the horizontal padding are the constants `menu_panel_width`
+    // predicts with, read rather than restated — the same rule `MENU_ROW_PAD`
+    // follows on the vertical axis.
     s.width_full()
         .flex_row()
         .items_center()
-        .gap(theme::scaled(8.0))
-        .padding_horiz(theme::scaled(12.0))
+        .gap(theme::scaled(MENU_KID_GAP))
+        .padding_horiz(theme::scaled(MENU_ROW_PAD_H))
         .padding_vert(theme::scaled(6.0))
         .color(theme::text())
         .hover(|s| s.background(theme::accent().multiply_alpha(0.15)))
@@ -2308,7 +2311,7 @@ fn menu_row(
     let mut kids: Vec<AnyView> = Vec::new();
     if let Some((svg, color)) = icon {
         kids.push(
-            icons::icon(svg, 16.0)
+            icons::icon(svg, MENU_ICON_BASE as f32)
                 .style(move |s| {
                     let c = if disabled {
                         theme::text_muted().multiply_alpha(0.3)
@@ -2335,11 +2338,11 @@ fn menu_row(
     if chevron {
         kids.push(
             empty()
-                .style(|s| s.flex_grow(1.0_f32).min_width(20.0))
+                .style(|s| s.flex_grow(1.0_f32).min_width(MENU_SUB_SPACER))
                 .into_any(),
         );
         kids.push(
-            icons::icon(icons::CHEVRON_RIGHT, 14.0)
+            icons::icon(icons::CHEVRON_RIGHT, MENU_CHEVRON_BASE as f32)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32))
                 .into_any(),
         );
@@ -2527,6 +2530,70 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
         + theme::scaled(MENU_PANEL_PAD) * 2.0
         + MENU_PANEL_BORDER * 2.0
 }
+
+/// The width the panel will actually draw at — [`menu_panel_height`]'s missing
+/// horizontal twin, and the number an edge flip has to decide against.
+///
+/// **The flip used the panel's `min_width` instead**, which is a floor, not a
+/// width: `menu_stack` sets `min_width(width)` and every row then pushes the
+/// panel wider than that as soon as a label doesn't fit. So the grid's cell menu
+/// — whose longest entries are things like "Filter by this value" and
+/// "Attach 1 column to chat" — drew far wider than the 170 the flip was testing,
+/// ran off the right edge of the window, and only flipped once the *predicted*
+/// 170 overflowed: about half a panel too late, and worse at every scale up
+/// because the labels grow while a stale unscaled `popup_width` does not.
+///
+/// Composed of the parts [`menu_row`] draws, each scaled separately, for the
+/// reason [`MENU_LINE_H`] spells out. The label is measured in the family and
+/// size the row renders (`font_title`), not counted in characters.
+///
+/// A separator has no width of its own — it is a rule that spans whatever the
+/// rows decide — so it contributes nothing. An empty menu is `0.0`, which leaves
+/// the caller's own floor to win.
+pub(crate) fn menu_panel_width(entries: &[MenuEntry]) -> f64 {
+    let font = theme::font_title();
+    let row_w = |label: &str, icon: bool, chevron: bool| {
+        let mut w = theme::scaled(MENU_ROW_PAD_H) * 2.0 + measure_text_px_at(label, font);
+        if icon {
+            // The glyph plus the gap `menu_item_style` puts between kids.
+            w += theme::scaled(MENU_ICON_BASE) + theme::scaled(MENU_KID_GAP);
+        }
+        if chevron {
+            // The spacer's floor, its two gaps, and the chevron itself. The
+            // spacer is **not** scaled here because `menu_row` does not scale it
+            // either — it is one of the flex-spacer literals the inset census
+            // holds pending a look at 160%, and an estimate that scaled what the
+            // row draws literal is the very drift this function exists to end.
+            // If that group is swept, this term moves with it.
+            w += MENU_SUB_SPACER
+                + theme::scaled(MENU_KID_GAP) * 2.0
+                + theme::scaled(MENU_CHEVRON_BASE);
+        }
+        w
+    };
+    entries
+        .iter()
+        .map(|e| match e {
+            MenuEntry::Separator => 0.0,
+            MenuEntry::Action { label, icon, .. } => row_w(label, icon.is_some(), false),
+            MenuEntry::Sub { label, icon, .. } => row_w(label, icon.is_some(), true),
+        })
+        .fold(0.0_f64, f64::max)
+        + MENU_PANEL_BORDER * 2.0
+}
+
+/// A row's horizontal padding at 100%, **and the one `menu_item_style` draws
+/// with** — the same single-statement rule [`MENU_ROW_PAD`] follows vertically.
+const MENU_ROW_PAD_H: f64 = 12.0;
+/// The gap `menu_item_style` puts between a row's kids (icon → label → chevron).
+const MENU_KID_GAP: f64 = 8.0;
+/// A row icon's **base** size — what `menu_row` hands [`crate::icons::icon`],
+/// which scales it itself.
+const MENU_ICON_BASE: f64 = 16.0;
+/// A submenu chevron's base, likewise.
+const MENU_CHEVRON_BASE: f64 = 14.0;
+/// The floor on the spacer that pushes a submenu's chevron to the right edge.
+const MENU_SUB_SPACER: f64 = 20.0;
 
 /// A menu row's text line box at 100% — the residual of the ≈30.5px a row was
 /// measured at, once [`MENU_ROW_PAD`] is taken off both sides.
@@ -5360,6 +5427,143 @@ mod menu_placement_tests {
              have scaled with it"
         );
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+    }
+
+    /// The reported bug, as arithmetic: the grid's cell menu is wider than the
+    /// `min_width` the flip was testing, so the flip fired late and the panel had
+    /// already run off the window. Uses the real labels from that menu.
+    #[test]
+    fn the_cell_menu_draws_wider_than_the_min_width_the_flip_used() {
+        let cell_menu = [
+            MenuEntry::action("Edit field", || {}),
+            MenuEntry::action("Edit row", || {}),
+            MenuEntry::action("Copy value", || {}),
+            MenuEntry::action("Paste", || {}),
+            MenuEntry::Separator,
+            MenuEntry::action("Filter by this value", || {}),
+            MenuEntry::action("Exclude this value", || {}),
+            MenuEntry::Separator,
+            MenuEntry::action("Duplicate row", || {}),
+            MenuEntry::action("Delete row", || {}),
+            MenuEntry::Separator,
+            MenuEntry::action_icon("AI summarize", (icons::SPARKLES, theme::key_foreign), || {}),
+            MenuEntry::action_icon(
+                "Attach 1 column to chat",
+                (icons::SPARKLES, theme::key_foreign),
+                || {},
+            ),
+        ];
+        for scale in crate::theme::UiScale::ALL {
+            crate::theme::set_ui_scale(scale);
+            let drawn = menu_panel_width(&cell_menu);
+            let floor = theme::scaled(170.0); // what the flip used to test
+            assert!(
+                drawn > floor,
+                "{}: the panel draws {drawn} but the flip tested {floor} — the                  overhang is what ran off the window",
+                scale.label()
+            );
+        }
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+    }
+
+    /// **The seam, not the metric.** The width predictor could be perfect and the
+    /// bug would survive if the flip still tested the floor, so this asserts the
+    /// *decision*: at a cursor where the real panel overflows the window but the
+    /// `min_width` does not, testing the floor says "open rightward" (which runs
+    /// it off the edge) and testing the drawn width flips it. This is what failed
+    /// on screen, and it fails here against the floor.
+    #[test]
+    fn the_flip_fires_on_the_width_the_panel_draws_not_its_floor() {
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        let cell_menu = [
+            MenuEntry::action("Filter by this value", || {}),
+            MenuEntry::action_icon(
+                "Attach 1 column to chat",
+                (icons::SPARKLES, theme::key_foreign),
+                || {},
+            ),
+        ];
+        let floor = theme::scaled(170.0);
+        let drawn = menu_panel_width(&cell_menu);
+        let win_w = 1000.0;
+        let gap = CURSOR_MENU_GAP;
+        // A cursor with room for the floor but not for the panel that is drawn.
+        let cursor = win_w - floor - gap - 1.0;
+        assert!(
+            cursor + gap + drawn > win_w,
+            "the fixture must actually overflow: {cursor} + {gap} + {drawn} vs {win_w}"
+        );
+        assert!(
+            matches!(menu_inset(cursor, floor, win_w, gap), MenuInset::Start(_)),
+            "testing the floor opens rightward — this is the bug"
+        );
+        assert!(
+            matches!(menu_inset(cursor, drawn, win_w, gap), MenuInset::End(_)),
+            "testing the drawn width flips it back inside the window"
+        );
+    }
+
+    /// The width is the **widest** row, not the last one and not a sum.
+    #[test]
+    fn the_panel_is_as_wide_as_its_longest_label() {
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        let short = menu_panel_width(&[MenuEntry::action("Cut", || {})]);
+        let long = menu_panel_width(&[MenuEntry::action("Attach 1 column to chat", || {})]);
+        let both = menu_panel_width(&[
+            MenuEntry::action("Cut", || {}),
+            MenuEntry::action("Attach 1 column to chat", || {}),
+        ]);
+        assert!(long > short);
+        assert_eq!(both, long, "the widest row decides, whatever its position");
+        assert_eq!(
+            menu_panel_width(&[
+                MenuEntry::action("Attach 1 column to chat", || {}),
+                MenuEntry::action("Cut", || {}),
+            ]),
+            long,
+            "and order must not change it"
+        );
+    }
+
+    /// An icon and a submenu chevron each cost the panel real width — a row that
+    /// carries one is wider than the same label without it, or a menu of icon rows
+    /// clips its labels at the very edge it was flipped to avoid.
+    #[test]
+    fn an_icon_and_a_chevron_each_widen_their_row() {
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        let plain = menu_panel_width(&[MenuEntry::action("Copy", || {})]);
+        let iconed = menu_panel_width(&[MenuEntry::action_icon(
+            "Copy",
+            (icons::SPARKLES, theme::key_foreign),
+            || {},
+        )]);
+        let subbed = menu_panel_width(&[MenuEntry::Sub {
+            label: "Copy".into(),
+            icon: None,
+            children: vec![MenuEntry::action("CSV", || {})],
+        }]);
+        assert!(
+            iconed > plain,
+            "an icon column is width: {iconed} vs {plain}"
+        );
+        assert!(subbed > plain, "a chevron is width: {subbed} vs {plain}");
+    }
+
+    /// A separator spans whatever the rows decide, so it contributes no width —
+    /// and an empty menu leaves the caller's own floor to win.
+    #[test]
+    fn a_separator_adds_no_width_and_an_empty_menu_none_at_all() {
+        crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+        let row = menu_panel_width(&[MenuEntry::action("Copy", || {})]);
+        assert_eq!(
+            menu_panel_width(&[MenuEntry::action("Copy", || {}), MenuEntry::Separator]),
+            row
+        );
+        assert_eq!(
+            menu_panel_width(&[]),
+            MENU_PANEL_BORDER * 2.0,
+            "nothing but the border"
+        );
     }
 
     #[test]

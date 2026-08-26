@@ -205,6 +205,43 @@ pub(crate) fn cmdk_diff_h(area: f64) -> f64 {
     (area - cmdk_diff_chrome()).max(0.0)
 }
 
+/// The overlay's own border, top and bottom — a hairline, so unscaled.
+pub(crate) const CMDK_BORDER: f64 = 2.0;
+/// The diff wrapper's own vertical padding: 5px of gap from the question field
+/// above, 10px to the buttons below. Named because [`cmdk_diff_h_measured`] has
+/// to subtract exactly what `cmdk_popup` draws.
+pub(crate) fn cmdk_diff_pad_v() -> f64 {
+    scaled(5.0) + scaled(10.0)
+}
+
+/// The diff's height once the chrome around it has been **measured** instead of
+/// estimated — `area` less the question field, the button row, this wrapper's own
+/// padding and the overlay's border.
+///
+/// **Why measuring replaced predicting.** [`cmdk_diff_chrome`] is a single number
+/// standing for a stack of parts, and it was tuned by eye at 100%. Scaling that
+/// total is not the same as scaling the parts: at 160% it subtracted 216px of
+/// chrome from a pane that is only ~256px tall, leaving the diff **40px** — one
+/// and a half lines — with the rest of the overlay below the buttons sitting
+/// empty. The estimate over-subtracted at *every* scale (the dead space was
+/// simply affordable at 100%, where 113px of diff was still five lines).
+///
+/// The residual is the trap here: `area` is the editor pane, whose height is a
+/// **user-dragged px intent that deliberately does not scale** ([`EDITOR_H`],
+/// floored by `query_min_h`), while the chrome inside it scales fully. So the
+/// diff absorbs the whole mismatch, and it shrinks as the scale grows — the one
+/// direction no one expects. Measuring removes both halves of that: the parts
+/// report what they actually are, at whatever scale and font.
+///
+/// `input_h`/`buttons_h` of zero mean "not laid out yet"; the first frame falls
+/// back to the estimate rather than collapsing the diff to nothing.
+pub(crate) fn cmdk_diff_h_measured(area: f64, input_h: f64, buttons_h: f64) -> f64 {
+    if input_h <= 0.0 || buttons_h <= 0.0 {
+        return cmdk_diff_h(area);
+    }
+    (area - input_h - buttons_h - cmdk_diff_pad_v() - CMDK_BORDER).max(0.0)
+}
+
 /// Estimated width of the editor's line-number gutter (used to place the
 /// completion popup near the caret).
 pub(crate) const COMPLETION_GUTTER: f64 = 38.0;
@@ -517,6 +554,43 @@ pub(crate) fn header_key_icon_w() -> f64 {
 pub(crate) fn grid_bar_h() -> f64 {
     scaled(35.0)
 }
+/// The **base** size of every results-toolbar glyph — the unscaled figure
+/// [`crate::icons::icon`] is handed and scales itself, like
+/// [`SCHEMA_ICON_BASE`]. Never hand an already-scaled value to `icon`.
+///
+/// It has a second reader, and that is why it is named: the three dropdown icons
+/// (Copy, Download, AI) anchor their menu by *reconstructing* the glyph's box
+/// from the view origin `on_move` reports, so the drop has to be the height
+/// `icon` actually drew. It was the literal `16.0` — the base, unscaled — so the
+/// menu hung by 16px under a glyph that is 26px tall at 160% and opened *over*
+/// the icon that owns it, by a quarter of it at 160% and less at 130%. The three
+/// other `PopupAnchor::BelowIcon` callers (`erd_view`, `monitor_view`,
+/// `table_designer`) take a laid-out rect and never had the bug; this is the one
+/// place the box is computed rather than measured.
+pub(crate) const TOOLBAR_ICON_BASE: f32 = 16.0;
+/// That base as the toolbar actually draws it — the drop an anchored menu owes
+/// its icon. Must agree with `icon`'s own scaling to the pixel, which is what
+/// `the_toolbar_menu_drops_by_the_icons_rendered_height` holds it to.
+pub(crate) fn toolbar_icon_px() -> f64 {
+    scaled(TOOLBAR_ICON_BASE as f64)
+}
+/// Height of the results-grid toolbar (`grid::grid_toolbar`), which is a fixed
+/// box so the commit control appearing never nudges the grid.
+///
+/// A **function with a caller that is not the toolbar**: the Seed-Table popover
+/// anchors under it, and that anchor used to be the literal `30.0` with
+/// `// just below the 28px toolbar` beside it. The toolbar is scaled, so from
+/// Large the popover opened *over* the toolbar it was written to clear (45px of
+/// toolbar under a 30px anchor at 160%), and at Small it floated 8px clear of it.
+/// One name, read by both, is what keeps the two from stating the height twice.
+pub(crate) fn grid_toolbar_h() -> f64 {
+    scaled(28.0)
+}
+/// Where the Seed-Table popover's top edge sits: under the toolbar, by the same
+/// air the panel's other floating boxes keep. Derived, never written out.
+pub(crate) fn seed_popover_top() -> f64 {
+    grid_toolbar_h() + scaled(2.0)
+}
 /// The inset both floating bars keep from the panel edge. Not scaled — it is the
 /// air a floating bar keeps, which is its own bullet on the module doc's
 /// exception list and covers exactly this constant and [`SELECTION_BAR_INSET`].
@@ -580,6 +654,22 @@ pub(crate) const MASK_CH: char = '*';
 
 /// Terminal font sizes offered in settings (logical px).
 pub(crate) const TERM_FONT_SIZES: [u16; 5] = [12, 13, 14, 16, 18];
+
+/// Padding between the terminal surface's border and its first glyph cell — and
+/// therefore the **origin of the cell grid**, which is why this is a function and
+/// not a literal at the two places that need it.
+///
+/// The surface pads by this; the cursor overlay and the scrollback bar are
+/// *absolute siblings* of the surface, so they compute the same origin from the
+/// outside. They used to do it with a literal `6.0` against a scaled padding, so
+/// at every scale but `Normal` the bar/underline cursor drew off the glyph it
+/// marks (3.6px up and left at 160%) — the one place this app has where a length
+/// that is not the terminal's own font still decides where a glyph is.
+/// The cell *size* stays font-relative (`term_cell_wh`) and is untouched by the
+/// interface scale, which is the module doc's `TERM_FONT_SIZES` bullet.
+pub(crate) fn term_pad() -> f64 {
+    scaled(6.0)
+}
 
 // ── Panel width arithmetic ──────────────────────────────────────────────────
 //
@@ -853,6 +943,148 @@ mod scale_tests {
                     grid_selection_lift(false),
                     SELECTION_BAR_INSET,
                     "{}: with no bar up it sits at the edge",
+                    scale.label()
+                );
+            });
+        }
+    }
+
+    /// The bug the 160% screenshot showed: the diff is the *residual*, so every
+    /// error in the chrome comes out of it — and the pane it is a residual of does
+    /// not scale while the chrome does. This pins the measured form against the
+    /// estimate it replaces: given the chrome the overlay actually draws, the diff
+    /// must fill what is left **exactly**, at every scale, with no dead space.
+    #[test]
+    fn the_cmdk_diff_fills_what_the_measured_chrome_leaves() {
+        for scale in UiScale::ALL {
+            at(scale, || {
+                // What `cmdk_popup` draws at this scale: a `scaled(40)` question
+                // field and a button row of text plus `scaled(5)` padding.
+                let input_h = scaled(40.0);
+                let buttons_h = scaled(28.0);
+                for area in [150.0, EDITOR_H, 300.0, 600.0, 1000.0] {
+                    let diff = cmdk_diff_h_measured(area, input_h, buttons_h);
+                    let chrome = input_h + buttons_h + cmdk_diff_pad_v() + CMDK_BORDER;
+                    if chrome < area {
+                        assert_eq!(
+                            diff + chrome,
+                            area,
+                            "{}: a {area}px overlay is filled exactly — {} of dead space",
+                            scale.label(),
+                            area - diff - chrome
+                        );
+                    } else {
+                        assert_eq!(
+                            diff,
+                            0.0,
+                            "{}: {chrome} of chrome doesn't fit {area} — the diff must                              not ask for more on top of it",
+                            scale.label()
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    /// The regression itself, stated as a number: at the top scale the estimate
+    /// left the diff a line and a half of a pane it should have had most of.
+    /// `Huge` is where it bites because the pane's floor (`query_min_h`) barely
+    /// moves while the chrome grows by 60%.
+    #[test]
+    fn the_estimate_starved_the_diff_at_the_top_scale() {
+        at(UiScale::Huge, || {
+            let area = query_min_h(); // the pane at its floor — the default
+            let estimated = cmdk_diff_h(area);
+            let measured = cmdk_diff_h_measured(area, scaled(40.0), scaled(28.0));
+            assert!(
+                estimated < scaled(50.0),
+                "the estimate is supposed to be the starved one, got {estimated}"
+            );
+            assert!(
+                measured > estimated * 2.0,
+                "measuring must give the diff back real room: {measured} vs {estimated}"
+            );
+        });
+    }
+
+    /// The grid toolbar's dropdowns reconstruct their icon's box instead of
+    /// measuring it, so the drop and the glyph are **one height stated twice** —
+    /// and they are stated through two different scalers (`scaled` for the
+    /// dimension, `scaled_font` for what `icons::icon` applies). This asserts the
+    /// two agree at every scale, which a frozen base fails everywhere but
+    /// `Normal`.
+    #[test]
+    fn the_toolbar_menu_drops_by_the_icons_rendered_height() {
+        at(UiScale::Normal, || {
+            assert_eq!(
+                toolbar_icon_px(),
+                TOOLBAR_ICON_BASE as f64,
+                "the number the app shipped with"
+            );
+        });
+        for scale in UiScale::ALL {
+            at(scale, || {
+                assert_eq!(
+                    toolbar_icon_px(),
+                    crate::theme::scaled_font(TOOLBAR_ICON_BASE) as f64,
+                    "{}: the menu's drop has parted from the glyph `icons::icon` draws",
+                    scale.label()
+                );
+            });
+        }
+    }
+
+    /// The seam this pair of metrics exists for: the popover's anchor and the
+    /// toolbar's height are **one number read twice**, and the bug was that the
+    /// second reading was a literal. Testing `seed_popover_top()` alone would
+    /// prove nothing — it is its relation to `grid_toolbar_h()` that broke — so
+    /// this asserts the composition at every scale, which is what a literal `30.0`
+    /// (the shipped value, correct at `Normal` and nowhere else) fails.
+    #[test]
+    fn the_seed_popover_opens_under_the_toolbar_at_every_scale() {
+        at(UiScale::Normal, || {
+            assert_eq!(seed_popover_top(), 30.0, "the number the app shipped with");
+            assert_eq!(grid_toolbar_h(), 28.0, "the number the app shipped with");
+        });
+        for scale in UiScale::ALL {
+            at(scale, || {
+                assert!(
+                    seed_popover_top() >= grid_toolbar_h(),
+                    "{}: the popover opens over the toolbar it anchors under                      ({} < {})",
+                    scale.label(),
+                    seed_popover_top(),
+                    grid_toolbar_h()
+                );
+                // And not *far* under it: the gap is air, so it must not grow
+                // into a visible detachment either.
+                assert!(
+                    seed_popover_top() - grid_toolbar_h() <= scaled(4.0),
+                    "{}: the popover has drifted off the toolbar",
+                    scale.label()
+                );
+            });
+        }
+    }
+
+    /// The terminal's glyph origin, read from outside the surface. The cursor
+    /// overlay and the scrollback bar are absolute *siblings* of the padded
+    /// surface, so they recompute this origin; a literal here draws the cursor
+    /// off its glyph at every scale but `Normal`.
+    ///
+    /// The composition itself lives in a view and cannot be asserted here — what
+    /// this pins is that the origin is a scaled length, which is the half that
+    /// was wrong.
+    #[test]
+    fn the_terminal_glyph_origin_scales_with_the_surface() {
+        at(UiScale::Normal, || {
+            assert_eq!(term_pad(), 6.0, "the number the app shipped with");
+        });
+        for scale in UiScale::ALL {
+            at(scale, || {
+                assert_eq!(
+                    term_pad(),
+                    scaled(6.0),
+                    "{}: the overlays' origin has parted from the surface's padding",
                     scale.label()
                 );
             });
