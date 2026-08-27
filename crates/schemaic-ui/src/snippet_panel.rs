@@ -375,8 +375,27 @@ fn snippet_row(
         1.4,
         dialect,
     )
-    .style(move |s| s.width_full().max_height((font_body() as f64) * 1.4 * 3.0))
-    .clip();
+    .style(move |s| {
+        s.width_full()
+            .min_width(0.0)
+            .max_height((font_body() as f64) * 1.4 * 3.0)
+    })
+    // **The `min_width(0)` on the `Clip` is what makes the preview wrap**, and
+    // it has to be repeated here because `.clip()` is not a style: it wraps the
+    // view in an unstyled `Clip` *node*, so the styles above land on the text
+    // and this node sits between them and the parent. `collapsed` folds a body
+    // to one long line, so three visible lines are three *soft-wrapped* ones,
+    // and a `RichText` soft-wraps only when the width it is handed is narrower
+    // than that line. Floem's `container` below is a **row** stack, which makes
+    // the `Clip` a main-axis flex item, and a main-axis item's automatic
+    // minimum size is its content's — the whole statement. It took that width,
+    // the text's `width_full` resolved against it, and the preview became one
+    // line cut off at the panel's edge. Before the background container was
+    // added the `Clip` was a *cross*-axis item in the row's `flex_col`, where
+    // no content-based minimum applies and an auto width simply stretches to
+    // the row, which is why the same text wrapped there without being asked.
+    .clip()
+    .style(|s| s.width_full().min_width(0.0));
     // **On the editor's surface, not the panel's.** The token colours are
     // reproductions of published palettes (One Dark Pro, Tokyo Night, Catppuccin
     // Latte) tuned against the *editor* background, which `contrast.rs` gates
@@ -387,6 +406,7 @@ fn snippet_row(
     // for; the AI panel's code blocks take the same surface for the same reason.
     let body_view = container(body_view).style(|s| {
         s.width_full()
+            .min_width(0.0)
             .margin_top(theme::scaled(5.0))
             .padding_horiz(theme::scaled(7.0))
             .padding_vert(theme::scaled(5.0))
