@@ -26,7 +26,7 @@ use schemaic_core::intel::SqlDialect;
 use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
 use crate::theme::{font_body, font_label};
 use crate::widgets::{
-    MenuEntry, autohide, debounced, highlight_mono, highlight_text, section_title, toolbar_icon,
+    MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, section_title, toolbar_icon,
 };
 use crate::{FieldCfg, OverlayUi, Ui, edit_field, icons, theme};
 
@@ -361,19 +361,38 @@ fn snippet_row(
     // The body, collapsed and clipped to three lines — the same treatment the
     // history panel gives a statement, and the same reason: it is SQL, in the
     // face the editor it came from uses.
-    let body_view = highlight_mono(
+    // Syntax-coloured, unlike the history panel's plain preview: this is the
+    // panel's one large block of text, and colouring it is what stops a list of
+    // saved queries reading as a wall of grey. The colours are the editor's own
+    // (`sql_highlight`), so a snippet looks in the library the way it will once
+    // it is inserted — the identifiers, which are most of the text, stay in the
+    // quiet base and only keywords, strings and numbers carry colour.
+    let body_view = highlight_sql_mono(
         snippet::collapsed(&snip.body),
         term.clone(),
         font_body,
         theme::text_dim,
         1.4,
+        dialect,
     )
-    .style(move |s| {
-        s.width_full()
-            .max_height((font_body() as f64) * 1.4 * 3.0)
-            .margin_top(theme::scaled(3.0))
-    })
+    .style(move |s| s.width_full().max_height((font_body() as f64) * 1.4 * 3.0))
     .clip();
+    // **On the editor's surface, not the panel's.** The token colours are
+    // reproductions of published palettes (One Dark Pro, Tokyo Night, Catppuccin
+    // Latte) tuned against the *editor* background, which `contrast.rs` gates
+    // them on and deliberately does not gate anywhere else — and the editor
+    // theme is chosen independently of the light/dark UI theme, so Latte's
+    // dark-on-light tokens can be live while the panel is dark. Painting the
+    // preview on `bg_editor` is what keeps that pairing the one it was designed
+    // for; the AI panel's code blocks take the same surface for the same reason.
+    let body_view = container(body_view).style(|s| {
+        s.width_full()
+            .margin_top(theme::scaled(5.0))
+            .padding_horiz(theme::scaled(7.0))
+            .padding_vert(theme::scaled(5.0))
+            .background(theme::bg_editor())
+            .border_radius(5.0)
+    });
 
     // A chip per `:name` the body holds — read live, never stored, so they can't
     // drift from the body they sit under.

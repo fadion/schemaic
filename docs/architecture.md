@@ -3016,7 +3016,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     where a history row opens a new tab — a record of a past run wants its own tab, a snippet is
     something you compose *with*; "Open in new tab" is on the row's menu for when it isn't. The
     parameter chips under a body are read live from `params::names`, never stored, so they cannot
-    disagree with the body above them.
+    disagree with the body above them. **The body preview is syntax-coloured** (`highlight_sql_mono`,
+    over the editor's own `sql_highlight::highlight_spans`, with the search match added last so it
+    still wins the overlap) and sits on **`bg_editor`, not the panel surface** — the token colours
+    reproduce published palettes tuned against the *editor* background, which is the pairing
+    `contrast.rs` gates and the only one it vouches for, and the editor theme is chosen
+    independently of the light/dark UI theme (Catppuccin Latte's dark-on-light tokens can be live
+    while the panel is dark). The AI panel's code blocks take that surface for the same reason. The
+    history panel's preview stays plain: it is a record of a run, and this is the panel that had to
+    stop reading as a wall of grey.
     **A saved snippet is scoped to the connection it was saved on and stamped as just-used**, so it
     lands in the topmost band's topmost row and the panel scrolls there — the first spelling (engine
     scope, no stamp) dropped a new row into the middle of a long alphabetical list, where nobody
