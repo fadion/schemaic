@@ -2994,7 +2994,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     currently reachable**: `v_resize_handle` is called once from `center`, itself built once in the
     workspace shell, and the per-tab `dyn_container`s are its siblings rather than its parents, so
     these signals live as long as the app does.
-  - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
+  - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel; its
+    row preview is syntax-coloured on `bg_editor` like the snippet library's, for the `contrast.rs`
+    reason `snippet_panel.rs` gives below. Its **dialect comes from the active connection**, same
+    memo and same reasoning as the library's: the list is filtered to that connection, so every row
+    on screen ran against it. That memo is tracked in the row `dyn_container`'s trigger tuple
+    alongside `visible` and `search` — two connections that both have no history yield the same
+    empty `visible`, and without it the rows would stay built with the previous engine's lexer.
   - `snippet_edit.rs` — the snippet editor modal: **the one place a saved query's body can be
     changed**, with its name and abbrev alongside. The panel's inline fields cover the two
     one-word edits because those are the same act as renaming a tab; a body is SQL, multi-line, and
@@ -3022,9 +3028,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     reproduce published palettes tuned against the *editor* background, which is the pairing
     `contrast.rs` gates and the only one it vouches for, and the editor theme is chosen
     independently of the light/dark UI theme (Catppuccin Latte's dark-on-light tokens can be live
-    while the panel is dark). The AI panel's code blocks take that surface for the same reason. The
-    history panel's preview stays plain: it is a record of a run, and this is the panel that had to
-    stop reading as a wall of grey.
+    while the panel is dark). The AI panel's code blocks take that surface for the same reason, and
+    so does the Query History panel's preview, which now runs through the same `highlight_sql_mono`
+    on the same `bg_editor` — a long list of past runs read as the same wall of grey this one did.
+    The two differ only in the base colour the uncoloured identifiers take: `text_dim` for a
+    snippet's body, `text` for a history row's SQL.
     **A saved snippet is scoped to the connection it was saved on and stamped as just-used**, so it
     lands in the topmost band's topmost row and the panel scrolls there — the first spelling (engine
     scope, no stamp) dropped a new row into the middle of a long alphabetical list, where nobody
@@ -5779,6 +5787,26 @@ Re-introducing the anti-patterns these guard against is a regression:
   `flex_grow` spacer inside it collapses (right-aligned children stop reaching the edge). Put
   `.clip()` on a container with a *definite* size (the fixed-width `v_stack`), not the flex row you
   depend on for stretch. (Bit the find/replace bar's `All` alignment.)
+  **`.clip()` is not a style — it is a node, so styling a clipped view means styling two of them.**
+  `floem::views::clip` (`floem-0.2.0/src/views/clip.rs`) wraps the child in an unstyled `Clip`, so a
+  `.style(…)` written *before* it lands on the child and the `Clip` sits between that child and the
+  parent with `width: auto`, `min_width: auto`. That stays invisible until the clipped view wraps
+  text. A `RichText` soft-wraps only when it is handed a width narrower than the line it holds, and
+  both SQL previews collapse a body to one long line (`snippet::collapsed`, `history::preview`), so
+  the wrapping is entirely at the mercy of the width the `Clip` resolves to. In a `flex_col` parent
+  width is the *cross* axis, where no content-based minimum applies: the auto-width `Clip` stretches
+  to the row and the text wrapped for free, which is why the snippet library and Query History
+  previews wrapped without anyone asking them to. Wrap the same view in a `container` to give it a
+  background and floem's `container` is a **row** (taffy's default direction, and `Container` sets
+  none) — the `Clip` becomes a main-axis flex item, whose automatic minimum size is its content's,
+  i.e. the whole statement. It took that width, the text's `width_full` resolved against it, and the
+  library's three-line preview became one line cut off at the panel edge (fixed in `ecfe595`, after
+  two attempts that put the same `min_width(0)` on the nodes either side of the `Clip` — the
+  container above it and the text below — and changed nothing, because neither is the flex item the
+  parent measures). The fix is `min_width(0)` on the `Clip` — a
+  `.style(…)` applied *after* `.clip()` — and both panels now carry it on all three of the text, the
+  `Clip` and the surface container. Adding a background container around a wrapping text view is
+  what turns the omitted second style into a visible bug.
 - **`s.hide()`/`s.flex()` (display none/flex) beat height/scale for a reactive show-hide** — adds/
   removes the element from layout cleanly (no clip/overflow/leftover space). Prefer it to animating
   height when you don't need the animation.
