@@ -4004,7 +4004,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - `lib.rs` (~7.6k lines; `grid.rs` at ~10.2k is the crate's largest) — the `Ui` struct + bundles,
     shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, `edit_field`/`FieldCfg`,
-    terminal panel. The shared types living in the crate root is what stalls further splitting: the
+    terminal panel.
+    Two things about `edit_field`'s **multiline** boxes, both found in a body field and both fixed
+    in the shared helper rather than at one call site. **Enter is only swallowed when there is
+    something to submit to**: a multiline field with no `on_submit` lets it through and breaks the
+    line, which is what Enter means in a box of SQL — consuming it unconditionally left every body
+    field (the snippet editor's, the view editor's) with a dead Enter and a Shift+Enter nobody would
+    guess at. And **the field repaints when its row count changes**: the box height is derived from
+    `rows`, so the edit that adds a line has already painted against the *old* height, leaving the
+    caret on the new last line outside the viewport that was drawn — it looks like the caret has
+    vanished until the next keystroke repaints against the grown box. The repaint is deferred a tick
+    so it runs against settled layout.
+    (`FieldCfg::min_rows` is the floor such a box starts at — 1 by default, 3 for a snippet body,
+    clamped against `max_rows` at use because `clamp` panics when the floor exceeds the cap.) The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
     **`modals.rs` is the first cut that did move**, and it is the shape the rest should follow: not
@@ -5177,7 +5189,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   pre-existing and both accepted: a database with `limit` *table-name* matches can still starve its
   objects (a name match is rare where a column match is not), and the cap is **global across
   databases**, so a wide first database still contributes everything and later ones nothing.
-  **Snippets are a fourth category, appended after all three** (`overlays::snippet_items`), and they
+  **Snippets are a fourth category, appended after all three** (`overlays::snippet_items`), with the
+  bookmark glyph the panel toggle wears — in the **accent**, the only row colour in the list, because
+  a snippet is the one result that is the user's rather than the server's (the completion popup tints
+  its snippet rows for the same reason). They
   sit outside that cap because they come from `snippets.json` rather than from the schema passes:
   the palette is a way to reach the database, and a saved query is a thing you wrote *about* it.
   Activating one inserts it at the caret, as its library row does — and it is **not recorded in the
