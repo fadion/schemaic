@@ -2311,6 +2311,11 @@ enum ResultIcon {
     /// same muted tint the schema tree gives its row, so the thing you found in
     /// one surface is recognisable in the other.
     Object(schemaic_core::ddl::ObjectKind),
+    /// A saved snippet. The **bookmark** the panel toggle wears, so the row is
+    /// recognisable as belonging to the library rather than to the database —
+    /// which is the one distinction that matters in a list where everything else
+    /// is a thing on the server.
+    Snippet,
 }
 
 #[derive(Clone, Copy)]
@@ -2327,6 +2332,7 @@ impl ResultIcon {
             ResultIcon::View => icons::TABLE_CELLS_MERGE,
             ResultIcon::Column(class, _) => crate::schema_tree::column_type_icon(class),
             ResultIcon::Object(kind) => crate::schema_tree::object_icon(kind),
+            ResultIcon::Snippet => icons::BOOKMARK,
         }
     }
     fn color(self) -> floem::peniko::Color {
@@ -2335,6 +2341,10 @@ impl ResultIcon {
             ResultIcon::View => theme::view_icon(),
             // The tree's object rows, which are muted at the same alpha.
             ResultIcon::Object(_) => theme::text_muted().multiply_alpha(0.7),
+            // The accent, and the only row here that gets it: a snippet is the
+            // one result that is *yours* rather than the server's, and the
+            // completion popup tints its snippet rows for the same reason.
+            ResultIcon::Snippet => theme::accent(),
             ResultIcon::Column(_, role) => {
                 let base = match role {
                     ColKeyRole::Primary => theme::key_primary(),
@@ -3404,7 +3414,7 @@ fn snippet_items(search: &SnippetSearch, q: &str, close: &Rc<dyn Fn()>) -> Vec<P
                     }),
                     complete: Some(s.name.clone()),
                     match_term: Some(q.to_string()),
-                    icon: None,
+                    icon: Some(ResultIcon::Snippet),
                     right_icon: None,
                     keys: None,
                 }

@@ -6315,20 +6315,23 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             return CommandExecuted::Yes;
         }
         if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _)) {
-            if multiline {
-                // Plain Enter submits; Shift/Ctrl+Enter fall through → newline.
-                if !mods.shift() && !mods.control() {
-                    if let Some(cb) = &submit {
-                        (cb)();
-                    }
+            // Plain Enter submits (multiline: only plain — Shift/Ctrl+Enter are
+            // the newline). **A field with nothing to submit to does not eat the
+            // key**: a multiline one lets it through and breaks the line, which
+            // is what Enter means in a box of SQL. Swallowing it unconditionally
+            // left every body field — the snippet editor's, the view editor's —
+            // with an Enter that did nothing at all and a Shift+Enter nobody
+            // would guess at.
+            let plain = !mods.shift() && !mods.control();
+            match &submit {
+                Some(cb) if !multiline || plain => {
+                    (cb)();
                     return CommandExecuted::Yes;
                 }
-            } else {
-                // Single line never inserts a newline; Enter just submits.
-                if let Some(cb) = &submit {
-                    (cb)();
-                }
-                return CommandExecuted::Yes;
+                // A single-line field never inserts a newline, submit or not:
+                // swallowing the key is what keeps its text one line.
+                None if !multiline => return CommandExecuted::Yes,
+                _ => {}
             }
         }
         default_key_handler(editor_sig)(kp, mods)
@@ -6616,6 +6619,35 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             if rows.get_untracked() != n {
                 rows.set(n);
             }
+        });
+    }
+
+    // **Repaint when the box gains or loses a row.**
+    //
+    // The height is derived from `rows`, which this edit has just changed — but
+    // the editor has already painted itself against the height it had *before*
+    // it. So the caret sitting on the brand-new last line is outside the
+    // viewport that was drawn, and simply isn't there: press Shift+Enter in a
+    // body field and the caret vanishes until the next keystroke, which repaints
+    // against a box that has since grown. Nothing is wrong with the caret's
+    // position — only with when it was drawn.
+    //
+    // Deferred a tick, so the new height has been through layout by the time the
+    // paint is asked for, and `try_get_untracked` because the field can be
+    // disposed inside that tick (a modal closed on the same keypress).
+    if multiline {
+        let ed_paint = ed.clone();
+        create_effect(move |prev: Option<usize>| {
+            let n = rows.get();
+            if prev.is_some_and(|p| p != n) {
+                let ed_paint = ed_paint.clone();
+                floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                    if let Some(Some(vid)) = ed_paint.editor_view_id.try_get_untracked() {
+                        vid.request_paint();
+                    }
+                });
+            }
+            n
         });
     }
 
