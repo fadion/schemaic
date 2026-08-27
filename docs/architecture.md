@@ -3031,8 +3031,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     while the panel is dark). The AI panel's code blocks take that surface for the same reason, and
     so does the Query History panel's preview, which now runs through the same `highlight_sql_mono`
     on the same `bg_editor` — a long list of past runs read as the same wall of grey this one did.
-    The two differ only in the base colour the uncoloured identifiers take: `text_dim` for a
-    snippet's body, `text` for a history row's SQL.
+    The two are the same treatment down to the base colour the uncoloured identifiers take
+    (`text_dim`): the panels share a column and are read the same way, and a brighter base in one of
+    them spent on identifiers the contrast the keywords are there to carry.
     **A saved snippet is scoped to the connection it was saved on and stamped as just-used**, so it
     lands in the topmost band's topmost row and the panel scrolls there — the first spelling (engine
     scope, no stamp) dropped a new row into the middle of a long alphabetical list, where nobody
