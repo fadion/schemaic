@@ -304,25 +304,36 @@ fn history_row(
     // and a long history read as a wall of grey without it. Identifiers, which
     // are most of a statement, stay in the base colour — only keywords, strings
     // and numbers carry colour, so the list still scans as a list.
-    let preview_view =
-        highlight_sql_mono(preview, term.clone(), font_body, theme::text, 1.4, dialect)
-            .style(move |s| {
-                s.width_full()
-                    // Three line boxes of `font_body()`, computed in the closure —
-                    // a captured height clips the preview at the old scale's three
-                    // lines while the SQL inside it grows.
-                    .max_height((font_body() as f64) * 1.4 * 3.0)
-                    // `preview` collapses a statement to one long line, so those
-                    // three lines are three *soft-wrapped* ones — and a `RichText`
-                    // wraps only when it is handed a width narrower than the line it
-                    // holds. Inside the row-direction stacks below (`.clip()`'s own
-                    // node, then the surface container) an auto width would resolve
-                    // to the whole statement instead; see the same pair in
-                    // `snippet_panel`, where adding the surface is what broke it.
-                    .min_width(0.0)
-            })
-            .clip()
-            .style(|s| s.width_full().min_width(0.0));
+    //
+    // `text_dim` is that base, the same one the library's previews take: the two
+    // panels sit in the same column and are read the same way, so a brighter
+    // base here made the colour that *is* meaningful — the keywords — carry less
+    // of the difference than it does one panel over.
+    let preview_view = highlight_sql_mono(
+        preview,
+        term.clone(),
+        font_body,
+        theme::text_dim,
+        1.4,
+        dialect,
+    )
+    .style(move |s| {
+        s.width_full()
+            // Three line boxes of `font_body()`, computed in the closure —
+            // a captured height clips the preview at the old scale's three
+            // lines while the SQL inside it grows.
+            .max_height((font_body() as f64) * 1.4 * 3.0)
+            // `preview` collapses a statement to one long line, so those
+            // three lines are three *soft-wrapped* ones — and a `RichText`
+            // wraps only when it is handed a width narrower than the line it
+            // holds. Inside the row-direction stacks below (`.clip()`'s own
+            // node, then the surface container) an auto width would resolve
+            // to the whole statement instead; see the same pair in
+            // `snippet_panel`, where adding the surface is what broke it.
+            .min_width(0.0)
+    })
+    .clip()
+    .style(|s| s.width_full().min_width(0.0));
     // On the **editor's** surface, not the panel's: the token colours are
     // reproductions of published palettes tuned against `bg_editor`, which
     // `contrast.rs` gates them on and deliberately gates them nowhere else, and
