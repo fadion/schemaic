@@ -361,9 +361,9 @@ fn snippet_row(
     // The body, collapsed and clipped to three lines — the same treatment the
     // history panel gives a statement, and the same reason: it is SQL, in the
     // face the editor it came from uses.
-    // Syntax-coloured, unlike the history panel's plain preview: this is the
-    // panel's one large block of text, and colouring it is what stops a list of
-    // saved queries reading as a wall of grey. The colours are the editor's own
+    // Syntax-coloured, as the history panel's preview is: this is the panel's
+    // one large block of text, and colouring it is what stops a list of saved
+    // queries reading as a wall of grey. The colours are the editor's own
     // (`sql_highlight`), so a snippet looks in the library the way it will once
     // it is inserted — the identifiers, which are most of the text, stay in the
     // quiet base and only keywords, strings and numbers carry colour.

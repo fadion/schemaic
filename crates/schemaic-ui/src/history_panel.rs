@@ -2,8 +2,9 @@
 //! statements on the right column (same chrome as the AI / Terminal panels).
 //!
 //! Each row previews the SQL (whitespace-collapsed, wrapped to ~3 lines then
-//! clipped) with its database + relative run time; clicking opens the full query
-//! in a new tab (`open_query`). The title carries a trash-2 that clears the
+//! clipped, syntax-coloured by the editor's own lexer on the editor's surface)
+//! with its database + relative run time; clicking opens the full query in a new
+//! tab (`open_query`). The title carries a trash-2 that clears the
 //! *current connection's* history, behind a confirm. The list is filtered from the app-wide
 //! `history.entries` signal by the active connection, so switching connections
 //! shows only that connection's queries.
@@ -16,11 +17,12 @@ use floem::reactive::create_memo;
 
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::history::{self, HistoryEntry};
+use schemaic_core::intel::SqlDialect;
 
 use crate::consts::SEARCH_DEBOUNCE_MS;
 use crate::theme::{font_body, font_label};
 use crate::widgets::{
-    autohide, debounced, highlight_mono, highlight_text, section_title, toolbar_icon,
+    autohide, debounced, highlight_sql_mono, highlight_text, section_title, toolbar_icon,
 };
 use crate::{FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
 
@@ -35,9 +37,26 @@ fn now_millis() -> u64 {
 pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let entries = ui.history.entries;
     let active_conn = ui.conn.active_conn;
+    let connections = ui.conn.connections;
     let open_history = ui.history_actions.open.clone();
     let clear = ui.history_actions.clear.clone();
     let db_colors = ui.db_colors;
+
+    // Which lexer colours the previews. The list is filtered to the **active
+    // connection**, so every row on screen ran against it and its dialect is the
+    // right one for all of them — the same reasoning (and the same memo) the
+    // snippet library uses, and for the same reason it reads the connection
+    // rather than the active tab.
+    let dialect = create_memo(move |_| {
+        let cid = active_conn.get();
+        connections
+            .with(|cs| {
+                cs.iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| SqlDialect::from_db_type(&c.db_type))
+            })
+            .unwrap_or_default()
+    });
 
     // Panel-local search filter (matched against SQL / database / tab name). Local
     // to this panel build — resets when the History panel is re-opened.
@@ -62,9 +81,13 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     // Track the search term too (not just `visible`): typing more characters that
     // still match the same set leaves `visible` unchanged (the memo dedups), but the
     // highlight term must still update, so rebuild the rows when either changes.
+    // The dialect rides along for the same reason: switching connections normally
+    // changes `visible` as well, but two connections with no history between them
+    // both yield an empty list, and the memo would hold the rows at the previous
+    // engine's lexer.
     let list = dyn_container(
-        move || (visible.get(), search.get()),
-        move |(rows, q)| {
+        move || (visible.get(), search.get(), dialect.get()),
+        move |(rows, q, dialect)| {
             if rows.is_empty() {
                 // Distinguish "nothing recorded" from "filtered everything out".
                 let msg = if q.trim().is_empty() {
@@ -101,7 +124,8 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
                         group
                             .into_iter()
                             .map(move |e| {
-                                history_row(e, now, oh.clone(), db_colors, term.clone()).into_any()
+                                history_row(e, now, oh.clone(), db_colors, term.clone(), dialect)
+                                    .into_any()
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -247,15 +271,17 @@ fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::An
         .into_any()
 }
 
-/// One history row: the database + when it ran, the SQL preview (monospace, ≤3
-/// wrapped lines, clipped), then how the run went. Clicking opens the full SQL
-/// in a new tab.
+/// One history row: the database + when it ran, the SQL preview (monospace,
+/// syntax-coloured, ≤3 wrapped lines, clipped), then how the run went. Clicking
+/// opens the full SQL in a new tab.
+#[allow(clippy::too_many_arguments)]
 fn history_row(
     entry: HistoryEntry,
     now: u64,
     open_history: Rc<dyn Fn(HistoryEntry)>,
     db_colors: RwSignal<Vec<DbColorRule>>,
     term: Option<String>,
+    dialect: SqlDialect,
 ) -> impl IntoView {
     // Full entry for the click handler — restores SQL + database + tab name.
     let entry_click = entry.clone();
@@ -269,21 +295,53 @@ fn history_row(
     // ~3 lines: font_body() (13) × 1.4 line-height × 3, clipped.
 
     // Monospace: it is SQL, and it is the same face the editor it came from and
-    // the diff view use. Still `highlight_*`, so a search term stays marked.
-    // +3px above and below the code, on top of the stack's own 4px gap: the SQL
-    // is the row's substance and was sitting tight against the two label lines,
-    // which made consecutive rows read as one block.
-    let preview_view = highlight_mono(preview, term.clone(), font_body, theme::text, 1.4)
-        .style(move |s| {
-            s.width_full()
-                // Three line boxes of `font_body()`, computed in the closure —
-                // a captured height clips the preview at the old scale's three
-                // lines while the SQL inside it grows.
-                .max_height((font_body() as f64) * 1.4 * 3.0)
-                .margin_top(theme::scaled(3.0))
-                .margin_bottom(theme::scaled(3.0))
-        })
-        .clip();
+    // the diff view use. Still `highlight_*`, so a search term stays marked, and
+    // it is added after the syntax so what was typed stays the loudest thing on
+    // the row.
+    //
+    // Syntax-coloured with the editor's own lexer, like the snippet library's
+    // previews: this is the row's substance and the panel's one block of text,
+    // and a long history read as a wall of grey without it. Identifiers, which
+    // are most of a statement, stay in the base colour — only keywords, strings
+    // and numbers carry colour, so the list still scans as a list.
+    let preview_view =
+        highlight_sql_mono(preview, term.clone(), font_body, theme::text, 1.4, dialect)
+            .style(move |s| {
+                s.width_full()
+                    // Three line boxes of `font_body()`, computed in the closure —
+                    // a captured height clips the preview at the old scale's three
+                    // lines while the SQL inside it grows.
+                    .max_height((font_body() as f64) * 1.4 * 3.0)
+                    // `preview` collapses a statement to one long line, so those
+                    // three lines are three *soft-wrapped* ones — and a `RichText`
+                    // wraps only when it is handed a width narrower than the line it
+                    // holds. Inside the row-direction stacks below (`.clip()`'s own
+                    // node, then the surface container) an auto width would resolve
+                    // to the whole statement instead; see the same pair in
+                    // `snippet_panel`, where adding the surface is what broke it.
+                    .min_width(0.0)
+            })
+            .clip()
+            .style(|s| s.width_full().min_width(0.0));
+    // On the **editor's** surface, not the panel's: the token colours are
+    // reproductions of published palettes tuned against `bg_editor`, which
+    // `contrast.rs` gates them on and deliberately gates them nowhere else, and
+    // the editor theme is chosen independently of the light/dark UI theme. The
+    // snippet library and the AI panel's code blocks take the same surface for
+    // the same reason.
+    //
+    // The padding replaces the 3px the text used to carry above and below, on
+    // top of the stack's own 4px gap: the SQL was sitting tight against the two
+    // label lines, which made consecutive rows read as one block.
+    let preview_view = container(preview_view).style(|s| {
+        s.width_full()
+            .min_width(0.0)
+            .margin_vert(theme::scaled(3.0))
+            .padding_horiz(theme::scaled(7.0))
+            .padding_vert(theme::scaled(5.0))
+            .background(theme::bg_editor())
+            .border_radius(5.0)
+    });
 
     // Database name + its identity dot as a tight group, so the footer's `gap(8)`
     // applies only between this group and the timestamp — the dot's spacing from
