@@ -658,7 +658,13 @@ fn params_bar(
     // One view, styled away when there is nothing to show, rather than a
     // `dyn_container` that rebuilds the whole bar — and with it every value
     // field — each time the query gains or loses its last placeholder.
-    container(autohide(scroll(list).style(|s| s.width_full()))).style(move |s| {
+    //
+    // `wheel_hscroll`, the tab strip's scroller: no bar at all, and the plain
+    // wheel pans sideways. This bar has no vertical axis of its own, so a wheel
+    // over it would otherwise do nothing while a row sat off the right edge, and
+    // an autohiding bar under a row of 24px fields is chrome taller than the gap
+    // it lives in.
+    container(wheel_hscroll(list).style(|s| s.width_full())).style(move |s| {
         if names.get().is_empty() {
             return s.height(0.0).width_full();
         }
@@ -715,20 +721,17 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
             .flex_shrink(0.0_f32)
     });
 
-    // `NULL` has no text of its own, so the field is replaced rather than left
-    // holding a value that no longer reaches the SQL.
+    // `NULL` has no text of its own, so the field goes away entirely rather than
+    // standing there holding a value that no longer reaches the SQL. Nothing is
+    // lost by hiding it: the chip beside it already says `NULL`, and the text is
+    // still in `value`, so it comes back with the field when the kind changes
+    // again. A greyed field, or the word NULL sitting in a field-shaped box, both
+    // read as something that could still be typed into.
     let value_view = dyn_container(
         move || kind.get(),
         move |k| {
             if !k.takes_text() {
-                return text("NULL")
-                    .style(|s| {
-                        s.font_family(MONO_FAMILY.to_string())
-                            .font_size(theme::font_body())
-                            .color(theme::text_faint())
-                            .width(theme::scaled(140.0))
-                    })
-                    .into_any();
+                return empty().into_any();
             }
             edit_field(
                 value,
@@ -741,7 +744,16 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
                     ..Default::default()
                 },
             )
-            .style(|s| s.width(theme::scaled(140.0)))
+            // Narrow on purpose. A parameter's value is a word or a number far
+            // more often than a sentence, and the bar's real constraint is how
+            // many rows fit before one has to be scrolled to — the field is the
+            // only part of a row whose width is a choice rather than its content.
+            //
+            // The gap to the chip is the field's own margin rather than the
+            // row's `gap`, because a `gap` is spent on the zero-width `empty()`
+            // above too: a `NULL` row would keep 7px of field-shaped space it no
+            // longer has a field for.
+            .style(|s| s.width(theme::scaled(98.0)).margin_left(theme::scaled(7.0)))
             .into_any()
         },
     );
@@ -759,16 +771,18 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
                 .border_color(theme::border())
                 .border_radius(4.0)
                 .cursor(CursorStyle::Pointer)
+                .margin_left(theme::scaled(7.0))
                 .hover(|s| s.color(theme::text()).border_color(theme::text_faint()))
         })
         .tooltip(|| text("Text, number, NULL, or raw SQL — click to change").style(tooltip_style));
 
-    h_stack((name_label, value_view, chip)).style(|s| {
-        s.flex_row()
-            .items_center()
-            .gap(theme::scaled(7.0))
-            .flex_shrink(0.0_f32)
-    })
+    // Name, then the kind, then the field: the chip qualifies the name — it says
+    // what `:age` *is* — and the field is the answer to both. Behind the field it
+    // read as a unit attached to the value, and it is also the control that makes
+    // the field disappear, which is easier to connect to a click that happens
+    // before it in the row than after.
+    h_stack((name_label, chip, value_view))
+        .style(|s| s.flex_row().items_center().flex_shrink(0.0_f32))
 }
 
 // ── Diagnostics (catalog-aware) ──────────────────────────────────────────────
