@@ -17,6 +17,7 @@ pub mod contrast;
 mod ddl_preview;
 mod diff_view;
 mod dividers;
+mod dump_view;
 mod editor_pane;
 pub mod erd_raster;
 mod erd_view;
@@ -197,6 +198,60 @@ pub enum ExportOutcome {
 /// format — the same rule the results grid's snapshot follows.
 ///
 /// What is captured is as little as the UI thread is *obliged* to do. For a
+/// What a schema + data dump writes, and where.
+///
+/// The **plan** it will follow is built in the app from a freshly introspected
+/// schema, not from anything captured here: the tree's catalog can be stale, and
+/// a dump that emits a `CREATE TABLE` the server has since changed is a corrupt
+/// backup. This carries only what the user chose.
+pub struct DumpRequest {
+    pub path: std::path::PathBuf,
+    pub conn_id: u64,
+    pub database: String,
+    /// The chosen tables, by display name (`sales.orders`, or bare where the
+    /// engine has no namespaces) — the same spelling the tree and the ER diagram
+    /// key nodes by, so the picker's rows resolve without a second identity.
+    pub tables: Vec<String>,
+    pub opts: schemaic_core::dump::DumpOptions,
+    pub dialect: SqlDialect,
+}
+
+/// How far a running dump has got — one message per table, as it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DumpProgress {
+    /// 1-based, so it reads as "3 of 12" without arithmetic at the label.
+    pub index: usize,
+    pub total: usize,
+    pub table: String,
+    /// Rows written **before** this table — the running total.
+    pub rows: u64,
+}
+
+/// How a dump ended. The three arms `ExportOutcome` has, for the same reasons:
+/// a cancel is neither a success nor a failure, and `partial` says whether a
+/// fragment was left behind.
+pub enum DumpOutcome {
+    /// Written: how many tables the file covers, and the export renderer's own
+    /// [`ExportTally`](schemaic_core::export::ExportTally).
+    ///
+    /// **The tally, not a row count.** It carries what the file could *not* hold
+    /// — the binary columns written as `NULL`, the values past the arena ceiling
+    /// left blank — and those are the difference between a backup and a file
+    /// that looks like one. A dump reporting only `rows` told the user "Wrote 5
+    /// tables and 115k rows." about a file whose every blob was `NULL`. Same
+    /// reasoning as [`ExportOutcome::Done`], which carries it for the same
+    /// reason.
+    Done {
+        tables: usize,
+        tally: schemaic_core::export::ExportTally,
+    },
+    Cancelled,
+    Failed {
+        message: String,
+        partial: bool,
+    },
+}
+
 /// picture that is the measured [`SvgScene`](schemaic_core::erd_export::SvgScene)
 /// and nothing more: the measuring goes through floem's font system and so cannot
 /// leave this thread, but building the document out of it is pure — 34 ms of
@@ -858,6 +913,16 @@ pub type ExportDoneFn = Rc<dyn Fn(ExportOutcome)>;
 /// as it took; the grid owns the save dialog, the app owns the worker.
 pub type ExportFn = Rc<dyn Fn(ExportRequest, ExportDoneFn)>;
 
+pub type DumpDoneFn = Rc<dyn Fn(DumpOutcome)>;
+/// Introspect and write a schema + data dump **off the UI thread**, reporting
+/// each table through [`DumpUi::progress`] and the end through [`DumpDoneFn`].
+pub type DumpFn = Rc<dyn Fn(DumpRequest, DumpDoneFn)>;
+/// The names a dump's picker offers: one database's tables and views, by display
+/// name. Its own read because it must be right for a database the tree has never
+/// been expanded on — a picker built from the cached tree would silently offer
+/// nothing there.
+pub type DumpTablesFn = Rc<dyn Fn(u64, String, Rc<dyn Fn(Result<Vec<String>, String>)>)>;
+
 /// Delivers the Tier-2 (DB-validated) diagnostics for the statement under the
 /// cursor back onto the UI thread.
 pub type ValidateDoneFn = Rc<dyn Fn(Vec<schemaic_core::intel::Diagnostic>)>;
@@ -1249,6 +1314,72 @@ pub enum ImportStep {
     Mapping,
     /// Rows landed.
     Done,
+}
+
+/// Which database a dump is being composed for. `Some` on [`DumpUi::target`] is
+/// what makes the modal show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DumpTarget {
+    pub conn_id: u64,
+    pub database: String,
+    /// The PostgreSQL namespace the entry was opened on, when it was opened on
+    /// one — the picker is then that namespace's tables rather than the whole
+    /// database's.
+    pub schema: Option<String>,
+    pub dialect: SqlDialect,
+}
+
+/// The dump modal's state — the same Copy-bundle shape [`ImportUi`] uses, reset
+/// on open rather than owned by a per-open scope, and for the same reason.
+#[derive(Clone, Copy)]
+pub struct DumpUi {
+    /// The database being dumped, and the open flag.
+    pub target: RwSignal<Option<DumpTarget>>,
+    /// Every table and view the picker offers, by display name.
+    pub tables: RwSignal<Vec<String>>,
+    /// The checked subset — what actually reaches the file.
+    pub chosen: RwSignal<Vec<String>>,
+    /// True while the list is being read.
+    pub listing: RwSignal<bool>,
+    /// The options, one signal per control — the shape [`ImportUi`] uses, and for
+    /// the same reason: a toggle binds to a `bool`, and a single struct signal
+    /// would make every control a read-modify-write of the other five.
+    /// [`DumpUi::options`] is what assembles them.
+    pub structure: RwSignal<bool>,
+    pub data: RwSignal<bool>,
+    pub other_objects: RwSignal<bool>,
+    pub drop_if_exists: RwSignal<bool>,
+    pub wrap_transaction: RwSignal<bool>,
+    pub disable_fk_checks: RwSignal<bool>,
+    /// True while the dump itself is running. Guards a second launch and is what
+    /// turns every exit into a cancel — see `import_view`'s `exit_action`, which
+    /// answers the same question for the same reason.
+    pub running: RwSignal<bool>,
+    /// The table currently being written, once one is.
+    pub progress: RwSignal<Option<DumpProgress>>,
+    pub error: RwSignal<Option<String>>,
+    /// The finished sentence, once an export succeeds — built where the file's
+    /// name is still in scope, so it can name both the file and whatever the
+    /// export could not carry.
+    pub done: RwSignal<Option<String>>,
+    /// Bumped on every open, so a late outcome can't report into a modal that has
+    /// since been reopened on another database.
+    pub generation: RwSignal<u64>,
+}
+
+impl DumpUi {
+    /// The six controls as the one value the core planner takes. A **tracked**
+    /// read, so a button gating on `is_empty()` re-evaluates when a toggle moves.
+    pub fn options(&self) -> schemaic_core::dump::DumpOptions {
+        schemaic_core::dump::DumpOptions {
+            structure: self.structure.get(),
+            data: self.data.get(),
+            other_objects: self.other_objects.get(),
+            drop_if_exists: self.drop_if_exists.get(),
+            wrap_transaction: self.wrap_transaction.get(),
+            disable_fk_checks: self.disable_fk_checks.get(),
+        }
+    }
 }
 
 /// The import modal's state (Copy bundle, created once and reset on open —
@@ -2192,6 +2323,14 @@ pub struct SchemaActions {
     pub import_probe: ImportProbeFn,
     /// Check a file and, if it's clean, load it in one transaction.
     pub import_run: ImportFn,
+    /// One database's table and view names, for the dump picker.
+    pub dump_tables: DumpTablesFn,
+    /// Introspect, plan and write a schema + data dump.
+    pub dump_run: DumpFn,
+    /// Stop the dump [`SchemaActions::dump_run`] is writing. A no-op when nothing
+    /// is running; the partial file is left as a `.part` sibling, never renamed
+    /// over the destination.
+    pub dump_cancel: Rc<dyn Fn()>,
     /// Stop the import [`SchemaActions::import_run`] is running, rolling it back.
     /// A no-op when nothing is running.
     pub import_cancel: Rc<dyn Fn()>,
@@ -2853,6 +2992,8 @@ pub struct Ui {
     pub schema_actions: Rc<SchemaActions>,
     /// The file-import modal (opened from a table's schema context menu).
     pub import: ImportUi,
+    /// The schema + data dump modal (opened from a database's context menu).
+    pub dump: DumpUi,
     /// The schema-editing modals: the table designer and the DDL preview.
     pub ddl: DdlUi,
     // Connections — grouped (review §3.3).

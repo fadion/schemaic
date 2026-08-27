@@ -16,6 +16,7 @@ pub mod db_color;
 pub mod db_hidden;
 pub mod ddl;
 pub mod diff;
+pub mod dump;
 pub mod edit;
 pub mod erd;
 pub mod erd_export;

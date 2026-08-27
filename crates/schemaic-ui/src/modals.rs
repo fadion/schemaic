@@ -107,6 +107,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 // raised it.
                 crate::snippet_edit::snippet_edit_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
+                crate::dump_view::dump_overlay(ui.clone()),
                 table_designer::table_designer_overlay(ui.clone()),
                 view_editor::view_editor_overlay(ui.clone()),
                 // The trigger, routine and event editors share one tuple
@@ -213,6 +214,7 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let tx_prompt = ui.overlay.tx_prompt;
     let confirm = ui.overlay.confirm;
     let import_open = ui.import.target;
+    let dump_open = ui.dump.target;
     let snippet_edit = ui.overlay.snippet_edit;
     let editors = ddl_editors_up(ui.ddl);
     move || {
@@ -220,6 +222,10 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
             || tx_prompt.get().is_some()
             || confirm.get().is_some()
             || import_open.get().is_some()
+            // Painted in this group, so it has to be in this list — the wrapper's
+            // `inset(0)` resolves against a box this predicate keeps at zero by
+            // zero otherwise, and the modal renders nothing at all.
+            || dump_open.get().is_some()
             // The snippet editor is painted in this group, so it has to be in
             // this list — the event editor shipped missing from exactly here and
             // rendered nothing at all, because the wrapper's `inset(0)` resolved
@@ -332,6 +338,9 @@ mod modal_backdrop_gate {
     const PAINTS_A_BACKDROP: &[&str] = &[
         "connection_form.rs",
         "ddl_preview.rs",
+        // In the layer's DDL group, raised by `ddl_modals_up`'s
+        // `dump_open.get().is_some()` arm.
+        "dump_view.rs",
         "erd_view.rs",
         "event_editor.rs",
         "import_view.rs",
