@@ -17,6 +17,7 @@ use floem::reactive::{Scope, create_effect};
 use floem::style::Transition;
 use floem::views::Scroll;
 use floem::views::scroll::ScrollCustomStyle;
+use schemaic_core::intel::SqlDialect;
 
 use crate::consts::*;
 use crate::{icons, theme};
@@ -4254,6 +4255,7 @@ pub(crate) fn highlight_text(
         base,
         bold,
         line_height,
+        None,
     )
 }
 
@@ -4274,6 +4276,40 @@ pub(crate) fn highlight_mono(
         base,
         false,
         line_height,
+        None,
+    )
+}
+
+/// [`highlight_mono`] with the SQL **syntax-coloured** underneath the search
+/// highlight — for a panel that shows a saved statement rather than a line of
+/// prose.
+///
+/// The colours are `sql_highlight::highlight_spans`, the editor's own lexer, so
+/// a snippet reads the same in the library as it will once inserted; the Ctrl+K
+/// diff renders its lines through the same call for the same reason. It takes
+/// **one line**, which is what a collapsed preview is — `highlight_spans` carries
+/// no cross-line block-comment state.
+///
+/// A search match still wins where the two overlap: its span is added last, and
+/// it is bold as well as coloured, so the thing you typed is never the quietest
+/// text on the row.
+pub(crate) fn highlight_sql_mono(
+    full: String,
+    term: Option<String>,
+    font_size: impl Fn() -> f32 + 'static,
+    base: impl Fn() -> floem::peniko::Color + 'static,
+    line_height: f32,
+    dialect: SqlDialect,
+) -> floem::views::RichText {
+    highlight_text_in(
+        crate::consts::MONO_FAMILY,
+        full,
+        term,
+        font_size,
+        base,
+        false,
+        line_height,
+        Some(dialect),
     )
 }
 
@@ -4289,6 +4325,7 @@ pub(crate) fn highlight_mono(
 /// panel kept its old type size when the interface scale changed, until a filter
 /// or a refetch happened to rebuild it. Reading it here subscribes this closure
 /// to the scale.
+#[allow(clippy::too_many_arguments)]
 fn highlight_text_in(
     family: &'static str,
     full: String,
@@ -4297,6 +4334,7 @@ fn highlight_text_in(
     base: impl Fn() -> floem::peniko::Color + 'static,
     bold: bool,
     line_height: f32,
+    syntax: Option<SqlDialect>,
 ) -> floem::views::RichText {
     use floem::text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout, Weight};
     let base_weight = if bold { Weight::BOLD } else { Weight::NORMAL };
@@ -4311,6 +4349,21 @@ fn highlight_text_in(
             .weight(base_weight)
             .line_height(lh);
         let mut list = AttrsList::new(base_attrs);
+        // Syntax first, the search term second: a later span wins the overlap,
+        // and what the user typed has to be the thing that stands out.
+        if let Some(dialect) = syntax {
+            for (lo, hi, color) in crate::sql_highlight::highlight_spans(&full, dialect) {
+                list.add_span(
+                    lo..hi,
+                    Attrs::new()
+                        .family(&sans)
+                        .font_size(size)
+                        .color(color)
+                        .weight(base_weight)
+                        .line_height(lh),
+                );
+            }
+        }
         if let Some(t) = term.as_deref().filter(|t| !t.is_empty()) {
             let hit = Attrs::new()
                 .family(&sans)
