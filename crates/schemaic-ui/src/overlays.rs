@@ -1093,6 +1093,25 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
+                    // Next to *Generate DDL*, and deliberately: the two answer
+                    // the same question at different depths — one hands you the
+                    // structure as text to read, the other writes the structure
+                    // *and* the rows to a file you can replay.
+                    {
+                        let dui = import_ui.clone();
+                        let db = menu.name.clone();
+                        entries.push(MenuEntry::action("Export", move || {
+                            let ctx = crate::table_designer::edit_ctx(&dui);
+                            crate::dump_view::open_dump(
+                                dui.clone(),
+                                ctx.conn_id,
+                                db.clone(),
+                                None,
+                                None,
+                                ctx.dialect,
+                            );
+                        }));
+                    }
                     // ER diagram of the whole database (every related table).
                     let edb = menu.name.clone();
                     entries.push(MenuEntry::action("ER Diagram", move || {
@@ -1317,6 +1336,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(MenuEntry::action("Generate DDL", move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
                             (oq)(ddl.clone(), Some(db.clone()));
+                        }));
+                    }
+                    // The namespace's own export — the picker is filtered to it,
+                    // so a `sales` export carries no `public` table.
+                    {
+                        let dui = import_ui.clone();
+                        let db = database.clone();
+                        let ns = menu.name.clone();
+                        entries.push(MenuEntry::action("Export", move || {
+                            let ctx = crate::table_designer::edit_ctx(&dui);
+                            crate::dump_view::open_dump(
+                                dui.clone(),
+                                ctx.conn_id,
+                                db.clone(),
+                                Some(ns.clone()),
+                                None,
+                                ctx.dialect,
+                            );
                         }));
                     }
                     // A namespace is introspected as part of its database, so
@@ -1654,6 +1691,31 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 // columns to map onto.
                                 .disabled(read_only || !has_columns),
                             );
+                        }
+                        // **Directly below Import**, because here the two are the
+                        // file pair — the same modal a database node opens, with
+                        // this table the only one ticked and the rest of the
+                        // database one click away. Offered on a read-only
+                        // connection, unlike Import: this reads the server and
+                        // writes a local file.
+                        {
+                            let dui = import_ui.clone();
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            entries.push(MenuEntry::action("Export", move || {
+                                let ctx = crate::table_designer::edit_ctx(&dui);
+                                crate::dump_view::open_dump(
+                                    dui.clone(),
+                                    ctx.conn_id,
+                                    db.clone(),
+                                    // The picker still offers the whole database:
+                                    // the namespace here is the *table's*, and
+                                    // narrowing to it would hide the neighbours
+                                    // this table's foreign keys point at.
+                                    None,
+                                    Some(schemaic_core::schema::display_name(ns.as_deref(), &tbl)),
+                                    ctx.dialect,
+                                );
+                            }));
                         }
 
                         // ── Schema editing ────────────────────────────────────
@@ -5718,6 +5780,19 @@ mod menu_order_gate {
             if arms.last() != Some(&b.arm) {
                 arms.push(b.arm.clone());
                 highest = (0, String::new());
+            }
+            // **`Export` is deliberately outside the skeleton**, the one label
+            // with two honest homes. On a database or a namespace it sits with
+            // `Generate DDL`, among the read entries that hand you what the node
+            // holds; on a table it sits directly below `Import`, because there
+            // the two are the file pair and separating them would be the
+            // surprise. Neither placement can be wrong in the way this gate
+            // exists to catch: it writes a file and never the server, so it is
+            // never the irreversible entry — and the position that actually
+            // matters is still pinned, by
+            // `drop_is_the_last_entry_before_ai_explain`.
+            if b.label == "Export" {
+                continue;
             }
             let Some(g) = group(&b.label) else {
                 unplaced.push(format!("{}: `{}` at line {}", b.arm, b.label, b.line));

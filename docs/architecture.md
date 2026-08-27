@@ -599,6 +599,105 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `false` to a bool and a refresh empties what there is to look at, and the caller passes
     `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
     compared them, so switching connection discarded a hand-built mapping. Pure + unit-tested.
+  - `dump.rs` — the **schema + data dump**: what one replayable `.sql` file holds and in what order,
+    as a `DumpPlan` of `DumpStep::Text`/`DumpStep::Rows` that `schemaic-app`'s `dump.rs` executes. It
+    writes nothing and connects to nothing, so every decision in it is unit-tested.
+    **The interface calls this *Export*; the code calls it a dump, and the split is deliberate.**
+    `export` is already taken in this crate by `crate::export`, which renders *one result set* to a
+    file — a different feature with different inputs, and a reader who meets `export` in
+    `schemaic-core` should be able to assume the grid one. So the menu entries, the modal's title and
+    its primary button all say Export, while `dump_run`, `DumpPlan` and `app::dump` keep the code
+    name; the module doc is where the two vocabularies are reconciled, and it is what to read before
+    "fixing" a `dump_` name that sits behind a menu called Export.
+    **It joins two emitters that already existed and adds no third.** Structure is
+    `TableInfo::create_ddl` (which routes a view on to `ddl::view_ddl`), triggers are
+    `TriggerInfo::create_sql`, the closing constraints are a `ddl::ChangeSet` of
+    `Change::AddForeignKey` through `ChangeSet::emit` — the emitter the apply path uses — and the
+    rows are `export::ExportFormat::Sql`, streamed by the app. Identifiers go through
+    `export::ident_sql`/`qualified_table`, so a dump cannot quote differently from the SQL export.
+    **The row `SELECT` names its columns and is never `SELECT *`.** `exported_columns` projects
+    everything `ColumnInfo::is_server_assigned` says the server does *not* fill for itself — the same
+    predicate `import::insert_columns` asks, about the same columns. The renderer names every column
+    the result carries, so `SELECT *` put generated columns and PostgreSQL `GENERATED ALWAYS AS
+    IDENTITY` columns straight into the `INSERT` column list, which all three engines refuse (MySQL
+    3105, SQLite *cannot INSERT into generated column*, PostgreSQL *cannot insert a non-DEFAULT
+    value*) — the file died on its first row. PostgreSQL's identity would need an `OVERRIDING SYSTEM
+    VALUE` the shared renderer has no way to emit. **The cost:** an identity column's values are not
+    carried, so the restored rows are renumbered — which the **header names, column by column**,
+    alongside the cycle and dropped-constraint notices. The person replaying the file is the one who
+    needs to know, and it is the same silence about a `NULL`ed blob that the tally exists to break;
+    a file that carries every column says nothing, because a caveat printed on every dump is one
+    nobody reads (`a_column_the_file_cannot_carry_is_announced_in_it`,
+    `a_file_that_carries_every_column_says_nothing_about_it`). A table whose columns are *all*
+    server-assigned gets **no data step at all**: nothing about it is insertable, and `SELECT  FROM`
+    would not even parse. Both halves are pinned by
+    `a_generated_column_is_never_selected_into_the_insert` — which also asserts the column is still
+    *declared*, since it is only the `INSERT` it has to stay out of — and
+    `a_table_the_server_fills_entirely_gets_no_data_step`.
+    **Foreign keys are restated after the data.** `create_ddl` deliberately emits none: for Copy DDL
+    an omitted key still leaves a script that runs, which is why the ordering effort there went to
+    types and views instead (`create_ddl_script`'s own account of it). A dump can't take that trade —
+    a restore that silently drops every constraint is not a restore — and the trailing section is
+    also what stops the insert order invalidating the file. It is **skipped for a table whose
+    `create_sql` is `Some`** (`needs_fk_section`): SQLite's verbatim captured `CREATE TABLE` already
+    carries the keys, and SQLite has no `ALTER TABLE … ADD CONSTRAINT` to restate them with. That
+    question is asked of the *table*, never of the dialect — the data answers it directly.
+    **And only a key whose target table is in the same file.** Exporting one table is a first-class
+    action now — a table node's own *Export* — and `ALTER TABLE orders ADD CONSTRAINT … REFERENCES
+    customers` in a file that never creates `customers` fails at restore: on PostgreSQL with no guard
+    to hide behind, and *after* the rows have landed. The keys pointing outside the selection are
+    dropped, counted, and **the header says how many and why**, which is the honest half of the trade
+    — emitting a statement that cannot succeed was the alternative, not a completer restore. That is
+    also why the whole constraints section is **decided before the header is emitted** even though it
+    is written last: the header has to be able to report the count, so a future tidy that moves the
+    section back into file order silently empties that sentence
+    (`a_foreign_key_to_a_table_outside_the_selection_is_not_restated`).
+    **The FK guard wraps the transaction, never the other way round.** `PRAGMA foreign_keys` is a
+    silent no-op inside a transaction on SQLite, so a guard emitted after `BEGIN` reads correctly in
+    the file and does nothing at all. `fk_guard_sql` and `transaction_sql` are the strings and `plan`
+    is what composes them, which is why `the_sqlite_guard_sits_outside_the_transaction` asserts on
+    the whole file rather than on either function — the bug is the composition. **PostgreSQL gets no
+    guard**: `session_replication_role` is superuser-only, so offering it would be a checkbox that
+    fails the restore for most roles, and the ordering plus the trailing constraints section is the
+    answer there. **`target_database_sql` emits `USE` on MySQL only, and it is load-bearing.**
+    `create_ddl` names a MySQL table bare — a database is not a namespace there, so there is nothing
+    to qualify with — while the `INSERT`s come from the export renderer, which addresses a table
+    through `qualified_table` and *does* name the database; without that line the file would create
+    `orders` wherever the client is pointed and then insert into `shop`.`orders`.
+    PostgreSQL needs none (both halves name the namespace) and SQLite has no qualifier at all.
+    What that line is **not** is a retarget: a `mysqldump` is replayed elsewhere by editing its one
+    `USE`, because its `INSERT`s name the table bare, while these name `` `shop`.`orders` `` outright
+    — so the file is locked to the database it came from, and that is **known debt rather than a
+    finished answer**. The fix is a way to render an unqualified target in
+    `export::qualified_table`/`export_inserts_chunks`, which is the grid's export path too — too wide
+    a change to make from inside this feature, so it is written down here rather than done. A second
+    edge is deliberately left alone: `qualified_table(database, None, table, Postgres)` names the
+    *database* as a namespace, which is wrong, but `pg::fetch_schema` always sets a
+    `TableInfo::schema` so nothing here reaches it, and the fallback lives in the shared quoter where
+    changing it for this one caller is the worse trade.
+    **Ordering is a topological sort over `TableInfo::foreign_keys`** (`order_tables`): a referenced
+    table before the table referencing it, views last — a view's body selects from the tables above
+    it and it holds no rows to order against anything — and ties broken by name, so two dumps of one
+    schema are the same file. A self-reference is not an edge, being one table that can only be
+    created before itself. A real cycle is **reported, never dropped**: no creation order satisfies
+    one, so an edge is broken at the smallest name, every chosen table still reaches the file, and
+    `DumpPlan::cycles` is what puts the explanation in the header. The standalone-objects section
+    covers only the namespaces the chosen tables live in — a dump of `sales` has no business
+    recreating `archive`'s types — and skips `ObjectItem::is_internal`, since a `serial`'s own
+    sequence is created by the column's definition and restating it fails the load on a name that
+    already exists. It also drops a sequence **owned by one of the chosen tables**, which
+    `is_internal` cannot answer on its own: a catalogue can report the link as external while the
+    column still owns the counter, the same question `DbSchema::create_ddl_script` asks and the two
+    scripts must not disagree about. The owner comparison is on **`(namespace, name)`**, not the name
+    — `create_ddl_script` gets away with a name because it works inside one namespace, while a
+    selection spans them, so `sales.orders_id_seq` owned by the unexported `sales.orders` was being
+    dropped on the strength of a chosen `public.orders`, leaving the column that defaults to it with
+    nothing behind it (`a_sequence_owned_by_a_same_named_table_in_another_namespace_is_kept`). A
+    sequence carries its own namespace and its owner is in that namespace, which is what makes the
+    pair available to compare. It is on by default because a file without it fails on the first
+    column typed as one of the database's enums. Pure + unit-tested; extend the tests that assert on the whole file
+    (`file_of`) rather than on one string, since ordering across the two step kinds is where this
+    module's real bugs live.
   - `ddl.rs` — **schema editing**, and every engine now reshapes a table, edits a view and edits a
     trigger. `supports_schema_editing(dialect)` is **gone**: it would have become "always true", and
     a vacuous predicate invites deletion for the wrong reason. The capabilities it used to answer
@@ -3156,6 +3255,80 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does
     for query runs) instead of closing — the transaction rolls back, so a cancelled import writes
     nothing.
+  - `dump_view.rs` — the **schema + data dump** modal, **Export** to the user, over `core::dump`.
+    Three entry points and one modal: a database's schema context menu and a PostgreSQL namespace's,
+    both next to *Generate DDL* (the two answer the same question at different depths — one hands you
+    the structure as text to read, the other writes the structure *and* the rows to a file you can
+    replay), and a **table's, directly below *Import***, where the two are the file pair. The table
+    entry passes `open_dump`'s `preselect`, which ticks that one table instead of all of them, and
+    deliberately passes **no namespace**: the picker still lists the whole database, because
+    narrowing to the table's own namespace would hide the neighbours its foreign keys point at. It is
+    offered on a **read-only** connection, unlike Import — it reads the server and writes a local
+    file. The code keeps the `dump` name throughout, for the reason `core::dump`'s entry gives. It
+    collects a table selection and the six `DumpOptions` and hands both to
+    `SchemaActions::dump_run`; nothing here builds SQL. The picker is **its own read**
+    (`SchemaActions::dump_tables` → `Db::fetch_table_list`, names only — `fetch_schema` would read
+    every column of every table to print them), because it has to be right for a database the tree
+    has never been expanded on, where a picker built from the cached tree would silently offer
+    nothing; a namespace's entry then filters that list to its own prefix, so a `sales` dump carries
+    no `public` table. Everything starts checked, the common case being all of it — or exactly the
+    preselected table when the entry was a table's own, since the click already said which one, and
+    only if the read's list actually contains that name — when it doesn't, the modal **says which
+    table is missing** in its error line. A click that names a table the server no longer reports
+    (dropped or renamed since the tree was last refreshed) otherwise opened a full list with nothing
+    ticked and a dead `Export` button, which reads as broken rather than as an answer.
+    The picker's rows read the selection through a `create_memo` of it as a `HashSet` and show or
+    hide their two glyphs with `s.hide()`, never a per-row `dyn_container`. `chosen` stays a `Vec`,
+    because that is what the request carries and what `All` resets from, but every row watches it, so
+    a single tick cost a linear `contains` per row *plus* a rebuild of every row — quadratic in the
+    number of tables listed. The memo makes each row's read O(1) and the show-hide is the *Floem 0.2
+    gotchas* rule (`display: none`/`flex` beats a rebuild), which here also means nothing is taken
+    apart under the pointer mid-click.
+    It follows `import_view`'s discipline for the same reasons: `widgets::accept_launch` in the same
+    synchronous step as the launch — inside the save dialog's callback (titled `Export to SQL`,
+    defaulting to `{database}.sql`), since that is where the launch is, and with `read_only` false
+    because a dump writes to the local disk and never to the server — a `listing`/`running` pair
+    that is what the buttons gate on, and `DumpUi::generation` bumped on every open so a table list
+    or an outcome that lands after the modal was reopened elsewhere reports into nothing. Every exit
+    — the footer's dismissive button, Escape, the ✕ — **stops the export rather than closing**
+    (`widgets::exit_action` with `cancellable: true`), the import modal's rule and for its reason:
+    closing would hide a write still going and leave its outcome with no reader, since the modal's
+    signals are the only channel the run reports to.
+    **The footer carries the run; the body is choices only.** The dismissive button is where the
+    stop lives: it reads `Close` and turns into a red `Stop` (`ActionKind::Danger`) for as long as
+    that is what pressing it does — a word and a colour, because in `Neutral` it reads as the same
+    way out with a different label, which is what it is not. `Export` is disabled while the run is
+    on. **The stop is deliberately not beside the progress text**: it was, for one revision, and the
+    line grows as its count does (`3 of 12, 9k` → `98k rows so far`), so the one control the user
+    wanted walked left and right under the cursor on every tick. The footer's **left** slot
+    (`modal_footer_split`) therefore carries text alone — the per-table line,
+    `Writing orders — 3 of 12, 56k rows so far`, the count through `text::human_count`, the same
+    abbreviation the grid uses — falling back to an animated `Reading the schema`
+    (`widgets::loading_dots`) before the first table, where there is nothing to count yet and a
+    static label and a hung one look identical. The **outcome** replaces it in that slot: the green
+    `Wrote 5 tables.` followed by `export::export_note` — the grid's own caveat wording, reused
+    rather than restated, so a file whose every blob went out as `NULL` says so instead of reading as
+    a clean success — and the red failure or cancel sentence. `DumpUi::done` is therefore the
+    finished `String` rather than the counts for the view to word: it is built in the outcome
+    callback, which is the last place the destination's file name is still in scope, and
+    `export_note` names that file. Both used to sit at the
+    bottom of the modal's scrolling body, where the thing whose whole purpose is being seen could
+    land below the fold; nothing about the run is written there now. The progress line is its
+    **own** `dyn_container` inside the footer's, because it ticks once per table and rebuilding the
+    buttons beside it on each tick would take the focus ring with it. The whole footer is a `dyn_container` keyed on
+    running / the chosen set / `DumpUi::options().is_empty()` / the outcome, the shape the import
+    footer uses and for the same reason: `action_button` takes a plain `bool`, so a state read while
+    the panel is built is the state at build time, and an `Export` button left enabled after the last
+    table is unchecked launches an export of nothing.
+    It is painted in the DDL group, so `modals::ddl_modals_up` has to name `ui.dump.target` — the
+    wrapper's `inset(0)` otherwise resolves against a box that predicate is keeping at zero by zero,
+    and the modal renders nothing at all. The foreign-key toggle is offered only where
+    `dump::fk_guard_sql` returns something, and where it doesn't the modal *says* so in a `form_hint`
+    rather than greying out a control: PostgreSQL's switch is superuser-only, so the honest thing is
+    a sentence about the constraints section, not a checkbox that fails the restore for most roles.
+    `watch_connection` closes the modal when the active connection changes under it — the Export
+    button would otherwise launch against a `conn_id` that is no longer selected — unless a dump is
+    running.
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -4524,6 +4697,47 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   one is a change the user was promised and wouldn't get. The tag is advertised from the constant
   the app extracts on (`the_proposal_tool_advertises_the_tag_the_app_looks_for`), so the two can't
   drift into a block nothing picks up.
+  - `dump.rs` — the I/O half of `core::dump`: introspect, plan, write. Its shape is `export_file`'s
+    `AllRows` branch with one difference that drives the whole module — an export is one statement
+    into one file and a dump is **many**, so the writer has to outlive each table. A single blocking
+    task owns the file and reads `Msg`s: a `Text` is written as it arrives, and a `Table` carries the
+    *receiving end* of that table's row channel, which the writer drains through `ExportFormat::Sql`,
+    so a dump's `INSERT`s and the grid's SQL export are the same statements by construction. Rows are
+    read at `EXPORT_CHUNK_ROWS` with the same bound of two blocks in flight, and the `.part`-sibling
+    + atomic-rename guarantee is the export's unchanged — `part_of` builds that sibling through
+    `export::part_path`, the one function that decides the suffix, because the modal's cancel
+    sentence names the same fragment through it and two spellings of `.part` could drift apart in
+    exactly the situation where the fragment is the thing the user still wants. Unchanged too is
+    **cancel is the reader's to declare
+    and every other failure the writer's to describe** — a cancelled read closes the channels, which
+    the writer sees as an ordinary end of stream and would otherwise call a truncated file finished.
+    **One check the export path has no need of**: after the join, `token.is_cancelled()` is asked
+    directly, because a cancel that arrives while no table is streaming — during the schema read, or
+    anywhere in a structure-only dump — never reaches the reader's error, and the writer's refusal to
+    publish surfaces as an *error*, so a stopped dump would be reported as a failed one. **The schema
+    is freshly introspected, never the tree's cache**: a dump is a backup, and a `CREATE TABLE` for a
+    shape the server no longer has is a backup that restores the wrong table. The two counts in the
+    report are deliberately different figures and must not be made to agree — progress counts the
+    `DumpStep::Rows` steps, since a view has no rows of its own and a structure-only dump streams
+    nothing at all, so counting tables would promise a "12 of 12" that never arrives, while
+    `DumpOutcome::Done`'s `tables` is `DumpPlan::tables`, what the file actually covers.
+    **Beside it rides an `ExportTally`, not a row count.** `write` folds each table's tally into one
+    — rows summed, and a withheld or blanked column named once however many tables it appears in,
+    the rule `ExportTally::note` already follows within a single export — because the driver used to
+    discard `withheld`/`blanked` and an export that wrote every BLOB as `NULL` came back as a green
+    *Wrote 5 tables and 115k rows.* What the file could **not** carry is the difference between a
+    backup and something that looks like one, so it has to survive the trip back. Progress
+    reaches the modal as a **crossbeam channel + `create_signal_from_channel`** rather than a
+    callback, for the reason the AI stream and `update.rs`'s download do: `create_ext_action` is
+    one-shot and has to be built on the UI thread, so a worker reporting *repeatedly* needs a signal
+    fed from a channel. **The dump owns its own cancel slot** (`dump_token`) rather than sharing
+    `export_token`: the *grid* export's slot exists to stop two result-set exports competing for one
+    disk, while a dump can only be launched from a modal that already refuses a second one, and
+    folding the two together would let a running result-set export's Cancel stop a dump the user
+    cannot even see. (Both features are called Export in the interface, which is why that sentence
+    names which one it means; `core::dump`'s entry has the naming split in full.) The sentences this
+    module produces are worded for the interface — `Export failed: {e}`, and
+    `Nothing to export — no table matched the selection.` for a plan with no steps.
   - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
     adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
     system allocator. It exists to answer one question the OS can't: whether memory growth is a
@@ -5043,6 +5257,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   the preview modal → `Db::run_ddl`. Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
   don't add one that applies a plan without the preview — the preview is where the destructive
   consequence is stated in plain language and where "Open in editor" hands the script over.
+  **A dump is on the written side of this rule rather than an exception to it.** `core::dump::plan`
+  composes a file out of the emitters that already exist — `TableInfo::create_ddl`, `ddl::view_ddl`,
+  `TriggerInfo::create_sql` and `ChangeSet::emit` for the closing foreign keys — and `app::dump`
+  writes it to disk; nothing on that path can execute it, which is exactly the standing Copy DDL has.
+  A second emitter would be the regression here, not the missing preview.
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. Which gate to ask depends on the question: `supports_change` for a single change
@@ -5110,7 +5329,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
   a change to `affected != 1` fails a test rather than passing silently.
 - **A destructive modal action guards its own launch, in the same step that launches it.** Import,
-  the DDL preview's Apply and Server Activity's kill are the three, and they go through
+  the DDL preview's Apply, Server Activity's kill and the Export modal's own launch are the four,
+  and they go through
   `widgets::accept_launch(in_flight, read_only)` — not through the disabled button, which is what
   *says* the action is unavailable and takes effect on a later update pass. `run_import` set a busy
   flag and never read it, resting on a comment that "its Import button is disabled while one is in
@@ -6404,6 +6624,15 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   arm pushes `Collapse all` after `Refresh` where the skeleton closes the read group with `Refresh`,
   and the table arm's write group is `Import` → `Edit table` → `Triggers` where the skeleton lists
   Create/Edit/Import/Triggers. Order *within* group 4 is not checked; `Drop` being last is.
+  **`Export` is the one label the gate skips outright**, and it is an exemption rather than a third
+  deviation: it has two honest homes — with `Generate DDL` on a database or a namespace, among the
+  read entries that hand you what the node holds; directly below `Import` on a table, where the two
+  are the file pair — so no single group can hold it without making one of the two placements a
+  failure. It is safe to exempt because neither placement can be wrong in the way this gate exists to
+  catch: it writes a file and never the server, so it is never the irreversible entry group 4's
+  ordering keeps off the cursor, and the position that does matter is still pinned by
+  `drop_is_the_last_entry_before_ai_explain`. The skip is a `continue` on that one label inside the
+  test, not a lenient `group` — an unknown label still fails, which is the part that stops drift.
   Four things the scan has to get right, each of which made it wrong first: comments are cut out of a
   constructor's span (one entry explains its own label with `"(0)" reads as a broken count` two lines
   above the label, and the scan read the comment as the name); a label is read only from the span

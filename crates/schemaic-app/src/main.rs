@@ -13,6 +13,7 @@
 
 mod ai;
 mod claude_cli;
+mod dump;
 mod heap;
 mod logging;
 mod mcp;
@@ -2987,6 +2988,111 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let export_token = export_token.clone();
         Rc::new(move || {
             if let Some(t) = export_token.borrow().as_ref() {
+                t.cancel();
+            }
+        })
+    };
+
+    // ── Schema + data dump ───────────────────────────────────────────────────
+    //
+    // The work is in `dump.rs`; these three are the wiring. A dump gets its own
+    // cancel slot rather than sharing the export's: the export token exists to
+    // stop two *exports* competing for one disk, while a dump can only be
+    // launched from a modal that already refuses a second one, and folding them
+    // together would let a running export's Cancel stop a dump the user cannot
+    // even see.
+    //
+    // Progress is a channel rather than a callback, for the reason the AI stream
+    // is: `create_ext_action` is one-shot and has to be built on the UI thread,
+    // so a worker reporting *repeatedly* needs a signal fed from a channel.
+    let (dump_tx, dump_rx) = crossbeam_channel::unbounded::<schemaic_ui::DumpProgress>();
+    let dump_stream = create_signal_from_channel(dump_rx);
+    // The modal's own signal, made here rather than in the `Ui` literal below so
+    // the effect that feeds it can be written next to the channel it feeds from.
+    let dump_progress: RwSignal<Option<schemaic_ui::DumpProgress>> = RwSignal::new(None);
+    create_effect(move |_| {
+        if let Some(p) = dump_stream.get() {
+            dump_progress.set(Some(p));
+        }
+    });
+    let dump_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+
+    let dump_tables: schemaic_ui::DumpTablesFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |conn_id: u64, database: String, done: Rc<dyn Fn(Result<Vec<String>, String>)>| {
+                let report = create_ext_action(cx, move |r: Result<Vec<String>, String>| (done)(r));
+                let db = match (db_for)(conn_id) {
+                    Ok(db) => db,
+                    Err(e) => return report(Err(e)),
+                };
+                handle.spawn(async move {
+                    // The *list*, not the full schema: names are all a picker
+                    // needs, and `fetch_schema` would read every column of every
+                    // table to print them.
+                    let out = db
+                        .fetch_table_list(&database)
+                        .await
+                        .map(|s| {
+                            s.tables
+                                .iter()
+                                .map(|t| {
+                                    schemaic_core::schema::display_name(
+                                        t.schema.as_deref(),
+                                        &t.name,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|e| e.to_string());
+                    report(out);
+                });
+            },
+        )
+    };
+
+    let dump_run: schemaic_ui::DumpFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let dump_token = dump_token.clone();
+        let dump_tx = dump_tx.clone();
+        Rc::new(
+            move |req: schemaic_ui::DumpRequest, done: schemaic_ui::DumpDoneFn| {
+                use schemaic_ui::DumpOutcome;
+                let db = match (db_for)(req.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        // Refused before the write, so it must not claim a file
+                        // it never touched.
+                        return (done)(DumpOutcome::Failed {
+                            message: format!("Dump failed: {e}"),
+                            partial: false,
+                        });
+                    }
+                };
+                let token = CancellationToken::new();
+                *dump_token.borrow_mut() = Some(token.clone());
+                let report = {
+                    let dump_token = dump_token.clone();
+                    create_ext_action(cx, move |o: DumpOutcome| {
+                        *dump_token.borrow_mut() = None;
+                        (done)(o);
+                    })
+                };
+                let (handle2, tx) = (handle.clone(), dump_tx.clone());
+                handle.spawn(async move {
+                    let outcome = dump::run(db, req, handle2, token, tx, EXPORT_CHUNK_ROWS).await;
+                    report(outcome);
+                });
+            },
+        )
+    };
+
+    let dump_cancel: Rc<dyn Fn()> = {
+        let dump_token = dump_token.clone();
+        Rc::new(move || {
+            if let Some(t) = dump_token.borrow().as_ref() {
                 t.cancel();
             }
         })
@@ -8383,6 +8489,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                 })
             },
+            dump_tables,
+            dump_run,
+            dump_cancel,
             run_ddl,
             view_algorithm,
             trigger_functions,
@@ -8421,6 +8530,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             applying: RwSignal::new(false),
             generation: RwSignal::new(0),
             probe_seq: RwSignal::new(0),
+        },
+        // Same rule as `import` above: one bundle, reset on open.
+        dump: schemaic_ui::DumpUi {
+            target: RwSignal::new(None),
+            tables: RwSignal::new(Vec::new()),
+            chosen: RwSignal::new(Vec::new()),
+            listing: RwSignal::new(false),
+            structure: RwSignal::new(true),
+            data: RwSignal::new(true),
+            other_objects: RwSignal::new(true),
+            drop_if_exists: RwSignal::new(true),
+            wrap_transaction: RwSignal::new(true),
+            disable_fk_checks: RwSignal::new(true),
+            running: RwSignal::new(false),
+            progress: dump_progress,
+            error: RwSignal::new(None),
+            done: RwSignal::new(None),
+            generation: RwSignal::new(0),
         },
         // Same rule as `import` above: reset on open, so one bundle serves every
         // table rather than a per-open scope that would need disposing.

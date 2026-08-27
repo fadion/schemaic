@@ -4573,10 +4573,16 @@ pub(crate) enum ExitAction {
 
 /// The exit decision. See [`ExitAction`].
 ///
-/// `cancellable` is what separates the two callers: the import modal holds a
+/// `cancellable` is what separates the callers: the import modal holds a
 /// cancellation token the load actually observes, while `run_ddl` is handed a
 /// fresh token nothing holds — and on MySQL each DDL statement has already
 /// committed anyway, so there is no meaningful "stop".
+///
+/// The export modal is the third, and passes `true` like the import modal: its
+/// run holds a token the writer observes, and its dismissive button *says* so —
+/// it reads `Stop`, in `Danger`, for as long as that is what pressing it does.
+/// A footer that changes its word and its colour is what makes `Cancel` here an
+/// answer rather than a trapdoor.
 pub(crate) fn exit_action(busy: bool, cancellable: bool) -> ExitAction {
     match (busy, cancellable) {
         (false, _) => ExitAction::Close,
