@@ -15,7 +15,6 @@ mod connection_form;
 mod consts;
 pub mod contrast;
 mod ddl_preview;
-mod diff_view;
 mod dividers;
 mod dump_view;
 mod editor_pane;
@@ -27,6 +26,7 @@ mod grid;
 mod history_panel;
 pub mod icons;
 mod import_view;
+mod inline_diff;
 mod markdown;
 mod modals;
 mod monitor_view;
@@ -6014,6 +6014,17 @@ pub(crate) struct FieldCfg {
     pub border_radius: f32,
     /// Read-only: no text edits (still handles Enter/Escape). Suppresses autofocus.
     pub read_only: bool,
+    /// Enter **never** inserts a line break, whatever the modifiers — for a
+    /// `multiline` box holding one *question* rather than a body. Wrapping and
+    /// auto-grow are unaffected; only the key's meaning changes.
+    ///
+    /// [`Self::multiline`] otherwise decides two things at once: wrap-and-grow,
+    /// and "Enter may break the line". They are the same answer for a snippet
+    /// body and opposite answers for the Ctrl+K prompt, which wants to grow with
+    /// a long question and has nothing a second line would mean. Leaving them
+    /// tied put stray newlines in that prompt via whichever path reached the
+    /// no-submit arm, and every fix that kept the tie was a fix to one path.
+    pub enter_never_breaks: bool,
     /// Fixed box height. `None` = derive from content (auto-grow for multiline).
     ///
     /// A `fn`, like [`Self::font_size`] and for the same reason — the box has to
@@ -6138,6 +6149,7 @@ impl Default for FieldCfg {
             mono: false,
             border_radius: 6.0,
             read_only: false,
+            enter_never_breaks: false,
             height: None,
             max_rows: None,
             min_rows: 1,
@@ -6277,6 +6289,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         mono,
         border_radius,
         read_only,
+        enter_never_breaks,
         height,
         max_rows,
         min_rows,
@@ -6463,15 +6476,22 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             // left every body field — the snippet editor's, the view editor's —
             // with an Enter that did nothing at all and a Shift+Enter nobody
             // would guess at.
+            // `enter_never_breaks` opts a multiline field out of the newline
+            // entirely — it is the *question* case, where a second line means
+            // nothing and the box is multiline only to wrap and grow.
             let plain = !mods.shift() && !mods.control();
+            // `enter_never_breaks` is folded in here rather than into `plain`: once
+            // a field cannot break its line, no modifier combination changes what
+            // Enter means, so the guards below stop consulting `plain` at all.
+            let breaks = multiline && !enter_never_breaks;
             match &submit {
-                Some(cb) if !multiline || plain => {
+                Some(cb) if !breaks || plain => {
                     (cb)();
                     return CommandExecuted::Yes;
                 }
-                // A single-line field never inserts a newline, submit or not:
-                // swallowing the key is what keeps its text one line.
-                None if !multiline => return CommandExecuted::Yes,
+                // A field that cannot break its line never inserts a newline,
+                // submit or not: swallowing the key is what keeps its text intact.
+                None if !breaks => return CommandExecuted::Yes,
                 _ => {}
             }
         }

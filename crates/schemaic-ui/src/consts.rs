@@ -158,81 +158,11 @@ pub(crate) const EDITOR_H: f64 = 248.0;
 /// move the content origin, so they need no compensation.)
 pub(crate) const EDITOR_PAD_TOP: f64 = 5.0;
 
-/// Everything stacked around the Ctrl+K diff, which is what the diff's own height
-/// is the editor area minus. Flex/percentage heights don't resolve through the
-/// absolute overlay in Floem, so the diff can't "fill the remaining space" — it is
-/// sized explicitly, and something has to say how much is not it. Subtraction (not
-/// a proportion) is correct: only the diff should absorb any extra height.
-///   ~30 toolbar + 20 editor_wrap pad + ~35 question row + ~45 buttons + 20 diff
-///   pad ≈ 150 of chrome — trimmed to 135 so a long diff + buttons + spacing
-///   reach the bottom of the overlay with no dead space.
-///
-/// **Scaled, unlike the [`EDITOR_H`] seed the editor's height starts at.** Every
-/// element it accounts for is scaled now — the toolbar row is `scaled(42)`, the
-/// option rows `scaled(35)`, the buttons `action_height()` — so a fixed 135 stopped
-/// describing the chrome it stands for, and at the top scale roughly 216px of
-/// chrome was being subtracted as 135. `EDITOR_H` stays unscaled because it is a
-/// persisted drag seed; this is a *composition of scaled parts*, which is the distinction the
-/// module doc draws.
-pub(crate) fn cmdk_diff_chrome() -> f64 {
-    scaled(135.0)
-}
-/// The diff's own height: what is left of `area` — the editor area the overlay
-/// actually fills — once its chrome is taken out.
-///
-/// **`area`, not [`EDITOR_H`].** The constant is a *drag seed*: the editor pane is
-/// resizable and the expanded overlay is sized from the measured
-/// `editor_area` height (`cmdk_popup`'s `area_h`), so deriving from 248 sized the
-/// diff for a pane nobody had any more — short in a pane dragged taller, and, once
-/// the chrome became scaled while the constant did not, longer than the whole
-/// overlay at Large and Huge.
-///
-/// **And it floors at zero, which is the whole point of a floor here.** The old
-/// `.max(scaled(60))` was written to keep something readable, but when the chrome
-/// alone doesn't fit, adding 60 more *guarantees* the overflow instead of
-/// preventing it — and what overflows is the bottom of the column, which is
-/// Accept/Discard. A pane too short for the chrome shows no diff and keeps its
-/// buttons; enlarging the editor is the way back, and it is a gesture the user has.
-pub(crate) fn cmdk_diff_h(area: f64) -> f64 {
-    (area - cmdk_diff_chrome()).max(0.0)
-}
-
-/// The overlay's own border, top and bottom — a hairline, so unscaled.
-pub(crate) const CMDK_BORDER: f64 = 2.0;
-/// The diff wrapper's own vertical padding: 5px of gap from the question field
-/// above, 10px to the buttons below. Named because [`cmdk_diff_h_measured`] has
-/// to subtract exactly what `cmdk_popup` draws.
-pub(crate) fn cmdk_diff_pad_v() -> f64 {
-    scaled(5.0) + scaled(10.0)
-}
-
-/// The diff's height once the chrome around it has been **measured** instead of
-/// estimated — `area` less the question field, the button row, this wrapper's own
-/// padding and the overlay's border.
-///
-/// **Why measuring replaced predicting.** [`cmdk_diff_chrome`] is a single number
-/// standing for a stack of parts, and it was tuned by eye at 100%. Scaling that
-/// total is not the same as scaling the parts: at 160% it subtracted 216px of
-/// chrome from a pane that is only ~256px tall, leaving the diff **40px** — one
-/// and a half lines — with the rest of the overlay below the buttons sitting
-/// empty. The estimate over-subtracted at *every* scale (the dead space was
-/// simply affordable at 100%, where 113px of diff was still five lines).
-///
-/// The residual is the trap here: `area` is the editor pane, whose height is a
-/// **user-dragged px intent that deliberately does not scale** ([`EDITOR_H`],
-/// floored by `query_min_h`), while the chrome inside it scales fully. So the
-/// diff absorbs the whole mismatch, and it shrinks as the scale grows — the one
-/// direction no one expects. Measuring removes both halves of that: the parts
-/// report what they actually are, at whatever scale and font.
-///
-/// `input_h`/`buttons_h` of zero mean "not laid out yet"; the first frame falls
-/// back to the estimate rather than collapsing the diff to nothing.
-pub(crate) fn cmdk_diff_h_measured(area: f64, input_h: f64, buttons_h: f64) -> f64 {
-    if input_h <= 0.0 || buttons_h <= 0.0 {
-        return cmdk_diff_h(area);
-    }
-    (area - input_h - buttons_h - cmdk_diff_pad_v() - CMDK_BORDER).max(0.0)
-}
+// The Ctrl+K diff no longer has a height of its own to compute. It is rendered in
+// the editor's own line flow as phantom rows (`inline_diff`), so it is sized by
+// the lines it adds and scrolls with the document — where the whole family of
+// `cmdk_diff_*` chrome measurements used to size an overlay box that covered the
+// editor. Nothing replaced them; the box is gone.
 
 /// Estimated width of the editor's line-number gutter (used to place the
 /// completion popup near the caret).
@@ -892,49 +822,11 @@ mod scale_tests {
         });
     }
 
-    /// **The diff never adds to an overflow.** It is the one child of the Ctrl+K
-    /// column with a fixed height, so what it takes is what the buttons below it
-    /// have left — and it is drawn in the *measured* editor area, which the user
-    /// can drag and the scale can grow.
-    ///
-    /// The two numbers this pins are the two the old spelling got wrong: it read
-    /// the unscaled `EDITOR_H` (so a pane dragged to 600 still sized a 113px diff
-    /// at Normal) and it floored at `scaled(60)` (so at the 200% scale then
-    /// offered, where 270 of chrome already overflowed a 248 box, it asked for
-    /// 120 more). The 150px area is what keeps that second arm live now that the
-    /// top scale is 160%: 216 of chrome fits the 248 seed, but not a pane
-    /// dragged short.
-    #[test]
-    fn the_cmdk_diff_takes_what_is_left_and_never_more() {
-        for scale in UiScale::ALL {
-            at(scale, || {
-                for area in [150.0, EDITOR_H, 300.0, 600.0, 1000.0] {
-                    let (diff, chrome) = (cmdk_diff_h(area), cmdk_diff_chrome());
-                    if chrome < area {
-                        assert_eq!(
-                            diff + chrome,
-                            area,
-                            "{}: a {area}px editor is filled exactly",
-                            scale.label()
-                        );
-                    } else {
-                        assert_eq!(
-                            diff,
-                            0.0,
-                            "{}: {chrome} of chrome doesn't fit {area} — the diff \
-                             must not ask for more on top of it",
-                            scale.label()
-                        );
-                    }
-                }
-            });
-        }
-        at(UiScale::Huge, || {
-            assert_eq!(cmdk_diff_h(EDITOR_H), EDITOR_H - 216.0, "216 of chrome");
-            assert_eq!(cmdk_diff_h(600.0), 600.0 - 216.0);
-            assert_eq!(cmdk_diff_h(150.0), 0.0, "216 of chrome in a 150px pane");
-        });
-    }
+    // The three tests that used to sit here pinned the Ctrl+K diff's height
+    // against the chrome stacked around it, at every UI scale. There is no such
+    // height any more: the diff is phantom rows in the editor's own line flow, so
+    // it is as tall as the lines it adds and the editor scrolls it like any other
+    // content. Nothing replaced them, because nothing is being computed.
 
     /// The selection summary sits **above** the error bar, at every scale: past
     /// the bar's own top edge, which is its inset plus its scaled height. A
@@ -965,64 +857,6 @@ mod scale_tests {
                 );
             });
         }
-    }
-
-    /// The bug the 160% screenshot showed: the diff is the *residual*, so every
-    /// error in the chrome comes out of it — and the pane it is a residual of does
-    /// not scale while the chrome does. This pins the measured form against the
-    /// estimate it replaces: given the chrome the overlay actually draws, the diff
-    /// must fill what is left **exactly**, at every scale, with no dead space.
-    #[test]
-    fn the_cmdk_diff_fills_what_the_measured_chrome_leaves() {
-        for scale in UiScale::ALL {
-            at(scale, || {
-                // What `cmdk_popup` draws at this scale: a `scaled(40)` question
-                // field and a button row of text plus `scaled(5)` padding.
-                let input_h = scaled(40.0);
-                let buttons_h = scaled(28.0);
-                for area in [150.0, EDITOR_H, 300.0, 600.0, 1000.0] {
-                    let diff = cmdk_diff_h_measured(area, input_h, buttons_h);
-                    let chrome = input_h + buttons_h + cmdk_diff_pad_v() + CMDK_BORDER;
-                    if chrome < area {
-                        assert_eq!(
-                            diff + chrome,
-                            area,
-                            "{}: a {area}px overlay is filled exactly — {} of dead space",
-                            scale.label(),
-                            area - diff - chrome
-                        );
-                    } else {
-                        assert_eq!(
-                            diff,
-                            0.0,
-                            "{}: {chrome} of chrome doesn't fit {area} — the diff must                              not ask for more on top of it",
-                            scale.label()
-                        );
-                    }
-                }
-            });
-        }
-    }
-
-    /// The regression itself, stated as a number: at the top scale the estimate
-    /// left the diff a line and a half of a pane it should have had most of.
-    /// `Huge` is where it bites because the pane's floor (`query_min_h`) barely
-    /// moves while the chrome grows by 60%.
-    #[test]
-    fn the_estimate_starved_the_diff_at_the_top_scale() {
-        at(UiScale::Huge, || {
-            let area = query_min_h(); // the pane at its floor — the default
-            let estimated = cmdk_diff_h(area);
-            let measured = cmdk_diff_h_measured(area, scaled(40.0), scaled(28.0));
-            assert!(
-                estimated < scaled(50.0),
-                "the estimate is supposed to be the starved one, got {estimated}"
-            );
-            assert!(
-                measured > estimated * 2.0,
-                "measuring must give the diff back real room: {measured} vs {estimated}"
-            );
-        });
     }
 
     /// The grid toolbar's dropdowns reconstruct their icon's box instead of
@@ -1292,6 +1126,19 @@ mod float_inset_gate {
             "inset_right(3.0)",
             "the editor's vertical scrollbar thumb — offset within a \
              code-font-relative track, not air at a panel edge",
+        ),
+        (
+            "editor_pane.rs",
+            "inset_left(1.0)",
+            "the Ctrl+K bars clearing the editor's own 1px border. They are not \
+             floating boxes — they are rows of the block of lines they sit under, \
+             and run edge to edge on purpose; this is the border's width, and a \
+             1px rule is 1px at every scale",
+        ),
+        (
+            "editor_pane.rs",
+            "inset_right(1.0)",
+            "the other side of the same border clearance",
         ),
         (
             "editor_pane.rs",

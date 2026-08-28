@@ -23,6 +23,7 @@ use floem::text::{Attrs, AttrsList, FamilyOwned};
 use floem::views::editor::EditorStyle;
 use floem::views::editor::core::buffer::rope_text::RopeText;
 use floem::views::editor::id::EditorId;
+use floem::views::editor::layout::{LineExtraStyle, TextLayoutLine};
 use floem::views::editor::text::{Document, Styling};
 use schemaic_core::intel::SqlDialect;
 
@@ -61,6 +62,15 @@ pub struct SqlStyling {
     /// follows the user's configured size. Per-tab, so zooming one editor doesn't
     /// touch others.
     zoom: RwSignal<Option<f32>>,
+    /// The pending inline-AI (Ctrl+K) suggestion, shared with the
+    /// [`InlineDiffDoc`](crate::inline_diff::InlineDiffDoc) that emits its added
+    /// rows as phantom text. This half paints them: the replaced lines tinted
+    /// and faded, the added rows on their own background.
+    ///
+    /// The two must read the *same* signal — the row backgrounds are positioned
+    /// by counting the phantom rows the document emitted, so a second source of
+    /// truth would paint bands over the wrong lines.
+    preview: crate::inline_diff::InlinePreview,
     /// Per-line "starts inside a block comment" flags, with the document
     /// revision they were computed for.
     ///
@@ -75,11 +85,17 @@ pub struct SqlStyling {
 }
 
 impl SqlStyling {
-    pub fn new(doc: Rc<dyn Document>, dialect: SqlDialect, zoom: RwSignal<Option<f32>>) -> Self {
+    pub fn new(
+        doc: Rc<dyn Document>,
+        dialect: SqlDialect,
+        zoom: RwSignal<Option<f32>>,
+        preview: crate::inline_diff::InlinePreview,
+    ) -> Self {
         Self {
             doc,
             dialect,
             zoom,
+            preview,
             block_lines: RefCell::new(None),
             // Explicit IBM Plex Mono (the bundled face) rather than the generic
             // `Monospace` — keeps the editor and the Ctrl+K diff on the exact
@@ -155,11 +171,89 @@ impl Styling for SqlStyling {
             return;
         }
         let content = rope.line_content(line);
+        let view = self.preview.get_untracked();
+        // A line that is being worked on, or that a settled suggestion replaces,
+        // is faded — alpha on the token colour, since editor text has no opacity
+        // of its own. The two states fade by different amounts; the view says
+        // which, so this stays one rule rather than two.
+        let fade = view.as_ref().filter(|v| v.fades(line)).map(|v| v.fade());
+        // Floem hands this hook the line's PRE-phantom columns and only adds the
+        // phantom spans afterwards, so an end-of-line block (every block but one)
+        // needs no adjustment. The exception is a block rendering *before* line 0,
+        // which pushes the line's own content right by its whole length.
+        let shift = view
+            .as_ref()
+            .and_then(|v| crate::inline_diff::block_at(v, line))
+            .map_or(0, |b| b.prefix_len());
+        let tint = |c: Color| match fade {
+            Some(a) => c.multiply_alpha(a),
+            None => c,
+        };
+        let faded = fade.is_some();
+        // Fade the whole line first — `lex_line` only colours the tokens it knows,
+        // and an identifier left on the default colour would stay at full strength
+        // in the middle of a faded row.
+        if faded {
+            attrs.add_span(
+                shift..shift + content.len(),
+                // The editor theme's own foreground — the same value
+                // `editor_pane` feeds the editor as its base text colour.
+                default.color(tint(crate::theme::editor_theme().fg)),
+            );
+        }
         // Does this line begin inside a `/* … */` opened on an earlier line?
         let start_in_block = self.starts_in_block(line);
         for (start, end, tok) in lex_line(&content, self.dialect, start_in_block) {
-            attrs.add_span(start..end, default.color(tok.color()));
+            attrs.add_span(shift + start..shift + end, default.color(tint(tok.color())));
         }
+    }
+
+    fn apply_layout_styles(
+        &self,
+        edid: EditorId,
+        _style: &EditorStyle,
+        line: usize,
+        layout_line: &mut TextLayoutLine,
+    ) {
+        let Some(view) = self.preview.get_untracked() else {
+            return;
+        };
+        // Only a settled suggestion paints bands. While the model is working there
+        // is nothing to band — the lines just fade (`apply_attr_styles`), which is
+        // the design's "dimmed, waiting" state and not a diff yet.
+        let Some(plan) = view.plan() else {
+            return;
+        };
+        let replaced = plan.hunks.iter().any(|h| h.del.contains(&line));
+        let block = crate::inline_diff::block_at(&view, line);
+        if !replaced && block.is_none() {
+            return;
+        }
+        let line_h = f64::from(self.line_height(edid, line));
+        // The line's own content length — the column an end-of-line phantom block
+        // hangs off, and the same one `InlineDiffDoc::phantom_text` used to place it.
+        let own_len = self.doc.rope_text().line_content(line).len();
+        let (added_rows, own_rows) =
+            crate::inline_diff::row_split(layout_line, line_h, block, own_len);
+        // `width: None` is what makes Floem paint the band across the whole
+        // viewport rather than just behind the glyphs — a diff row reads as a row.
+        let mut band = |rows: std::ops::Range<usize>, bg: Color| {
+            for row in rows {
+                layout_line.extra_style.push(LineExtraStyle {
+                    x: 0.0,
+                    y: row as f64 * line_h,
+                    width: None,
+                    height: line_h,
+                    bg_color: Some(bg),
+                    under_line: None,
+                    wave_line: None,
+                });
+            }
+        };
+        if replaced {
+            band(own_rows, crate::theme::diff_del_bg());
+        }
+        band(added_rows, crate::theme::diff_add_bg());
     }
 }
 
