@@ -956,7 +956,6 @@ fn param_row(name: String, store: RwSignal<Vec<params::Binding>>) -> impl IntoVi
                 .border(1.0)
                 .border_color(theme::border())
                 .border_radius(4.0)
-                .cursor(CursorStyle::Pointer)
                 .margin_left(theme::scaled(7.0))
                 .hover(|s| s.color(theme::text()).border_color(theme::text_faint()))
         })

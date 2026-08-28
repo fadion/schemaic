@@ -305,7 +305,6 @@ fn table_row(
             .padding_horiz(theme::scaled(8.0))
             .padding_vert(theme::scaled(4.0))
             .border_radius(4.0)
-            .cursor(floem::style::CursorStyle::Pointer)
             .hover(|s| s.background(theme::row_hover_soft()))
     })
 }
