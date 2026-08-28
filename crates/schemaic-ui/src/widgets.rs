@@ -1717,8 +1717,12 @@ pub(crate) fn sparkle_action(
     ))
     .on_click_stop(move |_| on_click())
     .style(move |s| {
+        // `flex_shrink(0)`, because a button squeezed by a long label beside it
+        // is never the layout anyone wanted — whatever text shares the row is
+        // the part that yields.
         s.flex_row()
             .items_center()
+            .flex_shrink(0.0_f32)
             .color(color())
             .cursor(floem::style::CursorStyle::Pointer)
             .hover(move |s| s.color(hover()))

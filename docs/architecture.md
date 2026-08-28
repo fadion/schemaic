@@ -2028,6 +2028,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       error". The messages ride in a `fenced` block under `UNTRUSTED_NOTE` like everything else here,
       which the error bar's own `format!` did not: a DB error quotes identifiers and cell values from
       a server that isn't necessarily the user's.
+      `explain_error_prompt` is its pair, and the two ask for **opposite things on purpose**: a fix
+      lands as a diff in the editor with an Approve behind it, an explanation lands as prose in the
+      chat panel, where there is no diff and no gate — so this one says outright not to answer with a
+      rewrite, or a reply ending in corrected SQL would invite a copy-paste past every check the fix
+      goes through. Its statement is **optional**, which is what lets *Explain* be offered for every
+      error the modal can show while *AI fix* is offered for one kind: an explanation needs only the
+      words, and a commit error, a failed export or a server that never answered are exactly the ones
+      whose modal is otherwise a dead end. **Neither prompt consults `AiData`**, unlike
+      `result_shape` two paragraphs up, and the difference is consent rather than sensitivity: that
+      gate is for text the model is handed *automatically each turn*, while these two carry an error
+      the user pressed a button to send — the same election an attached row is.
     - `summary.rs` — the grid's "AI Summary" cell/column prompts. `sample_column` spreads its
       sample *evenly* across loaded rows rather than taking the first N, because a sorted result's
       head often shares a date/status/prefix that reads as a pattern that isn't real; `sample_row`
@@ -4052,6 +4063,35 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     before it asks**: signals notify synchronously, so the request opens Ctrl+K and focuses its field
     on the spot, and asking first left that focus to be decided by the teardown of the modal's own
     `focus_root` afterwards.
+    **`Explain` is the fix's pair, and it deliberately goes somewhere else**: a fix is a diff in the
+    editor, an explanation is prose in the chat panel — the same split the right-click menu already
+    makes between its own *Explain* and *Optimize*. It reveals the panel before sending, because a
+    message into a hidden panel reads as a button doing nothing, and it highlights the statement it
+    asked about, so the answer and the SQL it is about are visibly the same statement. Both the error
+    bar and the modal offer it. On the bar the two AI actions sit **together at the far edge**, which
+    is what the sparkle marks — *View* opens a window, those two reach a model — and the bar is
+    **responsive about them**: `error_bar_fits_explain` measures every gap and label to the right of
+    the message and asks whether they fit in the share the message's own `max_width_pct` leaves them
+    (`ERROR_BAR_MSG_PCT`, 60/40), dropping *Explain* when they don't. It is the one of the three that
+    can go, because the *View* modal offers the same explanation. **A share, not a pixel floor**, and
+    the first attempt was the floor: a minimum width for the message with the buttons taking whatever
+    was left. It passed a bar where the message ended up a few ellipsized words with the buttons
+    packed against it — the arrangement it existed to prevent — because what makes the bar look
+    crowded is the buttons' *proportion* of it, and a floor written at 100% is the wrong number at
+    every other interface scale anyway. Two smaller things had to be true for the drop to be a
+    *choice* rather than the layout's opinion: the buttons are `flex_shrink(0)`, and the message
+    carries `min_width(0)` — a flex item defaults to `min-width: auto` and refuses to shrink below
+    its content, so a long error did not ellipsize past its cap, it pushed, and the right-hand
+    buttons were drawn on top of one another. The bar's two horizontal insets are **one
+    `padding_horiz` on the bar** rather than a margin on each end's child: written as two margins
+    they were the same number and still did not read as one, because the right-hand button is a row
+    (icon, gap, label) whose box ends past its last glyph. Unlike the fix it needs **no request
+    signal**:
+    the chat panel belongs to the workspace, so the modal can reach it directly, the way the schema
+    tree's own *AI Explain* does. It is also offered **wherever the fix is not** — over an
+    `error_modal_text` override, where there is no statement to rewrite but the words still deserve
+    an answer — and withheld only when the modal was opened on nothing at all, where it would ask
+    the model to account for the phrase "No error.".
     `inline_footer_y` is the other end's geometry, and it is deliberately not `points_of_offset` at
     the anchor line's end: that offset maps to a column *before* the phantom rows, so its `bot` is
     the bottom of the line's own row. The **next** document line's top is the honest answer — the

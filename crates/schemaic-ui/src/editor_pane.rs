@@ -1145,6 +1145,56 @@ fn editor_points(ed: &Editor) -> impl Fn(usize) -> Option<(Point, Point)> + '_ {
 /// always somewhere to go.
 const CMDK_BAR_RESERVE: f64 = 52.0;
 
+/// The share of the error bar its message may take, which is the same
+/// `max_width_pct` the message is capped at — so what is left for the buttons is
+/// `1 - ERROR_BAR_MSG_PCT`, and that is the budget below.
+const ERROR_BAR_MSG_PCT: f64 = 0.60;
+
+/// The error bar's horizontal inset, before the interface scale. It is padding on
+/// the bar rather than a margin on each end's child, so both edges are the same
+/// by construction — see the bar's own style for what went wrong when they were
+/// two numbers.
+const ERROR_BAR_PAD: f64 = 8.0;
+
+/// Has an error bar `bar_w` wide the room for **Explain** beside *View* and
+/// *AI fix*?
+///
+/// The rule is the message's own cap read from the other side. The message may
+/// take 60% of the bar, so the buttons have the remaining 40% to fit in — and
+/// when they don't, *Explain* is the one that goes, because the *View* modal
+/// offers the same explanation and the other two have nowhere else to be.
+///
+/// Stating it as a share rather than a pixel floor is what makes it hold at every
+/// interface scale, and every term measured rather than assumed for the same
+/// reason: at 160% the three labels need half again the room, so a breakpoint
+/// written at 100% would crowd them there — while a *share* is the same
+/// proportion at any scale, since the bar scales with them.
+///
+/// The first attempt at this put a pixel minimum on the message and let the
+/// buttons take whatever was left. It let all three through on a bar where the
+/// message ended up ellipsized to a few words with the buttons packed against it,
+/// which is the arrangement it was written to prevent — the floor was a guess,
+/// and a guess about the wrong quantity: what makes the bar look crowded is the
+/// buttons' *proportion* of it, not the message's absolute width.
+fn error_bar_fits_explain(bar_w: f64) -> bool {
+    let fs = theme::font_body();
+    let sparkle = |label: &str| {
+        theme::scaled_font(16.0) as f64
+            + theme::scaled(5.0)
+            + crate::widgets::measure_text_px_at(label, fs)
+    };
+    // Every gap and label to the right of the message, in bar order.
+    let buttons = theme::scaled(10.0)
+        + crate::widgets::measure_text_px_at("View", fs)
+        + theme::scaled(20.0)
+        + sparkle("Explain")
+        + sparkle("AI fix");
+    // `bar_w` is the border box; the share is of what the children actually get,
+    // which is what `max_width_pct` resolves against too.
+    let content = (bar_w - 2.0 * theme::scaled(ERROR_BAR_PAD)).max(0.0);
+    buttons <= content * (1.0 - ERROR_BAR_MSG_PCT)
+}
+
 /// The verdict footer's height, before the interface scale. **Two places need it
 /// to agree** — the style that draws the bar and [`inline_footer_y`], which decides
 /// whether the bar still fits on screen below the block — so it is one number
@@ -2663,6 +2713,32 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         })
     };
 
+    // The other half of the pair, and it deliberately goes somewhere else: a fix
+    // is a diff in the editor with an Approve behind it, an explanation is prose
+    // in the chat panel, which is where the menu's own "Explain" sends a
+    // statement. Reveal first, then send — a message into a hidden panel reads
+    // as the button doing nothing.
+    //
+    // It highlights the statement it asked about, like every other action here
+    // that scopes to one, so the answer and the SQL it is about are visibly the
+    // same statement.
+    let explain_error: Rc<dyn Fn()> = {
+        let ai_send = ai_send.clone();
+        Rc::new(move || {
+            let QueryState::Failed(err) = results.get_untracked() else {
+                return;
+            };
+            let sql = query.get_untracked();
+            let (lo, hi) = intel::error_fix_range(&sql, &err, dialect.get_untracked());
+            let Some(p) = prompt::explain_error_prompt(sql.get(lo..hi), &err) else {
+                return;
+            };
+            crate::reveal_ai_panel(right_panel);
+            (ai_send)(p);
+            highlight_pick(&sql, lo, hi, highlight);
+        })
+    };
+
     // The same fix asked for from the error modal ("View" on the bar). It has to
     // come through a request signal because `cmdk` is this pane's own state —
     // the modal is rendered by the workspace, which has no way to reach it. Same
@@ -3515,9 +3591,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         area_h,
     );
     // Error bar: pinned to the editor's bottom (5px inset) when the last run
-    // failed. Truncated error + View (opens the modal) + AI Fix. Cleared by any
-    // edit (see the editor `.update`). border_radius rounds the filled bar; no
-    // `.clip()` (clipping the absolute container would hide it).
+    // failed. Truncated error + View (opens the modal) + Explain + AI fix.
+    // Cleared by any edit (see the editor `.update`). border_radius rounds the
+    // filled bar; no `.clip()` (clipping the absolute container would hide it).
+    //
+    // Its measured width, so the bar can drop **Explain** rather than let the
+    // buttons collide. Lives out here because the bar's content is rebuilt on
+    // every `results` change and the width outlives that.
+    let error_bar_w = RwSignal::new(0.0_f64);
     let error_bar = {
         let ai_fix = ai_fix.clone();
         dyn_container(
@@ -3532,40 +3613,93 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // only trims one line). The full text is still in the View modal.
                 let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
                 let ai_fix = ai_fix.clone();
+                let explain_error = explain_error.clone();
                 h_stack((
+                    // **`min_width(0)`, and it is the whole reason the buttons
+                    // stopped overlapping.** A flex item defaults to
+                    // `min-width: auto`, which refuses to shrink below its
+                    // content — so a long error did not ellipsize any further
+                    // than 60%, it pushed, and the two right-hand buttons were
+                    // laid out on top of each other. The cap says how much of the
+                    // bar the message may *take*; this says it must yield the
+                    // rest.
                     text(one_line).style(|s| {
                         s.color(theme::reject_text())
                             .font_size(theme::font_body())
-                            .max_width_pct(60.0)
+                            .max_width_pct(ERROR_BAR_MSG_PCT * 100.0)
+                            .min_width(0.0)
                             .text_ellipsis()
-                            .margin_left(theme::scaled(8.0))
                     }),
-                    // Both buttons brighten under the pointer and take the hand
-                    // cursor: they are words on a coloured bar with no border to
-                    // read as a control, so the hover *is* the affordance.
+                    // Every button here brightens under the pointer: they are
+                    // words on a coloured bar with no border to read as a
+                    // control, so the hover *is* the affordance. No pointer
+                    // cursor — see *UI conventions*.
+                    //
+                    // The two AI actions sit together at the far edge, which is
+                    // what the sparkle marks: *View* opens a window, those two
+                    // reach a model. `flex_shrink(0)` because a button that
+                    // shrinks is never what the layout wants — the message is the
+                    // part that yields.
                     text("View")
                         .on_click_stop(move |_| error_modal_open.set(true))
                         .style(|s| {
                             s.color(theme::err_fix_btn())
                                 .font_size(theme::font_body())
                                 .margin_left(theme::scaled(10.0))
-                                .cursor(CursorStyle::Pointer)
+                                .flex_shrink(0.0_f32)
                                 .hover(|s| s.color(theme::err_fix_btn_hover()))
                         }),
                     empty().style(|s| s.flex_grow(1.0_f32)),
+                    // Dropped rather than crowded when the bar is too narrow to
+                    // hold all three with the message still readable. It is the
+                    // one of the three that has a second home — the *View* modal
+                    // offers the same explanation — so it is the one that can go.
+                    dyn_container(move || error_bar_fits_explain(error_bar_w.get()), {
+                        let explain_error = explain_error.clone();
+                        move |fits: bool| {
+                            if !fits {
+                                return empty().into_any();
+                            }
+                            let explain_error = explain_error.clone();
+                            crate::widgets::sparkle_action(
+                                "Explain",
+                                theme::err_fix_btn,
+                                theme::err_fix_btn_hover,
+                                move || (explain_error)(),
+                            )
+                            // The gap to *AI fix* belongs to the button, not
+                            // to the slot: on the container it would leave
+                            // 20px of nothing behind when Explain is dropped.
+                            .style(|s| s.margin_right(theme::scaled(20.0)))
+                            .into_any()
+                        }
+                    }),
                     crate::widgets::sparkle_action(
                         "AI fix",
                         theme::err_fix_btn,
                         theme::err_fix_btn_hover,
                         move || (ai_fix)(),
-                    )
-                    .style(|s| s.margin_right(theme::scaled(8.0))),
+                    ),
                 ))
+                .on_resize(move |r| {
+                    if (error_bar_w.get_untracked() - r.width()).abs() > 0.5 {
+                        error_bar_w.set(r.width());
+                    }
+                })
                 .style(|s| {
+                    // **The bar owns both horizontal insets**, as padding, rather
+                    // than the message and the last button each carrying a margin
+                    // of their own. Written as two margins they were the same
+                    // number and still did not read as one: the right-hand button
+                    // is a row (icon, gap, label) whose box ends past the last
+                    // glyph, so the same 8px looked wider after the words than
+                    // before them. One padding makes the two edges the same by
+                    // construction, and leaves no second place to change.
                     s.flex_row()
                         .items_center()
                         .width_full()
                         .height_full()
+                        .padding_horiz(theme::scaled(ERROR_BAR_PAD))
                         .background(theme::reject_bg())
                         .border_radius(5.0)
                 })
@@ -5198,5 +5332,34 @@ mod geometry_tests {
     fn an_unmeasured_viewport_clamps_nothing() {
         let p = run_menu_pos(Point::new(400.0, 90.0), MENU, cx(), Rect::ZERO);
         assert_eq!(p, Point::new(400.0, 90.0));
+    }
+
+    // ── The error bar drops Explain rather than crowding ──────────────────
+
+    /// The direction of the comparison, and that the answer is a *share* rather
+    /// than "do the buttons physically fit" — deliberately not exact widths,
+    /// because the glyph measurement behind them depends on the fonts the machine
+    /// running the test happens to have, and a pinned number would be a test of
+    /// the CI image. Every assertion here holds at any measurement, including one
+    /// that reports zero.
+    #[test]
+    fn a_narrow_error_bar_gives_up_explain_and_a_wide_one_does_not() {
+        assert!(error_bar_fits_explain(2000.0), "a wide bar holds all three");
+        assert!(
+            !error_bar_fits_explain(0.0),
+            "and an unmeasured one holds nothing"
+        );
+        // The message's share is what makes this stricter than "they fit": find
+        // the width where the buttons exactly fill the bar, and the bar has to
+        // still be refusing there, because at that width the message has nothing.
+        let mut just_fits = 0.0_f64;
+        while just_fits < 4000.0 && !error_bar_fits_explain(just_fits) {
+            just_fits += 1.0;
+        }
+        assert!(just_fits > 0.0, "some width must be too narrow");
+        assert!(
+            just_fits >= 1.0 / (1.0 - ERROR_BAR_MSG_PCT),
+            "the threshold is the buttons' share of the bar, not their width"
+        );
     }
 }
