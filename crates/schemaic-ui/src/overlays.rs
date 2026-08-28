@@ -4497,6 +4497,12 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
     let text_override = ui.overlay.error_modal_text;
     let tabs = ui.tabs_ui.tabs;
     let active = ui.tabs_ui.active;
+    // "Explain" goes straight to the chat panel — no request signal, unlike the
+    // fix: the panel is the workspace's, not the editor pane's, so this overlay
+    // can reach it the same way the schema tree's own AI Explain does.
+    let ai_send = ui.ai_actions.send.clone();
+    let right_panel = ui.layout.right_panel;
+    let connections = ui.conn.connections;
 
     dyn_container(
         move || open.get(),
@@ -4523,9 +4529,12 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                 .is_none()
                 .then_some(tab_error.clone())
                 .flatten();
-            let msg = override_text
-                .or(tab_error)
-                .unwrap_or_else(|| "No error.".to_string());
+            // `None` when the modal was opened on nothing at all — a state it can
+            // reach, and one where both actions have to go: there is no error to
+            // explain and nothing to fix, and a live "Explain" would send the
+            // model the words "No error." to account for.
+            let error = override_text.or(tab_error);
+            let msg = error.clone().unwrap_or_else(|| "No error.".to_string());
 
             // Closing clears the text override so the next open (e.g. the editor's
             // "View") falls back to the tab error again.
@@ -4546,8 +4555,8 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // the pair as exactly that) and is a pale pink — on the light theme's
             // panel it would be all but invisible. `accent` is the panel's own
             // action colour.
-            let fix = if let Some(err) = fixable_error {
-                container(crate::widgets::sparkle_action(
+            let fix = if let Some(err) = fixable_error.clone() {
+                crate::widgets::sparkle_action(
                     "AI fix",
                     theme::accent,
                     theme::accent_hover,
@@ -4563,12 +4572,59 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                             t.fix_req.set(Some(err.clone()));
                         }
                     },
-                ))
-                .style(|s| s.width_full().justify_end().margin_top(theme::scaled(14.0)))
+                )
+                .style(|s| s.margin_left(theme::scaled(16.0)))
                 .into_any()
             } else {
                 empty().into_any()
             };
+
+            // **Explain is offered for every error this modal shows**, where the
+            // fix is offered for one kind. A fix needs a statement to rewrite; an
+            // explanation needs nothing but the words, and a commit error, a
+            // failed export or a server that never answered are exactly the ones
+            // whose modal is otherwise a wall of text with nothing to do about
+            // it. The statement rides along only when there is one, and it is
+            // `error_fix_range`'s choice of statement so the two actions are
+            // talking about the same one.
+            let explain = if let Some(explain_msg) = error {
+                let ai_send = ai_send.clone();
+                let statement = fixable_error.and_then(|err| {
+                    let tab = tab?;
+                    let dialect = connections
+                        .with_untracked(|cs| {
+                            cs.iter()
+                                .find(|c| c.id == tab.conn_id.get_untracked())
+                                .map(|c| schemaic_core::intel::SqlDialect::from_db_type(&c.db_type))
+                        })
+                        .unwrap_or_default();
+                    tab.query.with_untracked(|sql| {
+                        let (lo, hi) = schemaic_core::intel::error_fix_range(sql, &err, dialect);
+                        sql.get(lo..hi).map(str::to_string)
+                    })
+                });
+                crate::widgets::sparkle_action("Explain", theme::accent, theme::accent_hover, {
+                    move || {
+                        let Some(p) = schemaic_core::prompt::explain_error_prompt(
+                            statement.as_deref(),
+                            &explain_msg,
+                        ) else {
+                            return;
+                        };
+                        // Close before revealing, for the reason the fix does:
+                        // the panel takes the keyboard when it opens.
+                        close();
+                        crate::reveal_ai_panel(right_panel);
+                        (ai_send)(p);
+                    }
+                })
+                .into_any()
+            } else {
+                empty().into_any()
+            };
+
+            let actions = container(h_stack((explain, fix)).style(|s| s.flex_row().items_center()))
+                .style(|s| s.width_full().justify_end().margin_top(theme::scaled(14.0)));
 
             // Fixed text width so the error wraps (a `scroll` gives its child
             // unbounded width otherwise). Must stay UNDER the scroll's content
@@ -4587,7 +4643,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                         .min_height(theme::scaled(160.0))
                         .max_height(modal_body_h(360.0))
                 }),
-                fix,
+                actions,
             )))
             .on_click_stop(|_| {})
             .style(|s| {
