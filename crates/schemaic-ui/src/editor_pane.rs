@@ -1,25 +1,30 @@
 //! The center editor pane: the SQL editor (Floem's editor engine) plus everything
-//! layered over it — the Ctrl+K inline-AI popup (`cmdk_popup`), the run/AI anchored
-//! menus, the statement-highlight + syntax-squiggle overlays and their geometry
-//! helpers (`underline_seg`/`highlight_pick`/`statement_line_boxes`/`wavy_svg`),
-//! the catalog-aware diagnostics bridge (`compute_diagnostics` → `schemaic_core::
+//! layered over it — the Ctrl+K inline-AI bar and verdict footer (`cmdk_popup`),
+//! the run/AI anchored menus, the statement-highlight + syntax-squiggle overlays
+//! and their geometry helpers
+//! (`underline_seg`/`highlight_pick`/`statement_line_boxes`/`wavy_svg`), the
+//! catalog-aware diagnostics bridge (`compute_diagnostics` → `schemaic_core::
 //! intel`), and the custom overlay scrollbars. `query_pane` is the entry point
 //! wired into `center`;
 //! `editor_placeholder` is the no-tab fallback. Autocomplete lives in
-//! `completion`, the diff preview in `diff_view`, statement/guard logic in
-//! `schemaic_core::sql`.
+//! `completion`, statement/guard logic in `schemaic_core::sql`.
+//!
+//! The Ctrl+K *suggestion* is deliberately not in that list: it is drawn inside
+//! the editor's own line flow as phantom rows (`crate::inline_diff`), not layered
+//! over it, so only the bar and the footer are overlays here.
 
 use std::rc::Rc;
 
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
-use floem::kurbo::{Point, Rect};
+use floem::kurbo::{Point, Rect, Vec2};
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect, create_memo};
-use floem::style::{CursorStyle, Height, InsetLeft, InsetRight, InsetTop, Transition};
+use floem::style::CursorStyle;
 use floem::unit::Px;
 use floem::views::editor::Editor;
 use floem::views::editor::command::{Command, CommandExecuted};
+use floem::views::editor::core::buffer::rope_text::RopeText;
 use floem::views::editor::core::command::EditCommand;
 use floem::views::editor::core::cursor::CursorAffinity;
 use floem::views::editor::core::editor::EditType;
@@ -32,7 +37,7 @@ use floem::views::editor::text::WrapMethod;
 use floem::views::scroll::{Handle, Thickness};
 use schemaic_core::connection::ConnStatus;
 
-use schemaic_core::diff::{DiffTag, build_diff_rows, line_diff};
+use schemaic_core::diff::{inline_plan, line_span};
 use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
 use schemaic_core::model::QueryState;
 use schemaic_core::pairs::{self, PairAction};
@@ -48,7 +53,7 @@ use crate::completion::{
     signature_popup, types_a_character, update_signature_help,
 };
 use crate::consts::*;
-use crate::diff_view::diff_view;
+use crate::inline_diff;
 use crate::widgets::*;
 use crate::{
     ConnNode, CtxMenu, FieldCfg, InlineAiRequest, InlineAiState, NavKeys, PopupAnchor, RightPanel,
@@ -165,29 +170,11 @@ fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     ed.cursor.update(|cc| cc.set_offset(caret, false, false));
 }
 
-// Line-level diff (`line_diff`/`build_diff_rows`, `DiffTag`/`DiffRow`) lives in
-// `schemaic_core::diff` — pure text logic, unit-tested there. The views below
-// render its output.
-
-fn approve_button_style(s: floem::style::Style) -> floem::style::Style {
-    s.padding_horiz(theme::scaled(14.0))
-        .padding_vert(theme::scaled(5.0))
-        .border_radius(5.0)
-        .font_size(theme::font_body())
-        .background(theme::approve_bg())
-        .color(theme::approve_text())
-        .hover(|s| s.background(theme::approve_bg().multiply_alpha(0.88)))
-}
-
-fn reject_button_style(s: floem::style::Style) -> floem::style::Style {
-    s.padding_horiz(theme::scaled(14.0))
-        .padding_vert(theme::scaled(5.0))
-        .border_radius(5.0)
-        .font_size(theme::font_body())
-        .background(theme::reject_bg())
-        .color(theme::reject_text())
-        .hover(|s| s.background(theme::reject_bg().multiply_alpha(0.85)))
-}
+// The inline-AI suggestion is rendered *in the editor's line flow* by
+// `crate::inline_diff` (phantom rows) plus `sql_highlight`'s row backgrounds, not
+// by a view here. `schemaic_core::diff::inline_plan` is the pure half that says
+// which document lines it touches; `cmdk_popup` below draws only the question bar
+// and the verdict footer that close the block.
 
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn cmdk_popup(
@@ -200,24 +187,101 @@ fn cmdk_popup(
     // Approving a diff is an edit nobody typed, so it goes through
     // `edit_untyped` — which needs the completion state to suppress the popup.
     comp: Completion,
-    // Editor-area height (tracked via on_resize), so the expanded overlay fills
-    // it exactly with an explicit `height` — needed because animating requires a
-    // definite height (can't interpolate to `inset(0)`'s auto height).
+    // Editor-area height, so the verdict bar can tell when the block it closes has
+    // scrolled out of the pane and take itself off screen with it.
     area_h: RwSignal<f64>,
-    dialect: SqlDialect,
 ) -> impl IntoView {
     // The editor's own view id, so closing the overlay can hand focus back to
     // the editor (else focus is left dangling after the input is torn down).
     let editor_view_id = ed.editor_view_id;
+    // The editor's own scroll, so the verdict bar can forward a wheel to it.
+    let scroll_delta = ed.scroll_delta;
 
-    // The expanded overlay's chrome, measured. These sit OUT here because the
-    // views that report them are rebuilt by the `dyn_container` below on every
-    // state change, and a signal owned inside it would be disposed with them —
-    // taking the last measurement with it and collapsing the diff on the frame
-    // after every rebuild. Zero means "not laid out yet" and
-    // `cmdk_diff_h_measured` falls back to the estimate for that one frame.
-    let input_h = RwSignal::new(0.0_f64);
-    let buttons_h = RwSignal::new(0.0_f64);
+    /// The question field opens as one line and grows with the question to this
+    /// many rows, then scrolls. Three, because the bar sits *between* two lines of
+    /// the user's own SQL — a taller one stops reading as an annotation on the
+    /// statement above it and starts reading as a panel that has displaced it.
+    const CMDK_MAX_ROWS: usize = 3;
+    // `edit_field` takes the cap as a signal so it can follow a resizing
+    // container; this one is fixed, and owned out here so the `dyn_container`
+    // rebuilding the field on every state change can't dispose it.
+    let cmdk_rows = RwSignal::new(CMDK_MAX_ROWS);
+
+    // Publish the suggestion into the editor's own line flow (and take it back
+    // down again). An *effect* over the state rather than a set inside each
+    // transition, because every way out of `Ready` has to remove the phantom
+    // rows — approve, reject, Escape, a second Ctrl+K, a tab switch that
+    // cancels the generation — and those don't share a single caller to hang it
+    // off. Anything that isn't a settled suggestion clears the preview, so the
+    // rows cannot outlive the state that justified them.
+    {
+        let ed_preview = ed.clone();
+        create_effect(move |_| {
+            let state = inline_ai.get();
+            let settled = matches!(state, InlineAiState::Ready(_));
+            // The buffer and the trigger range, read **only** by the two states
+            // that need them. Idle and Failed are the common transitions — every
+            // Escape, Accept, Reject and Ctrl+K passes through one — and copying a
+            // whole 190KB script to answer them cost more than the feature does.
+            //
+            // The **document's** text, not `query`: everything below resolves byte
+            // offsets that were captured against the document, and resolving those
+            // against anything else is precisely the bug that made Ctrl+K pick the
+            // wrong statement when the signal fell out of step. `query` is in step
+            // again, but the offsets belong to the rope, so the rope answers them —
+            // the same rule `accept` and the Ctrl+K widening follow.
+            let acted_on = || {
+                let full = ed_preview.doc().text().to_string();
+                // Clamp to char boundaries: the trigger range is a byte range
+                // captured earlier and the doc may have changed under it, so a
+                // naive slice can land mid-codepoint and panic.
+                let end = floor_char_boundary(&full, cmdk.end.get_untracked().min(full.len()));
+                let start = floor_char_boundary(&full, cmdk.start.get_untracked().min(end));
+                (full, start, end)
+            };
+            let view = match state {
+                // Fade the lines the request is about while it is in flight, so
+                // the editor shows what is being worked on. Line numbers, not
+                // byte offsets — that is what the styling hook is keyed on.
+                InlineAiState::Busy => {
+                    let (full, start, end) = acted_on();
+                    Some(inline_diff::InlineView::Working(line_span(
+                        &full, start, end,
+                    )))
+                }
+                InlineAiState::Ready(sql) => {
+                    let (full, start, end) = acted_on();
+                    let new_full = format!("{}{}{}", &full[..start], sql, &full[end..]);
+                    let plan = inline_plan(&full, &new_full);
+                    // A suggestion identical to what the user already has has no
+                    // rows to draw; leaving it unset keeps the editor untouched
+                    // and lets the footer say so instead.
+                    (!plan.is_empty()).then_some(inline_diff::InlineView::Plan(plan))
+                }
+                _ => None,
+            };
+            inline_diff::set_preview(cmdk.preview, &ed_preview, view);
+            // Freeze the buffer while a suggestion is on screen. The phantom rows
+            // are anchored to line *numbers* and the plan was computed against the
+            // text as it was, so an edit underneath would leave the rows sitting on
+            // lines they no longer describe and Accept splicing at offsets that
+            // have moved. The old overlay got this for free by covering the editor;
+            // this one deliberately does not cover it, so the freeze has to be
+            // asked for. Accept or reject to get the buffer back.
+            ed_preview.read_only.set(settled);
+            // The verdict state has no field in it, so focus would be left dangling
+            // where the prompt used to be. Hand it back to the editor, which is
+            // both where the suggestion now is and what answers Enter/Escape for
+            // it. Deferred, because the field is torn down on this same tick.
+            if settled {
+                floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
+                    if let Some(Some(vid)) = editor_view_id.try_get_untracked() {
+                        vid.request_focus();
+                    }
+                });
+            }
+        });
+    }
 
     // These three all mutate the state that drives the overlay's `dyn_container`,
     // which tears the prompt field down. Since they're invoked from INSIDE the
@@ -302,55 +366,108 @@ fn cmdk_popup(
         }
     };
 
+    // Hand the verdict to the editor's key handler (see `CmdK::verdict`). Both
+    // closures already defer their bodies a tick, which is exactly what being
+    // called from inside that handler requires.
+    cmdk.verdict.set(Some((
+        Rc::new(accept.clone()) as Rc<dyn Fn()>,
+        Rc::new(discard.clone()) as Rc<dyn Fn()>,
+    )));
+
+    // The two shapes the overlay has: closed, asking (Idle/Busy/Failed), or
+    // settled. See the key comment below for why this is a `Memo` and not the
+    // closure it looks like it could be.
+    let verdict_shape = create_memo(move |_| {
+        (
+            cmdk.open.get(),
+            matches!(inline_ai.get(), InlineAiState::Ready(_)),
+        )
+    });
     let content = dyn_container(
-        // `ui_generation` is in the key because the child resolves two things no
-        // style closure can re-read: `diff_view`'s `content_w` (the diff's scroll
-        // range, measured from the font at build time) and the text `Attrs` the
-        // diff's syntax colouring is built from. Without it a live scale change
-        // left the rows rendering 1.6x inside a `min_width` computed at 100%, so
-        // the end of a long line could not be scrolled to. It is bumped by a scale
-        // change as well as a theme change, which is exactly the two things that
-        // invalidate those measurements.
+        // `ui_generation` used to be in this key: the child resolved two things no
+        // style closure could re-read — `diff_view`'s `content_w` (the diff's
+        // scroll range, measured from the font at build time) and the text `Attrs`
+        // its syntax colouring was built from — so a live scale change left the
+        // rows rendering 1.6x inside a `min_width` computed at 100%. Both went
+        // with the box: the diff is phantom rows in the editor's own line flow
+        // now, laid out by the editor at the editor's own font. What is left here
+        // is a bar and a footer whose every metric is read inside a style closure
+        // (`theme::scaled(…)`, `icons::icon`'s own closure, `FieldCfg`'s
+        // `fn() -> f32` sizes), so nothing is frozen at build time and there is
+        // no measurement left for a generation to invalidate.
+        // **Keyed on `Ready`-or-not, not on the state.** The prompt field must
+        // survive the Idle → Busy transition: rebuilding it re-runs its layout,
+        // and for one frame the fresh field has almost no width, so a question
+        // that fits on one line wraps — `edit_field` measures its row count from
+        // the wrapped layout, latches the wrong number, and the bar opens a row
+        // taller with its text stranded at the top. That looked exactly like a
+        // newline had been inserted, which is what sent three rounds of fixes at
+        // the Enter key; the caret could never actually reach a second line.
+        // Everything that differs between Idle, Busy and Failed is reactive
+        // *inside* this branch instead.
         //
-        // Safe to rebuild: everything the overlay remembers — the prompt text
-        // (`cmdk.input`), the range, the state — lives in signals outside this
-        // scope, and the container already rebuilds on every state transition.
-        move || (cmdk.open.get(), inline_ai.get(), theme::ui_generation()),
-        move |(open, state, _gen)| {
+        // **The key has to be a `Memo`, and that is not a detail.** `dyn_container`
+        // rebuilds on every *run* of this closure, not on every change of its value:
+        // it wires the closure through `create_updater`, whose callback swaps the
+        // child unconditionally (floem `views/dyn_container.rs`). So a key that
+        // merely *computed* the same `(open, ready)` still rebuilt the field the
+        // moment `inline_ai` changed — writing the key as a tuple bought nothing,
+        // and Idle → Busy went on destroying and re-laying-out the field. `Memo`
+        // is the piece that makes the key mean what it reads as: it only notifies
+        // when the value actually differs (`floem_reactive::create_memo`).
+        move || verdict_shape.get(),
+        move |(open, ready)| {
             if !open {
                 return empty().into_any();
             }
-            // Idle = compact prompt box below the line; any other state expands
-            // the overlay to cover the editor with the question + diff + buttons.
-            let expanded = !matches!(state, InlineAiState::Idle);
-            let ready = matches!(state, InlineAiState::Ready(_));
-            // Enter: accept when a result is ready, submit when compact, and do
-            // nothing while Busy/Failed (swallowed so it can't re-submit).
-            let on_submit: Option<Rc<dyn Fn()>> = if ready {
+            // Enter accepts a settled suggestion, and otherwise asks — including
+            // after a failure, where it retries the question still sitting in the
+            // box. It reads the state *when pressed* rather than being rebuilt per
+            // state, and does nothing while a request is in flight.
+            //
+            // **This is never `None`, and that is the point.** A multiline
+            // `edit_field` with no `on_submit` does not swallow Enter, it breaks
+            // the line — the right default for a body field, and wrong for a
+            // one-question box, which is what `enter_never_breaks` now says
+            // outright.
+            let on_submit: Option<Rc<dyn Fn()>> = Some(if ready {
                 let accept_k = accept.clone();
-                Some(Rc::new(accept_k))
-            } else if !expanded {
-                let submit_k = submit.clone();
-                Some(Rc::new(submit_k))
+                Rc::new(accept_k) as Rc<dyn Fn()>
             } else {
-                None
-            };
+                let submit_k = submit.clone();
+                Rc::new(move || {
+                    if !matches!(inline_ai.get_untracked(), InlineAiState::Busy) {
+                        submit_k();
+                    }
+                })
+            });
             let discard_esc = discard.clone();
-            // The Ctrl+K prompt on the shared editor field. Borderless &
-            // transparent in BOTH states — the outer container owns the box
-            // surface (border/bg) so it can animate as one element from compact
-            // to full. Read-only once expanded. 40px tall in both states.
+            // One row: the sparkle, the question, and either the send affordance
+            // or the spinner. The field is borderless and transparent because the
+            // outer container owns the bar's surface (background + accent rule).
+            //
+            // Multiline with a 3-row cap: the bar opens as a single line and grows
+            // with the question to three, then scrolls with the auto-hiding bar the
+            // rest of the app uses. That is `edit_field`'s existing chat-compose
+            // behaviour, capped lower — not a second auto-grow input.
             let input_row = edit_field(
                 cmdk.input,
                 FieldCfg {
                     placeholder: "Ask the AI Assistant for help.",
                     background: bg_transparent,
-                    font_size: theme::font_title,
-                    read_only: expanded,
-                    // Focus in both states: compact to type, expanded (read-only,
-                    // no caret) so Enter=accept / Escape=discard still work.
+                    font_size: theme::font_body,
+                    multiline: true,
+                    max_rows: Some(cmdk_rows),
+                    // Multiline to wrap and grow with a long question — never to
+                    // hold two lines. Enter asks; it does not break the line.
+                    enter_never_breaks: true,
                     autofocus: true,
-                    height: Some(|| theme::scaled(40.0)),
+                    // Neither `read_only` nor the dim follow the request any more:
+                    // both are resolved when the field is built, and making them
+                    // follow meant rebuilding it — which is the thing that broke
+                    // its layout. Editing the question mid-flight is harmless (the
+                    // request already carries the text it was sent with), and the
+                    // spinner beside it says what is happening.
                     text_color: Some(theme::cmdk_text),
                     placeholder_color: Some(theme::cmdk_placeholder),
                     border_color: Some(bg_transparent),
@@ -359,186 +476,199 @@ fn cmdk_popup(
                     ..Default::default()
                 },
             )
-            .style(|s| s.width_full().min_width(0.0).flex_shrink(0.0_f32))
-            // Measured, not predicted — see `consts::cmdk_diff_h_measured`. The
-            // field states its own height (`scaled(40)`), but the button row below
-            // is text plus padding and only layout knows how tall that is.
-            .on_resize(move |r| input_h.set(r.height()));
+            .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
+            // The one part of the bar that does swap with the request, so it swaps
+            // on its own rather than taking the field down with it.
+            let submit_click = submit.clone();
+            // The verb is picked HERE, once per opening, rather than inside the
+            // slot — because the slot has to reserve the spinner's width before
+            // the spinner exists. See the `min_width` below.
+            let spinner_verb = pick_spinner_verb();
+            let trailing = dyn_container(
+                move || matches!(inline_ai.get(), InlineAiState::Busy),
+                move |busy| {
+                    if busy {
+                        // The spinner verb + animated dots the AI panel and the
+                        // query runner already use, rather than the design's
+                        // pulsing dot — one loader vocabulary across the app.
+                        loading_dots(spinner_verb, theme::text_dim, theme::font_hint).into_any()
+                    } else {
+                        let submit_click = submit_click.clone();
+                        container(icons::icon(icons::PLAY_LUCIDE, 15.0))
+                            .on_click_stop(move |_| submit_click())
+                            .style(|s| {
+                                s.items_center()
+                                    .color(theme::ai_send_icon())
+                                    .cursor(CursorStyle::Default)
+                                    .hover(|s| s.color(theme::ai_send_icon_hover()))
+                            })
+                            .into_any()
+                    }
+                },
+            )
+            .style(move |s| {
+                s.flex_shrink(0.0_f32)
+                    .items_center()
+                    // **Hold the spinner's width open while the icon is showing.**
+                    // The field beside this slot flex-grows into whatever is left,
+                    // so swapping a 15px play icon for an 80px "Pondering..." on
+                    // submit took ~70px off the question — the text re-wrapped,
+                    // `edit_field`'s row count went 1 → 2, and the box grew a line.
+                    // That is what "Enter inserts a newline" was: not the key at
+                    // all, which is why clicking the send icon did it too. Both run
+                    // the same submit, and the caret never moved.
+                    //
+                    // `justify_end` keeps the icon on the right edge where it was;
+                    // the reserved space opens to its left, over the field's
+                    // transparent tail.
+                    .justify_end()
+                    .min_width(loading_dots_w(spinner_verb, theme::font_hint()))
+            });
+            let input_row = h_stack((
+                container(icons::icon(icons::SPARKLES, 14.0))
+                    .style(|s| s.flex_shrink(0.0_f32).color(theme::key_foreign())),
+                input_row,
+                trailing,
+            ))
+            .style(|s| {
+                s.flex_row()
+                    .items_center()
+                    .width_full()
+                    .min_width(0.0)
+                    .gap(theme::scaled(8.0))
+                    .padding_left(theme::scaled(6.0))
+                    .padding_right(theme::scaled(8.0))
+                // No vertical padding of its own: `edit_field` already carries
+                // `chat_pad_v` above and below its text, and adding a second helping
+                // here is what made a one-line question sit in a bar deep enough to
+                // look like two.
+            });
 
-            let body = match state {
-                InlineAiState::Idle => empty().into_any(),
-                InlineAiState::Busy => {
-                    let discard_c = discard.clone();
-                    container(
-                        h_stack((
-                            verb_spinner(theme::text_dim, theme::font_body),
-                            // Same style as Reject; cancels the generation and
-                            // closes the overlay (see `discard`).
-                            container(text("Cancel"))
-                                .on_click_stop(move |_| discard_c())
-                                .style(reject_button_style),
-                        ))
-                        .style(|s| s.flex_row().items_center().gap(theme::scaled(10.0))),
+            // The failure message, reactive like the trailing slot — a failure must
+            // not rebuild the field either.
+            let body = dyn_container(
+                move || match inline_ai.get() {
+                    InlineAiState::Failed(msg) => Some(msg),
+                    _ => None,
+                },
+                move |msg| match msg {
+                    None => empty().into_any(),
+                    Some(msg) => container(
+                        text(msg).style(|s| s.color(theme::error()).font_size(theme::font_body())),
                     )
-                    // 5px gap from the question field above (matches the diff).
                     .style(|s| {
                         s.width_full()
                             .padding_horiz(theme::scaled(10.0))
-                            .padding_top(theme::scaled(5.0))
-                            .padding_bottom(theme::scaled(10.0))
+                            .padding_bottom(theme::scaled(6.0))
                     })
-                    .into_any()
-                }
-                InlineAiState::Failed(msg) => container(
-                    text(msg).style(|s| s.color(theme::error()).font_size(theme::font_body())),
-                )
-                .style(|s| {
-                    s.width_full()
-                        .padding_horiz(theme::scaled(10.0))
-                        .padding_top(theme::scaled(5.0))
-                        .padding_bottom(theme::scaled(10.0))
-                })
-                .into_any(),
-                InlineAiState::Ready(sql) => {
+                    .into_any(),
+                },
+            )
+            .style(|s| s.width_full().min_width(0.0));
+
+            // With a suggestion on screen the question has already been answered
+            // and the answer is in the editor itself: the bar goes away and the
+            // verdict footer is the whole overlay. The suggestion itself is not
+            // drawn here at all — it is in the editor's own line flow, as phantom
+            // rows (`inline_diff`), put there by the effect at the top of this
+            // function.
+            let content = if ready {
+                {
                     let discard_b = discard.clone();
                     let accept_b = accept.clone();
-                    let old_full = query.get_untracked();
-                    let (s0, e0) = (cmdk.start.get_untracked(), cmdk.end.get_untracked());
-                    // Clamp to char boundaries so multi-byte text (e.g. 'naïve')
-                    // can't slice mid-codepoint and panic (C12).
-                    let end = floor_char_boundary(&old_full, e0.min(old_full.len()));
-                    let s0c = floor_char_boundary(&old_full, s0.min(end));
-                    let new_full = format!("{}{}{}", &old_full[..s0c], sql, &old_full[end..]);
-                    let diff = line_diff(&old_full, &new_full);
-                    let added = diff
-                        .iter()
-                        .filter(|(t, _)| matches!(t, DiffTag::Ins))
-                        .count();
-                    let removed = diff
-                        .iter()
-                        .filter(|(t, _)| matches!(t, DiffTag::Del))
-                        .count();
-                    let no_changes = added == 0 && removed == 0;
-                    let rows = build_diff_rows(diff);
-
-                    // Body: the diff, or a "no changes" note if the suggestion is
-                    // identical to the current text (else the diff would be a lone
-                    // "⋯ N unchanged lines" gap, which reads as a bug).
-                    let diff_area =
-                        if no_changes {
-                            container(text("No changes suggested.").style(|s| {
-                                s.color(theme::text_dim()).font_size(theme::font_body())
-                            }))
-                            .style(|s| {
-                                s.width_full()
-                                    .flex_shrink(0.0_f32)
-                                    .padding_horiz(theme::scaled(10.0))
-                                    .padding_top(theme::scaled(5.0))
-                                    .padding_bottom(theme::scaled(10.0))
-                            })
-                            .into_any()
-                        } else {
-                            // Fixed-height scroll (`cmdk_diff_h()`); inner clip wrapper
-                            // carries the 5px radius (the scroll's own border_radius
-                            // didn't round visibly); `shift_hscroll` = Shift+wheel
-                            // horizontal scroll. Buttons below always stay visible.
-                            container(
-                                container(autohide(shift_hscroll(diff_view(rows, dialect))).style(
-                                    // `area_h` **tracked**, so dragging the editor
-                                    // taller (or changing the interface scale)
-                                    // re-sizes the diff instead of leaving it sized
-                                    // for the pane the overlay opened in.
-                                    move |s| {
-                                        s.height(cmdk_diff_h_measured(
-                                            area_h.get(),
-                                            input_h.get(),
-                                            buttons_h.get(),
-                                        ))
-                                        .width_full()
-                                        .min_width(0.0)
-                                    },
-                                ))
-                                .style(|s| s.width_full().border_radius(5.0))
-                                .clip(),
-                            )
-                            .style(|s| {
-                                // 5px gap from the question field above; 10px gap to
-                                // the buttons below.
-                                s.flex_col()
-                                    .width_full()
-                                    .min_width(0.0)
-                                    .flex_shrink(0.0_f32)
-                                    .padding_horiz(theme::scaled(5.0))
-                                    .padding_top(theme::scaled(5.0))
-                                    .padding_bottom(theme::scaled(10.0))
-                            })
-                            .into_any()
-                        };
-
-                    // `+N −M` change summary, left of the buttons (hidden when
-                    // there's nothing to summarize).
-                    let stat = if no_changes {
-                        empty().into_any()
-                    } else {
-                        h_stack((
-                            text(format!("+{added}")).style(|s| {
-                                s.font_size(theme::font_body())
-                                    .color(theme::diff_add_marker())
-                            }),
-                            text(format!("−{removed}")).style(|s| {
-                                s.font_size(theme::font_body())
-                                    .color(theme::diff_del_marker())
-                            }),
-                        ))
-                        .style(|s| s.flex_row().items_center().gap(theme::scaled(8.0)))
-                        .into_any()
+                    let summary = match cmdk.preview.get().as_ref().and_then(|v| v.plan()) {
+                        Some(p) => format!(
+                            "{} hunk{} · {} − / {} +",
+                            p.hunks.len(),
+                            if p.hunks.len() == 1 { "" } else { "s" },
+                            p.removed,
+                            p.added
+                        ),
+                        None => "No changes suggested".to_string(),
                     };
-
-                    v_stack((
-                        diff_area,
-                        container(
-                            h_stack((
-                                stat,
-                                empty().style(|s| s.flex_grow(1.0_f32)),
-                                container(text("Approve"))
-                                    .on_click_stop(move |_| accept_b())
-                                    .style(approve_button_style),
-                                container(text("Reject"))
-                                    .on_click_stop(move |_| discard_b())
-                                    .style(reject_button_style),
-                            ))
+                    // Floem gives no way to pass a pointer event on once a view is
+                    // eligible for it — the child walk `break`s on the first such
+                    // view, handled or not (`context.rs:143-158`) — so a 26px bar
+                    // lying across the document would kill scrolling over itself.
+                    // Forward the wheel to the editor's own scroll instead, which
+                    // is what Floem's gutter does with the same problem
+                    // (`view.rs:1112`).
+                    //
+                    // **Every view in here that takes pointer events needs this,
+                    // not just the bar.** The `break` happens at whichever child
+                    // is under the pointer, so with the handler only on the row,
+                    // scrolling worked over the bar but died over the two words —
+                    // which reads as "sometimes it swallows the scroll".
+                    let fwd_wheel = move |e: &Event| {
+                        if let Event::PointerWheel(pe) = e {
+                            scroll_delta.set(pe.delta);
+                        }
+                    };
+                    h_stack((
+                        container(text("Accept"))
+                            .on_click_stop(move |_| accept_b())
+                            .on_event_stop(EventListener::PointerWheel, fwd_wheel)
                             .style(|s| {
-                                s.flex_row()
-                                    .items_center()
-                                    .width_full()
-                                    .min_width(0.0)
-                                    .gap(theme::scaled(10.0))
+                                s.color(theme::diff_add_marker())
+                                    .font_size(theme::font_body())
+                                    .cursor(CursorStyle::Default)
+                                    .hover(|s| {
+                                        s.color(theme::diff_add_marker().multiply_alpha(0.8))
+                                    })
                             }),
-                        )
-                        // No top padding: the diff wrapper's 10px bottom padding
-                        // alone is the gap above the buttons (was 10+5=15).
-                        .style(|s| {
-                            s.width_full()
-                                .flex_shrink(0.0_f32)
-                                .padding_horiz(theme::scaled(5.0))
-                                .padding_bottom(theme::scaled(5.0))
-                        })
-                        // The other half of the measurement: this row is text plus
-                        // padding, so its height depends on the font, not on a
-                        // number anyone can write down.
-                        .on_resize(move |r| buttons_h.set(r.height())),
+                        container(text("Reject"))
+                            .on_click_stop(move |_| discard_b())
+                            .on_event_stop(EventListener::PointerWheel, fwd_wheel)
+                            .style(|s| {
+                                s.color(theme::diff_del_marker())
+                                    .font_size(theme::font_body())
+                                    .cursor(CursorStyle::Default)
+                                    .hover(|s| {
+                                        s.color(theme::diff_del_marker().multiply_alpha(0.8))
+                                    })
+                            }),
+                        empty().style(|s| s.flex_grow(1.0_f32)),
+                        text(summary)
+                            .style(|s| s.color(theme::text_muted()).font_size(theme::font_body()))
+                            .on_event_stop(EventListener::PointerWheel, fwd_wheel),
                     ))
-                    .style(|s| s.flex_col().width_full().min_width(0.0))
+                    .style(move |s| {
+                        s.flex_row()
+                            .items_center()
+                            .width_full()
+                            .min_width(0.0)
+                            .height_full()
+                            .gap(theme::scaled(12.0))
+                            // Aligns the verdict with the code column, so the bar
+                            // reads as the block's last row.
+                            .padding_left(content_x_of(&query.get()))
+                            .padding_right(theme::scaled(10.0))
+                            // Nothing here is selectable, so the editor's I-beam
+                            // (which this sits on top of) would be a lie.
+                            .cursor(CursorStyle::Default)
+                    })
+                    .on_event_stop(EventListener::PointerWheel, fwd_wheel)
                     .into_any()
                 }
+            } else {
+                v_stack((input_row, body))
+                    .style(|s| s.flex_col().width_full().min_width(0.0))
+                    .into_any()
             };
-
             // Clip the INNER content (not the absolute outer container — clipping
             // that hides the whole overlay) so long input/diff text stays inside
             // the border. Belt-and-suspenders over the per-element clips below.
-            v_stack((input_row, body))
+            container(content)
                 .style(|s| {
+                    // `justify_center` is what actually centres the row in the
+                    // verdict bar. The row asks for `height_full` + `items_center`,
+                    // but this wrapper is the one that fills the box's definite
+                    // height, and its default `justify_start` pinned the row to the
+                    // top — which is why the words hugged the bar's top edge and
+                    // why the empty space below them belonged to a view with no
+                    // wheel handler.
                     s.flex_col()
+                        .justify_center()
                         .width_full()
                         .height_full()
                         .min_width(0.0)
@@ -562,44 +692,77 @@ fn cmdk_popup(
     // never resolved against a definite height — that's why a tall diff
     // overflowed and pushed the buttons off. With this wrapper the height chain
     // resolves and the diff scroll bounds + scrolls correctly.
-    container(content).style(move |s| {
-        if !cmdk.open.get() {
-            return s;
-        }
-        // The box IS the outer container in both states (the field inside is
-        // borderless), so it can animate as one element. Position/size go from
-        // the compact box (a ~42px box below the caret line, inset 10) to the
-        // full editor (inset 0, height = editor-area). All values are Px so they
-        // interpolate; the 150ms transition on each animates compact↔expanded.
-        // (Open/close is Auto↔Px, which doesn't interpolate, so it snaps — good.)
-        let t = Transition::ease_in_out(std::time::Duration::from_millis(100));
-        let expanded = !matches!(inline_ai.get(), InlineAiState::Idle);
-        let s = s
-            .absolute()
-            .flex_col()
-            .background(theme::bg_deepest())
-            .border(1.0)
-            .border_color(theme::chip_active())
-            .border_radius(6.0)
-            .transition(InsetTop, t.clone())
-            .transition(InsetLeft, t.clone())
-            .transition(InsetRight, t.clone())
-            .transition(Height, t);
-        if expanded {
-            s.inset_left(0.0)
-                .inset_right(0.0)
-                .inset_top(0.0)
-                .height(area_h.get())
-        } else {
-            // `p.y` = the caret line's bottom edge; +8 clears the line, inset 10
-            // from the editor edges — matching the pre-animation compact box.
-            let p = cmdk.point.get();
-            s.inset_left(float_inset())
-                .inset_right(float_inset())
-                .inset_top(p.y + 8.0)
-                .height(theme::scaled(42.0))
-        }
-    })
+    let ed_geo = ed.clone();
+    container(content)
+        .style(move |s| {
+            if !cmdk.open.get() {
+                return s;
+            }
+            // Two shapes, both anchored into the editor's line flow rather than
+            // floating over it. Asking + working is a bar directly under the
+            // statement being acted on; the verdict is a footer directly under the
+            // phantom rows the suggestion added. Neither covers the editor any more,
+            // which is the whole point of the redesign — so there is nothing left to
+            // animate between, and the old compact↔expanded transition is gone with
+            // the box it was growing.
+            // Both bars are inset 1px from the editor's left and right edges so they
+            // sit *inside* its border rather than painting over it.
+            let s = s
+                .absolute()
+                .flex_col()
+                .justify_center()
+                .inset_left(1.0)
+                .inset_right(1.0);
+            match inline_ai.get() {
+                InlineAiState::Ready(_) => {
+                    // Directly below the block. `inline_footer_y` returns `None` when
+                    // the block is not fully on screen, and the bar is parked off the
+                    // top rather than left floating over the toolbar.
+                    let y = inline_footer_y(&ed_geo, cmdk.preview, area_h).unwrap_or(-9999.0);
+                    s.inset_top(y)
+                        .height(theme::scaled(VERDICT_BAR_H))
+                        // **Asymmetric on purpose**, and the two numbers are the
+                        // bar's whole geometry: 1px border, then a 21px band for the
+                        // words with 7px above it and 1px below.
+                        //
+                        // The row inside is centred in that band, so an even split
+                        // centres the words' *line box* — and a line box carries
+                        // descender space below the glyphs that almost nothing in
+                        // "Accept · Reject · 1 hunk" fills. Geometrically centred
+                        // therefore reads high. Spending the padding at the top drops
+                        // the glyphs onto the optical centre instead. Scaled like
+                        // every other metric here, so the split tracks the interface
+                        // scale rather than drifting at 130%.
+                        .padding_top(theme::scaled(7.0))
+                        .padding_bottom(theme::scaled(1.0))
+                        .background(theme::bg_deepest())
+                        .border_top(1.0)
+                        .border_color(theme::border())
+                }
+                _ => {
+                    // `p.y` is the bottom edge of the statement's last line in the
+                    // editor's **content** coordinates, so the viewport has to come off
+                    // it — without that the bar was placed by how far down the document
+                    // the statement is rather than by where it is on screen, and opening
+                    // Ctrl+K in a scrolled editor put the bar at the bottom of the pane.
+                    let p = cmdk.point.get();
+                    s.inset_top(p.y - ed_geo.viewport.get().y0 + theme::scaled(4.0))
+                        .background(theme::bg_deepest())
+                        .border_left(2.0)
+                        .border_color(theme::accent())
+                        .border_radius(0.0)
+                }
+            }
+        })
+        // On the outer box, not only on the row inside it. The row is content-height
+        // and centred, so the bar's padding, its border and the space above and below
+        // the words all belong to *this* view — and those were exactly the places a
+        // scroll died: it worked across the words' own band and nowhere else.
+        .on_event_stop(EventListener::PointerWheel, move |e| {
+            if let Event::PointerWheel(pe) = e {
+                scroll_delta.set(pe.delta);
+            }
+        })
 }
 
 /// Editor-local state for the inline (Ctrl+K) AI prompt popup. `start`/`end` are
@@ -612,7 +775,22 @@ struct CmdK {
     input: RwSignal<String>,
     start: RwSignal<usize>,
     end: RwSignal<usize>,
+    /// The suggestion currently rendered *in the editor's line flow* as phantom
+    /// rows, or `None`. Set only through [`inline_diff::set_preview`], which also
+    /// invalidates the layout cache the rows are baked into.
+    preview: inline_diff::InlinePreview,
+    /// `(accept, reject)`, published by `cmdk_popup` once it has built them.
+    ///
+    /// The suggestion is drawn in the editor's own lines now, so the verdict state
+    /// has no text field in it — and a field is what used to catch Enter and
+    /// Escape. The editor has focus instead, so its key handler answers for them,
+    /// and this is how it reaches the same two closures the footer's buttons call.
+    /// One implementation, two ways in; not a second copy of the logic.
+    verdict: RwSignal<Option<Verdict>>,
 }
+
+/// `(accept, reject)` for a settled Ctrl+K suggestion — see [`CmdK::verdict`].
+type Verdict = (Rc<dyn Fn()>, Rc<dyn Fn()>);
 
 // ── Unsafe-statement guard ───────────────────────────────────────────────────
 //
@@ -953,6 +1131,173 @@ fn editor_points(ed: &Editor) -> impl Fn(usize) -> Option<(Point, Point)> + '_ {
     }
 }
 
+/// Vertical room the Ctrl+K prompt bar needs below the line it opens under: the
+/// gap plus a bar of one or two rows. Generous rather than exact — over-scrolling
+/// by a few pixels is invisible, and `scroll_beyond_last_line` means there is
+/// always somewhere to go.
+const CMDK_BAR_RESERVE: f64 = 52.0;
+
+/// The verdict footer's height, before the interface scale. **Two places need it
+/// to agree** — the style that draws the bar and [`inline_footer_y`], which decides
+/// whether the bar still fits on screen below the block — so it is one number
+/// rather than two literals that drift apart the first time the bar is resized.
+const VERDICT_BAR_H: f64 = 30.0;
+
+/// Anchor the Ctrl+K bar under `end`, scrolling the editor if the bar would not
+/// fit below it.
+///
+/// The bar is an overlay, so the editor has no idea it is there and will happily
+/// leave the line it hangs off flush against the bottom of the pane — which opened
+/// the prompt clipped, or entirely out of sight, for any statement near the end of
+/// a full screen. The stored point stays in the editor's **content** coordinates
+/// (the style closure subtracts the viewport, so the bar tracks a later scroll);
+/// only the fit test converts to screen coordinates.
+fn anchor_cmdk(ed: &Editor, cmdk: CmdK, end: usize, area_h: RwSignal<f64>) {
+    let (_, mut below) = ed.points_of_offset(end, CursorAffinity::Backward);
+    below.y += EDITOR_PAD_TOP;
+    cmdk.point.set(below);
+    // Untracked, like the viewport read beside it: this runs from a key handler,
+    // and a tracked read here would quietly give any future caller inside an
+    // effect a dependency on the pane's height.
+    let overflow = (below.y - ed.viewport.get_untracked().y0) + theme::scaled(CMDK_BAR_RESERVE)
+        - area_h.get_untracked();
+    if overflow > 0.0 {
+        ed.scroll_delta.set(Vec2::new(0.0, overflow));
+    }
+}
+
+/// The y (in `editor_area` coords) of the first pixel *below* the phantom rows a
+/// pending Ctrl+K suggestion has added — where the verdict footer goes.
+///
+/// The block's own bottom is not something `points_of_offset` will report: the
+/// added rows are phantom text on the anchor line, and a caret offset at the end
+/// of that line maps to a column *before* them, so its `bot` is the bottom of the
+/// line's own row. The next document line's top is the honest answer, because the
+/// phantom rows are exactly what pushed it down — and the last-line case, which
+/// has no next line, is the one that has to count the rows itself.
+///
+/// Reactive: `screen_lines` is tracked, so the footer follows a scroll under it
+/// rather than staying where the suggestion arrived.
+fn inline_footer_y(
+    ed: &Editor,
+    preview: inline_diff::InlinePreview,
+    area_h: RwSignal<f64>,
+) -> Option<f64> {
+    ed.screen_lines.track();
+    let view = preview.get()?;
+    let hunk = view.plan()?.hunks.last()?;
+    let rope = ed.rope_text();
+    let vp_y = ed.viewport.get().y0;
+    let (top, bot) = if hunk.anchor + 1 < rope.num_lines() {
+        let off = rope.offset_of_line(hunk.anchor + 1);
+        let (top, _) = ed.points_of_offset(off, CursorAffinity::Backward);
+        (top, top)
+    } else {
+        // Last line of the document: there is no next line to ask, so step past
+        // the anchor's own rows. **`line_count()`, not `add.len()`** — it counts
+        // the line's *visual* rows, phantom and soft-wrapped alike, and with word
+        // wrap on a long added line occupies more rows than it has lines. Counting
+        // lines put the bar one row short and left the tail of the suggestion
+        // stranded below it.
+        let off = rope.offset_of_line(hunk.anchor);
+        let (mut t, _) = ed.points_of_offset(off, CursorAffinity::Backward);
+        t.y += ed.text_layout(hunk.anchor).line_count() as f64
+            * f64::from(ed.line_height(hunk.anchor));
+        (t, t)
+    };
+    let y = top.y + EDITOR_PAD_TOP - vp_y;
+    // Off screen when the block has scrolled out of the pane. The bar is placed by
+    // line geometry against an editor that scrolls under it, so without this it
+    // rides up over the toolbar and the tab strip — it is absolutely positioned in
+    // the pane, not clipped to the editor.
+    let h = theme::scaled(VERDICT_BAR_H);
+    let fits = y >= 0.0 && y + h <= area_h.get();
+    (placed(top, bot) && fits).then_some(y)
+}
+
+/// The inline-diff bands as one `(y, height, is_add)` entry **per banded line** in
+/// `editor_area` coords, top to bottom — each hunk's deleted lines, then the lines
+/// it adds. Per line rather than per run so the gutter strip can carry a `−`/`+`
+/// on each.
+///
+/// Every line the diff touches is banded by its **visual** rows, through the same
+/// [`inline_diff::row_split`] the code column's own bands go through — so the two
+/// halves of a band cover the same rows even where word wrap has given a line more
+/// rows than it has lines.
+///
+/// This exists because a band cannot be painted edge-to-edge from where the rest
+/// of it is painted. `sql_highlight`'s `LineExtraStyle` covers the code column
+/// correctly (under the glyphs, scrolling with them), but the editor's content
+/// lives inside a clipping `scroll` with the gutter as a *sibling painted before
+/// it*, so nothing drawn from inside can reach the gutter or the wrapper's right
+/// padding. Those two strips are text-free, so an overlay can finish the band
+/// there without covering anything — which is the one job this has.
+///
+/// Reactive on `screen_lines`, so the strips follow a scroll like the rest.
+fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f64, f64, bool)> {
+    ed.screen_lines.track();
+    let Some(view) = preview.get() else {
+        return Vec::new();
+    };
+    let Some(plan) = view.plan() else {
+        return Vec::new();
+    };
+    let rope = ed.rope_text();
+    let vp_y = ed.viewport.get().y0;
+    // `None` for a line that is off screen **or past the end of the document**.
+    // The plan is computed against the buffer as it was, so a hunk can outlive the
+    // lines it names; clamping such a line to the last one (as this used to) put
+    // its band against whatever text happens to be there now, which is worse than
+    // not drawing it.
+    let last_line = rope.num_lines().saturating_sub(1);
+    let top_of = |line: usize| -> Option<f64> {
+        if line > last_line {
+            return None;
+        }
+        let off = rope.offset_of_line(line);
+        let (top, bot) = ed.points_of_offset(off, CursorAffinity::Backward);
+        placed(top, bot).then_some(top.y + EDITOR_PAD_TOP - vp_y)
+    };
+    let mut rows = Vec::new();
+    // Every line the diff touches, banded by its **visual** rows. Each line is
+    // asked for its own split through `inline_diff::row_split`, the same function
+    // the code column's bands go through, so the two halves of a band cannot
+    // disagree about which rows they cover — including where word wrap has given a
+    // line more rows than it has lines.
+    for hunk in &plan.hunks {
+        for line in hunk.del.clone().chain(
+            // A pure insertion has no deleted line to hang the block off, so the
+            // anchor still has to be visited for its added rows.
+            (hunk.del.is_empty() && !hunk.add.is_empty()).then_some(hunk.anchor),
+        ) {
+            let Some(top) = top_of(line) else { continue };
+            let line_h = f64::from(ed.line_height(line));
+            let own_len = rope.line_content(line).len();
+            let (added, own) = inline_diff::row_split(
+                &ed.text_layout(line),
+                line_h,
+                inline_diff::block_at(&view, line),
+                own_len,
+            );
+            // Only a line the hunk actually removes is banded as a deletion. On a
+            // **pure insertion** the visited line is the anchor — an untouched
+            // context line the block merely hangs off — and banding its own rows
+            // put a red strip and a `−` in the gutter beside a line nothing had
+            // happened to, while the code column beside it stayed clean. The same
+            // gate as `sql_highlight`'s `replaced`, for the same reason.
+            if hunk.del.contains(&line) {
+                for r in own {
+                    rows.push((top + r as f64 * line_h, line_h, false));
+                }
+            }
+            for r in added {
+                rows.push((top + r as f64 * line_h, line_h, true));
+            }
+        }
+    }
+    rows
+}
+
 /// Pixel box `(x, y, w, h)` in `editor_area` coords around the single-line byte
 /// span `[lo, hi]`, for the caret-driven highlight overlays (bracket matching,
 /// identifier occurrences). `None` when either end is off screen.
@@ -1257,7 +1602,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         input: RwSignal::new(String::new()),
         start: RwSignal::new(0),
         end: RwSignal::new(0),
+        preview: RwSignal::new(None),
+        verdict: RwSignal::new(None),
     };
+    // Editor-area height, tracked so the completion popup knows whether its list
+    // fits below the caret, and so the Ctrl+K bars can tell when they would fall
+    // off the bottom of the pane. Declared up here because the editor's own key
+    // handler — built below — needs it to scroll the prompt into view.
+    let area_h: RwSignal<f64> = RwSignal::new(EDITOR_H);
     // Right-click editor menu (Ask AI… / Explain / Optimize). It's routed through
     // the app-wide `popup_menu` overlay (rendered at the workspace root) so it
     // floats *over* the results pane instead of being clipped by the editor area,
@@ -1436,6 +1788,26 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 _ => None,
             };
             if nav.handle(mods.shift(), ch.as_deref(), is_tab) {
+                return CommandExecuted::Yes;
+            }
+        }
+        // Enter accepts / Escape rejects a suggestion drawn in the editor's own
+        // lines. It has to be answered here: in that state the overlay is just the
+        // verdict footer, so there is no field left holding focus to route them,
+        // and the editor is what the suggestion is sitting in. Checked before the
+        // find/goto/completion branches below so a stale popup can't eat the
+        // verdict — and both closures are the footer buttons' own, reached through
+        // `cmdk.verdict`, so there is one accept and one reject in the pane.
+        if cmdk.open.get_untracked()
+            && matches!(inline_ai.get_untracked(), InlineAiState::Ready(_))
+            && let Some((accept, reject)) = cmdk.verdict.get_untracked()
+        {
+            if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _)) {
+                accept();
+                return CommandExecuted::Yes;
+            }
+            if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
+                reject();
                 return CommandExecuted::Yes;
             }
         }
@@ -1618,17 +1990,42 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // `sql.get(start..end)` slice return None → the snippet is
                 // dropped and Ctrl+K silently ignores the selection.
                 let (start, end) = (a.min(b), a.max(b));
+                // With nothing selected, take the statement the caret is in —
+                // the same "what does this key act on" answer Ctrl+Enter gives,
+                // through the same `sql::statement_range`. The old behaviour was
+                // a bare caret, so an unselected Ctrl+K asked the model to edit
+                // an insertion point and the diff had nothing to replace.
+                //
+                // Read the text from the **document**, not the `query` signal:
+                // the offsets being looked up are the document's own, so anything
+                // else risks resolving them against text that isn't what they
+                // index. `accept` re-reads the doc for the same reason.
+                let (start, end) = if start == end {
+                    let sql = e.doc().text().to_string();
+                    statement_range(&sql, start, dialect.get_untracked())
+                } else {
+                    (start, end)
+                };
                 cmdk.start.set(start);
                 cmdk.end.set(end);
+                // Show what the key picked, by actually selecting it. The design
+                // puts the editor's selection colour behind the statement in the
+                // asking state, and the honest way to get that is the editor's own
+                // selection rather than a lookalike overlay — the user can then
+                // see, extend or replace the range with the gestures they already
+                // have, instead of being told about it.
+                e.cursor
+                    .update(|cc| cc.set_insert(Selection::region(start, end)));
                 // Anchor to the BOTTOM of the caret's line (absolute
                 // screen coords via `points_of_offset().1`), not the
                 // per-line baseline `line_point_of_offset` returns —
                 // that baseline is ~0 on an empty line but ~font-ascent
                 // once the line has glyphs, which shoved the box down
                 // whenever the editor had code.
-                let (_, mut below) = e.points_of_offset(offset, CursorAffinity::Backward);
-                below.y += EDITOR_PAD_TOP;
-                cmdk.point.set(below);
+                // Anchored to the END of what Ctrl+K is acting on, not to the
+                // caret: the bar sits under the whole highlighted statement, so
+                // a caret in the middle of one doesn't split it in two.
+                anchor_cmdk(e, cmdk, end, area_h);
             });
             cmdk.input.set(String::new());
             inline_ai.set(InlineAiState::Idle);
@@ -1893,9 +2290,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // handler returns (it ignores our `CommandExecuted`), so when we take over
         // we must suppress that built-in insert: we flip the editor's `read_only`
         // true for the remainder of this key dispatch and restore it next tick.
-        // Nothing else reads `read_only` (the app gates writes elsewhere) and the
-        // handler → built-in-insert step is synchronous, so there's no race or
+        // The handler → built-in-insert step is synchronous, so there's no race or
         // flicker — the built-in `receive_char` sees `read_only` and no-ops.
+        //
+        // **`read_only` has a second owner**: the Ctrl+K preview freezes the buffer
+        // with it while a suggestion is on screen (see the publish effect). So this
+        // bows out entirely when the flag is already set, and restores what it
+        // found rather than assuming `false`. Both halves matter — `doc.edit_single`
+        // below goes through `Document::edit`, which `read_only` does *not* gate
+        // (only `receive_char`/`run_command` are), so without the first check a
+        // typed bracket edited straight through the freeze; and without the second
+        // the deferred restore then cleared the freeze for the rest of the preview.
         if !mods.control()
             && !mods.alt()
             && let KeyInput::Keyboard(Key::Character(cs), _) = &kp.key
@@ -1904,6 +2309,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         {
             let dia = dialect.get_untracked();
             let acted = editor_sig.with_untracked(|e| {
+                let ro = e.read_only;
+                // Already frozen — by the Ctrl+K preview, the only other owner.
+                // An edit here would bypass the freeze, so there is nothing to do.
+                let was = ro.get_untracked();
+                if was {
+                    return false;
+                }
                 let doc = e.doc();
                 let full = doc.text().to_string();
                 let cur = e.cursor.get_untracked();
@@ -1912,12 +2324,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let Some(action) = pairs::auto_pair(&full, a, b, ch, dia) else {
                     return false;
                 };
-                // Suppress the built-in char insert for the rest of this dispatch.
-                let ro = e.read_only;
+                // Suppress the built-in char insert for the rest of this dispatch,
+                // then put the flag back the way it was rather than assuming false.
                 ro.set(true);
                 floem::action::exec_after(std::time::Duration::ZERO, move |_| {
                     if ro.try_get_untracked().is_some() {
-                        ro.set(false);
+                        ro.set(was);
                     }
                 });
                 match action {
@@ -1998,6 +2410,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_menu2 = ed.clone(); // menu actions: anchor point for "Ask AI…"
     let ed_run = ed.clone(); // run menu: re-focus the editor after running
     let ed_hl = ed.clone(); // statement-highlight overlay geometry
+    let ed_band = ed.clone(); // inline-diff band strips (gutter + right padding)
     let ed_syntax = ed.clone(); // syntax-squiggle overlay geometry
     let ed_bm = ed.clone(); // bracket-matching: recompute offsets on caret/text
     let ed_bm2 = ed.clone(); // bracket-matching overlay geometry
@@ -2184,11 +2597,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let off = menu_offset.get_untracked();
-                        cmdk.start.set(off);
-                        cmdk.end.set(off);
-                        let (_, mut below) = ed_ask.points_of_offset(off, CursorAffinity::Backward);
-                        below.y += EDITOR_PAD_TOP;
-                        cmdk.point.set(below);
+                        // Widen to the statement the right-click landed in, exactly
+                        // as Ctrl+K does — this is the same action reached another
+                        // way, so it must pick the same thing. Left as a bare caret
+                        // it asked the model to edit an insertion point.
+                        let sql = ed_ask.doc().text().to_string();
+                        let (start, end) = statement_range(&sql, off, dialect.get_untracked());
+                        cmdk.start.set(start);
+                        cmdk.end.set(end);
+                        ed_ask
+                            .cursor
+                            .update(|cc| cc.set_insert(Selection::region(start, end)));
+                        anchor_cmdk(&ed_ask, cmdk, end, area_h);
                         cmdk.input.set(String::new());
                         inline_ai.set(InlineAiState::Idle);
                         cmdk.open.set(true);
@@ -2331,9 +2751,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         );
     }
 
-    // Editor-area height, tracked so the Ctrl+K expand animation fills it exactly,
-    // and so the completion popup knows whether its list fits below the caret.
-    let area_h: RwSignal<f64> = RwSignal::new(EDITOR_H);
     // The editor's scroll rect, lifted out of `ed` before the closures below consume
     // it. The caret-anchored popups subtract its origin to turn `points_of_offset`'s
     // document coordinates into `editor_area` ones (see the "Overlay geometry" note).
@@ -2414,12 +2831,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Guard: the tab (and this editor's scope) may be gone within 200 ms.
         let _ = bar_gen.try_update(|g| *g += 1);
     });
-    let doc = editor.doc();
+    // The document the Ctrl+K phantom-row wrapper will go around. Taken here, but
+    // installed at the *end* of the builder chain — see the `use_doc` call after
+    // `.update(…)` for why the order is load-bearing.
+    let inner_doc = editor.doc();
     let input = editor
+        // `SqlStyling` reads the INNER document deliberately: same rope, same
+        // `cache_rev` signal (the wrapper delegates both), and it must not depend
+        // on a wrapper installed later in this chain.
         .styling(sql_highlight::SqlStyling::new(
-            doc,
+            inner_doc.clone(),
             dialect.get_untracked(),
             zoom,
+            cmdk.preview,
         ))
         // `smart_tab` makes Tab insert spaces to the next tab stop; without it
         // Tab inserts a literal '\t' while OutdentLine assumes space indentation,
@@ -2596,6 +3020,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // the edited text).
             highlight.set(None);
         })
+        // Wrap the document so a pending Ctrl+K suggestion can be rendered as
+        // phantom rows *in the line flow*, without the rope ever holding text the
+        // user didn't write (`inline_diff`).
+        //
+        // **This has to come after `.update(…)` above, and after any other
+        // `TextEditor` builder that registers a document callback**
+        // (`placeholder`, `pre_command`). Those all resolve the document with
+        // `downcast_rc::<TextDocument>()` and *silently do nothing* when it isn't
+        // one — no error, no warning. Wrapping first therefore dropped the
+        // `query.set(…)` sync on the floor: the signal every consumer treats as
+        // the tab's SQL stopped following the editor at all, so autosave, Run,
+        // diagnostics and Ctrl+K's own statement lookup were reading whatever text
+        // the tab happened to open with.
+        .use_doc(Rc::new(inline_diff::InlineDiffDoc::new(
+            inner_doc,
+            cmdk.preview,
+            dialect.get_untracked(),
+        )) as Rc<dyn floem::views::editor::text::Document>)
         .style(|s| {
             s.width_full()
                 .flex_grow(1.0_f32)
@@ -2668,15 +3110,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // `cont` so the editor still handles the click and places the caret (TODO).
         .on_event_cont(EventListener::PointerDown, move |_| {
             comp.open.set(false);
-            // Also dismiss the Ctrl+K prompt: only its *compact* box sits on top as
-            // a sibling, so a click in the editor outside it lands here; expanded
-            // states cover the editor, so their clicks hit the overlay, not this.
-            // Reset to Idle so a later reopen starts clean.
-            if cmdk.open.get_untracked() {
+            // Also dismiss the Ctrl+K prompt — but **only while it is still just a
+            // prompt**. A click used to be safe to treat as "never mind" because
+            // the working and diff states covered the editor, so a click in them
+            // could not land here at all. Neither covers it now: the diff in
+            // particular sits *in* the lines, so clicking the very thing being
+            // decided on — or anywhere near it — threw the suggestion away, and a
+            // generation the user waited for is far too expensive to lose to a
+            // stray click. Escape dismisses, and Reject is right there.
+            if cmdk.open.get_untracked() && matches!(inline_ai.get_untracked(), InlineAiState::Idle)
+            {
                 cmdk.open.set(false);
-                if !matches!(inline_ai.get_untracked(), InlineAiState::Idle) {
-                    inline_ai.set(InlineAiState::Idle);
-                }
             }
         })
         .style(|s| {
@@ -2918,7 +3362,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         ed_cmdk,
         comp,
         area_h,
-        dialect.get_untracked(),
     );
     // AI Fix: open the Ctrl+K overlay pre-filled with the error and auto-submit
     // a whole-query fix. Goes straight to Busy (skips the compact prompt); the
@@ -3268,6 +3711,94 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // DataGrip-style border around the statement picked by Explain/Optimize.
     // Click-through (`pointer_events(false)`) so clicks reach the editor (which
     // clears the highlight); a thin absolute box per line the statement touches.
+    // The two strips finishing the diff's bands — over the gutter and over the
+    // wrapper's right padding. Click-through, because they lie across the document
+    // and Floem's wheel routing gives no way to pass an event on once a view is
+    // eligible for it (see the pointer-routing note on `cmdk_popup`'s verdict bar,
+    // which solves the same problem the other way because it needs clicks).
+    let inline_band_view = {
+        let ed = ed_band;
+        dyn_container(
+            move || inline_band_runs(&ed, cmdk.preview),
+            move |runs| {
+                if runs.is_empty() {
+                    return empty().into_any();
+                }
+                // The gutter's width follows the line-number digit count, exactly
+                // as the code column's origin does; the code column ends where the
+                // scroll viewport does, and everything past that is the wrapper's
+                // right padding.
+                let content_x = content_x_of(&query.get_untracked());
+                let content_right = content_x + ed_vp.get().width();
+                v_stack_from_iter(runs.into_iter().flat_map(move |(y, h, is_add)| {
+                    let bg = move || {
+                        if is_add {
+                            theme::diff_add_bg()
+                        } else {
+                            theme::diff_del_bg()
+                        }
+                    };
+                    // Left: the gutter. Right: pinned between the content's right
+                    // edge and the editor's, so it stretches without needing the
+                    // area's width — and, crucially, starts *past* the last glyph
+                    // column. This overlay paints over the editor, so a strip that
+                    // reached back into the code would cover the code.
+                    // The gutter, carrying this row's marker in place of the line
+                    // number the band covers — which is what the design puts there.
+                    let marker = if is_add { "+" } else { "−" };
+                    let fg = move || {
+                        if is_add {
+                            theme::diff_add_marker()
+                        } else {
+                            theme::diff_del_marker()
+                        }
+                    };
+                    let left = container(text(marker).style(move |s| {
+                        s.color(fg())
+                            .font_family(MONO_FAMILY.to_string())
+                            .font_size(theme::editor_font_size())
+                    }))
+                    .style(move |s| {
+                        s.absolute()
+                            .inset_left(0.0)
+                            .inset_top(y)
+                            // Stop `HL_PAD` short of the code column. `HL_GUTTER`
+                            // is a measured estimate that runs a shade generous —
+                            // fine for the statement-highlight *border* it was
+                            // tuned for, which pads outward by exactly this much to
+                            // clear the glyphs, but a filled band inherits no such
+                            // margin and was painting over the first character.
+                            .width((content_x - HL_PAD).max(0.0))
+                            .height(h)
+                            .flex_row()
+                            .items_center()
+                            .justify_end()
+                            // Line the marker up with the digits it replaces.
+                            .padding_right(theme::scaled(HL_DIGIT_W))
+                            .background(bg())
+                    });
+                    let right = empty().style(move |s| {
+                        s.absolute()
+                            .inset_left(content_right)
+                            .inset_right(0.0)
+                            .inset_top(y)
+                            .height(h)
+                            .background(bg())
+                    });
+                    [left.into_any(), right.into_any()]
+                }))
+                .style(|s| s.absolute().inset(0.0))
+                .into_any()
+            },
+        )
+        .style(|s| s.absolute().inset(0.0))
+        // Confined to the editor: the strips are placed by line geometry, and a
+        // block scrolled past the top of the pane would otherwise paint its bands
+        // over the toolbar above it.
+        .clip()
+        .pointer_events(|| false)
+    };
+
     let highlight_view = {
         let ed = ed_hl;
         dyn_container(
@@ -3963,14 +4494,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         })
     };
 
-    // Order: editor, syntax squiggles, statement highlight, run overlay, then the
-    // completion popup / error+guard bars / Ctrl+K / run menu / find bar on top.
+    // Order: editor + inline-diff band strips, syntax squiggles, statement
+    // highlight, run overlay, then the completion popup / error+guard bars /
+    // Ctrl+K, the scrollbars, and the run menu / find bar / goto bar on top.
     // (The right-click AI menu is rendered at the workspace root via `popup_menu`,
     // so it floats over the results pane instead of being clipped here.)
+    //
+    // The scrollbars sit that late deliberately — see the note at their entry.
     let editor_area = stack((
-        editor_box,
-        v_scrollbar,
-        h_scrollbar,
+        // The band strips sit directly over the editor and under every other
+        // overlay: they paint only the gutter and right-padding ends of the
+        // inline-diff bands, which carry no text, so they must not cover the
+        // overlays that do. Nested with the editor rather than listed beside it
+        // because `stack` takes at most 16 children — the pair occupies the same
+        // rect either way, so the absolute overlays below still share its coords.
+        stack((editor_box, inline_band_view))
+            .style(|s| s.flex_grow(1.0_f32).width_full().flex_col().min_height(0.0)),
         syntax_view,
         highlight_view,
         bracket_match_view,
@@ -3981,6 +4520,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         error_bar,
         guard_bar,
         cmdk_view,
+        // Above the Ctrl+K bars, not below them. The bars run edge to edge — they
+        // belong to the block of lines they close, and a row that stopped short of
+        // the border would read as a floating panel — so at this layer they covered
+        // the scrollbars, which are pinned to the border rather than to the content
+        // edge. The scrollbars are thin and sit at the extremes, so they cost the
+        // bars nothing by being drawn last, and being on top also puts a drag on
+        // the bar where the user aimed it.
+        //
+        // **Listed one by one, never wrapped in a stack to save a child slot.**
+        // Each scrollbar positions itself against the border and is only as big as
+        // it looks; a wrapper around them is `absolute().inset(0)` — a view the
+        // size of the whole pane, sitting above the editor, that takes pointer
+        // events. Floem stops a pointer event at the first eligible view under it,
+        // so that wrapper silently ate every click, drag and wheel in the editor.
+        v_scrollbar,
+        h_scrollbar,
         run_menu_view,
         find_bar,
         goto_bar,

@@ -3630,19 +3630,6 @@ pub(crate) fn measure_text_px_bold_at(text: &str, size: f32) -> f64 {
     measure_text_px_weighted(text, size, true)
 }
 
-/// As [`measure_text_px_at`], but in the app's monospace family — what the SQL
-/// surfaces (the Ctrl+K diff, the DDL preview's script box) actually render with.
-///
-/// A measurement in the wrong family is the same class of error as one in the
-/// wrong weight, and it is the one the diff used to make *without* measuring at
-/// all: it multiplied a `chars().count()` by a comment-documented advance
-/// (`8.43`). That is exact for ASCII and half the truth for a full-width glyph,
-/// so a line with CJK text in a string literal reported a content width narrower
-/// than it draws, and the horizontal scrollbar stopped before the end of the line.
-pub(crate) fn measure_mono_px_at(text: &str, size: f32) -> f64 {
-    measure_text_px_styled(text, size, false, true)
-}
-
 fn measure_text_px_weighted(text: &str, size: f32, bold: bool) -> f64 {
     measure_text_px_styled(text, size, bold, false)
 }
@@ -4381,6 +4368,20 @@ fn highlight_text_in(
     })
 }
 
+/// The width [`loading_dots`] reserves for `prefix` at `px` — the full
+/// `prefix...` state, so the label doesn't reflow as the dots cycle.
+///
+/// Public because a *caller* sometimes has to reserve the same width in the slot
+/// the loader will appear in, before it appears: swapping a small idle affordance
+/// for this label mid-layout otherwise steals width from whatever flex-grows
+/// beside it (Ctrl+K's question field, which then re-wraps and grows a row). Both
+/// sides measure through this one function so the reservation cannot drift from
+/// what the loader actually takes.
+pub(crate) fn loading_dots_w(prefix: &str, px: f32) -> f64 {
+    // +2px guards sub-pixel rounding so the 3-dot state never exceeds the box.
+    measure_text_px_at(&format!("{prefix}..."), px) + 2.0
+}
+
 /// An animated loading label — `prefix` followed by a cycling `.` → `..` → `...`
 /// on a 400ms timer (instead of a static `…`). The timer self-reschedules and
 /// stops when the view's scope is disposed (`try_update` → `None`), so it can't
@@ -4393,8 +4394,9 @@ pub(crate) fn loading_dots(
     let step = RwSignal::new(1usize);
     // Reserve the full `prefix...` width up front so the label keeps a fixed size
     // as the dots cycle (1→2→3) — otherwise it reflows, jittering when centred (the
-    // query runner) or shoving a neighbour (Ctrl+K's Cancel). +2px guards sub-pixel
-    // rounding so the 3-dot state never exceeds the reserved box.
+    // query runner) or shoving a neighbour (Ctrl+K's Cancel). `loading_dots_w` is
+    // that reservation, shared with callers that must hold the space open before
+    // this label exists.
     //
     // Measured *inside* the style closure, from a `fn() -> f32`: this label lives
     // for as long as the operation it reports, so a size (and a width measured
@@ -4419,7 +4421,7 @@ pub(crate) fn loading_dots(
                     let px = font_size();
                     s.color(color())
                         .font_size(px)
-                        .min_width(measure_text_px_at(&format!("{prefix}..."), px) + 2.0)
+                        .min_width(loading_dots_w(prefix, px))
                 })
                 .into_any()
         },
@@ -4770,46 +4772,23 @@ mod measure_tests {
         );
     }
 
+    /// A slot sized with [`loading_dots_w`] holds the loader at **every** dot
+    /// state, for every verb it might pick — that is what lets Ctrl+K's trailing
+    /// slot reserve the spinner's width before the spinner exists, and so keeps
+    /// the question field from being narrowed (and re-wrapped) on submit.
     #[test]
-    fn a_char_count_does_not_predict_the_width() {
-        // The Ctrl+K diff used to size its scroll extent as `chars().count()`
-        // times a fixed advance. `char` is not the unit text is laid out in: a
-        // combining mark is a `char` of its own and adds no advance at all, so
-        // the width came out over the truth for any accented line. Ctrl+K sends
-        // the editor buffer, so a literal in the user's own SQL reaches it.
-        //
-        // The mirror case — a full-width CJK glyph taking *two* advances for one
-        // `char` — is what this test used to assert, and it can't be pinned here:
-        // `MONO_FAMILY` carries no CJK coverage, so those glyphs resolve through
-        // whatever the machine happens to have installed. It failed on the bare
-        // Linux CI runner, which has nothing, while passing locally on a fallback
-        // box that measures identically to an unrenderable private-use codepoint
-        // — so it was asserting on the fallback, not on a glyph. The combining
-        // mark is in the bundled font and therefore measures the same everywhere.
+    fn the_reserved_loader_width_fits_every_verb_and_dot_state() {
         crate::fonts::load_fonts();
-        let advance = measure_mono_px_at("0", 14.0);
-        let ascii = "abcdefgh"; // 8 chars, 8 advances
-        let accented = "e\u{0301}"; // 2 chars, 1 advance
-
-        // The baseline the old arithmetic assumed, and where it held.
-        assert!((measure_mono_px_at(ascii, 14.0) - 8.0 * advance).abs() < 1.0);
-        // …and where it didn't: two chars occupying a single advance.
-        assert!(
-            measure_mono_px_at(accented, 14.0) < 1.5 * advance,
-            "a combining mark must not measure as an advance of its own"
-        );
-    }
-
-    #[test]
-    fn the_mono_measurement_is_not_the_proportional_one() {
-        // Measuring monospace text with the default family is the same class of
-        // error as measuring bold text at regular weight — silently narrow.
-        crate::fonts::load_fonts();
-        let s = "iiiiiiiiii"; // the letter proportional fonts make narrowest
-        assert!(
-            measure_mono_px_at(s, 14.0) > measure_text_px_at(s, 14.0),
-            "monospace must not be measured with the proportional family"
-        );
+        for verb in SPINNER_VERBS {
+            let reserved = loading_dots_w(verb, theme::font_hint());
+            for dots in ["", ".", "..", "..."] {
+                let drawn = measure_text_px_at(&format!("{verb}{dots}"), theme::font_hint());
+                assert!(
+                    reserved >= drawn,
+                    "{verb}{dots}: reserved {reserved} < drawn {drawn}"
+                );
+            }
+        }
     }
 }
 

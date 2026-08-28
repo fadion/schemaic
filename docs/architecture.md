@@ -323,6 +323,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     The live DB stays the semantic authority: **Tier-2 live validation**
     PREPAREs the statement under the cursor (`Db::prepare_check`, non-executing) behind the
     `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
+    **`sql_reply` is a gate on what a model may put in the editor, not a cleanup.** Ctrl+K's output
+    goes straight into the user's buffer, and while the model is told to answer with bare SQL the
+    *tool* it runs in can still put a line of its own on stdout: a `claude -p` run returned an MCP
+    diagnostic (`Client.listTools() called but server does not advertise tools capability…`)
+    stitched onto a perfectly good statement, and Ctrl+K offered the pair as an edit. So what cannot
+    be parsed is not offered. The whole reply is tried first — anything that already parses comes
+    back untouched — and only then does it try dropping up to `REPLY_TRIM_LINES` (3) lines from each
+    end, fewest first, never from the middle. The load-bearing detail is that **a line may only be
+    dropped if it cannot be SQL**: its first word is not a keyword (`is_sql_keyword`), and a line
+    opening with punctuation (`);`) is protected too. Without that guard, trimming the ends
+    *truncates* — given `SELECT a` / noise / `FROM t`, dropping the last two lines leaves
+    `SELECT a`, which parses perfectly and means something else entirely. That is what
+    `noise_in_the_middle_is_not_stitched_around` pins, and it is the reason the guard exists. The
+    cost is deliberate: a valid statement this parser cannot handle is refused rather than shown.
   - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that
     splices a `WHERE`/`ORDER BY` into the `SELECT` that produced the result and hands back SQL to
     re-run — so filtering covers the whole table, not the loaded page. `build_query` rewrites only
@@ -1415,7 +1429,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `set_interval` on the way in, so the picker can never be left with nothing marked; a choice
     equal to the default is still stored, or moving `DEFAULT_POLL_SECS` would silently move every
     connection someone had deliberately set to the old one.
-  - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
+  - `diff.rs` — the line-level diff behind the inline-AI (Ctrl+K) preview. `line_diff` is the LCS
+    pass, one tagged row per displayed line (context / removed / added); `inline_plan` re-addresses
+    those rows as **document line numbers**, which is what lets the UI draw the suggestion in the
+    editor's own line flow instead of in a box over it — the renderer needs to know which of the
+    user's lines to fade and where to hang the new ones, not how to lay out a list. Consecutive
+    non-`Equal` rows group into one `InlineHunk`; its `del` is the half-open range of document lines
+    the change removes, and its additions hang off the **last** line it removes, which is what puts
+    the `+` rows below the `−` rows they replace. A pure insertion falls back to the line above it,
+    and `before` — the one case the renderer special-cases — is true only for an insertion at the
+    very top of the buffer, which has no preceding line to anchor to. `line_span` is the companion
+    for the state *before* there is a plan: the request is captured as a byte range, everything
+    rendering against the editor surface is keyed on line numbers, and the lines being *worked on*
+    have to be named the same way the lines being replaced are. Its edge is pinned by
+    `a_range_ending_on_a_newline_does_not_reach_the_next_line` — the last line is the one holding
+    the range's **final byte**, not the one holding `end`, so a range stopping just after a newline
+    covers the line it ended and not the empty one after it. `DiffRow`/`build_diff_rows`/
+    `DIFF_CONTEXT`, which built the old preview *list*, went with the box that displayed it.
   - `snippet.rs` — the snippet library: named saved queries, persisted to `snippets.json`.
     `applies` answers whether a snippet may be offered on a connection, `grouped` builds the
     panel's headings (**narrowest bucket first** — this connection, this engine, everywhere — each
@@ -2902,8 +2932,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `Rc<…Actions>` callback bundles — so `ui.run` is `ui.tab_actions.run`, `ui.db_nodes` is
   `ui.schema.db_nodes`, the tabs signal is `ui.tabs_ui.tabs`. Modules:
   - `consts.rs` — layout/dimension metrics + `MONO_FAMILY` (glob-imported). Any SQL/code
-    surface reads that one name — the diff view, and `FieldCfg::mono` (the DDL preview's
-    script box, the view editor's definition). Most of the file is `fn() -> f64` rather than
+    surface reads that one name — the snippet library's preview, and `FieldCfg::mono` (the DDL
+    preview's script box, the view editor's definition). Most of the file is `fn() -> f64` rather than
     `const`, because the interface scale multiplies anything that boxes text; the module doc lists
     what stays a `const` and why — hairlines, editor-relative metrics, seeds for persisted widths,
     icon bases, `TERM_FONT_SIZES`, and the two floating-bar insets — and **that list is the copy to
@@ -3093,13 +3123,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     currently reachable**: `v_resize_handle` is called once from `center`, itself built once in the
     workspace shell, and the per-tab `dyn_container`s are its siblings rather than its parents, so
     these signals live as long as the app does.
-  - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel; its
-    row preview is syntax-coloured on `bg_editor` like the snippet library's, for the `contrast.rs`
-    reason `snippet_panel.rs` gives below. Its **dialect comes from the active connection**, same
-    memo and same reasoning as the library's: the list is filtered to that connection, so every row
-    on screen ran against it. That memo is tracked in the row `dyn_container`'s trigger tuple
-    alongside `visible` and `search` — two connections that both have no history yield the same
-    empty `visible`, and without it the rows would stay built with the previous engine's lexer.
+  - `history_panel.rs` — Query History right-column panel; its row preview is syntax-coloured on
+    `bg_editor` like the snippet library's, for the `contrast.rs` reason `snippet_panel.rs` gives
+    below. Its **dialect comes from the active connection**, same memo and same reasoning as the
+    library's: the list is filtered to that connection, so every row on screen ran against it. That
+    memo is tracked in the row `dyn_container`'s trigger tuple alongside `visible` and `search` —
+    two connections that both have no history yield the same empty `visible`, and without it the
+    rows would stay built with the previous engine's lexer.
   - `snippet_edit.rs` — the snippet editor modal: **the one place a saved query's body can be
     changed**, with its name and abbrev alongside. The panel's inline fields cover the two
     one-word edits because those are the same act as renaming a tab; a body is SQL, multi-line, and
@@ -3891,9 +3921,248 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     would otherwise repaint the accent border grey under the pointer.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `results_view`/`loaded_view` are the
     entry points). `editor_pane.rs` — SQL editor pane
-    (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
+    (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `compute_diagnostics`
     bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
     squiggles (red errors / amber typo warnings) with hover tooltips.
+    **The Ctrl+K suggestion is not drawn here** — it is phantom rows in the editor's own line flow
+    (`inline_diff`, below), and what `cmdk_popup` still draws is the two ends of the block: the
+    question bar (sparkle, a `multiline` `edit_field` capped at three rows, then a send affordance or
+    the `verb_spinner`) anchored under the statement, and the verdict footer — Accept / Reject / the
+    change count, read off the *published* plan so there is
+    no second diff of the same text — anchored under the added rows. Neither covers the editor any
+    more, so the compact↔expanded animation went with the box it was growing.
+    **The overlay's `dyn_container` is keyed on a `Memo` of `(open, is_ready)` — not on the state,
+    and not on a bare closure**, and both halves of that are load-bearing. Keyed on the state, every
+    Idle → Busy → Failed transition rebuilt the question field, and a freshly built `edit_field` has
+    almost no width for one frame, so a one-line question wrapped in that frame and the field latched
+    the row count it measured there. The bar reopened a row taller with its text stranded at the top,
+    which looked exactly like a typed newline and sent three rounds of fixes at the Enter key (see
+    `edit_field`'s Enter contract for the misdiagnosis). Computing the pair in the key closure did
+    **not** fix it, because `dyn_container` does not diff — it swaps the child on every *run* of the
+    key, whatever the value (`create_updater` → `swap_val`), the same trap the Live Monitor's body
+    documents. Only the memo, which notifies solely when the value differs, actually spares the
+    field; a fourth round of Enter fixes went to the wrong place for want of that distinction.
+    Everything that differs across those states is therefore reactive *inside* the branch: the
+    trailing slot (send triangle vs `verb_spinner`) is a nested `dyn_container`, the failure message
+    is another, and `on_submit` reads the state when pressed instead of being rebuilt per state.
+    **That trailing slot reserves the spinner's width while the triangle is showing** — its verb is
+    picked once per opening and the slot takes `loading_dots_w` of it, `justify_end` so the triangle
+    keeps the right edge. The field beside it flex-grows into what is left, so without the
+    reservation submitting swapped a 15px icon for up to 102px of "Metamorphosing..." and took that
+    width off the question mid-flight — a second, quieter way to the same re-wrap.
+    Two things were given up for it, both deliberate: the question is **no longer `read_only` while
+    a request is in flight, and no longer dims**, because both are resolved when the field is built
+    and following the request would mean rebuilding it. Editing mid-flight is harmless — the request
+    carries the text it was sent with — and the spinner beside it says what is happening. The input
+    row also carries **no vertical padding of its own**: `edit_field` already puts `chat_pad_v` above
+    and below its text, and the second helping made a one-line question sit in a bar deep enough to
+    read as two.
+    An **effect** over
+    `inline_ai` publishes and clears the preview rather than a set inside each transition: it maps
+    `Busy` to an `InlineView::Working` over `diff::line_span` of the captured range and `Ready` to a
+    `Plan`, and *everything else to `None`* — every way out of `Ready` (approve, reject, Escape, a
+    second Ctrl+K, a tab switch cancelling the generation) has to take the rows down, and those
+    share no single caller. The buffer read sits in a closure **only those two arms call**: Idle and
+    Failed are the common transitions, and they were copying a whole 190 KB script out of the rope to
+    compute offsets they then discarded.
+    **With nothing selected, Ctrl+K widens to `sql::statement_range`**, the same "what does this key
+    act on" answer Ctrl+Enter gives; it used to capture a bare caret, so an unselected Ctrl+K asked
+    the model to edit an insertion point and left the diff nothing to replace. It reads the text for
+    that from **`e.doc().text()`, not the `query` signal** — the offsets it is resolving are the
+    document's own, and `accept` re-reads the document for the same reason. The right-click *Ask
+    AI…* entry widens, selects and anchors identically: it is the same action reached another way,
+    so it has to pick the same thing. Ctrl+K then **selects** that range for real
+    (`cursor.set_insert`), which is where the design's selection colour behind the statement comes
+    from: the honest way to show what the key picked is the editor's own selection rather than a
+    lookalike overlay, and it leaves the user able to see, extend or replace the range with the
+    gestures they already have. The bar is anchored at the **end** of the acted-on range rather than
+    at the caret, so it sits under the whole statement instead of splitting one in two, and both
+    entry points go through `anchor_cmdk` to do it. That helper does two things neither caller should
+    repeat. It stores the point in the editor's **content** coordinates and leaves the style closure
+    to subtract the viewport, so the bar tracks a later scroll — while the closure was *not*
+    subtracting it, an open in a scrolled editor placed the bar by how far down the document the
+    statement is rather than by where it is on screen, which put it at the bottom of the pane. And it
+    **scrolls the editor when the bar would not fit** below the line: the bar is an overlay, so the
+    editor does not know it exists and will leave the anchor line flush against the bottom of the
+    pane, opening the prompt clipped or entirely out of sight. `CMDK_BAR_RESERVE` is the room it asks
+    for, deliberately generous — over-scrolling by a few pixels is invisible, and
+    `scroll_beyond_last_line` guarantees there is somewhere to go.
+    `inline_footer_y` is the other end's geometry, and it is deliberately not `points_of_offset` at
+    the anchor line's end: that offset maps to a column *before* the phantom rows, so its `bot` is
+    the bottom of the line's own row. The **next** document line's top is the honest answer — the
+    added rows are exactly what pushed it down — and the last-line case, which has no next line,
+    steps past them with `ed.text_layout(anchor).line_count()`, **visual rows and not `add.len()`**:
+    with word wrap on a long added line occupies more rows than it has lines, and counting lines put
+    the bar one row short with the tail of the suggestion stranded below it. It also takes `area_h`
+    and answers `None` when the bar would not fit inside the pane — it is absolutely positioned in
+    the pane rather than clipped to the editor, so a block scrolled past the top left Accept/Reject
+    floating over the toolbar and the tab strip. That fit test measures the bar through the same
+    `VERDICT_BAR_H` the style draws it with, since a height living in two literals is a bar that
+    reports itself on screen at one size and paints at another. Inside it the padding is deliberately
+    **top-heavy** (1px border, then 7 above the words and 1 below): the row is centred in the content
+    band, so an even split centres the words' *line box*, and a line box carries descender space that
+    almost nothing in "Accept · Reject · 1 hunk" fills — geometrically centred reads high.
+    **The verdict bar takes pointer events and forwards the wheel.** It lies across the document,
+    and Floem's child walk `break`s on the first view eligible for a pointer event whether or not it
+    handled anything (the pointer-routing gotcha), so a bar with pointer events on kills
+    scrolling over itself and *not* handling the wheel does not help. It forwards `PointerWheel` to
+    `ed.scroll_delta` instead — which is exactly what Floem's own gutter does with the same problem
+    (`view.rs:1112`) — and that is what lets it keep its buttons and set `CursorStyle::Default` over
+    them, since it sits on the editor's I-beam and nothing in it is selectable. (It was briefly
+    split in two, surface in the click-through overlay and words here; forwarding is the better
+    trade, and `pointer_events(false)` is now reserved for the band strips, which have nothing to
+    click.) **The forward is on all four views** — the row, Accept, Reject and the change count —
+    because the walk breaks at whichever child is under the pointer: on the row alone, a wheel over
+    the two words still died, which reads as intermittent rather than as a missing handler. The bar
+    is aligned to the code column, and the same two closures answer the keyboard: `CmdK::verdict`
+    publishes them to the editor's key handler, because in that state there is no field left to catch
+    Enter and Escape and the editor is what holds focus. One accept and one reject in the pane, two
+    ways in. **The forward is also on the outer box**, and that is what the "sometimes it swallows
+    the scroll" report was really about: the row is content-height, so the bar's padding, its border
+    and the space above and below the words all belong to the box, and a wheel worked across the
+    words' own band and died everywhere else. The centring is the same story from the layout side.
+    It is **`justify_center()` on the inner `container(content)` wrapper** — the one that actually
+    fills the box's definite height, and whose default `justify_start` was pinning the row to the
+    top. Putting it on the absolutely-positioned box did nothing, because that box's child chain asks
+    for `height_full` and so already fills it; the row's own `height_full` + `items_center` had
+    nothing to resolve against either. Centre on the view that fills the height, not on the one that
+    defines it.
+    **Both bars run edge to edge**, and that is a **deliberate divergence from the design**, which
+    insets the question bar from the right: both belong to the block of lines they sit under, and one
+    of the two stopping short read as an inconsistency rather than as a detail. It costs something,
+    which is why the scrollbars moved — see below. They are inset 1px on each side to clear the
+    editor's own border, and the verdict bar carries 2px of vertical padding. Those 1px insets are
+    `EXEMPT` entries in `consts::float_inset_gate` rather than `float_inset()` calls, for the reason
+    the entries state: these are not floating boxes keeping air from a panel edge but rows of the
+    block above them, and the number is the border's width, which does not scale.
+    **The buffer is frozen while a suggestion is on screen** (`ed.read_only`, released on accept or
+    reject — and read the gotcha on that flag before touching it, because the auto-pair handler owns
+    it too and it does not gate `Document::edit`): the phantom rows are anchored to line *numbers*
+    and the plan was computed against the text as it was, so an edit underneath would leave the rows
+    describing lines that had moved and Accept
+    splicing at stale offsets. The old overlay got that for free by covering the editor; this
+    one deliberately does not, so the freeze has to be asked for. For the same reason **a click in
+    the editor dismisses Ctrl+K only while it is still `Idle`**. Treating any click as "never mind"
+    was safe only while the working and diff states covered the editor and a click in them could not
+    land there at all; neither covers it now, and the diff in particular sits *in* the lines, so
+    clicking the very thing being decided on threw away a generation the user had waited for.
+    `inline_band_runs` finishes those bands, visiting every line the diff touches and asking
+    `inline_diff::row_split` — the same function the code column's own bands go through — which of
+    that line's **visual** rows are the block's and which are its own, so the two halves of a band
+    cover the same rows even where word wrap has given a line more rows than it has lines. Its
+    `top_of` answers `None` for a line **past the end of the document** as well as for one off
+    screen: the plan is computed against the buffer as it was, so a hunk can outlive the lines it
+    names, and clamping such a line to the last one (as it used to) painted its band against
+    whatever text happens to be there now. **`row_split` alone does not make the halves agree**:
+    it answers *which rows*, not *which lines*, and the deletion band needs the second answer too —
+    `hunk.del.contains(&line)`, the same gate as `sql_highlight`'s `replaced`. Where that is
+    load-bearing is the **pure insertion**, whose visited line is the anchor: an untouched context
+    line the block merely hangs off. Ungated, the strips painted a red band and a `−` in the gutter
+    beside a line nothing had happened to while the code column stayed clean — the two halves
+    agreeing about rows and disagreeing about lines, in exactly the case the `del.is_empty()` branch
+    exists for. Reading `row_split`'s guarantee as covering more than it does is the same shape of
+    mistake as the row count it replaced: **a helper that answers most of a question invites the
+    caller to stop asking the rest.**
+    `sql_highlight`'s `LineExtraStyle` covers the code column correctly, but the
+    editor's content lives inside a clipping `scroll` whose gutter is a *sibling painted before it*, so
+    nothing drawn from inside can reach the gutter or the wrapper's right padding. Those two strips
+    carry no text, so an overlay finishes the band across them without covering anything — and the
+    left one carries the row's `−`/`+` in place of the line number it hides, which is what the
+    design puts there. The gutter strip stops **`HL_PAD` short of the code column**: `HL_GUTTER` is
+    a measured estimate that runs a shade generous, which is fine for the statement-highlight
+    *border* it was tuned for (that one pads outward by exactly `HL_PAD` to clear the glyphs), but a
+    filled band inherits no such margin and was painting over the first character. The overlay is
+    `.clip()`ed to the editor for `inline_footer_y`'s reason — line geometry against a surface that
+    scrolls under it — and is nested with `editor_box` inside the `editor_area` stack (which takes
+    at most 16 children, and the pair occupies the same rect either way), sitting **directly over
+    the editor, under every other overlay**: the overlays above it carry text and must not be
+    covered.
+    **The custom scrollbars paint *above* the Ctrl+K bars**, listed after `cmdk_view` as **two
+    separate children** — the stack is at exactly 16, which fits. The bars run edge to edge and the
+    scrollbars are pinned to the editor's *border* rather than to its content edge, so at their old
+    layer an open Ctrl+K covered them; being drawn last costs the bars nothing (the scrollbars are
+    thin and sit at the extremes) and puts a drag where the user aimed it. **Never wrap the pair in
+    a `stack` to save a child slot**, however tight the 16 gets: a wrapper around them is
+    `absolute().inset(0)`, a pane-sized view above the editor that takes pointer events, and it ate
+    every click, drag and wheel in the editor for as long as it existed (see the pointer-routing
+    gotcha, which states the general form).
+    **A known cost, accepted rather than fixed**: `inline_band_runs` returns pixel positions and is
+    the strips' `dyn_container` key, so every scroll frame rebuilds those views while a diff is on
+    screen. Making it reactive means keying on `(line, row)` and moving the geometry into N per-strip
+    style closures that each call `ed.text_layout(line)` — a real refactor with its own failure
+    modes, for a transient overlay of usually under ten rows. The per-call cost dropped a long way
+    when the strips moved to `block_at`, which is what made leaving it the reasonable trade.
+  - `inline_diff.rs` — the Ctrl+K suggestion rendered **in the editor's own line flow**: the lines
+    it replaces stay where they are, faded, and the lines it proposes appear directly below them,
+    pushing the rest of the document down. They are Floem *phantom text* (the facility inlay hints
+    use), so **the rope is never touched** — `doc.text()` keeps returning the user's own SQL for the
+    whole preview, and tab autosave, Ctrl+Enter, live validation, completion and the outline all
+    keep seeing the buffer the user actually has. Splicing the diff into the rope would have been
+    far less code and would have put text the user never wrote in front of every one of them.
+    Two halves over one `RwSignal<Option<InlineView>>` (`InlinePreview`): `InlineDiffDoc`, a
+    `Document` wrapping the editor's real one that delegates everything except `phantom_text` — so
+    the rope, the undo history, IME preedit and every edit command are untouched — installed with
+    `TextEditor::use_doc` just before the `SqlStyling` that paints over it; and `segments`, the row
+    builder **both** halves go through, so the styling that paints the rows and the document that
+    emits them cannot disagree about what they hold or where they start (how many rows they *occupy*
+    is `row_split`'s question, below). **`segments` is the expensive one and only `phantom_text` needs
+    it** — it re-tokenises and re-allocates the whole suggestion for its colours — so the styling and
+    the gutter strips ask `block_at` instead, which answers the only three things they wanted: is
+    there a block here, which side of the line, how long. They run *per visible line, per relayout*,
+    and were re-highlighting the suggestion several times a frame to learn that. The two must agree
+    byte for byte, because `row_split` uses `Block::len` as a column into the combined line — one
+    `\n` per added row plus each row's text, and an **empty row still costs the one byte** of the
+    space `segments` substitutes for it, which is the one place the cheap length could silently
+    drift. `a_blocks_length_matches_the_bytes_segments_emits` and
+    `an_empty_added_line_costs_the_space_it_renders_as` pin that seam.
+    `set_preview` is the only correct way to set the signal: it also bumps `cache_rev`, because the
+    rows are baked into the line's cached `TextLayout` (see the Floem gotcha on phantom text for that
+    and the rest of the list's rules). It **returns early when the view is unchanged**, which is
+    worth the comparison rather than a micro-optimisation: the bump discards every cached line layout
+    in the editor, and the states that publish `None` are the common ones — every Escape, Accept,
+    Reject and Ctrl+K passes through one, almost always with `None` already in place.
+    `InlineView` is the *two* things a Ctrl+K request puts on that surface, not one.
+    `Working(Range<usize>)` is the request in flight — the document lines it covers (from
+    `diff::line_span`, since the request is a byte range) fade to say so, and nothing else happens:
+    no rows are added and **no band is painted**, because nothing has been proposed yet.
+    `Plan(InlinePlan)` is the settled suggestion, whose replaced lines fade *and* get the band while
+    its own lines arrive as phantom rows. The two fade depths differ deliberately — `fade()` returns
+    0.45 for `Working` and 0.65 for `Plan`: waiting is the stronger dim because the faded text is
+    all there is to look at, while a replaced line still has to stay readable against the one
+    proposed under it. Both that depth and the `fades(line)` predicate live on the enum, so
+    `sql_highlight` applies **one** rule rather than a rule per state; `segments` takes the view and
+    returns `None` for `Working` through `InlineView::plan()`.
+    The colour is `sql_highlight`'s half of the same signal. `apply_attr_styles` fades a line the
+    view says it fades — alpha on the token colours **plus a whole-line span**, or an identifier
+    `lex_line` doesn't colour would stay at full strength in the middle of a faded row — and shifts
+    the line's spans by `Block::prefix_len()` for the one `before` case; Floem calls that hook
+    with the line's *pre-phantom* columns and adds the phantom spans afterwards, so an end-of-line
+    block (every block but that one) needs no adjustment at all. `apply_layout_styles` early-returns
+    on `Working` for the reason above and otherwise pushes the row bands, `diff_del_bg` behind the
+    replaced rows and `diff_add_bg` behind the added ones, with **`width: None`** — that is what
+    makes Floem paint across the whole viewport rather than just behind the glyphs, i.e. what makes
+    a diff row read as a row. It cannot reach further than that, though: the gutter and the
+    wrapper's right padding are outside the editor's clipping scroll, so those two ends of every
+    band are finished from *outside* by `editor_pane::inline_band_runs`. The split is structural,
+    not duplication.
+    **Which rows to band is asked of the layout, never counted from the plan** — `row_split`, and
+    both painters go through it. The plan knows how many *lines* the suggestion adds; what has to be
+    banded and marked is *rows*, and the two part company the moment a line wraps. `Segments`
+    therefore carries no row count at all any more: a struct holding an answer to that question was
+    the standing invitation to get it wrong. `row_split` asks `hit_position` at the phantom's start
+    column, from the same text layout the glyphs came out of, so it cannot disagree with what is on
+    screen. The trap it encodes: for an end-of-line block the phantom's first byte is the `\n` that
+    ends the line's own content, and the layout puts that index at the start of the **next** row, so
+    `row_of(own_len)` already names the block's first row. Adding one to it — assuming the column
+    names the row the preceding text *ends* on — pushed every band a row late: without wrap the added
+    rows fell outside the range and got no band at all, so the whole diff read as deletions, and with
+    wrap it banded the suggestion's first row as a deletion.
+    **The arithmetic is `split_rows`, split out from the layout question so it can be tested.** Both
+    defects this code has shipped — a row count taken from the plan, then that off-by-one — lived in
+    those few lines, and neither was reachable by a test while exercising them needed a real
+    `TextLayoutLine`. Nine tests now cover it, `a_start_row_at_the_end_bands_nothing_as_added` being
+    the shipped off-by-one itself. `row_split` keeps only the part that genuinely needs the layout:
+    which visual row the block starts on.
   - `erd_view.rs` — the **ER-diagram** canvas over `core::erd`. Edges are drawn by a custom paint
     view (`EdgeCanvas`), *not* a Floem `svg` — `svg` doesn't repaint reliably on reactive change
     here and blanked the edges on drag/hover. Zoom is **semantic, not a paint transform**: cards and
@@ -4200,7 +4469,32 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     something to submit to**: a multiline field with no `on_submit` lets it through and breaks the
     line, which is what Enter means in a box of SQL — consuming it unconditionally left every body
     field (the snippet editor's, the view editor's) with a dead Enter and a Shift+Enter nobody would
-    guess at. And **the field repaints when its row count changes**: the box height is derived from
+    guess at. The corollary is a trap for callers: **the no-submit arm is only safe for a field that
+    is also read-only**, or Enter silently types a newline where the user meant an action. Separately
+    from that, `multiline` was answering two questions at once — *wrap and auto-grow*, and *Enter may
+    break the line* — which are the same answer for a snippet or view body and opposite answers for a
+    box holding one question, which wants to grow with a long question and has nothing a second line
+    could mean. `FieldCfg::enter_never_breaks` separates them: the Enter branch gates on
+    `breaks = multiline && !enter_never_breaks` in *both* arms, and that is the **only** place the
+    flag is folded in — `plain` stays `!shift && !control`, because once a field cannot break its
+    line no modifier combination changes what Enter means, so the guards stop consulting `plain` at
+    all. Wrapping and auto-grow are untouched. Ctrl+K's
+    prompt sets it, and its `on_submit` is **never `None`** (while a request is in flight the closure
+    is a no-op), so the key is swallowed on its own terms rather than by depending on read-only to
+    refuse the edit afterwards.
+    **All of which is right, and none of it was the reported bug.** The "stray newline" in the Ctrl+K
+    question was never a newline: the caret could not reach a second line, and it happened when
+    submitting with the send triangle too, so the Enter key was not involved at all. The bar was
+    *taller* — its `dyn_container` was keyed on the request state, so every transition **rebuilt the
+    field**, and a freshly built `edit_field` has almost no width for one frame. A one-line question
+    wraps in that frame, the row count is measured from that layout and latched, and the bar reopens
+    a row taller with its text stranded at the top, which is indistinguishable from a typed newline
+    in a screenshot. Three rounds of fixes went at the Enter key on that resemblance alone. The
+    lesson is the misdiagnosis: **a taller box and an extra line look identical, and only the caret
+    tells them apart** — ask where the caret can go before touching the key that would have put it
+    there. The fix is in `editor_pane` (the container is keyed on `Ready`-or-not now); what is kept
+    here was worth keeping on its own terms and has no regression test either way.
+    And **the field repaints when its row count changes**: the box height is derived from
     `rows`, so the edit that adds a line has already painted against the *old* height, leaving the
     caret on the new last line outside the viewport that was drawn — it looks like the caret has
     vanished until the next keystroke repaints against the grown box. The repaint is deferred a tick
@@ -4638,6 +4932,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   invented `orders(placed_at)`, and the invented SQL landed at the caret with nothing on screen
   marking it as ungrounded (`the_withheld_schema_note_is_something_a_one_shot_can_do`). The chat
   panel's wording is right *there*, where the model can answer back.
+  **What comes back is gated, not trusted**: `inline_outcome` runs `extract_sql` (fences off) and
+  then `intel::sql_reply` (the parse gate above), and a reply that will not parse becomes
+  `Failed("The model did not return SQL")` rather than an edit. The composition is what the caller
+  relies on, so it is pinned *here* as well as in `intel` —
+  `inline_outcome_drops_a_tool_diagnostic_riding_on_the_sql` puts the chatter inside the fences,
+  where neither function alone would have to deal with it, and
+  `inline_outcome_refuses_a_reply_that_is_only_prose` holds the refusal.
   `render_ai_context` also tells the model how a **schema change** reaches the
   user — call `propose_table_change`, then echo the JSON in a `FENCE_TAG` block — spelled out in
   the prompt as well as in the tool's own description, because the shape it replaces (an `ALTER` in
@@ -5627,9 +5928,16 @@ Re-introducing the anti-patterns these guard against is a regression:
     rebuild key**, because it is the one kind of answer a `.style` closure cannot give: whether to
     attach a tooltip at all, or how wide a scroll range is, is not a property that re-runs.
     `editor_pane`'s Ctrl+K / inline-AI key carries `theme::ui_generation()` because `diff_view`
-    measures `content_w` from the font at build time and bakes the diff's syntax colouring into a
+    measured `content_w` from the font at build time and baked the diff's syntax colouring into a
     text `Attrs` list — without it a live scale change left the rows rendering at 1.6× inside a
-    `min_width` computed at 100%, so the end of a long line could not be scrolled to. `tabs`' chip
+    `min_width` computed at 100%, so the end of a long line could not be scrolled to. **Both of
+    those measurements went with `diff_view`** when the suggestion moved into the editor's line flow:
+    the rows are laid out by the editor at the *editor's* own font (which the interface scale does
+    not touch) and their colours are resolved inside `inline_diff::segments` on every call. What is
+    left in that container is a bar and a footer whose every metric is read inside a style closure
+    (`theme::scaled(…)`, `icons::icon`'s own closure, `FieldCfg`'s `fn() -> f32` sizes), so **the
+    key was dropped with the measurements** — read the Ctrl+K story as the case that *taught* this
+    rule rather than as a live instance of it. `tabs`' chip
     key carries `theme::ui_scale()` **and the presence of the DB-identity dot**, for the same reason
     from the other side: `truncated` is computed once at build and decides whether the chip gets a
     tooltip, and all three terms of that comparison move — the measured title, `tab_title_avail()`,
@@ -5966,8 +6274,12 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **SQL editor padding is a no-op; inset via a wrapper.** The editor is a scroll view — its own
   `padding_*` is ignored. Wrap it in a container carrying the border + padding (`editor_box`); the
   editor fills it flush. Top padding shifts the content origin, so `points_of_offset`-anchored
-  overlays (completion popup, statement highlight, squiggles, Ctrl+K, run menu) each add back
-  `EDITOR_PAD_TOP` to their `y`. The built-in scrollbars float at the *content* edge (can only inset
+  overlays (completion popup, statement highlight, squiggles, Ctrl+K's question bar and verdict
+  footer, run menu) each add back `EDITOR_PAD_TOP` to their `y`. **Ctrl+K's *diff* is not on that
+  list and is not an overlay at all** — it is phantom rows inside the editor's own line flow
+  (`inline_diff`), so it is laid out, scrolled and padded as text; only the bar above it and the
+  footer below it are anchored, and the footer's `y` comes from `inline_footer_y`, which adds
+  `EDITOR_PAD_TOP` like the rest. The built-in scrollbars float at the *content* edge (can only inset
   inward), so they're **replaced with custom overlay scrollbars** (`v_scrollbar`/`h_scrollbar` in
   `editor_area`): built-in bars hidden (zero-`Thickness` + transparent `Handle`), two `empty()`
   thumbs pinned to the border (`inset_right/bottom(3)`) with `autohide_state()`. Geometry from
@@ -5983,6 +6295,60 @@ Re-introducing the anti-patterns these guard against is a regression:
   `query.get()` (content size isn't a signal). **Draggable**: `PointerDown` records grab offset +
   `id.request_active()` (pointer capture); each `PointerMove` sets `ed.scroll_to.set(Some(Vec2))`
   (it's `Option<Vec2>`, not `Point`). Thumbs use `scrollbar_hover()` + `CursorStyle::Default`.
+- **Phantom text is how you put rows in the editor that are not in the document — and its list is
+  order-sensitive.** A `Document`'s `phantom_text` hook returns text that is combined into a line's
+  layout without ever entering the rope; it is the facility inlay hints use, and `inline_diff`
+  renders the whole Ctrl+K suggestion through it. It may be **multiline** — a `\n` in a phantom lays
+  out as an extra visual row, which is exactly why `TextLayoutLine::line_count` counts the line's
+  nonempty layouts instead of assuming one per logical line, and why anything positioning by row has
+  to go through that count. `PhantomTextLine.text` is walked **in stored order**, accumulating a
+  column shift as it goes (`combine_with_text`), and floem never re-sorts it: the columns must be
+  non-decreasing, so a block rendering *before* the line (column 0) has to lead the list and an
+  end-of-line block has to trail it. Per-token colour therefore works by pushing one `PhantomText`
+  per token — each carries a single `fg`, and the order you give them is the order they render in.
+  **An added line that is empty has to render as a single space**: `relevant_layouts()` filters out
+  layouts with no glyphs, so a genuinely empty row collapses and the block comes out one row shorter
+  than it claims. And **writing the signal a phantom is built from changes nothing on screen by
+  itself** — phantom text is baked into the line's cached `TextLayout` and that cache is keyed on
+  `cache_rev`, so the write has to bump it or the rows appear a frame late, or not until the next
+  keystroke happens to invalidate the line. `inline_diff::set_preview` is the one place that pair is
+  spelled out, and the only way the preview should be set.
+- **Wrap the editor's document *last*: `TextEditor`'s document-callback builders silently do
+  nothing on a wrapped doc.** `update`, `placeholder` and `pre_command` each resolve the document
+  with `downcast_rc::<TextDocument>()` and are written `if let Some(doc) = self.text_doc() { … }`
+  (`floem-0.2.0/src/views/text_editor.rs:480,516,527`) — no error, no warning, no return value to
+  check. `use_doc` installed *before* `.update(…)` therefore registered the `query.set(text)` sync
+  on nothing, and the signal every consumer treats as the tab's SQL stopped following the editor
+  entirely: autosave, Run, diagnostics and Ctrl+K's own statement lookup all read whatever text the
+  tab happened to open with. It surfaced as "Ctrl+K always picks the first statement", which is
+  what a stale `query` looks like once `statement_range` clamps an out-of-range offset — the
+  wrapper was two months of features away from the symptom. So `use_doc` is the **last** builder in
+  `editor_pane`'s chain, after `.update(…)`, and `SqlStyling` is built over the *inner* document on
+  purpose (same rope, same `cache_rev` — the wrapper delegates both — and no dependency on a
+  wrapper installed later). **There is no regression test**: it is a view-wiring failure in a
+  builder chain that needs a running Floem app to observe, so the comment at the call site and this
+  entry are the whole guard.
+  The same family, one level down: **a `Document` wrapper inherits the trait default for everything
+  it does not override, and the default is not always what the wrapped document said.**
+  `InlineDiffDoc` took `has_multiline_phantom`'s default of `true`, where the `TextDocument` under it
+  answers `false` for any non-empty buffer. Floem's `is_linear()` is
+  `wrap == None && !has_multiline_phantom()` and word wrap is off by default here, so the wrapper
+  quietly took the SQL editor off its linear visual-line mapping — every document, the whole session,
+  for a feature that is live for a few seconds at a time. It now answers `true` only while a plan is
+  published and delegates otherwise. Overriding one method is not the end of the audit: read the
+  trait's other defaults and ask which of them the wrapped document was answering differently.
+- **`ed.read_only` is a shared flag with two owners, and it does not gate `Document::edit`.**
+  Anything that flips it must **save what it found and restore that**, never assume `false`, and
+  must not treat it as a lock on the document. Floem checks it in `receive_char` and `run_command`
+  only, so `doc.edit_single` — which goes through `Document::edit` — writes straight through it.
+  Both halves of that were live bugs at once. The auto-pair handler flips it true for one key
+  dispatch to suppress Floem's unconditional built-in char insert (the editor inserts the typed
+  character after the handler returns, ignoring `CommandExecuted`), and its comment claimed to be the
+  only reader; then the Ctrl+K preview began freezing the buffer with the same flag while a
+  suggestion is on screen. A bracket typed during a diff therefore edited *through* the freeze, and
+  the handler's deferred `set(false)` then cleared the freeze for the rest of the preview. The
+  handler now returns early when the flag is already set and restores the value it found. A flag two
+  features reach for is not a lock; if a third one arrives, this is the paragraph it has to read.
 - **Shift+wheel → horizontal scroll in the editor.** The editor owns its scroll internally, so
   `shift_hscroll` can't reach it. Register a `PointerWheel` listener on the internal scroll view —
   reached via `ed.editor_view_id.get_untracked().and_then(|c| c.parent())` (the content view's parent
@@ -5993,6 +6359,35 @@ Re-introducing the anti-patterns these guard against is a regression:
   parent's before/after, and a child that consumes a pointer event stops propagation — so a
   `PointerWheel` `on_event` on an ancestor never sees a wheel the inner scroll consumed. Target the
   scroll's own `ViewId`.
+- **A pointer event stops at the first child that accepts pointer events — handled or not.**
+  `EventCx`'s child loop (`floem-0.2.0/src/context.rs:143-158`) walks the children in reverse,
+  dispatches to the first one `should_send` passes, and then does `if event.is_pointer() { break }`.
+  For a pointer event (**the wheel included**) that break ends the search whether or not anything
+  was processed, so an absolute overlay lying across another view kills scrolling over itself, and
+  *not handling* the event does not help — there is no "pass it on" once your view is eligible.
+  There are two ways out, and which one applies is decided by whether the overlay needs clicks.
+  **Forward the wheel** if it does: take the event and push its delta into the target's own scroll
+  channel (`ed.scroll_delta`), which is what Floem's editor gutter does with this exact problem
+  (`floem-0.2.0/src/views/editor/view.rs:1112`) and what the inline-diff verdict bar does, so it can
+  hold its Accept/Reject buttons and set a cursor while a wheel over it still scrolls the document.
+  **The forward goes on every eligible view, not on the container** — the `break` happens at
+  whichever *child* the pointer is over, so the bar's own handler covered the bar and nothing else:
+  scrolling worked over the strip and died over the two words and the change count, which reads as
+  intermittent swallowing rather than as a missing handler. All four carry it.
+  **`pointer_events(false)`** otherwise: it takes the view out of `should_send` entirely, and is
+  right for something with nothing to click — the inline-diff band strips, the statement highlight,
+  the squiggles.
+  **A container introduced for layout or arity reasons is a hit target too**, and this is the trap
+  rather than any one overlay. `absolute().inset(0)` on a wrapper whose children are small and
+  edge-pinned turns a few thin overlays into a single pane-sized one, and nothing about it says so:
+  it paints nothing and looks like grouping. `stack`'s **16-child limit** is what tempts the edit —
+  wrapping two views to free a slot is the obvious move — and doing it to the editor's two custom
+  scrollbars put a full-pane, pointer-taking view above the editor, which by the rule above ate
+  every click, drag and wheel in it. The editor was dead to input, from a change that was about
+  arity. They are listed one by one now (exactly 16), with a comment at the site saying never to
+  group them. The `stack((editor_box, inline_band_view))` nesting is safe by contrast because it
+  wraps the editor *itself* rather than floating above it: the question is never how big the wrapper
+  is, but whether it sits over other interactive views.
 - **A programmatic `cursor` change shows a phantom caret on an *unfocused* editor.** `edit_field`'s
   signal→doc reconcile sets `cursor` to preserve caret position, but floem's internal "reset cursor
   blinking" effect tracks `ed.cursor` → `cursor_info.reset()` → shows + blinks the caret even with no
@@ -6033,9 +6428,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   height when you don't need the animation.
 - **In-flow reveal animations are janky; only `.absolute()` transforms animate smoothly.** A
   `.transition(Height, …)` on an in-flow element reflows its container every frame and Floem only
-  steps transitions on redraw ticks → ~5fps. Smooth animations here (Ctrl+K expand) animate an
-  `.absolute()` overlay's inset/size so nothing reflows. Either animate an absolute overlay or toggle
-  `display`.
+  steps transitions on redraw ticks → ~5fps. Smooth animation here means animating an `.absolute()`
+  overlay's inset/size so nothing reflows — which is what the Ctrl+K box did to grow from prompt to
+  diff, until it stopped being a box (`inline_diff`) and there was nothing left to animate between.
+  Either animate an absolute overlay or toggle `display`.
 - **`Style::rotate` is RADIANS** (kurbo `Affine::rotate`, centre-pivoted) — pass `FRAC_PI_2` for 90°,
   not `90.0` (~14 turns → glyph vanishes). `scale` is a `Pct`. Both transition via
   `.transition(Rotation/ScaleX, …)`. Even correct, a transform-transition on a small `svg` proved
