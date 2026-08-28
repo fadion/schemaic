@@ -759,6 +759,17 @@ pub fn rows_read_clause(loaded: usize, total: Option<RowCount>, truncated: bool)
 /// two million rows in one click.
 const CAP_STEP: usize = 5;
 
+/// How much of a sampled total to treat as possibly missing, as a divisor — a
+/// half.
+///
+/// This is the engine's own number, not a guess at one: MySQL and MariaDB both
+/// document `information_schema.TABLES.TABLE_ROWS` for InnoDB as an estimate
+/// that "can vary from the actual value by as much as 40 to 50%". Padding by
+/// the error the sampler admits to is what makes "read all rows" a promise
+/// rather than a hope, and 2.7% — the miss on `employees` — is nowhere near
+/// needing the whole of it.
+const ESTIMATE_SLACK: usize = 2;
+
 /// The cap a "read more of this" re-run should ask for, given how many rows the
 /// last one actually read.
 ///
@@ -810,20 +821,37 @@ fn round_up_2sf(n: usize) -> usize {
 /// crowd the toolbar's buttons off a narrow panel; `read all rows` is the same
 /// offer, and the only one it could be.
 ///
-/// The total is only ever consulted, never trusted as a limit. It is usually the
-/// engine's own sampled estimate, so the cap that goes with "read all" is the
-/// total rounded up rather than the total exactly — and if the estimate was low,
-/// the re-run simply comes back capped again and offers again, which is the
-/// self-correcting answer. A total at or below what was already read is stale
-/// and says nothing, exactly as it does for [`rows_read_clause`].
+/// The total is only ever consulted, never trusted as a limit, and **an estimate
+/// is given room to have been wrong.** Rounding the figure up to two significant
+/// figures tidies its tail but is not slack: MariaDB's `employees` samples to
+/// 292,025 and rounds to 300,000, which is 25 rows short of the table, so "read
+/// all rows" came back capped and the offer behind it — with nothing left to
+/// believe, 292,025 being stale against 300,000 read — asked for 1.5m rows to
+/// fetch those 25. Re-capping was supposed to be the self-correcting answer to a
+/// low estimate; it corrects into an offer that reads as a bug.
+///
+/// So an estimate is padded by [`ESTIMATE_SLACK`] before it is rounded, which is
+/// free: the cap is a cutoff of a stream that ends when the table does, so one
+/// set above the real count is never reached and costs nothing. What it is
+/// bounded by is the step it replaced — "read all rows" never asks for more than
+/// the numbered offer it was chosen over. A total at or below what was already
+/// read is stale and says nothing, exactly as it does for [`rows_read_clause`].
 pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, String) {
     let step = next_row_cap(rows_read);
     match total {
         // Within one click, and worth more rows than are already on screen.
         Some(t) if t.value() > rows_read as u64 && t.value() <= step as u64 => {
-            // Rounded up, and never below what the step would have to clear to
-            // be an improvement at all.
-            let cap = round_up_2sf(t.value() as usize).max(rows_read + 1);
+            // Guarded above: at most `step`, which is a `usize`.
+            let figure = t.value() as usize;
+            // A count is a count; only a sample needs room to have been low.
+            let want = if t.is_estimate() {
+                figure.saturating_add(figure / ESTIMATE_SLACK)
+            } else {
+                figure
+            };
+            // Rounded up, never past the step it stands in for, and never below
+            // what the step would have to clear to be an improvement at all.
+            let cap = round_up_2sf(want).min(step).max(rows_read + 1);
             (cap, "read all rows".to_string())
         }
         _ => (
@@ -1758,9 +1786,49 @@ mod tests {
         // words to the left on the same line, and naming it twice is what made
         // the strip too wide to hold its buttons.
         assert!(!label.contains(char::is_numeric), "{label}");
-        // Rounded up past the estimate, so a slightly low one doesn't re-cap.
-        assert!(cap >= 292_020, "{cap}");
-        assert_eq!(cap, 300_000);
+        // Past the estimate *with room*, because the estimate is a sample and
+        // clearing it exactly is what left `employees` 25 rows short — see
+        // `read_all_clears_the_table_the_estimate_only_sampled`.
+        assert!(cap > 292_020, "{cap}");
+        assert_eq!(cap, 440_000);
+        // But never past the numbered offer it was chosen over.
+        assert!(cap <= next_row_cap(200_000), "{cap}");
+    }
+
+    /// **"Read all rows" read 300k of 300,025 and then offered 1.5m.**
+    /// MariaDB's `employees` holds 300,025 rows and its sampled `TABLE_ROWS`
+    /// says 292,025 — 2.7% low, comfortably inside InnoDB's own documented
+    /// sampling error. Rounding *the estimate* up to two significant figures
+    /// asked for 300,000, so the click that promised every row came back capped
+    /// 25 rows short; and the offer after it had no total left to believe
+    /// (292,025 is stale against 300,000 read) so it fell to the step and asked
+    /// for 1.5m rows to fetch those 25.
+    ///
+    /// The estimate is not the table. What the cap has to clear is the row count
+    /// the estimate was sampling, which is why this asserts against the real
+    /// `COUNT(*)` and not against the figure the offer was computed from.
+    #[test]
+    fn read_all_clears_the_table_the_estimate_only_sampled() {
+        const TOTAL: RowCount = RowCount::Estimate(292_025);
+        const ACTUAL: usize = 300_025;
+
+        // The default cap reads 200k of it and stops short.
+        let (cap, label) = read_more_offer(200_000, Some(TOTAL));
+        assert_eq!(label, "read all rows");
+
+        // The click. `db::collect_rows` cuts the stream off at `cap`, so this
+        // subtraction *is* the second read — and "all rows" has to survive it.
+        let read = ACTUAL.min(cap);
+        assert_eq!(
+            read,
+            ACTUAL,
+            "read all rows asked for {cap}, leaving {} rows behind",
+            ACTUAL - read
+        );
+        assert!(
+            read < cap,
+            "the read that promised all of them came back capped"
+        );
     }
 
     #[test]
