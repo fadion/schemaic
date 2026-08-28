@@ -503,13 +503,24 @@ fn mark_stopped(messages: RwSignal<Vec<ChatMessage>>) {
     });
 }
 
-fn inline_outcome(success: bool, stdout: &[u8], stderr: &[u8]) -> InlineAiState {
+fn inline_outcome(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    dialect: SqlDialect,
+) -> InlineAiState {
     if success {
         let sql = extract_sql(&String::from_utf8_lossy(stdout));
         if sql.trim().is_empty() {
-            InlineAiState::Failed("No SQL returned".to_string())
-        } else {
-            InlineAiState::Ready(sql)
+            return InlineAiState::Failed("No SQL returned".to_string());
+        }
+        // Fences off, now prove it is SQL. The tool the model runs in can put a
+        // line of its own on stdout, and Ctrl+K's output goes straight into the
+        // editor — so anything that will not parse is refused rather than
+        // offered. See `intel::sql_reply` for what it will and won't shave off.
+        match schemaic_core::intel::sql_reply(&sql, dialect) {
+            Some(sql) => InlineAiState::Ready(sql),
+            None => InlineAiState::Failed("The model did not return SQL".to_string()),
         }
     } else {
         InlineAiState::Failed(
@@ -7659,7 +7670,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .output()
                     .await;
                 let state = match out {
-                    Ok(o) => inline_outcome(o.status.success(), &o.stdout, &o.stderr),
+                    Ok(o) => inline_outcome(o.status.success(), &o.stdout, &o.stderr, dialect),
                     Err(e) => InlineAiState::Failed(e.to_string()),
                 };
                 send(state);
@@ -9847,24 +9858,47 @@ mod app_tests {
         assert_eq!(psql_database(Some(""), Some("world")), "world");
     }
 
+    const MY: schemaic_core::intel::SqlDialect = schemaic_core::intel::SqlDialect::MySql;
+
     #[test]
     fn inline_outcome_success_returns_stripped_sql() {
-        let out = inline_outcome(true, b"```sql\nSELECT 1\n```", b"");
+        let out = inline_outcome(true, b"```sql\nSELECT 1\n```", b"", MY);
         assert!(matches!(out, InlineAiState::Ready(sql) if sql == "SELECT 1"));
     }
 
     #[test]
     fn inline_outcome_blank_success_is_no_sql_returned() {
-        let out = inline_outcome(true, b"   \n", b"");
+        let out = inline_outcome(true, b"   \n", b"", MY);
         assert!(matches!(out, InlineAiState::Failed(m) if m == "No SQL returned"));
     }
 
     #[test]
     fn inline_outcome_failure_surfaces_first_stderr_line() {
-        let out = inline_outcome(false, b"", b"boom: bad model\nsecond line");
+        let out = inline_outcome(false, b"", b"boom: bad model\nsecond line", MY);
         assert!(matches!(out, InlineAiState::Failed(m) if m == "boom: bad model"));
         // Empty stderr → a generic fallback message.
-        let out = inline_outcome(false, b"", b"");
+        let out = inline_outcome(false, b"", b"", MY);
         assert!(matches!(out, InlineAiState::Failed(m) if m == "generation failed"));
+    }
+
+    /// The tool's own chatter never reaches the editor: the composition of
+    /// `extract_sql` (fences) with `intel::sql_reply` (the parse gate) is what
+    /// the caller relies on, so it is pinned here rather than only in `intel`.
+    #[test]
+    fn inline_outcome_drops_a_tool_diagnostic_riding_on_the_sql() {
+        let out = inline_outcome(
+            true,
+            b"```sql\nSELECT * FROM t;\nClient.listTools() called but server does not advertise\n```",
+            b"",
+            MY,
+        );
+        assert!(matches!(out, InlineAiState::Ready(sql) if sql == "SELECT * FROM t;"));
+    }
+
+    /// And a reply with no SQL in it at all is a failure, not an empty edit.
+    #[test]
+    fn inline_outcome_refuses_a_reply_that_is_only_prose() {
+        let out = inline_outcome(true, b"I'm sorry, I can't do that.", b"", MY);
+        assert!(matches!(out, InlineAiState::Failed(m) if m == "The model did not return SQL"));
     }
 }

@@ -5202,12 +5202,158 @@ pub fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Di
     }
 }
 
+/// How many lines [`sql_reply`] will strip from each end of a model's reply
+/// while hunting for the SQL in it. Small on purpose: this is for shaving a
+/// stray diagnostic line off the ends, not for finding a needle in prose.
+const REPLY_TRIM_LINES: usize = 3;
+
+/// The SQL in an inline-AI reply, or `None` if it did not return SQL.
+///
+/// The model is told to answer with bare SQL and nothing else, but the tool it
+/// runs in can still put a line of its own on stdout — a `claude -p` run once
+/// returned an MCP diagnostic (`Client.listTools() called but server does not
+/// advertise tools capability…`) stitched to the end of a perfectly good
+/// statement, and Ctrl+K offered the pair as an edit. Prose landing in the
+/// user's editor is worse than no suggestion at all, so this is a gate, not a
+/// cleanup: **what cannot be parsed is not offered.**
+///
+/// The whole reply is tried first, so anything that already parses is returned
+/// untouched. Only then does it try dropping up to [`REPLY_TRIM_LINES`] lines
+/// from each end, fewest first, which is where a tool's own chatter lands. It
+/// never removes lines from the middle: a reply that needs surgery there is not
+/// one to trust.
+///
+/// The cost of the strictness is real and deliberate — a valid statement this
+/// parser cannot handle is refused rather than shown. That is the trade the gate
+/// exists to make.
+pub fn sql_reply(reply: &str, dialect: SqlDialect) -> Option<String> {
+    let parses = |s: &str| {
+        !s.trim().is_empty()
+            && sqlparser::parser::Parser::parse_sql(&*dialect.parser(), s)
+                .is_ok_and(|asts| !asts.is_empty())
+    };
+    let trimmed = reply.trim();
+    if parses(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    // A line may only be dropped if it cannot be part of the statement. Without
+    // this, trimming the ends silently *truncates*: given `SELECT a` / noise /
+    // `FROM t`, dropping the last two lines leaves `SELECT a`, which parses
+    // perfectly and means something else entirely. Leading with a SQL keyword is
+    // the cheap signal that a line is load-bearing — `FROM t` is protected by it,
+    // while `Client.listTools() called…` is not. A line starting with punctuation
+    // (`);`) is protected too: bare punctuation is SQL, not chatter.
+    let droppable = |line: &str| {
+        let t = line.trim();
+        if t.is_empty() {
+            return true;
+        }
+        let word: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        !word.is_empty() && !is_sql_keyword(&word)
+    };
+    // Fewest lines dropped first, so the most complete parse wins.
+    for dropped in 1..=REPLY_TRIM_LINES * 2 {
+        for front in 0..=dropped.min(REPLY_TRIM_LINES) {
+            let back = dropped - front;
+            if back > REPLY_TRIM_LINES || front + back >= lines.len() {
+                continue;
+            }
+            let cut = lines[..front]
+                .iter()
+                .chain(&lines[lines.len() - back..])
+                .all(|l| droppable(l));
+            if !cut {
+                continue;
+            }
+            let window = lines[front..lines.len() - back].join("\n");
+            if parses(&window) {
+                return Some(window.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlparser::parser::Parser;
 
     const DIALECTS: [SqlDialect; 3] = [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+
+    /// The reply that motivated the gate: real SQL with the CLI's own MCP
+    /// diagnostic stitched onto it. Before this, both lines went into the diff.
+    #[test]
+    fn a_tool_diagnostic_stitched_to_the_sql_is_dropped() {
+        let reply = "SELECT * FROM employees.employees;\n\
+                     Client.listTools() called but server does not advertise tools \
+                     capability - returning empty list";
+        assert_eq!(
+            sql_reply(reply, SqlDialect::MySql).as_deref(),
+            Some("SELECT * FROM employees.employees;")
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_ahead_of_the_sql_is_dropped_too() {
+        let reply = "Client.listTools() called but server does not advertise tools\n\
+                     SELECT 1;";
+        assert_eq!(
+            sql_reply(reply, SqlDialect::MySql).as_deref(),
+            Some("SELECT 1;")
+        );
+    }
+
+    #[test]
+    fn clean_sql_comes_back_untouched() {
+        for d in DIALECTS {
+            let sql = "SELECT a, b\nFROM t\nWHERE a > 1";
+            assert_eq!(sql_reply(sql, d).as_deref(), Some(sql), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn several_statements_survive_together() {
+        let sql = "SELECT 1;\nSELECT 2;";
+        assert_eq!(sql_reply(sql, SqlDialect::Postgres).as_deref(), Some(sql));
+    }
+
+    /// The whole point: prose is refused rather than tidied into something that
+    /// looks like an edit.
+    #[test]
+    fn prose_only_is_refused() {
+        assert_eq!(
+            sql_reply("I can't help with that, sorry.", SqlDialect::MySql),
+            None
+        );
+        assert_eq!(sql_reply("", SqlDialect::MySql), None);
+        assert_eq!(sql_reply("   \n \n", SqlDialect::MySql), None);
+    }
+
+    /// A reply whose noise is buried in the middle is refused outright — the
+    /// window only ever shrinks from the ends.
+    #[test]
+    fn noise_in_the_middle_is_not_stitched_around() {
+        let reply = "SELECT a\nnot sql at all here\nFROM t";
+        assert_eq!(sql_reply(reply, SqlDialect::MySql), None);
+    }
+
+    /// Bounded on purpose — four lines of chatter is not a reply to salvage.
+    #[test]
+    fn more_chatter_than_the_trim_allows_is_refused() {
+        let reply = "one\ntwo\nthree\nfour\nSELECT 1;";
+        assert_eq!(sql_reply(reply, SqlDialect::MySql), None);
+    }
+
+    #[test]
+    fn a_trailing_comment_is_kept_because_it_parses() {
+        let reply = "SELECT 1;\n-- why";
+        assert_eq!(sql_reply(reply, SqlDialect::MySql).as_deref(), Some(reply));
+    }
 
     /// The guard over a model's free SQL, tested directly and on **every**
     /// dialect it is parameterised by — the review found it had no direct test
