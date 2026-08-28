@@ -4709,10 +4709,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   and the pair was the widest thing on the strip. **The offer names a figure only when the figure
   is its own** — the step is a number that appears nowhere else on the line, and dropping it would
   leave "read more" implying a cursor the row cap has none of; "all" needs no number, because
-  there is only one thing it could mean. The total is consulted, never trusted: it is usually the
-  engine's sampled estimate, so the cap that goes with "read all" is the total *rounded up*, and an
-  estimate that was low simply comes back capped and offers again. A total at or below the rows
-  already read is stale and says nothing, the same rule `rows_read_of` follows. The offer is a
+  there is only one thing it could mean. The total is consulted, never trusted, **and an estimate
+  is given room to have been wrong**. Rounding it up to two significant figures tidies its tail but
+  is not slack, and re-capping is not the self-correcting answer it was written as: `employees`
+  samples to 292,025 and rounds to 300,000, which is 25 rows short of the table, so *"read all
+  rows"* came back capped — and the offer behind it, with 292,025 now stale against 300,000 read,
+  fell to the step and asked for **1.5m rows to fetch those 25**. So an estimate is padded by
+  `stats::ESTIMATE_SLACK` (a half — InnoDB's own documented 40–50% sampling error) before it is
+  rounded. The padding is free, because the cap cuts off a stream that ends when the table does: one
+  set above the real count is never reached. What bounds it is the step it replaced — *"read all
+  rows"* never asks for more than the numbered offer it was chosen over. A total at or below the
+  rows already read is stale and says nothing, the same rule `rows_read_of` follows. The offer is a
   `label`, not a `text`, for the same reason `stats` beside it is one — the total arrives from a
   catalogue query after the strip is built — and the click re-asks rather than capturing, so the
   cap always matches the words the user just read. The re-run goes through `GridState::current_statement`, **not** `apply_grid_query`:
