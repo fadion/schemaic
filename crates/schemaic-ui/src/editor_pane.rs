@@ -42,6 +42,7 @@ use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
 use schemaic_core::model::QueryState;
 use schemaic_core::pairs::{self, PairAction};
 use schemaic_core::params;
+use schemaic_core::prompt::{self, FixOrigin};
 use schemaic_core::sql::{statement_range, statement_ranges};
 use schemaic_core::text_ops::{
     find_matches, matches_at, move_line, offset_of_line, replace_all, soft_tab_indent,
@@ -383,6 +384,11 @@ fn cmdk_popup(
             matches!(inline_ai.get(), InlineAiState::Ready(_)),
         )
     });
+    // A request is in flight: the question has been sent and the field is frozen
+    // until it lands. Outside the `dyn_container` below, so it outlives the
+    // child — and a `Memo` so the field's style re-runs only when the answer to
+    // *this* question changes, not on every `inline_ai` transition.
+    let asking = create_memo(move |_| matches!(inline_ai.get(), InlineAiState::Busy));
     let content = dyn_container(
         // `ui_generation` used to be in this key: the child resolved two things no
         // style closure could re-read — `diff_view`'s `content_w` (the diff's
@@ -462,12 +468,14 @@ fn cmdk_popup(
                     // hold two lines. Enter asks; it does not break the line.
                     enter_never_breaks: true,
                     autofocus: true,
-                    // Neither `read_only` nor the dim follow the request any more:
-                    // both are resolved when the field is built, and making them
-                    // follow meant rebuilding it — which is the thing that broke
-                    // its layout. Editing the question mid-flight is harmless (the
-                    // request already carries the text it was sent with), and the
-                    // spinner beside it says what is happening.
+                    // A sent question is dimmed and takes no more typing, and it
+                    // is `FieldCfg::frozen` — a signal the *built* field reads —
+                    // rather than `read_only` plus a colour, which are resolved
+                    // at build and so meant rebuilding the field to change. That
+                    // rebuild is what broke the bar's layout, and dropping the
+                    // freeze with it left the box editable mid-flight, promising
+                    // an edit that could not reach the request already sent.
+                    frozen: Some(asking),
                     text_color: Some(theme::cmdk_text),
                     placeholder_color: Some(theme::cmdk_placeholder),
                     border_color: Some(bg_transparent),
@@ -1143,6 +1151,11 @@ const CMDK_BAR_RESERVE: f64 = 52.0;
 /// rather than two literals that drift apart the first time the bar is resized.
 const VERDICT_BAR_H: f64 = 30.0;
 
+/// One AI fix: the byte range the model may rewrite, the problems it is being
+/// asked to fix, and where those came from. The pane's `fix_with_ai`, shared by
+/// the error bar, the error modal and the editor menu's "AI fix".
+type FixFn = Rc<dyn Fn((usize, usize), Vec<String>, FixOrigin)>;
+
 /// Anchor the Ctrl+K bar under `end`, scrolling the editor if the bar would not
 /// fit below it.
 ///
@@ -1465,6 +1478,10 @@ pub(crate) struct QueryPaneParams {
     /// the tab so the status bar reads the analysis rather than repeating it —
     /// see [`Tab::diagnostics`](crate::Tab::diagnostics).
     pub syntax: RwSignal<Vec<Diagnostic>>,
+    /// When set, AI-fix *this* run error and clear it — the error modal's "AI
+    /// fix", which sends the message it was showing rather than a bare "go".
+    /// See [`Tab::fix_req`](crate::Tab::fix_req).
+    pub fix_req: RwSignal<Option<String>>,
     pub results: RwSignal<QueryState>,
     /// The **guarded** run action ([`crate::TabsActions::run`]) — a held-back run
     /// lands in `run_guard` and nothing executes.
@@ -1547,6 +1564,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         format_req,
         insert_req,
         syntax,
+        fix_req,
         results,
         run,
         run_all,
@@ -1610,7 +1628,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // off the bottom of the pane. Declared up here because the editor's own key
     // handler — built below — needs it to scroll the prompt into view.
     let area_h: RwSignal<f64> = RwSignal::new(EDITOR_H);
-    // Right-click editor menu (Ask AI… / Explain / Optimize). It's routed through
+    // Right-click editor menu (Ask AI / Explain / Optimize). It's routed through
     // the app-wide `popup_menu` overlay (rendered at the workspace root) so it
     // floats *over* the results pane instead of being clipped by the editor area,
     // and only edge-flips against the window. `menu_offset` is the caret offset
@@ -2407,7 +2425,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed = editor.editor().clone();
     let ed_cmdk = ed.clone(); // for the Ctrl+K popup (the editor's `.update` moves `ed`)
     let ed_menu = ed.clone(); // right-click handler: read caret offset
-    let ed_menu2 = ed.clone(); // menu actions: anchor point for "Ask AI…"
+    let ed_menu2 = ed.clone(); // menu actions: anchor point for "Ask AI"
+    let ed_fix = ed.clone(); // AI fix: anchor point for the Ctrl+K bar
     let ed_run = ed.clone(); // run menu: re-focus the editor after running
     let ed_hl = ed.clone(); // statement-highlight overlay geometry
     let ed_band = ed.clone(); // inline-diff band strips (gutter + right padding)
@@ -2571,7 +2590,96 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         });
     }
 
-    // Builds the right-click menu entries (Ask AI… / Explain / Optimize) for the
+    // ── AI fix ──────────────────────────────────────────────────────────────
+    //
+    // One action, asked for three ways: the error bar, the modal behind its
+    // "View" (through `fix_req`), and the editor menu's "AI fix" over a
+    // squiggled statement. It opens the Ctrl+K overlay pre-filled and goes
+    // straight to Busy (skipping the compact prompt); the user only approves or
+    // rejects the resulting diff, and nothing runs.
+    //
+    // `range` is what the model is allowed to rewrite, and it is the caller's to
+    // decide because only the caller knows which statement it means. The wording
+    // is `prompt::ai_fix_prompt`'s, so the three can't drift apart in what they
+    // ask the model for — the point of doing this as one action.
+    let fix_with_ai: FixFn = {
+        let inline_ai_run = inline_ai_run.clone();
+        let ed_fix = ed_fix.clone();
+        Rc::new(move |(lo, hi), problems: Vec<String>, origin| {
+            let sql = query.get_untracked();
+            let Some(stmt) = sql.get(lo..hi).filter(|s| !s.trim().is_empty()) else {
+                return;
+            };
+            let stmt = stmt.to_string();
+            let Some(p) = prompt::ai_fix_prompt(&problems, origin) else {
+                return;
+            };
+            cmdk.start.set(lo);
+            cmdk.end.set(hi);
+            cmdk.input.set(p.input);
+            // **Select what will be replaced**, exactly as Ctrl+K and "Ask AI"
+            // do — and this is the entry point that needs it most: the range is
+            // `error_fix_range`'s choice rather than a gesture of the user's, so
+            // without the selection nothing on screen tells them whether one
+            // statement or the whole script is about to be rewritten.
+            ed_fix
+                .cursor
+                .update(|cc| cc.set_insert(Selection::region(lo, hi)));
+            // Under the statement being fixed, and scrolled into view — without
+            // this the bar opened wherever the last Ctrl+K left its anchor.
+            anchor_cmdk(&ed_fix, cmdk, hi, area_h);
+            inline_ai.set(InlineAiState::Busy);
+            cmdk.open.set(true);
+            (inline_ai_run)(InlineAiRequest {
+                intent: p.intent,
+                current_sql: sql.clone(),
+                selection: Some(stmt),
+            });
+        })
+    };
+
+    // A run error's fix: the failing statement, not the whole buffer. What ran
+    // may be a script, and rewriting all of it to correct the one statement that
+    // failed is what `intel::error_fix_range` exists to stop.
+    //
+    // Takes the message rather than reading `results` itself, because its two
+    // callers hold different answers to "which error": the bar is showing the
+    // live one, the modal is showing the one it opened on.
+    let fix_error: Rc<dyn Fn(String)> = {
+        let fix_with_ai = fix_with_ai.clone();
+        Rc::new(move |err: String| {
+            let range = query
+                .with_untracked(|sql| intel::error_fix_range(sql, &err, dialect.get_untracked()));
+            (fix_with_ai)(range, vec![err], FixOrigin::Run);
+        })
+    };
+    let ai_fix: Rc<dyn Fn()> = {
+        let fix_error = fix_error.clone();
+        Rc::new(move || {
+            let QueryState::Failed(err) = results.get_untracked() else {
+                return;
+            };
+            (fix_error)(err);
+        })
+    };
+
+    // The same fix asked for from the error modal ("View" on the bar). It has to
+    // come through a request signal because `cmdk` is this pane's own state —
+    // the modal is rendered by the workspace, which has no way to reach it. Same
+    // request-and-clear shape as `format_req`, carrying the message the modal
+    // was showing.
+    {
+        let fix_error = fix_error.clone();
+        create_effect(move |_| {
+            let Some(err) = fix_req.get() else {
+                return;
+            };
+            fix_req.set(None);
+            (fix_error)(err);
+        });
+    }
+
+    // Builds the right-click menu entries (Ask AI / Explain / Optimize) for the
     // app-wide `popup_menu` overlay. Rebuilt per right-click; each action reads
     // `menu_offset` (the caret the right-click landed on) lazily, so it scopes to
     // the statement there. `menu_panel` auto-closes after an action runs.
@@ -2582,6 +2690,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let open_plan = open_plan.clone();
         let ed_fmt = ed_fmt.clone();
         let create_view = create_view.clone();
+        let fix_with_ai = fix_with_ai.clone();
         Rc::new(move || {
             let ed_ask = ed_menu_act.clone();
             let ai_explain = ai_send.clone();
@@ -2589,11 +2698,48 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let show_plan = open_plan.clone();
             let ed_format = ed_fmt.clone();
             let make_view = create_view.clone();
+            // "AI fix" — offered only over a statement the editor has something
+            // to say about, which is what the user is pointing at when they
+            // right-click a wavy underline. Both sources, because both draw one:
+            // the offline squiggles and the DB-validated ones.
+            //
+            // The range and the messages are **re-derived when the entry runs**,
+            // like every other action in this menu, and the build-time pass only
+            // decides whether to offer it. Captured, the offsets could outlive
+            // the text they described — a reload or an insert between the
+            // right-click and the click leaves `sql.get(lo..hi)` answering
+            // `None`, and the entry then does nothing at all with nothing said.
+            //
+            // `with_untracked`, not `get_untracked`: this needs two offsets, and
+            // the `get` it replaces copied the whole buffer out of the rope to
+            // find them — on every right-click, in a script that can be 190 KB.
+            let statement_problems = move || {
+                let (lo, hi) = query.with_untracked(|sql| {
+                    statement_range(sql, menu_offset.get_untracked(), dialect.get_untracked())
+                });
+                let mut diags = syntax.get_untracked();
+                db_diag.with_untracked(|d| diags.extend_from_slice(d));
+                ((lo, hi), intel::problems_in_range(&diags, lo, hi))
+            };
+            let fix_entry = {
+                let fix_with_ai = fix_with_ai.clone();
+                let has_problems = !statement_problems().1.is_empty();
+                has_problems.then(|| {
+                    MenuEntry::action_icon(
+                        "AI fix",
+                        (icons::SPARKLES, theme::key_foreign),
+                        move || {
+                            let (range, problems) = statement_problems();
+                            (fix_with_ai)(range, problems, FixOrigin::Editor);
+                        },
+                    )
+                })
+            };
             // The three AI actions carry the sparkle (matching AI Summary in the
             // grid); Plan + Format sit below the separator as plain actions.
             let mut entries = vec![
                 MenuEntry::action_icon(
-                    "Ask AI…",
+                    "Ask AI",
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let off = menu_offset.get_untracked();
@@ -2674,6 +2820,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     format_editor(&ed_format, comp, dialect.get_untracked())
                 }),
             ];
+            // First when it's there: over a squiggle it is the most specific
+            // thing this menu can offer, and the one the user came for.
+            if let Some(fix) = fix_entry {
+                entries.insert(0, fix);
+            }
             // "Create view" only when there's a query to make one *out of* — the
             // statement the right-click landed on has to be something a view's
             // body may be (`can_be_view_body`, the same rule the editor's own
@@ -3363,34 +3514,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         comp,
         area_h,
     );
-    // AI Fix: open the Ctrl+K overlay pre-filled with the error and auto-submit
-    // a whole-query fix. Goes straight to Busy (skips the compact prompt); the
-    // user only approves/rejects the resulting diff.
-    let ai_fix: Rc<dyn Fn()> = {
-        let inline_ai_run = inline_ai_run.clone();
-        Rc::new(move || {
-            let sql = query.get_untracked();
-            let err = match results.get_untracked() {
-                QueryState::Failed(m) => m,
-                _ => return,
-            };
-            cmdk.start.set(0);
-            cmdk.end.set(sql.len());
-            let first = err.lines().next().unwrap_or("").trim().to_string();
-            cmdk.input.set(format!("Fix this error: {first}"));
-            let intent = format!(
-                "The query failed with this error:\n{err}\n\nReturn the corrected SQL only."
-            );
-            inline_ai.set(InlineAiState::Busy);
-            cmdk.open.set(true);
-            (inline_ai_run)(InlineAiRequest {
-                intent,
-                current_sql: sql.clone(),
-                selection: Some(sql),
-            });
-        })
-    };
-
     // Error bar: pinned to the editor's bottom (5px inset) when the last run
     // failed. Truncated error + View (opens the modal) + AI Fix. Cleared by any
     // edit (see the editor `.update`). border_radius rounds the filled bar; no
@@ -3417,24 +3540,26 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .text_ellipsis()
                             .margin_left(theme::scaled(8.0))
                     }),
+                    // Both buttons brighten under the pointer and take the hand
+                    // cursor: they are words on a coloured bar with no border to
+                    // read as a control, so the hover *is* the affordance.
                     text("View")
                         .on_click_stop(move |_| error_modal_open.set(true))
                         .style(|s| {
                             s.color(theme::err_fix_btn())
                                 .font_size(theme::font_body())
                                 .margin_left(theme::scaled(10.0))
+                                .cursor(CursorStyle::Pointer)
+                                .hover(|s| s.color(theme::err_fix_btn_hover()))
                         }),
                     empty().style(|s| s.flex_grow(1.0_f32)),
-                    h_stack((
-                        icons::icon(icons::SPARKLES, 16.0).style(|s| {
-                            s.color(theme::err_fix_btn())
-                                .margin_right(theme::scaled(5.0))
-                        }),
-                        text("AI fix")
-                            .style(|s| s.color(theme::err_fix_btn()).font_size(theme::font_body())),
-                    ))
-                    .on_click_stop(move |_| (ai_fix)())
-                    .style(|s| s.flex_row().items_center().margin_right(theme::scaled(8.0))),
+                    crate::widgets::sparkle_action(
+                        "AI fix",
+                        theme::err_fix_btn,
+                        theme::err_fix_btn_hover,
+                        move || (ai_fix)(),
+                    )
+                    .style(|s| s.margin_right(theme::scaled(8.0))),
                 ))
                 .style(|s| {
                     s.flex_row()

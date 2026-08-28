@@ -234,12 +234,13 @@ macro_rules! disabled {
 /// eye reads is the composite against the surface, not the colour named in the
 /// style. The counterpart of `wash!` below, which fades the background instead.
 ///
-/// **No live row, deliberately kept.** Its one caller was the history band's
-/// count, and the alpha there turned out to be how a number the reader is meant
-/// to read came to be painted at 2.32:1 — the fix was a colour, not a different
-/// fade. It stays because the *next* faded foreground has to be measured
-/// composited, and re-deriving that is how one gets measured against the colour
-/// it was named with instead.
+/// **It sat with no live row for a while, deliberately kept.** Its first caller
+/// was the history band's count, and the alpha there turned out to be how a
+/// number the reader is meant to read came to be painted at 2.32:1 — the fix was
+/// a colour, not a different fade. It was kept because the *next* faded
+/// foreground would have to be measured composited, and re-deriving that is how
+/// one gets measured against the colour it was named with instead. That next one
+/// is `cmdk_text@0.5`, the Ctrl+K question after it has been sent.
 ///
 /// **It is expanded by
 /// `a_faded_foreground_is_measured_against_what_the_eye_sees`, and that is
@@ -326,6 +327,12 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
         "completion popup: the doc line; AI panel: a sent attachment's summary and table"),
     pair!(text_muted on bg_deepest, Icon, "completion popup: the kind label"),
     pair!(placeholder on bg_deepest, Recessive, "AI panel: the message field"),
+    // Half-strength, because `edit_field` dims a frozen field's *own* colour
+    // rather than swapping in a theme grey — so what the eye reads is the
+    // composite, and measuring `cmdk_text` itself would measure a colour this
+    // never paints. Recessive is the role a question already sent is asking for:
+    // still readable, deliberately no longer live.
+    faded!(cmdk_text(0.5) on bg_deepest, Recessive, "Ctrl+K: the question, once it has been sent"),
     // ── Header / tab strip / dropdown menus (`bg_chrome`).
     pair!(text on bg_chrome, Body, "header: connection + active database"),
     pair!(text_dim on bg_chrome, Body, "header + tab strip labels"),
@@ -346,6 +353,7 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(search_hint on bg_panel, Recessive, "schema tree: the search box hint"),
     pair!(error on bg_panel, Body, "modal + panel error lines"),
     pair!(accent on bg_panel, Body, "selected/active affordances in a panel"),
+    pair!(accent_hover on bg_panel, Body, "error modal: hovering AI fix"),
     pair!(match_highlight on bg_panel, Body, "Find Anywhere: the matched substring"),
     pair!(plan_warn on bg_panel, Body, "import modal: a pre-flight warning"),
     pair!(change_count on bg_panel, Body, "table designer: the N changes count"),
@@ -509,7 +517,8 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // views, so nothing but a pairing check looks at them side by side.
     pair!(approve_text on approve_bg, Body, "Ctrl+K diff: Approve"),
     pair!(reject_text on reject_bg, Body, "Ctrl+K diff: Reject"),
-    pair!(err_fix_btn on reject_bg, Body, "editor + grid error bar: View / AI Fix"),
+    pair!(err_fix_btn on reject_bg, Body, "editor + grid error bar: View / AI fix"),
+    pair!(err_fix_btn_hover on reject_bg, Body, "that bar's buttons, hovered"),
     pair!(fixed WHITE, "white", on seed_button, Body, "grid: the AI seed-rows Generate button"),
     pair!(diff_add_marker on diff_add_bg, Body, "Ctrl+K diff: the + gutter marker"),
     pair!(diff_del_marker on diff_del_bg, Body, "Ctrl+K diff: the − gutter marker"),
@@ -645,6 +654,13 @@ pub const UI_SHORTFALL: &[Shortfall] = {
         ),
         ("light", "reject_text", "reject_bg", Body, 4.0),
         ("light", "err_fix_btn", "reject_bg", Body, 3.3),
+        // The hover state is pure white, and pure white is the **ceiling** on
+        // this fill: the light theme's error bar is a saturated red (#D64545)
+        // against which no foreground reaches 4.5, which is why `reject_text`
+        // two lines up is listed at 4.0 as well. It is a full point brighter
+        // than the rest state it lightens from, so closing the gap means
+        // re-tuning the bar's fill rather than the text on it.
+        ("light", "err_fix_btn_hover", "reject_bg", Body, 4.38),
         ("light", "diff_add_marker", "diff_add_bg", Body, 3.6),
         ("light", "diff_del_marker", "diff_del_bg", Body, 4.0),
         ("light", "toggle_handle_off", "toggle_off", Icon, 1.5),

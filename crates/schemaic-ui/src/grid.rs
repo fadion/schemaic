@@ -2754,6 +2754,9 @@ pub(crate) fn grid_error_bar(
                     s.color(theme::err_fix_btn())
                         .font_size(theme::font_body())
                         .margin_right(theme::scaled(8.0))
+                        // The same hover the editor's bar gives the same word.
+                        .cursor(CursorStyle::Pointer)
+                        .hover(|s| s.color(theme::err_fix_btn_hover()))
                 })
                 .into_any()
         } else {

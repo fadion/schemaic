@@ -4506,27 +4506,76 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             }
             // A commit error (grid) supplies its text directly; otherwise fall back
             // to the active tab's full query error (editor error bar).
-            let msg = text_override
-                .get_untracked()
-                .or_else(|| {
-                    tabs.with_untracked(|v| {
-                        v.iter()
-                            .find(|t| t.id == active.get_untracked())
-                            .map(|t| t.results.get_untracked())
-                    })
-                    .and_then(|st| match st {
-                        QueryState::Failed(m) => Some(m),
-                        _ => None,
-                    })
-                })
+            let tab =
+                tabs.with_untracked(|v| v.iter().find(|t| t.id == active.get_untracked()).copied());
+            let tab_error = tab
+                .map(|t| t.results.get_untracked())
+                .and_then(|st| match st {
+                    QueryState::Failed(m) => Some(m),
+                    _ => None,
+                });
+            let override_text = text_override.get_untracked();
+            // "AI fix" belongs to the fallback only. An override is a commit
+            // error, a failed export, a server that didn't answer — none of them
+            // a statement the editor can rewrite, and the fix would silently act
+            // on whatever the active tab last ran instead.
+            let fixable_error = override_text
+                .is_none()
+                .then_some(tab_error.clone())
+                .flatten();
+            let msg = override_text
+                .or(tab_error)
                 .unwrap_or_else(|| "No error.".to_string());
+
+            // Closing clears the text override so the next open (e.g. the editor's
+            // "View") falls back to the tab error again.
+            let close = move || {
+                open.set(false);
+                text_override.set(None);
+            };
+
+            // The same "AI fix" the error bar offers, for the reader who opened
+            // the full text to work out what the server meant — which is where
+            // this modal used to end. It routes through `Tab::fix_req` because
+            // the Ctrl+K state it drives belongs to the editor pane, and it hands
+            // over `msg` — the error *this modal is showing* — rather than
+            // asking the pane to look up whatever the tab holds by then.
+            //
+            // **Not `err_fix_btn`**, which the error bar paints these words in:
+            // that colour is chosen against the bar's red fill (the audit lists
+            // the pair as exactly that) and is a pale pink — on the light theme's
+            // panel it would be all but invisible. `accent` is the panel's own
+            // action colour.
+            let fix = if let Some(err) = fixable_error {
+                container(crate::widgets::sparkle_action(
+                    "AI fix",
+                    theme::accent,
+                    theme::accent_hover,
+                    move || {
+                        // **Close first.** Signals notify synchronously, so
+                        // the request runs the pane's effect on the spot —
+                        // opening Ctrl+K and giving its field focus. Setting
+                        // it first left that focus to be decided by the
+                        // teardown of this modal's own `focus_root`, which
+                        // then happened afterwards.
+                        close();
+                        if let Some(t) = tab {
+                            t.fix_req.set(Some(err.clone()));
+                        }
+                    },
+                ))
+                .style(|s| s.width_full().justify_end().margin_top(theme::scaled(14.0)))
+                .into_any()
+            } else {
+                empty().into_any()
+            };
 
             // Fixed text width so the error wraps (a `scroll` gives its child
             // unbounded width otherwise). Must stay UNDER the scroll's content
             // area = panel 500 − 40 padding − 2 border = 458; wider triggers a
             // few-px horizontal scrollbar. `min_height` keeps the modal ~500×200
             // for short errors; it grows to `max_height` then scrolls if long.
-            let panel = container(
+            let panel = container(v_stack((
                 autohide(scroll(text(msg).style(|s| {
                     s.width(theme::scaled(450.0))
                         .color(theme::error())
@@ -4538,7 +4587,8 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                         .min_height(theme::scaled(160.0))
                         .max_height(modal_body_h(360.0))
                 }),
-            )
+                fix,
+            )))
             .on_click_stop(|_| {})
             .style(|s| {
                 panel_style(s)
@@ -4546,13 +4596,6 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                     .padding(theme::scaled(20.0))
                     .border_color(theme::modal_border())
             });
-
-            // Closing clears the text override so the next open (e.g. the editor's
-            // "View") falls back to the tab error again.
-            let close = move || {
-                open.set(false);
-                text_override.set(None);
-            };
             focus_root(stack((crate::widgets::dismiss_layer(close), panel)))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {

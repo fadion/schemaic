@@ -1692,6 +1692,39 @@ fn text_button(
         })
 }
 
+/// A sparkle and a label as one clickable row — the app's "this hands the
+/// statement to the model" control, wherever it is offered outside a menu (the
+/// editor's error bar, the error modal).
+///
+/// **Neither half sets a colour**: `color` is inherited, so the row's own is
+/// what tints the SVG's `currentColor` *and* the words, and one `hover` covers
+/// the pair. Set per child — which is how the error bar's copy started — the
+/// icon stays at its rest colour while the label lights up.
+///
+/// The colours are the caller's because they are chosen against the surface the
+/// row sits on: `err_fix_btn` is picked against the error bar's red fill and is
+/// a pale pink anywhere else. `fn`s, not `Color`s, so a live theme switch is
+/// picked up inside the style closure (§7.4).
+pub(crate) fn sparkle_action(
+    label: &'static str,
+    color: fn() -> floem::peniko::Color,
+    hover: fn() -> floem::peniko::Color,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    h_stack((
+        icons::icon(icons::SPARKLES, 16.0).style(|s| s.margin_right(theme::scaled(5.0))),
+        text(label).style(|s| s.font_size(theme::font_body())),
+    ))
+    .on_click_stop(move |_| on_click())
+    .style(move |s| {
+        s.flex_row()
+            .items_center()
+            .color(color())
+            .cursor(floem::style::CursorStyle::Pointer)
+            .hover(move |s| s.color(hover()))
+    })
+}
+
 /// The bordered bar a modal's actions sit in — quiet actions on the right, the
 /// affirmative one last.
 pub(crate) fn modal_footer(actions: impl IntoView + 'static) -> impl IntoView {

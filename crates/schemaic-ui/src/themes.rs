@@ -143,6 +143,10 @@ pub struct UiTheme {
     pub diff_add_marker: Color,
     pub diff_del_marker: Color,
     pub err_fix_btn: Color,
+    /// The same text buttons under the pointer. Brighter in **both** themes,
+    /// unlike [`UiTheme::status_warn_hover`]: the bar's fill is a saturated red
+    /// either way, so away-from-the-background is the same direction twice.
+    pub err_fix_btn_hover: Color,
     pub approve_bg: Color,
     pub approve_text: Color,
     pub reject_bg: Color,
@@ -353,6 +357,7 @@ impl UiTheme {
             diff_add_marker: c("#71C371"),
             diff_del_marker: c("#CF7B7B"),
             err_fix_btn: c("#EDC6C6"),
+            err_fix_btn_hover: c("#FDF0F0"),
             approve_bg: c("#71C371"),
             approve_text: c("#173717"),
             reject_bg: c("#9D3434"),
@@ -501,6 +506,7 @@ impl UiTheme {
             diff_add_marker: c("#2E8C46"),
             diff_del_marker: c("#C4444A"),
             err_fix_btn: c("#F7DADA"),
+            err_fix_btn_hover: c("#FFFFFF"),
             approve_bg: c("#3AA655"),
             approve_text: c("#08240F"),
             reject_bg: c("#D64545"),

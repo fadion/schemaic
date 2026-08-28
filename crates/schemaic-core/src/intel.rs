@@ -5202,6 +5202,88 @@ pub fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Di
     }
 }
 
+/// The byte range an AI fix for the run error `message` is allowed to rewrite.
+///
+/// A fix replaces text in the editor, so the range is the whole question: hand
+/// the model the buffer and it hands back a buffer, and every statement the user
+/// did *not* ask about is rewritten with the one that failed. That is what the
+/// error bar did — it passed `0..sql.len()` unconditionally.
+///
+/// So: one statement in the buffer (the overwhelmingly common case) keeps the
+/// whole buffer, comments around it included — the buffer *is* the statement.
+/// With several, the server names the offending token ([`locate_db_error`], the
+/// same lookup that places the squiggle) and the fix scopes to the statement
+/// that token sits in. An error naming nothing findable keeps the whole buffer:
+/// guessing a statement would be a rewrite of the wrong one.
+///
+/// **The named token has to be unique in the buffer**, and that is the whole
+/// difference between this and the squiggle's lookup. `locate_db_error` answers
+/// with the *first* case-insensitive hit, which is right when it is handed one
+/// statement and wrong when it is handed a script: `near 'FROM t2'` names a word
+/// every statement has, so the fix scoped to the first one — a working statement
+/// that Accept would then overwrite, leaving the broken one untouched. A token
+/// that appears twice identifies nothing, so the range falls back to the whole
+/// buffer rather than to a guess.
+pub fn error_fix_range(sql: &str, message: &str, dialect: SqlDialect) -> (usize, usize) {
+    let whole = (0, sql.len());
+    if crate::sql::statement_ranges(sql, dialect).len() < 2 {
+        return whole;
+    }
+    match locate_db_error(sql, message) {
+        Some((s, e)) if !repeats_ci(sql, &sql[s..e]) => {
+            crate::sql::statement_range(sql, s, dialect)
+        }
+        _ => whole,
+    }
+}
+
+/// Does `needle` occur more than once in `hay`, case-insensitively? Built on
+/// [`find_ci`], so "occur" means exactly what the location it is checking meant.
+fn repeats_ci(hay: &str, needle: &str) -> bool {
+    let Some((s, _)) = find_ci(hay, needle) else {
+        return false;
+    };
+    // Past the first hit, not past its start: the match is `needle.len()` bytes
+    // wide (they compared equal byte for byte), so this stays on a boundary.
+    hay.get(s + needle.len()..)
+        .is_some_and(|rest| find_ci(rest, needle).is_some())
+}
+
+/// The messages of every diagnostic touching `sql[lo..hi]`, in the order they
+/// appear, without repeats — what an AI fix for that range is being asked about.
+///
+/// The two diagnostic sources ([`diagnostics`] offline and the DB-validated ones)
+/// overlap by design: an unknown column is reported by both, with the same text.
+/// Deduplicating is not tidiness — the count goes into the prompt, and "fix these
+/// 2 problems" for one problem is a claim about the statement that isn't true.
+///
+/// A diagnostic merely *touching* an edge belongs to its neighbour, not here —
+/// and a zero-width one is on an edge exactly when it sits on a boundary, so it
+/// belongs to the range that **starts** there and to that one only. Both arms
+/// below are half-open for that reason: read inclusively, a point between two
+/// statements was reported for both of them.
+pub fn problems_in_range(diags: &[Diagnostic], lo: usize, hi: usize) -> Vec<String> {
+    let mut hits: Vec<&Diagnostic> = diags
+        .iter()
+        .filter(|d| {
+            let (s, e) = d.range;
+            if s == e {
+                lo <= s && s < hi
+            } else {
+                s < hi && e > lo
+            }
+        })
+        .collect();
+    hits.sort_by_key(|d| d.range.0);
+    let mut out: Vec<String> = Vec::with_capacity(hits.len());
+    for d in hits {
+        if !out.iter().any(|m| m == &d.message) {
+            out.push(d.message.clone());
+        }
+    }
+    out
+}
+
 /// How many lines [`sql_reply`] will strip from each end of a model's reply
 /// while hunting for the SQL in it. Small on purpose: this is for shaving a
 /// stray diagnostic line off the ends, not for finding a needle in prose.
@@ -7727,6 +7809,149 @@ mod tests {
         let (lo, hi) = (10, sql.len());
         let d = db_error_diagnostic(sql, lo, hi, "Unknown column 'salery' in 'field list'");
         assert_eq!(&sql[d.range.0..d.range.1], "salery");
+    }
+
+    // ── what an AI fix is allowed to rewrite ─────────────────────────────────
+
+    #[test]
+    fn fix_range_is_the_whole_buffer_for_a_single_statement() {
+        // One statement: the buffer *is* what failed. Trimming to the statement
+        // would drop the comment above it, which is context the model wants.
+        let sql = "-- the report\nSELECT salery FROM employees";
+        assert_eq!(
+            error_fix_range(
+                sql,
+                "Unknown column 'salery' in 'field list'",
+                SqlDialect::MySql
+            ),
+            (0, sql.len())
+        );
+    }
+
+    #[test]
+    fn fix_range_narrows_to_the_statement_the_error_names() {
+        // The bug this exists for: with several statements in the buffer, the
+        // fix used to be handed `0..len` and rewrote all of them to correct one.
+        let sql = "SELECT 1;\nSELECT * FROM users;\nSELECT salery FROM employees;";
+        let (lo, hi) = error_fix_range(
+            sql,
+            "Unknown column 'salery' in 'field list'",
+            SqlDialect::MySql,
+        );
+        assert_eq!(&sql[lo..hi], "SELECT salery FROM employees;");
+    }
+
+    #[test]
+    fn fix_range_narrows_on_a_postgres_syntax_error_too() {
+        let sql = "SELECT 1;\nSELECT 1 FRM t;";
+        let (lo, hi) = error_fix_range(
+            sql,
+            r#"syntax error at or near "FRM""#,
+            SqlDialect::Postgres,
+        );
+        assert_eq!(&sql[lo..hi], "SELECT 1 FRM t;");
+    }
+
+    #[test]
+    fn fix_range_keeps_the_whole_buffer_when_the_named_token_is_not_unique() {
+        // `find_ci` answers with the FIRST case-insensitive hit, so a message
+        // naming a token that also appears in an earlier statement scoped the fix
+        // to that earlier — working — statement. Accepting the suggestion then
+        // overwrote the healthy statement and left the broken one alone.
+        let sql = "SELECT a FROM t1;\nSELECT b FROM t2;";
+        let msg = "You have an error in your SQL syntax near 'FROM t2' at line 2";
+        assert_eq!(error_fix_range(sql, msg, SqlDialect::MySql), (0, sql.len()));
+
+        // A name error is the same hazard: `t1` is in both statements.
+        let sql = "SELECT * FROM t1;\nSELECT x FROM t2 JOIN t1 USING (id);";
+        let msg = r#"relation "t1" does not exist"#;
+        assert_eq!(
+            error_fix_range(sql, msg, SqlDialect::Postgres),
+            (0, sql.len())
+        );
+    }
+
+    #[test]
+    fn fix_range_keeps_the_whole_buffer_when_the_error_names_nothing() {
+        // An opaque message locates no token. Guessing the first statement would
+        // be a rewrite of the wrong one; the whole buffer at least contains it.
+        let sql = "SELECT 1;\nSELECT 2;";
+        assert_eq!(
+            error_fix_range(sql, "Some opaque server error", SqlDialect::MySql),
+            (0, sql.len())
+        );
+    }
+
+    #[test]
+    fn problems_in_range_takes_only_what_overlaps() {
+        let d = |lo: usize, hi: usize, m: &str| Diagnostic {
+            range: (lo, hi),
+            severity: Severity::Warning,
+            message: m.to_string(),
+        };
+        let diags = vec![
+            d(0, 6, "before"),
+            d(9, 15, "overlapping the start"),
+            d(20, 24, "inside"),
+            d(30, 34, "after"),
+        ];
+        assert_eq!(
+            problems_in_range(&diags, 10, 28),
+            vec!["overlapping the start".to_string(), "inside".to_string()]
+        );
+        // Touching an edge is not overlapping it: a diagnostic that ends where
+        // the statement starts belongs to the statement before.
+        assert!(problems_in_range(&diags, 6, 9).is_empty());
+    }
+
+    #[test]
+    fn problems_in_range_is_ordered_and_deduplicated() {
+        // The two diagnostic sources overlap by design — the offline analysis and
+        // the live DB validation both report an unknown column — and "Fix these 2
+        // problems" for one problem is a lie the prompt would repeat.
+        let d = |lo: usize, hi: usize, m: &str| Diagnostic {
+            range: (lo, hi),
+            severity: Severity::Error,
+            message: m.to_string(),
+        };
+        let diags = vec![
+            d(20, 26, "Unknown column 'salery'"),
+            d(7, 13, "Unknown table 'employes'"),
+            d(20, 26, "Unknown column 'salery'"),
+        ];
+        assert_eq!(
+            problems_in_range(&diags, 0, 40),
+            vec![
+                "Unknown table 'employes'".to_string(),
+                "Unknown column 'salery'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn problems_in_range_keeps_a_zero_width_diagnostic_inside_it() {
+        let diags = vec![Diagnostic {
+            range: (12, 12),
+            severity: Severity::Warning,
+            message: "missing something".to_string(),
+        }];
+        assert_eq!(problems_in_range(&diags, 10, 20).len(), 1);
+        assert!(problems_in_range(&diags, 0, 5).is_empty());
+    }
+
+    #[test]
+    fn a_zero_width_diagnostic_on_a_boundary_belongs_to_one_statement() {
+        // It sat in *both* neighbours: the empty arm was inclusive at each end
+        // while the non-empty one excludes a touch, so the two halves of one
+        // predicate disagreed about what an edge means. A point belongs to the
+        // range that starts there.
+        let diags = vec![Diagnostic {
+            range: (40, 40),
+            severity: Severity::Warning,
+            message: "missing something".to_string(),
+        }];
+        assert!(problems_in_range(&diags, 10, 40).is_empty());
+        assert_eq!(problems_in_range(&diags, 40, 70).len(), 1);
     }
 
     // ── generated SQL is dialect-correct ─────────────────────────────────────

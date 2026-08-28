@@ -1091,6 +1091,22 @@ pub struct Tab {
     /// (`format_editor`), so the palette can't drift from Ctrl+Alt+L, and the
     /// result lands as one undoable edit instead of a pane remount.
     pub format_req: RwSignal<bool>,
+    /// A run error to fix with the AI, which the editor pane does and then
+    /// clears — the same request-and-clear shape as [`Tab::format_req`], and for
+    /// a stricter version of the same reason.
+    ///
+    /// The fix opens the pane's Ctrl+K overlay, and that state (`CmdK`) is the
+    /// pane's own: it is created inside `query_pane` and never leaves it, so the
+    /// error modal — rendered by the workspace, over any tab — has no handle to
+    /// reach it with. Set by the modal's "AI fix"; cleared by the pane.
+    ///
+    /// **It carries the message rather than saying "the current one"**: the
+    /// modal shows the error it opened on, and a run that lands while it is up
+    /// moves `results` under it (its dismiss layer stops clicks, not queries).
+    /// Asked for the tab's *current* error, the fix would then quietly answer a
+    /// different question than the one on screen — or, on a run that succeeded,
+    /// none at all.
+    pub fix_req: RwSignal<Option<String>>,
     /// This tab's offline diagnostics — the squiggles — published by the editor
     /// pane's **debounced** analysis (`editor_pane`, 120 ms with a generation
     /// guard).
@@ -1221,6 +1237,7 @@ impl Tab {
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
             format_req: cx.create_rw_signal(false),
+            fix_req: cx.create_rw_signal(None),
             diagnostics: cx.create_rw_signal(Vec::new()),
             highlight_col: cx.create_rw_signal(None),
             results_maximized: cx.create_rw_signal(false),
@@ -4798,6 +4815,7 @@ fn center(ui: Ui) -> impl IntoView {
                     format_req: tab.format_req,
                     insert_req: tab.insert_req,
                     syntax: tab.diagnostics,
+                    fix_req: tab.fix_req,
                     results: tab.results,
                     run: run.clone(),
                     run_all: run_all.clone(),
@@ -6014,6 +6032,20 @@ pub(crate) struct FieldCfg {
     pub border_radius: f32,
     /// Read-only: no text edits (still handles Enter/Escape). Suppresses autofocus.
     pub read_only: bool,
+    /// **Read-only while this reads true**, dimmed to say so — and *without the
+    /// field being rebuilt*, which is the whole reason it is a signal rather
+    /// than [`FieldCfg::read_only`]'s second spelling.
+    ///
+    /// The Ctrl+K prompt is what needs it: a question that has been sent is no
+    /// longer the user's to type in, but rebuilding the field to say so re-runs
+    /// its layout, and for one frame the fresh field has almost no width — the
+    /// question wraps, the latched row count is wrong, and the bar opens a row
+    /// taller with its text stranded at the top. That is why both the freeze and
+    /// the dim were dropped when the bar was rebuilt around a stable field. Both
+    /// are back here as things the *built* field reads: the colour inside its
+    /// reactive style (like [`FieldCfg::uncommitted`]), and the editor's own
+    /// `read_only` signal through an effect, which floem re-reads per keystroke.
+    pub frozen: Option<Memo<bool>>,
     /// Enter **never** inserts a line break, whatever the modifiers — for a
     /// `multiline` box holding one *question* rather than a body. Wrapping and
     /// auto-grow are unaffected; only the key's meaning changes.
@@ -6149,6 +6181,7 @@ impl Default for FieldCfg {
             mono: false,
             border_radius: 6.0,
             read_only: false,
+            frozen: None,
             enter_never_breaks: false,
             height: None,
             max_rows: None,
@@ -6289,6 +6322,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         mono,
         border_radius,
         read_only,
+        frozen,
         enter_never_breaks,
         height,
         max_rows,
@@ -6503,6 +6537,29 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     } else {
         editor
     };
+    // `frozen` drives the same signal the builder above sets once, so floem's own
+    // per-keystroke checks (`TextDocument::receive_char` / `run_command`, both of
+    // which read it untracked at the moment of the key) do the enforcing — there
+    // is no second gate here to fall out of step with them. A fixed `read_only`
+    // wins whatever the signal says, and the caret is taken down with the edits:
+    // a blinking caret in a field that will not take a character is the wrong
+    // promise, and it is the same treatment `read_only` gets on focus below.
+    if let Some(frozen) = frozen {
+        let ed_frozen = ed.clone();
+        create_effect(move |_| {
+            let stop = read_only || frozen.get();
+            ed_frozen.read_only.set(stop);
+            if stop {
+                ed_frozen.cursor_info.hidden.set(true);
+                ed_frozen
+                    .cursor_info
+                    .blink_timer
+                    .set(floem::action::TimerToken::INVALID);
+            } else if focused.get_untracked() {
+                ed_frozen.cursor_info.reset();
+            }
+        });
+    }
 
     // Plain styling in the app's body font, with an explicit line height so the
     // box-height math below matches the rendered lines.
@@ -6615,7 +6672,15 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 // Recalled-but-not-yet-owned text reads as the placeholder it
                 // stands in for. Read inside the reactive style, so committing
                 // repaints it without rebuilding the field.
-                .color(if uncommitted.is_some_and(|u| u.get()) {
+                //
+                // A frozen field dims *its own* colour rather than switching to a
+                // theme grey: what it has to say is "this text is no longer
+                // yours to edit", and half-strength of whatever the field was
+                // painted in says that in both themes and in a field whose
+                // caller overrode the colour (the Ctrl+K bar does).
+                .color(if frozen.is_some_and(|f| f.get()) {
+                    text_color().multiply_alpha(0.5)
+                } else if uncommitted.is_some_and(|u| u.get()) {
                     placeholder_color()
                 } else {
                     text_color()
@@ -6768,6 +6833,23 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         let ed_rows = ed.clone();
         create_effect(move |_| {
             let vp = ed_rows.viewport.get();
+            // **`screen_lines` as well as `viewport`, and the second one is what
+            // makes the count true.** A width change arrives on `viewport`, but
+            // floem answers it in an effect of its own on that same signal:
+            // `ed.lines.set_wrap(Width(viewport.width()))`, which only *clears*
+            // the line layouts — they are rebuilt lazily, later. So a count read
+            // on the `viewport` edge alone is computed from the layout of the
+            // **previous** width, and `Lines::last_vline` caches its answer, so a
+            // box that measured two rows at a first-frame width stayed two rows
+            // until the next keystroke re-measured it. That is the Ctrl+K bar
+            // opening a row taller with its question stranded at the top — the
+            // rebuild-driven half of it was fixed by keeping the field across the
+            // Idle → Busy transition, and this is the other half, the one that
+            // survived and showed up about one opening in seven.
+            // `screen_lines` changes once those layouts exist again
+            // (`update_screen_lines` walks the visual lines, which is what builds
+            // them), so it is the first moment the count is worth reading.
+            ed_rows.screen_lines.track();
             // Not before the first layout. `EditorWidth` wrapping at a zero width
             // puts every character on its own visual line, so measuring there
             // reports one row per character and inflates the box — which then
@@ -6831,8 +6913,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             focused.set(true);
             focus_now_f.set(true);
             // A read-only field can still be focused (to receive Enter/Escape),
-            // but shows no blinking caret.
-            if read_only {
+            // but shows no blinking caret. **`frozen` counts here too**, and
+            // untracked so this stays a focus effect: the Ctrl+K bar opens
+            // already `Busy` on an AI fix, so a focus that ignored the freeze
+            // would put a blinking caret back in a field that takes no keys —
+            // the one state where the two effects race, and focus arrives last.
+            if read_only || frozen.is_some_and(|f| f.get_untracked()) {
                 ed_focus.cursor_info.hidden.set(true);
                 ed_focus
                     .cursor_info
