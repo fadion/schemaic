@@ -231,6 +231,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
     `None` when the statement alone can't say — what `ddl::pg_replaceable` reads).
+    **`error_fix_range` decides what an AI fix is allowed to rewrite**, and it is a range question
+    rather than a prompt one: a fix replaces text in the editor, so hand the model the buffer and
+    every statement the user did not ask about comes back rewritten — which is what the error bar
+    did, passing `0..sql.len()` unconditionally. One statement in the buffer keeps the whole buffer
+    (the buffer *is* the statement, comments around it included); with several, the same
+    `locate_db_error` that places the squiggle finds the offending token and the fix scopes to the
+    statement holding it; an error naming nothing findable keeps the whole buffer, because guessing
+    a statement would be a rewrite of the wrong one. **The token has to be unique in the buffer**,
+    and that is the one place this parts company with the squiggle's lookup: `locate_db_error`
+    answers with the *first* case-insensitive hit, which is right when it is handed one statement
+    and wrong when it is handed a script — `near 'FROM t2'` names a word every statement has, so the
+    fix scoped to the first one, a working statement that Accept would then overwrite while the
+    broken one stayed broken. A token that appears twice identifies nothing, so `repeats_ci` sends
+    it back to the whole-buffer fallback. `problems_in_range` is its companion for the
+    editor's own diagnostics — every message touching a range, ordered, **deduplicated**, since the
+    offline and DB-validated passes report an unknown column in the same words and the count reaches
+    the user as "fix these 2 problems". Both of its arms are **half-open**, the zero-width one
+    included: a point sitting on a statement boundary belongs to the range that starts there, and
+    read inclusively it was reported for both neighbours at once.
     **`simple_select_source` is the one definition of "structurally simple enough to aim a write
     at"** — one statement, a `SELECT` body, no CTE, one `FROM` entry, no joins, a plain named table
     — shared by `filter::build_query` (which needs to know it may splice a `WHERE` into the
@@ -2001,6 +2020,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       every level rather than one, so a fourth level can't be added on the wrong side. Both build on `pipe_table`, the one
       table renderer for anything a model reads (the MCP tools call it too), so a cell containing
       `|`, a newline or a megabyte of JSON is handled identically wherever it appears.
+      `ai_fix_prompt` is the **one wording of "fix this"**, for all three ways to ask — the editor's
+      error bar, the modal behind its *View*, and the right-click *AI fix* over a squiggle. It
+      returns the pair the caller needs (the Ctrl+K input line the user sees and can edit, and the
+      intent sent with the SQL), so the three can't drift apart in what they ask the model for; the
+      `FixOrigin` is what keeps the editor's *warnings* from being announced to the user as "this
+      error". The messages ride in a `fenced` block under `UNTRUSTED_NOTE` like everything else here,
+      which the error bar's own `format!` did not: a DB error quotes identifiers and cell values from
+      a server that isn't necessarily the user's.
     - `summary.rs` — the grid's "AI Summary" cell/column prompts. `sample_column` spreads its
       sample *evenly* across loaded rows rather than taking the first N, because a sorted result's
       head often shares a date/status/prefix that reads as a pattern that isn't real; `sample_row`
@@ -2950,7 +2977,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `section_title`/`centered_msg`/`toggle_icon` (whose `enabled` is **not optional**: every panel
     toggle in the footer needs it, so the ungated shims that passed `|| true` were only hiding the
     fact — see *The footer's panel toggles* below), `tip_when`, `measure_text_px`,
-    `jump_to_bottom_button`. Also `MenuId`/`MenuFlags` —
+    `jump_to_bottom_button`. Also `sparkle_action` — the sparkle-plus-label "AI fix" the editor's
+    error bar and the error modal both offer, in one definition because the two had already drifted
+    to different colours by the time there were two of them; **neither half sets a colour**, so the
+    row's own tints the SVG's `currentColor` and the words together and one `hover` covers the pair
+    (set per child, as the first copy did, the icon stays dark while the label lights up). Also
+    `MenuId`/`MenuFlags` —
     the single list of the app's mutually-exclusive dropdowns, which every trigger closes the others
     through (*Popup menus*), and `row_menu_mark`/`row_menu_mark_pad`/`clear_row_mark_on_close` — the
     rule a row wears while its own context menu is open, which lives here rather than in either list
@@ -3950,10 +3982,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     keeps the right edge. The field beside it flex-grows into what is left, so without the
     reservation submitting swapped a 15px icon for up to 102px of "Metamorphosing..." and took that
     width off the question mid-flight — a second, quieter way to the same re-wrap.
-    Two things were given up for it, both deliberate: the question is **no longer `read_only` while
-    a request is in flight, and no longer dims**, because both are resolved when the field is built
-    and following the request would mean rebuilding it. Editing mid-flight is harmless — the request
-    carries the text it was sent with — and the spinner beside it says what is happening. The input
+    A sent question is **dimmed and takes no more typing**, through `FieldCfg::frozen` — a `Memo`
+    the *built* field reads, not a second spelling of `read_only`. That distinction is the whole
+    point: `read_only` and the text colour are resolved when the field is built, so following the
+    request through them meant rebuilding it, which is the re-wrap above. Both were dropped for a
+    while on the reasoning that editing mid-flight is harmless (the request carries the text it was
+    sent with) — but an editable box promises an edit that cannot reach the question already asked,
+    and the spinner alone was left saying so. `frozen` drives the editor's own `read_only` signal
+    through an effect (floem re-reads it per keystroke in `TextDocument::receive_char` /
+    `run_command`, so there is no second gate to fall out of step with it) and dims the field's own
+    colour to half inside its reactive style. **The focus effect has to honour it too**: an AI fix
+    opens the bar already `Busy`, and focus arrives after the freeze, so a focus that reset the
+    caret put a blinking one in a field that takes no keys. The input
     row also carries **no vertical padding of its own**: `edit_field` already puts `chat_pad_v` above
     and below its text, and the second helping made a one-line question sit in a bar deep enough to
     read as two.
@@ -3970,14 +4010,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the model to edit an insertion point and left the diff nothing to replace. It reads the text for
     that from **`e.doc().text()`, not the `query` signal** — the offsets it is resolving are the
     document's own, and `accept` re-reads the document for the same reason. The right-click *Ask
-    AI…* entry widens, selects and anchors identically: it is the same action reached another way,
+    AI* entry widens, selects and anchors identically: it is the same action reached another way,
     so it has to pick the same thing. Ctrl+K then **selects** that range for real
     (`cursor.set_insert`), which is where the design's selection colour behind the statement comes
     from: the honest way to show what the key picked is the editor's own selection rather than a
     lookalike overlay, and it leaves the user able to see, extend or replace the range with the
     gestures they already have. The bar is anchored at the **end** of the acted-on range rather than
-    at the caret, so it sits under the whole statement instead of splitting one in two, and both
-    entry points go through `anchor_cmdk` to do it. That helper does two things neither caller should
+    at the caret, so it sits under the whole statement instead of splitting one in two, and every
+    entry point goes through `anchor_cmdk` to do it. That helper does two things neither caller should
     repeat. It stores the point in the editor's **content** coordinates and leaves the style closure
     to subtract the viewport, so the bar tracks a later scroll — while the closure was *not*
     subtracting it, an open in a scrolled editor placed the bar by how far down the document the
@@ -3987,6 +4027,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     pane, opening the prompt clipped or entirely out of sight. `CMDK_BAR_RESERVE` is the room it asks
     for, deliberately generous — over-scrolling by a few pixels is invisible, and
     `scroll_beyond_last_line` guarantees there is somewhere to go.
+    **The AI fix is one action with three ways to ask for it**, `fix_with_ai`: the error bar's *AI
+    fix*, the error modal behind its *View* (through `Tab::fix_req`), and the right-click *AI fix*
+    over a squiggled statement. All three open Ctrl+K pre-filled and go straight to `Busy`, so the
+    user approves or rejects a diff and nothing runs. The caller supplies the range, because only the
+    caller knows which statement it means — the run error's comes from `intel::error_fix_range` (the
+    failing statement, not the buffer), the menu's from `sql::statement_range` at the right-click
+    with `intel::problems_in_range` for the messages — and `prompt::ai_fix_prompt` supplies the
+    words. It **selects the range** as the other two entry points do, and this is the one that needs
+    it most: the range is `error_fix_range`'s choice rather than a gesture of the user's, so without
+    the selection nothing distinguishes "rewriting this statement" from "rewriting all forty".
+    The menu entry **is only there when that statement has a diagnostic**, shown rather than
+    disabled like *Create view*, but the build-time pass decides only *that*: the range and the
+    messages are re-derived when the entry runs, like every other action in this menu. Captured,
+    they could outlive the text they described — a reload between the right-click and the click
+    leaves `sql.get(lo..hi)` answering `None`, and the entry then does nothing with nothing said.
+    The modal's is the narrower case: it appears only when
+    the modal fell back to the tab's run error, never over an `error_modal_text` override, which is a
+    commit error or a server that didn't answer — nothing the editor can rewrite. It has to route
+    through a request signal at all because `CmdK` is created inside `query_pane` and never leaves
+    it, so the workspace-level modal has no handle to reach it with — and that signal **carries the
+    message**, because the modal shows the error it opened on while a run landing behind it moves
+    `results` out from under that (its dismiss layer stops clicks, not queries). It also **closes
+    before it asks**: signals notify synchronously, so the request opens Ctrl+K and focuses its field
+    on the spot, and asking first left that focus to be decided by the teardown of the modal's own
+    `focus_root` afterwards.
     `inline_footer_y` is the other end's geometry, and it is deliberately not `points_of_offset` at
     the anchor line's end: that offset maps to a column *before* the phantom rows, so its `bot` is
     the bottom of the line's own row. The **next** document line's top is the honest answer — the
@@ -4494,6 +4559,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     tells them apart** — ask where the caret can go before touching the key that would have put it
     there. The fix is in `editor_pane` (the container is keyed on `Ready`-or-not now); what is kept
     here was worth keeping on its own terms and has no regression test either way.
+    **That was only half of it**, and the other half outlived the rebuild by a long way: the bar went
+    on opening two rows tall about once in seven times, with no rebuild left to blame. The
+    re-measure effect tracked `viewport` alone — but floem answers a width change in an effect of its
+    own *on that same signal*, `lines.set_wrap(Width(viewport.width()))`, and that only **clears** the
+    line layouts; they are rebuilt lazily afterwards. So the count read on the `viewport` edge was
+    computed from the layout of the **previous** width, and `Lines::last_vline` caches its answer —
+    which is what made a bad frame permanent rather than momentary, since nothing but a keystroke
+    would ask again. The effect now also tracks `screen_lines`, which floem `update`s once those
+    layouts exist again (`update_screen_lines` walks the visual lines, and walking them is what
+    builds them), so the measurement happens at the first moment the count is true. The general
+    lesson is the one the misdiagnosis above teaches twice: **a value read on the edge that
+    *announces* a change can be older than the change**, and a cached reader turns that into a
+    permanent wrong answer instead of a frame of one.
     And **the field repaints when its row count changes**: the box height is derived from
     `rows`, so the edit that adds a line has already painted against the *old* height, leaving the
     caret on the new last line outside the viewport that was drawn — it looks like the caret has
@@ -6182,6 +6260,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   also needs the `.pointer_events(|| false)` the absolute-overlays bullet above is about.
 - **Deferred layout**: `exec_after(Duration::ZERO, …)` runs after layout settles — so
   `scroll_to(bottom)` clamps against new content height, not stale.
+- **`viewport` announces a width change; the editor's *lines* are not rebuilt yet.** Floem reacts to
+  `ed.viewport` in an effect of its own — `lines.set_wrap(Width(viewport.width()))` — which only
+  **clears** the line layouts, rebuilding them lazily. So anything measured from a *viewport* edge
+  (`last_vline`, and so any wrapped row count) is computed from the previous width's layout, and
+  `Lines::last_vline` caches its answer, which turns one bad frame into a permanently wrong box that
+  only a keystroke re-measures. Track **`screen_lines`** for that: floem `update`s it once
+  `update_screen_lines` has walked the visual lines, and walking them is what rebuilds the layouts.
+  `edit_field`'s auto-grow tracks both — the guard is `viewport.width() >= 1.0` (a zero-width
+  measurement wraps at `MIN_WRAPPED_WIDTH` and inflates the box), the *count* comes after
+  `screen_lines`.
 - **`.get()` clones the whole value — use `.with()` to read part of a collection.** `SignalGet::get`
   is documented as *"try to **clone** and return the current value"*, so `widths.get().get(ci)`
   allocates and frees the entire `Vec` to read one slot, and `expanded.get().contains(&k)` clones the

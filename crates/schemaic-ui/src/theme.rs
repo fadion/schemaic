@@ -247,9 +247,12 @@ pub fn diff_add_marker() -> Color {
 pub fn diff_del_marker() -> Color {
     ui().diff_del_marker
 }
-// Editor error bar: "View" and "AI Fix" text buttons.
+// Editor error bar: "View" and "AI fix" text buttons.
 pub fn err_fix_btn() -> Color {
     ui().err_fix_btn
+}
+pub fn err_fix_btn_hover() -> Color {
+    ui().err_fix_btn_hover
 }
 
 // Approve / Reject buttons on the diff overlay.
