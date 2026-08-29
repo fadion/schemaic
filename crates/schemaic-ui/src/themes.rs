@@ -295,7 +295,15 @@ pub struct UiTheme {
     pub confirm_yes: Color,
     pub confirm_yes_hover: Color,
     pub conn_ok: Color,
+    /// **No consumer.** `d133fe9` replaced floem's `Dropdown` with the app's own
+    /// menu, which paints on `bg_chrome` through `menu_item_style`. Kept because
+    /// removing it edits every theme file for nothing, and `contrast.rs` still
+    /// checks it — but read the name as history, not as a description.
     pub dropdown_hover: Color,
+    /// Despite the name, this is the **grid's formatted-value tint** — the wash
+    /// behind a header cell and a body cell showing a formatted value rather than
+    /// the raw one (`grid.rs`, its only two consumers). Same history as its
+    /// sibling above.
     pub dropdown_active: Color,
     pub jump_icon: Color,
     pub jump_icon_hover: Color,
