@@ -196,6 +196,18 @@ pub fn collapsed(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// [`collapsed`] for a preview that will be **syntax-coloured**.
+///
+/// The newline that terminates a `--` / `#` comment is exactly what this fold
+/// removes, and the panel lexes the result as one line — so a body whose first
+/// line is a comment rendered entirely in the comment colour.
+/// [`crate::sql::inline_line_comments`] rewrites them to `/* … */`, which
+/// survives the fold and keeps the text; see [`crate::history::preview_for_highlight`],
+/// which is the same fix for the same reason one panel over.
+pub fn collapsed_for_highlight(body: &str, dialect: SqlDialect) -> String {
+    collapsed(&crate::sql::inline_line_comments(body, dialect))
+}
+
 /// The panel's groups for a connection, narrowed by the filter.
 ///
 /// Buckets run **narrowest first** — this connection, then this engine, then
@@ -391,9 +403,17 @@ fn sort_for_panel(items: &mut [Snippet]) {
 /// The snippet an abbrev triggers, if one is in scope here.
 ///
 /// Whole-word and ASCII case-insensitive: a *prefix* must not expand, or typing
-/// `psql` in a query would offer the snippet abbreviated `ps`. Ties go to the
-/// narrowest scope, so a connection-specific abbrev shadows an engine-wide one
-/// of the same spelling.
+/// `psql` in a query would offer the snippet abbreviated `ps`.
+///
+/// **A snippet the user wrote wins, then the narrowest scope.** That order is
+/// [`library`]'s documented rule and it has to be the *first* key, not a
+/// tie-break under scope: every built-in is `Scope::Dialect`, so ranking scope
+/// first put the shipped pack above a user snippet moved to "All connections" —
+/// which is a scope a user chooses, on a snippet they wrote, losing its abbrev to
+/// one they cannot delete or re-spell. Exactly backwards.
+///
+/// Within one source, the narrowest scope still wins: a connection-specific
+/// abbrev shadows an engine-wide one of the same spelling.
 pub fn by_abbrev(
     all: &[Snippet],
     abbrev: &str,
@@ -412,12 +432,43 @@ pub fn by_abbrev(
                 .is_some_and(|a| a.eq_ignore_ascii_case(abbrev))
         })
         .collect();
-    hits.sort_by_key(|s| match s.scope {
-        Scope::Conn(_) => 0,
-        Scope::Dialect(_) => 1,
-        _ => 2,
+    hits.sort_by_key(|s| {
+        let source = match s.source {
+            Source::User => 0,
+            Source::Builtin => 1,
+        };
+        let scope = match s.scope {
+            Scope::Conn(_) => 0,
+            Scope::Dialect(_) => 1,
+            _ => 2,
+        };
+        (source, scope)
     });
     hits.first().map(|s| (*s).clone())
+}
+
+/// Drop every snippet scoped to `conn_id`, for a connection being deleted.
+///
+/// **Two reasons, and the app's `delete_conn_now` states both of them about the
+/// eleven sibling stores it already clears.** A deleted connection should not be
+/// reconstructable from what is left on disk, and its queries are the most
+/// telling part of that. And connection ids are **recycled** — `next_id` there is
+/// one-past-the-highest — so a snippet left behind is not merely orphaned: the
+/// next connection to take the freed id inherits it, under a heading that reads
+/// "THIS CONNECTION".
+///
+/// Only `Scope::Conn` goes. A `Dialect` or `Global` snippet was written for more
+/// than this connection and outlives it, which is what those scopes mean.
+pub fn clear_conn(all: &mut Vec<Snippet>, conn_id: u64) {
+    all.retain(|s| !matches!(s.scope, Scope::Conn(id) if id == conn_id));
+}
+
+/// How many snippets [`clear_conn`] would delete for `conn_id` — the count a
+/// confirmation may promise, answered by the same predicate that fulfils it.
+pub fn count_conn(all: &[Snippet], conn_id: u64) -> usize {
+    all.iter()
+        .filter(|s| matches!(s.scope, Scope::Conn(id) if id == conn_id))
+        .count()
 }
 
 /// The next free id: one past the highest in use, and `1` for an empty library
@@ -441,6 +492,37 @@ pub fn next_id(all: &[Snippet]) -> u64 {
         .max()
         .unwrap_or(0)
         + 1
+}
+
+/// **What a freshly saved snippet is**, so that the panel's first row is a
+/// decision the core states rather than a struct literal in a view closure.
+///
+/// Two of these fields are the whole of "save it where you can find it", and
+/// both were wrong once:
+///
+/// - [`Scope::Conn`], the narrowest scope and the one you can see. A snippet
+///   saved from the query in front of you is usually about *this* database, and
+///   widening it to the engine is one click in Show in. Saving it engine-wide
+///   dropped a new row into the middle of a list of other people's queries.
+/// - `last_used: Some(now)`, so [`sort_for_panel`]'s most-recently-used order
+///   puts it at the top of its band — which is where the panel then scrolls. It
+///   is also true: this snippet came from the statement being worked on, which
+///   is the most recent use there is.
+///
+/// Neither is visible from [`grouped`] or [`sort_for_panel`] alone; together
+/// with them it is the composition
+/// `a_snippet_saved_from_this_connection_is_the_first_row_of_the_first_band`
+/// pins.
+pub fn new_saved(id: u64, name: String, body: String, conn_id: u64, now: u64) -> Snippet {
+    Snippet {
+        id,
+        name,
+        abbrev: None,
+        body,
+        scope: Scope::Conn(conn_id),
+        source: Source::User,
+        last_used: Some(now),
+    }
 }
 
 /// Record that a snippet was just used. No-op for an id that is gone.
@@ -767,11 +849,82 @@ mod tests {
     /// somebody wrote.
     #[test]
     fn a_users_abbrev_wins_over_a_shipped_one() {
-        let mut mine = snip(1, "my own processlist", Scope::Dialect(MY));
-        mine.abbrev = Some("ps".to_string());
-        let all = library(&[mine], MY);
-        let hit = by_abbrev(&all, "ps", MY, 7).expect("something answers ps");
-        assert_eq!(hit.name, "my own processlist");
+        // **Every scope, not just the one where the old ranking happened to
+        // agree.** Pinning `Scope::Dialect` alone let the claim be true for one
+        // of three: every built-in is `Dialect`, so a scope-first ranking put the
+        // shipped pack above a user snippet moved to `Global` — and the test
+        // stayed green over the bug it was written to guard.
+        for scope in scope_options(MY, 7) {
+            let mut mine = snip(1, "my own processlist", scope.clone());
+            mine.abbrev = Some("ps".to_string());
+            let all = library(&[mine], MY);
+            let hit = by_abbrev(&all, "ps", MY, 7).expect("something answers ps");
+            assert_eq!(hit.name, "my own processlist", "{scope:?}");
+            assert_eq!(hit.source, Source::User, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn among_a_users_own_snippets_the_narrowest_scope_still_wins() {
+        // The rule the source key sits *above*, not one it replaces.
+        let mut wide = snip(1, "everywhere", Scope::Global);
+        wide.abbrev = Some("ps".to_string());
+        let mut engine = snip(2, "this engine", Scope::Dialect(MY));
+        engine.abbrev = Some("ps".to_string());
+        let mut here = snip(3, "this connection", Scope::Conn(7));
+        here.abbrev = Some("ps".to_string());
+        let all = library(&[wide.clone(), engine.clone(), here], MY);
+        assert_eq!(
+            by_abbrev(&all, "ps", MY, 7).unwrap().name,
+            "this connection"
+        );
+        // On another connection the connection-scoped one is out of scope.
+        let all = library(&[wide, engine], MY);
+        assert_eq!(by_abbrev(&all, "ps", MY, 9).unwrap().name, "this engine");
+    }
+
+    #[test]
+    fn a_shipped_abbrev_still_answers_when_no_user_snippet_claims_it() {
+        let all = library(&[], MY);
+        let hit = by_abbrev(&all, "ps", MY, 7).expect("the pack still answers");
+        assert_eq!(hit.source, Source::Builtin);
+    }
+
+    #[test]
+    fn deleting_a_connection_takes_its_snippets_and_leaves_the_others() {
+        let mut all = vec![
+            snip(1, "for this connection", Scope::Conn(7)),
+            snip(2, "for another", Scope::Conn(9)),
+            snip(3, "for the engine", Scope::Dialect(MY)),
+            snip(4, "for everything", Scope::Global),
+        ];
+        assert_eq!(count_conn(&all, 7), 1);
+        clear_conn(&mut all, 7);
+        assert_eq!(
+            all.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 3, 4],
+            "only the connection's own scope goes"
+        );
+        assert_eq!(count_conn(&all, 7), 0);
+        // Connection ids are recycled: the next connection to take 7 must not
+        // find anything waiting for it under "THIS CONNECTION".
+        assert!(
+            !all.iter()
+                .any(|s| applies(s, MY, 7) && s.scope == Scope::Conn(7))
+        );
+    }
+
+    #[test]
+    fn the_count_a_confirmation_promises_is_what_the_delete_removes() {
+        let all = vec![
+            snip(1, "a", Scope::Conn(7)),
+            snip(2, "b", Scope::Conn(7)),
+            snip(3, "c", Scope::Global),
+        ];
+        let n = count_conn(&all, 7);
+        let mut after = all.clone();
+        clear_conn(&mut after, 7);
+        assert_eq!(all.len() - after.len(), n);
     }
 
     #[test]
@@ -928,5 +1081,94 @@ mod tests {
         remove(&mut all, 1);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, 2);
+    }
+
+    // ── new_saved, composed with the panel ──────────────────────────────────
+
+    /// **The composition, not the parts.** [`grouped`] and [`sort_for_panel`]
+    /// are each well covered on their own; what neither can see is what a
+    /// *saved* snippet looks like when it reaches them. Both halves of that —
+    /// the [`Scope::Conn`] and the used-now stamp — shipped wrong once, and
+    /// reverting either one on its own has to fail this.
+    ///
+    /// The library is built the way the app builds it (the user's list plus the
+    /// built-in pack), with existing rows that would win on every other
+    /// ordering: a name that sorts first alphabetically, and an older
+    /// most-recently-used stamp on the same connection.
+    #[test]
+    fn a_snippet_saved_from_this_connection_is_the_first_row_of_the_first_band() {
+        const CONN: u64 = 7;
+        let mut older = snip(1, "aaa first alphabetically", Scope::Conn(CONN));
+        older.last_used = Some(1_000);
+        let engine_wide = snip(2, "aab engine wide", Scope::Dialect(MY));
+        let user = vec![older, engine_wide];
+
+        let id = next_id(&user);
+        let saved = new_saved(
+            id,
+            "zzz last alphabetically".into(),
+            "SELECT 1".into(),
+            CONN,
+            2_000,
+        );
+        let mut all = library(&user, MY);
+        all.push(saved);
+
+        let bands = grouped(&all, MY, CONN, "");
+        assert_eq!(
+            bands[0].bucket,
+            Bucket::Conn(CONN),
+            "this connection is the first band"
+        );
+        assert_eq!(
+            bands[0].items[0].id,
+            id,
+            "a just-saved snippet is not the top row of the top band: bands {:?}",
+            bands
+                .iter()
+                .map(|g| (g.bucket, g.items.iter().map(|s| s.id).collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        );
+        // And the pack is really in the list it had to beat.
+        assert!(
+            all.iter().any(|s| s.source == Source::Builtin),
+            "the built-in pack must be part of the library under test"
+        );
+    }
+
+    /// The same composition, one revert at a time, so the test above cannot pass
+    /// for half a reason. Each of these is exactly one of `3684dd1`'s two token
+    /// edits, applied to an otherwise identical snippet.
+    #[test]
+    fn either_half_of_a_saved_snippet_alone_loses_the_top_row() {
+        const CONN: u64 = 7;
+        let mut older = snip(1, "aaa first alphabetically", Scope::Conn(CONN));
+        older.last_used = Some(1_000);
+        let user = vec![older];
+        let id = next_id(&user);
+
+        // Revert 1: engine-wide instead of this connection. It lands in the
+        // *second* band, below the other connection's rows.
+        let mut wrong_scope = new_saved(id, "zzz".into(), "SELECT 1".into(), CONN, 2_000);
+        wrong_scope.scope = Scope::Dialect(MY);
+        let mut all = library(&user, MY);
+        all.push(wrong_scope);
+        let bands = grouped(&all, MY, CONN, "");
+        assert_ne!(
+            bands[0].items[0].id, id,
+            "an engine-wide save must not reach the top of the connection band"
+        );
+
+        // Revert 2: right band, no stamp. It sorts by name, under every row
+        // that has been used.
+        let mut no_stamp = new_saved(id, "zzz".into(), "SELECT 1".into(), CONN, 2_000);
+        no_stamp.last_used = None;
+        let mut all = library(&user, MY);
+        all.push(no_stamp);
+        let bands = grouped(&all, MY, CONN, "");
+        assert_ne!(
+            bands[0].items[0].id, id,
+            "an unstamped save must not sort above a snippet that has been used"
+        );
     }
 }
