@@ -83,10 +83,15 @@ impl Default for DumpOptions {
 }
 
 impl DumpOptions {
-    /// Nothing to write — neither half was asked for. What the modal's button
-    /// gates on.
+    /// Nothing to write — none of the three sections was asked for. What the
+    /// modal's button gates on.
+    ///
+    /// **`other_objects` counts.** It is a peer checkbox in the modal, so ticking
+    /// it alone is a thing a user can do; leaving it out of this predicate left
+    /// the Export button permanently grey with a box ticked and nothing saying
+    /// why.
     pub fn is_empty(self) -> bool {
-        !self.structure && !self.data
+        !self.structure && !self.data && !self.other_objects
     }
 }
 
@@ -95,10 +100,23 @@ impl DumpOptions {
 pub enum DumpStep {
     /// SQL (or a comment) to write verbatim.
     Text(String),
-    /// A table to stream: run `select`, render the rows as `INSERT`s naming
-    /// `database`/`schema`/`table`, append them.
+    /// A table to stream: run `select` against `database`, render the rows as
+    /// `INSERT`s naming `insert_database`/`schema`/`table`, append them.
     Rows {
+        /// The database `select` reads from — the **source**.
         database: String,
+        /// How the generated `INSERT` names its target database. **Empty
+        /// wherever the file already points itself at one**, which is MySQL and
+        /// its `USE` line ([`target_database_sql`]).
+        ///
+        /// Not the same string as `database`, and the difference is the whole
+        /// point: the file's `CREATE`/`DROP` name a MySQL table bare, so editing
+        /// the `USE` line — the retarget gesture this module's own doc
+        /// prescribes — used to move the structure and leave every `INSERT`
+        /// pointed at the source. The target came back empty and every exported
+        /// row was written back into the live database it came from, with no
+        /// duplicate-key error to stop it and a success report at the end.
+        insert_database: String,
         schema: Option<String>,
         table: String,
         select: String,
@@ -115,6 +133,91 @@ pub struct DumpPlan {
     /// satisfy them all. The header says so, and the FK guard is what carries the
     /// file.
     pub cycles: bool,
+    /// Tables the user ticked that the dump's own fresh introspection could not
+    /// find — renamed, dropped, or permission-revoked between the picker and the
+    /// save dialog.
+    ///
+    /// **Reported, never silent.** The re-introspection is deliberate (a backup
+    /// of a shape the server no longer has is not a backup), but its cost is that
+    /// a selection can go stale, and a file one table short of what was ticked
+    /// looks exactly like a complete one. Only an *all* missing selection used to
+    /// say anything, while the sibling vanished-preselect case was named.
+    pub missing: Vec<String>,
+}
+
+impl DumpPlan {
+    /// How many tables the progress line counts against.
+    ///
+    /// **The tables that will be *streamed*, not [`DumpPlan::tables`].** A view
+    /// has structure and no rows, and a structure-only dump streams nothing at
+    /// all, so counting tables promises a "12 of 12" that never arrives.
+    pub fn streamed_tables(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|s| matches!(s, DumpStep::Rows { .. }))
+            .count()
+    }
+}
+
+/// How the reader half of a dump ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadEnd {
+    /// Every table streamed.
+    Clean,
+    /// The user stopped it.
+    Cancelled,
+    /// The server said no.
+    Failed(String),
+}
+
+/// How the writer half ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteEnd {
+    /// The file was published.
+    Wrote,
+    /// A disk or permission failure, in the writer's own words.
+    Failed(String),
+    /// The worker task itself did not come back.
+    Died(String),
+}
+
+/// What to report about a finished dump.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DumpVerdict {
+    Done,
+    Cancelled,
+    /// `partial` means a `.part` fragment is on disk and worth naming.
+    Failed {
+        message: String,
+        partial: bool,
+    },
+}
+
+/// Which of the two halves' endings the user is told about.
+///
+/// **Cancel is the reader's to declare; every other failure is the writer's to
+/// describe.** A cancelled read closes the channels, which the writer sees as an
+/// ordinary end of stream — on its own it would call a truncated file finished.
+/// Anything else (a full disk, a revoked permission) fails the *writer* first,
+/// and the reader then only ever sees "nobody is reading any more", which is a
+/// worse sentence than the real cause.
+///
+/// The five arms were written out inside an `async fn` that needs a `Db`, a
+/// runtime handle and two channels to reach, so nothing could test them: swapping
+/// two of them turns "The disk is full" into "connection reset" with the suite
+/// still green.
+pub fn dump_verdict(read: ReadEnd, write: WriteEnd) -> DumpVerdict {
+    let failed = |message: String| DumpVerdict::Failed {
+        message,
+        partial: true,
+    };
+    match (read, write) {
+        (ReadEnd::Cancelled, _) => DumpVerdict::Cancelled,
+        (_, WriteEnd::Failed(e)) => failed(e),
+        (_, WriteEnd::Died(e)) => failed(format!("Export failed: worker died: {e}")),
+        (ReadEnd::Failed(e), _) => failed(format!("Export failed: {e}")),
+        (ReadEnd::Clean, WriteEnd::Wrote) => DumpVerdict::Done,
+    }
 }
 
 /// The session switch that turns foreign-key enforcement off and back on, when
@@ -155,6 +258,63 @@ pub fn needs_fk_section(t: &TableInfo) -> bool {
             .as_deref()
             .map(str::trim)
             .is_some_and(|s| !s.is_empty())
+}
+
+/// What a `DROP` in this file has to carry to succeed on a database that still
+/// holds the objects depending on it.
+///
+/// **PostgreSQL, and only PostgreSQL.** MySQL and SQLite both have a session
+/// switch that turns foreign-key enforcement off for the whole load
+/// ([`fk_guard_sql`]); PostgreSQL's is superuser-only and returns `None` there,
+/// so nothing else in the file protects the `DROP`. Replaying a default dump onto
+/// the database it came from — the primary way anyone tests a dump — stopped at
+/// the first parent table with *"cannot drop table customers because other
+/// objects depend on it"*, and the rest of the file was never reached.
+///
+/// `CASCADE` drops the dependants too, which is right precisely because this file
+/// is about to recreate them: the section below it is their `CREATE`, and the
+/// closing constraints section puts the keys back.
+pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Postgres => " CASCADE",
+        SqlDialect::MySql | SqlDialect::Sqlite => "",
+    }
+}
+
+/// The statements that make the file's own container before it is used —
+/// `CREATE DATABASE` on MySQL, `CREATE SCHEMA` for every non-default namespace
+/// on PostgreSQL.
+///
+/// **The primary use case is a restore onto a fresh server**, and without these
+/// the file failed on line 1: MySQL's `USE shop` is `ERROR 1049 Unknown database`,
+/// and a PostgreSQL table in `sales` is `schema "sales" does not exist`.
+/// `mysqldump --databases` emits the same `CREATE DATABASE IF NOT EXISTS`, for
+/// the same reason.
+///
+/// `IF NOT EXISTS` throughout, because the *other* use case — replaying onto the
+/// database it came from — must not start with an error either.
+///
+/// PostgreSQL gets no `CREATE DATABASE`: it cannot be run from inside the
+/// database being restored into, and the connection is already pointed at one.
+/// `public` is skipped — every PostgreSQL database has it.
+pub fn create_container_sql(
+    dialect: SqlDialect,
+    database: &str,
+    namespaces: &[Option<String>],
+) -> Vec<String> {
+    match dialect {
+        SqlDialect::MySql => vec![format!(
+            "CREATE DATABASE IF NOT EXISTS {};",
+            ident_sql(database, dialect)
+        )],
+        SqlDialect::Postgres => namespaces
+            .iter()
+            .filter_map(|ns| ns.as_deref())
+            .filter(|ns| *ns != "public")
+            .map(|ns| format!("CREATE SCHEMA IF NOT EXISTS {};", ident_sql(ns, dialect)))
+            .collect(),
+        SqlDialect::Sqlite => Vec::new(),
+    }
 }
 
 /// The statement that points the rest of the file at one database, where the
@@ -202,14 +362,129 @@ pub fn exported_columns(t: &TableInfo) -> Vec<&str> {
         .collect()
 }
 
-/// Does `fk` point at `cand`?
+/// The tables of one namespace, out of the whole database's list.
 ///
-/// A key with no namespace of its own means "in mine" — which is every key on
-/// MySQL, where the server reports the *database* and the table carries no
-/// namespace at all. Only two namespaces that both exist and differ are a miss.
-fn fk_targets(fk: &crate::schema::ForeignKeyInfo, cand: &TableInfo) -> bool {
+/// `names` are `display_name`s — `schema.table`, or a bare name where the
+/// namespace is the default one. `namespace` is `None` when the picker was opened
+/// on a database rather than on a PostgreSQL schema, and then everything stays.
+///
+/// **Through [`crate::schema::sql_qualifier`], not a bare `"{ns}."` prefix.**
+/// `display_name` *omits* `public`, so matching on the prefix filtered a `public`
+/// dump down to nothing — none of its tables carries one. `None` from the
+/// qualifier means "the unqualified ones are mine", which is exactly the set to
+/// keep.
+pub fn tables_in_namespace(names: &[String], namespace: Option<&str>) -> Vec<String> {
+    let Some(ns) = namespace else {
+        return names.to_vec();
+    };
+    match crate::schema::sql_qualifier(Some(ns)) {
+        Some(q) => {
+            let prefix = format!("{q}.");
+            names
+                .iter()
+                .filter(|n| n.starts_with(&prefix))
+                .cloned()
+                .collect()
+        }
+        None => names.iter().filter(|n| !n.contains('.')).cloned().collect(),
+    }
+}
+
+/// What the Export picker opens with: the ticked tables, and the message to show
+/// if the click named one that is not there.
+///
+/// Everything is ticked when the picker was opened on a *database* — the common
+/// case is "all of it", and unticking a few is less work than ticking forty. When
+/// it was opened on a *table*, that one table instead: the click said which one,
+/// and re-ticking the other thirty-nine is the opposite of what was asked.
+///
+/// **A preselect the list does not contain is named**, not silently ignored. The
+/// table was dropped or renamed since the tree last refreshed, and a modal that
+/// opens with a full list, nothing ticked and a dead Export button reads as broken
+/// rather than as an answer.
+pub fn initial_selection(
+    names: &[String],
+    preselect: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    match preselect {
+        None => (names.to_vec(), None),
+        Some(t) if names.iter().any(|n| n == t) => (vec![t.to_string()], None),
+        Some(t) => (
+            Vec::new(),
+            Some(format!(
+                "{t} is no longer in this database — pick the tables to export."
+            )),
+        ),
+    }
+}
+
+/// The statements that put a table's key counter back where the data left it.
+///
+/// **PostgreSQL only, and it is the difference between a restore that works and
+/// one that reports success and then fails.** The rows come back with their
+/// original keys — [`exported_columns`] carries a `serial` or a
+/// `GENERATED BY DEFAULT AS IDENTITY` column deliberately, because someone
+/// re-importing their own keys wants them — but an *explicit* insert does not
+/// advance the sequence behind the column. The restored table therefore holds
+/// keys 1..10000 with its counter still at 1, and the first ordinary insert
+/// afterwards is a duplicate-key error that repeats until the counter catches up.
+/// Live-verified; `pg_dump` emits the same `setval` for the same reason.
+///
+/// MySQL needs none: `AUTO_INCREMENT` is a table property the server raises as
+/// rows land. SQLite's `sqlite_sequence` is maintained the same way.
+///
+/// The statement is written so that a column with **no** sequence behind it is a
+/// no-op rather than an error: `pg_get_serial_sequence` answers `NULL` there, and
+/// `setval(NULL, …)` would fail the load. Selecting through a subquery with a
+/// `WHERE … IS NOT NULL` means no row is produced and `setval` is never called —
+/// which also covers an empty table, where there is no maximum to set.
+///
+/// Gated on the **capability** — [`crate::ddl::supports_sequence_resync`], an
+/// exhaustive `match` — rather than on `dialect != Postgres`, which would sort a
+/// fourth engine onto MySQL's side without a comparison to grep for.
+pub fn sequence_resync_sql(t: &TableInfo, dialect: SqlDialect) -> Vec<String> {
+    if !crate::ddl::supports_sequence_resync(dialect) || t.is_view {
+        return Vec::new();
+    }
+    let q = |s: &str| ident_sql(s, dialect);
+    let table = match crate::schema::sql_qualifier(t.schema.as_deref()) {
+        Some(s) => format!("{}.{}", q(s), q(&t.name)),
+        None => q(&t.name),
+    };
+    t.columns
+        .iter()
+        .filter(|c| c.auto_increment && c.generated.is_none())
+        .map(|c| {
+            format!(
+                "SELECT setval(s, v) FROM (SELECT pg_get_serial_sequence({}, {}) AS s, \
+                 (SELECT MAX({}) FROM {table}) AS v) r WHERE s IS NOT NULL AND v IS NOT NULL;",
+                crate::schema::ddl_string(&table, dialect),
+                crate::schema::ddl_string(&c.name, dialect),
+                q(&c.name),
+            )
+        })
+        .collect()
+}
+
+/// Does `fk`, declared on `owner`, point at `cand`?
+///
+/// A key with no namespace of its own means **"in `owner`'s"** — not "in any".
+/// The distinction was invisible while the premise held that only MySQL leaves
+/// `ref_schema` empty, where there are no namespaces to confuse; PostgreSQL
+/// leaves it empty too (`grep ref_schema` over `schemaic-db` finds no writer for
+/// it), so a selection spanning two schemas matched a key on nothing but the
+/// table's *name*. A `sales.orders` key was then restated bare against a
+/// same-named `archive.orders`, and counted as carried rather than as one of the
+/// keys `dropped_fks` reports.
+///
+/// Only two namespaces that both exist and differ are a miss: one side unknown
+/// still cannot be answered no.
+fn fk_targets(fk: &crate::schema::ForeignKeyInfo, owner: &TableInfo, cand: &TableInfo) -> bool {
     fk.ref_table == cand.name
-        && match (fk.ref_schema.as_deref(), cand.schema.as_deref()) {
+        && match (
+            fk.ref_schema.as_deref().or(owner.schema.as_deref()),
+            cand.schema.as_deref(),
+        ) {
             (Some(a), Some(b)) => a == b,
             _ => true,
         }
@@ -225,20 +500,24 @@ fn fk_targets(fk: &crate::schema::ForeignKeyInfo, cand: &TableInfo) -> bool {
 /// so one edge is broken at the smallest name — the file still carries every
 /// table, and [`DumpPlan::cycles`] is what tells the reader the order alone
 /// can't be trusted.
-pub fn order_tables(tables: &[TableInfo], chosen: &[String]) -> (Vec<usize>, bool) {
+pub fn order_tables(
+    tables: &[TableInfo],
+    chosen: &[String],
+    dialect: SqlDialect,
+) -> (Vec<usize>, bool) {
     let key = |i: usize| display_name(tables[i].schema.as_deref(), &tables[i].name);
     let mut picked: Vec<usize> = (0..tables.len())
         .filter(|&i| chosen.iter().any(|c| *c == key(i)))
         .collect();
     picked.sort_by_key(|&i| key(i));
-    // Views last, whatever their name: a view's body selects from the tables
-    // above it, and it holds no rows to order against anything.
+    // Views after every base table: a view's body selects from the tables above
+    // it, and it holds no rows to order against anything.
     let (views, base): (Vec<usize>, Vec<usize>) =
         picked.into_iter().partition(|&i| tables[i].is_view);
 
     // Edges point *into* the table that has to wait. A self-reference is not an
     // edge — it is one table, and it can only ever be created before itself.
-    let waits_for: Vec<Vec<usize>> = base
+    let base_edges: Vec<Vec<usize>> = base
         .iter()
         .map(|&i| {
             base.iter()
@@ -248,32 +527,76 @@ pub fn order_tables(tables: &[TableInfo], chosen: &[String]) -> (Vec<usize>, boo
                         && tables[i]
                             .foreign_keys
                             .iter()
-                            .any(|fk| fk_targets(fk, &tables[j]))
+                            .any(|fk| fk_targets(fk, &tables[i], &tables[j]))
                 })
                 .map(|(pos, _)| pos)
                 .collect()
         })
         .collect();
 
-    let mut done = vec![false; base.len()];
+    // **Views need the same treatment, for a different reason.** Sorting them by
+    // name put a view built on another view first, and `CREATE VIEW … SELECT …
+    // FROM other_view` on a target where `other_view` does not exist yet is
+    // ERROR 1146 — after `DROP VIEW IF EXISTS` has already removed it from that
+    // target. The dependency walk above is built from `foreign_keys`, and a view
+    // has none, so nothing ordered them at all.
+    //
+    // A view's edges are the other picked views its body names, matched as whole
+    // words in code (`intel::code_word_hits`) so a name inside a comment, a
+    // string literal or a longer identifier is not an edge.
+    let view_edges: Vec<Vec<usize>> = views
+        .iter()
+        .map(|&i| {
+            let Some(def) = tables[i].view_definition.as_deref() else {
+                return Vec::new();
+            };
+            // Lexed **once** per definition, then asked about every candidate
+            // name. `code_word_hits` builds this mask itself, so calling it in
+            // the loop below re-lexed each definition once per picked view.
+            let code = crate::intel::code_mask(def, dialect);
+            views
+                .iter()
+                .enumerate()
+                .filter(|&(_, &j)| {
+                    j != i
+                        && !crate::intel::code_word_hits_in(def, &code, &tables[j].name).is_empty()
+                })
+                .map(|(pos, _)| pos)
+                .collect()
+        })
+        .collect();
+
+    let (base_order, base_cycle) = topo_order(&base_edges);
+    let (view_order, view_cycle) = topo_order(&view_edges);
     let mut out: Vec<usize> = Vec::with_capacity(base.len() + views.len());
+    out.extend(base_order.into_iter().map(|p| base[p]));
+    out.extend(view_order.into_iter().map(|p| views[p]));
+    (out, base_cycle || view_cycle)
+}
+
+/// Positions `0..waits_for.len()` in an order where every member comes after the
+/// ones it waits for, plus whether a cycle had to be broken.
+///
+/// The caller passes members **already in name order**, so "the first ready one"
+/// is the name tie-break and two dumps of one schema are byte-identical.
+fn topo_order(waits_for: &[Vec<usize>]) -> (Vec<usize>, bool) {
+    let n = waits_for.len();
+    let mut done = vec![false; n];
+    let mut out: Vec<usize> = Vec::with_capacity(n);
     let mut cycles = false;
-    for _ in 0..base.len() {
-        // The first *ready* one — `base` is already in name order, so "first"
-        // is the name tie-break, and two dumps of one schema are byte-identical.
-        let next = (0..base.len())
+    for _ in 0..n {
+        let next = (0..n)
             .find(|&p| !done[p] && waits_for[p].iter().all(|&d| done[d]))
             .or_else(|| {
                 // Nothing is ready and something is left: a cycle. Break it at
                 // the smallest name and say so.
                 cycles = true;
-                (0..base.len()).find(|&p| !done[p])
+                (0..n).find(|&p| !done[p])
             });
         let Some(p) = next else { break };
         done[p] = true;
-        out.push(base[p]);
+        out.push(p);
     }
-    out.extend(views);
     (out, cycles)
 }
 
@@ -292,11 +615,36 @@ pub fn plan(
     if opts.is_empty() {
         return DumpPlan::default();
     }
-    let (order, cycles) = order_tables(&schema.tables, chosen);
+    let (order, cycles) = order_tables(&schema.tables, chosen, dialect);
+    // Everything ticked that this introspection could not resolve. Computed even
+    // when nothing resolved, so the empty-plan arm can carry it too.
+    let missing: Vec<String> = chosen
+        .iter()
+        .filter(|c| {
+            !order.iter().any(|&i| {
+                display_name(schema.tables[i].schema.as_deref(), &schema.tables[i].name) == **c
+            })
+        })
+        .cloned()
+        .collect();
     if order.is_empty() {
-        return DumpPlan::default();
+        return DumpPlan {
+            missing,
+            ..DumpPlan::default()
+        };
     }
     let q = |s: &str| ident_sql(s, dialect);
+    // Only the namespaces the chosen tables live in: a dump of `sales` has no
+    // business recreating `archive`'s types — nor creating `archive` itself.
+    let namespaces: Vec<Option<String>> = {
+        let mut ns: Vec<Option<String>> = order
+            .iter()
+            .map(|&i| schema.tables[i].schema.clone())
+            .collect();
+        ns.sort();
+        ns.dedup();
+        ns
+    };
     // The same qualification `TableInfo::create_ddl` uses, so a `DROP` names the
     // table its `CREATE` is about to make.
     let qname = |t: &TableInfo| match crate::schema::sql_qualifier(t.schema.as_deref()) {
@@ -328,7 +676,7 @@ pub fn plan(
                 .foreign_keys
                 .iter()
                 .cloned()
-                .partition(|fk| order.iter().any(|&j| fk_targets(fk, &schema.tables[j])));
+                .partition(|fk| order.iter().any(|&j| fk_targets(fk, t, &schema.tables[j])));
             dropped_fks += elsewhere.len();
             if here.is_empty() {
                 continue;
@@ -401,6 +749,19 @@ pub fn plan(
             ));
         }
     }
+    // A ticked table the fresh introspection could not find. Said here as well as
+    // in the modal's report, because the file outlives the modal and this is what
+    // makes it a backup that is one table short rather than one that looks whole.
+    if !missing.is_empty() {
+        header.push_str(&format!(
+            "\n--\n-- {} {} ticked for export {} not found when the file was written\n\
+             -- (renamed, dropped, or no longer readable): {}.",
+            missing.len(),
+            crate::text::plural(missing.len(), "table", "tables"),
+            crate::text::plural(missing.len(), "was", "were"),
+            missing.join(", "),
+        ));
+    }
     // Said in the file, because the file is where it will be noticed: a restore
     // that comes back without a constraint it used to have is worth one line.
     if dropped_fks > 0 {
@@ -414,6 +775,14 @@ pub fn plan(
     }
     text!(header);
 
+    // The container before the thing that enters it: `USE shop` on a server that
+    // has no `shop` is ERROR 1049 on line 1, and restoring onto a fresh server is
+    // what a dump is mostly for.
+    if opts.structure {
+        for sql in create_container_sql(dialect, database, &namespaces) {
+            text!(sql);
+        }
+    }
     if let Some(sql) = target_database_sql(dialect, database) {
         text!(sql);
     }
@@ -432,18 +801,20 @@ pub fn plan(
     }
 
     // ── Standalone objects the tables lean on ────────────────────────────────
-    if opts.structure && opts.other_objects {
-        // Only the namespaces the chosen tables live in: a dump of `sales` has no
-        // business recreating `archive`'s types.
-        let namespaces: Vec<Option<String>> = {
-            let mut ns: Vec<Option<String>> = order
-                .iter()
-                .map(|&i| schema.tables[i].schema.clone())
-                .collect();
-            ns.sort();
-            ns.dedup();
-            ns
-        };
+    //
+    // **Split in two, and the split is the ordering rule**
+    // `DbSchema::create_ddl_script` already states: a *type* is what a column is
+    // declared with, so it has to exist before the table; a *routine* reads the
+    // tables, so it cannot be created until they do. With `check_function_bodies`
+    // on — PostgreSQL's default — a `LANGUAGE sql` function naming a table that
+    // is not there yet fails at `CREATE`, and the whole array used to be emitted
+    // ahead of the table loop.
+    let mut routines: Vec<String> = Vec::new();
+    // **`other_objects` alone, not `structure && other_objects`.** The modal
+    // draws it as a peer of Structure and Data, so ticking it by itself asks for
+    // a file of the database's types, sequences and routines — a coherent thing
+    // to want, and one that silently emitted nothing.
+    if opts.other_objects {
         let kinds = [
             ObjectKind::Enum,
             ObjectKind::Domain,
@@ -489,12 +860,20 @@ pub fn plan(
                     continue;
                 }
                 if namespaces.iter().any(|ns| ns.as_deref() == o.schema()) {
-                    objects.push(o.create_sql(dialect));
+                    let after_tables = matches!(
+                        kind,
+                        ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event
+                    );
+                    if after_tables {
+                        routines.push(o.create_sql(dialect));
+                    } else {
+                        objects.push(o.create_sql(dialect));
+                    }
                 }
             }
         }
         if !objects.is_empty() {
-            text!("-- Types, sequences and routines".to_string());
+            text!("-- Types and sequences".to_string());
             for o in objects {
                 text!(o);
             }
@@ -508,11 +887,22 @@ pub fn plan(
         if opts.structure {
             if opts.drop_if_exists {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
-                text!(format!("DROP {kw} IF EXISTS {};", qname(t)));
+                text!(format!(
+                    "DROP {kw} IF EXISTS {}{};",
+                    qname(t),
+                    drop_cascade(dialect)
+                ));
             }
             text!(t.create_ddl(dialect));
-            for tr in &t.triggers {
-                text!(tr.create_sql(dialect));
+            // **Through the shared client wrapper**, which is what puts
+            // `DELIMITER` around a compound body on MySQL. Written raw, the file
+            // died at the first `BEGIN … END` trigger with ERROR 1064 — after the
+            // `DROP` above it had already run against the target. The routine and
+            // event path has always gone through this; the trigger path did not.
+            if !t.triggers.is_empty() {
+                let bodies: Vec<String> =
+                    t.triggers.iter().map(|tr| tr.create_sql(dialect)).collect();
+                text!(crate::ddl::client_script(&bodies, dialect));
             }
         }
         // Named columns, never `*` — see [`exported_columns`]. A table the server
@@ -522,6 +912,14 @@ pub fn plan(
         if opts.data && !t.is_view && !cols.is_empty() {
             steps.push(DumpStep::Rows {
                 database: database.to_string(),
+                // Whatever `target_database_sql` wrote is what the `INSERT`s
+                // inherit: where the file points itself at a database, they must
+                // not name one, or the retarget gesture moves half the file.
+                insert_database: if target_database_sql(dialect, database).is_some() {
+                    String::new()
+                } else {
+                    database.to_string()
+                },
                 schema: t.schema.clone(),
                 table: t.name.clone(),
                 select: format!(
@@ -531,6 +929,28 @@ pub fn plan(
                 ),
             });
         }
+    }
+
+    // ── Key counters, once the rows they have to clear are in ────────────────
+    if opts.data {
+        let resync: Vec<String> = order
+            .iter()
+            .flat_map(|&i| sequence_resync_sql(&schema.tables[i], dialect))
+            .collect();
+        if !resync.is_empty() {
+            steps.push(DumpStep::Text("-- Key sequences".to_string()));
+            steps.extend(resync.into_iter().map(DumpStep::Text));
+        }
+    }
+
+    // ── Routines and events, once the tables they read exist ─────────────────
+    if !routines.is_empty() {
+        steps.push(DumpStep::Text("-- Routines and events".to_string()));
+        // Through the client wrapper, so a MySQL compound body gets its
+        // `DELIMITER` — the same rule the triggers above follow.
+        steps.push(DumpStep::Text(crate::ddl::client_script(
+            &routines, dialect,
+        )));
     }
 
     // ── Foreign keys, once every table is filled ─────────────────────────────
@@ -550,6 +970,7 @@ pub fn plan(
         steps,
         tables: order.len(),
         cycles,
+        missing,
     }
 }
 
@@ -667,7 +1088,7 @@ mod tests {
     fn a_referenced_table_is_created_before_the_table_referencing_it() {
         // `orders` → `customers`, declared in the wrong order on purpose.
         let s = schema_of(vec![refs(table("orders"), "customers"), table("customers")]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s));
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
         assert_eq!(names(&s, &order), vec!["customers", "orders"]);
         assert!(!cycles);
     }
@@ -680,7 +1101,7 @@ mod tests {
             refs(table("products"), "customers"),
             table("customers"),
         ]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s));
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
         let out = names(&s, &order);
         assert!(!cycles);
         assert_eq!(out[0], "customers");
@@ -694,7 +1115,7 @@ mod tests {
     fn a_self_reference_is_not_a_cycle() {
         // An employee's manager is an employee. One table, orderable.
         let s = schema_of(vec![refs(table("employees"), "employees")]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s));
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
         assert_eq!(names(&s, &order), vec!["employees"]);
         assert!(!cycles, "a self-reference orders fine — it is one table");
     }
@@ -702,7 +1123,7 @@ mod tests {
     #[test]
     fn a_two_table_cycle_still_dumps_every_table_and_says_so() {
         let s = schema_of(vec![refs(table("a"), "b"), refs(table("b"), "a")]);
-        let (order, cycles) = order_tables(&s.tables, &all(&s));
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
         assert!(
             cycles,
             "no order satisfies both keys — the caller must know"
@@ -713,7 +1134,7 @@ mod tests {
     #[test]
     fn an_fk_to_a_table_outside_the_selection_does_not_order_it_in() {
         let s = schema_of(vec![refs(table("orders"), "archive"), table("archive")]);
-        let (order, cycles) = order_tables(&s.tables, &["orders".to_string()]);
+        let (order, cycles) = order_tables(&s.tables, &["orders".to_string()], SqlDialect::MySql);
         assert_eq!(names(&s, &order), vec!["orders"]);
         assert!(!cycles);
     }
@@ -721,14 +1142,14 @@ mod tests {
     #[test]
     fn views_come_after_every_base_table() {
         let s = schema_of(vec![view("v_recent"), table("orders"), table("customers")]);
-        let (order, _) = order_tables(&s.tables, &all(&s));
+        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
         assert_eq!(names(&s, &order).last().unwrap(), "v_recent");
     }
 
     #[test]
     fn ties_break_by_name_so_two_dumps_of_one_schema_match() {
         let s = schema_of(vec![table("zebra"), table("apple"), table("mango")]);
-        let (order, _) = order_tables(&s.tables, &all(&s));
+        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
         assert_eq!(names(&s, &order), vec!["apple", "mango", "zebra"]);
     }
 
@@ -1296,16 +1717,519 @@ mod tests {
         assert_eq!(p.tables, 3);
     }
 
+    // ── which of the two halves' failures the user is told about ─────────────
+
+    /// The rule, and the reason it is not symmetric: a cancelled read closes the
+    /// channels, which the writer sees as an ordinary end of stream — so on its
+    /// own the writer would call a truncated file finished.
     #[test]
-    fn nothing_at_all_is_planned_when_neither_half_was_asked_for() {
+    fn a_cancel_is_the_readers_to_declare_whatever_the_writer_saw() {
+        for write in [
+            WriteEnd::Wrote,
+            WriteEnd::Failed("disk full".to_string()),
+            WriteEnd::Died("panic".to_string()),
+        ] {
+            assert_eq!(
+                dump_verdict(ReadEnd::Cancelled, write.clone()),
+                DumpVerdict::Cancelled,
+                "{write:?}"
+            );
+        }
+    }
+
+    /// And the other direction: anything that is *not* a cancel failed the writer
+    /// first, and the reader then only ever saw "nobody is reading any more".
+    /// Preferring the reader's words there is how "The disk is full" became
+    /// "connection reset".
+    #[test]
+    fn the_writers_words_win_over_the_readers_for_a_real_failure() {
+        assert_eq!(
+            dump_verdict(
+                ReadEnd::Failed("connection reset".to_string()),
+                WriteEnd::Failed("Export failed: disk full".to_string())
+            ),
+            DumpVerdict::Failed {
+                message: "Export failed: disk full".to_string(),
+                partial: true,
+            }
+        );
+        // A worker that did not come back is named as such.
+        assert_eq!(
+            dump_verdict(ReadEnd::Clean, WriteEnd::Died("panicked".to_string())),
+            DumpVerdict::Failed {
+                message: "Export failed: worker died: panicked".to_string(),
+                partial: true,
+            }
+        );
+        // The reader's reason is used only when the writer had none.
+        assert_eq!(
+            dump_verdict(
+                ReadEnd::Failed("connection reset".to_string()),
+                WriteEnd::Wrote
+            ),
+            DumpVerdict::Failed {
+                message: "Export failed: connection reset".to_string(),
+                partial: true,
+            }
+        );
+    }
+
+    #[test]
+    fn only_two_clean_halves_are_a_finished_dump() {
+        assert_eq!(
+            dump_verdict(ReadEnd::Clean, WriteEnd::Wrote),
+            DumpVerdict::Done
+        );
+    }
+
+    /// A view has structure and no rows, and a structure-only dump streams
+    /// nothing at all — so counting *tables* promised a "12 of 12" the progress
+    /// line never reached.
+    #[test]
+    fn the_progress_denominator_counts_what_will_actually_stream() {
+        let s = schema_of(vec![table("orders"), view("v_orders")]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+        assert_eq!(p.tables, 2, "the file covers both");
+        assert_eq!(p.streamed_tables(), 1, "only one of them has rows");
+
+        let structure_only = DumpOptions {
+            data: false,
+            ..Default::default()
+        };
+        let p = plan(&s, "shop", &all(&s), structure_only, SqlDialect::MySql);
+        assert_eq!(p.streamed_tables(), 0);
+    }
+
+    // ── what the picker opens with ───────────────────────────────────────────
+
+    #[test]
+    fn a_namespace_keeps_its_own_tables_and_public_keeps_the_unqualified_ones() {
+        let names = [
+            "orders".to_string(),
+            "customers".to_string(),
+            "sales.orders".to_string(),
+            "archive.orders".to_string(),
+        ];
+        assert_eq!(
+            tables_in_namespace(&names, Some("sales")),
+            vec!["sales.orders".to_string()]
+        );
+        // **`public` is the trap.** `display_name` omits it, so a `"public."`
+        // prefix match filters a `public` dump down to nothing.
+        assert_eq!(
+            tables_in_namespace(&names, Some("public")),
+            vec!["orders".to_string(), "customers".to_string()]
+        );
+        // Opened on a database rather than a namespace: everything stays.
+        assert_eq!(tables_in_namespace(&names, None), names.to_vec());
+    }
+
+    #[test]
+    fn the_picker_ticks_everything_unless_a_table_was_named() {
+        let names = ["orders".to_string(), "customers".to_string()];
+        assert_eq!(
+            initial_selection(&names, None),
+            (names.to_vec(), None),
+            "opened on a database: all of it"
+        );
+        assert_eq!(
+            initial_selection(&names, Some("orders")),
+            (vec!["orders".to_string()], None),
+            "opened on a table: that table"
+        );
+    }
+
+    /// A modal that opens with a full list, nothing ticked and a dead Export
+    /// button reads as broken. The table was dropped or renamed since the tree
+    /// last refreshed, and that is worth a sentence.
+    #[test]
+    fn a_preselect_the_list_has_lost_is_named() {
+        let names = ["orders".to_string()];
+        let (chosen, error) = initial_selection(&names, Some("gone"));
+        assert!(chosen.is_empty());
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("gone")),
+            "{error:?}"
+        );
+    }
+
+    // ── the file has to address one database, and it has to be the target ────
+
+    /// The Critical: `DROP`/`CREATE` name a MySQL table bare so the `USE` line is
+    /// the one thing to edit, while the `INSERT`s qualified with the **source**.
+    /// Editing that line — the retarget this module's own doc prescribes — left
+    /// the target empty and refilled the live source, with a success report.
+    #[test]
+    fn a_mysql_insert_does_not_name_the_source_database_the_use_line_already_points_at() {
+        let s = schema_of(vec![table("orders")]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+        let DumpStep::Rows {
+            database,
+            insert_database,
+            ..
+        } = p
+            .steps
+            .iter()
+            .find(|s| matches!(s, DumpStep::Rows { .. }))
+            .expect("a data step")
+        else {
+            unreachable!()
+        };
+        // The read still comes from the source; only the write target is bare.
+        assert_eq!(database, "shop");
+        assert_eq!(insert_database, "");
+        // And that is exactly what `qualified_table` renders as a bare name, so
+        // the `INSERT` matches the `CREATE` above it.
+        assert_eq!(
+            qualified_table(insert_database, None, "orders", SqlDialect::MySql),
+            "`orders`"
+        );
+        assert_eq!(
+            qualified_table(database, None, "orders", SqlDialect::MySql),
+            "`shop`.`orders`"
+        );
+    }
+
+    /// The counterweight: PostgreSQL has no `USE` line, so its `INSERT`s must
+    /// keep naming the namespace — both halves of the file agree there already.
+    #[test]
+    fn a_postgres_insert_keeps_its_namespace() {
+        let mut t = table("orders");
+        t.schema = Some("sales".to_string());
+        let s = schema_of(vec![t]);
+        let p = plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        );
+        let DumpStep::Rows {
+            insert_database,
+            schema,
+            ..
+        } = p
+            .steps
+            .iter()
+            .find(|s| matches!(s, DumpStep::Rows { .. }))
+            .expect("a data step")
+        else {
+            unreachable!()
+        };
+        assert_eq!(insert_database, "shop");
+        assert_eq!(schema.as_deref(), Some("sales"));
+    }
+
+    // ── the file has to be replayable ────────────────────────────────────────
+
+    /// A compound trigger body holds its own semicolons; without `DELIMITER` the
+    /// file dies at the first one (live ERROR 1064) — after the `DROP` above it
+    /// has already run against the target.
+    #[test]
+    fn a_mysql_trigger_is_wrapped_for_a_client_that_splits_on_semicolons() {
+        let mut t = table("orders");
+        t.triggers.push(TriggerInfo {
+            name: "trg_orders".to_string(),
+            table: "orders".to_string(),
+            timing: TriggerTiming::Before,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Body("BEGIN\n  SET NEW.id = 1;\nEND".to_string()),
+            ..Default::default()
+        });
+        let s = schema_of(vec![t]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        assert!(file.contains("DELIMITER $$"), "{file}");
+        assert!(file.contains("DELIMITER ;"), "{file}");
+    }
+
+    /// PostgreSQL has no FK guard an ordinary role can throw, so a bare `DROP`
+    /// stopped the very case a dump is most often tested with — replaying onto
+    /// the database it came from.
+    #[test]
+    fn a_postgres_drop_cascades_and_the_others_do_not() {
+        assert_eq!(drop_cascade(SqlDialect::Postgres), " CASCADE");
+        assert_eq!(drop_cascade(SqlDialect::MySql), "");
+        assert_eq!(drop_cascade(SqlDialect::Sqlite), "");
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let s = schema_of(vec![t]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        // `public` is the default namespace, so `sql_qualifier` leaves it off —
+        // the point here is the ` CASCADE`, and that the `DROP` still names the
+        // table its `CREATE` is about to make.
+        assert!(
+            text.contains(r#"DROP TABLE IF EXISTS "orders" CASCADE;"#),
+            "{text}"
+        );
+    }
+
+    /// `USE shop` on a server with no `shop` is ERROR 1049 on line 1, and
+    /// restoring onto a fresh server is the primary use case.
+    #[test]
+    fn the_file_creates_its_own_container_before_entering_it() {
+        let s = schema_of(vec![table("orders")]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        let create = text
+            .find("CREATE DATABASE IF NOT EXISTS `shop`;")
+            .expect("a CREATE DATABASE");
+        let use_line = text.find("USE `shop`;").expect("a USE");
+        assert!(create < use_line, "{text}");
+
+        // PostgreSQL: the namespace, not the database — the connection is already
+        // pointed at one, and `public` always exists.
+        let mut t = table("orders");
+        t.schema = Some("sales".to_string());
+        let s = schema_of(vec![t]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(
+            text.contains(r#"CREATE SCHEMA IF NOT EXISTS "sales";"#),
+            "{text}"
+        );
+        assert!(!text.contains("CREATE DATABASE"), "{text}");
+
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let s = schema_of(vec![t]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        assert!(!text.contains("CREATE SCHEMA"), "{text}");
+    }
+
+    /// A view on a view was created first because views left in *name* order and
+    /// the dependency walk is built from foreign keys, which a view has none of.
+    /// Live ERROR 1146 — and `DROP VIEW IF EXISTS` had already removed it.
+    #[test]
+    fn a_view_built_on_another_view_comes_after_it() {
+        let mut base = view("a_summary");
+        base.view_definition = Some("SELECT * FROM orders".to_string());
+        let mut on_top = view("b_detail");
+        on_top.view_definition = Some("SELECT * FROM z_totals".to_string());
+        let mut last = view("z_totals");
+        last.view_definition = Some("SELECT * FROM orders".to_string());
+        let s = schema_of(vec![table("orders"), base, on_top, last]);
+        let (order, cycles) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        assert!(!cycles);
+        let got = names(&s, &order);
+        let at = |n: &str| got.iter().position(|g| g == n).unwrap();
+        assert!(at("z_totals") < at("b_detail"), "{got:?}");
+        // Base tables still come before every view, and ties are still by name.
+        assert_eq!(got[0], "orders");
+        assert!(at("a_summary") < at("b_detail"), "{got:?}");
+    }
+
+    /// The counterweight to the scan: a name inside a comment or a string
+    /// literal is not a dependency, and neither is one buried in a longer
+    /// identifier.
+    #[test]
+    fn a_view_name_that_is_only_mentioned_is_not_a_dependency() {
+        let mut first = view("a_view");
+        first.view_definition =
+            Some("-- see z_view\nSELECT 'z_view' AS note, z_view_backup FROM orders".to_string());
+        let s = schema_of(vec![table("orders"), first, view("z_view")]);
+        let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
+        let got = names(&s, &order);
+        // No edge, so the name tie-break stands.
+        assert_eq!(got, vec!["orders", "a_view", "z_view"]);
+    }
+
+    /// A `LANGUAGE sql` function naming a table that does not exist yet fails at
+    /// `CREATE` with `check_function_bodies` on — PostgreSQL's default — and the
+    /// whole standalone-object array was emitted ahead of the table loop.
+    #[test]
+    fn routines_come_after_the_tables_they_read() {
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        s.routines
+            .push(std::sync::Arc::new(crate::schema::RoutineInfo {
+                name: "orders_count".to_string(),
+                schema: Some("public".to_string()),
+                kind: crate::schema::RoutineKind::Function,
+                language: "sql".to_string(),
+                body: "SELECT count(*) FROM orders".to_string(),
+                ..Default::default()
+            }));
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let routines = file
+            .find("-- Routines and events")
+            .expect("a routine section");
+        let table_ddl = file.find("CREATE TABLE").expect("the table");
+        assert!(table_ddl < routines, "{file}");
+    }
+
+    /// The rows come back with their keys, but an explicit insert does not move
+    /// the sequence: the first ordinary insert after a "successful" restore is a
+    /// duplicate-key error, and it repeats until the counter catches up.
+    #[test]
+    fn a_postgres_key_counter_is_moved_past_the_rows_that_were_loaded() {
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        t.columns[0].auto_increment = true;
+        let s = schema_of(vec![t]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        let setval = file.find("setval").expect("a setval");
+        let rows = file.find("<<rows orders").expect("the data step");
+        assert!(rows < setval, "the counter is set from the rows: {file}");
+        assert!(file.contains("pg_get_serial_sequence"), "{file}");
+        // A column with no sequence behind it, and an empty table, both have to
+        // be no-ops rather than errors.
+        assert!(
+            file.contains("WHERE s IS NOT NULL AND v IS NOT NULL"),
+            "{file}"
+        );
+
+        // MySQL and SQLite maintain their counters as rows land.
+        for dialect in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), dialect));
+            assert!(!file.contains("setval"), "{dialect:?}: {file}");
+        }
+    }
+
+    /// A key with no namespace means "in the owner's", not "in any": a selection
+    /// spanning two schemas matched on the table's *name* alone, so a
+    /// `sales.orders` key was restated bare against `archive.orders` — and
+    /// counted as carried rather than reported as dropped.
+    #[test]
+    fn a_key_without_a_namespace_means_the_owners_not_any() {
+        let mut owner = refs(table("lines"), "orders");
+        owner.schema = Some("sales".to_string());
+        let mut other = table("orders");
+        other.schema = Some("archive".to_string());
+        let s = schema_of(vec![owner, other]);
+        let text = text_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::Postgres,
+        ));
+        // The key points into `sales`, which is not in the file: dropped, and
+        // said so — not restated against the `archive` table that happens to
+        // share the name.
+        assert!(text.contains("foreign key is not restated"), "{text}");
+        assert!(!text.contains("ADD CONSTRAINT"), "{text}");
+    }
+
+    /// The re-introspection is deliberate, but its cost is that a selection can
+    /// go stale — and a file one table short of what was ticked looks exactly
+    /// like a whole one.
+    #[test]
+    fn a_ticked_table_that_vanished_is_named_rather_than_dropped_in_silence() {
+        let s = schema_of(vec![table("orders")]);
+        let p = plan(
+            &s,
+            "shop",
+            &["orders".to_string(), "customers".to_string()],
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+        assert_eq!(p.missing, vec!["customers".to_string()]);
+        assert!(text_of(&p).contains("customers"), "{}", text_of(&p));
+        // And the whole selection vanishing still carries the names, so the
+        // "nothing matched" arm can say which.
+        let p = plan(
+            &s,
+            "shop",
+            &["gone".to_string()],
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+        assert!(p.steps.is_empty());
+        assert_eq!(p.missing, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn nothing_at_all_is_planned_when_no_section_was_asked_for() {
         let s = schema_of(vec![table("orders")]);
         let opts = DumpOptions {
             structure: false,
             data: false,
+            other_objects: false,
             ..Default::default()
         };
         assert!(opts.is_empty());
         let p = plan(&s, "shop", &all(&s), opts, SqlDialect::MySql);
         assert!(p.steps.is_empty());
+    }
+
+    /// "Other objects" is a peer checkbox in the modal, so ticking it alone is
+    /// something a user can do — and it left the Export button permanently grey
+    /// while `plan` would have emitted nothing anyway.
+    #[test]
+    fn other_objects_alone_is_a_file_worth_writing() {
+        let opts = DumpOptions {
+            structure: false,
+            data: false,
+            other_objects: true,
+            ..Default::default()
+        };
+        assert!(!opts.is_empty(), "the Export button must not be grey");
+
+        let mut t = table("orders");
+        t.schema = Some("public".to_string());
+        let mut s = schema_of(vec![t]);
+        s.enums.push(crate::schema::EnumInfo {
+            name: "mood".to_string(),
+            schema: Some("public".to_string()),
+            values: vec!["ok".to_string()],
+            comment: None,
+        });
+        let text = text_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::Postgres));
+        assert!(text.contains("mood"), "{text}");
+        // …and nothing else: no `CREATE TABLE`, no rows.
+        assert!(!text.contains("CREATE TABLE"), "{text}");
     }
 }

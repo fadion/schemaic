@@ -91,49 +91,23 @@ pub(crate) fn open_dump(
             }
             d.listing.set(false);
             match res {
-                Ok(mut names) => {
-                    // One namespace's tables when the entry was opened on a
-                    // namespace: a PostgreSQL `sales` dump has no business
-                    // listing `public`'s tables.
-                    //
-                    // Through `sql_qualifier`, because `display_name` is what
-                    // built these strings and it **omits `public`** — matching on
-                    // a bare `"{ns}."` prefix would filter `public`'s own dump
-                    // down to nothing, since none of its tables carries the
-                    // prefix. `None` from the qualifier means "the unqualified
-                    // ones are mine", which is exactly the set to keep.
-                    if let Some(ns) = schema.as_deref() {
-                        match schemaic_core::schema::sql_qualifier(Some(ns)) {
-                            Some(q) => {
-                                let prefix = format!("{q}.");
-                                names.retain(|n| n.starts_with(&prefix));
-                            }
-                            None => names.retain(|n| !n.contains('.')),
-                        }
-                    }
+                Ok(names) => {
+                    // Both decisions are `core::dump`'s, with tests: which of the
+                    // database's tables belong to this namespace, and what the
+                    // picker opens ticked. They were written out here, inside a
+                    // `create_ext_action` callback, in the range's largest file
+                    // with no tests at all — and each is a rule with a
+                    // counter-intuitive arm (`public` is *unqualified*; a
+                    // preselect the list has lost has to be named, not ignored).
+                    let mut names =
+                        schemaic_core::dump::tables_in_namespace(&names, schema.as_deref());
                     names.sort();
-                    // Everything checked: the common case is "all of it", and
-                    // unchecking a few is less work than checking forty. Opened
-                    // from a table, that one table instead — the click said which
-                    // one, and re-ticking the other thirty-nine would be the
-                    // opposite of what was asked.
-                    d.chosen.set(match preselect.as_ref() {
-                        // Only if it is actually in the list: a name the read
-                        // doesn't know would tick nothing and export nothing.
-                        Some(t) if names.contains(t) => vec![t.clone()],
-                        Some(t) => {
-                            // **Say which one.** The click named a table the
-                            // server no longer reports — dropped or renamed since
-                            // the tree was last refreshed — and a modal that opens
-                            // with a full list, nothing ticked and a dead Export
-                            // button reads as broken rather than as an answer.
-                            d.error.set(Some(format!(
-                                "{t} is no longer in this database — pick the tables to export."
-                            )));
-                            Vec::new()
-                        }
-                        None => names.clone(),
-                    });
+                    let (chosen, error) =
+                        schemaic_core::dump::initial_selection(&names, preselect.as_deref());
+                    d.chosen.set(chosen);
+                    if let Some(e) = error {
+                        d.error.set(Some(e));
+                    }
                     d.tables.set(names);
                 }
                 Err(e) => d.error.set(Some(e)),
@@ -154,15 +128,26 @@ fn run_dump(ui: Ui) {
     let Some(target) = d.target.get_untracked() else {
         return;
     };
-    let opts = schemaic_core::dump::DumpOptions {
-        structure: d.structure.get_untracked(),
-        data: d.data.get_untracked(),
-        other_objects: d.other_objects.get_untracked(),
-        drop_if_exists: d.drop_if_exists.get_untracked(),
-        wrap_transaction: d.wrap_transaction.get_untracked(),
-        disable_fk_checks: d.disable_fk_checks.get_untracked(),
+    // **Read at the moment of the launch, not before the dialog.** floem's save
+    // dialog is not window-modal, so the modal stays live behind it: untick every
+    // table, tick one, choose a filename — and the file was written from the
+    // selection as it stood before the dialog opened, contradicting the modal
+    // still on screen. The pre-dialog read below is only to decide whether there
+    // is anything to ask a filename *for*.
+    let selection = move || {
+        (
+            schemaic_core::dump::DumpOptions {
+                structure: d.structure.get_untracked(),
+                data: d.data.get_untracked(),
+                other_objects: d.other_objects.get_untracked(),
+                drop_if_exists: d.drop_if_exists.get_untracked(),
+                wrap_transaction: d.wrap_transaction.get_untracked(),
+                disable_fk_checks: d.disable_fk_checks.get_untracked(),
+            },
+            d.chosen.get_untracked(),
+        )
     };
-    let tables = d.chosen.get_untracked();
+    let (opts, tables) = selection();
     if opts.is_empty() || tables.is_empty() {
         return;
     }
@@ -174,11 +159,31 @@ fn run_dump(ui: Ui) {
             extensions: &["sql"],
         }]);
     let actions = ui.schema_actions.clone();
+    // Read **before** the dialog opens: the launch below has to be able to tell
+    // "the modal that asked for this" from "a modal that has since been closed
+    // and reopened on another database". The late-outcome guard further down
+    // already reads it for the same reason.
+    let asked_at = d.generation.get_untracked();
     floem::action::save_as(dialog, move |file| {
         let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
             return; // The dialog was dismissed.
         };
-        if !crate::widgets::accept_launch(d.running.get_untracked(), false) {
+        // `accept_dialog_launch`, not `accept_launch`: floem's save dialog is not
+        // window-modal, so the modal that asked can be gone by now — and then
+        // `running` is still `false` and the plain guard says yes to an invisible,
+        // unstoppable dump.
+        if !crate::widgets::accept_dialog_launch(
+            d.running.get_untracked(),
+            false,
+            d.target.get_untracked().is_some(),
+            asked_at,
+            d.generation.get_untracked(),
+        ) {
+            return;
+        }
+        // The selection as it stands *now* — see `selection` above.
+        let (opts, tables) = selection();
+        if opts.is_empty() || tables.is_empty() {
             return;
         }
         d.running.set(true);
@@ -232,12 +237,34 @@ fn run_dump(ui: Ui) {
                     // file whose every blob is `NULL` is the failure this whole
                     // sentence exists to prevent. The table count is this path's
                     // own; the rest is the same sentence the grid's bar shows.
-                    DumpOutcome::Done { tables, tally } => d.done.set(Some(format!(
-                        "Wrote {} {}. {}",
+                    DumpOutcome::Done {
                         tables,
-                        schemaic_core::text::plural(tables, "table", "tables"),
-                        schemaic_core::export::export_note(&tally, &name, true).unwrap_or_default(),
-                    ))),
+                        tally,
+                        missing,
+                    } => {
+                        // A ticked table the dump's own fresh introspection could
+                        // not find is the difference between a backup and a file
+                        // that looks like one, so it goes in the same sentence as
+                        // the tally rather than only into the file's header.
+                        let short = if missing.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " {} ticked {} not found and {} not in the file: {}.",
+                                missing.len(),
+                                schemaic_core::text::plural(missing.len(), "table", "tables"),
+                                schemaic_core::text::plural(missing.len(), "is", "are"),
+                                missing.join(", "),
+                            )
+                        };
+                        d.done.set(Some(format!(
+                            "Wrote {} {}. {}{short}",
+                            tables,
+                            schemaic_core::text::plural(tables, "table", "tables"),
+                            schemaic_core::export::export_note(&tally, &name, true)
+                                .unwrap_or_default(),
+                        )))
+                    }
                     DumpOutcome::Cancelled => d.error.set(Some(format!(
                         "Export cancelled — {name} was not changed; what had been written is in {}",
                         schemaic_core::export::part_path(&name)

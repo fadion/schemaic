@@ -6220,6 +6220,27 @@ pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does an auto-increment column on `dialect` draw from a **separate counter**
+/// that a restore has to be told about?
+///
+/// PostgreSQL's does: a `serial` or an identity column is backed by a sequence,
+/// and loading rows with explicit keys leaves that sequence where it was, so the
+/// first ordinary `INSERT` after a "successful" restore is a duplicate-key
+/// error. The dump answers it with a `setval` per column
+/// ([`crate::dump::sequence_resync_sql`]). MySQL's `AUTO_INCREMENT` and SQLite's
+/// `rowid` both advance from the data already in the table, so there is nothing
+/// to resync.
+///
+/// An exhaustive `match` rather than the `!= Postgres` this shipped as: that
+/// spelling hands a fourth engine MySQL's answer silently, and there is no
+/// comparison left in the tree to grep for when someone comes looking.
+pub fn supports_sequence_resync(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Is this the change that performs a whole set by rebuilding the table?
 fn is_rebuild(c: &Change) -> bool {
     matches!(c, Change::RebuildTable(_))

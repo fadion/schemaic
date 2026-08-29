@@ -203,6 +203,32 @@ impl ExportTally {
     pub fn has_caveat(&self) -> bool {
         !self.withheld.is_empty() || !self.blanked.is_empty()
     }
+
+    /// Fold **another table's** tally into this one — a dump writes many tables
+    /// into one file and reports one sentence about it.
+    ///
+    /// Rows sum; a column name is kept **once**, in first-seen order. Two tables
+    /// that both have a `body` column too wide to carry say `body` once, and two
+    /// tables with different withheld columns keep both — which is the whole
+    /// content of a caveat that has to name what to distrust.
+    ///
+    /// It lives here rather than in the dump's writer loop because it is the same
+    /// question [`ExportTally::note`] answers one level down, and a fold written
+    /// out at the call site is one nothing can test: the caller needs a `Db`, a
+    /// runtime handle and two channels to reach.
+    pub fn absorb(&mut self, other: ExportTally) {
+        self.rows += other.rows;
+        for c in other.withheld {
+            if !self.withheld.contains(&c) {
+                self.withheld.push(c);
+            }
+        }
+        for c in other.blanked {
+            if !self.blanked.contains(&c) {
+                self.blanked.push(c);
+            }
+        }
+    }
 }
 
 /// One block of rows on its way out — a [`ResultSet`] and the rows to take from
@@ -970,6 +996,14 @@ pub fn qualified_table(
         SqlDialect::Sqlite => q(table),
         _ => match schema {
             Some(ns) => format!("{}.{}", q(ns), q(table)),
+            // **An empty `database` means "don't qualify"**, and no engine has a
+            // database whose name is the empty string, so nothing legal collides
+            // with it. The dump needs this: its `CREATE`/`DROP` name a MySQL table
+            // bare so the file's own `USE` line is the one thing to edit to
+            // retarget it, and an `INSERT` that qualified with the *source*
+            // database refilled the database the rows came from — a success
+            // report, an empty target, and no duplicate-key error to stop it.
+            None if database.is_empty() => q(table),
             None => format!("{}.{}", q(database), q(table)),
         },
     }
@@ -2232,6 +2266,53 @@ mod tests {
             assert_eq!(t.blanked, vec!["thumb".to_string()], "{}", format.label());
             assert!(t.has_caveat(), "{}", format.label());
         }
+    }
+
+    /// A dump writes many tables into one file and reports one sentence about
+    /// it. The fold used to be written out inside the writer loop, where nothing
+    /// could reach it: the caller needs a `Db`, a runtime handle and two
+    /// channels.
+    #[test]
+    fn absorbing_another_tables_tally_sums_rows_and_names_a_column_once() {
+        let mut total = ExportTally {
+            rows: 10,
+            withheld: vec!["body".to_string()],
+            blanked: vec!["notes".to_string()],
+        };
+        // A second table with the *same* wide column: named once, not twice.
+        total.absorb(ExportTally {
+            rows: 5,
+            withheld: vec!["body".to_string()],
+            blanked: vec![],
+        });
+        assert_eq!(total.rows, 15);
+        assert_eq!(total.withheld, vec!["body".to_string()]);
+
+        // A third with a different one: both kept, in first-seen order — the
+        // caveat has to name every part of the file to distrust.
+        total.absorb(ExportTally {
+            rows: 1,
+            withheld: vec!["thumb".to_string()],
+            blanked: vec!["notes".to_string(), "memo".to_string()],
+        });
+        assert_eq!(total.rows, 16);
+        assert_eq!(
+            total.withheld,
+            vec!["body".to_string(), "thumb".to_string()]
+        );
+        assert_eq!(total.blanked, vec!["notes".to_string(), "memo".to_string()]);
+        assert!(total.has_caveat());
+    }
+
+    #[test]
+    fn absorbing_a_clean_table_says_nothing_new() {
+        let mut total = ExportTally::default();
+        total.absorb(ExportTally {
+            rows: 7,
+            ..Default::default()
+        });
+        assert_eq!(total.rows, 7);
+        assert!(!total.has_caveat());
     }
 
     /// The sentence the bar shows. **Silence is the default and a caveat
