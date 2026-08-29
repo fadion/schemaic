@@ -1470,10 +1470,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     panel's headings (**narrowest bucket first** — this connection, this engine, everywhere — each
     snippet under exactly one, empty buckets omitted), `matches_query` is the panel's filter
     (name/abbrev/body, the body whitespace-collapsed the way `history::matches_query` reads a
-    statement), `by_abbrev` is the completion trigger (whole-word, case-insensitive, narrowest
-    scope wins a shared spelling), `scope_options` is the scope picker's three choices **in the
-    bands' own order** — a test pins each choice to the heading a row moves to when it is picked,
-    so the picker and `grouped` cannot drift — plus `next_id`/`touch`/`remove`.
+    statement), `by_abbrev` is the completion trigger (whole-word, case-insensitive, **a snippet
+    the user wrote wins, then the narrowest scope**), `scope_options` is the scope picker's three
+    choices **in the bands' own order** — a test pins each choice to the heading a row moves to
+    when it is picked, so the picker and `grouped` cannot drift — plus
+    `next_id`/`touch`/`remove`/`clear_conn`.
+    **A pack of built-in snippets ships in the code**, not in anybody's `snippets.json`:
+    `builtins(dialect)` returns them per engine (`Source::Builtin`, `Scope::Dialect`), and
+    `library(user, dialect)` is the merged view — user snippets first, then the pack — that every
+    consumer must be handed, because `applies`/`grouped`/`by_abbrev` all answer about a list. They
+    are kept in code so a later release can fix one; a shipped snippet is not editable or
+    deletable (the panel offers Duplicate instead), which is exactly why the *source* has to be
+    `by_abbrev`'s first ranking key: every built-in is `Scope::Dialect`, so ranking scope first put
+    the pack above a user snippet moved to "All connections" — a snippet they wrote, losing its
+    abbrev to one they cannot delete or re-spell.
+    `clear_conn`/`count_conn` drop a deleted connection's `Scope::Conn` snippets, for the two
+    reasons `delete_conn_now` states about its eleven siblings: a deleted connection should not be
+    reconstructable from what is left on disk, and connection ids are **recycled**, so a snippet
+    left behind is inherited by the next connection to take the freed id, under a heading reading
+    "THIS CONNECTION".
     **Scope is `Global | Dialect | Conn`, not a `conn_id` like `history.rs` uses** — that is the
     difference between a library and a log: a "running queries" snippet is wanted on every MySQL
     connection, not on the one it was saved from. Nothing is capped or evicted, for the same
@@ -1482,9 +1497,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `Scope` is a **preserving** persisted enum: `Unknown(String)` keeps the text it didn't
     recognise and the hand-written `Serialize` writes it back verbatim, the rule
     `search_history::ObjectTag` states, because this file is rewritten whole on every change.
-    `next_id` is max-plus-one and therefore **reuses a deleted snippet's id**; that is safe only
-    while no id outlives the file, which is why snippet activations are not recorded in
-    `search_history.json` — a test pins the limit.
+    `next_id` is max-plus-one **over the user's snippets only** — it filters out anything at or
+    above `BUILTIN_ID_BASE`, so the pack's ids never raise the counter and a careless caller
+    passing the merged `library()` list gets the same answer as one passing the user's. It
+    therefore **reuses a deleted snippet's id**; that is safe only while no id outlives the file,
+    which is why snippet activations are not recorded in `search_history.json` — a test pins both
+    limits.
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`. An entry is written in **two passes** — `push` when the run
     launches, `finish` when it lands (duration, rows, `Outcome`) — because the two moments
@@ -3184,6 +3202,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ddl_modals_up` group and is therefore *in* that predicate: an overlay in that group whose flag
     the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
     nothing, which is exactly how the event editor once shipped invisible.
+  - `source_gate.rs` — **test-only**, and the shared machinery behind the crate's *source gates*:
+    the tests that read the crate's own `.rs` files and fail on a spelling production code must not
+    contain (a floem `Dropdown`, a captured `Color`, a raw pixel inset, an unguarded `exec_after`,
+    a menu trigger that doesn't close its siblings). `production_code` strips every `#[cfg(test)]`
+    **item** — brace-aware, skipping braces inside strings, chars and comments — and every `//`
+    line; `crate_sources` enumerates the files to scan. Both halves exist because the idiom was
+    written out eleven times across nine files and every copy had the same two holes. It cut each
+    file at the **first** `#[cfg(test)]`, which is right only for a file whose tests are all at the
+    bottom: `widgets.rs` has an inline test-only `fn` a tenth of the way in, so its gates read 929
+    of 7,259 lines and a planted `Dropdown` at line 2000 passed. And it walked
+    `env!("CARGO_MANIFEST_DIR")/src` — `schemaic-ui` alone — while the invariants the gates enforce
+    are stated app-wide, so a violation added to `schemaic-app` (which builds views too, in
+    `app_view`) passed the whole suite. A copy each also meant that fixing either hole reached one
+    gate of eleven.
   - `snippet_panel.rs` — the **Snippet Library** right-column panel (`RightPanel::Snippets`, the
     toolbar's bookmark toggle): the saved queries that apply to the active connection, under the
     scope bands `core::snippet::grouped` returns, over the History panel's chrome. It decides
