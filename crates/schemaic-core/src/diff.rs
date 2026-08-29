@@ -160,6 +160,33 @@ impl InlinePlan {
     }
 }
 
+/// What an inline-AI reply would do to the buffer: the text that will actually be
+/// spliced into `full[start..end]`, and the whole buffer that results.
+///
+/// **One function because the two answers have to agree.** The preview diffs the
+/// prospective buffer; Accept splices the reply. When those were computed
+/// separately, a CRLF buffer plus an LF reply — the ordinary case on Windows,
+/// where the clipboard hands you CRLF and neither `clipboard-win` nor floem's
+/// editor normalises it — made [`inline_plan`] answer *empty*, because
+/// [`str::lines`] strips a trailing `\r`. The footer then read "No changes
+/// suggested" while Accept, gated on the state rather than on the plan, converted
+/// every line ending in the range. The buffer changed after the UI said it would
+/// not.
+///
+/// So the reply is brought into the buffer's own line ending first, and both
+/// callers read the result of the same decision. The buffer's ending is whatever
+/// its **first** newline uses; a buffer with none is left alone, since there is
+/// nothing to disagree with.
+pub fn inline_splice(full: &str, start: usize, end: usize, reply: &str) -> (String, String) {
+    let text = if full.find('\n').is_some_and(|i| full[..i].ends_with('\r')) {
+        reply.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        reply.to_string()
+    };
+    let new_full = format!("{}{}{}", &full[..start], text, &full[end..]);
+    (text, new_full)
+}
+
 /// Turn `old` → `new` into an in-place render plan against `old`'s line numbering.
 ///
 /// `new` is the whole prospective buffer (the caller splices the model's SQL into
@@ -213,6 +240,34 @@ pub fn inline_plan(old: &str, new: &str) -> InlinePlan {
             anchor,
             before,
         });
+    }
+    // The one collision the anchoring can produce, and the renderer resolves a
+    // line by `.find(|h| h.anchor == line)` — so a second hunk on the same anchor
+    // is drawn nowhere at all, while the footer counts its rows and Accept
+    // applies them. A `before` hunk consumes no document line, so line 0's own
+    // `Equal` row still advances `line` from 0 to 1, and a pure insertion right
+    // after it anchors on `1 - 1 = 0` as well. It is the only way two hunks can
+    // share an anchor: every other pair has an `Equal` row between them that
+    // moved the counter.
+    //
+    // Merging their `add`s into one *before* block would draw the trailing
+    // addition above the line it belongs under, so line 0 joins the hunk instead:
+    // one strike-through and the three lines re-offered in place. Truthful, and a
+    // shape the renderer already draws everywhere else.
+    if plan.hunks.len() > 1 && plan.hunks[0].before && plan.hunks[1].anchor == 0 {
+        let carried = diff
+            .iter()
+            .find(|(tag, _)| *tag == DiffTag::Equal)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        let second = plan.hunks.remove(1);
+        let first = &mut plan.hunks[0];
+        first.add.push(carried);
+        first.add.extend(second.add);
+        first.del = 0..1;
+        first.before = false;
+        plan.added += 1;
+        plan.removed += 1;
     }
     plan
 }
@@ -290,6 +345,164 @@ mod tests {
         assert_eq!(h.add, vec!["X".to_string()]);
         assert_eq!(h.anchor, 0);
         assert!(h.before, "nothing precedes line 0 to anchor to");
+    }
+
+    /// Every hunk that adds rows must be reachable from its anchor line, because
+    /// that is the only key the renderer has: `block_at` and `segments` both
+    /// resolve a line with `.find(|h| h.anchor == line && !h.add.is_empty())`, so
+    /// a second hunk sharing an anchor is drawn *nowhere* — while the footer
+    /// counts its rows and Accept applies them. Consent given on half a change.
+    #[test]
+    fn no_two_hunks_that_add_rows_share_an_anchor() {
+        let cases = [
+            ("b", "d\nb\nd"),
+            (
+                "SELECT * FROM employees",
+                "-- employees hired since 1990\nSELECT * FROM employees\nWHERE hire_date >= '1990-01-01'",
+            ),
+            ("a\nb", "X\na\nY\nb"),
+            ("a", "X\na\nY\nZ"),
+        ];
+        for (old, new) in cases {
+            let plan = inline_plan(old, new);
+            let mut anchors: Vec<usize> = plan
+                .hunks
+                .iter()
+                .filter(|h| !h.add.is_empty())
+                .map(|h| h.anchor)
+                .collect();
+            let before = anchors.len();
+            anchors.sort_unstable();
+            anchors.dedup();
+            assert_eq!(anchors.len(), before, "{old:?} -> {new:?}: {plan:?}");
+        }
+    }
+
+    /// The merge the collision forces, and the shape it has to take: rendering
+    /// both blocks before line 0 would put the trailing addition *above* the line
+    /// it belongs under, so line 0 joins the hunk instead — struck through once
+    /// and re-offered in place, which is what the screen can actually show.
+    #[test]
+    fn a_prepend_and_an_append_around_line_zero_become_one_hunk_that_carries_it() {
+        let plan = inline_plan(
+            "SELECT * FROM employees",
+            "-- employees hired since 1990\nSELECT * FROM employees\nWHERE hire_date >= '1990-01-01'",
+        );
+        assert_eq!(plan.hunks.len(), 1);
+        let h = &plan.hunks[0];
+        assert_eq!(h.del, 0..1);
+        assert!(!h.before);
+        assert_eq!(h.anchor, 0);
+        assert_eq!(
+            h.add,
+            vec![
+                "-- employees hired since 1990".to_string(),
+                "SELECT * FROM employees".to_string(),
+                "WHERE hire_date >= '1990-01-01'".to_string(),
+            ]
+        );
+        // The footer reads straight off these, so they have to describe the hunk
+        // as merged rather than as the two it came from.
+        assert_eq!((plan.added, plan.removed), (3, 1));
+    }
+
+    /// The composition the two call sites used to get wrong separately: whatever
+    /// the preview says about the plan has to be true of what Accept splices.
+    #[test]
+    fn a_crlf_buffer_and_an_lf_reply_do_not_disagree_about_whether_anything_changed() {
+        let full = "SELECT a\r\nFROM t\r\n";
+        // Identical SQL, LF-terminated — what a model hands back.
+        let (text, new_full) = inline_splice(full, 0, full.len(), "SELECT a\nFROM t\n");
+        assert_eq!(text, full, "the splice must be a no-op, not a re-ending");
+        assert!(inline_plan(full, &new_full).is_empty());
+
+        // One real edit: only that line may show as changed, and only that line
+        // may be different after the splice.
+        let full = "SELECT a\r\nFROM t\r\nWHERE x=1\r\n";
+        let (text, new_full) = inline_splice(full, 0, full.len(), "SELECT a\nFROM t\nWHERE x=2\n");
+        assert_eq!(text, "SELECT a\r\nFROM t\r\nWHERE x=2\r\n");
+        let plan = inline_plan(full, &new_full);
+        assert_eq!(plan.hunks.len(), 1);
+        assert_eq!(plan.hunks[0].del, 2..3);
+    }
+
+    #[test]
+    fn an_lf_buffer_leaves_the_reply_exactly_as_the_model_wrote_it() {
+        let full = "SELECT a\nFROM t\n";
+        let (text, new_full) = inline_splice(full, 0, full.len(), "SELECT b\nFROM t\n");
+        assert_eq!(text, "SELECT b\nFROM t\n");
+        assert_eq!(new_full, "SELECT b\nFROM t\n");
+        // A buffer with no newline at all has no ending to match.
+        let (text, new_full) = inline_splice("SELECT a", 0, 8, "SELECT b\nFROM t");
+        assert_eq!(text, "SELECT b\nFROM t");
+        assert_eq!(new_full, "SELECT b\nFROM t");
+    }
+
+    #[test]
+    fn a_splice_into_the_middle_keeps_the_text_around_it() {
+        let full = "-- head\nSELECT a\n-- tail\n";
+        let (text, new_full) = inline_splice(full, 8, 16, "SELECT b");
+        assert_eq!(text, "SELECT b");
+        assert_eq!(new_full, "-- head\nSELECT b\n-- tail\n");
+    }
+
+    /// The same property, swept rather than sampled: every buffer of up to three
+    /// lines against every suggestion of up to four, over a two-symbol alphabet.
+    /// Deterministic and exhaustive over that space, which is where the collision
+    /// lives — it needs only a prepend, one line, and an append.
+    #[test]
+    fn no_anchor_collision_anywhere_in_a_small_exhaustive_sweep() {
+        fn corpus(max_lines: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut level = vec![String::new()];
+            for _ in 0..max_lines {
+                let mut next = Vec::new();
+                for base in &level {
+                    for sym in ["a", "b"] {
+                        next.push(if base.is_empty() {
+                            sym.to_string()
+                        } else {
+                            format!("{base}\n{sym}")
+                        });
+                    }
+                }
+                out.extend(next.iter().cloned());
+                level = next;
+            }
+            out
+        }
+        for old in corpus(3) {
+            for new in corpus(4) {
+                let plan = inline_plan(&old, &new);
+                let mut anchors: Vec<usize> = plan
+                    .hunks
+                    .iter()
+                    .filter(|h| !h.add.is_empty())
+                    .map(|h| h.anchor)
+                    .collect();
+                let seen = anchors.len();
+                anchors.sort_unstable();
+                anchors.dedup();
+                assert_eq!(anchors.len(), seen, "{old:?} -> {new:?}: {plan:?}");
+                // The counts the footer prints have to keep matching the hunks.
+                let (add, del) = plan
+                    .hunks
+                    .iter()
+                    .fold((0, 0), |(a, d), h| (a + h.add.len(), d + h.del.len()));
+                assert_eq!((plan.added, plan.removed), (add, del), "{old:?} -> {new:?}");
+            }
+        }
+    }
+
+    /// The counterweight: a prepend followed by an insertion further down does
+    /// not collide, and must not be merged into one enormous hunk.
+    #[test]
+    fn a_prepend_and_a_later_insertion_stay_two_hunks() {
+        let plan = inline_plan("a\nb\nc", "X\na\nb\nY\nc");
+        assert_eq!(plan.hunks.len(), 2);
+        assert_eq!((plan.hunks[0].anchor, plan.hunks[0].before), (0, true));
+        assert_eq!((plan.hunks[1].anchor, plan.hunks[1].before), (1, false));
+        assert_eq!((plan.added, plan.removed), (2, 0));
     }
 
     #[test]
