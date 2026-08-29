@@ -1486,7 +1486,13 @@ pub(crate) async fn prepare_check(db: &Db, sql: &str) -> Result<(), DbError> {
 /// are left empty rather than invented: no namespaces (`schema: None`), no
 /// storage engine, no collation at table level, no comments anywhere — SQLite
 /// stores none, so a comment field would be a promise the round-trip can't keep.
-pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
+/// The token is checked **at the door and no further**: the whole read is local
+/// `sqlite_master` and `PRAGMA` traffic against a file, with no server to leave a
+/// query running on and no round trip to abandon. What it buys is that a request
+/// already cancelled before the worker starts does not run at all, which is what
+/// the caller's `Cancelled` arm is written for.
+pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<DbSchema, DbError> {
+    refuse_if_cancelled(&cancel)?;
     with_conn(db, |conn| {
         let mut tables = Vec::new();
         for (name, kind, sql) in master_entries(conn)? {
@@ -3343,7 +3349,9 @@ mod tests {
                    INSERT INTO "nothing" VALUES ('y');"#,
             )
             .unwrap();
-        let schema = fetch_schema(&db).await.expect("introspect");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("introspect");
         for name in ["if", "nothing"] {
             let t = schema
                 .tables
@@ -3370,6 +3378,46 @@ mod tests {
                     panic!("generated statement does not run: {sql}\n  {e}");
                 });
             assert_eq!(rs.row_count(), 1, "{sql}");
+        }
+    }
+
+    /// **A cancel during the schema read is honoured**, through the public
+    /// [`Db::fetch_schema`] rather than this module's own function — the seam
+    /// where it went wrong. The Export modal paints a full backdrop over this
+    /// phase and its only exit is a cancel, so before `fetch_schema` took a
+    /// token the press did nothing: `app/dump.rs`'s `Err(DbError::Cancelled)`
+    /// arm was unreachable code, and the whole read of every column of every
+    /// table ran to completion with nothing else in the app clickable.
+    ///
+    /// SQLite is the engine whose DB layer is testable without a server; the
+    /// same token reaches MySQL's `collect_schema` and PostgreSQL's through the
+    /// `tokio::select!` each arm wraps it in.
+    #[tokio::test]
+    async fn a_cancelled_read_is_refused_before_any_table_is_introspected() {
+        let (keeper, db) = shared_memory("fetch_schema_cancel");
+        keeper
+            .execute_batch("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);")
+            .unwrap();
+        // Uncancelled, the same call reads the table — so the refusal below is
+        // the token's doing and not an empty database.
+        let ok = db
+            .fetch_schema(MAIN, CancellationToken::new())
+            .await
+            .expect("introspect");
+        assert!(ok.tables.iter().any(|t| t.name == "t"));
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        match db.fetch_schema(MAIN, cancel.clone()).await {
+            Err(DbError::Cancelled) => {}
+            other => panic!("a cancelled read was not refused: {other:?}"),
+        }
+        // And at this module's own door, not only at `Db::fetch_schema`'s: the
+        // two checks guard different callers, and a test that only sees the
+        // outer one would go green with this arm's removed.
+        match fetch_schema(&db, cancel).await {
+            Err(DbError::Cancelled) => {}
+            other => panic!("the SQLite arm ran a cancelled read: {other:?}"),
         }
     }
 
@@ -4671,7 +4719,7 @@ mod tests {
         let tbl = m.insert_target().expect("writable");
 
         // A designer edit on the same table, through the real path.
-        let before = fetch_schema(&db)
+        let before = fetch_schema(&db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables
@@ -5275,7 +5323,9 @@ mod tests {
                  CREATE TABLE pair (a TEXT, b TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID;",
             )
             .unwrap();
-        let schema = fetch_schema(&db).await.expect("schema");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("schema");
         let ddl_of = |name: &str| {
             schema
                 .tables
@@ -5362,7 +5412,9 @@ mod tests {
                      SELECT album.id, album.title FROM album;",
             )
             .unwrap();
-        let schema = fetch_schema(&db).await.expect("schema");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("schema");
         let view = schema
             .tables
             .iter()
@@ -5513,7 +5565,9 @@ mod ddl_tests {
             keeper
                 .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
                 .unwrap();
-            let schema = fetch_schema(&db).await.expect("schema");
+            let schema = fetch_schema(&db, CancellationToken::new())
+                .await
+                .expect("schema");
             let table = schema.tables.iter().find(|t| t.name == "t").expect("t");
 
             let mut draft = TableDraft::from_table(table);
@@ -5574,7 +5628,9 @@ mod ddl_tests {
             keeper
                 .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
                 .unwrap();
-            let schema = fetch_schema(&db).await.expect("schema");
+            let schema = fetch_schema(&db, CancellationToken::new())
+                .await
+                .expect("schema");
             let table = schema.tables.iter().find(|t| t.name == "t").expect("t");
 
             let mut draft = TableDraft::from_table(table);
@@ -5624,7 +5680,9 @@ mod ddl_tests {
             )
             .unwrap();
 
-        let schema = fetch_schema(&db).await.expect("schema");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("schema");
         let view = schema.tables.iter().find(|t| t.name == "v").expect("view");
         let mut draft = ViewDraft::from_table(view).expect("a view drafts");
         draft.select = "SELECT a, b FROM t WHERE a > 1".into();
@@ -5665,7 +5723,9 @@ mod ddl_tests {
             )
             .unwrap();
 
-        let schema = fetch_schema(&db).await.expect("schema");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("schema");
         let view = schema.tables.iter().find(|t| t.name == "v").expect("view");
         let mut draft = ViewDraft::from_table(view).expect("a view drafts");
         draft.name = "v2".into();
@@ -5703,7 +5763,9 @@ mod ddl_tests {
             )
             .unwrap();
 
-        let schema = fetch_schema(&db).await.expect("schema");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("schema");
         let table = schema.tables.iter().find(|t| t.name == "emp").expect("emp");
         assert_eq!(table.triggers.len(), 1, "the trigger was read back");
         let cur = &table.triggers[0];
@@ -5758,7 +5820,9 @@ mod ddl_tests {
             )
             .unwrap();
 
-        let schema = fetch_schema(&db).await.expect("schema");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("schema");
         let view = schema.tables.iter().find(|t| t.name == "v").expect("view");
         assert_eq!(view.triggers.len(), 1, "a view's trigger is read too");
         assert_eq!(view.triggers[0].timing, TriggerTiming::InsteadOf);
@@ -5796,7 +5860,9 @@ mod ddl_tests {
                  CREATE TRIGGER gone AFTER INSERT ON emp BEGIN SELECT 1; END;",
             )
             .unwrap();
-        let schema = fetch_schema(&db).await.expect("schema");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("schema");
         let table = schema.tables.iter().find(|t| t.name == "emp").expect("emp");
 
         let set = TriggerSetDraft {
@@ -6023,7 +6089,9 @@ mod check_schema_tests {
                    CREATE VIEW rich AS SELECT * FROM account WHERE balance > 100;"#,
             )
             .unwrap();
-        let schema = fetch_schema(&db).await.expect("introspect");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("introspect");
         let t = schema
             .tables
             .iter()
@@ -6060,7 +6128,7 @@ mod rebuild_roundtrip_tests {
     use tokio_util::sync::CancellationToken;
 
     async fn table_of(db: &Db, name: &str) -> TableInfo {
-        fetch_schema(db)
+        fetch_schema(db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables
@@ -6298,7 +6366,7 @@ mod rebuild_fidelity_tests {
     use tokio_util::sync::CancellationToken;
 
     async fn table_of(db: &Db, name: &str) -> TableInfo {
-        fetch_schema(db)
+        fetch_schema(db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables
@@ -6437,7 +6505,9 @@ mod rebuild_fidelity_tests {
         let (keeper, db) = shared_memory("fid_phantom");
         keeper.execute_batch(ddl).unwrap();
 
-        let schema = fetch_schema(&db).await.expect("introspect");
+        let schema = fetch_schema(&db, CancellationToken::new())
+            .await
+            .expect("introspect");
         assert!(
             schema.tables.len() >= 13,
             "the premise: {}",
@@ -6924,7 +6994,7 @@ mod rebuild_bystander_tests {
     use tokio_util::sync::CancellationToken;
 
     async fn table_of(db: &Db, name: &str) -> TableInfo {
-        fetch_schema(db)
+        fetch_schema(db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables
@@ -7090,7 +7160,7 @@ mod rebuild_fk_tests {
     use tokio_util::sync::CancellationToken;
 
     async fn table_of(db: &Db, name: &str) -> TableInfo {
-        fetch_schema(db)
+        fetch_schema(db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables
@@ -7237,7 +7307,7 @@ mod rebuild_fk_tests {
         _keeper
             .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
             .unwrap();
-        let before = fetch_schema(&db)
+        let before = fetch_schema(&db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables
@@ -7282,7 +7352,7 @@ mod rebuild_fk_tests {
                  CREATE INDEX ib ON t(b);",
             )
             .unwrap();
-        let ddl = fetch_schema(&db)
+        let ddl = fetch_schema(&db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables
@@ -7428,7 +7498,7 @@ mod designer_path_tests {
     use tokio_util::sync::CancellationToken;
 
     async fn table_of(db: &Db, name: &str) -> TableInfo {
-        fetch_schema(db)
+        fetch_schema(db, CancellationToken::new())
             .await
             .expect("introspect")
             .tables

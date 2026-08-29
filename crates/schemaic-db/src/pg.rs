@@ -1140,13 +1140,33 @@ pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(),
     activity::kill_verdict(cell.as_deref(), kind, id).map_err(DbError::Query)
 }
 
-pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
+pub(crate) async fn fetch_schema(
+    db: &Db,
+    database: &str,
+    cancel: CancellationToken,
+) -> Result<DbSchema, DbError> {
     let client = connect_to(db, database).await?;
+    // A dozen catalogue queries over every table of the database, so the token
+    // is what stops it *on the server* rather than only abandoning the answer —
+    // the same shape `count_rows` uses, and for the same reason.
+    let token = client.cancel_token();
+    tokio::select! {
+        r = collect_schema(&client) => r,
+        _ = cancel.cancelled() => {
+            let _ = token.cancel_query(NoTls).await;
+            Err(DbError::Cancelled)
+        }
+    }
+}
 
+/// The catalogue reads themselves, on a client the caller owns — split out so
+/// [`fetch_schema`] can race the whole sequence against a cancellation rather
+/// than checking a token between each of the dozen queries.
+async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
     // Every browsable object (BASE TABLE / VIEW / materialized view), across
     // every user schema. See `table_list_sql` for why this can't come from
     // `information_schema`.
-    let table_rows: Vec<(String, String, String)> = query_all(&client, &table_list_sql())
+    let table_rows: Vec<(String, String, String)> = query_all(client, &table_list_sql())
         .await?
         .into_iter()
         .map(|r| (cell(&r, 0), cell(&r, 1), cell(&r, 2)))
@@ -1180,7 +1200,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     //
     // Verified to flag all five shapes on a fixture and to fire **zero** times
     // across the 108 indexes of the `world` and `chinook` sample databases.
-    let idx_all = query_all(&client, &index_list_sql()).await?;
+    let idx_all = query_all(client, &index_list_sql()).await?;
     let idx_rows: Vec<InSchema<IdxRow>> = idx_all
         .iter()
         .map(|r| {
@@ -1238,7 +1258,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // identity column from a generated one, and `col_description` carries the
     // comment.
     let col_rows: Vec<InSchema<ColRow>> = query_all(
-        &client,
+        client,
         &format!(
             "SELECT n.nspname, c.relname, a.attname, \
                     format_type(a.atttypid, a.atttypmod), \
@@ -1306,7 +1326,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // (referenced) by ordinal so composite FKs map their columns correctly (the
     // `constraint_column_usage` join can mis-pair them).
     let fk_all = query_all(
-        &client,
+        client,
         &format!(
             "SELECT n.nspname, c.relname, con.conname, a.attname, \
                     rn.nspname, rc.relname, ra.attname, \
@@ -1372,7 +1392,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // `security_barrier` among them, whose loss makes a view leak the rows it
     // was written to hide.
     let view_all = query_all(
-        &client,
+        client,
         &format!(
             "SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, true), \
                     c.relkind, array_to_string(c.reloptions, ',') \
@@ -1427,7 +1447,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // constraint here too, under `'n'`, and `conislocal` keeps an inherited
     // constraint from being restated on the child that merely inherits it.
     let check_all = query_all(
-        &client,
+        client,
         &format!(
             "SELECT n.nspname, c.relname, con.conname, pg_get_constraintdef(con.oid) \
              FROM pg_constraint con \
@@ -1452,7 +1472,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // or edit of a clone failed ("trigger pt on table p1 ... requires it"),
     // because a clone can only be dropped through its parent.
     let trigger_all = query_all(
-        &client,
+        client,
         &format!(
             "SELECT n.nspname, c.relname, t.tgname, t.tgtype::int, t.tgenabled, \
                     (t.tgconstraint <> 0)::int, t.tgfoid::regproc::text, \
@@ -1481,7 +1501,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // cast, and `NULLIF` makes the empty case yield no rows rather than one
     // empty element.
     let trigger_cols_all = query_all(
-        &client,
+        client,
         &format!(
             "SELECT n.nspname, c.relname, t.tgname, a.attname \
              FROM pg_trigger t \
@@ -1618,13 +1638,13 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
 
     // The standalone objects. They hang off the database, not off any table, so
     // they're gathered after the per-table fold rather than inside it.
-    let (enums, domains) = pg_types(&client).await?;
+    let (enums, domains) = pg_types(client).await?;
     Ok(DbSchema {
         tables,
         enums,
         domains,
-        sequences: pg_sequences(&client).await?,
-        routines: routines_on(&client)
+        sequences: pg_sequences(client).await?,
+        routines: routines_on(client)
             .await?
             .into_iter()
             .map(std::sync::Arc::new)

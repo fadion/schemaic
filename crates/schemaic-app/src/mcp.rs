@@ -486,7 +486,7 @@ async fn list_schema(
     hidden: &HashSet<String>,
 ) -> (String, bool) {
     if let Some(name) = database {
-        return match db.fetch_schema(name).await {
+        return match db.fetch_schema(name, CancellationToken::new()).await {
             Ok(schema) => (format_database_schema(name, &schema), false),
             Err(e) => (format!("Error reading schema for {name}: {e}"), true),
         };
@@ -682,7 +682,7 @@ async fn describe_table(
             true,
         );
     };
-    let schema = match db.fetch_schema(database).await {
+    let schema = match db.fetch_schema(database, CancellationToken::new()).await {
         Ok(s) => s,
         Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
     };
@@ -776,7 +776,7 @@ async fn propose_change(
         Err(e) => return (e, true),
     };
 
-    let schema = match db.fetch_schema(database).await {
+    let schema = match db.fetch_schema(database, CancellationToken::new()).await {
         Ok(s) => s,
         Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
     };
