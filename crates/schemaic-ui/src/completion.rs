@@ -395,6 +395,70 @@ fn database_suggestion_visible(db: &str, prefix: &str, active_db: Option<&str>) 
     !prefix.is_empty() && active_db.is_none_or(|a| !a.eq_ignore_ascii_case(db))
 }
 
+/// One snippet-abbrev row for the popup: what the row shows, its snippet's name,
+/// and the body accepting it splices.
+pub(crate) struct AbbrevRow {
+    pub abbrev: String,
+    pub name: String,
+    pub body: String,
+}
+
+/// The snippet abbrevs to offer at a caret with `prefix` already typed.
+///
+/// **Only once something has been typed.** An abbrev is a name its owner chose
+/// *in order to type it*, so one nobody has started typing is not a match — and
+/// on an empty prefix it is not merely a weak row, it is the **selected** one:
+/// `fuzzy_score` answers `Some(0)` for every candidate, snippets take no recency
+/// bonus, and the sort falls through to shortest-text. On a stock install with no
+/// snippets of the user's own, `SELECT * FROM ` auto-opened the popup with the
+/// two-character built-in `ps` preselected, and Enter — for a line break — or Tab
+/// — for the first table — spliced a whole `;`-terminated statement into the one
+/// being typed.
+///
+/// Not offered after a `qualifier.` either: there the only sensible answers are
+/// that table's columns.
+///
+/// One row per distinct spelling, resolved through [`snippet::by_abbrev`] so the
+/// narrowest scope wins a shared abbrev by the same rule everywhere rather than
+/// by whichever the list happened to reach first.
+///
+/// **It deliberately does not claim the caller's `seen` set.** That set is shared
+/// by every candidate producer and first writer wins, and this block runs before
+/// all of them — so a table named `locks`, a column named `idx` or a lookup table
+/// named `sizes` (all shipped abbrevs) never reached the popup at all, at any
+/// position, with no way out: a built-in cannot be deleted or re-spelled. Two rows
+/// of one spelling is the right answer; they differ by icon and detail.
+pub(crate) fn snippet_abbrev_rows(
+    all: &[snippet::Snippet],
+    prefix: &str,
+    qualified: bool,
+    dialect: SqlDialect,
+    conn_id: u64,
+) -> Vec<AbbrevRow> {
+    if qualified || prefix.is_empty() {
+        return Vec::new();
+    }
+    let mut spellings: Vec<String> = Vec::new();
+    for s in all.iter().filter(|s| snippet::applies(s, dialect, conn_id)) {
+        if let Some(a) = s.abbrev.as_deref().filter(|a| !a.is_empty())
+            && !spellings.iter().any(|s| s.eq_ignore_ascii_case(a))
+        {
+            spellings.push(a.to_string());
+        }
+    }
+    spellings
+        .into_iter()
+        .filter_map(|spelling| {
+            let s = snippet::by_abbrev(all, &spelling, dialect, conn_id)?;
+            Some(AbbrevRow {
+                abbrev: spelling,
+                name: s.name.clone(),
+                body: s.body.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Ranking bonus for a candidate identifier (table/column/database) already used
 /// elsewhere in the statement. Keywords/functions don't get it — repeating `SELECT`
 /// or `COUNT` isn't a relevance signal. Modest, so a strong prefix match on a fresh
@@ -906,45 +970,26 @@ pub(crate) fn recompute_completions(
     // Snippet abbrevs, in the top tier and ahead of the keyword continuations: an
     // abbrev is a name its owner chose *in order to type it*, so when one matches
     // what is being typed it is not a guess the way a ranked keyword is.
-    //
-    // Not offered after a `qualifier.` — there the only sensible answers are that
-    // table's columns — and one row per distinct spelling, resolved through
-    // `snippet::by_abbrev` so the narrowest scope wins a shared abbrev by the
-    // same rule everywhere rather than by whichever the list happened to reach
-    // first.
-    if !qualified {
-        let all = snippets.get_untracked();
-        let mut spellings: Vec<String> = Vec::new();
-        for s in all.iter().filter(|s| snippet::applies(s, dialect, conn_id)) {
-            if let Some(a) = s.abbrev.as_deref().filter(|a| !a.is_empty()) {
-                let lower = a.to_ascii_lowercase();
-                if !spellings.iter().any(|s| s.eq_ignore_ascii_case(&lower)) {
-                    spellings.push(a.to_string());
-                }
-            }
-        }
-        for spelling in spellings {
-            let Some(s) = snippet::by_abbrev(&all, &spelling, dialect, conn_id) else {
-                continue;
-            };
-            let tl = spelling.to_ascii_lowercase();
-            if !seen.insert(tl) {
-                continue;
-            }
-            cands.push(Cand {
-                text: spelling,
-                kind: SuggestKind::Snippet,
-                detail: s.name.clone(),
-                table: String::new(),
-                alias: String::new(),
-                icon: kind_icon(SuggestKind::Snippet),
-                key: KeyKind::None,
-                tier: 0,
-                // The row shows the abbrev and inserts the query.
-                insert: Some(s.body.clone()),
-                replace: None,
-            });
-        }
+    for row in snippet_abbrev_rows(
+        &snippets.get_untracked(),
+        &prefix,
+        qualified,
+        dialect,
+        conn_id,
+    ) {
+        cands.push(Cand {
+            text: row.abbrev,
+            kind: SuggestKind::Snippet,
+            detail: row.name,
+            table: String::new(),
+            alias: String::new(),
+            icon: kind_icon(SuggestKind::Snippet),
+            key: KeyKind::None,
+            tier: 0,
+            // The row shows the abbrev and inserts the query.
+            insert: Some(row.body),
+            replace: None,
+        });
     }
     // Expected clause-keyword continuations go in the *top* tier (above columns,
     // functions, and — after a complete table ref — schema table names), so the
@@ -1617,7 +1662,8 @@ mod tests {
     use super::{
         KeyKind, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
         database_suggestion_visible, natural_width, popup_may_open, popup_placement, popup_w,
-        popup_x, recency_bonus, row_width, statement_identifiers, types_a_character,
+        popup_x, recency_bonus, row_width, snippet_abbrev_rows, statement_identifiers,
+        types_a_character,
     };
     use crate::consts::{
         COMPLETION_BORDER, COMPLETION_GUTTER, COMPLETION_LINE_H, completion_detail_gap,
@@ -1626,6 +1672,8 @@ mod tests {
         completion_slack_w,
     };
     use floem::keyboard::{Key, NamedKey};
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::snippet::{Scope, Snippet, Source};
     use std::collections::HashSet;
 
     // ── What is allowed to summon the popup ───────────────────────────────
@@ -1690,6 +1738,65 @@ mod tests {
         // Backspace isn't typing, but a list already on screen must still refine
         // (and close itself once the prefix is gone) rather than freeze.
         assert!(popup_may_open(false, true, false));
+    }
+
+    fn snip(id: u64, name: &str, abbrev: &str, scope: Scope) -> Snippet {
+        Snippet {
+            id,
+            name: name.to_string(),
+            abbrev: Some(abbrev.to_string()),
+            body: format!("-- {name}"),
+            scope,
+            source: Source::User,
+            last_used: None,
+        }
+    }
+
+    #[test]
+    fn an_abbrev_is_offered_only_once_something_has_been_typed() {
+        // On an empty prefix the abbrev is not a weak row, it is the *selected*
+        // one — every candidate scores 0 and the sort falls to shortest text — so
+        // Enter after `SELECT * FROM ` spliced a whole statement into the one
+        // being typed. Nobody had started typing the abbrev.
+        let all = [snip(
+            1,
+            "Processes",
+            "ps",
+            Scope::Dialect(SqlDialect::MySql),
+        )];
+        assert!(snippet_abbrev_rows(&all, "", false, SqlDialect::MySql, 7).is_empty());
+        assert_eq!(
+            snippet_abbrev_rows(&all, "p", false, SqlDialect::MySql, 7).len(),
+            1
+        );
+        // Never after a `qualifier.`, prefix or no prefix.
+        assert!(snippet_abbrev_rows(&all, "p", true, SqlDialect::MySql, 7).is_empty());
+        // Nor on a connection the snippet does not apply to.
+        assert!(snippet_abbrev_rows(&all, "p", false, SqlDialect::Postgres, 7).is_empty());
+    }
+
+    #[test]
+    fn an_abbrev_row_does_not_carry_the_matching_filter_itself() {
+        // The caller ranks; this only decides what is in scope. A prefix that
+        // matches nothing still yields the in-scope abbrevs, and `fuzzy_score`
+        // drops them — the same path every other candidate takes.
+        let all = [snip(1, "Processes", "ps", Scope::Global)];
+        assert_eq!(
+            snippet_abbrev_rows(&all, "zzz", false, SqlDialect::Sqlite, 3).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn one_row_per_spelling_resolved_by_scope() {
+        // Two snippets share an abbrev: one row, and `by_abbrev` picks which.
+        let all = [
+            snip(1, "Shipped", "ps", Scope::Global),
+            snip(2, "This connection's", "PS", Scope::Conn(7)),
+        ];
+        let rows = snippet_abbrev_rows(&all, "p", false, SqlDialect::MySql, 7);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "This connection's");
     }
 
     #[test]
