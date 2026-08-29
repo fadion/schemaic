@@ -238,13 +238,12 @@ mod tests {
     /// reported `Ctrl+B` as an undocumented binding, which was
     /// `Some("b".to_string())` in a grid fixture. Test data is full of one-letter
     /// strings, so scanning it makes the gate cry wolf — and a gate that cries
-    /// wolf gets deleted. Every file here keeps its tests at the bottom.
-    fn production_code(src: &str) -> &str {
-        match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
+    /// wolf gets deleted.
+    ///
+    /// [`crate::source_gate`] owns the cut. This used to assume "every file here
+    /// keeps its tests at the bottom", which `widgets.rs` does not: its inline
+    /// test-only `fn` at line 929 ended the scan 6,330 lines early.
+    use crate::source_gate::production_code;
 
     /// Every single letter bound with Ctrl or Alt in `src`, by the five idioms
     /// the codebase actually uses:
@@ -269,6 +268,7 @@ mod tests {
     /// prove the absence of one.
     fn bound_letters(src: &str) -> BTreeSet<char> {
         let src = production_code(src);
+        let src = src.as_str();
         let mut out = BTreeSet::new();
         let bytes = src.as_bytes();
 
