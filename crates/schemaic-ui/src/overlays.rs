@@ -22,9 +22,9 @@ use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton}
 use crate::consts::{chat_pad_h, chat_pad_v, db_menu_w};
 use crate::widgets::{
     ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, box_menu_inset, cursor_menu_insets,
-    dialog_button, first_enabled, focus_root, list_step_enabled, measure_text_px_at, menu_inset,
-    menu_item_style, menu_panel, menu_panel_height, menu_panel_width, modal_body_h, modal_w,
-    panel_style, window_size,
+    dialog_button, first_enabled, focus_root, list_step_enabled, measure_text_px_at,
+    menu_drawn_height, menu_inset, menu_item_style, menu_panel, menu_panel_width, modal_body_h,
+    modal_w, panel_style, window_size,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
@@ -2114,7 +2114,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
         // however the menu was raised.
         let from = menu.at.unwrap_or_else(|| last_mouse.get_untracked());
         let entries = (build)(menu);
-        let h = menu_panel_height(&entries);
+        // The **drawn** height: a list longer than the window scrolls inside its
+        // own panel now, so the placement must not be told it is taller than it is.
+        let h = menu_drawn_height(&entries);
         // `ctx_menu_w()` is the panel's `min_width`; a long entry (a table name in
         // "Truncate <name>") draws wider, and the flip has to test what is drawn.
         let w = ctx_menu_w().max(menu_panel_width(&entries));
@@ -2211,7 +2213,7 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
         // decides a flip outright, which is why it is measured from the labels.
         let Some((ph, content_w)) = popup.with(|p| {
             p.as_ref()
-                .map(|e| (menu_panel_height(e), menu_panel_width(e)))
+                .map(|e| (menu_drawn_height(e), menu_panel_width(e)))
         }) else {
             return s;
         };
@@ -4495,6 +4497,7 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
 pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
     let open = ui.overlay.error_modal_open;
     let text_override = ui.overlay.error_modal_text;
+    let override_is_statement = ui.overlay.error_modal_fixable;
     let tabs = ui.tabs_ui.tabs;
     let active = ui.tabs_ui.active;
     // "Explain" goes straight to the chat panel — no request signal, unlike the
@@ -4521,14 +4524,20 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                     _ => None,
                 });
             let override_text = text_override.get_untracked();
-            // "AI fix" belongs to the fallback only. An override is a commit
-            // error, a failed export, a server that didn't answer — none of them
-            // a statement the editor can rewrite, and the fix would silently act
-            // on whatever the active tab last ran instead.
-            let fixable_error = override_text
-                .is_none()
-                .then_some(tab_error.clone())
-                .flatten();
+            // "AI fix" belongs to a **statement** error. Most overrides are not
+            // one — a commit error, a failed export, a server that didn't answer —
+            // and fixing on those would silently act on whatever the active tab
+            // last ran instead. But a *Run-Everything statement failure* is
+            // routed here as an override too, and it is precisely the case
+            // `intel::error_fix_range` was added to scope: refusing it left the
+            // one multi-statement run error in the app with no fix affordance on
+            // any surface. `error_modal_fixable` is the bar's answer to which
+            // kind this is.
+            let fixable_error = match &override_text {
+                None => tab_error.clone(),
+                Some(m) if override_is_statement.get_untracked() => Some(m.clone()),
+                Some(_) => None,
+            };
             // `None` when the modal was opened on nothing at all — a state it can
             // reach, and one where both actions have to go: there is no error to
             // explain and nothing to fix, and a live "Explain" would send the
@@ -4541,6 +4550,9 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             let close = move || {
                 open.set(false);
                 text_override.set(None);
+                // The flag is part of the override and goes with it, or the next
+                // open would inherit this one's answer.
+                override_is_statement.set(false);
             };
 
             // The same "AI fix" the error bar offers, for the reader who opened
@@ -4589,6 +4601,19 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // talking about the same one.
             let explain = if let Some(explain_msg) = error {
                 let ai_send = ai_send.clone();
+                // The **tab's** connection decides how much of the error may leave
+                // the machine, not the active one — a tab keeps the connection it
+                // was opened on. Same lookup as the dialect two lines down, which
+                // is why they are read together.
+                let ai_data = tab
+                    .and_then(|t| {
+                        connections.with_untracked(|cs| {
+                            cs.iter()
+                                .find(|c| c.id == t.conn_id.get_untracked())
+                                .and_then(|c| c.ai_data)
+                        })
+                    })
+                    .unwrap_or_default();
                 let statement = fixable_error.and_then(|err| {
                     let tab = tab?;
                     let dialect = connections
@@ -4608,6 +4633,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                         let Some(p) = schemaic_core::prompt::explain_error_prompt(
                             statement.as_deref(),
                             &explain_msg,
+                            ai_data,
                         ) else {
                             return;
                         };
