@@ -1186,14 +1186,47 @@ impl Db {
     /// Introspect one database's schema (tables → columns + indexes) via
     /// `information_schema` (ARCHITECTURE §11). Everything is `CAST` to a known type
     /// so the protocol never surprises us with a width mismatch.
-    pub async fn fetch_schema(&self, database: &str) -> Result<DbSchema, DbError> {
+    ///
+    /// **Takes a `CancellationToken` like every other unbounded operation.** This
+    /// is every column, index, key, view, check and trigger of a whole database,
+    /// so on a few hundred tables it runs for a long time — and the Export
+    /// modal's `Reading the schema` phase is mounted over it behind a full
+    /// backdrop whose only exit is a cancel. Without the token the press did
+    /// nothing: the read ran to completion, and nothing else in the app was
+    /// clickable meanwhile. [`Db::count_rows`]' own doc records the same failure
+    /// once already.
+    ///
+    /// A caller with no cancel of its own passes `CancellationToken::new()`,
+    /// which is never cancelled.
+    pub async fn fetch_schema(
+        &self,
+        database: &str,
+        cancel: CancellationToken,
+    ) -> Result<DbSchema, DbError> {
+        // At the door, before any engine opens anything: a token cancelled
+        // before the call — Stop pressed while a queued dump was still waiting —
+        // would otherwise pay for a full connection handshake and then a *second*
+        // connection to KILL a query that was never issued.
+        if cancel.is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
         match self.engine {
-            Engine::Postgres => return pg::fetch_schema(self, database).await,
-            Engine::Sqlite => return sqlite::fetch_schema(self).await,
+            Engine::Postgres => return pg::fetch_schema(self, database, cancel).await,
+            Engine::Sqlite => return sqlite::fetch_schema(self, cancel).await,
             Engine::MySql => {}
         }
         let mut conn = self.open(None, false).await?;
-        let out = collect_schema(&mut conn, database).await;
+        // The connection id, so a second connection can KILL the read that is
+        // already running on the server — the same shape `count_rows` uses, and
+        // the only thing that actually stops work in flight.
+        let conn_id = conn.id();
+        let out = tokio::select! {
+            r = collect_schema(&mut conn, database) => r,
+            _ = cancel.cancelled() => {
+                self.kill_query(conn_id).await;
+                Err(DbError::Cancelled)
+            }
+        };
         let _ = conn.disconnect().await;
         out
     }
