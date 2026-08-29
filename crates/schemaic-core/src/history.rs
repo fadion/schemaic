@@ -422,6 +422,25 @@ pub fn preview(sql: &str) -> String {
     out
 }
 
+/// [`preview`] for a row that will be **syntax-coloured**.
+///
+/// The fold removes the newline that terminates a `--` / `#` comment, so on one
+/// line the comment runs to the end of the buffer — and the highlighter, which
+/// lexes exactly one line, painted the whole statement in the comment colour. A
+/// saved query with `-- daily revenue` on its first line rendered as if the SQL
+/// were commented out.
+///
+/// [`crate::sql::inline_line_comments`] rewrites them to `/* … */` first, which
+/// is the form that survives the fold — and keeps the text, which is often the
+/// most informative part of the row.
+///
+/// Separate from [`preview`] because the two answers differ only for a consumer
+/// that lexes: the palette and Server Activity draw plain text and want the
+/// statement as written.
+pub fn preview_for_highlight(sql: &str, dialect: crate::intel::SqlDialect) -> String {
+    preview(&crate::sql::inline_line_comments(sql, dialect))
+}
+
 /// [`preview`] without the clamp — what a *search* reads.
 ///
 /// The two are separate so a term past [`PREVIEW_MAX`] still finds its entry:

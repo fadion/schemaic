@@ -73,9 +73,15 @@ pub(crate) fn snippet_panel(ui: Ui) -> impl IntoView {
         items.with(|all| snippet::grouped(all, dialect.get(), conn, &q))
     });
 
-    let list = dyn_container(move || groups.get(), {
+    // **`(groups, search, dialect)`, not `groups` alone** — the reference tuple
+    // `history_panel.rs` uses, and for the reasons stated there in full. A
+    // `create_memo` notifies only on `!=` and `Group: PartialEq`, so a filter
+    // keystroke that does not change the matched set never rebuilt the rows: the
+    // highlight term (read `get_untracked` inside the child builder) froze on the
+    // previous word, and the preview stayed lexed with the previous engine.
+    let list = dyn_container(move || (groups.get(), search.get(), dialect.get()), {
         let actions = actions.clone();
-        move |groups: Vec<snippet::Group>| {
+        move |(groups, _, _): (Vec<snippet::Group>, String, SqlDialect)| {
             let conn = active_conn.get_untracked();
             if groups.is_empty() {
                 return empty_state().into_any();
@@ -368,10 +374,10 @@ fn snippet_row(
     // it is inserted — the identifiers, which are most of the text, stay in the
     // quiet base and only keywords, strings and numbers carry colour.
     let body_view = highlight_sql_mono(
-        snippet::collapsed(&snip.body),
+        snippet::collapsed_for_highlight(&snip.body, dialect),
         term.clone(),
         font_body,
-        theme::text_dim,
+        theme::preview_fg,
         1.4,
         dialect,
     )
@@ -396,21 +402,17 @@ fn snippet_row(
     // the row, which is why the same text wrapped there without being asked.
     .clip()
     .style(|s| s.width_full().min_width(0.0));
-    // **On the editor's surface, not the panel's.** The token colours are
-    // reproductions of published palettes (One Dark Pro, Tokyo Night, Catppuccin
-    // Latte) tuned against the *editor* background, which `contrast.rs` gates
-    // them on and deliberately does not gate anywhere else — and the editor
-    // theme is chosen independently of the light/dark UI theme, so Latte's
-    // dark-on-light tokens can be live while the panel is dark. Painting the
-    // preview on `bg_editor` is what keeps that pairing the one it was designed
-    // for; the AI panel's code blocks take the same surface for the same reason.
+    // **On the editor's surface, not the panel's** — `theme::preview_bg`, which
+    // holds the reason and the ratios. The history panel's preview takes the
+    // same surface and the same base, and `contrast.rs`'s cross-axis test is
+    // what keeps both there.
     let body_view = container(body_view).style(|s| {
         s.width_full()
             .min_width(0.0)
             .margin_top(theme::scaled(5.0))
             .padding_horiz(theme::scaled(7.0))
             .padding_vert(theme::scaled(5.0))
-            .background(theme::bg_editor())
+            .background(theme::preview_bg())
             .border_radius(5.0)
     });
 

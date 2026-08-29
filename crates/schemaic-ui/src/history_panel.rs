@@ -285,7 +285,7 @@ fn history_row(
 ) -> impl IntoView {
     // Full entry for the click handler — restores SQL + database + tab name.
     let entry_click = entry.clone();
-    let preview = history::preview(&entry.sql);
+    let preview = history::preview_for_highlight(&entry.sql, dialect);
     let db = entry.database.clone().unwrap_or_else(|| "—".to_string());
     let when = history::relative_time(entry.ts, now);
     // Key for the DB-identity dot (only drawn when this run's database has a colour).
@@ -305,15 +305,17 @@ fn history_row(
     // are most of a statement, stay in the base colour — only keywords, strings
     // and numbers carry colour, so the list still scans as a list.
     //
-    // `text_dim` is that base, the same one the library's previews take: the two
-    // panels sit in the same column and are read the same way, so a brighter
-    // base here made the colour that *is* meaningful — the keywords — carry less
-    // of the difference than it does one panel over.
+    // `theme::preview_fg` is that base, the same one the library's previews
+    // take: the two panels sit in the same column and are read the same way, so
+    // a brighter base here would make the colour that *is* meaningful — the
+    // keywords — carry less of the difference than it does one panel over. It
+    // comes from the editor axis because the token colours beside it do; a UI
+    // colour on this surface is the mismatch `theme::preview_bg` describes.
     let preview_view = highlight_sql_mono(
         preview,
         term.clone(),
         font_body,
-        theme::text_dim,
+        theme::preview_fg,
         1.4,
         dialect,
     )
@@ -334,12 +336,9 @@ fn history_row(
     })
     .clip()
     .style(|s| s.width_full().min_width(0.0));
-    // On the **editor's** surface, not the panel's: the token colours are
-    // reproductions of published palettes tuned against `bg_editor`, which
-    // `contrast.rs` gates them on and deliberately gates them nowhere else, and
-    // the editor theme is chosen independently of the light/dark UI theme. The
-    // snippet library and the AI panel's code blocks take the same surface for
-    // the same reason.
+    // On the **editor's** surface, not the panel's — `theme::preview_bg`, which
+    // is where the reason lives. The snippet library takes the same one, and the
+    // gate that keeps both there is `contrast.rs`'s cross-axis test.
     //
     // The padding replaces the 3px the text used to carry above and below, on
     // top of the stack's own 4px gap: the SQL was sitting tight against the two
@@ -350,7 +349,7 @@ fn history_row(
             .margin_vert(theme::scaled(3.0))
             .padding_horiz(theme::scaled(7.0))
             .padding_vert(theme::scaled(5.0))
-            .background(theme::bg_editor())
+            .background(theme::preview_bg())
             .border_radius(5.0)
     });
 

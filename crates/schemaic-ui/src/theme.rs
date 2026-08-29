@@ -60,6 +60,34 @@ pub fn caption_close_glyph() -> Color {
 pub fn code_bg() -> Color {
     editor().bg
 }
+
+/// The surface a **syntax-coloured preview** paints on — the History panel's and
+/// the Snippet Library's — and [`preview_fg`] the colour of the text on it that
+/// is not a token.
+///
+/// **Both come from the editor axis, and that is the whole point.** The token
+/// colours are reproductions of published palettes (One Dark Pro, Tokyo Night,
+/// Catppuccin Latte) tuned against their own background, and the editor theme is
+/// chosen *independently* of the light/dark UI theme — so pairing them with a UI
+/// surface is a cross-axis combination nobody chose. Both previews used to paint
+/// [`bg_editor`], which despite the name is the UI theme's **text-field**
+/// surface (`contrast.rs`'s own entry says so), and on the Light UI theme with
+/// the shipped-default Tokyo Night that put `string` at 1.70:1 and `number` at
+/// 1.90:1 — under even the *Recessive* floor of 2.0, while the uncoloured text
+/// beside them sat at 5.70:1. The text the colour was added to make stand out
+/// was the only text made unreadable.
+///
+/// Named here rather than spelled at each site so the cross-axis gate in
+/// `contrast.rs` measures the surface the previews actually paint.
+pub fn preview_bg() -> Color {
+    code_bg()
+}
+
+/// The base colour of a syntax-coloured preview's non-token text — see
+/// [`preview_bg`] for why it is the editor's own foreground.
+pub fn preview_fg() -> Color {
+    editor().fg
+}
 // Autocomplete popup: outline + selected/hovered row background.
 pub fn completion_border() -> Color {
     ui().completion_border
