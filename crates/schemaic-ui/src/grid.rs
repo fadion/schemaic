@@ -28,7 +28,7 @@ use floem::file::{FileDialogOptions, FileSpec};
 
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
-use schemaic_core::edit::{EditModel, analyze_edit, refetch_key, refetch_template, row_key};
+use schemaic_core::edit::{self, EditModel, analyze_edit, refetch_key, refetch_template, row_key};
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_statement};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
@@ -808,22 +808,21 @@ impl GridState {
         let rs = self.rs.get_untracked();
         self.dirty.update(|d| {
             for (di, ci, val) in cells {
-                // Original as `Option<String>`: NULL → `None`.
-                let orig = rs
-                    .cell(di, ci)
-                    .map(|c| {
-                        if c.is_null() {
-                            None
-                        } else {
-                            Some(c.display().to_string())
-                        }
-                    })
-                    .unwrap_or(None);
-                if orig == val {
-                    d.remove(&(di, ci)); // reverted to original → no longer dirty
-                } else {
-                    d.insert((di, ci), val);
-                    staged += 1;
+                // The rule itself is `edit::staged_cell`, in core with its four
+                // cases: a cell that is not there reads as NULL, which is what
+                // an out-of-range index meant here before.
+                let cell = rs.cell(di, ci);
+                let is_null = cell.as_ref().is_none_or(|c| c.is_null());
+                let orig = cell.as_ref().map(|c| c.display());
+                match edit::staged_cell(orig, is_null, val.as_deref()) {
+                    // Reverted to original → no longer dirty, and not counted.
+                    edit::StageOutcome::Revert => {
+                        d.remove(&(di, ci));
+                    }
+                    edit::StageOutcome::Stage => {
+                        d.insert((di, ci), val);
+                        staged += 1;
+                    }
                 }
             }
         });
@@ -2666,6 +2665,9 @@ pub(crate) struct GridCtx {
     /// error so the modal shows that instead of the tab's query error.
     pub(crate) error_open: RwSignal<bool>,
     pub(crate) error_text: RwSignal<Option<String>>,
+    /// Whether the override in `error_text` is a *statement* failure. See
+    /// [`BarState::Error`].
+    pub(crate) error_fixable: RwSignal<bool>,
 }
 
 /// The grid's commit-status bar, rendered at the RESULTS-panel level so it pins to
@@ -2698,6 +2700,7 @@ pub(crate) fn grid_error_bar(
     export_cancel: Rc<dyn Fn()>,
     error_open: RwSignal<bool>,
     error_text: RwSignal<Option<String>>,
+    error_fixable: RwSignal<bool>,
 ) -> impl IntoView {
     let BarSignals {
         batch_err,
@@ -2714,11 +2717,16 @@ pub(crate) fn grid_error_bar(
     // describes a write that is already over, while the note describes one still in
     // flight (and every path clears the note before reporting a failure anyway).
     let current = move || {
+        // **Which of the three it is, carried.** A Run-Everything statement's own
+        // failure is a *statement* error — the one thing `intel::error_fix_range`
+        // was added to scope — while a commit error, a filter re-run failure or a
+        // failed export is not. The bar looked identical for all of them and so
+        // offered the same nothing.
         batch_err
             .get()
-            .or_else(|| commit_err.get())
-            .or_else(|| view_err.get())
-            .map(BarState::Error)
+            .map(|m| BarState::Error(m, true))
+            .or_else(|| commit_err.get().map(|m| BarState::Error(m, false)))
+            .or_else(|| view_err.get().map(|m| BarState::Error(m, false)))
             .or_else(|| commit_wait.get().map(BarState::Wait))
             // Above the note and below the two problems. A running export is not
             // a problem, so an error or a stalled write outranks it; but it is
@@ -2735,18 +2743,26 @@ pub(crate) fn grid_error_bar(
             Some(BarState::Exporting) => {
                 return export_bar(export_cancel.clone()).into_any();
             }
-            Some(BarState::Error(msg)) => msg,
+            Some(BarState::Error(msg, fixable)) => (msg, fixable),
         };
+        let (msg, fixable) = msg;
         // Collapse to a single line (a multi-line server error would spill out
         // the top); the full text stays available in the View modal.
         let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
         let full = msg;
-        // View only when the bar is hiding something — a server error with a
-        // DETAIL under it. On a short one-liner (a JSON parse error, a NOT-NULL
-        // rejection) it opens a modal repeating the same words.
-        let view: AnyView = if hides_detail(&full, BAR_ONE_LINE_CHARS) {
+        // View when the bar is hiding something — a server error with a DETAIL
+        // under it — **or when the modal has an action this bar does not.** On a
+        // short one-liner it would otherwise open a modal repeating the same
+        // words; on a *statement* failure the modal is where "AI fix" and
+        // "Explain" live, so `Unknown column 'x' in 'field list'` offered nothing
+        // at all on the one surface those actions exist for.
+        let view: AnyView = if fixable || hides_detail(&full, BAR_ONE_LINE_CHARS) {
             text("View")
                 .on_click_stop(move |_| {
+                    // The flag rides with the text: the modal reads an override
+                    // as "not a statement", which is right for a commit error and
+                    // wrong for this one.
+                    error_fixable.set(fixable);
                     error_text.set(Some(full.clone()));
                     error_open.set(true);
                 })
@@ -2807,7 +2823,9 @@ pub(crate) fn grid_error_bar(
 /// chrome (`export_bar` draws `note_bar`'s exact fill), because they are one
 /// operation told in two tenses.
 enum BarState {
-    Error(String),
+    /// The message, and whether it is a **statement** failure — the batch arm —
+    /// which is what decides whether the modal behind "View" may offer a fix.
+    Error(String, bool),
     Wait(WaitNote),
     Exporting,
     Note(String),
