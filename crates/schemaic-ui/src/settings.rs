@@ -1567,25 +1567,6 @@ mod tests {
 /// `in_ring_picker`'s own.
 #[cfg(test)]
 mod no_floem_dropdown_gate {
-    use std::path::{Path, PathBuf};
-
-    fn src_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-    }
-
-    /// The file with its test module and every comment line cut off — a gate
-    /// that fires on prose about the thing it forbids gets deleted.
-    fn production_code(src: &str) -> String {
-        let body = match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
-        body.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// Every spelling that reaches floem's dropdown: the path, the `use` that
     /// shortens it, and the constructor a shortened one calls.
     const SPELLINGS: &[&str] = &[
@@ -1596,18 +1577,17 @@ mod no_floem_dropdown_gate {
     ];
 
     #[test]
-    fn no_view_in_this_crate_builds_a_floem_dropdown() {
+    fn no_view_in_the_app_builds_a_floem_dropdown() {
+        // `crate::source_gate::crate_sources`, for two reasons the old inline
+        // scan got wrong. It read `schemaic-ui/src` alone, while the invariant is
+        // stated app-wide ("every `<select>` in the app") and `schemaic-app`
+        // builds views too — so a `Dropdown` added there passed the whole suite.
+        // And it cut each file at the **first** `#[cfg(test)]`, which in
+        // `widgets.rs` is an inline test-only `fn` at line 929: 87% of the file,
+        // including the entire replacement menu system this gate exists to
+        // protect, was never scanned. A planted `Dropdown` at line 2000 passed.
         let mut offenders: Vec<String> = Vec::new();
-        let mut files = 0usize;
-        for entry in std::fs::read_dir(src_dir()).expect("the crate's own src") {
-            let path = entry.expect("a dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            files += 1;
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let src = std::fs::read_to_string(&path).expect("a source file");
-            let code = production_code(&src);
+        for (name, code) in crate::source_gate::crate_sources() {
             for (i, line) in code.lines().enumerate() {
                 if let Some(hit) = SPELLINGS.iter().find(|p| line.contains(**p)) {
                     offenders.push(format!(
@@ -1620,9 +1600,6 @@ mod no_floem_dropdown_gate {
                 }
             }
         }
-        // The scan has to still be reading something: a moved `src` would pass
-        // this test by finding no files at all.
-        assert!(files > 10, "only {files} source files scanned");
         assert!(offenders.is_empty(), "{}", offenders.join("\n"));
     }
 }

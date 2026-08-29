@@ -944,10 +944,9 @@ mod row_panel_focus_gate {
             .join("src")
             .join("cell_editors.rs");
         let src = std::fs::read_to_string(path).expect("this module's own source");
-        match src.find("#[cfg(test)]") {
-            Some(i) => src[..i].to_string(),
-            None => src,
-        }
+        // [`crate::source_gate`] owns the cut — brace-aware, so an inline
+        // `#[cfg(test)]` item does not end the scan where it starts.
+        crate::source_gate::production_code(&src)
     }
 
     #[test]

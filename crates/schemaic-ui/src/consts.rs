@@ -1163,18 +1163,13 @@ mod float_inset_gate {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
 
-    /// The file with its test module and comment lines cut off — a gate that
-    /// fires on prose about the thing it forbids gets deleted.
-    fn production_code(src: &str) -> String {
-        let body = match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
-        body.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+    /// The file with its `#[cfg(test)]` items and comment lines cut off — a gate
+    /// that fires on prose about the thing it forbids gets deleted.
+    ///
+    /// [`crate::source_gate`] owns the cut, because the eleven copies of it that
+    /// used to exist all cut at the *first* `#[cfg(test)]` and so read 929 of
+    /// `widgets.rs`'s 7,259 lines.
+    use crate::source_gate::production_code;
 
     /// Every `inset_*(…)` call on a line, with its argument text.
     fn inset_calls(line: &str) -> Vec<String> {
