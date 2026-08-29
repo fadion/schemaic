@@ -2653,15 +2653,41 @@ fn menu_stack(
         .enumerate()
         .map(|(i, e)| menu_entry_view(i, e, level, close.clone()))
         .collect();
-    v_stack_from_iter(rows)
+    // **Scrolled, and capped to the window.** A picker's list is as long as the
+    // schema makes it — the FK designer's "References table" is one row per table
+    // (34 on a modest database, 21 visible at 160%), and the import mapping is one
+    // per target column. A plain `v_stack` has no cap and no scroll, and
+    // `box_menu_inset`'s "taller than the window" arm pins the panel at y = 0, so
+    // everything below the fold was invisible *and* unclickable with nothing on
+    // screen to say there was more.
+    //
+    // The cap is read inside the style closure, so a scale change or a window
+    // resize moves it — the rule `min_w`'s siblings in `dividers.rs` follow.
+    scroll(v_stack_from_iter(rows))
         .on_event_stop(EventListener::PointerDown, |_| {})
         .style(move |s| {
-            panel_style(s)
+            let cap = menu_max_h();
+            let s = panel_style(s)
                 .background(theme::bg_chrome())
                 .min_width(width)
                 .padding_vert(theme::scaled(6.0))
-                .font_size(theme::font_title())
+                .font_size(theme::font_title());
+            if cap > 0.0 { s.max_height(cap) } else { s }
         })
+}
+
+/// The tallest a menu panel may be: the window less the title bar and a margin at
+/// each end, so a long one scrolls inside its own panel instead of running off the
+/// bottom of the screen.
+///
+/// `0.0` before the window has been measured, which the caller reads as "no cap"
+/// — the same "not yet" answer [`cap_to`] gives.
+fn menu_max_h() -> f64 {
+    let h = window_size().get().1;
+    if h <= 1.0 {
+        return 0.0;
+    }
+    (h - theme::header_h() - theme::scaled(16.0)).max(theme::scaled(80.0))
 }
 
 /// Gap between the cursor and the corner of a menu opened at it.
@@ -2707,6 +2733,19 @@ pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
         .sum::<f64>()
         + theme::scaled(MENU_PANEL_PAD) * 2.0
         + MENU_PANEL_BORDER * 2.0
+}
+
+/// [`menu_panel_height`] as the panel will actually be **drawn** — clamped to
+/// [`menu_max_h`], which is what a long list scrolls inside.
+///
+/// The placement arithmetic has to ask this one, not the raw sum: a 34-row picker
+/// estimates well past the window, so `box_menu_inset` took its "taller than the
+/// window" arm and pinned the panel at the top even where the *capped* panel would
+/// have fitted below the field, or flipped cleanly above it.
+pub(crate) fn menu_drawn_height(entries: &[MenuEntry]) -> f64 {
+    let want = menu_panel_height(entries);
+    let cap = menu_max_h();
+    if cap > 0.0 { want.min(cap) } else { want }
 }
 
 /// The width the panel will actually draw at — [`menu_panel_height`]'s missing
@@ -3196,7 +3235,7 @@ pub(crate) fn submenu_layer() -> impl IntoView {
         let Some(s) = open.get() else {
             return st;
         };
-        let (x, y) = submenu_insets(s.row, window_size().get(), menu_panel_height(&s.entries));
+        let (x, y) = submenu_insets(s.row, window_size().get(), menu_drawn_height(&s.entries));
         let st = st.absolute();
         let st = match x {
             SubX::Left(v) => st.inset_left(v),
@@ -4703,6 +4742,36 @@ pub(crate) fn accept_launch(in_flight: bool, read_only: bool) -> bool {
     !in_flight && !read_only
 }
 
+/// [`accept_launch`] for a launch that goes through an **OS file dialog** — one
+/// asked for *then*, and started when the dialog comes back.
+///
+/// floem's `save_as` is not window-modal (`file_action.rs:58-79` spawns a bare
+/// thread with no parent window), so the app keeps taking input for the whole
+/// life of the dialog. The modal that asked can therefore be gone by the time the
+/// callback runs, and [`accept_launch`] alone says yes: `running` is still
+/// `false`, because nothing has started. What followed was a full schema+data
+/// dump with **no view rendering it, no way to cancel it and nowhere for its
+/// outcome to go** — and then, because reopening the modal resets `running`, a
+/// second one streaming over the first's `.part` file, with the first's
+/// cancellation token overwritten. Verbatim the failure [`accept_launch`]'s own
+/// doc records for the import bug.
+///
+/// So two more terms, and both are already computed at the site:
+///
+/// - `modal_open` — the modal that asked still exists.
+/// - `generation` — and it is still the *same* one. Reopening Export on another
+///   database bumps it, which the late-outcome guard four lines further on
+///   already reads for exactly this reason; the launch simply never asked.
+pub(crate) fn accept_dialog_launch(
+    in_flight: bool,
+    read_only: bool,
+    modal_open: bool,
+    generation_at_ask: u64,
+    generation_now: u64,
+) -> bool {
+    accept_launch(in_flight, read_only) && modal_open && generation_at_ask == generation_now
+}
+
 /// [`accept_launch`] for the app crate, whose destructive actions are the same
 /// class and must not re-derive the answer.
 pub fn may_launch_destructive(in_flight: bool, read_only: bool) -> bool {
@@ -4890,6 +4959,36 @@ mod exit_tests {
     #[test]
     fn idle_and_writable_launches() {
         assert!(accept_launch(false, false));
+    }
+
+    /// The dump's Critical, and the composition that produced it: an OS save
+    /// dialog is not window-modal, so the modal that asked can be closed while it
+    /// is up — and then `running` is still `false`, so `accept_launch` alone said
+    /// yes to a dump nothing rendered, nothing could cancel, and whose outcome
+    /// had nowhere to go.
+    #[test]
+    fn a_dialog_launch_is_refused_when_the_modal_that_asked_for_it_has_closed() {
+        assert!(
+            accept_launch(false, false),
+            "the plain guard is what said yes"
+        );
+        assert!(!accept_dialog_launch(false, false, false, 3, 3));
+    }
+
+    /// And refused when the modal was reopened on something else in the meantime
+    /// — the same generation the late-outcome guard reads, asked at the launch.
+    #[test]
+    fn a_dialog_launch_is_refused_when_the_modal_moved_on() {
+        assert!(!accept_dialog_launch(false, false, true, 3, 4));
+    }
+
+    /// The counterweight: the ordinary Export must still go through, and the two
+    /// original terms still hold.
+    #[test]
+    fn a_dialog_launch_from_the_modal_that_asked_goes_through() {
+        assert!(accept_dialog_launch(false, false, true, 3, 3));
+        assert!(!accept_dialog_launch(true, false, true, 3, 3));
+        assert!(!accept_dialog_launch(false, true, true, 3, 3));
     }
 
     /// **A patch to what is behind the key is not a change to the key.**
@@ -5777,6 +5876,34 @@ mod menu_placement_tests {
              have scaled with it"
         );
         crate::theme::set_ui_scale(crate::theme::UiScale::Normal);
+    }
+
+    /// A picker's list is as long as the schema makes it — one row per table in
+    /// the FK designer's "References table", one per target column in the import
+    /// mapping — and the panel had no cap and no scroll, so everything below the
+    /// fold was invisible *and* unclickable. The placement has to be told what
+    /// will be drawn, not what the rows add up to, or a menu that now fits below
+    /// the field is still pinned to the top of the window.
+    #[test]
+    fn a_menu_longer_than_the_window_is_capped_to_what_it_will_draw() {
+        let long: Vec<MenuEntry> = (0..200)
+            .map(|i| MenuEntry::action(format!("table_{i}"), || {}))
+            .collect();
+        window_size().set((1280.0, 800.0));
+        let raw = menu_panel_height(&long);
+        let drawn = menu_drawn_height(&long);
+        assert!(raw > 800.0, "the fixture has to overflow the window: {raw}");
+        assert!(drawn < raw, "{drawn} vs {raw}");
+        assert!(drawn <= 800.0, "{drawn}");
+        // And the cap only ever shortens: a menu that already fits is untouched.
+        let short = [MenuEntry::action("x", || {})];
+        assert_eq!(menu_drawn_height(&short), menu_panel_height(&short));
+
+        // Before the window has been measured there is no cap to apply — the
+        // same "not yet" answer `cap_to` gives. Left there, which is the
+        // unmeasured state every other test in this file restores to.
+        window_size().set((0.0, 0.0));
+        assert_eq!(menu_drawn_height(&long), raw);
     }
 
     /// The reported bug, as arithmetic: the grid's cell menu is wider than the
@@ -6899,14 +7026,12 @@ mod popup_anchor_gate {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
 
-    /// The file with its `#[cfg(test)]` module cut off — test data is full of
+    /// The file with its `#[cfg(test)]` items cut off — test data is full of
     /// `.set(Some(…))` and a gate that cries wolf gets deleted.
-    fn production_code(src: &str) -> &str {
-        match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
+    ///
+    /// [`crate::source_gate`] owns the cut. Cutting at the *first*
+    /// `#[cfg(test)]`, as this used to, reads 929 lines of **this** file.
+    use crate::source_gate::production_code;
 
     /// The file's *logical* lines, each with the 1-based number it starts at.
     ///
@@ -6980,7 +7105,7 @@ mod popup_anchor_gate {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             let src = std::fs::read_to_string(&path).expect("readable");
             let mut anchored = false;
-            for (lineno, line) in logical_lines(production_code(&src)) {
+            for (lineno, line) in logical_lines(&production_code(&src)) {
                 if sets_anchor(&line) {
                     anchored = true;
                 }
@@ -7060,10 +7185,7 @@ mod menu_trigger_gate {
             .map(|p| {
                 let src = std::fs::read_to_string(p).expect("readable");
                 // Test data names every id; only production sites count.
-                match src.find("#[cfg(test)]") {
-                    Some(i) => src[..i].to_string(),
-                    None => src,
-                }
+                crate::source_gate::production_code(&src)
             })
             .collect::<Vec<_>>()
             .join("\n")
