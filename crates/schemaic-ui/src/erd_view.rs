@@ -2527,6 +2527,51 @@ struct Controls {
     export: AnyView,
 }
 
+/// The toolbar's width accounting, as the four numbers
+/// [`schemaic_core::erd::fit_toolbar`] takes: `(fixed, counts, zoom, export)`.
+///
+/// `fixed` is what the bar pays whatever it hides — the two paddings, the
+/// toolbar's own two gaps, the scope group, and, when the controls are drawn,
+/// the Fit/Reset pair with the gap between them. The other three are what each
+/// optional group costs, **each including the flex gap that goes with it**: a
+/// hidden child really does take its gap, because taffy filters `Display::None`
+/// out in `generate_anonymous_flex_items`, before the line the gaps are
+/// distributed over is built. So counting the gap here is right rather than
+/// conservative.
+///
+/// Free-standing rather than inline in [`modal_frame`]'s closure, which
+/// captures four locals and returns an `Rc<dyn Fn()>` no test can reach: this
+/// is where every way the toolbar can be wrong lives, so the sum the app draws
+/// has to be the sum a test reads.
+fn toolbar_metrics(scope: &str, labels: &[String], has_controls: bool) -> (f64, f64, f64, f64) {
+    let counts_w = match labels.is_empty() {
+        true => 0.0,
+        false => {
+            labels.iter().map(|l| chip_w(l)).sum::<f64>()
+                + theme::scaled(CHIP_GAP) * (labels.len() - 1) as f64
+                + theme::scaled(TOOLBAR_GAP)
+        }
+    };
+    let scope_w = crate::widgets::measure_text_px_at("Scope", toolbar_font())
+        + theme::scaled(SCOPE_GAP)
+        + crate::widgets::measure_text_px_at(scope, toolbar_font());
+    let mut fixed = theme::scaled(TOOLBAR_PAD_LEFT)
+        + theme::scaled(TOOLBAR_PAD_RIGHT)
+        + theme::scaled(TOOLBAR_GAP) * 2.0
+        + scope_w;
+    if has_controls {
+        fixed += icon_button_w() * 2.0 + theme::scaled(TOOLBAR_GAP);
+    }
+    let (zoom_w, export_w) = match has_controls {
+        true => (
+            zoom_unit_w() + theme::scaled(TOOLBAR_GAP),
+            icon_button_w() + theme::scaled(TOOLBAR_GAP),
+        ),
+        false => (0.0, 0.0),
+    };
+    (fixed, counts_w, zoom_w, export_w)
+}
+
 /// Assemble the modal: backdrop + panel (header, toolbar, body). `body` is the
 /// canvas (or a message). Sized ~80% of the window.
 ///
@@ -2552,47 +2597,12 @@ fn modal_frame(
     let scope_text = scope.clone();
     // Cloned for the fit closure, which outlives the pill construction below.
     let count_labels = counts.clone();
-    // What the toolbar loses by dropping each optional group: the group itself
-    // **plus the flex gap that goes with it**. A hidden child really does take
-    // its gap — taffy filters `Display::None` out in
-    // `generate_anonymous_flex_items`, before the line the gaps are distributed
-    // over is built — so counting the gap here is right rather than
-    // conservative. Stated once, here, rather than guessed at inside the fit.
+    // The accounting itself lives in `toolbar_metrics`, where a test can read
+    // the same sum the app draws.
     let fit: Rc<dyn Fn() -> erd::ToolbarFit> = Rc::new(move || {
-        let counts_w = |labels: &[String]| match labels.is_empty() {
-            true => 0.0,
-            false => {
-                labels.iter().map(|l| chip_w(l)).sum::<f64>()
-                    + theme::scaled(CHIP_GAP) * (labels.len() - 1) as f64
-                    + theme::scaled(TOOLBAR_GAP)
-            }
-        };
-        // Fixed: the paddings, the toolbar's two own gaps, the scope group, and
-        // the Fit/Reset pair with the gap between them.
-        let scope_w = crate::widgets::measure_text_px_at("Scope", toolbar_font())
-            + theme::scaled(SCOPE_GAP)
-            + crate::widgets::measure_text_px_at(&scope_text, toolbar_font());
-        let mut fixed = theme::scaled(TOOLBAR_PAD_LEFT)
-            + theme::scaled(TOOLBAR_PAD_RIGHT)
-            + theme::scaled(TOOLBAR_GAP) * 2.0
-            + scope_w;
-        if has_controls {
-            fixed += icon_button_w() * 2.0 + theme::scaled(TOOLBAR_GAP);
-        }
-        let (zoom_w, export_w) = match has_controls {
-            true => (
-                zoom_unit_w() + theme::scaled(TOOLBAR_GAP),
-                icon_button_w() + theme::scaled(TOOLBAR_GAP),
-            ),
-            false => (0.0, 0.0),
-        };
-        erd::fit_toolbar(
-            avail.get(),
-            fixed,
-            counts_w(&count_labels),
-            zoom_w,
-            export_w,
-        )
+        let (fixed, counts_w, zoom_w, export_w) =
+            toolbar_metrics(&scope_text, &count_labels, has_controls);
+        erd::fit_toolbar(avail.get(), fixed, counts_w, zoom_w, export_w)
     });
 
     let count_pills = h_stack_from_iter(counts.into_iter().map(count_chip)).style({
@@ -3282,25 +3292,11 @@ mod toolbar_width_tests {
             let avail =
                 win_w * 0.8 - theme::scaled(TOOLBAR_PAD_LEFT) - theme::scaled(TOOLBAR_PAD_RIGHT);
             let labels = ["5 tables".to_string(), "4 relationships".to_string()];
-            let counts = labels.iter().map(|l| chip_w(l)).sum::<f64>()
-                + theme::scaled(CHIP_GAP)
-                + theme::scaled(TOOLBAR_GAP);
-            let scope = crate::widgets::measure_text_px_at("Scope", toolbar_font())
-                + theme::scaled(SCOPE_GAP)
-                + crate::widgets::measure_text_px_at("employees.employees", toolbar_font());
-            let fixed = theme::scaled(TOOLBAR_PAD_LEFT)
-                + theme::scaled(TOOLBAR_PAD_RIGHT)
-                + theme::scaled(TOOLBAR_GAP) * 2.0
-                + scope
-                + icon_button_w() * 2.0
-                + theme::scaled(TOOLBAR_GAP);
-            let got = erd::fit_toolbar(
-                avail,
-                fixed,
-                counts,
-                zoom_unit_w() + theme::scaled(TOOLBAR_GAP),
-                icon_button_w() + theme::scaled(TOOLBAR_GAP),
-            );
+            // Through the production accounting, not a copy of it: a `fixed`
+            // that over-counts has to be able to fail this.
+            let (fixed, counts, zoom, export) =
+                toolbar_metrics("employees.employees", &labels, true);
+            let got = erd::fit_toolbar(avail, fixed, counts, zoom, export);
             crate::theme::set_ui_scale(UiScale::Normal);
             assert_eq!(
                 got,
@@ -3309,5 +3305,85 @@ mod toolbar_width_tests {
                  with room"
             );
         }
+    }
+
+    /// **Every gap the bar draws is paid for.** Four groups shown means the
+    /// toolbar's own two gaps, the one between the scope and the pills, and the
+    /// three inside the control row — and the sum is written out here by hand
+    /// rather than restated from the production expression, so dropping a term
+    /// from `toolbar_metrics` fails this.
+    #[test]
+    fn the_toolbar_pays_for_every_gap_it_draws() {
+        crate::theme::set_ui_scale(UiScale::Normal);
+        let labels = ["5 tables".to_string(), "4 relationships".to_string()];
+        let (fixed, counts, zoom, export) = toolbar_metrics("app.orders", &labels, true);
+
+        let gap = theme::scaled(TOOLBAR_GAP);
+        let scope = crate::widgets::measure_text_px_at("Scope", toolbar_font())
+            + theme::scaled(SCOPE_GAP)
+            + crate::widgets::measure_text_px_at("app.orders", toolbar_font());
+        // Paddings + the bar's own two gaps + the scope group + Fit/Reset and
+        // the gap between them.
+        assert_eq!(
+            fixed,
+            theme::scaled(TOOLBAR_PAD_LEFT)
+                + theme::scaled(TOOLBAR_PAD_RIGHT)
+                + gap * 2.0
+                + scope
+                + icon_button_w() * 2.0
+                + gap,
+            "the fixed width is not the sum of the parts the bar always draws"
+        );
+        // Two chips, the gap between them, and the gap that separates the group
+        // from the scope.
+        assert_eq!(
+            counts,
+            chip_w("5 tables") + chip_w("4 relationships") + theme::scaled(CHIP_GAP) + gap,
+            "the count group does not carry its own leading gap"
+        );
+        assert_eq!(zoom, zoom_unit_w() + gap, "the zoom unit lost its gap");
+        assert_eq!(export, icon_button_w() + gap, "Export lost its gap");
+    }
+
+    /// The `has_controls == false` arm — the two early-return `modal_frame`
+    /// calls, which draw a message and no controls. Nothing may be reserved for
+    /// buttons that are not there, or the bar strips the counts off a toolbar
+    /// with nothing else in it.
+    #[test]
+    fn a_toolbar_without_controls_reserves_no_control_width() {
+        crate::theme::set_ui_scale(UiScale::Normal);
+        let labels = ["5 tables".to_string()];
+        let (fixed, counts, zoom, export) = toolbar_metrics("app.orders", &labels, false);
+
+        assert_eq!(zoom, 0.0, "a bar with no controls reserved zoom width");
+        assert_eq!(export, 0.0, "a bar with no controls reserved Export width");
+        let with = toolbar_metrics("app.orders", &labels, true).0;
+        assert_eq!(
+            with - fixed,
+            icon_button_w() * 2.0 + theme::scaled(TOOLBAR_GAP),
+            "the Fit/Reset pair and its gap are the whole difference"
+        );
+        assert_eq!(counts, chip_w("5 tables") + theme::scaled(TOOLBAR_GAP));
+    }
+
+    /// Hiding the pills gives back the gap that went with them, not just the
+    /// chips — the taffy behaviour `toolbar_metrics`' doc rests on, pinned here
+    /// because it is a third-party rule the arithmetic depends on.
+    #[test]
+    fn hiding_the_pills_gives_back_their_gap_too() {
+        crate::theme::set_ui_scale(UiScale::Normal);
+        let labels = ["5 tables".to_string(), "4 relationships".to_string()];
+        let (fixed, counts, ..) = toolbar_metrics("app.orders", &labels, true);
+        let (bare_fixed, bare_counts, ..) = toolbar_metrics("app.orders", &[], true);
+
+        assert_eq!(bare_counts, 0.0, "no labels should cost nothing");
+        assert_eq!(
+            bare_fixed, fixed,
+            "the pills are not part of the fixed width"
+        );
+        assert!(
+            counts > chip_w("5 tables") + chip_w("4 relationships") + theme::scaled(CHIP_GAP),
+            "dropping the group must give back its leading gap as well: {counts}"
+        );
     }
 }
