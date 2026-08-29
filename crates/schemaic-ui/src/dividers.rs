@@ -148,9 +148,23 @@ pub(crate) fn h_resize_handle(
             hovered.leave();
             EventPropagation::Continue
         })
-        .on_event_stop(EventListener::PointerDown, move |_| {
+        .on_event(EventListener::PointerDown, move |e| {
+            // **The primary button only.** floem gates its whole primary-button
+            // branch on `is_primary()` — including the unconditional `PointerUp`
+            // dispatch (`context.rs:291,354`) — so a drag armed by a right-press
+            // never receives the `PointerUp` that would disarm it. The bar then
+            // stayed `dragging` for ever, and the panel snapped to the pointer on
+            // every buttonless crossing afterwards. The crate's two other drags
+            // both guard this.
+            let Event::PointerDown(pe) = e else {
+                return EventPropagation::Continue;
+            };
+            if !pe.button.is_primary() {
+                return EventPropagation::Continue;
+            }
             dragging.set(true);
             id.request_active();
+            EventPropagation::Stop
         })
         .on_event(EventListener::PointerMove, move |e| {
             if dragging.get_untracked() {
@@ -196,7 +210,20 @@ pub(crate) fn h_resize_handle(
             // happened to trigger the leave. `leave` also voids a pending arm, so
             // a double-click inside the hover delay cannot light it afterwards.
             hovered.leave();
-            dim.set(default);
+            // **Through the same clamp the drag uses.** This was the one write in
+            // the file that skipped it, and the three defaults are deliberately
+            // unscaled while the three floors are `scaled(…)`: at 160% the schema
+            // panel's default (300) is below its floor (400), so the reset
+            // persisted 300 while the app rendered 400. The width the user sees
+            // and the width the app remembers were different numbers, and the next
+            // launch reproduced the mismatch.
+            //
+            // Clamped rather than scaled: a reset must land in the same place at
+            // every scale (`scaled_arg_gate`'s exemption says so), and where that
+            // place is out of range the honest answer is the nearest width the app
+            // will actually draw.
+            let lo = min_w();
+            dim.set(default.clamp(lo, max_w().max(lo)));
             on_commit();
         })
 }
@@ -253,9 +280,23 @@ pub(crate) fn v_resize_handle(
             hovered.leave();
             EventPropagation::Continue
         })
-        .on_event_stop(EventListener::PointerDown, move |_| {
+        .on_event(EventListener::PointerDown, move |e| {
+            // **The primary button only.** floem gates its whole primary-button
+            // branch on `is_primary()` — including the unconditional `PointerUp`
+            // dispatch (`context.rs:291,354`) — so a drag armed by a right-press
+            // never receives the `PointerUp` that would disarm it. The bar then
+            // stayed `dragging` for ever, and the panel snapped to the pointer on
+            // every buttonless crossing afterwards. The crate's two other drags
+            // both guard this.
+            let Event::PointerDown(pe) = e else {
+                return EventPropagation::Continue;
+            };
+            if !pe.button.is_primary() {
+                return EventPropagation::Continue;
+            }
             dragging.set(true);
             id.request_active();
+            EventPropagation::Stop
         })
         .on_event(EventListener::PointerMove, move |e| {
             if dragging.get_untracked() {
@@ -280,11 +321,13 @@ pub(crate) fn v_resize_handle(
         })
         .on_double_click_stop(move |_| {
             // See h_resize_handle: clear the drag state the eaten PointerUp would
-            // have, and darken the bar the reset moves out from under the pointer.
+            // have, darken the bar the reset moves out from under the pointer, and
+            // clamp the default the same way the drag does.
             dragging.set(false);
             id.clear_active();
             hovered.leave();
-            dim.set(default);
+            let lo = min_h();
+            dim.set(default.clamp(lo, max_h().max(lo)));
             on_commit();
         })
 }
@@ -322,15 +365,10 @@ mod double_click_gate {
         .expect("dividers.rs");
         // This module quotes the calls it is looking for, so cut it off, and drop
         // comment lines for the same reason.
-        let body = match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => &src[..],
-        };
-        let body: String = body
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // `source_gate::production_code` drops both, and cuts each
+        // `#[cfg(test)]` *item* rather than everything after the first one.
+        let body = crate::source_gate::production_code(&src);
+        let body: String = body.lines().collect::<Vec<_>>().join("\n");
 
         let handlers: Vec<&str> = body
             .split(".on_double_click_stop(")
@@ -410,7 +448,9 @@ mod scaled_arg_gate {
          which are seeds for a persisted user-dragged size and are deliberately \
          unscaled (see `consts.rs`'s exception list). A scale change must not \
          move where a reset lands, or the same double-click would give a \
-         different width at each scale.",
+         different width at each scale. What *is* scaled is the clamp the reset \
+         goes through — at 160% a 300px default is below a 400px floor, and \
+         setting it raw persisted a width the app would never draw.",
     )];
 
     #[test]
@@ -421,10 +461,8 @@ mod scaled_arg_gate {
                 .join("dividers.rs"),
         )
         .expect("dividers.rs");
-        let body = match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => &src[..],
-        };
+        let body = crate::source_gate::production_code(&src);
+        let body = body.as_str();
 
         let mut checked = 0usize;
         let mut offenders: Vec<String> = Vec::new();
@@ -476,7 +514,8 @@ mod scaled_arg_gate {
                 .join("dividers.rs"),
         )
         .expect("dividers.rs");
-        let body = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let body = crate::source_gate::production_code(&src);
+        let body = body.as_str();
         for (param, why) in EXEMPT {
             assert!(
                 body.contains(&format!("{param}: f64")),
@@ -484,5 +523,55 @@ mod scaled_arg_gate {
                  any more — drop the entry"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    /// The premise the publishers' equality guard rests on (`lib.rs`'s
+    /// `schema_panel_w` / `right_panel_w` effects): once a drag pushes past the
+    /// floor, **every further frame produces the same width**.
+    ///
+    /// So without a guard those frames each republish an unchanged number, and
+    /// floem notifies unconditionally — restyling every rendered schema-tree row
+    /// for no visual change. This is the pure half of that; the rest is a
+    /// signal-notification count no `#[test]` can see.
+    #[test]
+    fn a_drag_past_the_floor_yields_the_same_width_every_frame() {
+        let (lo, hi) = (240.0_f64, 800.0_f64);
+        let mut w = 250.0_f64;
+        // Ten frames of a pointer still moving left, well past the floor.
+        let widths: Vec<f64> = (0..10)
+            .map(|_| {
+                w = (w + -40.0).clamp(lo, hi);
+                w
+            })
+            .collect();
+        assert!(
+            widths.iter().all(|x| *x == lo),
+            "every frame past the floor is the floor: {widths:?}"
+        );
+        // And the same at the ceiling.
+        let mut w = 790.0_f64;
+        let widths: Vec<f64> = (0..10)
+            .map(|_| {
+                w = (w + 40.0).clamp(lo, hi);
+                w
+            })
+            .collect();
+        assert!(widths.iter().all(|x| *x == hi), "{widths:?}");
+        // A drag that is actually moving does change the width, so the guard
+        // cannot be mistaken for "never publish".
+        assert_ne!((500.0_f64 + -40.0).clamp(lo, hi), 500.0);
+    }
+
+    /// A floor above the ceiling — a window too narrow for both minimums — is
+    /// why every clamp here spells `max_w().max(lo)`. `f64::clamp` panics when
+    /// `min > max`, and the drag reads both inside the gesture.
+    #[test]
+    fn a_ceiling_below_the_floor_is_raised_rather_than_panicking() {
+        let lo = 400.0_f64;
+        let hi = 120.0_f64.max(lo);
+        assert_eq!((300.0_f64).clamp(lo, hi), lo);
     }
 }
