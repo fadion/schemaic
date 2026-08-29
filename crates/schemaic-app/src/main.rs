@@ -1386,6 +1386,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let find_query = RwSignal::new(String::new());
     let error_modal_open = RwSignal::new(false);
     let error_modal_text: RwSignal<Option<String>> = RwSignal::new(None);
+    // Whether that override is a *statement* failure — see `error_modal_fixable`.
+    let error_modal_fixable = RwSignal::new(false);
     let conn_status = RwSignal::new(ConnStatus::Unknown);
     // Consecutive failed health checks of the active connection, folded by every
     // check (polled or manual). Drives the health poll's backoff so a server
@@ -1634,17 +1636,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
     };
     // The dialect of the **active connection** — what a newly saved snippet is
-    // scoped to. The panel groups by the same one.
-    let conn_dialect = move || {
-        let cid = active_conn.get_untracked();
+    // scoped to, and what the snippet library, the library panel, the history
+    // panel and the palette all group and colour by.
+    //
+    // **A memo, so it can be read either way.** The library below has to *track*
+    // it: its built-in pack is `snippet::builtins(dialect)`, so a memo that read
+    // the dialect untracked recomputed only when `snippets` changed — and every
+    // writer of that signal is a user action. Switching to a connection of
+    // another engine therefore left the whole shipped pack of the *previous*
+    // engine in place, which `snippet::applies` then filtered out entirely: the
+    // panel, abbrev expansion and Find-Anywhere all lost the built-ins until the
+    // next time a user snippet happened to be written.
+    let conn_dialect_memo = create_memo(move |_| {
+        let cid = active_conn.get();
         connections
-            .with_untracked(|cs| {
+            .with(|cs| {
                 cs.iter()
                     .find(|c| c.id == cid)
                     .map(|c| SqlDialect::from_db_type(&c.db_type))
             })
             .unwrap_or_default()
-    };
+    });
     // What the editor would contribute to a snippet: the selection if there is
     // one, else the whole buffer. The same rule Format follows, and the same
     // `selected_text` that degrades to `None` when the mirrored range has
@@ -1706,28 +1718,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let body = editor_snippet_text()?;
             let id = snippets.with_untracked(|v| schemaic_core::snippet::next_id(v));
             let name = active_tab().map_or_else(|| "Snippet".to_string(), |t| t.title());
+            // The scope and the used-now stamp are `new_saved`'s, in core with
+            // the test that composes them with the panel's grouping and sort —
+            // both were a struct literal here, and both shipped wrong once.
             snippets.update(|v| {
-                v.push(schemaic_core::snippet::Snippet {
+                v.push(schemaic_core::snippet::new_saved(
                     id,
                     name,
-                    abbrev: None,
                     body,
-                    // **This connection**, which is the narrowest scope and the
-                    // one you can see: a snippet saved from the query in front
-                    // of you is usually about *this* database, and widening it
-                    // to the engine is one click in Show in. Saving it engine-wide
-                    // instead dropped a new row into the middle of a list of
-                    // other people's queries, which is where it was found to be
-                    // wrong.
-                    scope: schemaic_core::snippet::Scope::Conn(active_conn.get_untracked()),
-                    source: schemaic_core::snippet::Source::User,
-                    // Stamped as used **now**, so the most-recently-used sort
-                    // puts it first in its band — the top row of the top band,
-                    // which is where the panel then scrolls. It is also true:
-                    // this snippet came from the statement the user is working
-                    // on, which is the most recent use there is.
-                    last_used: Some(snippet_now()),
-                })
+                    active_conn.get_untracked(),
+                    snippet_now(),
+                ))
             });
             (save_snippets)();
             Some(id)
@@ -1742,7 +1743,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // alone, which is what keeps the pack in code where a later release can fix
     // one, instead of copied into everybody's `snippets.json`.
     let snippet_library = create_memo(move |_| {
-        let dialect = conn_dialect();
+        // **Tracked.** The pack is per engine, so this memo's dependency set has
+        // to include the engine — see `conn_dialect_memo`.
+        let dialect = conn_dialect_memo.get();
         snippets.with(|user| schemaic_core::snippet::library(user, dialect))
     });
     // Tracked, so the `+` un-dims as soon as the tab has text. It asks the same
@@ -3182,7 +3185,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return;
                     }
                 };
-                let query = tab.query.get_untracked();
+                // **`base_sql`, not `query`, and only if it reads.**
+                //
+                // `query` is the live editor buffer, and it drifts: after a
+                // parameterised run it holds the *template*, so the post-commit
+                // re-run replayed `… WHERE id = :id` and replaced a successful
+                // commit's grid with `ERROR 1064 … near ':id'` — with `commit_err`
+                // empty, so it read as a failed commit and invited the insert to
+                // be made twice. `base_sql` is what actually ran: substituted, and
+                // already judged by `run_verdict` when it did.
+                //
+                // The read check is the other half. This site takes the *raw*
+                // run — `guarded_run` is built much later in this function and
+                // cannot be reached from here — so whatever it replays executes
+                // with the missing-`WHERE` net and `confirm_writes` both bypassed.
+                // A grid is only editable when it came from a read, so refusing to
+                // replay anything else costs nothing real and closes the hole
+                // rather than narrowing it.
+                let refetch_sql = tab
+                    .base_sql
+                    .get_untracked()
+                    .filter(|s| schemaic_core::sql::read_only_reason(s, dialect_of(&db)).is_ok());
                 let run = run.clone();
                 let engine = tx_engine(&db);
                 let fold = create_ext_action(cx, move |stmt: StmtOutcome| {
@@ -3203,8 +3226,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let still_active = active.get_untracked() == id;
                     let outcome = match outcome {
                         CommitDone::FullReran => {
-                            if still_active {
-                                (run)(query.clone());
+                            if still_active && let Some(sql) = refetch_sql.clone() {
+                                (run)(sql);
                             }
                             CommitDone::FullReran
                         }
@@ -5748,7 +5771,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             };
             let sql = stmts.pop().unwrap_or(sql);
             match verdict {
-                RunVerdict::Allow => (gated_run)(sql),
+                RunVerdict::Allow => {
+                    // **A run that goes through clears the bar it got past.**
+                    // Nothing else does: the only two writers of `None` are the
+                    // tab-switch effect and "Run anyway", and neither is reachable
+                    // from filling a parameter in. So "No value for :id" — the
+                    // hold this very function raises — stayed on screen after the
+                    // value was typed and the query ran, describing a state that
+                    // no longer existed.
+                    if run_guard.get_untracked().is_some() {
+                        run_guard.set(None);
+                    }
+                    (gated_run)(sql)
+                }
                 RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
                     message,
                     pending: None,
@@ -5777,7 +5812,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                 };
             match verdict {
-                RunVerdict::Allow => (gated_run_all)(stmts),
+                RunVerdict::Allow => {
+                    // Same as `guarded_run`: the batch that gets past the bar is
+                    // what takes it down.
+                    if run_guard.get_untracked().is_some() {
+                        run_guard.set(None);
+                    }
+                    (gated_run_all)(stmts)
+                }
                 RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
                     message,
                     pending: None,
@@ -5886,7 +5928,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let _ = refreshing.try_update(|v| *v = false);
             });
             handle.spawn(async move {
-                let st = match db.fetch_schema(&database).await {
+                // A fresh token: the tree's own refresh has no Stop to offer, so
+                // there is nothing to cancel it with. `fetch_schema` takes one
+                // for the Export modal, which does.
+                let st = match db.fetch_schema(&database, CancellationToken::new()).await {
                     Ok(s) => SchemaState::Loaded(Arc::new(s)),
                     Err(e) => SchemaState::Failed(e.to_string()),
                 };
@@ -7152,6 +7197,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (save_ui)();
             formats.update(|v| schemaic_core::format::clear_conn(v, id));
             (save_formats)();
+            // The twelfth store, and it was the one missed. A connection-scoped
+            // snippet is a query the user wrote against *this* connection — so
+            // both reasons above apply to it, and the id-recycling one with
+            // force: the next connection to take this freed id would have found
+            // them waiting under "THIS CONNECTION".
+            snippets.update(|v| schemaic_core::snippet::clear_conn(v, id));
+            (save_snippets)();
             // Diagram layouts live only on disk (no signal) — load, prune, save.
             let mut layouts: schemaic_core::erd::DiagramLayoutsFile =
                 persist::load_json("diagrams.json");
@@ -7705,9 +7757,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let inline_ai_cancel = inline_ai_cancel.clone();
         create_effect(move |prev: Option<usize>| {
             let id = active.get();
+            // **`Ready` too, not just `Busy`.** A settled suggestion belongs to
+            // the tab it was asked for by exactly the argument above, and the
+            // pane that could answer it is gone: the new pane's `CmdK` is fresh
+            // (`open: false`, `start == end == 0`), so the publish effect drew
+            // tab A's SQL as an insertion at line 0 of tab B and set tab B's
+            // editor `read_only` — with no footer, because that is gated on
+            // `open`, and no Escape route for the same reason. Every tab visited
+            // afterwards came up frozen; only another Ctrl+K cleared it.
             if let Some(prev) = prev
                 && prev != id
-                && matches!(inline_ai.get_untracked(), InlineAiState::Busy)
+                && matches!(
+                    inline_ai.get_untracked(),
+                    InlineAiState::Busy | InlineAiState::Ready(_)
+                )
             {
                 (inline_ai_cancel)();
             }
@@ -8446,6 +8509,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             search_history,
             error_modal_open,
             error_modal_text,
+            error_modal_fixable,
             tx_prompt,
             confirm,
             plan_open,
