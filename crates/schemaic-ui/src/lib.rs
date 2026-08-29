@@ -44,6 +44,9 @@ mod settings;
 mod shortcuts;
 mod snippet_edit;
 mod snippet_panel;
+/// The shared machinery behind this crate's source gates. Test-only.
+#[cfg(test)]
+mod source_gate;
 pub mod sql_highlight;
 mod table_designer;
 mod tabs;
@@ -244,6 +247,11 @@ pub enum DumpOutcome {
     Done {
         tables: usize,
         tally: schemaic_core::export::ExportTally,
+        /// Tables the user ticked that the dump's own fresh introspection could
+        /// not find — see [`DumpPlan::missing`](schemaic_core::dump::DumpPlan::missing).
+        /// A backup one table short of what was asked for is exactly the case
+        /// that must not read as a clean success.
+        missing: Vec<String>,
     },
     Cancelled,
     Failed {
@@ -1070,9 +1078,9 @@ pub struct Tab {
     /// carries no `Serialize` derive to make that hard to undo by accident.
     ///
     /// The *rows* are not stored — they are derived from `query` on every edit
-    /// through `params::bindings_for`, so they cannot drift from the statement
-    /// they belong to. This holds only the values, including ones for names the
-    /// query has momentarily lost.
+    /// through `params::names`, so they cannot drift from the statement they
+    /// belong to. This holds only the values, including ones for names the query
+    /// has momentarily lost (`params::set_value` never removes one).
     pub params: RwSignal<Vec<schemaic_core::params::Binding>>,
     /// Opens this tab's Go-to-line popup. Set by Ctrl+G in the editor or by
     /// clicking the Ln/Col segment in the status bar; the editor pane owns the view.
@@ -2857,6 +2865,14 @@ pub struct OverlayUi {
     /// active tab's full query error (the editor error bar).
     pub error_modal_open: RwSignal<bool>,
     pub error_modal_text: RwSignal<Option<String>>,
+    /// Whether the text in `error_modal_text` is a **statement** failure — a
+    /// Run-Everything statement's own error — as opposed to a commit error, a
+    /// failed export or a server that never answered. It decides whether the
+    /// modal may offer "AI fix" and "Explain": those act on a statement, and an
+    /// override was treated as "not one" across the board, which left the single
+    /// case `intel::error_fix_range` exists for with no fix affordance anywhere.
+    /// Cleared alongside the text.
+    pub error_modal_fixable: RwSignal<bool>,
     /// Pending "you have an open transaction" prompt, or `None`. Set by any
     /// action that would strand a transaction — switching back to Auto-commit,
     /// closing the tab, disconnecting, or changing the tab's database — and
@@ -3616,6 +3632,40 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 {
                     ring.step_from(ring_root, m.shift());
                     return EventPropagation::Stop;
+                }
+                // **Nothing past here fires while a modal is up.**
+                //
+                // The two branches above are modal-aware by design and stay: the
+                // Escape one closes a control's popup *inside* a modal, and the
+                // Tab one steps the innermost modal's own focus ring. Everything
+                // below acts on the workspace behind the backdrop, and none of it
+                // should.
+                //
+                // A modal's focus root consumes only Tab
+                // (`widgets::focus_root_with_ring` returns `Continue` for every
+                // other key), so KeyDown reaches this handler whenever focus is on
+                // the root or on a button rather than in a text field — floem's
+                // editor is what swallowed these keys before, which is why the
+                // failure read as intermittent. Two of them are serious:
+                //
+                // - **Ctrl+W mid-confirm.** `close_tabs_seq` parks its
+                //   continuation in the single-slot `Confirm` signal; a second
+                //   `set` from `guard_close` overwrote it, so the chain's
+                //   `resolve` was dropped and the remaining tabs were neither
+                //   closed nor reported. `overlays.rs`'s own comment says this
+                //   must not happen — the focus root simply could not deliver it.
+                // - **Ctrl+P.** Find Anywhere is the modal layer's *bottom* entry,
+                //   right for a palette raised before a modal and wrong for one
+                //   raised while one is up: it mounted invisibly behind the modal
+                //   and its autofocusing field took the keyboard, so typing went
+                //   into a search box nobody could see and Enter opened a row of
+                //   an invisible list.
+                //
+                // At `v0.19.0` this handler sat on an inner stack floem never
+                // reached, so none of these branches ran at all; `0bbd6ef`
+                // restored the reachability without restoring a modal guard.
+                if modal_up() {
+                    return EventPropagation::Continue;
                 }
                 if m.control() {
                     // Global nav (Ctrl+P/T/W/Tab/1-9) — also wired inside the
@@ -4466,14 +4516,30 @@ fn body(
     // used to publish the *intent*, so under the clamp it laid its content out
     // wider than the wrapper it is clipped by: the search box's clear button was
     // cut off and the tree kept a horizontal scrollbar it didn't need.
-    create_effect(move |_| schema_panel_w().set(eff_schema_w()));
+    //
+    // **Guarded, like `reveal_panel` above and for the same reason**: floem
+    // never dedups a `set`, so an unchanged width still invalidates the style
+    // closure of every rendered tree row (`schema_tree::tree_row_min_w` reads
+    // this signal). A drag is 60–120 `PointerMove`s a second and each one
+    // re-runs this effect — so a drag held past `schema_min_w()`, where the
+    // clamp returns the same number every frame, restyled the whole tree for no
+    // visual change. `schema_tree`'s note on not memoising the per-row closure
+    // rests on "a restyle is a theme switch, a scale change or a panel resize,
+    // not a frame"; a resize *is* frames, and this is what makes the premise
+    // true again rather than paying for a memo.
+    create_effect(move |_| {
+        let w = eff_schema_w();
+        if schema_panel_w().get_untracked() != w {
+            schema_panel_w().set(w);
+        }
+    });
     // The same for the right column — the AI / terminal / history panels size
     // themselves to it, and the clamp is what they must follow (see
     // `widgets::right_panel_w`). A closed panel publishes nothing: `eff` is 0
     // then, and a panel that reopened at 0 would have to wait for a resize.
     create_effect(move |_| {
         let w = eff_right_w();
-        if w > 0.0 {
+        if w > 0.0 && widgets::right_panel_w().get_untracked() != w {
             widgets::right_panel_w().set(w);
         }
     });
@@ -4608,6 +4674,20 @@ fn center(ui: Ui) -> impl IntoView {
             None => SqlDialect::default(),
         }
     });
+    // How much of the active tab's connection the assistant may see. Same
+    // derivation shape as `dialect`, and read from the **tab's** connection for
+    // `grid::ai_data_of`'s reason: a tab keeps the connection it was opened on, so
+    // reading the active one would let a production error be judged by a local
+    // database's setting. `None` (never configured) falls to `AiData::default()`,
+    // which is the same conservative default every other consumer takes.
+    let ai_data = create_memo(move |_| {
+        let id = active.get();
+        let cid = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.conn_id.get()));
+        cid.and_then(|cid| {
+            connections.with(|cs| cs.iter().find(|c| c.id == cid).and_then(|c| c.ai_data))
+        })
+        .unwrap_or_default()
+    });
     let live_validate = ui.layout.live_validate;
     let validate_stmt = ui.tab_actions.validate_stmt.clone();
     let run = ui.tab_actions.run.clone();
@@ -4626,6 +4706,7 @@ fn center(ui: Ui) -> impl IntoView {
     let inline_ai_cancel = ui.ai_actions.inline_cancel.clone();
     let error_modal_open = ui.overlay.error_modal_open;
     let error_modal_text = ui.overlay.error_modal_text;
+    let error_modal_fixable = ui.overlay.error_modal_fixable;
     let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
     let ai_send = ui.ai_actions.send.clone();
@@ -4838,6 +4919,7 @@ fn center(ui: Ui) -> impl IntoView {
                     editor_collapsed,
                     active_db,
                     dialect,
+                    ai_data,
                     active_db_menu_open,
                     active_db_anchor,
                     menus: all_menus,
@@ -4980,6 +5062,7 @@ fn center(ui: Ui) -> impl IntoView {
                     rollback_tx: rollback_tx.clone(),
                     error_open: error_modal_open,
                     error_text: error_modal_text,
+                    error_fixable: error_modal_fixable,
                 },
             )
             .into_any(),
@@ -5058,6 +5141,7 @@ fn results_section(
     let (goto_open, goto_query, goto_step) = (gctx.goto_open, gctx.goto_query, gctx.goto_step);
     let sel_summary = gctx.sel_summary;
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
+    let error_fixable = gctx.error_fixable;
     let commit_note = gctx.commit_note;
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let (exporting, export_cancel) = (gctx.exporting, gctx.export_cancel.clone());
@@ -5210,6 +5294,7 @@ fn results_section(
             export_cancel.clone(),
             error_open,
             error_text,
+            error_fixable,
         ),
         // Last, so it paints over the panel — and it lifts itself above the
         // bottom bar when that one is up, through the **same** predicate
@@ -8254,11 +8339,15 @@ mod window_key_gate {
                 .join("lib.rs"),
         )
         .expect("lib.rs");
-        // This module quotes the names it looks for, so cut the tests off.
-        let body = match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => &src[..],
-        };
+        // This module quotes the names it looks for, so cut the tests off —
+        // through `source_gate`, which cuts each `#[cfg(test)]` **item** rather
+        // than everything after the first one. The positional cut broke the
+        // moment a `#[cfg(test)] mod source_gate;` was declared near the top of
+        // this file: the gate then read 45 lines and failed with "`workspace` is
+        // gone", which is precisely the silent-blind-spot failure mode inverted
+        // into a loud one.
+        let body = crate::source_gate::production_code(&src);
+        let body = body.as_str();
         let at = body
             .find("pub fn workspace(")
             .expect("`workspace` is gone — this gate is stale");
@@ -8282,6 +8371,85 @@ mod window_key_gate {
              view's own listeners and to nothing else, so every branch in that \
              handler is dead whenever focus is outside the SQL editor — which \
              answers the same keys itself and hides it."
+        );
+
+        // **And it refuses to act while a modal is up.** The handler is only
+        // reachable at all because it is on the returned view, and a modal's
+        // focus root consumes nothing but Tab — so without this term Ctrl+W
+        // mid-confirm overwrote the single-slot `Confirm` and dropped
+        // `close_tabs_seq`'s continuation, and Ctrl+P mounted Find Anywhere
+        // invisibly *behind* the open modal with its autofocusing field taking
+        // the keyboard.
+        //
+        // The position is the assertion, not the presence: the Escape and Tab
+        // branches above it are modal-aware by design and must keep running, so
+        // the guard has to sit after them and before `navkeys.handle`.
+        let guard = f
+            .find("if modal_up() {")
+            .expect("the modal guard is gone — Ctrl+W now closes a tab mid-confirm");
+        let nav = f
+            .find("navkeys.handle(")
+            .expect("`navkeys.handle` is gone — this gate is stale");
+        let tab_trap = f
+            .find("innermost_ring_root()")
+            .expect("the Tab-trap backstop is gone — this gate is stale");
+        assert!(
+            guard < nav,
+            "the modal guard must come before `navkeys.handle`, or the workspace \
+             shortcuts fire from behind a modal backdrop"
+        );
+        assert!(
+            guard > tab_trap,
+            "the modal guard must come *after* the Escape and Tab branches: those \
+             two exist to serve the modal that is up, and an early return above \
+             them takes the modal's own focus ring and popup dismissal with it"
+        );
+    }
+
+    /// The invariant is *"the KeyDown listener is on the view the app's view
+    /// function returned"*, and that function is `schemaic-app`'s `app_view` —
+    /// not `ui::workspace`. The gate above asserts a position **inside**
+    /// `workspace`, which is necessary and not sufficient: wrapping
+    /// `workspace()` in a `container(...)` over in `schemaic-app` — exactly
+    /// `69fd7aa`'s original mistake, one crate over — puts the handler back on an
+    /// inner view with this gate still green.
+    #[test]
+    fn the_app_returns_the_workspace_itself_and_does_not_wrap_it() {
+        let src = crate::source_gate::crate_sources()
+            .into_iter()
+            .find(|(n, _)| n == "schemaic-app/main.rs")
+            .map(|(_, code)| code)
+            .expect("schemaic-app's main.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("schemaic_ui::workspace("))
+            .expect("`app_view` no longer builds the workspace — this gate is stale");
+        // The call has to *open* its line: `container(schemaic_ui::workspace(…))`
+        // is a wrapper, and a wrapper moves the listener off the returned view.
+        assert!(
+            lines[at]
+                .trim_start()
+                .starts_with("schemaic_ui::workspace("),
+            "`workspace()` is not the head of its expression ({}). Floem hands an \
+             unconsumed key to the returned view's own listeners and to nothing \
+             else, so the window key handler inside `workspace` goes dead — and \
+             this gate's sibling stays green, because that one only looks inside \
+             `schemaic-ui`.",
+            lines[at].trim()
+        );
+        // …and the expression it heads must not itself be an argument, which is
+        // what a wrapper broken across lines looks like.
+        let prev = lines[..at]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .unwrap_or("");
+        assert!(
+            !prev.ends_with('(') && !prev.ends_with("(("),
+            "`workspace()` is the argument of `{prev}` — same failure as above, \
+             written across two lines."
         );
     }
 }

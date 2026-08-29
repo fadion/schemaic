@@ -73,26 +73,21 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
     let ddl_modals_up = ddl_modals_up(&ui);
     let workspace_modals_up = workspace_modals_up(&ui);
     let settings_modals_up = settings_modals_up(&ui);
+    let confirm_up = ui.overlay.confirm;
     stack((
         // First, so it keeps the place it had in the root stack: under every
         // modal. A palette raised over one would be painted behind it, and
         // that is the right way round — the modal is the thing being
         // answered.
         find_overlay(ui.clone()),
-        // **Before the confirm below, because it raises one.** Siblings paint in
-        // tuple order, so a modal that can put a question up has to come *first*
-        // or its own panel covers the question: right-click a connection →
-        // Delete, and the "are you sure" opened behind Manage Connections, its
-        // backdrop dimming the modal that was still on top of it. The rule is
-        // the one the popup menu states at the end of this tuple — this is the
-        // second instance of it, and the reason it is worth stating as a rule.
-        //
-        // Nothing else in the group below is reachable from here (the schema
-        // editors are opened from the tree, and a full-screen backdrop keeps the
-        // title bar out of reach while this is up), so moving it up costs
-        // nothing else its place.
+        // Right-click a connection → Delete raises a confirm, and it used to open
+        // *behind* this modal, its backdrop dimming the panel still on top of it.
+        // That was fixed by ordering the two here; the confirm now sits at the end
+        // of this tuple, above every group, so the ordering is no longer this
+        // entry's business — but the failure is worth remembering, because it is
+        // the same one the DDL preview and the popup menu each hit.
         manage_modal(ui.clone()),
-        // Error modal + open-transaction prompt + the shared confirm share one
+        // Error modal + open-transaction prompt and the schema editors share one
         // tuple element, for the same 16-arity reason as monitor/ERD below (and
         // with the same fill-only-when-open wrapper, or it would eat every click).
         {
@@ -101,10 +96,6 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let event_open = ui.ddl.event;
             stack((
                 error_modal_overlay(ui.clone()),
-                confirm_overlay(ui.clone()),
-                // Before the confirm in the tuple would be wrong: deleting a
-                // snippet asks, and the question has to paint over whatever
-                // raised it.
                 crate::snippet_edit::snippet_edit_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
                 crate::dump_view::dump_overlay(ui.clone()),
@@ -189,6 +180,31 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 s
             }
         }),
+        // **The shared confirm, last, above every group.**
+        //
+        // A confirm is by definition raised *by* something already on screen, so
+        // "whatever can raise a question comes first" — the rule `manage_modal`
+        // and the DDL preview each state above — has exactly one stable answer
+        // once there is more than one group: put the question above all of them.
+        //
+        // It used to live inside the DDL group, which is entry 3 of six, and the
+        // Live Monitor is in the workspace group at 5: "Clear the log?" painted
+        // *entirely* behind the monitor, with its focus root holding the keyboard
+        // over a question nobody could see. Reordering the two groups only moves
+        // which modal has the problem; this ends it for all of them, and it makes
+        // the three "comes first" comments above local facts about their own
+        // group rather than rules the next modal has to rediscover.
+        //
+        // Its own `absolute().inset(0)` needs a box to resolve against, hence the
+        // wrapper — and the wrapper must be out of flow while nothing is asked,
+        // or it would eat every click in the app.
+        confirm_overlay(ui.clone()).style(move |s| {
+            if confirm_up.get().is_some() {
+                s.absolute().inset(0.0)
+            } else {
+                s
+            }
+        }),
     ))
     .style(move |s| {
         if modal_up() {
@@ -209,10 +225,14 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
 /// [`modal_backdrop_up`]. Spelling it twice is how the two drift apart, and the
 /// failure is silent in the worst direction: a modal the aggregate doesn't know
 /// about opens with the title bar left live and undimmed over it.
+///
+/// **What belongs here is what is painted in this group**, which is the same
+/// thing the wrapper's box is for. The shared confirm is not: it is its own entry
+/// at the end of the layer, above every group, and so has its own term in
+/// [`modal_backdrop_up`] exactly as `find`, `manage` and `plan` do.
 fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let err_open = ui.overlay.error_modal_open;
     let tx_prompt = ui.overlay.tx_prompt;
-    let confirm = ui.overlay.confirm;
     let import_open = ui.import.target;
     let dump_open = ui.dump.target;
     let snippet_edit = ui.overlay.snippet_edit;
@@ -220,7 +240,6 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     move || {
         err_open.get()
             || tx_prompt.get().is_some()
-            || confirm.get().is_some()
             || import_open.get().is_some()
             // Painted in this group, so it has to be in this list — the wrapper's
             // `inset(0)` resolves against a box this predicate keeps at zero by
@@ -296,6 +315,10 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let find_open = ui.overlay.find_open;
     let manage_open = ui.conn.manage_open;
     let plan_open = ui.overlay.plan_open;
+    // Its own entry in the layer, above every group — so its own term here, the
+    // same way `find`, `manage` and `plan` each have one. It used to be counted
+    // by `ddl_modals_up`, which is now only about that group's own box.
+    let confirm = ui.overlay.confirm;
     let ddl = ddl_modals_up(ui);
     let workspace = workspace_modals_up(ui);
     let settings = settings_modals_up(ui);
@@ -303,6 +326,7 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
         find_open.get()
             || manage_open.get()
             || plan_open.get()
+            || confirm.get().is_some()
             || ddl()
             || workspace()
             || settings()
@@ -386,19 +410,10 @@ mod modal_backdrop_gate {
     /// dropped — this very module quotes the rule, and `lib.rs` states it twice in
     /// prose, so a gate that counted comments would be measuring its own
     /// documentation.
-    fn production_code(src: &str) -> String {
-        let body = match src.find("#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
-        body.lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+    ///
+    /// [`crate::source_gate`] owns the cut — see there for what the eleven
+    /// hand-written copies of it all got wrong.
+    use crate::source_gate::production_code;
 
     #[test]
     fn every_backdrop_in_the_crate_is_one_the_layer_knows_about() {
