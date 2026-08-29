@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use schemaic_core::dump::{DumpStep, plan};
+use schemaic_core::dump::{DumpStep, DumpVerdict, ReadEnd, WriteEnd, dump_verdict, plan};
 use schemaic_core::export::{ExportFormat, ExportTally, PullChunks};
 use schemaic_db::{Db, DbError, ExportChunk};
 use schemaic_ui::{DumpOutcome, DumpProgress, DumpRequest};
@@ -72,7 +72,12 @@ pub(crate) async fn run(
     // **Freshly introspected, never the tree's cache.** A dump is a backup, and
     // a `CREATE TABLE` for a shape the server no longer has is a backup that
     // restores the wrong table.
-    let schema = match db.fetch_schema(&req.database).await {
+    // The token, so **Stop really stops this phase**. It is the longest one on a
+    // large database and the modal animates it behind a full backdrop whose only
+    // exit is a cancel; before `fetch_schema` took a token the `Cancelled` arm
+    // below was unreachable and the press did nothing until the whole read was
+    // done.
+    let schema = match db.fetch_schema(&req.database, token.clone()).await {
         Ok(s) => s,
         Err(DbError::Cancelled) => return DumpOutcome::Cancelled,
         Err(e) => return failed(format!("Export failed: {e}"), false),
@@ -96,11 +101,7 @@ pub(crate) async fn run(
     // actually be *streamed*, not `dump.tables`: a view has structure and no rows,
     // and a structure-only dump streams nothing at all, so counting tables would
     // promise a "12 of 12" that never arrives.
-    let total = dump
-        .steps
-        .iter()
-        .filter(|s| matches!(s, DumpStep::Rows { .. }))
-        .count();
+    let total = dump.streamed_tables();
     let mut index = 0usize;
     let mut rows_so_far = 0u64;
     // The reader's own failure, kept aside: the writer has to be let go of first
@@ -117,6 +118,7 @@ pub(crate) async fn run(
             }
             DumpStep::Rows {
                 database,
+                insert_database,
                 schema,
                 table,
                 select,
@@ -135,7 +137,9 @@ pub(crate) async fn run(
                 let (row_tx, row_rx) = tokio::sync::mpsc::channel::<ExportChunk>(2);
                 if tx
                     .send(Msg::Table {
-                        source: (database.clone(), schema.clone(), table.clone()),
+                        // The **target**, not the source: `select` reads from
+                        // `database`, the `INSERT`s name `insert_database`.
+                        source: (insert_database, schema.clone(), table.clone()),
                         rows: row_rx,
                     })
                     .await
@@ -170,20 +174,33 @@ pub(crate) async fn run(
         return DumpOutcome::Cancelled;
     }
 
-    // **Cancel is the reader's to declare; every other failure is the writer's to
-    // describe.** A cancelled read closes the channels, which the writer sees as
-    // an ordinary end of stream — on its own it would call a truncated file
-    // finished. Anything else (a full disk, a permission) fails the *writer*
-    // first, and the reader then only sees "nobody is reading any more".
-    match (read_err, written) {
-        (Some(DbError::Cancelled), _) => DumpOutcome::Cancelled,
-        (_, Ok(Err(e))) => failed(e, true),
-        (_, Err(e)) => failed(format!("Export failed: worker died: {e}"), true),
-        (Some(e), _) => failed(format!("Export failed: {e}"), true),
-        (None, Ok(Ok(tally))) => DumpOutcome::Done {
+    // The five-arm resolution is `core::dump::dump_verdict`'s, with tests: it is a
+    // decision about which of two failures the user is told about, and written out
+    // here it sat inside an `async fn` needing a `Db`, a runtime handle and two
+    // channels to reach. Swapping two arms turned "The disk is full" into
+    // "connection reset" with the suite green.
+    let tally = match &written {
+        Ok(Ok(t)) => Some(t.clone()),
+        _ => None,
+    };
+    let read = match read_err {
+        None => ReadEnd::Clean,
+        Some(DbError::Cancelled) => ReadEnd::Cancelled,
+        Some(e) => ReadEnd::Failed(e.to_string()),
+    };
+    let write = match written {
+        Ok(Ok(_)) => WriteEnd::Wrote,
+        Ok(Err(e)) => WriteEnd::Failed(e),
+        Err(e) => WriteEnd::Died(e.to_string()),
+    };
+    match dump_verdict(read, write) {
+        DumpVerdict::Cancelled => DumpOutcome::Cancelled,
+        DumpVerdict::Failed { message, partial } => failed(message, partial),
+        DumpVerdict::Done => DumpOutcome::Done {
             // The file's own count: every table it covers, streamed or not.
             tables: dump.tables,
-            tally,
+            tally: tally.unwrap_or_default(),
+            missing: dump.missing,
         },
     }
 }
@@ -232,17 +249,9 @@ fn write(
                         dialect,
                     )
                     .map_err(|e| format!("Export failed: {e}"))?;
-                total.rows += tally.rows;
-                for c in tally.withheld {
-                    if !total.withheld.contains(&c) {
-                        total.withheld.push(c);
-                    }
-                }
-                for c in tally.blanked {
-                    if !total.blanked.contains(&c) {
-                        total.blanked.push(c);
-                    }
-                }
+                // The fold is `ExportTally::absorb`'s, beside `note`, which
+                // answers the same question one level down.
+                total.absorb(tally);
                 writeln!(w).map_err(|e| format!("Export failed: {e}"))?;
             }
         }
@@ -265,4 +274,30 @@ fn write(
         )
     })?;
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fragment's name has to be the one the modal tells the user about, and
+    /// that sentence is built by `export::part_path` — so this must not spell
+    /// `.part` a second time. It is the one situation where the fragment is the
+    /// thing the user still wants.
+    #[test]
+    fn the_part_file_is_a_sibling_named_by_the_one_function_that_names_them() {
+        let p = part_of(Path::new("/tmp/shop.sql"));
+        assert_eq!(p.parent(), Path::new("/tmp/shop.sql").parent());
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(name, schemaic_core::export::part_path("shop.sql"));
+        assert_ne!(name, "shop.sql", "the fragment must not be the destination");
+    }
+
+    /// A path with no file name cannot be written to at all; `File::create` is
+    /// where that is reported, and this must not panic on the way there.
+    #[test]
+    fn a_path_with_no_file_name_is_returned_unchanged() {
+        let p = Path::new("/");
+        assert_eq!(part_of(p), p.to_path_buf());
+    }
 }
