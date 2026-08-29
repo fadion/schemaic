@@ -29,7 +29,9 @@
 //!   start where [`crate::sql::is_word_start`] says one can.
 //! - **`arr[lo:hi]`** — a PostgreSQL array slice. Excluded by requiring the byte
 //!   *before* the `:` not to be part of a word (or a `]`), which a placeholder's
-//!   never is and a slice bound's always is.
+//!   never is and a slice bound's always is — plus the open-ended `arr[:hi]`,
+//!   which has neither and is settled by [`subscript_open_before`]. `ARRAY[:a]`
+//!   is a constructor rather than a subscript, and `:a` there is a parameter.
 //!
 //! Everything inside a string, comment, dollar-quoted body or quoted identifier
 //! is skipped by [`crate::sql::skip_noncode`], per the one-boundary-lexer rule —
@@ -151,7 +153,7 @@ impl ParamValue {
 /// Set (or clear) one name's value in a bar's store, leaving the rest alone.
 ///
 /// Appends a name the store hasn't seen. A name the *query* no longer contains
-/// is deliberately left in place: [`bindings_for`] decides which rows are shown,
+/// is deliberately left in place: [`names`] decides which rows are shown,
 /// and dropping the value here would mean an edit that briefly removes a
 /// placeholder — a retyped `WHERE`, an undo — throws away what was typed into
 /// it.
@@ -227,9 +229,27 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
             i += 2;
             continue;
         }
-        // An array slice's `:` is attached to the bound before it; a
-        // placeholder's `:` never is.
-        let attached = i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']');
+        // An array slice's `:` belongs to the subscript around it; a
+        // placeholder's `:` never does.
+        //
+        // Three shapes say "subscript":
+        //
+        // - a word byte immediately before — `arr[1:2]`, `arr[lo:hi]`
+        // - a `]` immediately before       — `m[1][2:3]`
+        // - an **open `[`**                — `arr[:hi]`, PostgreSQL's open-ended
+        //   lower bound. This one was missing, and it is not cosmetic: a legal
+        //   statement grew a parameter row named `hi`, `prepare_run` returned
+        //   `Err(Missing)`, and the run was held with no "Run anyway" to get past
+        //   it. The three existing slice tests all wrote a lower bound.
+        //
+        // The first two must look at the byte *immediately* before, not the last
+        // non-space one — `SELECT :a` has `T` a space away, and skipping the space
+        // would swallow every placeholder in the language. The `[` rule looks past
+        // whitespace, and has to ask what the `[` hangs off — see
+        // [`subscript_open_before`]. Where `[` quotes an identifier (SQLite)
+        // `skip_noncode` has already consumed it.
+        let attached =
+            i > 0 && (is_word_byte(b[i - 1]) || b[i - 1] == b']') || subscript_open_before(b, i);
         if attached || !b.get(i + 1).copied().is_some_and(is_word_start) {
             i += 1;
             continue;
@@ -248,6 +268,44 @@ pub fn scan(sql: &str, dialect: SqlDialect) -> Vec<ParamRef> {
     out
 }
 
+/// Is the `:` at `i` opening a **subscript's** slice bound — `arr[:hi]`?
+///
+/// It is, when the last non-whitespace byte before it is a `[` **and** that `[`
+/// hangs off something subscriptable: an identifier, or the `]` of an earlier
+/// subscript.
+///
+/// The second half is the whole of the function. `ARRAY[…]` is a *constructor*,
+/// not a subscript, and a placeholder inside one is an ordinary parameter — so
+/// a rule that read every `[` as a slice reported `SELECT ARRAY[:a, :b]` as
+/// carrying only `:b`. The bar then offered one row, `substitute` left `:a` in
+/// the statement verbatim, and the server got SQL with an unbound name in it
+/// and no row for the user to fill in. `arr[` and `ARRAY[` are the same two
+/// bytes here; only what precedes them tells them apart.
+fn subscript_open_before(b: &[u8], i: usize) -> bool {
+    let Some(open) = b[..i].iter().rposition(|c| !c.is_ascii_whitespace()) else {
+        return false;
+    };
+    if b[open] != b'[' {
+        return false;
+    }
+    // What the bracket hangs off.
+    let Some(host) = b[..open].iter().rposition(|c| !c.is_ascii_whitespace()) else {
+        // A `[` with nothing before it subscripts nothing.
+        return false;
+    };
+    if b[host] == b']' {
+        return true;
+    }
+    if !is_word_byte(b[host]) {
+        return false;
+    }
+    let start = b[..=host]
+        .iter()
+        .rposition(|c| !is_word_byte(*c))
+        .map_or(0, |p| p + 1);
+    !b[start..=host].eq_ignore_ascii_case(b"ARRAY")
+}
+
 /// The distinct placeholder names, in the order they first appear — the order
 /// the parameters bar lists its rows in.
 ///
@@ -262,25 +320,6 @@ pub fn names(sql: &str, dialect: SqlDialect) -> Vec<String> {
         }
     }
     out
-}
-
-/// The parameters bar's rows for `sql`, keeping any value already typed for a
-/// name that is still there.
-///
-/// The rows are *derived from the SQL on every edit*, never stored, so they
-/// cannot drift from the statement they belong to; carrying the typed values
-/// across is what stops an edit elsewhere in the query from emptying the bar.
-pub fn bindings_for(sql: &str, dialect: SqlDialect, existing: &[Binding]) -> Vec<Binding> {
-    names(sql, dialect)
-        .into_iter()
-        .map(|name| {
-            let value = existing
-                .iter()
-                .find(|b| b.name == name)
-                .and_then(|b| b.value.clone());
-            Binding { name, value }
-        })
-        .collect()
 }
 
 /// `sql` with every placeholder replaced by its bound value, or the reason it
@@ -550,6 +589,37 @@ mod tests {
     fn an_array_slice_between_names_is_not_a_placeholder() {
         assert!(found("SELECT arr[lo:hi] FROM t", PG).is_empty());
         assert!(found("SELECT arr[1:hi] FROM t", PG).is_empty());
+        // **An open-ended lower bound.** Every case above writes one, so the
+        // shape PostgreSQL actually spells `arr[:hi]` went unread: the statement
+        // is legal, and the bar grew a row named `hi` that held the run with no
+        // "Run anyway" to get past it.
+        assert!(found("SELECT arr[:hi] FROM t", PG).is_empty());
+        assert!(found("SELECT arr[ :hi ] FROM t", PG).is_empty());
+        assert!(found("SELECT m[1][:2] FROM t", PG).is_empty());
+        // The counterweight: a real placeholder still reads, including the one a
+        // space away from a word — which is every placeholder in the language.
+        assert_eq!(found("SELECT :a, 42", MY), ["a"]);
+        assert_eq!(found("SELECT arr[1:2] FROM t WHERE id = :id", PG), ["id"]);
+    }
+
+    /// **`ARRAY[` is not `arr[`.** An array *constructor* holds ordinary
+    /// expressions, so a placeholder in one is a placeholder — and a rule that
+    /// read every open `[` as a slice bound reported `ARRAY[:a, :b]` as carrying
+    /// only `:b`, leaving `:a` in the SQL the server was handed with no bar row
+    /// to fill it in.
+    #[test]
+    fn a_placeholder_in_an_array_constructor_is_still_a_placeholder() {
+        assert_eq!(found("SELECT ARRAY[:a, :b]", PG), ["a", "b"]);
+        assert_eq!(found("SELECT ARRAY[ :a ]", PG), ["a"]);
+        // The keyword is matched case-insensitively, like every other keyword.
+        assert_eq!(found("SELECT array[:a]", PG), ["a"]);
+        assert_eq!(found("SELECT Array [ :a ]", PG), ["a"]);
+        // And a subscript on a column *named* array is still a subscript — it is
+        // the word before the bracket that decides, not the bracket.
+        assert!(found("SELECT arrays[:hi] FROM t", PG).is_empty());
+        assert!(found("SELECT myarray[:hi] FROM t", PG).is_empty());
+        // A bracket with nothing before it subscripts nothing.
+        assert_eq!(found("SELECT f([:a])", PG), ["a"]);
     }
 
     #[test]
@@ -755,53 +825,33 @@ mod tests {
         assert!(msg.contains(":n") && msg.contains("abc"), "{msg}");
     }
 
-    // ── bindings_for ────────────────────────────────────────────────────────
+    // ── which rows the bar shows ────────────────────────────────────────────
+    //
+    // These pin [`names`], which is what the bar's memo actually calls
+    // (`editor_pane::params_bar`). They used to pin a `bindings_for` that had no
+    // production caller at all: five tests reading as coverage of the live rule
+    // and guarding a function nothing ran, while the rule itself had none.
 
     #[test]
-    fn a_new_name_gets_an_empty_row() {
-        assert_eq!(
-            bindings_for("WHERE a = :x", MY, &[]),
-            vec![Binding {
-                name: "x".to_string(),
-                value: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn editing_the_sql_keeps_a_value_already_typed() {
-        let existing = vec![bound("x", ParamValue::Number("7".to_string()))];
-        assert_eq!(
-            bindings_for("WHERE a = :x AND b = :new", MY, &existing),
-            vec![
-                bound("x", ParamValue::Number("7".to_string())),
-                Binding {
-                    name: "new".to_string(),
-                    value: None,
-                },
-            ]
-        );
+    fn a_name_in_the_sql_gets_a_row() {
+        assert_eq!(names("WHERE a = :x", MY), vec!["x".to_string()]);
     }
 
     #[test]
     fn a_name_no_longer_in_the_sql_drops_its_row() {
-        let existing = vec![
-            bound("x", ParamValue::Null),
-            bound("gone", ParamValue::Null),
-        ];
-        assert_eq!(
-            bindings_for("WHERE a = :x", MY, &existing),
-            vec![bound("x", ParamValue::Null)]
-        );
+        assert_eq!(names("WHERE a = :x", MY), vec!["x".to_string()]);
+        assert!(names("WHERE a = 1", MY).is_empty());
     }
 
     #[test]
     fn rows_follow_the_order_the_names_appear_in() {
-        let existing = vec![bound("b", ParamValue::Null), bound("a", ParamValue::Null)];
-        let rows = bindings_for("WHERE a = :a AND b = :b", MY, &existing);
         assert_eq!(
-            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            ["a", "b"]
+            names("WHERE a = :a AND b = :b", MY),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            names("WHERE b = :b AND a = :a", MY),
+            vec!["b".to_string(), "a".to_string()]
         );
     }
 
@@ -864,9 +914,23 @@ mod tests {
     fn a_value_survives_the_placeholder_leaving_and_returning() {
         let mut store: Vec<Binding> = Vec::new();
         set_value(&mut store, "id", Some(ParamValue::Number("7".to_string())));
-        // The query loses the placeholder: the row goes, the store doesn't.
-        assert!(bindings_for("SELECT 1", MY, &store).is_empty());
-        assert_eq!(bindings_for("SELECT :id", MY, &store), store);
+        // The query loses the placeholder: the *row* goes (`names` decides that),
+        // the store does not — which is the composition the bar relies on, and
+        // the reason `set_value` never removes a name.
+        assert!(names("SELECT 1", MY).is_empty());
+        assert_eq!(
+            store,
+            vec![bound("id", ParamValue::Number("7".to_string()))]
+        );
+        // It comes back, and the value is still there for the row to read.
+        assert_eq!(names("SELECT :id", MY), vec!["id".to_string()]);
+        assert_eq!(
+            store
+                .iter()
+                .find(|b| b.name == "id")
+                .and_then(|b| b.value.clone()),
+            Some(ParamValue::Number("7".to_string()))
+        );
     }
 
     // ── strip_param_diagnostics ─────────────────────────────────────────────

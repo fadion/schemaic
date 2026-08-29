@@ -444,6 +444,76 @@ pub fn balanced_paren_span(b: &[u8], start: usize, dialect: SqlDialect) -> Optio
     None
 }
 
+/// `sql` with every `--` / `#` **line** comment rewritten as an equivalent
+/// `/* … */` block comment — the form that survives being collapsed onto one
+/// line.
+///
+/// **What this is for.** A preview folds a statement to one flowing line
+/// ([`crate::history::preview`], [`crate::snippet::collapsed`]) and the panels
+/// then syntax-colour that line. A line comment's terminator is the newline the
+/// collapse just removed, so
+///
+/// ```text
+/// -- daily revenue
+/// SELECT id, name FROM orders
+/// ```
+///
+/// arrived at the highlighter as one 76-byte comment token and the row rendered
+/// as if the whole query were commented out. The hazard the collapse's own doc
+/// had considered was a *block* comment spanning lines; this is the inverse, and
+/// it only exists because the two correct functions are composed.
+///
+/// **Rewritten rather than dropped**, because `-- daily revenue` is often the
+/// most informative thing in a saved query and a preview that silently loses it
+/// is a different wrong answer. The body is escaped so it cannot close the block
+/// it is now inside — a comment containing `*/` would otherwise end the block
+/// early and leave the rest of the statement outside it, which is the same class
+/// of bug one level down.
+///
+/// Everything else is copied byte for byte, strings and quoted identifiers
+/// included, through the shared boundary lexer — so a `--` inside a literal is
+/// still a literal.
+pub fn inline_line_comments(sql: &str, dialect: SqlDialect) -> String {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut i = 0usize;
+    let mut copied = 0usize;
+    while i < b.len() {
+        let Some(j) = skip_noncode(b, i, dialect) else {
+            i += 1;
+            continue;
+        };
+        let j = j.max(i + 1).min(b.len());
+        let region = &sql[i..j];
+        if let Some(body) = line_comment_body(region) {
+            out.push_str(&sql[copied..i]);
+            // Spaced on both sides so `--daily` and `-- daily` come out the
+            // same, and so the closing `*/` can never end up glued to the body.
+            out.push_str("/* ");
+            out.push_str(body.trim().replace("*/", "* /").replace("/*", "/ *").trim());
+            out.push_str(" */");
+            // The newline was the terminator, and it is also what a caller that
+            // keeps the lines needs; only the *comment* changes shape here.
+            if region.ends_with('\n') {
+                out.push('\n');
+            }
+            copied = j;
+        }
+        i = j;
+    }
+    out.push_str(&sql[copied..]);
+    out
+}
+
+/// A noncode region's text, if it is a line comment: everything after the opener
+/// and before the newline that ended it.
+fn line_comment_body(region: &str) -> Option<&str> {
+    let body = region
+        .strip_prefix("--")
+        .or_else(|| region.strip_prefix('#'))?;
+    Some(body.trim_end_matches('\n').trim_end_matches('\r'))
+}
+
 /// The index of the first occurrence of `needle` at a *code* position — outside
 /// every string, quoted identifier and comment.
 ///
@@ -1484,6 +1554,68 @@ mod tests {
     /// fourth engine is added to the suite by adding it here.
     const EVERY_DIALECT: [SqlDialect; 3] =
         [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+
+    /// The composition the two correct functions got wrong: a preview folds the
+    /// statement to one line, which removes the newline a `--` comment ends on,
+    /// and the panel then lexes that line — so the whole query was one comment
+    /// token and rendered as if it were commented out.
+    #[test]
+    fn a_line_comment_survives_being_folded_onto_one_line() {
+        let folded = |sql: &str, d: SqlDialect| {
+            super::inline_line_comments(sql, d)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for d in EVERY_DIALECT {
+            let one = folded("-- daily revenue\nSELECT id FROM orders", d);
+            assert_eq!(one, "/* daily revenue */ SELECT id FROM orders", "{d:?}");
+            // The claim, stated the way the failure was measured: the comment
+            // must not reach the `SELECT`.
+            let end = super::skip_noncode(one.as_bytes(), 0, d).expect("a comment opens it");
+            assert!(end < one.find("SELECT").unwrap(), "{d:?}: {one}");
+            // A trailing comment does the same to everything after it.
+            let two = folded("SELECT 1 -- why\nFROM t", d);
+            assert_eq!(two, "SELECT 1 /* why */ FROM t", "{d:?}");
+        }
+        // MySQL's `#`, which PostgreSQL and SQLite do not have.
+        assert_eq!(
+            folded("SELECT 1 # note\nFROM t", SqlDialect::MySql),
+            "SELECT 1 /* note */ FROM t"
+        );
+    }
+
+    /// Everything that is not a line comment is copied byte for byte — including
+    /// a `--` inside a string, which is not a comment at all.
+    #[test]
+    fn inline_line_comments_leaves_everything_else_alone() {
+        for d in EVERY_DIALECT {
+            for sql in [
+                "SELECT '-- not a comment' FROM t",
+                "SELECT /* block */ 1 FROM t",
+                "SELECT 1 FROM t",
+                "",
+            ] {
+                assert_eq!(super::inline_line_comments(sql, d), sql, "{d:?}: {sql}");
+            }
+        }
+        // A quoted identifier holding the opener is a name, not a comment.
+        assert_eq!(
+            super::inline_line_comments("SELECT `a--b` FROM t", SqlDialect::MySql),
+            "SELECT `a--b` FROM t"
+        );
+    }
+
+    /// A comment carrying `*/` would close the block it is now inside and leave
+    /// the rest of the statement outside it — the same bug one level down.
+    #[test]
+    fn a_comment_cannot_close_the_block_it_is_rewritten_into() {
+        let out = super::inline_line_comments("-- see /* x */ here\nSELECT 1", SqlDialect::MySql);
+        assert_eq!(out, "/* see / * x * / here */\nSELECT 1");
+        let folded = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        let end = super::skip_noncode(folded.as_bytes(), 0, SqlDialect::MySql).unwrap();
+        assert!(end < folded.find("SELECT").unwrap(), "{folded}");
+    }
 
     // These legacy tests predate the dialect parameter and assert MySQL boundary
     // behavior; thin MySQL-defaulting wrappers (shadowing the glob import) keep them

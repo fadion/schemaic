@@ -5083,7 +5083,13 @@ fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
     }
     let h = hay.as_bytes();
     let n = needle.as_bytes();
-    (0..=h.len().saturating_sub(n.len())).find_map(|i| {
+    // Not just tidiness: `saturating_sub` bottoms out at 0, so a needle longer
+    // than the haystack still visited `i = 0` and sliced past the end — a panic
+    // reachable from any caller that hands over a tail shorter than the token.
+    if n.len() > h.len() {
+        return None;
+    }
+    (0..=h.len() - n.len()).find_map(|i| {
         if h[i..i + n.len()]
             .iter()
             .zip(n)
@@ -5216,37 +5222,121 @@ pub fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Di
 /// that token sits in. An error naming nothing findable keeps the whole buffer:
 /// guessing a statement would be a rewrite of the wrong one.
 ///
-/// **The named token has to be unique in the buffer**, and that is the whole
-/// difference between this and the squiggle's lookup. `locate_db_error` answers
-/// with the *first* case-insensitive hit, which is right when it is handed one
-/// statement and wrong when it is handed a script: `near 'FROM t2'` names a word
-/// every statement has, so the fix scoped to the first one — a working statement
-/// that Accept would then overwrite, leaving the broken one untouched. A token
-/// that appears twice identifies nothing, so the range falls back to the whole
-/// buffer rather than to a guess.
+/// **The named token has to identify exactly one place in the buffer**, and that
+/// is the whole difference between this and the squiggle's lookup.
+/// `locate_db_error` answers with the *first* case-insensitive hit, which is
+/// right when it is handed one statement and wrong when it is handed a script:
+/// `near 'FROM t2'` names a word every statement has, so the fix scoped to the
+/// first one — a working statement that Accept would then overwrite, leaving the
+/// broken one untouched.
+///
+/// So the decision is made over [`code_word_hits`]' whole list, and only a list
+/// of exactly one narrows. Two hits identify nothing; **zero** hits is the case a
+/// first-hit-plus-repeat-check could not express, and it is the common one — the
+/// token's only occurrence was inside a comment, inside a string literal, or in
+/// the middle of a longer identifier, none of which is the thing the server named.
+///
+/// **What it still cannot see:** a server error routinely names a token the
+/// failing statement does not contain at all — a `NOT NULL` column an `INSERT`
+/// omitted, a column a trigger touched. The token is genuinely unique and
+/// genuinely code, just in the statement *above* the one that failed. Closing
+/// that needs the failing range carried down from the run pipeline, which knows
+/// it; nothing in the text does.
 pub fn error_fix_range(sql: &str, message: &str, dialect: SqlDialect) -> (usize, usize) {
     let whole = (0, sql.len());
     if crate::sql::statement_ranges(sql, dialect).len() < 2 {
         return whole;
     }
-    match locate_db_error(sql, message) {
-        Some((s, e)) if !repeats_ci(sql, &sql[s..e]) => {
-            crate::sql::statement_range(sql, s, dialect)
-        }
+    let Some((s, e)) = locate_db_error(sql, message) else {
+        return whole;
+    };
+    match code_word_hits(sql, &sql[s..e], dialect).as_slice() {
+        [(hit, _)] => crate::sql::statement_range(sql, *hit, dialect),
         _ => whole,
     }
 }
 
-/// Does `needle` occur more than once in `hay`, case-insensitively? Built on
-/// [`find_ci`], so "occur" means exactly what the location it is checking meant.
-fn repeats_ci(hay: &str, needle: &str) -> bool {
-    let Some((s, _)) = find_ci(hay, needle) else {
-        return false;
-    };
-    // Past the first hit, not past its start: the match is `needle.len()` bytes
-    // wide (they compared equal byte for byte), so this stays on a boundary.
-    hay.get(s + needle.len()..)
-        .is_some_and(|rest| find_ci(rest, needle).is_some())
+/// Every occurrence of `needle` in `sql` that could be the thing the server
+/// named: case-insensitive, on identifier boundaries, and **in code**.
+///
+/// The three qualifiers are the difference between uniqueness and identity, and
+/// each one was a reproduced case of the fix scoping to a *healthy* statement:
+///
+/// - **Boundaries** — a plain substring search matched `salery` inside
+///   `order_salery_log`, a column with nothing wrong with it. A boundary is only
+///   required on an end whose own byte is a word byte, so a token the server
+///   quoted with punctuation still locates.
+/// - **Code** — a hit inside a comment or a string literal is text the server
+///   never parsed. `Duplicate entry 'alice@corp.com'` reduces to `com`
+///   ([`locate_db_error`] takes the last `.`-segment, right for `db.table`), whose
+///   only occurrence was inside the seed literal of the statement above.
+/// - **A quoted identifier is code**, not a literal — the same rule
+///   [`tokens_in`] follows, and skipping `` `salery` `` would give up the
+///   narrowing this exists for.
+///
+/// Deciding on *all* the hits rather than the first plus a repeat check is what
+/// makes the comment case answerable at all: the count is zero, not one.
+pub(crate) fn code_word_hits(sql: &str, needle: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
+    code_word_hits_in(sql, &code_mask(sql, dialect), needle)
+}
+
+/// Which bytes of `sql` the server would have **parsed** — `false` for every
+/// byte inside a string literal, a comment or a dollar-quoted body.
+///
+/// Built on the shared boundary lexer; only the *literal* regions it reports are
+/// struck out, because a quoted identifier is code (see [`code_word_hits`]).
+///
+/// Separate from the search so a caller asking many needles of one buffer lexes
+/// it once. [`crate::dump::order_tables`] asks every picked view's name of every
+/// other view's definition, which is V² questions over V definitions; folding
+/// the lex into the search re-lexed each definition V times.
+pub(crate) fn code_mask(sql: &str, dialect: SqlDialect) -> Vec<bool> {
+    let b = sql.as_bytes();
+    let mut code = vec![true; b.len()];
+    let mut i = 0usize;
+    while i < b.len() {
+        let Some(j) = crate::sql::skip_noncode(b, i, dialect) else {
+            i += 1;
+            continue;
+        };
+        let j = j.max(i + 1).min(b.len());
+        if ident_quote(dialect, b[i]).is_none() {
+            code[i..j].fill(false);
+        }
+        i = j;
+    }
+    code
+}
+
+/// [`code_word_hits`] against a mask [`code_mask`] already built for `sql`.
+pub(crate) fn code_word_hits_in(sql: &str, code: &[bool], needle: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let (b, n) = (sql.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > b.len() {
+        return out;
+    }
+    for i in 0..=b.len() - n.len() {
+        let end = i + n.len();
+        if !code[i..end].iter().all(|c| *c) {
+            continue;
+        }
+        if !b[i..end]
+            .iter()
+            .zip(n)
+            .all(|(a, c)| a.eq_ignore_ascii_case(c))
+        {
+            continue;
+        }
+        let opens =
+            !crate::sql::is_word_byte(n[0]) || i == 0 || !crate::sql::is_word_byte(b[i - 1]);
+        let closes = !crate::sql::is_word_byte(n[n.len() - 1])
+            || end == b.len()
+            || !crate::sql::is_word_byte(b[end]);
+        if opens && closes {
+            out.push((i, end));
+        }
+    }
+    out
 }
 
 /// The messages of every diagnostic touching `sql[lo..hi]`, in the order they
@@ -5312,12 +5402,9 @@ pub fn sql_reply(reply: &str, dialect: SqlDialect) -> Option<String> {
     let parses = |s: &str| {
         !s.trim().is_empty()
             && sqlparser::parser::Parser::parse_sql(&*dialect.parser(), s)
-                .is_ok_and(|asts| !asts.is_empty())
+                .is_ok_and(|asts| !asts.is_empty() && asts.iter().all(is_real_statement))
     };
     let trimmed = reply.trim();
-    if parses(trimmed) {
-        return Some(trimmed.to_string());
-    }
     let lines: Vec<&str> = trimmed.lines().collect();
     // A line may only be dropped if it cannot be part of the statement. Without
     // this, trimming the ends silently *truncates*: given `SELECT a` / noise /
@@ -5331,14 +5418,24 @@ pub fn sql_reply(reply: &str, dialect: SqlDialect) -> Option<String> {
         if t.is_empty() {
             return true;
         }
-        let word: String = t
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        !word.is_empty() && !is_sql_keyword(&word)
+        // `sql::is_word_byte`, not a fifth hand-written word run: without its
+        // `>= 0x80` clause a chatter line opening with a non-ASCII letter scanned
+        // to an empty word, counted as load-bearing SQL, and the whole reply was
+        // refused. See that function for why there are only two definitions.
+        let end = t
+            .bytes()
+            .position(|b| !crate::sql::is_word_byte(b))
+            .unwrap_or(t.len());
+        !t[..end].is_empty() && !is_sql_keyword(&t[..end])
     };
-    // Fewest lines dropped first, so the most complete parse wins.
-    for dropped in 1..=REPLY_TRIM_LINES * 2 {
+    // **Most** lines dropped first, not fewest. Fewest-first reads as "keep the
+    // most complete parse" and is the opposite of safe: a trailing chatter line
+    // parses as the last table's *alias*, so the fullest window is the one where
+    // the chatter silently changed what the statement means. Dropping is already
+    // confined to lines that cannot be part of the statement (`droppable`), so
+    // the shortest surviving window is the most conservative reading — and the
+    // whole reply is what is left when nothing may be dropped at all.
+    for dropped in (1..=REPLY_TRIM_LINES * 2).rev() {
         for front in 0..=dropped.min(REPLY_TRIM_LINES) {
             let back = dropped - front;
             if back > REPLY_TRIM_LINES || front + back >= lines.len() {
@@ -5357,7 +5454,49 @@ pub fn sql_reply(reply: &str, dialect: SqlDialect) -> Option<String> {
             }
         }
     }
-    None
+    parses(trimmed).then(|| trimmed.to_string())
+}
+
+/// Does this parsed statement say something a user could have asked for?
+///
+/// **"Parses" is not "is SQL."** `sqlparser` is deliberately permissive, so a
+/// line of prose can reach a `Statement` no engine would accept, and the gate
+/// then offers it as an edit to the buffer. The three shapes below were each
+/// measured against a real reply, and every one is unresolvable on MySQL,
+/// PostgreSQL and SQLite alike — which is why refusing them costs no valid SQL:
+///
+/// - `SHOW a b c` — from `Show me the table.` A real `SHOW` names one variable.
+/// - `PRINT …` — from `print(1)`. T-SQL only; none of the three dialects has it.
+/// - `SELECT <bare identifier>` with no `FROM` — from `SELECT is misspelled`,
+///   where `misspelled` became the alias. An unqualified column reference with
+///   nothing to resolve against is an error everywhere. A function call is not an
+///   identifier, so `SELECT NOW()` and `SELECT CURRENT_TIMESTAMP` are untouched,
+///   and neither is `@@version`, which does not begin on a word-start byte.
+fn is_real_statement(stmt: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+    match stmt {
+        Statement::Print(_) => false,
+        Statement::ShowVariable { variable } => variable.len() <= 1,
+        Statement::Query(q) => {
+            let SetExpr::Select(sel) = &*q.body else {
+                return true;
+            };
+            if !sel.from.is_empty() {
+                return true;
+            }
+            !sel.projection.iter().any(|item| {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(e) => e,
+                    SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => return false,
+                };
+                matches!(expr, Expr::Identifier(id)
+                    if id.quote_style.is_none()
+                        && id.value.bytes().next().is_some_and(crate::sql::is_word_start))
+            })
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -5366,6 +5505,85 @@ mod tests {
     use sqlparser::parser::Parser;
 
     const DIALECTS: [SqlDialect; 3] = [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+
+    #[test]
+    fn a_reply_with_a_non_ascii_chatter_line_still_finds_its_sql() {
+        // `droppable` inlined a fifth word-run predicate without the `>= 0x80`
+        // clause, so a chatter line beginning with a non-ASCII letter scanned to
+        // an *empty* word, was classed as load-bearing SQL, and the whole reply
+        // was refused. `sql::is_word_byte` is the only definition.
+        let reply = "SELECT a\nFROM t;\nÜbersetzung fehlgeschlagen";
+        assert_eq!(
+            sql_reply(reply, SqlDialect::MySql).as_deref(),
+            Some("SELECT a\nFROM t;")
+        );
+    }
+
+    #[test]
+    fn a_trailing_chatter_line_is_not_absorbed_as_a_table_alias() {
+        // The commit's own motivating case minus the semicolon: `employees`
+        // parses as `t`'s alias, so the *whole* reply parsed and was returned
+        // with the chatter silently changed into the statement's meaning.
+        assert_eq!(
+            sql_reply("SELECT a\nFROM t\nemployees", SqlDialect::MySql).as_deref(),
+            Some("SELECT a\nFROM t")
+        );
+        // Chatter at both ends, where the fewest-dropped-first order took the
+        // window that kept the trailing line.
+        assert_eq!(
+            sql_reply(
+                "Here is the query:\nSELECT a\nFROM t\nemployees",
+                SqlDialect::MySql
+            )
+            .as_deref(),
+            Some("SELECT a\nFROM t")
+        );
+    }
+
+    #[test]
+    fn a_multi_line_statement_is_not_trimmed_by_the_shortest_window_rule() {
+        // The counterweight to the test above: preferring a shorter window must
+        // not shave a line off SQL that is entirely load-bearing.
+        for reply in [
+            "SELECT a,\n       b\nFROM t",
+            "INSERT INTO t (a) VALUES\n(1),\n(2)",
+            "SELECT id\nFROM users\nWHERE id IN (\n  1, 2\n)",
+        ] {
+            assert_eq!(
+                sql_reply(reply, SqlDialect::MySql).as_deref(),
+                Some(reply),
+                "{reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_that_parses_but_is_prose_is_refused() {
+        // Each of these parses. None is SQL a user asked for, and each would land
+        // in the editor as a suggested edit.
+        for reply in ["Show me the table.", "SELECT is misspelled", "print(1)"] {
+            assert_eq!(sql_reply(reply, SqlDialect::MySql), None, "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn a_from_less_select_of_real_expressions_is_still_sql() {
+        // The counterweight: `SELECT <bare identifier>` with no `FROM` resolves
+        // on no engine, but a function call or a literal does.
+        for reply in [
+            "SELECT NOW()",
+            "SELECT CURRENT_TIMESTAMP",
+            "SELECT DATABASE()",
+            "SELECT 1",
+            "SELECT 1 + 1 AS two",
+        ] {
+            assert_eq!(
+                sql_reply(reply, SqlDialect::MySql).as_deref(),
+                Some(reply),
+                "{reply:?}"
+            );
+        }
+    }
 
     /// The reply that motivated the gate: real SQL with the CLI's own MCP
     /// diagnostic stitched onto it. Before this, both lines went into the diff.
@@ -7869,6 +8087,111 @@ mod tests {
             error_fix_range(sql, msg, SqlDialect::Postgres),
             (0, sql.len())
         );
+    }
+
+    #[test]
+    fn fix_range_does_not_panic_when_the_named_token_reaches_the_end_of_the_buffer() {
+        // The uniqueness check searched the tail *after* the first hit, which is
+        // shorter than the needle whenever the token is the last thing in the
+        // buffer. `find_ci`'s `saturating_sub` still yielded `i = 0`, and slicing
+        // `h[0..needle.len()]` out of a shorter haystack panicked the app on an
+        // ordinary two-statement buffer — every "Fix with AI"/"Explain" click.
+        let cases: [(&str, &str, SqlDialect); 4] = [
+            (
+                "SELECT 1;\nSELECT * FROM orders",
+                "Table 'shop.orders' doesn't exist",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT 1;\nSELECT * FROM orders;",
+                "Table 'shop.orders' doesn't exist",
+                SqlDialect::MySql,
+            ),
+            (
+                "SELECT 1;\nSELECT * FROM missing_table",
+                r#"relation "missing_table" does not exist"#,
+                SqlDialect::Postgres,
+            ),
+            (
+                "SELECT 1;\nSELECT 1 FRM",
+                r#"syntax error at or near "FRM""#,
+                SqlDialect::Postgres,
+            ),
+        ];
+        for (sql, msg, dialect) in cases {
+            let (lo, hi) = error_fix_range(sql, msg, dialect);
+            assert!(lo <= hi && hi <= sql.len(), "{sql:?} gave ({lo}, {hi})");
+        }
+    }
+
+    #[test]
+    fn find_ci_answers_none_when_the_needle_is_longer_than_the_haystack() {
+        assert_eq!(find_ci("ab", "abc"), None);
+        assert_eq!(find_ci("", "a"), None);
+        assert_eq!(find_ci("abc", "abc"), Some((0, 3)));
+    }
+
+    #[test]
+    fn fix_range_ignores_a_hit_inside_a_comment_or_a_string_literal() {
+        // Uniqueness is not identity. The token was unique in the buffer, but its
+        // one occurrence was text the server never saw, so the fix scoped to a
+        // healthy statement — and the editor *selected* it, claiming that is what
+        // it was working on.
+        let sql = "-- fix the salery column later\nSELECT 1;\nSELECT * FROM t WHERE x=1;";
+        assert_eq!(
+            error_fix_range(
+                sql,
+                "Unknown column 'salery' in 'field list'",
+                SqlDialect::MySql
+            ),
+            (0, sql.len())
+        );
+
+        // `locate_db_error` reduces a quoted name to its last `.`-segment, which
+        // is right for `db.table` and wrong for a value: this searched for `com`.
+        let sql = "SELECT 'alice@corp.com' AS seed;\nINSERT INTO users (email) SELECT email FROM staging;";
+        assert_eq!(
+            error_fix_range(
+                sql,
+                "Duplicate entry 'alice@corp.com' for key 'users.email'",
+                SqlDialect::MySql
+            ),
+            (0, sql.len())
+        );
+    }
+
+    #[test]
+    fn fix_range_ignores_a_hit_that_is_only_part_of_a_longer_identifier() {
+        let sql = "SELECT order_salery_log FROM audit;\nSELECT 1;";
+        assert_eq!(
+            error_fix_range(
+                sql,
+                "Unknown column 'salery' in 'field list'",
+                SqlDialect::MySql
+            ),
+            (0, sql.len())
+        );
+    }
+
+    #[test]
+    fn fix_range_still_narrows_when_the_name_is_quoted_in_the_sql() {
+        // A quoted identifier is a name, not a literal: skipping it the way a
+        // string is skipped would give up the narrowing this function exists for.
+        let sql = "SELECT 1;\nSELECT `salery` FROM employees;";
+        let (lo, hi) = error_fix_range(
+            sql,
+            "Unknown column 'salery' in 'field list'",
+            SqlDialect::MySql,
+        );
+        assert_eq!(&sql[lo..hi], "SELECT `salery` FROM employees;");
+
+        let sql = "SELECT 1;\nSELECT \"salery\" FROM employees;";
+        let (lo, hi) = error_fix_range(
+            sql,
+            r#"column "salery" does not exist"#,
+            SqlDialect::Postgres,
+        );
+        assert_eq!(&sql[lo..hi], "SELECT \"salery\" FROM employees;");
     }
 
     #[test]
