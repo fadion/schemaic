@@ -574,6 +574,44 @@ pub fn pasted_value(text: String) -> Option<String> {
     (text != STAGED_NULL).then_some(text)
 }
 
+/// What staging one cell does to the dirty map: keep the edit, or drop it
+/// because the value is what was already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// The value differs from the original — record it, and count it.
+    Stage,
+    /// The value *is* the original — remove any edit at this cell, and do not
+    /// count it as staged.
+    Revert,
+}
+
+/// **The one revert-to-original rule**, for one cell.
+///
+/// `orig` is the cell's displayed text and `is_null` whether the cell is SQL
+/// NULL; a cell that is not there at all is `(None, true)`. `val` is the value
+/// being staged, with `None` for SQL NULL — the shape [`pasted_value`] produces.
+///
+/// The normalisation is inside this function rather than at the call site
+/// because it is the whole of the decision. A NULL cell *displays* as the four
+/// characters `NULL`, so comparing the display text would make a NULL original
+/// read `Some("NULL")` and never equal a pasted NULL — turning "copy a column
+/// and paste it straight back" into a full staged rewrite, and making
+/// `paste_report` say `Pasted 300,000 cells` over a paste that changed nothing.
+///
+/// It is also what the paste's `staged` figure counts, so the report and the
+/// dirty map cannot disagree: exactly the entries this answers `Stage` for are
+/// the entries the map gains.
+pub fn staged_cell(orig: Option<&str>, is_null: bool, val: Option<&str>) -> StageOutcome {
+    let original = match is_null {
+        true => None,
+        false => orig,
+    };
+    match original == val {
+        true => StageOutcome::Revert,
+        false => StageOutcome::Stage,
+    }
+}
+
 /// The grid's cell values as plain data: what the view's signals hold, borrowed
 /// for one read.
 ///
@@ -1286,11 +1324,18 @@ mod tests {
         let model = analyze_edit(&r, schema);
 
         // Three rows x four columns of pasted values — a `dirty` map exactly as
-        // `stage_many` leaves one.
+        // `stage_many` leaves one. **Column `c` is pasted NULL**, which is the
+        // range's own headline path (a copied NULL reads back as `None` through
+        // `pasted_value`); every earlier fixture built each cell as `Some(..)`,
+        // so nothing carried a `None` from a paste all the way to a statement.
         let mut dirty: HashMap<(usize, usize), Option<String>> = HashMap::new();
         for di in 0..3 {
             for ci in 1..5 {
-                dirty.insert((di, ci), Some(format!("r{di}c{ci}")));
+                let val = match ci == 3 {
+                    true => None,
+                    false => Some(format!("r{di}c{ci}")),
+                };
+                dirty.insert((di, ci), val);
             }
         }
 
@@ -1307,8 +1352,19 @@ mod tests {
             assert_eq!(
                 e.set.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
                 (1..5)
-                    .map(|ci| Some(format!("r{di}c{ci}")))
+                    .map(|ci| match ci == 3 {
+                        true => None,
+                        false => Some(format!("r{di}c{ci}")),
+                    })
                     .collect::<Vec<_>>()
+            );
+            // Named rather than left to the vector above: a pasted NULL has to
+            // reach the statement as `None`, which is what the engines render
+            // as SQL `NULL` rather than the four-character string.
+            assert_eq!(
+                e.set.iter().find(|(c, _)| c == "c").map(|(_, v)| v.clone()),
+                Some(None),
+                "the pasted NULL column arrived as a value, not as SQL NULL"
             );
             // And the WHERE key is the row's own identity, from its original
             // values — one column, the primary key.
@@ -2520,6 +2576,58 @@ mod tests {
             all_editable,
         );
         assert_eq!(plan.cells, vec![(0, 0, Some("keep".to_string()))]);
+    }
+
+    /// The step `a_copied_null_comes_back_as_sql_null` stops one call short of:
+    /// what the grid *does* with those `None`s. All four cases, because the
+    /// distinction between them is the whole of the rule.
+    ///
+    /// The one that decides it is the first: a NULL cell displays as the four
+    /// characters `NULL`, so a comparison spelled through the display text would
+    /// answer `Stage` there, and copying a NULL column back over itself would
+    /// stage every cell and report `Pasted N cells` over a paste that changed
+    /// nothing.
+    #[test]
+    fn a_value_equal_to_the_original_reverts_and_is_not_counted() {
+        // A stored NULL, pasted back as NULL: the round trip is a no-op.
+        assert_eq!(
+            staged_cell(Some("NULL"), true, None),
+            StageOutcome::Revert,
+            "a NULL pasted back over itself must not stage"
+        );
+        // A stored NULL, pasted a value: a real edit.
+        assert_eq!(
+            staged_cell(Some("NULL"), true, Some("x")),
+            StageOutcome::Stage
+        );
+        // A column that legitimately holds the *string* `NULL`, pasted NULL —
+        // `pasted_value`'s documented cost, asserted here at the level where it
+        // becomes a staged change rather than a no-op.
+        assert_eq!(
+            staged_cell(Some("NULL"), false, None),
+            StageOutcome::Stage,
+            "the string NULL and SQL NULL are different values"
+        );
+        // Ordinary text pasted back verbatim: also a no-op.
+        assert_eq!(
+            staged_cell(Some("x"), false, Some("x")),
+            StageOutcome::Revert
+        );
+        assert_eq!(
+            staged_cell(Some("x"), false, Some("y")),
+            StageOutcome::Stage
+        );
+        // A cell that is not there at all reads as NULL, so pasting NULL into
+        // one is still nothing to record.
+        assert_eq!(staged_cell(None, true, None), StageOutcome::Revert);
+        assert_eq!(staged_cell(None, true, Some("x")), StageOutcome::Stage);
+        // The empty string is a value, and not the same value as NULL.
+        assert_eq!(staged_cell(Some(""), false, None), StageOutcome::Stage);
+        assert_eq!(
+            staged_cell(Some("NULL"), true, Some("")),
+            StageOutcome::Stage
+        );
+        assert_eq!(staged_cell(Some(""), false, Some("")), StageOutcome::Revert);
     }
 
     /// The escape hatch, and its width: **only** the literal the grid writes is

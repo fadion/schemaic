@@ -832,10 +832,18 @@ fn round_up_2sf(n: usize) -> usize {
 ///
 /// So an estimate is padded by [`ESTIMATE_SLACK`] before it is rounded, which is
 /// free: the cap is a cutoff of a stream that ends when the table does, so one
-/// set above the real count is never reached and costs nothing. What it is
-/// bounded by is the step it replaced — "read all rows" never asks for more than
-/// the numbered offer it was chosen over. A total at or below what was already
-/// read is stale and says nothing, exactly as it does for [`rows_read_clause`].
+/// set above the real count is never reached and costs nothing.
+///
+/// **An exact count is bounded by the step it replaced; an estimate is not.**
+/// "Read all rows" over a counted table never asks for more than the numbered
+/// offer it was chosen over, because it has no reason to. Over a *sampled* one it
+/// may, and it has to: the step is what a large estimate approaches, so clamping
+/// the padded figure back to it took the padding away again for the upper half of
+/// the band — the same "read all rows, still capped, now offering 5× the step"
+/// this was written to end.
+///
+/// A total at or below what was already read is stale and says nothing, exactly
+/// as it does for [`rows_read_clause`].
 pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, String) {
     let step = next_row_cap(rows_read);
     match total {
@@ -849,9 +857,29 @@ pub fn read_more_offer(rows_read: usize, total: Option<RowCount>) -> (usize, Str
             } else {
                 figure
             };
-            // Rounded up, never past the step it stands in for, and never below
-            // what the step would have to clear to be an improvement at all.
-            let cap = round_up_2sf(want).min(step).max(rows_read + 1);
+            // Rounded up, and never below what the step would have to clear to
+            // be an improvement at all.
+            //
+            // **The step bounds a count, not an estimate.** Clamping the padded
+            // figure back to `step` discarded the padding exactly where the
+            // estimate is large: at `estimate = 0.7 × step` the slack survived
+            // only to 1.43×, and at `estimate == step` to 1.00× — so the upper
+            // half of the very band this padding was added for still came back
+            // capped, with "read all rows" on the button and the 5×-step offer
+            // behind it. The padding is free by the same argument that added it
+            // (the cap is a cutoff of a stream that ends when the table does), so
+            // there is nothing for the bound to save; and an estimate is not a
+            // number to be held to, which is the whole reason it is padded.
+            //
+            // An exact count keeps the bound: it needs no room, and "never more
+            // than the numbered offer it was chosen over" is true of it.
+            let rounded = round_up_2sf(want);
+            let cap = if t.is_estimate() {
+                rounded
+            } else {
+                rounded.min(step)
+            }
+            .max(rows_read + 1);
             (cap, "read all rows".to_string())
         }
         _ => (
@@ -1791,7 +1819,10 @@ mod tests {
         // `read_all_clears_the_table_the_estimate_only_sampled`.
         assert!(cap > 292_020, "{cap}");
         assert_eq!(cap, 440_000);
-        // But never past the numbered offer it was chosen over.
+        // Still well under the numbered offer it was chosen over — the padding
+        // is bounded by the estimate, not by the step (see
+        // `read_all_clears_a_table_whose_estimate_is_near_the_step`, which is
+        // what happens when the two are close).
         assert!(cap <= next_row_cap(200_000), "{cap}");
     }
 
@@ -1829,6 +1860,48 @@ mod tests {
             read < cap,
             "the read that promised all of them came back capped"
         );
+    }
+
+    /// The same promise, at the **other end of the band it applies to.** The
+    /// padding was clamped back to the step, and the step is what the estimate
+    /// approaches: at `estimate = 0.7 × step` the slack survived only to 1.43×,
+    /// at `estimate == step` to 1.00× — no slack at all for the largest
+    /// qualifying estimates, while the label still said "read all rows" and the
+    /// follow-up offer was the 5×-step figure this feature exists to avoid.
+    #[test]
+    fn read_all_clears_a_table_whose_estimate_is_near_the_step() {
+        // 33% low — inside the 40-50% `ESTIMATE_SLACK` cites.
+        const TOTAL: RowCount = RowCount::Estimate(700_000);
+        const ACTUAL: usize = 1_050_000;
+
+        let (cap, label) = read_more_offer(200_000, Some(TOTAL));
+        assert_eq!(label, "read all rows");
+        let read = ACTUAL.min(cap);
+        assert_eq!(
+            read,
+            ACTUAL,
+            "read all rows asked for {cap}, leaving {} rows behind",
+            ACTUAL - read
+        );
+
+        // And at the very top of the band, where the estimate *is* the step.
+        let step = next_row_cap(1_000);
+        let (cap, label) = read_more_offer(1_000, Some(RowCount::Estimate(step as u64)));
+        assert_eq!(label, "read all rows");
+        assert!(
+            cap > step,
+            "an estimate at the step got no slack at all: {cap} vs {step}"
+        );
+    }
+
+    /// The counterweight: an **exact** count needs no room, and the bound the
+    /// clamp expresses still holds for it.
+    #[test]
+    fn an_exact_total_is_never_padded_past_the_step() {
+        let step = next_row_cap(1_000);
+        let (cap, label) = read_more_offer(1_000, Some(RowCount::Exact(step as u64)));
+        assert_eq!(label, "read all rows");
+        assert!(cap <= step, "{cap} vs {step}");
     }
 
     #[test]
