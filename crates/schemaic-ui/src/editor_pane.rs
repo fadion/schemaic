@@ -37,7 +37,7 @@ use floem::views::editor::text::WrapMethod;
 use floem::views::scroll::{Handle, Thickness};
 use schemaic_core::connection::ConnStatus;
 
-use schemaic_core::diff::{inline_plan, line_span};
+use schemaic_core::diff::{self, inline_plan, line_span};
 use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
 use schemaic_core::model::QueryState;
 use schemaic_core::pairs::{self, PairAction};
@@ -252,7 +252,11 @@ fn cmdk_popup(
                 }
                 InlineAiState::Ready(sql) => {
                     let (full, start, end) = acted_on();
-                    let new_full = format!("{}{}{}", &full[..start], sql, &full[end..]);
+                    // `inline_splice`, not a `format!` here and another in
+                    // `accept`: the preview and the splice have to be the same
+                    // decision, or a CRLF buffer plans empty while Accept rewrites
+                    // every line ending in the range.
+                    let (_, new_full) = diff::inline_splice(&full, start, end, &sql);
                     let plan = inline_plan(&full, &new_full);
                     // A suggestion identical to what the user already has has no
                     // rows to draw; leaving it unset keeps the editor untouched
@@ -261,7 +265,14 @@ fn cmdk_popup(
                 }
                 _ => None,
             };
-            inline_diff::set_preview(cmdk.preview, &ed_preview, view);
+            // **Does this pane own the request?** `inline_ai` is one global
+            // signal and `CmdK` is per pane — see `inline_pane_action`.
+            let act = inline_pane_action(cmdk.open.get_untracked(), settled);
+            inline_diff::set_preview(
+                cmdk.preview,
+                &ed_preview,
+                act.draw.then_some(view).flatten(),
+            );
             // Freeze the buffer while a suggestion is on screen. The phantom rows
             // are anchored to line *numbers* and the plan was computed against the
             // text as it was, so an edit underneath would leave the rows sitting on
@@ -269,12 +280,12 @@ fn cmdk_popup(
             // have moved. The old overlay got this for free by covering the editor;
             // this one deliberately does not cover it, so the freeze has to be
             // asked for. Accept or reject to get the buffer back.
-            ed_preview.read_only.set(settled);
+            ed_preview.read_only.set(act.freeze);
             // The verdict state has no field in it, so focus would be left dangling
             // where the prompt used to be. Hand it back to the editor, which is
             // both where the suggestion now is and what answers Enter/Escape for
             // it. Deferred, because the field is torn down on this same tick.
-            if settled {
+            if act.focus {
                 floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
                     if let Some(Some(vid)) = editor_view_id.try_get_untracked() {
                         vid.request_focus();
@@ -316,12 +327,21 @@ fn cmdk_popup(
         move || {
             let run = run.clone();
             floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
-                let Some(intent) = cmdk.input.try_get_untracked() else {
+                let Some(typed) = cmdk.input.try_get_untracked() else {
                     return; // tab closed in the same tick
                 };
-                if intent.trim().is_empty() {
+                if typed.trim().is_empty() {
                     return;
                 }
+                // The app's own instruction wins over the label in the box, when
+                // the box was filled in by the app — see `CmdK::intent`. This is
+                // what makes a *retry* of a failed AI fix send the fenced,
+                // provenance-flagged prompt rather than `Fix this error: <server
+                // text>` interpolated into Schemaic's own prose.
+                let intent = match cmdk.intent.try_get_untracked().flatten() {
+                    Some((label, instruction)) if label == typed => instruction,
+                    _ => typed,
+                };
                 let current_sql = query.get_untracked();
                 let (s, e) = (cmdk.start.get_untracked(), cmdk.end.get_untracked());
                 let selection = if s != e {
@@ -357,9 +377,12 @@ fn cmdk_popup(
                     let full = doc.text().to_string();
                     let s = floor_char_boundary(&full, s);
                     let e = floor_char_boundary(&full, e);
-                    edit_untyped(&ed, comp, Selection::region(s, e), &sql, EditType::Paste);
+                    // The same `inline_splice` the preview used, so what lands is
+                    // what the plan described — line endings included.
+                    let (text, _) = diff::inline_splice(&full, s, e, &sql);
+                    edit_untyped(&ed, comp, Selection::region(s, e), &text, EditType::Paste);
                     ed.cursor
-                        .update(|c| c.set_offset(s + sql.len(), false, false));
+                        .update(|c| c.set_offset(s + text.len(), false, false));
                 }
                 cmdk.open.set(false);
                 inline_ai.set(InlineAiState::Idle);
@@ -773,6 +796,11 @@ fn cmdk_popup(
         })
 }
 
+/// What "Optimize" actually asks the model, as opposed to the two-word label the
+/// prompt box shows. One constant, because the launch and a **retry** of it have
+/// to send the same thing — see [`CmdK::intent`].
+const OPTIMIZE_INTENT: &str = "Rewrite this SQL query to be more efficient and readable while      preserving its exact result set. Return only the SQL.";
+
 /// Editor-local state for the inline (Ctrl+K) AI prompt popup. `start`/`end` are
 /// the doc byte-range captured at trigger time — equal ⇒ generate/insert at the
 /// caret; distinct ⇒ transform that selection. `point` anchors the popup.
@@ -781,6 +809,22 @@ struct CmdK {
     open: RwSignal<bool>,
     point: RwSignal<Point>,
     input: RwSignal<String>,
+    /// `(the label the app put in the box, the instruction to actually send)`,
+    /// when the box was filled in by the app rather than typed by the user.
+    ///
+    /// **`input` is a label; this is the prompt.** `prompt::ai_fix_prompt`
+    /// returns both, and only its `intent` carries the fence and the
+    /// `UNTRUSTED_NOTE`: the error text it quotes is server-controlled, and that
+    /// module's own doc says that is exactly why it must not be interpolated into
+    /// Schemaic's prose. The box holds `Fix this error: <server text>`, and a
+    /// *retry* — the generation failed, the field comes back with that line still
+    /// in it, Enter — sent it as the instruction, unfenced and unflagged.
+    ///
+    /// The **label** is kept rather than a "has the user typed" flag so that no
+    /// effect has to watch the field: `submit` uses the instruction exactly while
+    /// the box still reads what the app wrote, and the first keystroke makes the
+    /// two differ.
+    intent: RwSignal<Option<(String, String)>>,
     start: RwSignal<usize>,
     end: RwSignal<usize>,
     /// The suggestion currently rendered *in the editor's line flow* as phantom
@@ -999,6 +1043,43 @@ pub(crate) fn compute_diagnostics(
     let analysable = params::neutralize(sql, dialect);
     let diagnostics = intel::diagnostics(&analysable, &catalog, dialect);
     params::strip_param_diagnostics(diagnostics, &refs)
+}
+
+/// What one editor pane should do about the inline-AI state it is watching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InlinePaneAction {
+    /// Draw the suggestion's phantom rows in this editor.
+    pub draw: bool,
+    /// Hold the buffer `read_only` — the plan is anchored to line numbers, so an
+    /// edit underneath it would leave the rows describing lines that moved.
+    pub freeze: bool,
+    /// Take the keyboard, because the prompt field that had it is being torn
+    /// down and the editor is what answers Enter/Escape for the verdict.
+    pub focus: bool,
+}
+
+/// The three of them, from whether this pane **owns** the request and whether the
+/// request has settled.
+///
+/// **`inline_ai` is one global signal; `CmdK` is per pane.** The panes are keyed
+/// on the active tab, so switching tabs disposes one and builds another with a
+/// fresh `CmdK` — `open: false`, `start == end == 0`. Nothing gated the publish
+/// effect on ownership, so a suggestion left un-answered in tab A was published
+/// into tab B: its SQL drawn as an insertion at line 0 of a document it had
+/// nothing to do with, and tab B's editor set `read_only`, which really does stop
+/// typing. There was no way out — the verdict footer and Escape are both gated on
+/// `open`, which tab B's `CmdK` has as `false` — so every tab visited afterwards
+/// came up frozen until another Ctrl+K happened to reset the state.
+///
+/// So `open` gates all three. It is the pane's own answer to "was this asked for
+/// here", and the only one available: the request carries no pane id, and floem
+/// offers no scope-cleanup hook to clear the signal on teardown.
+pub(crate) fn inline_pane_action(open: bool, settled: bool) -> InlinePaneAction {
+    InlinePaneAction {
+        draw: open,
+        freeze: open && settled,
+        focus: open && settled,
+    }
 }
 
 /// An inline SVG wavy line `width` px wide and [`WAVE_H`] tall — a smooth sine
@@ -1221,11 +1302,50 @@ fn anchor_cmdk(ed: &Editor, cmdk: CmdK, end: usize, area_h: RwSignal<f64>) {
     // Untracked, like the viewport read beside it: this runs from a key handler,
     // and a tracked read here would quietly give any future caller inside an
     // effect a dependency on the pane's height.
-    let overflow = (below.y - ed.viewport.get_untracked().y0) + theme::scaled(CMDK_BAR_RESERVE)
-        - area_h.get_untracked();
-    if overflow > 0.0 {
-        ed.scroll_delta.set(Vec2::new(0.0, overflow));
+    if let Some(by) = cmdk_scroll_overflow(
+        below.y,
+        ed.viewport.get_untracked().y0,
+        theme::scaled(CMDK_BAR_RESERVE),
+        area_h.get_untracked(),
+    ) {
+        ed.scroll_delta.set(Vec2::new(0.0, by));
     }
+}
+
+/// How far the editor has to scroll for the Ctrl+K bar, anchored under document
+/// y `anchor_y`, to be fully on screen — or `None` when it already is.
+///
+/// `reserve` is the bar's own height plus the gap it wants beneath it; `vp_y0` is
+/// the viewport's top in document coordinates, and `area_h` the pane's height.
+///
+/// **A pure function because `c058b98` deleted the three tests that used to guard
+/// this arithmetic.** They belonged to `cmdk_diff_chrome`, which went with the
+/// overlay; the property moved here and into [`footer_fits`] and arrived with
+/// none. A sign error is invisible on screen until the one buffer that is long
+/// enough to scroll.
+pub(crate) fn cmdk_scroll_overflow(
+    anchor_y: f64,
+    vp_y0: f64,
+    reserve: f64,
+    area_h: f64,
+) -> Option<f64> {
+    let overflow = (anchor_y - vp_y0) + reserve - area_h;
+    (overflow > 0.0).then_some(overflow)
+}
+
+/// Does the verdict footer, `bar_h` tall and placed at `y` in the pane's own
+/// coordinates, fit inside a pane `area_h` tall?
+///
+/// **Both edges.** The bar is positioned by line geometry against an editor that
+/// scrolls *under* it, and it is absolutely positioned in the pane rather than
+/// clipped to the editor — so without the `y >= 0.0` half it rides up over the
+/// toolbar and the tab strip when the suggestion scrolls off the top, and without
+/// the other half it hangs below the pane when the suggestion is near the bottom.
+///
+/// A pane shorter than the bar itself fits nothing, which is the `area_h = 0`
+/// case a collapsed editor produces.
+pub(crate) fn footer_fits(y: f64, bar_h: f64, area_h: f64) -> bool {
+    y >= 0.0 && y + bar_h <= area_h
 }
 
 /// The y (in `editor_area` coords) of the first pixel *below* the phantom rows a
@@ -1272,8 +1392,7 @@ fn inline_footer_y(
     // line geometry against an editor that scrolls under it, so without this it
     // rides up over the toolbar and the tab strip — it is absolutely positioned in
     // the pane, not clipped to the editor.
-    let h = theme::scaled(VERDICT_BAR_H);
-    let fits = y >= 0.0 && y + h <= area_h.get();
+    let fits = footer_fits(y, theme::scaled(VERDICT_BAR_H), area_h.get());
     (placed(top, bot) && fits).then_some(y)
 }
 
@@ -1295,6 +1414,48 @@ fn inline_footer_y(
 /// padding. Those two strips are text-free, so an overlay can finish the band
 /// there without covering anything — which is the one job this has.
 ///
+/// Which of one hunk's lines this frame has any reason to ask the layout about,
+/// given the buffer lines `visible` (inclusive) currently on screen: the deleted
+/// range narrowed to the viewport, plus the anchor of a pure insertion when that
+/// is on screen.
+///
+/// **A filter, never a clamp.** A line outside the viewport is dropped, not
+/// pulled to the nearest one — the same rule `top_of` states for a line past the
+/// end of the document, and for the same reason: a band placed against whatever
+/// text happens to be at the clamped line is worse than no band.
+///
+/// This is here because [`inline_band_runs`] re-runs on **every scroll tick**
+/// (it tracks `screen_lines`), and it used to call `points_of_offset` for every
+/// line of every hunk before finding out the line was off screen — and floem
+/// answers that with a linear scan of `screen_lines`. So a whole-buffer
+/// suggestion, which `fix_with_ai` produces routinely when
+/// `intel::error_fix_range` cannot locate the error's token, cost
+/// `O(deleted × visible)` per frame with none of it drawing anything. Bounded by
+/// the viewport, it is `O(visible)`.
+///
+/// `None` for `visible` is an editor with nothing laid out yet, which places no
+/// offset at all — so there is nothing to ask about either.
+pub(crate) fn visible_hunk_lines(
+    del: std::ops::Range<usize>,
+    anchor: usize,
+    has_add: bool,
+    visible: Option<(usize, usize)>,
+) -> (std::ops::Range<usize>, Option<usize>) {
+    // A pure insertion has no deleted line to hang the block off, so the anchor
+    // still has to be visited for its added rows.
+    let anchor = (del.is_empty() && has_add).then_some(anchor);
+    let Some((first, last)) = visible else {
+        return (0..0, None);
+    };
+    let start = del.start.max(first);
+    let end = del.end.min(last + 1);
+    let clipped = match start < end {
+        true => start..end,
+        false => 0..0,
+    };
+    (clipped, anchor.filter(|a| *a >= first && *a <= last))
+}
+
 /// Reactive on `screen_lines`, so the strips follow a scroll like the rest.
 fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f64, f64, bool)> {
     ed.screen_lines.track();
@@ -1321,17 +1482,22 @@ fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f6
         placed(top, bot).then_some(top.y + EDITOR_PAD_TOP - vp_y)
     };
     let mut rows = Vec::new();
+    // The lines on screen, so the walk below is bounded by the viewport rather
+    // than by the size of the plan — see `visible_hunk_lines`.
+    let visible = ed
+        .screen_lines
+        .get()
+        .rvline_range()
+        .map(|(f, l)| (f.line, l.line));
     // Every line the diff touches, banded by its **visual** rows. Each line is
     // asked for its own split through `inline_diff::row_split`, the same function
     // the code column's bands go through, so the two halves of a band cannot
     // disagree about which rows they cover — including where word wrap has given a
     // line more rows than it has lines.
     for hunk in &plan.hunks {
-        for line in hunk.del.clone().chain(
-            // A pure insertion has no deleted line to hang the block off, so the
-            // anchor still has to be visited for its added rows.
-            (hunk.del.is_empty() && !hunk.add.is_empty()).then_some(hunk.anchor),
-        ) {
+        let (del_lines, anchor) =
+            visible_hunk_lines(hunk.del.clone(), hunk.anchor, !hunk.add.is_empty(), visible);
+        for line in del_lines.chain(anchor) {
             let Some(top) = top_of(line) else { continue };
             let line_h = f64::from(ed.line_height(line));
             let own_len = rope.line_content(line).len();
@@ -1570,6 +1736,11 @@ pub(crate) struct QueryPaneParams {
     /// The SQL dialect of the active tab's connection (MySQL/PostgreSQL), driving
     /// completion + diagnostics parsing. Reactive — follows the tab's `conn_id`.
     pub dialect: Memo<SqlDialect>,
+    /// How much of the active tab's connection the assistant may see. The **tab's**
+    /// connection, not the active one, for `grid::ai_data_of`'s reason. Gates the
+    /// engine's error text out of the AI fix and Explain prompts on any level
+    /// below `Full` — see [`prompt::result_shape`](schemaic_core::prompt::result_shape).
+    pub ai_data: Memo<schemaic_core::connection::AiData>,
     pub active_db_menu_open: RwSignal<bool>,
     pub active_db_anchor: RwSignal<Point>,
     /// Every menu-open flag in the app, so the database selector can close the
@@ -1636,6 +1807,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         editor_collapsed,
         active_db,
         dialect,
+        ai_data,
         active_db_menu_open,
         active_db_anchor,
         menus,
@@ -1667,6 +1839,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         open: RwSignal::new(false),
         point: RwSignal::new(Point::ZERO),
         input: RwSignal::new(String::new()),
+        intent: RwSignal::new(None),
         start: RwSignal::new(0),
         end: RwSignal::new(0),
         preview: RwSignal::new(None),
@@ -2095,6 +2268,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 anchor_cmdk(e, cmdk, end, area_h);
             });
             cmdk.input.set(String::new());
+            cmdk.intent.set(None);
             inline_ai.set(InlineAiState::Idle);
             comp.open.set(false);
             cmdk.open.set(true);
@@ -2660,12 +2834,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return;
             };
             let stmt = stmt.to_string();
-            let Some(p) = prompt::ai_fix_prompt(&problems, origin) else {
+            let Some(p) = prompt::ai_fix_prompt(&problems, origin, ai_data.get_untracked()) else {
                 return;
             };
             cmdk.start.set(lo);
             cmdk.end.set(hi);
-            cmdk.input.set(p.input);
+            cmdk.input.set(p.input.clone());
+            // The fenced, provenance-flagged instruction, kept beside the label
+            // in the box so a retry sends *this* — see `CmdK::intent`.
+            cmdk.intent.set(Some((p.input.clone(), p.intent.clone())));
             // **Select what will be replaced**, exactly as Ctrl+K and "Ask AI"
             // do — and this is the entry point that needs it most: the range is
             // `error_fix_range`'s choice rather than a gesture of the user's, so
@@ -2729,7 +2906,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             };
             let sql = query.get_untracked();
             let (lo, hi) = intel::error_fix_range(&sql, &err, dialect.get_untracked());
-            let Some(p) = prompt::explain_error_prompt(sql.get(lo..hi), &err) else {
+            let Some(p) =
+                prompt::explain_error_prompt(sql.get(lo..hi), &err, ai_data.get_untracked())
+            else {
                 return;
             };
             crate::reveal_ai_panel(right_panel);
@@ -2831,6 +3010,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .update(|cc| cc.set_insert(Selection::region(start, end)));
                         anchor_cmdk(&ed_ask, cmdk, end, area_h);
                         cmdk.input.set(String::new());
+                        cmdk.intent.set(None);
                         inline_ai.set(InlineAiState::Idle);
                         cmdk.open.set(true);
                     },
@@ -2867,6 +3047,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             cmdk.start.set(lo);
                             cmdk.end.set(hi);
                             cmdk.input.set("Optimize this query".to_string());
+                            // The box shows a label; the instruction below is
+                            // what the model is actually sent, retry included.
+                            cmdk.intent.set(Some((
+                                "Optimize this query".to_string(),
+                                OPTIMIZE_INTENT.to_string(),
+                            )));
                             inline_ai.set(InlineAiState::Busy);
                             cmdk.open.set(true);
                             (run_optimize)(InlineAiRequest {
@@ -2884,10 +3070,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 MenuEntry::Separator,
                 MenuEntry::action("Plan", move || {
                     let sql = query.get_untracked();
-                    let (lo, hi) =
-                        statement_range(&sql, menu_offset.get_untracked(), dialect.get_untracked());
+                    let dia = dialect.get_untracked();
+                    let (lo, hi) = statement_range(&sql, menu_offset.get_untracked(), dia);
                     if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.trim().is_empty()) {
-                        (show_plan)(stmt.to_string());
+                        // **The substituted statement, like every other path that
+                        // sends text to the server.** EXPLAIN was handed the raw
+                        // template and answered `ERROR 1064 … near ':id'`, about
+                        // text the user has already filled in in the bar directly
+                        // below. `167c87b` added exactly this to live-validate and
+                        // not here. A value still missing leaves the template
+                        // alone; the plan modal then shows the engine's complaint,
+                        // which is the same thing Run does.
+                        let stmt = params::substitute(stmt, &tab_params.get_untracked(), dia)
+                            .unwrap_or_else(|_| stmt.to_string());
+                        (show_plan)(stmt);
                         highlight_pick(&sql, lo, hi, highlight);
                     }
                 }),
@@ -5009,6 +5205,178 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+mod cmdk_geometry_tests {
+    use super::*;
+
+    /// The three deleted tests' property, on the function it moved into: the bar
+    /// is under the statement, and if that puts it past the pane's bottom the
+    /// editor scrolls by exactly the shortfall.
+    #[test]
+    fn the_editor_scrolls_by_exactly_what_the_bar_overhangs() {
+        // Anchor 300px down a 400px pane whose viewport starts at 0, with 60px
+        // reserved: 300 + 60 = 360 ≤ 400, nothing to do.
+        assert_eq!(cmdk_scroll_overflow(300.0, 0.0, 60.0, 400.0), None);
+        // 20px further down and it overhangs by 20.
+        assert_eq!(cmdk_scroll_overflow(360.0, 0.0, 60.0, 400.0), Some(20.0));
+        // **The viewport offset is subtracted, not added.** A scrolled editor
+        // measures the anchor from the document's top; the pane measures from the
+        // viewport's. Getting this backwards puts the bar at the bottom of the
+        // pane whenever the statement is deep in a long buffer.
+        assert_eq!(
+            cmdk_scroll_overflow(1360.0, 1000.0, 60.0, 400.0),
+            Some(20.0)
+        );
+        assert_eq!(cmdk_scroll_overflow(1300.0, 1000.0, 60.0, 400.0), None);
+        // Exactly flush is not an overflow.
+        assert_eq!(cmdk_scroll_overflow(340.0, 0.0, 60.0, 400.0), None);
+    }
+
+    /// The footer is absolutely positioned in the pane, not clipped to the
+    /// editor, and the editor scrolls under it — so it has to be refused at
+    /// **both** edges.
+    #[test]
+    fn the_verdict_footer_is_refused_off_either_edge() {
+        assert!(footer_fits(100.0, 30.0, 400.0));
+        assert!(footer_fits(0.0, 30.0, 400.0), "flush with the top fits");
+        assert!(
+            footer_fits(370.0, 30.0, 400.0),
+            "flush with the bottom fits"
+        );
+        // Scrolled off the top: without this it rides over the toolbar and the
+        // tab strip.
+        assert!(!footer_fits(-1.0, 30.0, 400.0));
+        // Past the bottom by a pixel.
+        assert!(!footer_fits(371.0, 30.0, 400.0));
+        // A collapsed editor has room for nothing.
+        assert!(!footer_fits(0.0, 30.0, 0.0));
+    }
+
+    /// The gutter strips ask the layout only about lines that are on screen.
+    ///
+    /// The case that matters is the whole-buffer rewrite `fix_with_ai` produces
+    /// when the error's token cannot be located: `del` is the document and the
+    /// viewport is fifty lines of it.
+    #[test]
+    fn a_hunk_is_walked_only_over_the_lines_on_screen() {
+        // A 5,000-line deletion with lines 100..=149 visible.
+        let (del, anchor) = visible_hunk_lines(0..5_000, 4_999, true, Some((100, 149)));
+        assert_eq!(del, 100..150, "the walk is bounded by the viewport");
+        assert_eq!(anchor, None, "a hunk that deletes has no separate anchor");
+        // A hunk entirely above or below the viewport is skipped outright.
+        assert_eq!(
+            visible_hunk_lines(0..40, 39, true, Some((100, 149))).0,
+            0..0
+        );
+        assert_eq!(
+            visible_hunk_lines(900..1_000, 999, true, Some((100, 149))).0,
+            0..0
+        );
+        // A hunk that straddles an edge keeps only its visible half — and the
+        // last visible line is **inclusive**.
+        assert_eq!(
+            visible_hunk_lines(90..110, 109, true, Some((100, 149))).0,
+            100..110
+        );
+        assert_eq!(
+            visible_hunk_lines(140..200, 199, true, Some((100, 149))).0,
+            140..150
+        );
+        // A hunk that fits inside the viewport is untouched.
+        assert_eq!(
+            visible_hunk_lines(110..120, 119, true, Some((100, 149))).0,
+            110..120
+        );
+    }
+
+    /// A pure insertion has no deleted line, so its anchor is the only line to
+    /// visit — and it is subject to the same viewport test.
+    #[test]
+    fn a_pure_insertions_anchor_is_visited_only_when_it_is_on_screen() {
+        assert_eq!(
+            visible_hunk_lines(7..7, 7, true, Some((0, 20))),
+            (0..0, Some(7))
+        );
+        assert_eq!(
+            visible_hunk_lines(7..7, 7, true, Some((10, 20))),
+            (0..0, None),
+            "an anchor above the viewport is not visited"
+        );
+        assert_eq!(
+            visible_hunk_lines(7..7, 7, true, Some((0, 6))),
+            (0..0, None),
+            "nor one below it"
+        );
+        // A pure *deletion* adds nothing, so there is no block to hang and no
+        // anchor to visit — only the deleted lines' own bands.
+        assert_eq!(
+            visible_hunk_lines(7..9, 8, false, Some((0, 20))),
+            (7..9, None)
+        );
+        assert_eq!(
+            visible_hunk_lines(7..7, 7, false, Some((0, 20))),
+            (0..0, None)
+        );
+    }
+
+    /// An editor with nothing laid out places no offset at all, so there is
+    /// nothing to ask about — and asking anyway is exactly the wasted scan this
+    /// filter exists to avoid.
+    #[test]
+    fn an_unlaid_out_editor_is_asked_about_no_line() {
+        assert_eq!(visible_hunk_lines(0..5_000, 0, true, None), (0..0, None));
+        assert_eq!(visible_hunk_lines(3..3, 3, true, None), (0..0, None));
+    }
+
+    /// A single visible line is a valid viewport, not an empty one — the
+    /// inclusive/exclusive seam where an off-by-one would silently drop the only
+    /// banded line the user can see.
+    #[test]
+    fn a_one_line_viewport_still_yields_that_line() {
+        assert_eq!(
+            visible_hunk_lines(0..100, 99, true, Some((42, 42))).0,
+            42..43
+        );
+        assert_eq!(
+            visible_hunk_lines(42..43, 42, true, Some((42, 42))).0,
+            42..43
+        );
+    }
+}
+
+#[cfg(test)]
+mod inline_pane_tests {
+    use super::*;
+
+    /// The regression: a pane that did not ask for the suggestion drew it and
+    /// froze itself. A `CmdK` that was never opened is the only signal a fresh
+    /// pane has, and all three consequences hang off it.
+    #[test]
+    fn a_pane_that_did_not_open_the_prompt_does_nothing_at_all() {
+        for settled in [false, true] {
+            let act = inline_pane_action(false, settled);
+            assert!(!act.draw, "settled={settled}");
+            assert!(!act.freeze, "settled={settled}");
+            assert!(!act.focus, "settled={settled}");
+        }
+    }
+
+    /// The counterweight — the owning pane still does the whole job.
+    #[test]
+    fn the_pane_that_asked_draws_while_working_and_freezes_once_it_lands() {
+        let working = inline_pane_action(true, false);
+        assert!(working.draw, "the in-flight fade is what shows the range");
+        assert!(
+            !working.freeze,
+            "the buffer is editable until there is a verdict to protect"
+        );
+        assert!(!working.focus);
+
+        let landed = inline_pane_action(true, true);
+        assert!(landed.draw && landed.freeze && landed.focus);
+    }
 }
 
 #[cfg(test)]

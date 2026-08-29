@@ -520,6 +520,88 @@ mod tests {
         assert!(block_at(&InlineView::Working(0..2), 0).is_none());
     }
 
+    // ── the producer/consumer seam ──────────────────────────────────────────
+
+    /// Every added row a plan claims has to be **reachable** — some document
+    /// line has to anchor a block that renders it.
+    ///
+    /// The tests above hand-build their hunks, so none of them can see this:
+    /// the renderer finds a block with `hunks.iter().find(|h| h.anchor == line)`,
+    /// which returns the *first* hunk on an anchor, so two hunks sharing one
+    /// anchor means the second is drawn nowhere. A hand-written fixture never
+    /// produces that pair; `inline_plan` does, for a pure insertion after line 0
+    /// alongside a `before` hunk at 0 — the shape `("b", "d\nb\nd")` builds, and
+    /// the one that shipped drawing 1 of its 2 added lines.
+    ///
+    /// So the plan comes from `inline_plan` here, and the count is taken from
+    /// `segments` — one `\n` per added row is the module's own contract, pinned
+    /// by `a_blocks_length_matches_the_bytes_segments_emits`.
+    #[test]
+    fn every_line_a_plan_adds_is_drawn_somewhere() {
+        for (old, new) in [
+            ("b", "d\nb\nd"),
+            ("b", "d\nb"),
+            ("b", "b\nd"),
+            ("a\nb\nc", "a\nB\nc"),
+            ("a\nb\nc", "x\na\nb\nc\ny"),
+            ("a\nb\nc", ""),
+            ("", "a\nb"),
+            ("a\nb\nc", "a\nb\nc"),
+            ("a\nb\nc\nd", "d\nc\nb\na"),
+        ] {
+            let p = schemaic_core::diff::inline_plan(old, new);
+            let v = InlineView::Plan(p.clone());
+            // Every line of the old buffer, plus one past it: a hunk can anchor
+            // at the last line, and `inline_plan` anchors a leading insertion at
+            // line 0 with `before`.
+            let lines = old.lines().count().max(1);
+            let drawn: usize = (0..=lines)
+                .filter_map(|l| segments(&v, l, SqlDialect::MySql))
+                .map(|s| s.parts.iter().filter(|(t, _)| t == "\n").count())
+                .sum();
+            assert_eq!(
+                drawn, p.added,
+                "{old:?} → {new:?}: the plan claims {} added lines and the \
+                 renderer draws {drawn}; hunks {:?}",
+                p.added, p.hunks
+            );
+        }
+    }
+
+    /// The cheap and expensive halves have to agree on plans the differ really
+    /// produces, not only on hand-built ones — `row_split` uses `block_at`'s
+    /// `len` as a byte column into the text `segments` built, so a disagreement
+    /// bands the wrong rows.
+    #[test]
+    fn the_cheap_and_full_blocks_agree_on_a_real_plan() {
+        for (old, new) in [
+            ("b", "d\nb\nd"),
+            ("SELECT 1", "SELECT 1\nWHERE x = 1"),
+            ("a\nb", "\na\n\nb"),
+        ] {
+            let p = schemaic_core::diff::inline_plan(old, new);
+            let v = InlineView::Plan(p);
+            for l in 0..=old.lines().count().max(1) {
+                let cheap = block_at(&v, l);
+                let full = segments(&v, l, SqlDialect::MySql);
+                assert_eq!(
+                    cheap.is_some(),
+                    full.is_some(),
+                    "{old:?} → {new:?} line {l}: the two halves disagree on \
+                     whether a block is there"
+                );
+                if let (Some(c), Some(f)) = (cheap, full) {
+                    assert_eq!(c.before, f.before, "{old:?} → {new:?} line {l}");
+                    assert_eq!(
+                        c.len,
+                        f.parts.iter().map(|(t, _)| t.len()).sum::<usize>(),
+                        "{old:?} → {new:?} line {l}: byte lengths differ"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn only_a_leading_block_shifts_the_lines_own_spans() {
         assert_eq!(
