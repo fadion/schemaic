@@ -4185,7 +4185,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     lookalike overlay, and it leaves the user able to see, extend or replace the range with the
     gestures they already have. The bar is anchored at the **end** of the acted-on range rather than
     at the caret, so it sits under the whole statement instead of splitting one in two, and every
-    entry point goes through `anchor_cmdk` to do it. That helper does two things neither caller should
+    entry point goes through `anchor_cmdk` to do it.
+    **That sentence was not true of *Optimize*, and `cmdk_open_gate` is what makes it a fact rather
+    than an intention.** Four entry points open the bar — the key, *Ask AI*, *Optimize*, and
+    `fix_with_ai`'s three menus — each written separately, and *Optimize* selected nothing and
+    anchored nothing. The two symptoms did not look like one bug. With no selection, the in-flight
+    fade over the acted-on lines was the only sign of what was about to be rewritten, so the gesture
+    that reads as "this statement" everywhere else read as *the editor going dim*. With no anchor,
+    the bar opened at whatever `cmdk.point` the previous Ctrl+K had left — the origin on a fresh
+    tab, so it drew **over** the statement, and pressing Ctrl+K once anywhere and closing it again
+    "fixed" it for the rest of the tab's life, which is the tell for a stale anchor and reads as
+    nothing else. It also dropped its `highlight_pick`: the statement border belongs to the action
+    whose answer lands *elsewhere* (*Explain*, which sends prose to the chat panel and needs
+    something in the editor pointing back), while an action that rewrites the statement in place has
+    the selection as its marker. The gate is a source gate for the reason the crate's others are —
+    the thing under test is a set of call sites — and it bounds its look-back to a window rather
+    than latching a flag per file, since a 5.8k-line file has unrelated `set_insert`s in it.
+    `anchor_cmdk` does two things neither caller should
     repeat. It stores the point in the editor's **content** coordinates and leaves the style closure
     to subtract the viewport, so the bar tracks a later scroll — while the closure was *not*
     subtracting it, an open in a scrolled editor placed the bar by how far down the document the

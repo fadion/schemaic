@@ -2992,6 +2992,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let fix_with_ai = fix_with_ai.clone();
         Rc::new(move || {
             let ed_ask = ed_menu_act.clone();
+            let ed_opt = ed_menu_act.clone();
             let ai_explain = ai_send.clone();
             let run_optimize = inline_ai_run.clone();
             let show_plan = open_plan.clone();
@@ -3091,6 +3092,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             let stmt = stmt.to_string();
                             cmdk.start.set(lo);
                             cmdk.end.set(hi);
+                            // **Select the range, and anchor the bar under it** —
+                            // the two things every other way into the bar does,
+                            // and this one did neither. Without the selection the
+                            // in-flight fade over those lines was the only sign of
+                            // what was about to be rewritten, so a gesture that
+                            // says "this statement" everywhere else read as the
+                            // editor going dim; and without the anchor the bar
+                            // drew at whatever `cmdk.point` the last Ctrl+K left,
+                            // which on a fresh tab is the origin — over the
+                            // statement. `cmdk_open_gate` is what keeps the four
+                            // entry points agreeing about this.
+                            ed_opt
+                                .cursor
+                                .update(|cc| cc.set_insert(Selection::region(lo, hi)));
+                            anchor_cmdk(&ed_opt, cmdk, hi, area_h);
                             cmdk.input.set("Optimize this query".to_string());
                             // The box shows a label; the instruction below is
                             // what the model is actually sent, retry included.
@@ -3108,7 +3124,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 current_sql: sql.clone(),
                                 selection: Some(stmt),
                             });
-                            highlight_pick(&sql, lo, hi, highlight);
+                            // No `highlight_pick` here any more: the statement
+                            // border belongs to the action whose answer lands
+                            // *elsewhere* — "Explain", which sends prose to the
+                            // chat panel and needs something in the editor
+                            // pointing back at the statement it is about. This
+                            // one rewrites the statement in place, so the
+                            // selection above is the marker, exactly as it is for
+                            // "Ask AI" and the AI fix. Drawing both was the
+                            // remaining difference between them.
                         }
                     },
                 ),
@@ -5821,6 +5845,115 @@ mod geometry_tests {
         assert!(
             just_fits >= 1.0 / (1.0 - ERROR_BAR_MSG_PCT),
             "the threshold is the buttons' share of the bar, not their width"
+        );
+    }
+}
+
+/// A source gate, for the reason the other four in this crate exist: the thing
+/// under test is a **set of call sites**, and no runtime test in a Floem crate
+/// can see them.
+///
+/// What it pins is what every way of opening the Ctrl+K bar owes the user before
+/// it opens: the range it is about, **selected**, and the bar **anchored** under
+/// that range. There are four entry points — the key itself, *Ask AI*,
+/// *Optimize*, and `fix_with_ai` (three menus of its own) — and each was written
+/// separately, which is exactly the shape the doc's own warning about
+/// `set_menu_return` describes.
+///
+/// *Optimize* is why it is here. It set neither, and the two symptoms did not
+/// look like one bug: with nothing selected, the in-flight fade over the acted-on
+/// lines was the only sign of what was about to be rewritten — so the same
+/// gesture that reads as "this statement" everywhere else read as "the editor has
+/// gone dim" — and with no anchor written, the bar opened whatever `cmdk.point`
+/// the *last* Ctrl+K had left it at, which on a fresh tab is the origin. It drew
+/// over the statement, and pressing Ctrl+K once (anywhere) and closing it again
+/// "fixed" it for the rest of the tab's life, which is the tell for a stale
+/// anchor and reads as nothing else.
+#[cfg(test)]
+mod cmdk_open_gate {
+    use crate::source_gate::production_code;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// Openers that deliberately do neither, each with the reason. Empty is the
+    /// healthy state — a site joins this list only with a reason a reader can
+    /// check.
+    const EXEMPT: &[(u32, &str)] = &[];
+
+    /// How far back an opener's own preparation may sit, in source lines. The
+    /// four real sites span 5, 5, 5 and 16 lines from their first preparation to
+    /// the `open`; the window is wide enough for all of them and far too narrow
+    /// to reach an unrelated `set_insert` elsewhere in a 5.8k-line file, which is
+    /// the whole point of bounding it rather than latching a flag per file.
+    const WINDOW: u32 = 40;
+
+    /// The file's *logical* lines, each with the 1-based number it starts at:
+    /// `rustfmt` breaks `ed.cursor.update(|cc| cc.set_insert(…))` at the dots, so
+    /// a per-line scan reads the receiver and the call separately and sees
+    /// neither half of what it is looking for.
+    fn logical_lines(src: &str) -> Vec<(u32, String)> {
+        let mut out: Vec<(u32, String)> = Vec::new();
+        for (i, raw) in src.lines().enumerate() {
+            let t = raw.trim_start();
+            match out.last_mut() {
+                Some((_, prev)) if t.starts_with('.') => prev.push_str(t),
+                _ => out.push((i as u32 + 1, t.to_string())),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_way_of_opening_the_bar_selects_its_range_and_anchors_the_bar() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("editor_pane.rs"),
+        )
+        .expect("this file");
+        let exempt: BTreeSet<u32> = EXEMPT.iter().map(|(l, _)| *l).collect();
+
+        let lines = logical_lines(&production_code(&src));
+        let mut opens = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (i, (lineno, line)) in lines.iter().enumerate() {
+            if !line.contains("cmdk.open.set(true)") {
+                continue;
+            }
+            opens += 1;
+            if exempt.contains(lineno) {
+                continue;
+            }
+            // Look back over the preparation this opener is allowed to have done.
+            let prep = lines[..i]
+                .iter()
+                .rev()
+                .take_while(|(n, _)| lineno.saturating_sub(*n) <= WINDOW);
+            let (mut selected, mut anchored) = (false, false);
+            for (_, l) in prep {
+                selected |= l.contains("set_insert(Selection::region(");
+                anchored |= l.contains("anchor_cmdk(");
+            }
+            if !selected {
+                offenders.push(format!(
+                    "editor_pane.rs:{lineno} opens the Ctrl+K bar without selecting \
+                     the range it is about"
+                ));
+            }
+            if !anchored {
+                offenders.push(format!(
+                    "editor_pane.rs:{lineno} opens the Ctrl+K bar without anchoring \
+                     it — it will draw wherever the last opener left `cmdk.point`"
+                ));
+            }
+        }
+
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+        // The scan has to still be finding the sites: a renamed signal would
+        // otherwise make this pass by seeing nothing at all.
+        assert!(
+            opens >= 4,
+            "the scan found only {opens} openers — has `cmdk.open` been renamed?"
         );
     }
 }
