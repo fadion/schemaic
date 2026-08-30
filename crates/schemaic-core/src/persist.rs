@@ -1262,12 +1262,16 @@ mod tests {
     /// The case that costs the most: a connection file is the one whose loss the
     /// user can't reconstruct.
     ///
-    /// The fixture is a *real* serialization with the two enum values swapped
-    /// for ones this build doesn't know, so it can't rot as fields are added —
+    /// The fixture is a *real* serialization with the enum values swapped for
+    /// ones this build doesn't know, so it can't rot as fields are added —
     /// which is what a newer build writing this file actually does.
+    ///
+    /// Every `#[serde(other)]` shim on a connection belongs here, not only in
+    /// its own unit test: the shim is correct in isolation and still useless if
+    /// the field it guards is not reached through it.
     #[test]
-    fn an_unknown_ssh_auth_or_environment_keeps_every_connection() {
-        use crate::connection::{Connection, Environment, SshAuth};
+    fn an_unknown_ssh_auth_environment_or_ssl_mode_keeps_every_connection() {
+        use crate::connection::{Connection, Environment, SshAuth, SslMode, Tls};
 
         let c = Connection {
             id: 1,
@@ -1280,6 +1284,11 @@ mod tests {
             file: String::new(),
             ssh: crate::connection::SshTunnel {
                 auth: SshAuth::Agent,
+                ..Default::default()
+            },
+            tls: Tls {
+                mode: SslMode::VerifyFull,
+                ca_path: "/etc/ca.crt".to_string(),
                 ..Default::default()
             },
             color: None,
@@ -1296,9 +1305,10 @@ mod tests {
         let json = serde_json::to_string(&file)
             .unwrap()
             .replace("\"Agent\"", "\"Fido2\"")
-            .replace("\"Production\"", "\"Sandbox\"");
+            .replace("\"Production\"", "\"Sandbox\"")
+            .replace("\"VerifyFull\"", "\"VerifyEverything\"");
         assert!(
-            json.contains("Fido2") && json.contains("Sandbox"),
+            json.contains("Fido2") && json.contains("Sandbox") && json.contains("VerifyEverything"),
             "fixture"
         );
 
@@ -1311,6 +1321,11 @@ mod tests {
             back.connections[0].environment,
             Environment::None,
             "→ default"
+        );
+        assert_eq!(back.connections[0].tls.mode, SslMode::Prefer, "→ default");
+        assert_eq!(
+            back.connections[0].tls.ca_path, "/etc/ca.crt",
+            "the rest of the TLS block survives the unknown mode"
         );
     }
 

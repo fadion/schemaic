@@ -1,9 +1,10 @@
 //! Secret handling for saved connections — keeps credentials out of the plaintext
 //! `connections.json` by storing them in the OS keyring instead.
 //!
-//! Three secrets per connection can be stored: the database password, the SSH
-//! tunnel password, and the SSH key passphrase. Each is keyed in the keyring by
-//! the connection id + a kind suffix (see [`account`]).
+//! Four secrets per connection can be stored: the database password, the SSH
+//! tunnel password, the SSH key passphrase, and the TLS client-key passphrase.
+//! Each is keyed in the keyring by the connection id + a kind suffix (see
+//! [`account`]).
 //!
 //! This module is the *pure, testable* layer: it defines the [`SecretStore`]
 //! seam and the transforms over a [`ConnectionsFile`] (hydrate on load, sanitize
@@ -22,7 +23,7 @@ use crate::connection::Connection;
 use crate::persist::ConnectionsFile;
 
 /// Which secret of a connection an entry holds. The keyring account name is
-/// `conn.{id}.{suffix}`, so the three secrets of one connection never collide and
+/// `conn.{id}.{suffix}`, so one connection's secrets never collide and
 /// entries for different connections stay independent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SecretKind {
@@ -32,14 +33,20 @@ pub enum SecretKind {
     SshPassword,
     /// The SSH private-key passphrase ([`crate::connection::SshTunnel::key_passphrase`]).
     SshPassphrase,
+    /// The TLS client-key passphrase
+    /// ([`crate::connection::Tls::client_key_passphrase`]).
+    TlsKeyPassphrase,
 }
 
 impl SecretKind {
-    /// All three kinds, so callers can iterate a connection's secrets uniformly.
-    pub const ALL: [SecretKind; 3] = [
+    /// Every kind, so callers can iterate a connection's secrets uniformly —
+    /// which is what makes adding one here enough to have it hydrated, sanitized
+    /// and forgotten everywhere.
+    pub const ALL: [SecretKind; 4] = [
         SecretKind::DbPassword,
         SecretKind::SshPassword,
         SecretKind::SshPassphrase,
+        SecretKind::TlsKeyPassphrase,
     ];
 
     fn suffix(self) -> &'static str {
@@ -47,6 +54,7 @@ impl SecretKind {
             SecretKind::DbPassword => "password",
             SecretKind::SshPassword => "ssh_password",
             SecretKind::SshPassphrase => "ssh_passphrase",
+            SecretKind::TlsKeyPassphrase => "tls_key_passphrase",
         }
     }
 }
@@ -62,6 +70,7 @@ fn field(conn: &Connection, kind: SecretKind) -> &str {
         SecretKind::DbPassword => &conn.password,
         SecretKind::SshPassword => &conn.ssh.password,
         SecretKind::SshPassphrase => &conn.ssh.key_passphrase,
+        SecretKind::TlsKeyPassphrase => &conn.tls.client_key_passphrase,
     }
 }
 
@@ -71,6 +80,7 @@ fn set_field(conn: &mut Connection, kind: SecretKind, value: String) {
         SecretKind::DbPassword => conn.password = value,
         SecretKind::SshPassword => conn.ssh.password = value,
         SecretKind::SshPassphrase => conn.ssh.key_passphrase = value,
+        SecretKind::TlsKeyPassphrase => conn.tls.client_key_passphrase = value,
     }
 }
 
@@ -321,6 +331,7 @@ mod tests {
             password: String::new(),
             file: String::new(),
             ssh: SshTunnel::default(),
+            tls: crate::connection::Tls::default(),
             color: None,
             prominent_color: false,
             read_only: false,
@@ -337,10 +348,56 @@ mod tests {
             account(1, SecretKind::SshPassphrase),
             "conn.1.ssh_passphrase"
         );
+        assert_eq!(
+            account(1, SecretKind::TlsKeyPassphrase),
+            "conn.1.tls_key_passphrase"
+        );
         assert_ne!(
             account(1, SecretKind::DbPassword),
             account(2, SecretKind::DbPassword)
         );
+    }
+
+    /// Every kind must have its own slot: two sharing a suffix would have one
+    /// secret overwrite the other on save and come back as the wrong credential
+    /// on load. Asserted over `ALL` so a kind added later has to earn a suffix
+    /// rather than inherit a collision.
+    #[test]
+    fn no_two_kinds_share_a_slot() {
+        let mut names: Vec<String> = SecretKind::ALL.iter().map(|k| account(3, *k)).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), total, "two kinds share one keyring account");
+    }
+
+    /// The TLS client key's passphrase is a password like the other three, and
+    /// the invariant is the same one: after a save it is in the keyring and
+    /// **not** in `connections.json`.
+    #[test]
+    fn a_tls_key_passphrase_is_kept_out_of_the_json() {
+        let store = MemStore::new();
+        let mut c = conn(4);
+        c.tls.client_key_passphrase = "let me in".to_string();
+        let file = ConnectionsFile {
+            connections: vec![c],
+            active: Some(4),
+        };
+
+        let clean = sanitize(&file, &store);
+        assert_eq!(
+            clean.connections[0].tls.client_key_passphrase, "",
+            "blanked in the file"
+        );
+        assert_eq!(
+            store.stored("conn.4.tls_key_passphrase").as_deref(),
+            Some("let me in"),
+            "and stored in the keyring"
+        );
+
+        let mut back = clean;
+        hydrate_file(&mut back, &store);
+        assert_eq!(back.connections[0].tls.client_key_passphrase, "let me in");
     }
 
     /// Sanitize a file that wasn't hydrated from this store (the common case in
@@ -405,6 +462,7 @@ mod tests {
                 (7, SecretKind::DbPassword),
                 (7, SecretKind::SshPassword),
                 (7, SecretKind::SshPassphrase),
+                (7, SecretKind::TlsKeyPassphrase),
             ]
         );
         assert!(
@@ -603,12 +661,14 @@ mod tests {
             ("conn.7.password", "a"),
             ("conn.7.ssh_password", "b"),
             ("conn.7.ssh_passphrase", "c"),
+            ("conn.7.tls_key_passphrase", "d"),
             ("conn.8.password", "keep"),
         ]);
         forget(7, &store);
         assert_eq!(store.stored("conn.7.password"), None);
         assert_eq!(store.stored("conn.7.ssh_password"), None);
         assert_eq!(store.stored("conn.7.ssh_passphrase"), None);
+        assert_eq!(store.stored("conn.7.tls_key_passphrase"), None);
         assert_eq!(
             store.stored("conn.8.password").as_deref(),
             Some("keep"),

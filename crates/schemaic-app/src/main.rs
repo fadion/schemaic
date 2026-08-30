@@ -7239,8 +7239,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
-    // Ask first. **Every one of those is unrecoverable**: the three keyring
-    // entries (`conn.{id}.password` / `.ssh_password` / `.ssh_passphrase`), the
+    // Ask first. **Every one of those is unrecoverable**: the keyring entries
+    // (`conn.{id}.password` / `.ssh_password` / `.ssh_passphrase` /
+    // `.tls_key_passphrase`), the
     // saved AI conversation, the query history, the tabs *and* their editor
     // contents — and `recently_closed` is filtered too, so Ctrl+Shift+T cannot
     // bring them back.
@@ -9761,6 +9762,7 @@ mod app_tests {
             password: "s3cr3t".to_string(),
             file: String::new(),
             ssh: Default::default(),
+            tls: Default::default(),
             color: None,
             prominent_color: false,
             read_only: false,
