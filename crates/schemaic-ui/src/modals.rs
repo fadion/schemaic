@@ -468,9 +468,15 @@ mod modal_backdrop_gate {
     /// And the other direction, which `07bda98`'s "loud failure" argument covers
     /// and which is worth pinning next to it: every term of `modal_backdrop_up` is
     /// a predicate the layer also uses to size itself, so a modal in the layer with
-    /// no term gets a zero box. All six terms are named here — the three grouped
-    /// predicates and the three signals the layer raises directly — so a seventh
+    /// no term gets a zero box. All seven terms are named here — the three grouped
+    /// predicates and the four signals the layer raises directly — so an eighth
     /// added without joining `modal_backdrop_up` fails.
+    ///
+    /// `confirm` is the seventh, and it arrived here late: hoisting the shared
+    /// confirm out of the DDL group gave it its own entry in the layer and its
+    /// own term in the predicate, and the array below was not extended with it —
+    /// which is precisely the drift the paragraph above claims to catch. The list
+    /// only guards what it names.
     #[test]
     fn the_predicate_names_every_group_the_layer_raises() {
         let src = std::fs::read_to_string(src_dir().join("modals.rs")).expect("modals.rs");
@@ -494,6 +500,7 @@ mod modal_backdrop_gate {
             "find_open.get()",
             "manage_open.get()",
             "plan_open.get()",
+            "confirm.get()",
         ] {
             assert!(
                 closure.contains(term),
