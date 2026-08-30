@@ -3104,10 +3104,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   someone else's parser). That switch is deliberately **not** made for `prefer`/`require`: the
   driver builds a `WebPkiServerVerifier` even when it will never consult it, and that builder
   fails on an empty root store, so disabling the built-ins for a mode that names no CA would break
-  the default mode of every connection. Two Windows-specific consequences to know before blaming a
-  server: the root program is populated lazily, so a public certificate every browser accepts can
-  still fail `verify-ca` with `UnknownIssuer`, and a certificate installed during a session needs
-  a restart to be seen.
+  the default mode of every connection. Two things to know before blaming a server. The anchor
+  count is legitimately smaller than the certificate manager's — `rustls-native-certs` returns only
+  server-auth roots, and a Windows box measured here held 69 and yielded 37, the rest being
+  code-signing and timestamping CAs, with `ISRG Root X1` among those kept — so a low number is not
+  itself a symptom. Separately, Windows populates its root program lazily, so a certificate every
+  browser accepts can still fail `verify-ca` with `UnknownIssuer`, and one installed during a
+  session needs a restart to be seen.
   `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
