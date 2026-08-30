@@ -461,10 +461,20 @@ fn snippet_row(
             // menu was open.
             menus.close_except(Some(crate::widgets::MenuId::Popup));
             overlay.popup_anchor.set(None);
-            overlay.popup_width.set(180.0);
+            // **Measured, not a constant.** `popup_width` is the panel's
+            // `min_width`, so a number picked by eye is a floor the rows cannot
+            // pull back in: 180 sat well wide of "Insert into editor", the
+            // longest entry here, and the menu drew with a band of empty space
+            // down its right edge. It was also the one popup width in the crate
+            // written unscaled, so at 160% the floor stayed 180 while every
+            // label grew past it. `menu_panel_width` is the same prediction the
+            // edge flip decides against — the parts `menu_row` actually draws,
+            // each scaled, with the labels measured in the render font.
+            let entries = row_menu(&menu_snip, &menu_actions, dialect, conn_id);
             overlay
-                .popup_menu
-                .set(Some(row_menu(&menu_snip, &menu_actions, dialect, conn_id)));
+                .popup_width
+                .set(crate::widgets::menu_panel_width(&entries));
+            overlay.popup_menu.set(Some(entries));
         })
         .style(|s| {
             s.width_full()
