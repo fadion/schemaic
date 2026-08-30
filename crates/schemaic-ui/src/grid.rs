@@ -419,6 +419,10 @@ struct GridState {
     /// or a live DB error from the re-run (tab-level). Rendered in the grid's bottom
     /// bar; cleared on any table click (`dismiss_overlays`) or a new run.
     view_err: RwSignal<Option<String>>,
+    /// True while a view re-run is in flight (tab-level) — see
+    /// [`crate::Tab::view_busy`]. Read by the capped notice's read-more offer,
+    /// which is the affordance most able to start a second one by accident.
+    view_busy: RwSignal<bool>,
     /// App-wide formatter-rule store (upserted + persisted on a menu choice).
     fmt_rules: RwSignal<Vec<ColumnFormatRule>>,
     /// Persist the formatter rules (wrapped so `GridState` stays `Copy`).
@@ -622,6 +626,7 @@ impl GridState {
             row_cap_override: gctx.row_cap_override,
             apply_view: RwSignal::new(Some(gctx.apply_view.clone())),
             view_err: gctx.view_err,
+            view_busy: gctx.view_busy,
             fmt_rules: gctx.formats,
             save_formats: RwSignal::new(Some(gctx.save_formats.clone())),
             // Shared with the find bar (rendered up at the RESULTS-panel level).
@@ -2513,6 +2518,9 @@ pub(crate) struct GridCtx {
     /// A filter/sort re-run's DB error (tab-level) — rendered in the grid's bottom
     /// bar so the current table stays put. Cleared on a table click / new run.
     pub(crate) view_err: RwSignal<Option<String>>,
+    /// A view re-run is in flight (tab-level) — see [`crate::Tab::view_busy`].
+    /// The capped notice's read-more offer reads it to stop offering itself twice.
+    pub(crate) view_busy: RwSignal<bool>,
     /// Fresh-load nonce (tab-level): part of the results-view container key so a
     /// `Loaded`→`Loaded` filter/sort re-run rebuilds the grid, while an in-place
     /// commit splice (which doesn't bump it) still skips the rebuild.
@@ -6754,6 +6762,15 @@ fn grid_toolbar(
             // control keeps `commit_hov`), and the click target is the pair, so
             // the dot has to brighten the words with it.
             let offer_hov = RwSignal::new(false);
+            // **The offer takes itself off while it is being answered.** The
+            // re-run leaves this table on screen, so nothing else on the panel
+            // says one is running and the words go on inviting a second click —
+            // which on a large table is a second full read of it, and the label
+            // says "all rows" precisely where that costs the most. The three
+            // things that make it a link (the word, the colour, the click) all
+            // read the one flag the app's run path owns, so they cannot disagree
+            // about whether it is one.
+            let busy = gs.view_busy;
             // A `label`, and for the same reason `stats` beside it is one: the
             // total arrives from a catalogue query after the strip is built, and
             // it is what decides whether the offer is a step ("read 5k rows") or
@@ -6761,25 +6778,48 @@ fn grid_toolbar(
             // million rows for a table with 292 thousand.
             h_stack((
                 text("·").style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
-                label(move || schemaic_core::stats::read_more_offer(nrows, row_total.get()).1)
-                    .style(move |s| {
-                        // Stays blue on hover and steps *away from the surface*
-                        // (`accent_hover`) rather than going white: the accent is
-                        // what says the words are pressable, and a hover that
-                        // trades it for the same colour as ordinary text reads as
-                        // the link switching off at the moment it is aimed at.
-                        let c = if offer_hov.get() {
-                            theme::accent_hover()
-                        } else {
-                            theme::accent()
-                        };
-                        s.color(c).font_size(theme::font_label())
-                    }),
+                label(move || {
+                    if busy.get() {
+                        // The present participle the rest of the app answers with
+                        // while it works ("Committing…" two controls to the
+                        // right), and the same verb the offer itself used.
+                        "reading…".to_string()
+                    } else {
+                        schemaic_core::stats::read_more_offer(nrows, row_total.get()).1
+                    }
+                })
+                .style(move |s| {
+                    // Stays blue on hover and steps *away from the surface*
+                    // (`accent_hover`) rather than going white: the accent is
+                    // what says the words are pressable, and a hover that
+                    // trades it for the same colour as ordinary text reads as
+                    // the link switching off at the moment it is aimed at.
+                    // Which is exactly what it is doing while the re-run is in
+                    // flight, so that is the one state where it does go dim —
+                    // to the colour of the description beside it, which is what
+                    // the words have become.
+                    let c = if busy.get() {
+                        theme::text_dim()
+                    } else if offer_hov.get() {
+                        theme::accent_hover()
+                    } else {
+                        theme::accent()
+                    };
+                    s.color(c).font_size(theme::font_label())
+                }),
             ))
             .style(|s| s.flex_row().items_center().gap(theme::scaled(4.0)))
             .on_event_cont(EventListener::PointerEnter, move |_| offer_hov.set(true))
             .on_event_cont(EventListener::PointerLeave, move |_| offer_hov.set(false))
             .on_click_stop(move |_| {
+                // The guard is on the *action*, not only on the words: dimming
+                // the label is what tells the user, and refusing the click is
+                // what makes it true. A pointer already over the link when the
+                // first re-run started never leaves and re-enters it, so hover
+                // alone would have gone on painting a live control.
+                if busy.get_untracked() {
+                    return;
+                }
                 let Some(sql) = gs.current_statement() else {
                     return;
                 };
