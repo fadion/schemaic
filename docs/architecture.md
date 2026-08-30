@@ -4279,7 +4279,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is aligned to the code column, and the same two closures answer the keyboard: `CmdK::verdict`
     publishes them to the editor's key handler, because in that state there is no field left to catch
     Enter and Escape and the editor is what holds focus. One accept and one reject in the pane, two
-    ways in. **The forward is also on the outer box**, and that is what the "sometimes it swallows
+    ways in.
+    **Which states the editor answers for is `cmdk_editor_keys`, and Escape's are not Enter's.**
+    Enter belongs to `Ready` alone — there is nothing to accept before the suggestion lands — but
+    Escape also takes down a request that is still `Busy`. A request is not always started from the
+    prompt field: *Optimize* and the three ways to ask for an AI fix open the bar already `Busy`
+    from a menu the user clicked, so the editor never gave the keyboard up. Gating the branch on
+    `Ready` therefore left Escape doing nothing for the whole of a running request — it closed the
+    bar while prompting (the field's own `on_escape`) and while previewing a diff, and not in
+    between, which is the state a user most wants out of. `Idle` and `Failed` stay the field's:
+    both have a live, focused, unfrozen field that answers Escape itself, and a branch here would
+    take the key from the completion popup the user can open in the editor underneath.
+    **The forward is also on the outer box**, and that is what the "sometimes it swallows
     the scroll" report was really about: the row is content-height, so the bar's padding, its border
     and the space above and below the words all belong to the box, and a wheel worked across the
     words' own band and died everywhere else. The centring is the same story from the layout side.

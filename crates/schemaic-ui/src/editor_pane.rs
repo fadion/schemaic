@@ -1082,6 +1082,42 @@ pub(crate) fn inline_pane_action(open: bool, settled: bool) -> InlinePaneAction 
     }
 }
 
+/// Which of the Ctrl+K bar's two verdict keys the **editor's own** key handler
+/// answers, given the bar's state.
+pub(crate) struct CmdkEditorKeys {
+    /// Enter approves the suggestion sitting in the editor's lines.
+    pub accept_on_enter: bool,
+    /// Escape takes the bar down — abandoning a suggestion, or abandoning a
+    /// request that has not landed yet.
+    pub reject_on_escape: bool,
+}
+
+/// The editor answers the verdict keys for the states in which the prompt field
+/// **is not the thing holding the keyboard**.
+///
+/// `Ready` is the obvious one: the field is torn down when the suggestion lands,
+/// so Enter and Escape have nowhere else to go and the suggestion is sitting in
+/// the editor's own lines anyway.
+///
+/// `Busy` is the one this used to miss. A request is not always started from the
+/// field — "Optimize", and the error bar's *Fix with AI*, open the bar already
+/// `Busy` from a menu the user clicked, and the editor keeps the keyboard. So
+/// Escape reached this handler, matched no branch, and the only way out of a
+/// running request was the mouse: it closed the bar while prompting (the field
+/// answers Escape) and while previewing a diff (`Ready`, below), and did nothing
+/// in between.
+///
+/// `Idle` and `Failed` are left alone deliberately. Both have a live, focused,
+/// unfrozen field, whose `on_escape` already closes the bar — and a branch here
+/// would take Escape away from the completion popup the user can open by typing
+/// in the editor underneath.
+pub(crate) fn cmdk_editor_keys(open: bool, state: &InlineAiState) -> CmdkEditorKeys {
+    CmdkEditorKeys {
+        accept_on_enter: open && matches!(state, InlineAiState::Ready(_)),
+        reject_on_escape: open && matches!(state, InlineAiState::Ready(_) | InlineAiState::Busy),
+    }
+}
+
 /// An inline SVG wavy line `width` px wide and [`WAVE_H`] tall — a smooth sine
 /// squiggle (quadratic beziers) drawn under a misspelled keyword. A thin (1px)
 /// stroke and gentle amplitude read as a wave rather than a thick band.
@@ -2031,24 +2067,27 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return CommandExecuted::Yes;
             }
         }
-        // Enter accepts / Escape rejects a suggestion drawn in the editor's own
-        // lines. It has to be answered here: in that state the overlay is just the
-        // verdict footer, so there is no field left holding focus to route them,
-        // and the editor is what the suggestion is sitting in. Checked before the
-        // find/goto/completion branches below so a stale popup can't eat the
-        // verdict — and both closures are the footer buttons' own, reached through
+        // Enter accepts / Escape rejects the Ctrl+K bar from the editor. Which
+        // states that covers is `cmdk_editor_keys`', where it is written down and
+        // tested; both closures are the footer buttons' own, reached through
         // `cmdk.verdict`, so there is one accept and one reject in the pane.
-        if cmdk.open.get_untracked()
-            && matches!(inline_ai.get_untracked(), InlineAiState::Ready(_))
-            && let Some((accept, reject)) = cmdk.verdict.get_untracked()
+        // Checked before the find/goto/completion branches below so a stale popup
+        // can't eat the verdict.
         {
-            if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _)) {
-                accept();
-                return CommandExecuted::Yes;
-            }
-            if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
-                reject();
-                return CommandExecuted::Yes;
+            let keys = cmdk_editor_keys(cmdk.open.get_untracked(), &inline_ai.get_untracked());
+            if let Some((accept, reject)) = cmdk.verdict.get_untracked() {
+                if keys.accept_on_enter
+                    && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _))
+                {
+                    accept();
+                    return CommandExecuted::Yes;
+                }
+                if keys.reject_on_escape
+                    && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
+                {
+                    reject();
+                    return CommandExecuted::Yes;
+                }
             }
         }
         // Esc closes the find bar even when focus is back in the editor (its input's
@@ -5376,6 +5415,55 @@ mod inline_pane_tests {
 
         let landed = inline_pane_action(true, true);
         assert!(landed.draw && landed.freeze && landed.focus);
+    }
+
+    /// **The reported bug.** "Optimize" and *Fix with AI* open the bar already
+    /// `Busy` from a menu click, so the editor still holds the keyboard — and the
+    /// editor's Escape branch was gated on `Ready`. Escape closed the bar while
+    /// prompting and while previewing a diff, and did nothing at all in between,
+    /// which is the state a user most wants out of.
+    #[test]
+    fn escape_takes_down_a_request_that_has_not_landed_yet() {
+        let working = cmdk_editor_keys(true, &InlineAiState::Busy);
+        assert!(
+            working.reject_on_escape,
+            "Escape must abandon an in-flight request from the editor"
+        );
+        assert!(
+            !working.accept_on_enter,
+            "there is nothing to accept until the suggestion lands"
+        );
+    }
+
+    /// The counterweight, so the fix above can't be had by answering every key in
+    /// every state: a closed bar is not the editor's business, and the two states
+    /// that keep a live focused field answer their own Escape — taking it here
+    /// would steal the key from the completion popup underneath.
+    #[test]
+    fn the_editor_leaves_a_closed_bar_and_a_live_field_alone() {
+        for state in [
+            InlineAiState::Idle,
+            InlineAiState::Busy,
+            InlineAiState::Ready("SELECT 1".into()),
+            InlineAiState::Failed("nope".into()),
+        ] {
+            let shut = cmdk_editor_keys(false, &state);
+            assert!(!shut.accept_on_enter && !shut.reject_on_escape);
+        }
+        for state in [InlineAiState::Idle, InlineAiState::Failed("nope".into())] {
+            let asking = cmdk_editor_keys(true, &state);
+            assert!(
+                !asking.reject_on_escape && !asking.accept_on_enter,
+                "the prompt field answers its own keys"
+            );
+        }
+    }
+
+    /// The state the branch was written for still works.
+    #[test]
+    fn a_settled_suggestion_answers_both_keys_in_the_editor() {
+        let landed = cmdk_editor_keys(true, &InlineAiState::Ready("SELECT 1".into()));
+        assert!(landed.accept_on_enter && landed.reject_on_escape);
     }
 }
 
