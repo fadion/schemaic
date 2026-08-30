@@ -91,6 +91,7 @@ fn connection(db_type: &str, host: &str, port: u16, tls: Tls) -> Connection {
         user: env("TLS_USER", "schemaic"),
         password: env("TLS_PASSWORD", "schemaic"),
         file: String::new(),
+        database: env("TLS_DATABASE", ""),
         ssh: SshTunnel::default(),
         tls,
         color: None,
@@ -146,15 +147,11 @@ async fn main() {
                     ca_path: ca_path.clone(),
                     ..Tls::default()
                 };
+                // `TLS_DATABASE` reaches this through the connection's own
+                // `database` field, so the ping exercises the same resolution
+                // the app does rather than a shortcut around it.
                 let db = Db::connect(&connection(engine, &host, port, tls), None);
-                // With a database named, one connection to exactly it — no
-                // maintenance probe to fail for reasons that have nothing to do
-                // with the handshake this table is measuring.
-                let outcome = match &database {
-                    Some(name) => db.prepare_check(Some(name), "SELECT 1").await,
-                    None => db.ping(Duration::from_secs(5)).await,
-                };
-                cells.push(match outcome {
+                cells.push(match db.ping(Duration::from_secs(5)).await {
                     Ok(()) => "connected".to_string(),
                     Err(e) => format!("refused ({e})"),
                 });

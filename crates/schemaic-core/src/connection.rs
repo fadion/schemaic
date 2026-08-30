@@ -625,6 +625,21 @@ pub struct Connection {
     /// MySQL to SQLite and back must not discard the host it is going back to.
     #[serde(default)]
     pub file: String,
+    /// The database to connect to, or empty for none — read through
+    /// [`Self::default_database`].
+    ///
+    /// **PostgreSQL cannot connect without one.** That is protocol, not
+    /// preference, and it stayed invisible only because almost every server has
+    /// a `postgres` database anyone may reach, which the driver layer guesses at
+    /// along with the username and `template1`. A hosted provider need not: on
+    /// Aiven only `defaultdb` is permitted, every guess is refused by `pg_hba`,
+    /// and without this field the connection is simply unreachable with nothing
+    /// in the form to correct it.
+    ///
+    /// Optional on MySQL, where it is a convenience — the database a connection
+    /// opens in when nothing else has been selected.
+    #[serde(default)]
+    pub database: String,
     #[serde(default)]
     pub ssh: SshTunnel,
     /// How the transport to the server is secured ([`Tls`]). Defaults to
@@ -707,6 +722,7 @@ impl Connection {
             self.password = String::new();
             self.ssh = SshTunnel::default();
             self.tls = Tls::default();
+            self.database = String::new();
         }
         self
     }
@@ -742,6 +758,24 @@ impl Connection {
     /// driver.
     pub fn uses_tls(&self) -> bool {
         self.tls.mode.negotiates_tls() && !is_sqlite(&self.db_type)
+    }
+
+    /// The database this connection opens in, or `None` for "let the driver
+    /// decide" — the maintenance probe on PostgreSQL, no database on MySQL.
+    ///
+    /// **Asked through the engine, like [`Self::uses_tunnel`] and
+    /// [`Self::uses_tls`].** SQLite's file *is* its database, and the picker is
+    /// editable in place, so a connection switched over from PostgreSQL keeps a
+    /// name with no control anywhere that could unset it. Blank-but-present is
+    /// treated as absent for the same reason a whitespace host would be: it is a
+    /// typo, and offering it to the driver turns a correctable mistake into a
+    /// refusal naming a database with no name.
+    pub fn default_database(&self) -> Option<&str> {
+        if is_sqlite(&self.db_type) {
+            return None;
+        }
+        let name = self.database.trim();
+        (!name.is_empty()).then_some(name)
     }
 
     /// How this connection's handshake should be performed, or `None` for
@@ -1177,6 +1211,7 @@ mod tests {
             user: "root".to_string(),
             password: "secret".to_string(),
             file: String::new(),
+            database: String::new(),
             ssh: SshTunnel::default(),
             tls: Tls::default(),
             color: None,
@@ -1272,6 +1307,7 @@ mod tests {
             user: "root".to_string(),
             password: "secret".to_string(),
             file: String::new(),
+            database: String::new(),
             ssh: SshTunnel::default(),
             tls: Tls::default(),
             color: None,
@@ -1784,6 +1820,7 @@ mod tls_tests {
             user: "root".to_string(),
             password: "secret".to_string(),
             file: String::new(),
+            database: String::new(),
             ssh: SshTunnel::default(),
             tls: Tls::default(),
             color: None,
@@ -2065,6 +2102,60 @@ mod tls_tests {
 
         c.db_type = "SQLite".into();
         assert!(c.tls_plan().is_none());
+    }
+
+    /// A connection saved before the field existed has no default database, and
+    /// must keep behaving exactly as it did — which for PostgreSQL means the
+    /// maintenance probe, and for MySQL means connecting with no database.
+    #[test]
+    fn a_connection_saved_before_the_database_field_has_none() {
+        let json = r#"{
+            "id": 7,
+            "name": "legacy",
+            "host": "127.0.0.1",
+            "port": 5432,
+            "user": "app",
+            "password": ""
+        }"#;
+        let c: Connection = serde_json::from_str(json).unwrap();
+        assert_eq!(c.database, "");
+        assert_eq!(c.default_database(), None);
+    }
+
+    /// Postgres cannot connect without naming a database, and most servers have
+    /// a `postgres` one to fall back on. A hosted provider need not: Aiven's
+    /// `pg_hba` permits only `defaultdb`, so every guess is rejected and the
+    /// connection is unreachable with no field to correct it.
+    #[test]
+    fn a_named_database_is_offered_to_the_driver() {
+        let mut c = conn();
+        c.db_type = "PostgreSQL".into();
+        c.database = "defaultdb".into();
+        assert_eq!(c.default_database(), Some("defaultdb"));
+
+        // Whitespace is a typo, not a database.
+        c.database = "   ".into();
+        assert_eq!(c.default_database(), None);
+    }
+
+    /// SQLite's file **is** the database, so there is nothing to name — and the
+    /// engine picker is editable in place, so a connection switched over from
+    /// Postgres would otherwise carry a database no control can unset. The same
+    /// trap `sanitized` already closes for the host and the TLS block.
+    #[test]
+    fn a_sqlite_connection_names_no_database() {
+        let mut c = conn();
+        c.db_type = "SQLite".into();
+        c.database = "defaultdb".into();
+        assert_eq!(c.default_database(), None);
+        assert_eq!(c.sanitized().database, "");
+    }
+
+    #[test]
+    fn a_duplicate_carries_the_database() {
+        let mut c = conn();
+        c.database = "defaultdb".into();
+        assert_eq!(c.duplicate(9, "copy".into(), None).database, "defaultdb");
     }
 
     /// A **tripwire**, not a behaviour test. `Tls` grows fields, and every one of

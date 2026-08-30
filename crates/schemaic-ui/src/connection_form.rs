@@ -1083,8 +1083,22 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     )
     .style(|s| s.width_full());
 
+    // Between the coordinates and the credentials, where libpq's own field order
+    // puts it and where every other client shows it. 65: the gap the surrounding
+    // indices were spaced out to leave.
+    let database_field = v_stack((
+        field("Database", draft.database, ring.clone(), 65).style(|s| s.width(conn_field_w())),
+        form_hint(
+            "Optional, and the database the connection opens in. Some hosted \
+             providers allow only their own — Aiven's is `defaultdb` — and refuse \
+             a connection that does not name it.",
+        ),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+
     v_stack((
         host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
+        database_field,
         field("User", draft.user, ring.clone(), 70).style(|s| s.width(conn_field_w())),
         masked_field("Password", draft.password, ring.clone(), 80)
             .style(|s| s.width(conn_field_w())),
@@ -1192,8 +1206,10 @@ fn conn_form(
         draft.tls_client_key_passphrase.track();
         // The SQLite target is a connection parameter like any other: pointing at
         // a different file invalidates a Test result exactly as a different host
-        // does.
+        // does. So is the database: on PostgreSQL it decides whether the connect
+        // is permitted at all.
         draft.file.track();
+        draft.database.track();
         conn_test.set(crate::TestState::Idle);
     });
 

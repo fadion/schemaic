@@ -192,8 +192,15 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
     let tls = v
         .get("tls")
         .and_then(|t| serde_json::from_value(t.clone()).ok());
+    // The connection's own database, distinct from `database` below — that one
+    // is the *selected* database for this session, this one is where the
+    // connection opens when nothing is selected. Absent means the driver
+    // guesses, which is what every blob written before the field meant.
+    let conn_database = v.get("connection_database").and_then(|x| x.as_str());
     McpEndpoint {
-        db: Db::from_parts(engine, host, port, user, pass, file).with_tls(tls),
+        db: Db::from_parts(engine, host, port, user, pass, file)
+            .with_tls(tls)
+            .with_database(conn_database),
         database,
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
@@ -233,7 +240,8 @@ fn endpoint_json(
     serde_json::json!({
         "host": host, "port": port, "user": user, "pass": pass, "file": file,
         "database": database, "engine": db.engine().as_str(), "samples": samples,
-        "schema": schema, "hidden": hidden, "tls": db.tls_plan()
+        "schema": schema, "hidden": hidden, "tls": db.tls_plan(),
+        "connection_database": db.database()
     })
     .to_string()
 }
@@ -1682,6 +1690,36 @@ mod tests {
         // No key → plaintext, not a default that starts verifying.
         let older = endpoint_from_value(&serde_json::json!({ "host": "h" }));
         assert!(older.db.tls_plan().is_none());
+    }
+
+    /// The subprocess has to open where the connection opens. A provider that
+    /// permits only its own database refuses every guess, so a dropped default
+    /// leaves the assistant unable to reach a server the app is connected to.
+    #[test]
+    fn the_endpoint_handoff_carries_the_connection_database() {
+        let db = Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "host".into(),
+            5432,
+            "user".into(),
+            "pw".into(),
+            String::new(),
+        )
+        .with_database(Some("defaultdb"));
+
+        let json = endpoint_json(&db, Some("shop"), true, true, &HashSet::new());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed = endpoint_from_value(&v);
+        assert_eq!(parsed.db.database(), Some("defaultdb"));
+        assert_eq!(
+            parsed.database.as_deref(),
+            Some("shop"),
+            "the selected database is a different thing and must not be overwritten"
+        );
+
+        // A blob written before the field: the driver guesses, as it did.
+        let older = endpoint_from_value(&serde_json::json!({ "host": "h" }));
+        assert_eq!(older.db.database(), None);
     }
 
     #[test]

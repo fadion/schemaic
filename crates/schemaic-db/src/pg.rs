@@ -165,13 +165,41 @@ pub(crate) async fn cancel_query(db: &Db, token: &tokio_postgres::CancelToken) {
 /// always-present candidates in turn so it works whether or not `postgres` exists.
 pub(crate) async fn connect_maintenance(db: &Db) -> Result<Client, DbError> {
     let mut last: Option<DbError> = None;
-    for cand in ["postgres", db.user.as_str(), "template1"] {
+    for cand in maintenance_candidates(db.database(), &db.user) {
         match connect_to(db, cand).await {
             Ok(c) => return Ok(c),
             Err(e) => last = Some(e),
         }
     }
     Err(last.unwrap_or_else(|| DbError::Connect("no maintenance database reachable".to_string())))
+}
+
+/// Which databases to try, in order, for server-level work.
+///
+/// **A configured database is not one guess among four — it is the answer, and
+/// the rest are what to do without one.** Postgres cannot connect without naming
+/// a database, which stayed invisible while almost every server had a `postgres`
+/// one anybody could reach; a hosted provider need not. On Aiven only
+/// `defaultdb` is permitted, so all three guesses are refused by `pg_hba` and
+/// the server is unreachable — the whole reason
+/// [`Connection::database`](schemaic_core::connection::Connection::database)
+/// exists.
+///
+/// It is still only *first* rather than only: a database that has since been
+/// dropped should degrade to the old behaviour rather than lock the user out of
+/// the server, and the guesses cost nothing when the first attempt succeeds.
+///
+/// Split out from the connect loop so the order is a decision with a test on it
+/// rather than a literal in the middle of an I/O function.
+fn maintenance_candidates<'a>(configured: Option<&'a str>, user: &'a str) -> Vec<&'a str> {
+    let mut out = Vec::with_capacity(4);
+    out.extend(configured);
+    for fallback in ["postgres", user, "template1"] {
+        if !fallback.is_empty() && !out.contains(&fallback) {
+            out.push(fallback);
+        }
+    }
+    out
 }
 
 /// Lightweight reachability check bounded by `timeout`.
@@ -3015,6 +3043,45 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             self.1.as_deref().map(|l| l as &dyn std::error::Error)
         }
+    }
+
+    /// The configured database goes first, because on a provider that permits
+    /// only its own it is the sole one that can work — and it is not the only
+    /// candidate, because one that has since been dropped must degrade to the
+    /// old guesses rather than lock the user out of the server entirely.
+    #[test]
+    fn a_configured_database_is_tried_before_the_guesses() {
+        assert_eq!(
+            maintenance_candidates(Some("defaultdb"), "avnadmin"),
+            ["defaultdb", "postgres", "avnadmin", "template1"]
+        );
+    }
+
+    /// Without one, exactly the order that shipped before the field existed.
+    #[test]
+    fn no_configured_database_leaves_the_old_order_alone() {
+        assert_eq!(
+            maintenance_candidates(None, "app"),
+            ["postgres", "app", "template1"]
+        );
+    }
+
+    /// A wasted round trip against a server that is already refusing us is a
+    /// real cost: the probe is bounded as a whole, so a duplicate can be the
+    /// attempt that pushes the last real candidate past the deadline.
+    #[test]
+    fn a_candidate_is_never_tried_twice() {
+        assert_eq!(
+            maintenance_candidates(Some("postgres"), "postgres"),
+            ["postgres", "template1"]
+        );
+    }
+
+    /// An empty username is not a database to try. It reached the loop as `""`
+    /// before, which spends a round trip to be told so.
+    #[test]
+    fn an_empty_username_is_not_a_candidate() {
+        assert_eq!(maintenance_candidates(None, ""), ["postgres", "template1"]);
     }
 
     /// The reason a TLS handshake failed lives only in `source()`, so a message
