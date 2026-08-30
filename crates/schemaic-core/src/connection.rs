@@ -491,9 +491,9 @@ impl SslMode {
 pub struct Tls {
     #[serde(default)]
     pub mode: SslMode,
-    /// PEM file of CA certificates to trust. Empty means the system roots, which
-    /// is what a hosted provider with a publicly-signed certificate needs — see
-    /// [`Self::ca_file`].
+    /// PEM file of CA certificates to trust. Empty means the bundled public
+    /// roots, which is what a hosted provider with a publicly-signed certificate
+    /// needs — see [`Self::ca_file`].
     #[serde(default)]
     pub ca_path: String,
     /// Client certificate offered to the server (mutual TLS), PEM.
@@ -582,7 +582,9 @@ pub struct TlsPlan {
     pub accept_invalid_certs: bool,
     /// Accept a certificate that does not name the host we asked for.
     pub skip_hostname_check: bool,
-    /// PEM file of roots to trust; `None` means the platform's own root set.
+    /// PEM file of roots to trust; `None` means the bundled public root set —
+    /// **not** the operating system's certificate store, so a CA trusted
+    /// machine-wide still has to be named by path.
     pub root_ca: Option<String>,
     /// `(certificate, key)` paths to offer as this client's identity.
     pub client_identity: Option<(String, String)>,
@@ -1949,9 +1951,10 @@ mod tls_tests {
     }
 
     /// An empty CA path under a verifying mode is not "verify nothing" — it is
-    /// "verify against the system roots", which is what a hosted provider with a
-    /// public certificate needs. Reading it as a missing file instead would make
-    /// `verify-full` unusable against exactly the servers it exists for.
+    /// "verify against the bundled public roots", which is what a hosted provider
+    /// with a publicly-signed certificate needs. Reading it as a missing file
+    /// instead would make `verify-full` unusable against exactly the servers it
+    /// exists for.
     #[test]
     fn the_ca_file_is_only_consulted_by_a_verifying_mode() {
         let mut t = Tls {
@@ -1965,7 +1968,7 @@ mod tls_tests {
         assert_eq!(t.ca_file(), Some("/etc/ca.crt"));
 
         t.ca_path = String::new();
-        assert_eq!(t.ca_file(), None, "empty means the system roots");
+        assert_eq!(t.ca_file(), None, "empty means the bundled public roots");
     }
 
     /// The plan is what every driver is actually configured from, so this is the

@@ -148,11 +148,21 @@ fn client_config(plan: &TlsPlan) -> Result<ClientConfig, DbError> {
     }
 }
 
-/// The roots to trust: the named PEM file, or the platform's own set.
+/// The roots to trust: the named PEM file, or the **bundled** public set.
 ///
 /// An empty `root_ca` is not "trust nothing" — it is a hosted server whose
 /// certificate is already publicly signed, which is the common case the file
 /// exists to *narrow*.
+///
+/// Those roots are `webpki-roots` — Mozilla's set, compiled in — and **not the
+/// operating system's certificate store**. Worth stating because the difference
+/// is invisible until it isn't: a company CA installed machine-wide, or the one
+/// a TLS-inspecting proxy injects, is trusted by every browser on the box and
+/// not by this. Such a connection has to name the CA file by path. The choice is
+/// deliberate for now — one trust set on both engines and all three platforms,
+/// with nothing that varies by how the machine was provisioned — and the same
+/// set `mysql_async` uses internally, so the two engines cannot disagree about
+/// which public CAs exist.
 fn root_store(ca_path: Option<&str>) -> Result<RootCertStore, DbError> {
     let mut store = RootCertStore::empty();
     let Some(path) = ca_path else {
@@ -424,7 +434,7 @@ mod tests {
         );
     }
 
-    /// The empty CA path means the platform roots, and it has to actually
+    /// The empty CA path means the bundled public roots, and it has to actually
     /// produce a usable store — an empty `RootCertStore` would fail every
     /// handshake against a correctly-configured hosted server.
     #[test]
