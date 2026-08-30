@@ -3283,8 +3283,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     underneath. What it shows below the picker comes from the mode's **capabilities**, never the
     variant: the CA path appears when `verifies_certificate`, the client identity when
     `negotiates_tls`, so a sixth level would not need this view found and edited. An *empty* CA
-    path under a verifying mode means the system roots — the hint says so, because a blank
-    required-looking field reads as unfinished — and every TLS signal joins host/port/user/password
+    path under a verifying mode means the **bundled** public roots (`webpki-roots`, not the OS
+    certificate store — see `db/tls.rs`), and the hint says both halves: that a blank field is
+    meaningful rather than unfinished, and that a company CA trusted machine-wide still has to be
+    named by path. Every TLS signal joins host/port/user/password
     in the effect that **invalidates a prior Test result**, since raising the mode or naming the
     wrong CA turns a working endpoint into a refused one and a green Test left standing over that
     is the most misleading state the indicator has. `path_field` is the shared path+Browse control
