@@ -9761,6 +9761,7 @@ mod app_tests {
             user: "root".to_string(),
             password: "s3cr3t".to_string(),
             file: String::new(),
+            database: String::new(),
             ssh: Default::default(),
             tls: Default::default(),
             color: None,

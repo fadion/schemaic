@@ -283,6 +283,11 @@ pub struct Db {
     /// engine has no server. Empty for every other engine, where the coordinates
     /// above are the target instead. See [`sqlite`].
     pub(crate) file: String,
+    /// The database this endpoint opens in when no other is named, empty for
+    /// none — already resolved through
+    /// [`schemaic_core::connection::Connection::default_database`], so no driver
+    /// here re-asks the engine whether one applies.
+    pub(crate) database: String,
     /// How this endpoint's transport is secured, or `None` for plaintext —
     /// already resolved from the saved connection by
     /// [`schemaic_core::connection::Connection::tls_plan`], so no driver here
@@ -306,6 +311,9 @@ impl Db {
         // Asked once, through the connection rather than the mode: a SQLite file
         // plans no handshake however the picker left the TLS block.
         let tls = conn.tls_plan();
+        // Asked through the connection, so a name left behind by an engine
+        // switch never reaches a driver that has no databases to open.
+        let database = conn.default_database().unwrap_or_default().to_string();
         match tunnel_port.filter(|_| engine.is_networked()) {
             // **The certificate is still the far end's.** Rewriting the endpoint
             // to `127.0.0.1` would have `verify-full` compare a perfectly good
@@ -319,6 +327,7 @@ impl Db {
                 user: conn.user.clone(),
                 pass: conn.password.clone(),
                 file,
+                database,
                 tls: tls.map(|p| schemaic_core::connection::TlsPlan {
                     hostname_override: Some(conn.host.clone()),
                     ..p
@@ -331,6 +340,7 @@ impl Db {
                 user: conn.user.clone(),
                 pass: conn.password.clone(),
                 file,
+                database,
                 tls,
             },
         }
@@ -358,8 +368,26 @@ impl Db {
             user,
             pass,
             file,
+            database: String::new(),
             tls: None,
         }
+    }
+
+    /// The database this handle opens in when none is named, or `None`.
+    pub fn database(&self) -> Option<&str> {
+        (!self.database.is_empty()).then_some(self.database.as_str())
+    }
+
+    /// Attach a default database to a handle built by [`Self::from_parts`] —
+    /// the endpoint handoff's half of [`Self::database`], for the same reason
+    /// [`Self::with_tls`] exists.
+    ///
+    /// Without it the MCP subprocess falls back to guessing, which on a provider
+    /// that permits only its own database means the assistant cannot reach a
+    /// server the app itself is connected to.
+    pub fn with_database(mut self, database: Option<&str>) -> Db {
+        self.database = database.unwrap_or_default().to_string();
+        self
     }
 
     /// Attach a resolved TLS plan to a handle built by [`Self::from_parts`].
@@ -420,7 +448,11 @@ impl Db {
             .pass(Some(self.pass.clone()))
             .client_found_rows(found_rows)
             .ssl_opts(tls.map(tls::mysql_ssl_opts));
-        if let Some(db) = database {
+        // The connection's own database is a *fallback*, never an override: an
+        // operation that named one is working in it, and quietly redirecting
+        // that to the connection default would run a statement somewhere the
+        // caller did not ask for.
+        if let Some(db) = database.or_else(|| self.database()) {
             b = b.db_name(Some(db));
         }
         b
@@ -4956,6 +4988,7 @@ mod tests {
             user: "u".to_string(),
             password: "p".to_string(),
             file: String::new(),
+            database: String::new(),
             ssh: Default::default(),
             tls: Default::default(),
             color: None,
@@ -4988,6 +5021,7 @@ mod tests {
             user: String::new(),
             password: String::new(),
             file: "/data/app.db".to_string(),
+            database: String::new(),
             ssh: Default::default(),
             tls: Default::default(),
             color: None,

@@ -1282,6 +1282,7 @@ mod tests {
             user: "u".to_string(),
             password: String::new(),
             file: String::new(),
+            database: "defaultdb".to_string(),
             ssh: crate::connection::SshTunnel {
                 auth: SshAuth::Agent,
                 ..Default::default()

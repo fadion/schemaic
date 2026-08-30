@@ -330,6 +330,7 @@ mod tests {
             user: "u".to_string(),
             password: String::new(),
             file: String::new(),
+            database: String::new(),
             ssh: SshTunnel::default(),
             tls: crate::connection::Tls::default(),
             color: None,
