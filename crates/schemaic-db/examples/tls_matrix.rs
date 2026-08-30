@@ -22,6 +22,15 @@
 //! | `TLS_WRONG_CA` | `TLS_CA` with `ca.crt` → `otherca.crt`; `os` likewise |
 //! | `TLS_USER` / `TLS_PASSWORD` | `schemaic` / `schemaic` |
 //! | `TLS_MYSQL_PORT` / `TLS_PG_PORT` | `3306` / `5432` (`0` skips the engine) |
+//! | `TLS_DATABASE` | unset — probe for a maintenance database |
+//!
+//! **Set `TLS_DATABASE` against a hosted provider.** Without it the check is a
+//! ping, and a Postgres ping has to reach *some* database, so it tries
+//! `postgres`, the username and `template1` in turn. A provider that permits
+//! only its own default (Aiven's `defaultdb`) rejects all three at `pg_hba`,
+//! which fills every cell with an authorisation error and hides the handshake
+//! result the table is for — after three round trips each, on a link where
+//! three may not fit in the ping budget.
 //!
 //! **`os` is spelled out rather than written as an empty value** because an
 //! empty environment variable cannot be set from PowerShell at all — `$env:X =
@@ -110,8 +119,14 @@ async fn main() {
     let ca = ca_setting("TLS_CA", "/etc/schemaic-tls/ca.crt");
     let wrong_ca = ca_setting("TLS_WRONG_CA", &ca.replace("ca.crt", "otherca.crt"));
 
+    let database = std::env::var("TLS_DATABASE").ok().filter(|d| !d.is_empty());
+
     println!("A = {}", ca_label(&ca));
     println!("B = {}", ca_label(&wrong_ca));
+    match &database {
+        Some(d) => println!("database = {d}"),
+        None => println!("database = (probing for a maintenance database)"),
+    }
 
     for (engine, port) in [
         ("MySQL", port("TLS_MYSQL_PORT", 3306)),
@@ -132,7 +147,14 @@ async fn main() {
                     ..Tls::default()
                 };
                 let db = Db::connect(&connection(engine, &host, port, tls), None);
-                cells.push(match db.ping(Duration::from_secs(5)).await {
+                // With a database named, one connection to exactly it — no
+                // maintenance probe to fail for reasons that have nothing to do
+                // with the handshake this table is measuring.
+                let outcome = match &database {
+                    Some(name) => db.prepare_check(Some(name), "SELECT 1").await,
+                    None => db.ping(Duration::from_secs(5)).await,
+                };
+                cells.push(match outcome {
                     Ok(()) => "connected".to_string(),
                     Err(e) => format!("refused ({e})"),
                 });
