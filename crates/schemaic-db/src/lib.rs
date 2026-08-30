@@ -15,6 +15,7 @@ pub mod pg;
 pub mod session;
 pub mod sqlite;
 pub mod ssh;
+mod tls;
 
 pub use session::{Outcome, Session};
 
@@ -282,6 +283,11 @@ pub struct Db {
     /// engine has no server. Empty for every other engine, where the coordinates
     /// above are the target instead. See [`sqlite`].
     pub(crate) file: String,
+    /// How this endpoint's transport is secured, or `None` for plaintext —
+    /// already resolved from the saved connection by
+    /// [`schemaic_core::connection::Connection::tls_plan`], so no driver here
+    /// re-reads a mode. See [`tls`].
+    pub(crate) tls: Option<schemaic_core::connection::TlsPlan>,
 }
 
 impl Db {
@@ -297,7 +303,15 @@ impl Db {
         // (`Engine::is_networked`), but the rewrite is ignored here as well, so a
         // caller that does can't repoint the file.
         let file = conn.file.clone();
+        // Asked once, through the connection rather than the mode: a SQLite file
+        // plans no handshake however the picker left the TLS block.
+        let tls = conn.tls_plan();
         match tunnel_port.filter(|_| engine.is_networked()) {
+            // **The certificate is still the far end's.** Rewriting the endpoint
+            // to `127.0.0.1` would have `verify-full` compare a perfectly good
+            // certificate against the loopback address and reject it, so the
+            // name to check is carried over in the same step that moves the
+            // address — the two must not be able to drift apart.
             Some(port) => Db {
                 engine,
                 host: "127.0.0.1".to_string(),
@@ -305,6 +319,10 @@ impl Db {
                 user: conn.user.clone(),
                 pass: conn.password.clone(),
                 file,
+                tls: tls.map(|p| schemaic_core::connection::TlsPlan {
+                    hostname_override: Some(conn.host.clone()),
+                    ..p
+                }),
             },
             None => Db {
                 engine,
@@ -313,6 +331,7 @@ impl Db {
                 user: conn.user.clone(),
                 pass: conn.password.clone(),
                 file,
+                tls,
             },
         }
     }
@@ -339,7 +358,26 @@ impl Db {
             user,
             pass,
             file,
+            tls: None,
         }
+    }
+
+    /// Attach a resolved TLS plan to a handle built by [`Self::from_parts`].
+    ///
+    /// Separate from `from_parts` because the endpoint handoff is a *string*
+    /// channel (environment variables, for the MCP subprocess) while a plan is a
+    /// structure: the caller rebuilds it on the far side and hangs it on here.
+    /// Without it the subprocess would connect in plaintext to a server the user
+    /// configured for TLS — the same query, quietly less protected, which is the
+    /// one outcome this setting must never produce silently.
+    pub fn with_tls(mut self, plan: Option<schemaic_core::connection::TlsPlan>) -> Db {
+        self.tls = plan;
+        self
+    }
+
+    /// The TLS plan this handle connects with, if any — for the endpoint handoff.
+    pub fn tls_plan(&self) -> Option<&schemaic_core::connection::TlsPlan> {
+        self.tls.as_ref()
     }
 
     /// Borrow the endpoint parts `(host, port, user, pass, file)` — used to
@@ -363,12 +401,25 @@ impl Db {
     /// `CLIENT_FOUND_ROWS` (so `affected_rows()` counts *matched* rows, not
     /// *changed* ones — the commit path's exactly-one-row guard relies on it).
     fn opts(&self, database: Option<&str>, found_rows: bool) -> OptsBuilder {
+        self.opts_with_tls(database, found_rows, self.tls.as_ref())
+    }
+
+    /// [`Self::opts`] with the TLS plan named explicitly, so the `prefer`
+    /// fallback can build the *same* options minus the handshake rather than a
+    /// second, subtly different set.
+    fn opts_with_tls(
+        &self,
+        database: Option<&str>,
+        found_rows: bool,
+        tls: Option<&schemaic_core::connection::TlsPlan>,
+    ) -> OptsBuilder {
         let mut b = OptsBuilder::default()
             .ip_or_hostname(self.host.clone())
             .tcp_port(self.port)
             .user(Some(self.user.clone()))
             .pass(Some(self.pass.clone()))
-            .client_found_rows(found_rows);
+            .client_found_rows(found_rows)
+            .ssl_opts(tls.map(tls::mysql_ssl_opts));
         if let Some(db) = database {
             b = b.db_name(Some(db));
         }
@@ -376,14 +427,37 @@ impl Db {
     }
 
     /// Open one connection to this endpoint (optionally scoped to a database).
+    ///
+    /// **`prefer` retries in plaintext, and nothing else does.** A server with no
+    /// TLS fails the handshake rather than declining it, so "encrypt if you can"
+    /// can only be implemented as a second attempt — and offering that second
+    /// attempt to `require` would turn the strongest half of this setting into
+    /// the weakest while still reporting success.
     pub(crate) async fn open(
         &self,
         database: Option<&str>,
         found_rows: bool,
     ) -> Result<Conn, DbError> {
-        Conn::new(self.opts(database, found_rows))
-            .await
-            .map_err(|e| DbError::Connect(e.to_string()))
+        // Before the driver gets a chance to report a mistyped path as an
+        // anonymous I/O error. Skipped when the plan may fall back anyway, since
+        // `prefer` names no files.
+        if let Some(plan) = self.tls.as_ref() {
+            tls::preflight(plan)?;
+        }
+        let first = Conn::new(self.opts(database, found_rows)).await;
+        match first {
+            Ok(conn) => Ok(conn),
+            Err(e) => {
+                if !self.tls.as_ref().is_some_and(|p| p.fallback_to_plaintext) {
+                    return Err(DbError::Connect(e.to_string()));
+                }
+                // The plaintext error is the one worth reporting: having chosen
+                // to fall back, the user's problem is whatever plaintext hit.
+                Conn::new(self.opts_with_tls(database, found_rows, None))
+                    .await
+                    .map_err(|e| DbError::Connect(e.to_string()))
+            }
+        }
     }
 
     /// Best-effort server-side cancel: connect afresh and `KILL QUERY <id>`.

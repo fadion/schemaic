@@ -373,12 +373,15 @@ impl Session {
             }
             Backend::Postgres { client } => {
                 let token = client.cancel_token();
-                let db = self.database.as_deref().unwrap_or("");
+                let database = self.database.as_deref().unwrap_or("");
                 let mut dest = crate::RowDest::Capped(row_cap);
                 tokio::select! {
-                    r = pg::run_statement(client, db, sql, &mut dest, &cancel) => r,
+                    r = pg::run_statement(&self.db, client, database, sql, &mut dest, &cancel) => r,
+                    // Over this session's own transport: a cancel that opened a
+                    // plaintext connection would be refused by the very servers
+                    // the TLS setting exists for, and the failure is discarded.
                     _ = cancel.cancelled() => {
-                        let _ = token.cancel_query(NoTls).await;
+                        pg::cancel_query(&self.db, &token).await;
                         Err(DbError::Cancelled)
                     }
                 }

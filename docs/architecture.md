@@ -3067,6 +3067,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   everything".
   SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
+  **`tls.rs` translates a connection's TLS settings into the two networked drivers**, and only
+  translates: the decisions were already made by `core::connection::Tls::plan`, which collapses the
+  five libpq `sslmode` levels into the four booleans a handshake is actually made of. The drivers
+  spell those very differently — `mysql_async` takes two `danger_*` toggles on an `SslOpts`, while
+  `tokio_postgres` takes an `SslMode` for the negotiation and leaves every verification question to
+  the rustls `ClientConfig` behind it — and deriving each from the five modes separately is how
+  `verify-ca` comes to mean one thing on MySQL and another on PostgreSQL. Three things here are
+  load-bearing. **The verifier ladder**: rustls checks the chain and the host name in one call, so
+  `verify-ca` cannot be *configured*, only wrapped — `NameAgnosticVerifier` is the real webpki
+  verifier forgiving exactly `CertificateError::NotValidForName`, because a wrapper that accepted
+  everything on any error would turn `verify-ca` into `require` wearing a stronger label, silently
+  admitting expired and unknown-CA certificates. **The tunnel's name**: `Db::connect` rewrites the
+  endpoint to `127.0.0.1:<local port>`, which would have `verify-full` compare a perfectly good
+  certificate against the loopback address, so the name to check is carried over in the same step
+  that moves the address (`TlsPlan::hostname_override` → `FixedNameVerifier`, and MySQL's
+  `with_danger_tls_hostname_override`) — substituting the name rather than skipping the check,
+  which would make `verify-full` mean `verify-ca` for every tunnelled connection. **The `prefer`
+  retry**: a server without TLS fails the handshake rather than declining it, so "encrypt if you
+  can" exists only as a second attempt in `Db::open`, and offering that second attempt to anything
+  above `Prefer` would let the strongest half of the setting report success in plaintext.
+  PostgreSQL needs no such retry — its driver negotiates the downgrade itself — which is why the
+  mapping is `pg_ssl_mode`, not a shared retry. Cancellation goes through `pg::cancel_query` rather
+  than a bare `NoTls`: cancelling opens a *second* connection, and a plaintext one is refused by
+  exactly the servers this setting exists for, with the failure discarded.
   `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its

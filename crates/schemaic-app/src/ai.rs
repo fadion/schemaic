@@ -186,8 +186,14 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         .and_then(|x| x.as_str())
         .unwrap_or_default()
         .to_string();
+    // How the subprocess must secure its own connections. Absent — every blob
+    // written before TLS existed — means plaintext, which is what those
+    // connections were; a default that started verifying would fail them all.
+    let tls = v
+        .get("tls")
+        .and_then(|t| serde_json::from_value(t.clone()).ok());
     McpEndpoint {
-        db: Db::from_parts(engine, host, port, user, pass, file),
+        db: Db::from_parts(engine, host, port, user, pass, file).with_tls(tls),
         database,
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
@@ -227,7 +233,7 @@ fn endpoint_json(
     serde_json::json!({
         "host": host, "port": port, "user": user, "pass": pass, "file": file,
         "database": database, "engine": db.engine().as_str(), "samples": samples,
-        "schema": schema, "hidden": hidden
+        "schema": schema, "hidden": hidden, "tls": db.tls_plan()
     })
     .to_string()
 }
@@ -1640,6 +1646,42 @@ mod tests {
         assert_eq!(parsed.db.parts(), ("host", 3306, "user", "pw", ""));
         assert_eq!(parsed.db.engine(), schemaic_db::Engine::Postgres);
         assert_eq!(parsed.database.as_deref(), Some("db1"));
+    }
+
+    /// **The subprocess must reach the server the same way the app does.** The
+    /// MCP tools run the user's own queries against the user's own connection,
+    /// so a handoff that dropped the TLS plan would answer them over plaintext —
+    /// the same rows, quietly less protected, and nothing in the UI would say
+    /// so. A blob written before the key existed still means plaintext, which is
+    /// what every such connection was.
+    #[test]
+    fn the_endpoint_handoff_carries_the_tls_plan() {
+        let plan = schemaic_core::connection::Tls {
+            mode: schemaic_core::connection::SslMode::VerifyFull,
+            ca_path: "/etc/ca.crt".into(),
+            ..Default::default()
+        }
+        .plan();
+        assert!(plan.is_some(), "verify-full plans a handshake");
+
+        let db = Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "host".into(),
+            5432,
+            "user".into(),
+            "pw".into(),
+            String::new(),
+        )
+        .with_tls(plan.clone());
+
+        let json = endpoint_json(&db, Some("db1"), true, true, &HashSet::new());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed = endpoint_from_value(&v);
+        assert_eq!(parsed.db.tls_plan(), plan.as_ref());
+
+        // No key → plaintext, not a default that starts verifying.
+        let older = endpoint_from_value(&serde_json::json!({ "host": "h" }));
+        assert!(older.db.tls_plan().is_none());
     }
 
     #[test]
