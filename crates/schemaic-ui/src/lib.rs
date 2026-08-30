@@ -102,7 +102,7 @@ use floem::views::{
     Decorators, Delay, LabelClass, TextInputClass, TooltipClass, TooltipContainerClass,
 };
 use floem::window::WindowId;
-use schemaic_core::connection::{AiData, ConnStatus, Connection, Environment, SshAuth};
+use schemaic_core::connection::{AiData, ConnStatus, Connection, Environment, SshAuth, SslMode};
 use schemaic_core::db_color::{DbColorRule, TableColorRule};
 use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::format::ColumnFormatRule;
@@ -1646,6 +1646,14 @@ pub struct DraftSignals {
     pub ssh_auth: RwSignal<SshAuth>,
     pub ssh_key_path: RwSignal<String>,
     pub ssh_key_passphrase: RwSignal<String>,
+    /// How the transport is secured, and the files that mode needs. Independent
+    /// of the SSH block above: a tunnelled connection may still want the server
+    /// to prove who it is at the far end.
+    pub tls_mode: RwSignal<SslMode>,
+    pub tls_ca_path: RwSignal<String>,
+    pub tls_client_cert_path: RwSignal<String>,
+    pub tls_client_key_path: RwSignal<String>,
+    pub tls_client_key_passphrase: RwSignal<String>,
     /// Chosen identity colour (a `#rrggbb` hex), or `None` for no colour.
     pub color: RwSignal<Option<String>>,
     /// Draw the identity colour as a prominent editor frame (off by default).
@@ -1680,6 +1688,11 @@ impl DraftSignals {
             ssh_auth: cx.create_rw_signal(SshAuth::Password),
             ssh_key_path: cx.create_rw_signal(String::new()),
             ssh_key_passphrase: cx.create_rw_signal(String::new()),
+            tls_mode: cx.create_rw_signal(SslMode::default()),
+            tls_ca_path: cx.create_rw_signal(String::new()),
+            tls_client_cert_path: cx.create_rw_signal(String::new()),
+            tls_client_key_path: cx.create_rw_signal(String::new()),
+            tls_client_key_passphrase: cx.create_rw_signal(String::new()),
             color: cx.create_rw_signal(None),
             prominent_color: cx.create_rw_signal(false),
             read_only: cx.create_rw_signal(false),
@@ -1706,6 +1719,13 @@ impl DraftSignals {
         self.ssh_auth.set(c.ssh.auth);
         self.ssh_key_path.set(c.ssh.key_path.clone());
         self.ssh_key_passphrase.set(c.ssh.key_passphrase.clone());
+        self.tls_mode.set(c.tls.mode);
+        self.tls_ca_path.set(c.tls.ca_path.clone());
+        self.tls_client_cert_path
+            .set(c.tls.client_cert_path.clone());
+        self.tls_client_key_path.set(c.tls.client_key_path.clone());
+        self.tls_client_key_passphrase
+            .set(c.tls.client_key_passphrase.clone());
         self.color.set(c.color.clone());
         self.prominent_color.set(c.prominent_color);
         self.read_only.set(c.read_only);
@@ -1733,6 +1753,11 @@ impl DraftSignals {
         self.ssh_auth.set(SshAuth::Password);
         self.ssh_key_path.set(String::new());
         self.ssh_key_passphrase.set(String::new());
+        self.tls_mode.set(SslMode::default());
+        self.tls_ca_path.set(String::new());
+        self.tls_client_cert_path.set(String::new());
+        self.tls_client_key_path.set(String::new());
+        self.tls_client_key_passphrase.set(String::new());
         self.color.set(None);
         self.prominent_color.set(false);
         self.read_only.set(false);
@@ -1776,6 +1801,13 @@ impl DraftSignals {
                 auth: self.ssh_auth.get_untracked(),
                 key_path: self.ssh_key_path.get_untracked(),
                 key_passphrase: self.ssh_key_passphrase.get_untracked(),
+            },
+            tls: schemaic_core::connection::Tls {
+                mode: self.tls_mode.get_untracked(),
+                ca_path: self.tls_ca_path.get_untracked().trim().to_string(),
+                client_cert_path: self.tls_client_cert_path.get_untracked().trim().to_string(),
+                client_key_path: self.tls_client_key_path.get_untracked().trim().to_string(),
+                client_key_passphrase: self.tls_client_key_passphrase.get_untracked(),
             },
             color: self.color.get_untracked(),
             prominent_color: self.prominent_color.get_untracked(),

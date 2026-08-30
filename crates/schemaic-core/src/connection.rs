@@ -347,6 +347,197 @@ impl Default for SshTunnel {
     }
 }
 
+/// How hard a connection insists on TLS, and how far it verifies the server.
+///
+/// Five modes rather than one "use SSL" checkbox, because "is this connection
+/// safe" is two independent questions — are the bytes encrypted, and is the peer
+/// who it claims to be — and a checkbox answers only the first. That is the
+/// setting that makes a session *look* protected while anything presenting any
+/// self-signed certificate is reading it.
+///
+/// The names and the semantics are libpq's `sslmode`, deliberately: they are
+/// what the hosted providers document, so a user moving a connection string over
+/// already has the answer in hand rather than a mapping to guess at.
+///
+/// Ask one of the four predicates below rather than matching a variant at the
+/// call site — [`Self::negotiates_tls`], [`Self::requires_tls`],
+/// [`Self::verifies_certificate`], [`Self::verifies_hostname`]. A `mode ==
+/// VerifyFull` compiles cleanly while silently sorting a mode added later onto
+/// whichever side it happens to fall.
+///
+/// Deserialized through [`SslModeRaw`], so a value written by a newer build
+/// degrades to the default instead of failing the whole `connections.json` —
+/// see [`crate::persist::RightPanelState`] for the full reasoning.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "SslModeRaw")]
+pub enum SslMode {
+    /// Never negotiate TLS; connect in plaintext.
+    Disable,
+    /// Encrypt when the server offers it, fall back to plaintext when it does
+    /// not, and verify nothing.
+    ///
+    /// The default, and the reason it can be: it never refuses a server that a
+    /// plaintext connection would have reached, so every connection saved before
+    /// this setting existed keeps working while gaining encryption wherever the
+    /// server already offered it.
+    #[default]
+    Prefer,
+    /// Encryption is mandatory — fail rather than fall back — but the
+    /// certificate is not checked.
+    Require,
+    /// Mandatory encryption, and the certificate must chain to a trusted CA.
+    VerifyCa,
+    /// Mandatory encryption, a trusted chain, **and** a certificate that names
+    /// the host we asked for.
+    VerifyFull,
+}
+
+/// Parsing shim for [`SslMode`]; see [`crate::persist::RightPanelState`].
+#[derive(Deserialize)]
+enum SslModeRaw {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<SslModeRaw> for SslMode {
+    fn from(raw: SslModeRaw) -> Self {
+        match raw {
+            SslModeRaw::Disable => SslMode::Disable,
+            SslModeRaw::Prefer => SslMode::Prefer,
+            SslModeRaw::Require => SslMode::Require,
+            SslModeRaw::VerifyCa => SslMode::VerifyCa,
+            SslModeRaw::VerifyFull => SslMode::VerifyFull,
+            SslModeRaw::Unknown => SslMode::default(),
+        }
+    }
+}
+
+impl SslMode {
+    /// All variants, in dropdown order — weakest first, so the list reads as the
+    /// ladder it is.
+    pub const ALL: [SslMode; 5] = [
+        SslMode::Disable,
+        SslMode::Prefer,
+        SslMode::Require,
+        SslMode::VerifyCa,
+        SslMode::VerifyFull,
+    ];
+
+    /// Human label for the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            SslMode::Disable => "Disable",
+            SslMode::Prefer => "Prefer",
+            SslMode::Require => "Require",
+            SslMode::VerifyCa => "Verify CA",
+            SslMode::VerifyFull => "Verify full",
+        }
+    }
+
+    /// One line under the picker saying what this mode actually protects — the
+    /// difference between the last two is the whole reason there are five, and
+    /// it is not guessable from their names.
+    pub fn description(self) -> &'static str {
+        match self {
+            SslMode::Disable => "Connect in plain text.",
+            SslMode::Prefer => "Encrypt if the server offers it. No verification.",
+            SslMode::Require => "Refuse to connect without encryption. No verification.",
+            SslMode::VerifyCa => "Encrypt, and check the certificate against the CA.",
+            SslMode::VerifyFull => "Encrypt, check the certificate, and check the host name.",
+        }
+    }
+
+    /// Does this mode attempt TLS at all?
+    pub fn negotiates_tls(self) -> bool {
+        !matches!(self, SslMode::Disable)
+    }
+
+    /// Must the connect **fail** when the server offers no TLS, rather than fall
+    /// back to plaintext?
+    pub fn requires_tls(self) -> bool {
+        matches!(
+            self,
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
+        )
+    }
+
+    /// Is the server's certificate chain checked against a trusted CA?
+    pub fn verifies_certificate(self) -> bool {
+        matches!(self, SslMode::VerifyCa | SslMode::VerifyFull)
+    }
+
+    /// Is the server's certificate checked against the host name we asked for?
+    ///
+    /// The rung above [`Self::verifies_certificate`]: a valid certificate for
+    /// *some other host*, replayed by whoever holds it, passes the chain check
+    /// and fails only this one.
+    pub fn verifies_hostname(self) -> bool {
+        matches!(self, SslMode::VerifyFull)
+    }
+}
+
+/// How a connection secures its transport: the [`SslMode`] plus the files that
+/// mode needs.
+///
+/// Beside [`SshTunnel`] rather than inside it — the two are independent ways of
+/// protecting the same hop, and a tunnelled connection may still want the server
+/// to prove who it is at the far end.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct Tls {
+    #[serde(default)]
+    pub mode: SslMode,
+    /// PEM file of CA certificates to trust. Empty means the system roots, which
+    /// is what a hosted provider with a publicly-signed certificate needs — see
+    /// [`Self::ca_file`].
+    #[serde(default)]
+    pub ca_path: String,
+    /// Client certificate offered to the server (mutual TLS), PEM.
+    #[serde(default)]
+    pub client_cert_path: String,
+    /// Private key for `client_cert_path`, PEM.
+    #[serde(default)]
+    pub client_key_path: String,
+    /// Passphrase decrypting `client_key_path`, if the key is encrypted (may be
+    /// empty). A secret: it lives in the OS keyring, not in `connections.json`
+    /// — see [`crate::secrets::SecretKind::TlsKeyPassphrase`].
+    #[serde(default)]
+    pub client_key_passphrase: String,
+}
+
+impl Tls {
+    /// Should the handshake offer a client certificate?
+    ///
+    /// **Both halves, and a mode that handshakes at all.** A certificate without
+    /// its key cannot answer the server's challenge, so half a pair is not a
+    /// weaker identity but a failed connect — and an identity offered during a
+    /// handshake means nothing on a connection that never performs one.
+    pub fn uses_client_cert(&self) -> bool {
+        self.mode.negotiates_tls()
+            && !self.client_cert_path.is_empty()
+            && !self.client_key_path.is_empty()
+    }
+
+    /// The CA file this connection verifies against, or `None` for the system
+    /// roots.
+    ///
+    /// `None` covers two different situations on purpose, because they need the
+    /// same thing from the caller: a mode that verifies nothing, and a verifying
+    /// mode with no file named. Reading the second as a missing path instead
+    /// would break `verify-full` against precisely the hosted servers whose
+    /// certificates are already publicly signed.
+    pub fn ca_file(&self) -> Option<&str> {
+        if !self.mode.verifies_certificate() || self.ca_path.is_empty() {
+            return None;
+        }
+        Some(&self.ca_path)
+    }
+}
+
 /// A saved connection to a database server.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Connection {
@@ -375,6 +566,11 @@ pub struct Connection {
     pub file: String,
     #[serde(default)]
     pub ssh: SshTunnel,
+    /// How the transport to the server is secured ([`Tls`]). Defaults to
+    /// [`SslMode::Prefer`], which is what makes the field safe to add to
+    /// connections saved before it existed.
+    #[serde(default)]
+    pub tls: Tls,
     /// Optional identity colour (a `#rrggbb` hex), shown as a dot across the
     /// connection switcher and the SCHEMA header. `None` = no colour assigned.
     #[serde(default)]
@@ -449,6 +645,7 @@ impl Connection {
             self.user = String::new();
             self.password = String::new();
             self.ssh = SshTunnel::default();
+            self.tls = Tls::default();
         }
         self
     }
@@ -469,6 +666,21 @@ impl Connection {
     /// rather than a sixth spelling of it at each.
     pub fn uses_tunnel(&self) -> bool {
         self.ssh.enabled && !is_sqlite(&self.db_type)
+    }
+
+    /// Should opening this connection negotiate TLS?
+    ///
+    /// **Not `tls.mode.negotiates_tls()` on its own**, and for the same reason
+    /// [`Self::uses_tunnel`] is not `ssh.enabled` on its own: the engine picker
+    /// is editable in place and the SQLite form renders no TLS section, so a
+    /// connection switched over from a MySQL one keeps whatever mode it had with
+    /// no control anywhere that could unset it. SQLite is a local file with no
+    /// transport to secure, so the question is settled before the mode is asked.
+    ///
+    /// One answer, asked everywhere, rather than a second spelling of it at each
+    /// driver.
+    pub fn uses_tls(&self) -> bool {
+        self.tls.mode.negotiates_tls() && !is_sqlite(&self.db_type)
     }
 
     /// The whole path of a SQLite connection's file, empty for any other engine.
@@ -510,7 +722,8 @@ impl Connection {
     /// The id a **new** connection takes: past every one in use.
     ///
     /// One function because the id is the sole component of the keyring account
-    /// string (`conn.{id}.password` / `.ssh_password` / `.ssh_passphrase`), so
+    /// string (`conn.{id}.password` / `.ssh_password` / `.ssh_passphrase` /
+    /// `.tls_key_passphrase`), so
     /// two connections sharing one share all three secret slots — a saved
     /// password appearing under a connection that never had it, and a delete
     /// taking the other's with it. It was written out twice (Save, and
@@ -894,6 +1107,7 @@ mod tests {
             password: "secret".to_string(),
             file: String::new(),
             ssh: SshTunnel::default(),
+            tls: Tls::default(),
             color: None,
             prominent_color: false,
             read_only: false,
@@ -988,6 +1202,7 @@ mod tests {
             password: "secret".to_string(),
             file: String::new(),
             ssh: SshTunnel::default(),
+            tls: Tls::default(),
             color: None,
             prominent_color: false,
             read_only: false,
@@ -1481,5 +1696,245 @@ mod tests {
             assert!(!is_postgres(label), "{label}");
             assert_eq!(default_port(label), 3306, "{label}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        Connection {
+            id: 1,
+            name: "prod".to_string(),
+            db_type: "MySQL".to_string(),
+            host: "db.example.com".to_string(),
+            port: 3307,
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            file: String::new(),
+            ssh: SshTunnel::default(),
+            tls: Tls::default(),
+            color: None,
+            prominent_color: false,
+            read_only: false,
+            environment: Environment::None,
+            ai_data: None,
+        }
+    }
+
+    #[test]
+    fn ssl_mode_labels_and_all_cover_every_variant() {
+        assert_eq!(SslMode::ALL.len(), 5);
+        assert_eq!(SslMode::Disable.label(), "Disable");
+        assert_eq!(SslMode::Prefer.label(), "Prefer");
+        assert_eq!(SslMode::Require.label(), "Require");
+        assert_eq!(SslMode::VerifyCa.label(), "Verify CA");
+        assert_eq!(SslMode::VerifyFull.label(), "Verify full");
+        // Every mode says something about itself in the form; a blank one would
+        // leave the riskiest choice the least explained.
+        for m in SslMode::ALL {
+            assert!(!m.description().is_empty(), "{m:?}");
+        }
+    }
+
+    /// The four predicates are a *ladder*, and the whole point of splitting them
+    /// is that each one is asked where it belongs. If a later mode were sorted
+    /// onto the wrong rung — verifying a hostname without checking the chain it
+    /// came from — the connection would report itself verified while trusting a
+    /// certificate signed by nobody. Asserted over `ALL` so a new variant has to
+    /// pass it rather than merely compile.
+    #[test]
+    fn the_verification_ladder_holds_for_every_mode() {
+        for m in SslMode::ALL {
+            if m.verifies_hostname() {
+                assert!(
+                    m.verifies_certificate(),
+                    "{m:?} checks a name it can't trust"
+                );
+            }
+            if m.verifies_certificate() {
+                assert!(
+                    m.requires_tls(),
+                    "{m:?} verifies a session it would give up"
+                );
+            }
+            if m.requires_tls() {
+                assert!(m.negotiates_tls(), "{m:?} requires TLS it never offers");
+            }
+        }
+    }
+
+    #[test]
+    fn prefer_is_the_default_and_never_mandates_tls() {
+        assert_eq!(SslMode::default(), SslMode::Prefer);
+        assert_eq!(Tls::default().mode, SslMode::Prefer);
+        // The property that makes Prefer safe as the default for connections
+        // saved before this setting existed: it can encrypt, but it can never
+        // refuse a server that plaintext would have reached.
+        assert!(SslMode::Prefer.negotiates_tls());
+        assert!(!SslMode::Prefer.requires_tls());
+        assert!(!SslMode::Disable.negotiates_tls());
+    }
+
+    #[test]
+    fn a_connection_saved_before_tls_existed_reads_as_prefer() {
+        let json = r#"{
+            "id": 7,
+            "name": "legacy",
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "app",
+            "password": ""
+        }"#;
+        let c: Connection = serde_json::from_str(json).unwrap();
+        assert_eq!(c.tls, Tls::default());
+        assert_eq!(c.tls.mode, SslMode::Prefer);
+    }
+
+    /// A mode written by a newer build must degrade to the default rather than
+    /// fail the deserialize — which, because `connections.json` is one document,
+    /// would take out *every* connection and not just this field.
+    #[test]
+    fn an_unknown_ssl_mode_degrades_instead_of_failing_the_file() {
+        let json = r#"{"mode":"VerifyFullPlusSomethingNew","ca_path":"/ca.crt"}"#;
+        let t: Tls = serde_json::from_str(json).unwrap();
+        assert_eq!(t.mode, SslMode::default());
+        // …and the rest of the block still parses.
+        assert_eq!(t.ca_path, "/ca.crt");
+    }
+
+    #[test]
+    fn a_tls_block_round_trips_through_json() {
+        let mut c = conn();
+        c.tls = Tls {
+            mode: SslMode::VerifyFull,
+            ca_path: "/etc/ca.crt".into(),
+            client_cert_path: "/etc/client.crt".into(),
+            client_key_path: "/etc/client.key".into(),
+            client_key_passphrase: "pw".into(),
+        };
+        let back: Connection = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.tls, c.tls);
+    }
+
+    /// SQLite has no server, so it has no transport to secure. The same trap as
+    /// the SSH block: the engine picker is editable in place and the SQLite form
+    /// renders no TLS section, so a connection switched over from MySQL would
+    /// keep a CA path and a `verify-full` with no control anywhere that could
+    /// unset either.
+    #[test]
+    fn a_sqlite_connection_is_saved_without_tls_settings() {
+        let mut c = conn();
+        c.db_type = "SQLite".into();
+        c.tls = Tls {
+            mode: SslMode::VerifyFull,
+            ca_path: "/etc/ca.crt".into(),
+            ..Tls::default()
+        };
+        assert_eq!(c.sanitized().tls, Tls::default());
+    }
+
+    #[test]
+    fn uses_tls_is_false_for_sqlite_however_the_mode_reads() {
+        let mut c = conn();
+        c.tls.mode = SslMode::VerifyFull;
+        assert!(c.uses_tls());
+
+        c.db_type = "SQLite".into();
+        assert!(!c.uses_tls());
+
+        let mut plain = conn();
+        plain.tls.mode = SslMode::Disable;
+        assert!(!plain.uses_tls());
+    }
+
+    /// Half a client identity is not a weaker identity, it is a broken connect:
+    /// a certificate with no key cannot answer the server's challenge, so the
+    /// pair is asked for together or not at all.
+    #[test]
+    fn a_client_certificate_needs_both_halves() {
+        let mut t = Tls {
+            mode: SslMode::Require,
+            client_cert_path: "/c.crt".into(),
+            ..Tls::default()
+        };
+        assert!(!t.uses_client_cert(), "a certificate with no key");
+        t.client_key_path = "/c.key".into();
+        assert!(t.uses_client_cert());
+        t.client_cert_path = String::new();
+        assert!(!t.uses_client_cert(), "a key with no certificate");
+    }
+
+    /// A client certificate is an offer made during the handshake, so it is
+    /// meaningless on a connection that never handshakes.
+    #[test]
+    fn a_disabled_connection_offers_no_client_certificate() {
+        let t = Tls {
+            mode: SslMode::Disable,
+            client_cert_path: "/c.crt".into(),
+            client_key_path: "/c.key".into(),
+            ..Tls::default()
+        };
+        assert!(!t.uses_client_cert());
+    }
+
+    /// An empty CA path under a verifying mode is not "verify nothing" — it is
+    /// "verify against the system roots", which is what a hosted provider with a
+    /// public certificate needs. Reading it as a missing file instead would make
+    /// `verify-full` unusable against exactly the servers it exists for.
+    #[test]
+    fn the_ca_file_is_only_consulted_by_a_verifying_mode() {
+        let mut t = Tls {
+            mode: SslMode::Require,
+            ca_path: "/etc/ca.crt".into(),
+            ..Tls::default()
+        };
+        assert_eq!(t.ca_file(), None, "require verifies nothing to verify with");
+
+        t.mode = SslMode::VerifyCa;
+        assert_eq!(t.ca_file(), Some("/etc/ca.crt"));
+
+        t.ca_path = String::new();
+        assert_eq!(t.ca_file(), None, "empty means the system roots");
+    }
+
+    /// A **tripwire**, not a behaviour test. `Tls` grows fields, and every one of
+    /// them so far is *how* the same server is reached rather than *which*
+    /// server — so none belongs in `targets_same_server`, and the schema tree
+    /// must not blank itself when a CA path is corrected.
+    ///
+    /// Update the literal **and** decide, for the new field: does it change which
+    /// server the next query reaches? A field that does belongs in
+    /// `targets_same_server` alongside host and port.
+    #[test]
+    fn every_tls_field_has_been_judged() {
+        let t = Tls {
+            mode: SslMode::VerifyFull,
+            ca_path: "/etc/ca.crt".into(),
+            client_cert_path: "/etc/client.crt".into(),
+            client_key_path: "/etc/client.key".into(),
+            client_key_passphrase: "pw".into(),
+        };
+        let mut edited = conn();
+        edited.tls = t;
+        assert!(conn().targets_same_server(&edited));
+    }
+
+    /// The credentials are the point of a duplicate, and a CA path plus a client
+    /// key is as much retyping as an SSH block. Carried by the struct update in
+    /// `duplicate`, so this guards that it stays a struct update.
+    #[test]
+    fn a_duplicate_carries_the_tls_settings() {
+        let mut c = conn();
+        c.tls = Tls {
+            mode: SslMode::VerifyFull,
+            ca_path: "/etc/ca.crt".into(),
+            client_cert_path: "/etc/client.crt".into(),
+            client_key_path: "/etc/client.key".into(),
+            client_key_passphrase: "pw".into(),
+        };
+        let copy = c.duplicate(9, "copy".into(), None);
+        assert_eq!(copy.tls, c.tls);
     }
 }
