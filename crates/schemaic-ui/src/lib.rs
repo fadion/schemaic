@@ -6829,6 +6829,13 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         let ed_af = ed.clone();
         floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
             if let Some(Some(vid)) = ed_af.editor_view_id.try_get_untracked() {
+                // **Say so, because a hand-back may be queued behind this.** A
+                // field that autofocuses on mount is very often mounted *by* the
+                // gesture that closed something else, and closing an overlay
+                // queues `widgets::hand_keyboard_back`'s deferred home — the
+                // Ctrl+K bar opened from the editor's right-click menu being the
+                // case that shipped broken. See `widgets::claim_keyboard`.
+                widgets::claim_keyboard();
                 vid.request_focus();
                 // Land the caret at the end of any seeded text — a programmatic
                 // focus on a prefilled field (e.g. the inline tab rename) should
