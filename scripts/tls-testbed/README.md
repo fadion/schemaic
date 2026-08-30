@@ -83,6 +83,21 @@ Two more cases the table does not cover:
   server rejects the *login* rather than the transport, which is a different
   error path and deserves its own message.
 
+## Walking the matrix without the app
+
+`cargo run -p schemaic-db --example tls_matrix` drives every mode through the
+real driver stack and prints the two columns that matter — trusting the CA that
+signed the server, and trusting one that did not. It takes the same certificates
+this script generates:
+
+```bash
+TLS_CA=/etc/schemaic-tls/ca.crt cargo run -p schemaic-db --example tls_matrix
+```
+
+On Windows against servers in WSL, point `TLS_CA` at the Windows copy
+(`%USERPROFILE%\schemaic-tls\ca.crt`) — the app is a Windows process and cannot
+read a WSL path. The example's header comment lists every variable.
+
 ## Sanity checks before involving the app
 
     openssl s_client -connect 127.0.0.1:3306 -starttls mysql    -CAfile /etc/schemaic-tls/ca.crt </dev/null 2>&1 | grep -E 'Verify return|Verification'
