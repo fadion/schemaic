@@ -3091,6 +3091,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   mapping is `pg_ssl_mode`, not a shared retry. Cancellation goes through `pg::cancel_query` rather
   than a bare `NoTls`: cancelling opens a *second* connection, and a plaintext one is refused by
   exactly the servers this setting exists for, with the failure discarded.
+  **Trust anchors are the OS store** (`default_roots`, `rustls-native-certs`), read **once** —
+  one-connection-per-operation puts this on the path of every query and health poll, and
+  enumerating the Windows store per connection would be a cost paid thousands of times for an
+  answer that cannot change mid-session. `webpki-roots` remains only as a fallback for a machine
+  with nothing readable, and as a *fallback* rather than a union on purpose: reading the OS store
+  is worth doing because an administrator's decisions there bind, so a CA they removed has to stop
+  being trusted. Keeping the two engines on one set is the part that takes work — `mysql_async`
+  adds its own compiled-in roots to whatever it is given, so `mysql_ssl_opts` sets
+  `with_disable_built_in_roots` and passes the anchors as raw DER buffers, which its loader
+  accepts only because DER trips no PEM section (pinned by a test, since it is an assumption about
+  someone else's parser). That switch is deliberately **not** made for `prefer`/`require`: the
+  driver builds a `WebPkiServerVerifier` even when it will never consult it, and that builder
+  fails on an empty root store, so disabling the built-ins for a mode that names no CA would break
+  the default mode of every connection. Two Windows-specific consequences to know before blaming a
+  server: the root program is populated lazily, so a public certificate every browser accepts can
+  still fail `verify-ca` with `UnknownIssuer`, and a certificate installed during a session needs
+  a restart to be seen.
   `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
@@ -3283,10 +3300,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     underneath. What it shows below the picker comes from the mode's **capabilities**, never the
     variant: the CA path appears when `verifies_certificate`, the client identity when
     `negotiates_tls`, so a sixth level would not need this view found and edited. An *empty* CA
-    path under a verifying mode means the **bundled** public roots (`webpki-roots`, not the OS
-    certificate store — see `db/tls.rs`), and the hint says both halves: that a blank field is
-    meaningful rather than unfinished, and that a company CA trusted machine-wide still has to be
-    named by path. Every TLS signal joins host/port/user/password
+    path under a verifying mode means **whatever the operating system trusts** (`db/tls.rs`), and
+    the hint says so, because a blank required-looking field otherwise reads as unfinished.
+    Every TLS signal joins host/port/user/password
     in the effect that **invalidates a prior Test result**, since raising the mode or naming the
     wrong CA turns a working endpoint into a refused one and a green Test left standing over that
     is the most misleading state the indicator has. `path_field` is the shared path+Browse control

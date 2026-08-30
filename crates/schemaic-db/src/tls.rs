@@ -11,7 +11,19 @@
 //!
 //! Both engines run on one rustls, so a certificate accepted by one is accepted
 //! by the other — see the workspace `Cargo.toml` for why the crypto provider
-//! must stay single.
+//! must stay single. Keeping that true takes work in one place: `mysql_async`
+//! builds its own root store and adds its compiled-in roots unless told not to,
+//! so [`mysql_ssl_opts`] switches those off and hands it the same anchors
+//! [`client_config`] gives Postgres. Without that, naming a private CA would
+//! *narrow* the trust on one engine and *widen* it on the other.
+//!
+//! **A caveat worth knowing before blaming a server.** Trust anchors come from
+//! the OS store ([`default_roots`]), and Windows populates its root program
+//! lazily — a fresh machine can report a few dozen anchors where a browser
+//! effectively trusts hundreds, because the rest are fetched on demand by a
+//! component we are not going through. So a public certificate that every
+//! browser on the box accepts can still fail `verify-ca` here, with
+//! `UnknownIssuer`. Naming the provider's CA file is the immediate answer.
 //!
 //! **The verifier ladder is the load-bearing part.** rustls verifies the chain
 //! and the name together inside `verify_server_cert`, so `verify-ca` — trust the
@@ -46,8 +58,44 @@ pub(crate) fn mysql_ssl_opts(plan: &TlsPlan) -> SslOpts {
     if let Some(name) = &plan.hostname_override {
         opts = opts.with_danger_tls_hostname_override(Some(name.clone()));
     }
-    if let Some(ca) = &plan.root_ca {
-        opts = opts.with_root_certs(vec![std::path::PathBuf::from(ca).into()]);
+
+    // Anchors, but **only for a mode that has something to verify**. Two reasons
+    // it is guarded rather than unconditional, and neither is visible from the
+    // handshake: `mysql_async` builds a `WebPkiServerVerifier` even when it will
+    // not consult it, and that builder fails on an empty root store — so
+    // switching its built-in roots off for `prefer` would break the default mode
+    // of every connection. And copying a whole trust store into the options is
+    // real work on a path that runs once per operation.
+    if !plan.accept_invalid_certs {
+        match &plan.root_ca {
+            // Naming a CA means "trust exactly this". Without disabling the
+            // driver's own roots it would mean "this *as well as* every public
+            // CA", which narrows the trust on Postgres and widens it here.
+            Some(ca) => {
+                opts = opts
+                    .with_disable_built_in_roots(true)
+                    .with_root_certs(vec![std::path::PathBuf::from(ca).into()]);
+            }
+            // No file: the same anchors `client_config` gives Postgres. When we
+            // fell back to the bundled set there is nothing to copy — the
+            // driver's own built-ins are that set already.
+            None => {
+                let roots = default_roots();
+                if roots.source == RootSource::Os {
+                    // As raw DER bytes: the driver's loader tries PEM first and
+                    // falls back to reading a whole non-empty buffer as one
+                    // certificate, which is what these are. `PathOrBuf` is not
+                    // nameable from outside the crate, hence the `into`.
+                    opts = opts.with_disable_built_in_roots(true).with_root_certs(
+                        roots
+                            .certs
+                            .iter()
+                            .map(|c| c.as_ref().to_vec().into())
+                            .collect(),
+                    );
+                }
+            }
+        }
     }
     if let Some((cert, key)) = &plan.client_identity {
         opts = opts.with_client_identity(Some(ClientIdentity::new(
@@ -72,7 +120,7 @@ pub(crate) fn mysql_ssl_opts(plan: &TlsPlan) -> SslOpts {
 /// [`client_config`], and already fails with the path in the message.
 pub(crate) fn preflight(plan: &TlsPlan) -> Result<(), DbError> {
     if let Some(ca) = &plan.root_ca {
-        root_store(Some(ca))?;
+        file_root_store(ca)?;
     }
     if let Some((cert, key)) = &plan.client_identity {
         read_certs(cert)?;
@@ -117,8 +165,11 @@ fn client_config(plan: &TlsPlan) -> Result<ClientConfig, DbError> {
     let verifier: Arc<dyn ServerCertVerifier> = if plan.accept_invalid_certs {
         Arc::new(NoVerification(provider))
     } else {
-        let roots = root_store(plan.root_ca.as_deref())?;
-        let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        let roots = match plan.root_ca.as_deref() {
+            Some(path) => Arc::new(file_root_store(path)?),
+            None => default_roots().store.clone(),
+        };
+        let webpki = WebPkiServerVerifier::builder_with_provider(roots, provider)
             .build()
             .map_err(|e| DbError::Connect(format!("TLS trust store is unusable: {e}")))?;
         match (plan.skip_hostname_check, &plan.hostname_override) {
@@ -148,38 +199,131 @@ fn client_config(plan: &TlsPlan) -> Result<ClientConfig, DbError> {
     }
 }
 
-/// The roots to trust: the named PEM file, or the **bundled** public set.
-///
-/// An empty `root_ca` is not "trust nothing" — it is a hosted server whose
-/// certificate is already publicly signed, which is the common case the file
-/// exists to *narrow*.
-///
-/// Those roots are `webpki-roots` — Mozilla's set, compiled in — and **not the
-/// operating system's certificate store**. Worth stating because the difference
-/// is invisible until it isn't: a company CA installed machine-wide, or the one
-/// a TLS-inspecting proxy injects, is trusted by every browser on the box and
-/// not by this. Such a connection has to name the CA file by path. The choice is
-/// deliberate for now — one trust set on both engines and all three platforms,
-/// with nothing that varies by how the machine was provisioned — and the same
-/// set `mysql_async` uses internally, so the two engines cannot disagree about
-/// which public CAs exist.
-fn root_store(ca_path: Option<&str>) -> Result<RootCertStore, DbError> {
-    let mut store = RootCertStore::empty();
-    let Some(path) = ca_path else {
-        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        return Ok(store);
-    };
+/// Which anchors an *empty* CA path resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootSource {
+    /// The operating system's own certificate store.
+    Os,
+    /// `webpki-roots` — Mozilla's set, compiled in.
+    Bundled,
+}
 
-    let certs = read_certs(path)?;
-    let count = certs.len();
-    for cert in certs {
-        store
-            .add(cert)
-            .map_err(|e| DbError::Connect(format!("CA file {path} is not usable: {e}")))?;
+/// The bundled set is a **fallback**, never a supplement.
+///
+/// Unioning the two would be the tempting shape and is the wrong one: reading
+/// the OS store is worth doing precisely because an administrator's decisions
+/// there are binding, and a CA they *removed* has to stop being trusted. A
+/// compiled-in set quietly underneath would undo exactly that.
+///
+/// The fallback is for a machine with no store to read — a scratch container
+/// with no `ca-certificates` package. Trusting nothing there would be
+/// defensible and would also make the app useless with an error naming no
+/// cause.
+fn root_source(os_cert_count: usize) -> RootSource {
+    match os_cert_count {
+        0 => RootSource::Bundled,
+        _ => RootSource::Os,
     }
-    if count == 0 {
+}
+
+/// Trust anchors, and the certificates they were built from.
+///
+/// Both, because the two drivers want different things from the same decision:
+/// Postgres verifies against a [`RootCertStore`] we hand rustls directly, while
+/// `mysql_async` builds its own store internally and will only take certificates
+/// as bytes. Deriving them separately is how the engines come to disagree about
+/// what is trusted.
+struct DefaultRoots {
+    store: Arc<RootCertStore>,
+    certs: Vec<CertificateDer<'static>>,
+    source: RootSource,
+}
+
+/// Filter `certs` down to the ones rustls will accept as trust anchors,
+/// returning the store and the certificates that actually went into it.
+///
+/// One at a time rather than in bulk, because a real trust store contains
+/// entries rustls refuses — anchors a platform accumulated over a decade — and
+/// one of them must not be the difference between a working machine and one that
+/// can open no verified connection at all.
+fn usable_roots(
+    certs: Vec<CertificateDer<'static>>,
+) -> (RootCertStore, Vec<CertificateDer<'static>>) {
+    let mut store = RootCertStore::empty();
+    let kept = certs
+        .into_iter()
+        .filter(|cert| store.add(cert.clone()).is_ok())
+        .collect();
+    (store, kept)
+}
+
+/// The anchors an empty CA path verifies against — the OS store, read **once**.
+///
+/// Once because of the one-connection-per-operation invariant: this is on the
+/// path of every query, schema refresh and health poll, and enumerating the
+/// Windows certificate store or walking `/etc/ssl/certs` per connection would be
+/// a cost paid thousands of times for an answer that does not change while the
+/// app is running. The trade is that a certificate installed *during* a session
+/// needs a restart, which is the same deal every other TLS client makes.
+fn default_roots() -> &'static DefaultRoots {
+    static ROOTS: std::sync::OnceLock<DefaultRoots> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let loaded = rustls_native_certs::load_native_certs();
+        for err in &loaded.errors {
+            // Not fatal on its own: a store can be partly readable, and the
+            // count below is what decides whether we got anything usable.
+            tracing::debug!("reading the OS certificate store: {err}");
+        }
+
+        if root_source(loaded.certs.len()) == RootSource::Os {
+            let (store, certs) = usable_roots(loaded.certs);
+            // An OS store that yielded certificates rustls can do nothing with
+            // still leaves us with no anchors, and `mysql_async` cannot even
+            // *build* a verifier from an empty store — so the fallback is asked
+            // about the usable count, not the loaded one.
+            if !store.is_empty() {
+                tracing::debug!("{} trust anchors from the OS store", certs.len());
+                return DefaultRoots {
+                    store: Arc::new(store),
+                    certs,
+                    source: RootSource::Os,
+                };
+            }
+            tracing::warn!("the OS certificate store held nothing usable; using bundled roots");
+        }
+
+        // `webpki_roots` hands out `TrustAnchor`s — a subject and a public key,
+        // not certificates — so there is nothing here to give `mysql_async` as
+        // bytes. That is exactly why this case leaves the driver's own roots
+        // switched **on**: its built-in set *is* this set, so both engines still
+        // verify against the same anchors without anything being copied.
+        let mut bundled = RootCertStore::empty();
+        bundled.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        DefaultRoots {
+            store: Arc::new(bundled),
+            certs: Vec::new(),
+            source: RootSource::Bundled,
+        }
+    })
+}
+
+/// Trust anchors from a CA file the user named — **and nothing else**.
+///
+/// "Trust exactly this" is what the field is for, and what libpq's
+/// `sslrootcert` means: naming a private CA narrows the trust rather than adding
+/// to it.
+fn file_root_store(path: &str) -> Result<RootCertStore, DbError> {
+    let certs = read_certs(path)?;
+    if certs.is_empty() {
         return Err(DbError::Connect(format!(
             "CA file {path} contains no certificates"
+        )));
+    }
+    let count = certs.len();
+    let (store, kept) = usable_roots(certs);
+    if kept.len() != count {
+        return Err(DbError::Connect(format!(
+            "CA file {path} contains a certificate that cannot be used as a trust anchor"
         )));
     }
     Ok(store)
@@ -434,13 +578,150 @@ mod tests {
         );
     }
 
-    /// The empty CA path means the bundled public roots, and it has to actually
-    /// produce a usable store — an empty `RootCertStore` would fail every
-    /// handshake against a correctly-configured hosted server.
+    /// The empty CA path has to produce a usable store whichever source wins —
+    /// an empty `RootCertStore` fails every handshake against a correctly
+    /// configured hosted server, and `mysql_async` will not even *build* a
+    /// verifier from one once we have switched its own roots off.
     #[test]
-    fn no_ca_file_means_the_public_roots_are_loaded() {
-        let store = root_store(None).expect("builds");
-        assert!(!store.is_empty(), "the bundled roots are missing");
+    fn the_default_roots_are_never_empty() {
+        let roots = default_roots();
+        assert!(!roots.store.is_empty(), "no trust anchors at all");
+
+        match roots.source {
+            // Read from the OS: the certificates we hand `mysql_async` are
+            // exactly the anchors Postgres verifies against, or the engines are
+            // trusting overlapping sets rather than one.
+            RootSource::Os => {
+                assert!(!roots.certs.is_empty());
+                assert_eq!(roots.certs.len(), roots.store.len());
+            }
+            // Fallen back: there is nothing to hand over, because the driver's
+            // own built-in set already *is* this set.
+            RootSource::Bundled => assert!(roots.certs.is_empty()),
+        }
+    }
+
+    /// The bundled set is a **fallback**, not the default. An OS store that
+    /// offered certificates is the whole point of reading it: a CA an
+    /// administrator removed there has to actually stop being trusted, which
+    /// quietly unioning the compiled-in roots underneath would undo.
+    #[test]
+    fn the_bundled_roots_are_only_a_fallback() {
+        assert_eq!(root_source(12), RootSource::Os);
+        assert_eq!(root_source(1), RootSource::Os);
+        // Nothing loadable — a minimal container with no ca-certificates
+        // package. Trusting nothing would be defensible and would also make the
+        // app useless there, with an error naming no cause.
+        assert_eq!(root_source(0), RootSource::Bundled);
+    }
+
+    /// Real trust stores contain entries rustls refuses — expired anchors,
+    /// oddities a platform accumulated over a decade. Dropping them one at a
+    /// time is the difference between "one bad certificate in the Windows store"
+    /// and "this machine cannot open a verified connection".
+    #[test]
+    fn an_unusable_certificate_is_dropped_rather_than_fatal() {
+        let good = default_roots().certs[0].clone();
+        let junk = CertificateDer::from(vec![0x30, 0x00, 0xff, 0xff]);
+
+        let (store, kept) = usable_roots(vec![junk.clone(), good.clone()]);
+        assert_eq!(kept.len(), 1, "the good one survives");
+        assert_eq!(store.len(), 1);
+        assert_eq!(kept[0], good);
+
+        let (empty, none) = usable_roots(vec![junk]);
+        assert!(empty.is_empty() && none.is_empty());
+    }
+
+    /// **The two engines must narrow to the same set.** Naming a CA file means
+    /// "trust exactly this" — that is what the field is *for*, and what libpq's
+    /// `sslrootcert` means. `mysql_async` adds its own built-in roots to
+    /// whatever we hand it unless told not to, so without this a private CA
+    /// would narrow the trust on Postgres and merely *widen* it on MySQL, which
+    /// no local test-bed can show: our own server's certificate is refused by
+    /// the public roots either way, so both engines look correct until the
+    /// server is a hosted one with a publicly-signed certificate.
+    #[test]
+    fn a_named_ca_file_is_the_only_anchor_on_both_engines() {
+        let plan = TlsPlan {
+            root_ca: Some("/etc/ca.crt".to_string()),
+            ..plan_for(SslMode::VerifyFull)
+        };
+        assert!(
+            mysql_ssl_opts(&plan).disable_built_in_roots(),
+            "MySQL would otherwise trust the named CA *plus* every public one"
+        );
+
+        // The Postgres side narrows by construction — the store is built from
+        // the file alone — so one certificate in means one anchor out.
+        let (store, _) = usable_roots(vec![default_roots().certs[0].clone()]);
+        assert_eq!(store.len(), 1);
+    }
+
+    /// A verifying mode with no file named still hands the driver *our* anchors
+    /// rather than leaving it on its own compiled-in set, or the OS store would
+    /// be read for Postgres and ignored for MySQL.
+    #[test]
+    fn a_verifying_mode_hands_mysql_our_own_anchors() {
+        let roots = default_roots();
+        let opts = mysql_ssl_opts(&plan_for(SslMode::VerifyCa));
+        match roots.source {
+            RootSource::Os => {
+                assert!(opts.disable_built_in_roots(), "or the OS store is ignored");
+                assert_eq!(
+                    opts.root_certs().len(),
+                    roots.certs.len(),
+                    "the same anchors Postgres verifies against"
+                );
+            }
+            // The driver's own built-in roots are the bundled set, so leaving
+            // them on *is* agreeing with Postgres here — and there is nothing to
+            // copy per connection.
+            RootSource::Bundled => {
+                assert!(!opts.disable_built_in_roots());
+                assert!(opts.root_certs().is_empty());
+            }
+        }
+    }
+
+    /// **An assumption about somebody else's parser, pinned.**
+    ///
+    /// The OS store hands us DER, and `mysql_async` has no DER entry point: its
+    /// loader iterates PEM sections and falls back to reading a whole non-empty
+    /// buffer as one certificate *only when it saw none*. So the anchors reach
+    /// MySQL at all only because DER carries nothing that scanner recognises —
+    /// if it ever returned an error instead of ending, that `cert?` would fail
+    /// every verified MySQL connection, and no test of ours would be looking.
+    #[test]
+    fn a_der_certificate_carries_no_pem_section_for_the_driver_to_trip_on() {
+        let der = default_roots().certs[0].as_ref();
+        let mut sections = CertificateDer::pem_slice_iter(der);
+        assert!(
+            sections.next().is_none(),
+            "the driver would take this as PEM and error instead of falling back"
+        );
+    }
+
+    /// **And a non-verifying mode must leave them alone.** `mysql_async` builds
+    /// a `WebPkiServerVerifier` even when it will not consult it, and that
+    /// builder fails on an empty root store — so switching the built-in roots
+    /// off for `prefer` (which names no CA and needs no anchors) would break the
+    /// default mode of every connection. Nothing about the handshake says so;
+    /// this is a property of the driver's construction order.
+    #[test]
+    fn a_non_verifying_mode_leaves_the_drivers_own_roots_alone() {
+        for m in [SslMode::Prefer, SslMode::Require] {
+            let opts = mysql_ssl_opts(&plan_for(m));
+            assert!(
+                !opts.disable_built_in_roots(),
+                "{m:?} would leave the driver with no anchors to build a verifier from"
+            );
+            assert!(
+                opts.root_certs().is_empty(),
+                "{m:?} verifies nothing, so copying the whole trust store per \
+                 connection is pure cost"
+            );
+        }
     }
 
     #[test]
@@ -450,7 +731,7 @@ mod tests {
         let path = dir.join("not-a-cert.pem");
         std::fs::write(&path, b"hello, not a certificate").expect("write");
 
-        let err = root_store(Some(path.to_str().unwrap()))
+        let err = file_root_store(path.to_str().unwrap())
             .expect_err("a file with no certificates in it is not a trust store");
         assert!(format!("{err:?}").contains("no certificates"), "{err:?}");
         let _ = std::fs::remove_file(&path);

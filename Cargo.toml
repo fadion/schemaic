@@ -93,6 +93,10 @@ rustls = { version = "0.23", default-features = false, features = [
     "logging",
 ] }
 rustls-pki-types = "1"
+# The OS certificate store, which is what an empty CA path resolves to — see
+# `db::tls::default_roots`. `webpki-roots` stays as the fallback for a machine
+# with no store to read (a scratch container with no `ca-certificates`).
+rustls-native-certs = "0.8"
 webpki-roots = "0.26"
 tokio-postgres-rustls = "0.13"
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
