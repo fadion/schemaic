@@ -17,6 +17,7 @@ use schemaic_core::connection::Connection;
 use schemaic_core::connection::Environment;
 
 use schemaic_core::connection::SshAuth;
+use schemaic_core::connection::SslMode;
 
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
@@ -164,34 +165,41 @@ fn host_port_row(
     })
 }
 
-// Key-pair credentials: a private-key path (with a native "Browse…" picker) and
-// an optional passphrase. Shown when the SSH auth method is "Key pair".
-fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl IntoView {
+/// A labelled path field with a native **Browse…** picker beside it, occupying
+/// `tabindex` and `tabindex + 1`.
+///
+/// One helper because the SSH key and the three TLS certificate paths are the
+/// same control, and the first of them had already drifted: the picker was two
+/// stops away from the field it fills in, so Tab went path → passphrase →
+/// Browse while a comment above it said "its own stop, right after the path".
+/// The field stays editable by hand — a keyboard user who wants the picker
+/// shouldn't have to reach for the mouse, and one who wants to paste a path
+/// shouldn't have to open a dialog.
+fn path_field(
+    label_text: &'static str,
+    sig: RwSignal<String>,
+    dialog_title: &'static str,
+    ring: FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
     use floem::file::FileDialogOptions;
     use floem::file_action::open_file;
 
-    let key_sig = draft.ssh_key_path;
-    // Its own stop, right after the path it fills in — the field is editable by
-    // hand, but a keyboard user who wants the picker shouldn't have to reach for
-    // the mouse to open it.
-    let browse = control_button("Browse…", ring.clone(), tabindex + 2, move || {
-        open_file(
-            FileDialogOptions::new().title("Select private key"),
-            move |file| {
-                if let Some(info) = file
-                    && let Some(path) = info.path.first()
-                {
-                    key_sig.set(path.to_string_lossy().to_string());
-                }
-            },
-        )
+    let browse = control_button("Browse…", ring.clone(), tabindex + 1, move || {
+        open_file(FileDialogOptions::new().title(dialog_title), move |file| {
+            if let Some(info) = file
+                && let Some(path) = info.path.first()
+            {
+                sig.set(path.to_string_lossy().to_string());
+            }
+        })
     });
 
-    let key_row = v_stack((
-        text("Private key").style(form_label_style),
+    v_stack((
+        text(label_text).style(form_label_style),
         h_stack((
             edit_field(
-                draft.ssh_key_path,
+                sig,
                 FieldCfg {
                     focus: Some((ring.clone(), tabindex)),
                     ..Default::default()
@@ -207,11 +215,21 @@ fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl 
                 .width_full()
         }),
     ))
-    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+}
 
+// Key-pair credentials: a private-key path (with a native "Browse…" picker) and
+// an optional passphrase. Shown when the SSH auth method is "Key pair".
+fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl IntoView {
     v_stack((
-        key_row,
-        masked_field("Passphrase", draft.ssh_key_passphrase, ring, tabindex + 1)
+        path_field(
+            "Private key",
+            draft.ssh_key_path,
+            "Select private key",
+            ring.clone(),
+            tabindex,
+        ),
+        masked_field("Passphrase", draft.ssh_key_passphrase, ring, tabindex + 2)
             .style(|s| s.width(conn_field_w())),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
@@ -851,12 +869,127 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     })
 }
 
+/// How the connection to the server is secured: the [`SslMode`] picker, and the
+/// certificate files that mode actually uses.
+///
+/// **Always visible, unlike the SSH block, and not behind a toggle.** A hosted
+/// database that enforces TLS is the common case rather than the advanced one,
+/// and a checkbox marked "use SSL" is exactly the control that leaves people
+/// believing a connection is verified when it is only encrypted — so the choice
+/// is a named level with the sentence that distinguishes it printed underneath.
+///
+/// The fields below the picker are built from the mode's **capabilities**, not
+/// from the variant: a CA file appears when the mode verifies a certificate, and
+/// a client identity when it performs a handshake at all. Asking
+/// `mode == VerifyCa || mode == VerifyFull` here would have to be found and
+/// updated again the day a sixth level exists.
+///
+/// Tab indices 150–158, above everything the SSH block uses, matching where the
+/// section sits on screen.
+fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
+    let mode = draft.tls_mode;
+
+    let picker = v_stack((
+        text("SSL / TLS").style(form_label_style),
+        container(focusable_dropdown(
+            draft.tls_mode,
+            SslMode::ALL,
+            SslMode::label,
+            ring.clone(),
+            150,
+        ))
+        .style(|s| s.width(theme::scaled(200.0))),
+        label(move || mode.get().description().to_string()).style(|s| {
+            s.width_full()
+                .font_size(theme::font_hint())
+                .color(theme::text_muted())
+        }),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
+
+    let ring_files = ring.clone();
+    let files = dyn_container(
+        move || mode.get(),
+        move |m| {
+            if !m.negotiates_tls() {
+                return empty().into_any();
+            }
+            let ring = ring_files.clone();
+
+            // Only for a mode that checks the chain — and an *empty* path there
+            // means the system's own roots, which is what a hosted server with a
+            // publicly-signed certificate needs. The hint says so, because a
+            // blank required-looking field reads as unfinished.
+            let ca = if m.verifies_certificate() {
+                v_stack((
+                    path_field(
+                        "CA certificate",
+                        draft.tls_ca_path,
+                        "Select CA certificate",
+                        ring.clone(),
+                        151,
+                    ),
+                    form_hint("Leave empty to trust the system's root certificates."),
+                ))
+                .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+                .into_any()
+            } else {
+                empty().into_any()
+            };
+
+            v_stack((
+                ca,
+                path_field(
+                    "Client certificate",
+                    draft.tls_client_cert_path,
+                    "Select client certificate",
+                    ring.clone(),
+                    153,
+                ),
+                path_field(
+                    "Client key",
+                    draft.tls_client_key_path,
+                    "Select client key",
+                    ring.clone(),
+                    155,
+                ),
+                masked_field(
+                    "Client key passphrase",
+                    draft.tls_client_key_passphrase,
+                    ring,
+                    157,
+                )
+                .style(|s| s.width(conn_field_w())),
+                form_hint(
+                    "A client certificate and key are only needed where the server asks \
+                     you to prove who you are (mutual TLS).",
+                ),
+            ))
+            // Grouped like the SSH block: outlined rather than tinted, since a
+            // fill reads as a *state* everywhere else in the app.
+            .style(|s| {
+                s.flex_col()
+                    .gap(theme::scaled(20.0))
+                    .width_full()
+                    .padding(theme::scaled(10.0))
+                    .border(1.0)
+                    .border_color(theme::border())
+                    .border_radius(6.0)
+            })
+            .into_any()
+        },
+    )
+    .style(|s| s.width_full());
+
+    v_stack((picker, files)).style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
+}
+
 /// The half of the form that only a **networked** engine has: where the server
 /// is, who you are on it, and the optional tunnel to reach it.
 ///
 /// Split out so it can be built per engine rather than built and hidden — see the
 /// `engine_block` comment in [`conn_form`]. Its Tab indices are the ones the
-/// server form has always used (60–150), so nothing else in the modal renumbers.
+/// server form has always used (60–160), so nothing else in the modal renumbers.
 fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // SSH tunnel fields, shown only when enabled. The toggle is the themed switch
     // (like the other toggles); the fields lay out exactly like the normal ones.
@@ -953,6 +1086,7 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             .style(|s| s.width(conn_field_w())),
         ssh_toggle,
         ssh_fields,
+        tls_fields(draft, ring),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
@@ -1043,6 +1177,15 @@ fn conn_form(
         draft.ssh_auth.track();
         draft.ssh_key_path.track();
         draft.ssh_key_passphrase.track();
+        // The TLS settings decide whether the connection is *possible*, not just
+        // how it looks: raising the mode to verify-full, or naming the wrong CA,
+        // turns a working endpoint into a refused one. A green Test left standing
+        // over either is the most misleading state this indicator has.
+        draft.tls_mode.track();
+        draft.tls_ca_path.track();
+        draft.tls_client_cert_path.track();
+        draft.tls_client_key_path.track();
+        draft.tls_client_key_passphrase.track();
         // The SQLite target is a connection parameter like any other: pointing at
         // a different file invalidates a Test result exactly as a different host
         // does.

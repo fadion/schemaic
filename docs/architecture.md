@@ -3276,6 +3276,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     a `menu_row: RwSignal<Option<u64>>` created in the modal's **stable scope** beside `save_flash`
     and `test_flash` and for the same reason — the clearing effect outlives the open/close
     `dyn_container`, and a signal built inside it would be disposed out from under that effect.
+    **`tls_fields` is always visible on a networked engine, not behind a toggle like the SSH
+    block**: a database that enforces TLS is the ordinary case rather than the advanced one, and a
+    checkbox marked "use SSL" is the control that leaves people believing a connection is verified
+    when it is only encrypted — so it is a named level with `SslMode::description` printed
+    underneath. What it shows below the picker comes from the mode's **capabilities**, never the
+    variant: the CA path appears when `verifies_certificate`, the client identity when
+    `negotiates_tls`, so a sixth level would not need this view found and edited. An *empty* CA
+    path under a verifying mode means the system roots — the hint says so, because a blank
+    required-looking field reads as unfinished — and every TLS signal joins host/port/user/password
+    in the effect that **invalidates a prior Test result**, since raising the mode or naming the
+    wrong CA turns a working endpoint into a refused one and a green Test left standing over that
+    is the most misleading state the indicator has. `path_field` is the shared path+Browse control
+    behind the SSH key and all three certificate paths; folding them together also fixed the
+    original, whose picker sat two Tab stops from the field it fills in while its own comment
+    claimed otherwise.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
     panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
     share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
