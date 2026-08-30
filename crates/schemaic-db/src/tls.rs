@@ -17,13 +17,22 @@
 //! [`client_config`] gives Postgres. Without that, naming a private CA would
 //! *narrow* the trust on one engine and *widen* it on the other.
 //!
-//! **A caveat worth knowing before blaming a server.** Trust anchors come from
-//! the OS store ([`default_roots`]), and Windows populates its root program
-//! lazily — a fresh machine can report a few dozen anchors where a browser
-//! effectively trusts hundreds, because the rest are fetched on demand by a
-//! component we are not going through. So a public certificate that every
-//! browser on the box accepts can still fail `verify-ca` here, with
-//! `UnknownIssuer`. Naming the provider's CA file is the immediate answer.
+//! **The anchor count is smaller than the certificate manager's, and that is
+//! correct.** Trust anchors come from the OS store ([`default_roots`]), and
+//! `rustls-native-certs` returns only the roots valid for *server*
+//! authentication — a Windows box measured here holds 69 roots and yields 37,
+//! the rest being code-signing and timestamping CAs that have no business
+//! vouching for a database server. None were rejected by [`usable_roots`] on
+//! that machine, and `ISRG Root X1` — what Let's Encrypt, and so most hosted
+//! providers, chain to — was among the 37. So a low number is not itself a
+//! symptom; check whether the *specific* root is present before treating it as
+//! one.
+//!
+//! Windows does also populate its root program lazily, fetching roots on demand
+//! through a component we do not go through, so a certificate every browser on
+//! the box accepts can still fail `verify-ca` here with `UnknownIssuer`. That is
+//! a real failure mode and a different one from the count above. Naming the
+//! provider's CA file is the immediate answer either way.
 //!
 //! **The verifier ladder is the load-bearing part.** rustls verifies the chain
 //! and the name together inside `verify_server_cert`, so `verify-ca` — trust the
