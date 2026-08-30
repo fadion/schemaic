@@ -2663,7 +2663,19 @@ fn menu_stack(
     //
     // The cap is read inside the style closure, so a scale change or a window
     // resize moves it — the rule `min_w`'s siblings in `dividers.rs` follow.
-    scroll(v_stack_from_iter(rows))
+    //
+    // **`min_width_full` on the list, and it is not decoration.** The panel's
+    // surface and its `min_width` sit on the *scroll*, and floem's
+    // `Scroll::view_style` is `Style::new().items_start()` — so its one child is
+    // laid out at its own content width and never stretches to the viewport.
+    // Every row's `width_full` then resolved against a stack narrower than the
+    // panel, and the hover background and the hit box stopped short of the right
+    // edge by however much `min_width` had widened the panel. A percentage
+    // rather than `width`, because the scroll's content box is what it has to
+    // match and only taffy knows that number once the border and the caller's
+    // floor are in — and as a *minimum*, so a row wider than the panel still
+    // pushes out and scrolls horizontally instead of being clipped.
+    scroll(v_stack_from_iter(rows).style(|s| s.min_width_full()))
         .on_event_stop(EventListener::PointerDown, |_| {})
         .style(move |s| {
             let cap = menu_max_h();
