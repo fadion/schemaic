@@ -18,14 +18,22 @@
 //! | variable | default |
 //! |---|---|
 //! | `TLS_HOST` | `schemaic-tls.test` |
-//! | `TLS_CA` | `/etc/schemaic-tls/ca.crt` |
-//! | `TLS_WRONG_CA` | `TLS_CA` with `ca.crt` → `otherca.crt` |
+//! | `TLS_CA` | `/etc/schemaic-tls/ca.crt`, or `os` for the OS trust store |
+//! | `TLS_WRONG_CA` | `TLS_CA` with `ca.crt` → `otherca.crt`; `os` likewise |
 //! | `TLS_USER` / `TLS_PASSWORD` | `schemaic` / `schemaic` |
 //! | `TLS_MYSQL_PORT` / `TLS_PG_PORT` | `3306` / `5432` (`0` skips the engine) |
 //!
-//! Each mode is tried twice: once trusting the CA that signed the server, once
-//! trusting a CA that did not. The second column is the one that matters — a
-//! verifying mode that connects there is not verifying anything.
+//! **`os` is spelled out rather than written as an empty value** because an
+//! empty environment variable cannot be set from PowerShell at all — `$env:X =
+//! ''` *removes* the variable — so the obvious spelling would silently fall back
+//! to the default path on the shell most likely to be running this on Windows.
+//!
+//! Each mode is tried under two CA settings, printed above the table. Against a
+//! local test-bed those are the CA that signed the server and one that did not,
+//! and the second column is the one that matters: a verifying mode that connects
+//! there is not verifying anything. Against a hosted provider with a private CA
+//! (Aiven), set the second to `os` — its refusal is the proof that a named file
+//! *replaces* the trust set rather than adding to it.
 
 use std::time::Duration;
 
@@ -34,6 +42,27 @@ use schemaic_db::Db;
 
 fn env(key: &str, fallback: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| fallback.to_string())
+}
+
+/// A CA setting: a file path, or an empty string meaning the OS trust store.
+///
+/// `os` is the portable spelling of "no file". An empty *value* means the same
+/// thing and works from a POSIX shell, but PowerShell deletes a variable
+/// assigned `''`, so that spelling would quietly resolve to the default path.
+fn ca_setting(key: &str, fallback: &str) -> String {
+    let value = env(key, fallback);
+    match value.trim().eq_ignore_ascii_case("os") {
+        true => String::new(),
+        false => value,
+    }
+}
+
+/// How a CA setting reads in the table header.
+fn ca_label(path: &str) -> &str {
+    match path.is_empty() {
+        true => "the OS trust store",
+        false => path,
+    }
 }
 
 fn port(key: &str, fallback: u16) -> u16 {
@@ -78,8 +107,11 @@ async fn main() {
         .init();
 
     let host = env("TLS_HOST", "schemaic-tls.test");
-    let ca = env("TLS_CA", "/etc/schemaic-tls/ca.crt");
-    let wrong_ca = env("TLS_WRONG_CA", &ca.replace("ca.crt", "otherca.crt"));
+    let ca = ca_setting("TLS_CA", "/etc/schemaic-tls/ca.crt");
+    let wrong_ca = ca_setting("TLS_WRONG_CA", &ca.replace("ca.crt", "otherca.crt"));
+
+    println!("A = {}", ca_label(&ca));
+    println!("B = {}", ca_label(&wrong_ca));
 
     for (engine, port) in [
         ("MySQL", port("TLS_MYSQL_PORT", 3306)),
@@ -89,10 +121,7 @@ async fn main() {
             continue;
         }
         println!("\n{engine} @ {host}:{port}");
-        println!(
-            "  {:<12} {:<28} trusting the wrong one",
-            "mode", "trusting the right CA"
-        );
+        println!("  {:<12} {:<34} B", "mode", "A");
 
         for mode in SslMode::ALL {
             let mut cells = Vec::new();
@@ -108,7 +137,7 @@ async fn main() {
                     Err(e) => format!("refused ({e})"),
                 });
             }
-            println!("  {:<12} {:<28} {}", mode.label(), cells[0], cells[1]);
+            println!("  {:<12} {:<34} {}", mode.label(), cells[0], cells[1]);
         }
     }
 }

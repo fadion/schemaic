@@ -94,9 +94,20 @@ this script generates:
 TLS_CA=/etc/schemaic-tls/ca.crt cargo run -p schemaic-db --example tls_matrix
 ```
 
-On Windows against servers in WSL, point `TLS_CA` at the Windows copy
-(`%USERPROFILE%\schemaic-tls\ca.crt`) — the app is a Windows process and cannot
-read a WSL path. The example's header comment lists every variable.
+PowerShell has no inline `VAR=value` prefix, so set them first:
+
+```powershell
+$env:TLS_CA = "$env:USERPROFILE\schemaic-tls\ca.crt"; cargo run -p schemaic-db --example tls_matrix
+```
+
+On Windows against servers in WSL, `TLS_CA` must be the **Windows** copy the
+setup script placed in your profile — the app is a Windows process and cannot
+read a WSL path.
+
+Set either CA variable to `os` to use the operating system's trust store instead
+of a file. It is a word rather than an empty value because PowerShell *deletes*
+a variable assigned `''`, so the empty spelling would silently fall back to the
+default path. The example's header comment lists every variable.
 
 ## Sanity checks before involving the app
 
