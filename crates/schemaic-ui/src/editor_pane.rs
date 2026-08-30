@@ -288,6 +288,11 @@ fn cmdk_popup(
             if act.focus {
                 floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
                     if let Some(Some(vid)) = editor_view_id.try_get_untracked() {
+                        // Claimed for the same reason the prompt field's autofocus
+                        // is: a menu-opened request whose reply lands promptly
+                        // reaches here with the menu's own deferred hand-back
+                        // still queued behind it (`widgets::claim_keyboard`).
+                        crate::widgets::claim_keyboard();
                         vid.request_focus();
                     }
                 });
@@ -317,6 +322,7 @@ fn cmdk_popup(
                 cmdk.open.set(false);
                 (cancel)();
                 if let Some(Some(vid)) = editor_view_id.try_get_untracked() {
+                    crate::widgets::claim_keyboard();
                     vid.request_focus();
                 }
             });

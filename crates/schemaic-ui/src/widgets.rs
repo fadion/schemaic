@@ -46,6 +46,53 @@ thread_local! {
     /// overlay above it** — see [`set_keyboard_home`].
     static KEYBOARD_HOME: std::cell::RefCell<Option<Rc<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Bumped every time something deliberately takes the keyboard — see
+    /// [`claim_keyboard`].
+    static KEYBOARD_CLAIM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// **"I am taking the keyboard now."** Announce a deliberate focus move, so a
+/// *deferred* one scheduled before it can tell that it has been overtaken.
+///
+/// This exists because two of the app's focus moves are both `exec_after(ZERO)`
+/// and both get scheduled by the same gesture. Pick "Optimize" (or any AI fix)
+/// off the editor's right-click menu and, in one update pass: the Ctrl+K bar
+/// opens and its prompt field queues [`crate::edit_field`]'s autofocus, and the
+/// menu panel — a [`focus_root`] — is torn down, whose cleanup calls
+/// [`hand_keyboard_back`], which finds no other overlay and queues the
+/// workspace's home, `grid::refocus_grid`. Two timers, both due immediately,
+/// scheduled microseconds apart; whichever lands last owns the keyboard. When
+/// that was the grid, the bar was open with the keyboard behind it, the grid
+/// answers Escape by clearing its selection, and the only way out of a running
+/// request was to click the editor or the bar first. It read as intermittent —
+/// about one opening in three — because it *was*: the two timers were racing.
+///
+/// A generation rather than a "focus is held" flag, because there is no such
+/// thing to ask floem: `AppState::focus` is `pub(crate)` to it, and a flag of our
+/// own would have to be cleared by every path that drops focus, including the
+/// ones inside floem. A counter needs no clearing — the question a deferred mover
+/// asks is only ever *"is my hand-back still the latest word on the keyboard?"*,
+/// and [`keyboard_claim_unchanged`] answers it from the number alone.
+///
+/// The race is settled either way round, which is the point: claim-then-home
+/// leaves the home refusing to fire, home-then-claim leaves the claim landing on
+/// top of it. Only a *deferred* mover needs to ask — a synchronous
+/// `request_focus` cannot be overtaken by something that has not run yet.
+pub(crate) fn claim_keyboard() {
+    KEYBOARD_CLAIM.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// The current claim, for a deferred focus move to quote back to
+/// [`keyboard_claim_unchanged`] when it finally runs.
+pub(crate) fn keyboard_claim() -> u64 {
+    KEYBOARD_CLAIM.with(|c| c.get())
+}
+
+/// Whether the claim taken at `since` is still the latest — i.e. whether a focus
+/// move scheduled back then is still the right answer, or has been overtaken by a
+/// [`claim_keyboard`] in the meantime.
+pub(crate) fn keyboard_claim_unchanged(since: u64) -> bool {
+    keyboard_claim() == since
 }
 
 /// Register the workspace's own "the keyboard lives here" action, for the case
@@ -6640,6 +6687,36 @@ mod ring_tests {
         set_keyboard_home(None);
         hand_keyboard_back(None);
         assert_eq!(called.get(), 1);
+    }
+
+    /// **The race the home half then lost.** The workspace's home is deferred
+    /// (`grid::refocus_grid` is an `exec_after(ZERO)`), and so is the autofocus of
+    /// a field mounted by the very gesture that closed the overlay — so "Optimize"
+    /// off the editor's right-click menu queued both, and the grid won about one
+    /// opening in three, leaving the Ctrl+K bar up with the keyboard behind it.
+    ///
+    /// The two orders are the test, because settling only one of them is what a
+    /// flag would have done: a hand-back scheduled *before* a claim must stand
+    /// down, and one scheduled after an older claim must still fire.
+    #[test]
+    fn a_deferred_hand_back_stands_down_for_a_claim_taken_after_it() {
+        // Queued first, then overtaken — the order in which the grid used to win.
+        let queued = keyboard_claim();
+        assert!(
+            keyboard_claim_unchanged(queued),
+            "nothing has happened yet, so the hand-back is still the latest word"
+        );
+        claim_keyboard();
+        assert!(
+            !keyboard_claim_unchanged(queued),
+            "a field took the keyboard after this hand-back was queued"
+        );
+
+        // And the other way round: a hand-back queued after that claim is the
+        // latest word and must still move focus, or closing an overlay would stop
+        // handing the keyboard back at all.
+        let queued_later = keyboard_claim();
+        assert!(keyboard_claim_unchanged(queued_later));
     }
 
     /// **Every index the app really registers must go in without complaint**,

@@ -4165,7 +4165,20 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
 /// got back into the strip. `grid_toolbar`'s `focus_icon` states the same rule for
 /// the menus, and resolves by tabindex for it.
 fn refocus_grid(gs: GridState) {
+    // **And it is a hand-back, not a claim** — so it stands down if something has
+    // taken the keyboard since it was scheduled. As the workspace's keyboard home
+    // this is queued by `widgets::hand_keyboard_back` whenever any overlay closes,
+    // the editor's right-click menu included; that menu's actions open the Ctrl+K
+    // bar, whose prompt field queues its own `exec_after(ZERO)` autofocus in the
+    // same pass. Two immediate timers, and the one that lands last wins — which
+    // was the grid about one opening in three, leaving the bar on screen with the
+    // keyboard behind it and Escape clearing a cell selection instead of closing
+    // it. See `widgets::claim_keyboard` for why the answer is a generation.
+    let since = crate::widgets::keyboard_claim();
     floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
+        if !crate::widgets::keyboard_claim_unchanged(since) {
+            return;
+        }
         // `try_get_untracked`: this is also the workspace's registered keyboard
         // home (`widgets::set_keyboard_home`), which outlives the grid that
         // registered it — a tab switch disposes the grid's scope, and a read of a

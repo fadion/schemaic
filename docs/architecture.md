@@ -6962,6 +6962,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   was parked on a removed view and **every** key was dropped until a click. The ✓ escaped it only
   because `commit_busy` isn't in the body's key. Defer the *resolution*, not just the request —
   `grid_toolbar`'s `focus_icon` says the same thing and resolves by tabindex.
+  **And a deferred hand-back stands down for a claim taken after it** — `widgets::claim_keyboard`,
+  quoted back through `keyboard_claim` / `keyboard_claim_unchanged`. Being deferred is what put
+  `refocus_grid` in a race with the *other* immediate timer the same gesture schedules:
+  `edit_field`'s autofocus. Pick **Optimize** (or any of the three AI fixes) off the editor's
+  right-click menu and one update pass opens the Ctrl+K bar — queueing its prompt field's autofocus
+  — and tears the menu panel down, whose `focus_root` cleanup calls `hand_keyboard_back`, which
+  finds no other overlay and queues the workspace's home. Two timers due immediately, scheduled
+  microseconds apart, and whichever lands last owns the keyboard: when that was the grid, the bar
+  stood open with the keyboard behind it and Escape cleared a cell selection instead of closing it.
+  It read as intermittent — about one opening in three — because it *was*. So an autofocus, and the
+  Ctrl+K bar's own two hand-offs to the editor, **claim**; `refocus_grid` snapshots the claim when
+  it is scheduled and refuses to fire if it has moved. A generation, not a "focus is held" flag,
+  because floem's `AppState::focus` is private to it and a flag of our own would need clearing by
+  every path that drops focus, floem's included; a counter answers the only question a deferred
+  mover has — *is my hand-back still the latest word on the keyboard?* — and settles the race in
+  both orders, which is the property the test pins.
   This is the durable form of what
   `set_menu_return` does for one case: fixing the sites one at a time is what produced the tree's
   cursor regression below.
