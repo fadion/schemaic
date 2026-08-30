@@ -16,6 +16,7 @@ use floem::reactive::{Scope, create_effect};
 use floem::style::{CursorStyle, ScaleX, ScaleY, Transition, TranslateX};
 use floem::unit::PxPct;
 
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::transcript::{
     Recall, RecallDir, Seg, ToolCall, TurnStats, recall_apply, user_prompts,
 };
@@ -125,6 +126,28 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     );
                 };
                 crate::ddl_preview::preview_proposal(&ui, &db, &proposal)
+            })
+        },
+        // Which lexer colours a SQL block. **The tab's connection**, not the
+        // active one, for the same reason `insert` and `propose` above use it:
+        // a tab keeps the connection it was opened on, so the chat — and the SQL
+        // in it — is about that database rather than whichever connection
+        // happens to be selected in the tree.
+        dialect: {
+            let tabs = ui.tabs_ui.tabs;
+            let active = ui.tabs_ui.active;
+            let connections = ui.conn.connections;
+            floem::reactive::create_memo(move |_| {
+                let id = active.get();
+                let cid = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.conn_id.get()));
+                cid.and_then(|cid| {
+                    connections.with(|cs| {
+                        cs.iter()
+                            .find(|c| c.id == cid)
+                            .map(|c| SqlDialect::from_db_type(&c.db_type))
+                    })
+                })
+                .unwrap_or_default()
             })
         },
     };

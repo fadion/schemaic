@@ -12,10 +12,13 @@ use std::rc::Rc;
 
 use floem::AnyView;
 use floem::prelude::*;
+use floem::reactive::Memo;
 use floem::text::{
     Attrs, AttrsList, FamilyOwned, LineHeightValue, Style as FontStyle, TextLayout, Weight,
 };
 use floem::views::{RichText, rich_text};
+
+use schemaic_core::intel::SqlDialect;
 
 use crate::{icons, theme};
 
@@ -352,7 +355,8 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                         } else {
                             let is_sql = code_is_sql(&code_lang, &trimmed);
                             out.push(
-                                code_block(trimmed, actions.clone(), &code_lang, is_sql).into_any(),
+                                code_block(trimmed, actions.clone(), &code_lang, is_sql, settled)
+                                    .into_any(),
                             );
                         }
                     }
@@ -455,6 +459,15 @@ pub(crate) struct CodeActions {
     /// the card — every failure here is the model being wrong about the table,
     /// and the card is where the user can see what it asked for.
     pub propose: Rc<dyn Fn(schemaic_core::propose::Proposal) -> Result<(), String>>,
+    /// Which lexer colours a SQL block — **the tab's** connection, for the same
+    /// reason `insert` and `propose` use it: the chat is about the tab the user
+    /// is looking at, so a code block in it is about that tab's database.
+    ///
+    /// Read untracked at build, like `InlineDiffDoc`'s: a block keeps the
+    /// dialect it was rendered with until its message rebuilds. Syntax colouring
+    /// only — no wrong text and no wrong action — and subscribing here would put
+    /// a dependency on the connection into every bubble in the conversation.
+    pub dialect: Memo<SqlDialect>,
 }
 
 /// One header action: a text link, dim until hovered, then accent. Words rather
@@ -557,7 +570,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
                         .font_size(theme::font_label())
                         .color(theme::text_muted())
                 }),
-                code_block(json, actions, "json", false),
+                code_block(json, actions, "json", false, true),
             ))
             .style(|s| s.flex_col().width_full().gap(theme::scaled(5.0)))
             .into_any();
@@ -647,15 +660,57 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
         .into_any()
 }
 
-fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> impl IntoView {
-    let body = text(code.trim_end().to_string()).style(|s| {
+fn code_block(
+    code: String,
+    actions: CodeActions,
+    lang: &str,
+    is_sql: bool,
+    settled: bool,
+) -> impl IntoView {
+    let shown = code.trim_end().to_string();
+    // **Syntax-coloured, on the editor's own surface** — the same pairing the
+    // History and Snippet previews take, through the same two accessors, because
+    // this is the same thing: SQL, read outside the editor. `theme::preview_bg`
+    // holds why both come off the editor axis rather than the UI one.
+    //
+    // **Only once the turn has settled**, and that is not a perf hedge. The
+    // bubbles rebuild on every streamed token, and mid-stream the block is
+    // syntactically incomplete: one arrived-but-unclosed quote paints every line
+    // after it as a string literal, so the block would flicker through wrong
+    // colourings on the way to the right one. Plain until it is whole, then
+    // coloured — and the per-token lex goes with it.
+    //
+    // A non-SQL block (shell, json) stays plain in any case, but takes the same
+    // surface and the same base: it is still code, and a second background for
+    // it would be two kinds of block in one conversation.
+    let base_style = |s: floem::style::Style| {
         s.width_full()
-            .font_family("monospace".to_string())
             .font_size(theme::font_body())
-            .color(theme::text())
             .padding_horiz(theme::scaled(9.0))
             .padding_vert(theme::scaled(7.0))
-    });
+    };
+    let body: AnyView = match is_sql && settled {
+        true => crate::widgets::highlight_sql_mono(
+            shown,
+            None,
+            theme::font_body,
+            theme::preview_fg,
+            CODE_LINE_H,
+            actions.dialect.get_untracked(),
+        )
+        .style(base_style)
+        .into_any(),
+        // The family and the line height are spelled the same on both paths, so
+        // a block does not change shape when it settles — only colour.
+        false => text(shown)
+            .style(move |s| {
+                base_style(s)
+                    .font_family(crate::consts::MONO_FAMILY.to_string())
+                    .line_height(CODE_LINE_H)
+                    .color(theme::preview_fg())
+            })
+            .into_any(),
+    };
 
     // What the block *is*, said once on the left. `is_sql` is the authority
     // rather than the tag, because an untagged block that starts `SELECT` is
@@ -729,7 +784,7 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
     v_stack((header, body)).style(|s| {
         s.flex_col()
             .width_full()
-            .background(theme::bg_editor())
+            .background(theme::preview_bg())
             .border(1.0)
             .border_color(theme::border())
             .border_radius(CODE_RADIUS)
@@ -739,6 +794,10 @@ fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> i
 /// Corner radius of a code block, shared by the block and its header so the two
 /// arcs agree — see the note in [`code_block`].
 const CODE_RADIUS: f64 = 5.0;
+/// Line height of a code block's text, on **both** the coloured and the plain
+/// path so a block does not reflow when the turn settles. The figure the History
+/// and Snippet previews use, for the same text at the same size.
+const CODE_LINE_H: f32 = 1.4;
 
 #[cfg(test)]
 mod tests {
