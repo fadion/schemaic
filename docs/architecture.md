@@ -4926,7 +4926,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   rows already read is stale and says nothing, the same rule `rows_read_of` follows. The offer is a
   `label`, not a `text`, for the same reason `stats` beside it is one — the total arrives from a
   catalogue query after the strip is built — and the click re-asks rather than capturing, so the
-  cap always matches the words the user just read. The re-run goes through `GridState::current_statement`, **not** `apply_grid_query`:
+  cap always matches the words the user just read.
+  **The offer takes itself off while it is being answered.** The re-run is a view run, which
+  deliberately leaves the current table on screen, so nothing else on the panel says one is
+  happening: the grid goes on looking idle and the words go on inviting a second click — a second
+  full read of the very table the label has just promised to read *all* of. `Tab::view_busy` is
+  that flag, and the app's run path owns it because only it knows when the re-run lands: set on the
+  last line before the spawn (so every early return above it leaves the flag alone), cleared on
+  every arm of the landing including `Cancelled` — a link disabled for ever is worse than one that
+  can be clicked twice — and cleared **after** the supersede check rather than before it, since a
+  run that has been replaced is not the one the flag is about any more. Whatever did the
+  superseding clears it instead, beside the `token.cancel()` in `run_query_core` and `run_all`,
+  because the superseded run returns at that check and never reaches its own clear. The label, its
+  colour and the click all read the one flag, so they cannot disagree about whether it is still a
+  link — and the click is guarded on it rather than on hover, since a pointer already over the
+  words when the first re-run started never leaves and re-enters them.
+  The re-run goes through `GridState::current_statement`, **not** `apply_grid_query`:
   the latter reports a base it cannot rewrite as a *filter* failure ("not a simple single-table
   SELECT"), and a join is perfectly re-runnable at a bigger cap — telling a user with no filter
   that their filter is at fault is worse than the cap they were trying to get past

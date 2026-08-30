@@ -1923,6 +1923,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
             }
+            // **Whatever supersedes a view re-run clears its flag**, because the
+            // superseded run returns at the generation check below and never
+            // reaches its own clear. Written beside the cancel that does the
+            // superseding rather than in the `else` branch further down, so a run
+            // that is *not* a view re-run cannot be added later without it: the
+            // flag would then stay set for ever and every later result's
+            // read-more offer would open permanently disabled. A view re-run sets
+            // it straight back a few lines below.
+            tab.view_busy.set(false);
             let token = CancellationToken::new();
             let generation = run_gen.get() + 1;
             run_gen.set(generation);
@@ -1931,6 +1940,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // Keep the current table on screen during the re-run; a fresh attempt
                 // clears any prior filter error.
                 view_err.set(None);
+                // **Nothing else on the panel says this is happening.** The table
+                // the re-run replaces stays on screen and the grid goes on looking
+                // idle, so the affordance that started it — the capped notice's
+                // "read all rows" — is still sitting there inviting a second full
+                // read of a large table. Set here, on the last line before the
+                // spawn, so every early return above it leaves the flag alone.
+                tab.view_busy.set(true);
             } else {
                 // A single run reverts the results pane to the one-grid view (any
                 // prior Run Everything tabs are cleared).
@@ -1973,6 +1989,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     }
                     tokens_done.borrow_mut().remove(&id);
                     if is_view {
+                        // Cleared for every arm, and **after** the supersede check
+                        // above rather than before it: a run that has been replaced
+                        // is not the one the flag is about any more, and clearing it
+                        // here would say "idle" over the top of the run that
+                        // replaced it. Cancelled counts as landing — nothing else
+                        // is coming, and a link left disabled for ever is worse
+                        // than one that can be clicked twice.
+                        tab.view_busy.set(false);
                         match state {
                             // Success → swap in the filtered result, then bump the load
                             // nonce so the grid rebuilds despite Loaded→Loaded. Order
@@ -2335,6 +2359,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
             }
+            // A batch supersedes a view re-run too — see the same line in
+            // `run_query_core`.
+            tab.view_busy.set(false);
             let token = CancellationToken::new();
             let generation = run_gen.get() + 1;
             run_gen.set(generation);

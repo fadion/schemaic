@@ -1168,6 +1168,21 @@ pub struct Tab {
     /// the *table* (the previous results stay put — unlike a manual run, which
     /// replaces the grid with the error). Cleared on a table click / new run.
     pub view_err: RwSignal<Option<String>>,
+    /// True while a **view re-run** is in flight — the filter/sort splice, and the
+    /// capped notice's "read all rows".
+    ///
+    /// Such a re-run deliberately leaves the current table on screen, so nothing
+    /// else on the panel says one is happening: the grid looks idle, and the
+    /// affordance that started it is still sitting there inviting a second click.
+    /// On a large table that is a second full read of it. A manual run has no
+    /// need of this — it replaces the grid with `QueryState::Running`, which is
+    /// the same statement said louder.
+    ///
+    /// Owned by the app's run path (`run_query_core`), which is the only thing
+    /// that knows when the re-run lands, and cleared by a manual run too: that
+    /// supersedes the view run, whose own landing then returns early and never
+    /// reaches its clear.
+    pub view_busy: RwSignal<bool>,
     /// Bumped on every fresh full result load (including a filter/sort re-run) so
     /// the results grid rebuilds even on a `Loaded`→`Loaded` transition — an
     /// in-place commit splice deliberately does NOT bump it, so it still avoids a
@@ -1256,6 +1271,7 @@ impl Tab {
             grid_query: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
             row_cap_override: cx.create_rw_signal(None),
             view_err: cx.create_rw_signal(None),
+            view_busy: cx.create_rw_signal(false),
             load_gen: cx.create_rw_signal(0),
             path: cx.create_rw_signal(None),
             disk_sql: cx.create_rw_signal(None),
@@ -4970,6 +4986,7 @@ fn center(ui: Ui) -> impl IntoView {
                     grid_query: tab.grid_query,
                     row_cap_override: tab.row_cap_override,
                     view_err: tab.view_err,
+                    view_busy: tab.view_busy,
                     load_gen: tab.load_gen,
                     apply_view: apply_view.clone(),
                     db_nodes,
