@@ -851,7 +851,8 @@ const ATTACH_PREVIEW_WINDOW_SHARE: f64 = 3.0;
 /// Pure, and separate from the signal read, so the arithmetic is testable — the
 /// rest of this file's sizes are style closures and none of them is.
 /// An unmeasured window (0) means "not yet" and takes the wanted size rather
-/// than guessing, the same answer [`crate::widgets::cap_to`] gives.
+/// than guessing, the same answer `widgets::cap_to` gives (module-private there,
+/// so this names it rather than linking it).
 fn attach_preview_cap(want: f64, win_h: f64) -> f64 {
     if win_h <= 1.0 {
         return want;

@@ -5271,7 +5271,7 @@ pub fn error_fix_range(sql: &str, message: &str, dialect: SqlDialect) -> (usize,
 ///   ([`locate_db_error`] takes the last `.`-segment, right for `db.table`), whose
 ///   only occurrence was inside the seed literal of the statement above.
 /// - **A quoted identifier is code**, not a literal — the same rule
-///   [`tokens_in`] follows, and skipping `` `salery` `` would give up the
+///   [`code_mask`] follows, and skipping `` `salery` `` would give up the
 ///   narrowing this exists for.
 ///
 /// Deciding on *all* the hits rather than the first plus a repeat check is what

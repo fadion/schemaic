@@ -1781,7 +1781,7 @@ pub(crate) struct QueryPaneParams {
     /// How much of the active tab's connection the assistant may see. The **tab's**
     /// connection, not the active one, for `grid::ai_data_of`'s reason. Gates the
     /// engine's error text out of the AI fix and Explain prompts on any level
-    /// below `Full` — see [`prompt::result_shape`](schemaic_core::prompt::result_shape).
+    /// below `Full` — see [`schemaic_core::prompt::result_shape`].
     pub ai_data: Memo<schemaic_core::connection::AiData>,
     pub active_db_menu_open: RwSignal<bool>,
     pub active_db_anchor: RwSignal<Point>,
