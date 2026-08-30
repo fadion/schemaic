@@ -16,10 +16,17 @@ tokio-util = { workspace = true }
 russh = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+rustls-native-certs = { workspace = true }
 webpki-roots = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 ssh-key = { workspace = true }
 tracing = { workspace = true }
+
+# For `examples/tls_matrix.rs` only: it prints the crate's own debug logs, which
+# is where "N trust anchors from the OS store" comes from — the first thing to
+# check when a verified connection fails and the server looks fine.
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -930,9 +930,9 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                         151,
                     ),
                     form_hint(
-                        "Leave empty to trust the bundled public root certificates. \
-                         A private or company CA has to be named here — the operating \
-                         system's certificate store is not consulted.",
+                        "Leave empty to trust the certificate authorities your \
+                         operating system trusts, including any your organisation \
+                         installed. Name a file to trust that one instead.",
                     ),
                 ))
                 .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())

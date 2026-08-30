@@ -65,6 +65,18 @@ fn connection(db_type: &str, host: &str, port: u16, tls: Tls) -> Connection {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // The crate's own debug logs, which include how many trust anchors were
+    // loaded and from where. When a verified connection fails against a server
+    // that looks fine, that line is the first thing worth reading.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "schemaic_db=debug".into()),
+        )
+        .with_target(false)
+        .without_time()
+        .init();
+
     let host = env("TLS_HOST", "schemaic-tls.test");
     let ca = env("TLS_CA", "/etc/schemaic-tls/ca.crt");
     let wrong_ca = env("TLS_WRONG_CA", &ca.replace("ca.crt", "otherca.crt"));
