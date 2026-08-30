@@ -3441,9 +3441,10 @@ pub(crate) fn menu_anchored_at(
 /// from.
 #[derive(Clone, Copy)]
 pub(crate) struct PopupChannel {
-    /// Reached as `menus.popup` — the field name is what
-    /// [`popup_anchor_gate`] scans for (`popup.set(Some(`), so this opener is on
-    /// its list too.
+    /// Reached as `menus.popup` — the field name is what the
+    /// `popup_anchor_gate` source gate scans for (`popup.set(Some(`), so this
+    /// opener is on its list too. Named rather than linked: a `#[cfg(test)]`
+    /// module is not there to link to in a doc build.
     pub menus: MenuFlags,
     pub anchor: RwSignal<Option<crate::PopupAnchor>>,
     pub width: RwSignal<f64>,
