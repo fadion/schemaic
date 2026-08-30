@@ -61,6 +61,7 @@ use schemaic_core::schema::{
 };
 use schemaic_core::sql;
 use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
@@ -77,6 +78,18 @@ const PG: SqlDialect = SqlDialect::Postgres;
 /// The background connection driver is spawned onto the tokio runtime and lives
 /// until the returned [`Client`] is dropped.
 pub(crate) async fn connect_to(db: &Db, database: &str) -> Result<Client, DbError> {
+    connect_probe(db, database).await.map_err(|(e, _)| e)
+}
+
+/// [`connect_to`], with the extra bit [`connect_maintenance`] needs: whether
+/// trying a **different database** could plausibly succeed.
+///
+/// Without it the probe repeats a doomed connect once per candidate. Against
+/// Aiven that meant four TLS handshakes across Europe to learn one thing the
+/// first already knew, inside a budget bounded for the whole sequence — so a
+/// certificate the user had misconfigured reported "timed out" instead of
+/// naming the certificate.
+async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool)> {
     let mut cfg = Config::new();
     cfg.host(&db.host)
         .port(db.port)
@@ -90,10 +103,40 @@ pub(crate) async fn connect_to(db: &Db, database: &str) -> Result<Client, DbErro
 
     // The two arms differ only in the connector's *type*, which is why they
     // cannot be one expression.
-    match db.tls_plan() {
-        None => spawn_connection(cfg.connect(NoTls).await),
-        Some(plan) => spawn_connection(cfg.connect(crate::tls::pg_connector(plan)?).await),
-    }
+    let connected = match db.tls_plan() {
+        None => cfg.connect(NoTls).await.map(spawn_connection),
+        Some(plan) => {
+            // A TLS setup failure is ours, not the server's — no database
+            // changes it.
+            let connector = crate::tls::pg_connector(plan).map_err(|e| (e, false))?;
+            cfg.connect(connector).await.map(spawn_connection)
+        }
+    };
+
+    connected.map_err(|e| {
+        let retry = another_database_might_work(e.code());
+        (DbError::Connect(error_chain(&e)), retry)
+    })
+}
+
+/// Is this failure about the *database* we asked for, rather than the server,
+/// the transport or the user?
+///
+/// Two codes qualify and no others. `3D000` is the database not existing.
+/// `28000` is `pg_hba.conf` refusing the connection — which reads like an
+/// authentication failure but is matched **per database**, so it is exactly the
+/// case another candidate can fix, and exactly what a hosted provider answers
+/// for a database it does not publish.
+///
+/// A wrong password (`28P01`) deliberately does not qualify: it is the same
+/// wrong password for every database, and retrying it three more times is three
+/// more failed logins against whatever is counting them.
+fn another_database_might_work(code: Option<&SqlState>) -> bool {
+    matches!(
+        code,
+        Some(&SqlState::INVALID_CATALOG_NAME)
+            | Some(&SqlState::INVALID_AUTHORIZATION_SPECIFICATION)
+    )
 }
 
 /// Drive a freshly-opened connection in the background and hand back its client.
@@ -102,19 +145,18 @@ pub(crate) async fn connect_to(db: &Db, database: &str) -> Result<Client, DbErro
 /// [`connect_to`] share one body; the connection future completes when the
 /// client drops.
 fn spawn_connection<S, T>(
-    connected: Result<(Client, tokio_postgres::Connection<S, T>), tokio_postgres::Error>,
-) -> Result<Client, DbError>
+    (client, connection): (Client, tokio_postgres::Connection<S, T>),
+) -> Client
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (client, connection) = connected.map_err(|e| DbError::Connect(error_chain(&e)))?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::debug!("postgres connection closed: {e}");
         }
     });
-    Ok(client)
+    client
 }
 
 /// An error together with everything it was caused by, joined into one line.
@@ -166,9 +208,14 @@ pub(crate) async fn cancel_query(db: &Db, token: &tokio_postgres::CancelToken) {
 pub(crate) async fn connect_maintenance(db: &Db) -> Result<Client, DbError> {
     let mut last: Option<DbError> = None;
     for cand in maintenance_candidates(db.database(), &db.user) {
-        match connect_to(db, cand).await {
+        match connect_probe(db, cand).await {
             Ok(c) => return Ok(c),
-            Err(e) => last = Some(e),
+            // The server answered about *this database*; another may work.
+            Err((e, true)) => last = Some(e),
+            // Anything else — the transport, the host, the password — is the
+            // same answer for every candidate, and the caller is better served
+            // by that error now than by the last one three round trips later.
+            Err((e, false)) => return Err(e),
         }
     }
     Err(last.unwrap_or_else(|| DbError::Connect("no maintenance database reachable".to_string())))
@@ -3043,6 +3090,31 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             self.1.as_deref().map(|l| l as &dyn std::error::Error)
         }
+    }
+
+    /// The probe exists to find a database, so it may only repeat itself for a
+    /// failure that is *about* the database. `pg_hba` refusal is the one that
+    /// looks like it should not qualify and must: it reads as an authentication
+    /// error and is matched per database, which is precisely what a hosted
+    /// provider answers for one it does not publish.
+    #[test]
+    fn only_a_database_level_failure_is_worth_another_candidate() {
+        assert!(another_database_might_work(Some(
+            &SqlState::INVALID_CATALOG_NAME
+        )));
+        assert!(another_database_might_work(Some(
+            &SqlState::INVALID_AUTHORIZATION_SPECIFICATION
+        )));
+
+        // The same wrong password for every database, and three more failed
+        // logins against whatever is counting them.
+        assert!(!another_database_might_work(Some(
+            &SqlState::INVALID_PASSWORD
+        )));
+        // No SQLSTATE at all: the server never answered. A TLS rejection, a
+        // refused socket, a wrong host — repeating it four times is how a
+        // misconfigured certificate came to report "timed out".
+        assert!(!another_database_might_work(None));
     }
 
     /// The configured database goes first, because on a provider that permits
