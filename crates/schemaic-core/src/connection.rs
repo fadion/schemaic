@@ -536,6 +536,65 @@ impl Tls {
         }
         Some(&self.ca_path)
     }
+
+    /// How the handshake should be performed, or `None` for "connect in
+    /// plaintext" — the whole of this setting, resolved once.
+    ///
+    /// The drivers speak different dialects of the same four decisions (MySQL
+    /// takes two `danger_*` toggles on an `SslOpts`; Postgres takes an `SslMode`
+    /// plus a rustls verifier), and translating five modes into each of them
+    /// separately is how `verify-ca` ends up meaning one thing on one engine and
+    /// another on the other. They translate a [`TlsPlan`] instead, so the
+    /// *decisions* are made here, once, where they are unit-tested without a
+    /// server.
+    pub fn plan(&self) -> Option<TlsPlan> {
+        if !self.mode.negotiates_tls() {
+            return None;
+        }
+        Some(TlsPlan {
+            fallback_to_plaintext: !self.mode.requires_tls(),
+            accept_invalid_certs: !self.mode.verifies_certificate(),
+            skip_hostname_check: !self.mode.verifies_hostname(),
+            root_ca: self.ca_file().map(str::to_string),
+            client_identity: self
+                .uses_client_cert()
+                .then(|| (self.client_cert_path.clone(), self.client_key_path.clone())),
+            hostname_override: None,
+        })
+    }
+}
+
+/// A resolved [`Tls`] — what a driver is actually configured from.
+///
+/// Deliberately *not* the mode: by the time a driver sees this, the five modes
+/// have already collapsed into the four independent decisions a handshake is
+/// made of, so no driver has to re-derive "does verify-ca check the hostname"
+/// and no driver can get a different answer.
+/// Serializable because the MCP subprocess is handed its endpoint as a JSON blob
+/// over the environment, and a handoff that dropped this would run the user's
+/// own queries over plaintext against a server they configured for TLS.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsPlan {
+    /// May the connection be retried in plaintext when TLS is unavailable?
+    /// True for [`SslMode::Prefer`] and nothing else.
+    pub fallback_to_plaintext: bool,
+    /// Accept a certificate that does not chain to a trusted root.
+    pub accept_invalid_certs: bool,
+    /// Accept a certificate that does not name the host we asked for.
+    pub skip_hostname_check: bool,
+    /// PEM file of roots to trust; `None` means the platform's own root set.
+    pub root_ca: Option<String>,
+    /// `(certificate, key)` paths to offer as this client's identity.
+    pub client_identity: Option<(String, String)>,
+    /// The name the certificate must be *checked against*, when that is not the
+    /// host being dialled.
+    ///
+    /// Exists for one situation, and it is not exotic: an SSH tunnel rewrites the
+    /// endpoint to `127.0.0.1:<local port>`, so `verify-full` would compare the
+    /// server's certificate against `127.0.0.1` and reject a perfectly good
+    /// certificate naming the real host. Set by whoever performs the rewrite, in
+    /// the same step — see `schemaic_db::Db::connect`.
+    pub hostname_override: Option<String>,
 }
 
 /// A saved connection to a database server.
@@ -681,6 +740,16 @@ impl Connection {
     /// driver.
     pub fn uses_tls(&self) -> bool {
         self.tls.mode.negotiates_tls() && !is_sqlite(&self.db_type)
+    }
+
+    /// How this connection's handshake should be performed, or `None` for
+    /// plaintext — [`Tls::plan`] asked through [`Self::uses_tls`], so the engine
+    /// settles it before the mode is consulted.
+    ///
+    /// **The one entry point for the drivers.** Reaching for `conn.tls.plan()`
+    /// instead would plan a handshake for a SQLite file.
+    pub fn tls_plan(&self) -> Option<TlsPlan> {
+        self.uses_tls().then(|| self.tls.plan()).flatten()
     }
 
     /// The whole path of a SQLite connection's file, empty for any other engine.
@@ -1897,6 +1966,98 @@ mod tls_tests {
 
         t.ca_path = String::new();
         assert_eq!(t.ca_file(), None, "empty means the system roots");
+    }
+
+    /// The plan is what every driver is actually configured from, so this is the
+    /// table the whole feature reduces to. Written out mode by mode rather than
+    /// derived from the predicates, because a plan computed from the same
+    /// expression it is checked against would agree with itself no matter what
+    /// either said.
+    #[test]
+    fn each_mode_plans_the_handshake_it_promises() {
+        let of = |mode| {
+            Tls {
+                mode,
+                ..Tls::default()
+            }
+            .plan()
+        };
+
+        assert!(of(SslMode::Disable).is_none(), "disable never handshakes");
+
+        let prefer = of(SslMode::Prefer).expect("prefer handshakes");
+        assert!(prefer.fallback_to_plaintext);
+        assert!(prefer.accept_invalid_certs);
+        assert!(prefer.skip_hostname_check);
+
+        let require = of(SslMode::Require).expect("require handshakes");
+        assert!(!require.fallback_to_plaintext, "require may not fall back");
+        assert!(require.accept_invalid_certs);
+        assert!(require.skip_hostname_check);
+
+        let ca = of(SslMode::VerifyCa).expect("verify-ca handshakes");
+        assert!(!ca.fallback_to_plaintext);
+        assert!(!ca.accept_invalid_certs, "the chain is checked");
+        assert!(ca.skip_hostname_check, "but the name is not");
+
+        let full = of(SslMode::VerifyFull).expect("verify-full handshakes");
+        assert!(!full.fallback_to_plaintext);
+        assert!(!full.accept_invalid_certs);
+        assert!(!full.skip_hostname_check, "the name is checked too");
+    }
+
+    /// Only [`SslMode::Prefer`] may quietly end up unencrypted. Stated as its own
+    /// property because it is the one that would make the whole setting a lie:
+    /// a `require` that fell back looks identical to a `require` that worked.
+    #[test]
+    fn only_prefer_may_end_up_in_plaintext() {
+        for m in SslMode::ALL {
+            let planned_fallback = Tls {
+                mode: m,
+                ..Tls::default()
+            }
+            .plan()
+            .is_some_and(|p| p.fallback_to_plaintext);
+            assert_eq!(planned_fallback, m == SslMode::Prefer, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn the_plan_carries_the_files_the_mode_actually_uses() {
+        let mut t = Tls {
+            mode: SslMode::VerifyFull,
+            ca_path: "/etc/ca.crt".into(),
+            client_cert_path: "/c.crt".into(),
+            client_key_path: "/c.key".into(),
+            client_key_passphrase: "pw".into(),
+        };
+        let p = t.plan().expect("handshakes");
+        assert_eq!(p.root_ca.as_deref(), Some("/etc/ca.crt"));
+        assert_eq!(
+            p.client_identity,
+            Some(("/c.crt".to_string(), "/c.key".to_string()))
+        );
+
+        // A non-verifying mode has nothing to verify the CA against, so the path
+        // is not carried — but the client identity still is, since offering one
+        // is unrelated to checking theirs.
+        t.mode = SslMode::Require;
+        let p = t.plan().expect("handshakes");
+        assert_eq!(p.root_ca, None);
+        assert!(p.client_identity.is_some());
+    }
+
+    /// A connection is planned through the engine, not the mode: SQLite is a
+    /// local file, and a `verify-full` left on it by the engine picker must not
+    /// reach a driver that would then look for a CA file.
+    #[test]
+    fn a_sqlite_connection_plans_no_handshake() {
+        let mut c = conn();
+        c.tls.mode = SslMode::VerifyFull;
+        assert!(c.tls_plan().is_some());
+
+        c.db_type = "SQLite".into();
+        assert!(c.tls_plan().is_none());
     }
 
     /// A **tripwire**, not a behaviour test. `Tls` grows fields, and every one of

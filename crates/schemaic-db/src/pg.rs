@@ -82,18 +82,82 @@ pub(crate) async fn connect_to(db: &Db, database: &str) -> Result<Client, DbErro
         .port(db.port)
         .user(&db.user)
         .password(&db.pass)
-        .dbname(database);
-    let (client, connection) = cfg
-        .connect(NoTls)
-        .await
-        .map_err(|e| DbError::Connect(e.to_string()))?;
-    // Drive the connection in the background; it completes when `client` drops.
+        .dbname(database)
+        // `Prefer` here is what implements the mode of the same name: unlike
+        // MySQL, the Postgres driver negotiates the downgrade itself, so no
+        // retry of ours is involved and `require` upward cannot fall back.
+        .ssl_mode(crate::tls::pg_ssl_mode(db.tls_plan()));
+
+    // The two arms differ only in the connector's *type*, which is why they
+    // cannot be one expression.
+    match db.tls_plan() {
+        None => spawn_connection(cfg.connect(NoTls).await),
+        Some(plan) => spawn_connection(cfg.connect(crate::tls::pg_connector(plan)?).await),
+    }
+}
+
+/// Drive a freshly-opened connection in the background and hand back its client.
+///
+/// Generic over the stream type so the plaintext and rustls arms of
+/// [`connect_to`] share one body; the connection future completes when the
+/// client drops.
+fn spawn_connection<S, T>(
+    connected: Result<(Client, tokio_postgres::Connection<S, T>), tokio_postgres::Error>,
+) -> Result<Client, DbError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (client, connection) = connected.map_err(|e| DbError::Connect(error_chain(&e)))?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::debug!("postgres connection closed: {e}");
         }
     });
     Ok(client)
+}
+
+/// An error together with everything it was caused by, joined into one line.
+///
+/// `tokio_postgres::Error`'s own `Display` is a *category* — a failed TLS
+/// handshake renders as exactly "error performing TLS handshake", with the
+/// reason (unknown issuer, expired, wrong name) only in `source()`. That is the
+/// whole content of the message for the failures this driver's TLS support
+/// exists to produce, so the chain is walked rather than the head printed.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Some wrappers restate their cause verbatim; repeating it reads like
+        // two separate problems.
+        if !msg.ends_with(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        source = cause.source();
+    }
+    msg
+}
+
+/// Best-effort query cancellation, over the same transport the query itself
+/// used.
+///
+/// Postgres cancellation opens a *second* connection, so a server configured to
+/// refuse plaintext refuses this one too — a `NoTls` cancel would simply stop
+/// working for every TLS user, silently, since the result is discarded.
+pub(crate) async fn cancel_query(db: &Db, token: &tokio_postgres::CancelToken) {
+    match db.tls_plan() {
+        None => {
+            let _ = token.cancel_query(NoTls).await;
+        }
+        Some(plan) => match crate::tls::pg_connector(plan) {
+            Ok(connector) => {
+                let _ = token.cancel_query(connector).await;
+            }
+            Err(e) => tracing::debug!("cancel skipped, TLS setup failed: {e:?}"),
+        },
+    }
 }
 
 /// Connect to a *maintenance* database for server-level work (listing databases,
@@ -179,7 +243,7 @@ pub(crate) async fn fetch_query(
         Some(d) => connect_to(db, d).await?,
         None => connect_maintenance(db).await?,
     };
-    run_statement(&client, database.unwrap_or(""), sql, dest, &cancel).await
+    run_statement(db, &client, database.unwrap_or(""), sql, dest, &cancel).await
 }
 
 /// Run several statements in order on ONE connection, so session state carries
@@ -223,6 +287,7 @@ pub(crate) async fn run_batch(
             continue;
         }
         let outcome = run_statement(
+            db,
             &client,
             database.unwrap_or(""),
             sql,
@@ -340,6 +405,7 @@ pub(crate) async fn explain(
         .await
         .map_err(|e| db_err(&e))?;
     let out = run_statement(
+        db,
         &client,
         database.unwrap_or(""),
         &format!("EXPLAIN ANALYZE {stmt}"),
@@ -405,6 +471,7 @@ pub(crate) async fn run_ddl(
 }
 
 pub(crate) async fn run_statement(
+    db: &Db,
     client: &Client,
     database: &str,
     sql: &str,
@@ -493,7 +560,7 @@ pub(crate) async fn run_statement(
     let stream = tokio::select! {
         r = client.simple_query_raw(sql) => r.map_err(|e| db_err(&e))?,
         _ = cancel.cancelled() => {
-            let _ = token.cancel_query(NoTls).await;
+            cancel_query(db, &token).await;
             return Err(DbError::Cancelled);
         }
     };
@@ -536,7 +603,7 @@ pub(crate) async fn run_statement(
         let next = tokio::select! {
             n = stream.next() => n,
             _ = cancel.cancelled() => {
-                let _ = token.cancel_query(NoTls).await;
+                cancel_query(db, &token).await;
                 return Err(DbError::Cancelled);
             }
         };
@@ -970,7 +1037,7 @@ pub(crate) async fn count_rows(
     let rows = tokio::select! {
         r = query_all(&client, sql) => r?,
         _ = cancel.cancelled() => {
-            let _ = token.cancel_query(NoTls).await;
+            cancel_query(db, &token).await;
             return Err(DbError::Cancelled);
         }
     };
@@ -1153,7 +1220,7 @@ pub(crate) async fn fetch_schema(
     tokio::select! {
         r = collect_schema(&client) => r,
         _ = cancel.cancelled() => {
-            let _ = token.cancel_query(NoTls).await;
+            cancel_query(db, &token).await;
             Err(DbError::Cancelled)
         }
     }
@@ -2655,7 +2722,7 @@ pub(crate) async fn import_rows(
     tokio::select! {
         r = import_on(&client, &target, rows) => r,
         _ = cancel.cancelled() => {
-            let _ = token.cancel_query(NoTls).await;
+            cancel_query(db, &token).await;
             // Explicit, like every other exit in `import_on` — the drop would
             // abort the transaction too, but it leaves it open until the
             // connection actually goes away, holding its locks meanwhile.
@@ -2762,7 +2829,7 @@ pub(crate) async fn commit_writes(
     tokio::select! {
         r = write_on(&client, write, TxScope::Own) => r,
         _ = cancel.cancelled() => {
-            let _ = token.cancel_query(NoTls).await;
+            cancel_query(db, &token).await;
             Err(DbError::Cancelled)
         }
     }
@@ -2853,7 +2920,7 @@ pub(crate) async fn refetch_rows(
     tokio::select! {
         r = refetch_on(&client, template, rows) => r,
         _ = cancel.cancelled() => {
-            let _ = token.cancel_query(NoTls).await;
+            cancel_query(db, &token).await;
             Err(DbError::Cancelled)
         }
     }
@@ -2932,6 +2999,57 @@ pub(crate) async fn refetch_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A synthetic chain, because a `tokio_postgres::Error` cannot be built by
+    /// hand — and the property under test is the walk, not the driver.
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as &dyn std::error::Error)
+        }
+    }
+
+    /// The reason a TLS handshake failed lives only in `source()`, so a message
+    /// built from the head alone says "error performing TLS handshake" and
+    /// nothing else — for every one of the failures this feature exists to
+    /// produce.
+    #[test]
+    fn a_connect_error_carries_what_caused_it() {
+        let e = Layer(
+            "error performing TLS handshake",
+            Some(Box::new(Layer(
+                "invalid peer certificate: UnknownIssuer",
+                None,
+            ))),
+        );
+        assert_eq!(
+            error_chain(&e),
+            "error performing TLS handshake: invalid peer certificate: UnknownIssuer"
+        );
+    }
+
+    /// A wrapper that restates its cause would otherwise read as two problems.
+    #[test]
+    fn a_cause_already_spelled_out_is_not_repeated() {
+        let e = Layer(
+            "connection closed: broken pipe",
+            Some(Box::new(Layer("broken pipe", None))),
+        );
+        assert_eq!(error_chain(&e), "connection closed: broken pipe");
+    }
+
+    #[test]
+    fn an_error_with_no_cause_is_left_alone() {
+        assert_eq!(error_chain(&Layer("plain", None)), "plain");
+    }
 
     /// The decision this pins lives in the SQL string, so the string is the
     /// subject — a `from_pg_rows` case is a level too low to see it.

@@ -42,13 +42,26 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"
 tokio-util = "0.7"
 # Async MySQL/MariaDB driver. We need per-column wire metadata (org_table /
 # org_name / key flags) for the editing system — sqlx's MySQL driver discards it.
-# `minimal` = no TLS/compression (the app connects over localhost SSH tunnels /
-# plain TCP, matching the old sqlx config which enabled no TLS either).
-mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
-# Async PostgreSQL driver (second engine). `NoTls` — the app reaches Postgres over
-# localhost / SSH tunnels / plain TCP, matching the MySQL driver's no-TLS config.
-# Result values come back over the simple-query (text) protocol, so NUMERIC and any
-# exotic type round-trip losslessly as their text form (mirrors the MySQL text path).
+# `minimal` = no compression; `rustls-tls` is the TLS backend, chosen over
+# `native-tls-tls` so a Linux release binary needs no system OpenSSL and the
+# handshake behaves identically on both platforms — see `db::tls`.
+#
+# **0.37, not 0.34, for a dependency reason rather than an API one** (the bump
+# was a drop-in: not one call site changed). 0.34 declares its `rustls`
+# dependency with default features, which enables rustls' `aws_lc_rs` provider —
+# the aws-lc-sys C/cmake/NASM build this workspace avoids everywhere else, *and*
+# a second provider alongside the `ring` that velopack → ureq already selects.
+# Two providers is not merely redundant: `ClientConfig::builder()` cannot then
+# name one from crate features and panics at the first handshake unless a
+# process-level default is installed. 0.37 declares it `default-features =
+# false`, so the tree has exactly one provider and nothing to install.
+mysql_async = { version = "0.37", default-features = false, features = [
+    "minimal",
+    "rustls-tls",
+] }
+# Async PostgreSQL driver (second engine). Result values come back over the
+# simple-query (text) protocol, so NUMERIC and any exotic type round-trip
+# losslessly as their text form (mirrors the MySQL text path).
 tokio-postgres = "0.7"
 futures-util = "0.3"
 # SQLite (third engine). `bundled` compiles SQLite's own amalgamation in, so there
@@ -61,6 +74,28 @@ futures-util = "0.3"
 # call runs inside `spawn_blocking`; that suits the one-connection-per-operation
 # invariant, which already opens and closes a connection per call.
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+# TLS for the two networked engines. One stack for both, so `verify-ca` and
+# `verify-full` mean the same thing whichever engine is behind them — the
+# alternative is two verifiers with two sets of edge cases and one test-bed that
+# only ever exercised one of them.
+#
+# `ring` rather than the default `aws-lc-rs`, for the same reason russh below
+# pins it: it avoids the aws-lc-sys C/cmake/NASM build in CI. Every crate in the
+# tree that reaches rustls must agree — features are additive, so one
+# default-featured dependency enables the second provider for everybody, and
+# rustls then refuses to pick one from crate features at all. `cargo tree -e
+# features -i rustls` is the check; exactly one `rustls feature "…"` provider
+# line should appear.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+tokio-postgres-rustls = "0.13"
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
 # `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
