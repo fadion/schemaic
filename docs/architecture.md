@@ -3067,6 +3067,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   everything".
   SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
+  **PostgreSQL cannot connect without naming a database**, which is protocol rather than
+  preference and stayed invisible while almost every server had a `postgres` one anybody could
+  reach — so `connect_maintenance` guessed at that, the username and `template1` for server-level
+  work. A hosted provider need not publish any of them: on Aiven only `defaultdb` is permitted,
+  every guess is refused by `pg_hba`, and the server was unreachable with nothing in the form to
+  correct it (Test connection, the database list and the schema tree all route through that probe).
+  `Connection::database` is the fix, read through `default_database` so SQLite — whose file *is*
+  its database — answers `None` however the engine picker left the field. It is the probe's
+  **first** candidate rather than its only one, since a database since dropped should degrade to
+  the old guesses instead of locking the user out of the server; `maintenance_candidates` holds
+  that order, deduplicated and without an empty username, as a tested decision rather than a
+  literal inside an I/O loop. On MySQL the same field is the database a connection opens in when
+  none is selected, and a *fallback* rather than an override — an operation that named one is
+  working in it. MySQL stays strict where Postgres cannot be: a database that does not exist fails
+  with `Unknown database 'x'`, which beats silently opening nowhere, and Postgres has no such
+  option because it must connect somewhere. The probe also **stops early**: only a database-level
+  failure (`3D000`, or `28000`, which reads as an auth error but is matched per database) is worth
+  another candidate, because repeating a rejected certificate or a wrong password once per
+  candidate is how a misconfigured certificate came to report "timed out" rather than naming
+  itself.
   **`tls.rs` translates a connection's TLS settings into the two networked drivers**, and only
   translates: the decisions were already made by `core::connection::Tls::plan`, which collapses the
   five libpq `sslmode` levels into the four booleans a handshake is actually made of. The drivers
