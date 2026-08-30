@@ -25,7 +25,8 @@ use std::sync::Arc;
 use mysql_async::{ClientIdentity, SslOpts};
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use schemaic_core::connection::TlsPlan;
 use tokio_postgres::config::SslMode as PgSslMode;
@@ -174,20 +175,26 @@ fn root_store(ca_path: Option<&str>) -> Result<RootCertStore, DbError> {
     Ok(store)
 }
 
+/// PEM parsing goes through `rustls-pki-types`' own `PemObject`, not the
+/// `rustls-pemfile` crate — which is unmaintained (RUSTSEC-2025-0134) precisely
+/// because this is where it moved.
+///
+/// The file is read here rather than through `pem_file_iter` so the error can
+/// name the path: "cannot read certificate file …" is the message for the most
+/// common way to misconfigure this, and the library's own is not.
 fn read_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, DbError> {
     let pem = std::fs::read(path)
         .map_err(|e| DbError::Connect(format!("cannot read certificate file {path}: {e}")))?;
-    rustls_pemfile::certs(&mut pem.as_slice())
+    CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DbError::Connect(format!("{path} is not a PEM certificate file: {e}")))
 }
 
-fn read_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, DbError> {
+fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, DbError> {
     let pem = std::fs::read(path)
         .map_err(|e| DbError::Connect(format!("cannot read key file {path}: {e}")))?;
-    rustls_pemfile::private_key(&mut pem.as_slice())
-        .map_err(|e| DbError::Connect(format!("{path} is not a PEM private key: {e}")))?
-        .ok_or_else(|| DbError::Connect(format!("{path} contains no private key")))
+    PrivateKeyDer::from_pem_slice(&pem)
+        .map_err(|e| DbError::Connect(format!("{path} is not a PEM private key: {e}")))
 }
 
 /// Verifies nothing at all — for `prefer` and `require`, which encrypt without

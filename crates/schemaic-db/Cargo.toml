@@ -15,7 +15,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 russh = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
