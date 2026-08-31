@@ -27,8 +27,8 @@ use schemaic_core::conn_import::{ImportNote, Imported, Skipped};
 
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_button_icon, autohide, control_button,
-    focus_root_with_ring, form_hint, form_label_style, modal_h, modal_pad_h, modal_title, modal_w,
-    panel_style,
+    focus_root_with_ring, form_hint, form_label_style, link_button, modal_h, modal_pad_h,
+    modal_title, modal_w, panel_style,
 };
 use crate::{FieldCfg, Ui, edit_field, icons, theme};
 
@@ -300,51 +300,15 @@ fn found_header(imp: crate::ConnImportUi, ring: FocusRing) -> impl IntoView {
     .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)))
 }
 
-/// A word of clickable text that keeps its Tab stop and its focus ring.
-///
-/// `in_ring_button` is what makes it more than a `text().on_click`: a link a
-/// keyboard user cannot reach is a control only half the users have, and these
-/// two are the only way to change the selection without clicking every row.
-fn link_button(
-    label: &'static str,
-    color: fn() -> floem::peniko::Color,
-    ring: FocusRing,
-    tabindex: u32,
-    action: impl Fn() + Clone + 'static,
-) -> impl IntoView {
-    let clicked = action.clone();
-    crate::widgets::in_ring_button(
-        // **The colour lives on the container, not on the text.** `color` is
-        // inherited, so a child that sets its own shadows the parent's — and the
-        // hover below is on the parent, which is what left this link with no
-        // hover state at all. Every row-like control in this file and in
-        // `manage_modal` colours the parent and lets the label inherit.
-        container(text(label).style(|s| s.font_size(theme::font_hint())))
-            .on_click_stop(move |_| clicked())
-            .style(move |s| {
-                s.items_center()
-                    .padding_horiz(theme::scaled(2.0))
-                    .color(color())
-                    .hover(|s| s.color(theme::text()))
-            }),
-        ring,
-        tabindex,
-        true,
-        4.0,
-        action,
-    )
-}
-
 /// One proposed connection: a tick box, where it points, its engine and source,
 /// and whatever is missing from it.
 ///
 /// Nothing in it is rebuilt as the selection moves — the box changes by style
-/// alone (see [`check_box`]), which is the dump modal's table-picker rule and
-/// holds for its reason: a row rebuilt under the pointer takes itself apart
-/// mid-click.
+/// alone (see [`crate::widgets::check_box`]), which is the dump modal's
+/// table-picker rule and holds for its reason: a row rebuilt under the pointer
+/// takes itself apart mid-click.
 fn import_row(chosen: RwSignal<HashSet<usize>>, index: usize, imp: Imported) -> impl IntoView {
     let is_in = move || chosen.with(|c| c.contains(&index));
-    let (box_in, check_in) = (is_in, is_in);
 
     // Every note, joined: a row can be both already-saved and password-less, and
     // showing only the first would hide the one that decides whether to tick it.
@@ -391,7 +355,7 @@ fn import_row(chosen: RwSignal<HashSet<usize>>, index: usize, imp: Imported) -> 
     });
 
     h_stack((
-        check_box(box_in, check_in),
+        crate::widgets::check_box(is_in),
         detail,
         // Engine then source, right-aligned: what it is, and who told us. Both
         // are one short word, and both are what the eye scans a mixed list by.
@@ -439,47 +403,6 @@ fn row_target(c: &schemaic_core::connection::Connection) -> String {
         out.push_str(c.database.trim());
     }
     out
-}
-
-/// The ticked/unticked box: a filled square with a white check when in, an empty
-/// outline when out.
-///
-/// One box that changes colour rather than two glyphs swapped, and both halves
-/// are style rather than a rebuild — nothing beside it can move by a pixel, and
-/// a row cannot take itself apart under the pointer mid-click.
-///
-/// **The toggle's colours, not the accent's.** `toggle_on` + `toggle_handle_on`
-/// are what "this is on" already looks like everywhere else in the app, and they
-/// are a *pair*: the second is white in both themes precisely because it is
-/// drawn on the first. Reaching for `accent()` and `btn_primary_text()` instead
-/// looks right in a palette and is not — `btn_primary_text` is the light blue a
-/// Primary button's label wears on its own dark navy fill, and on a saturated
-/// box it left a check nobody could see. Add [`icons::CHECK_BOLD`] to that, and
-/// the tick had neither weight nor contrast.
-fn check_box(
-    filled: impl Fn() -> bool + 'static,
-    checked: impl Fn() -> bool + 'static,
-) -> impl IntoView {
-    container(icons::icon(icons::CHECK_BOLD, 11.0).style(move |s| {
-        let s = s.color(theme::toggle_handle_on());
-        if checked() { s } else { s.hide() }
-    }))
-    .style(move |s| {
-        let s = s
-            .width(theme::scaled(15.0))
-            .height(theme::scaled(15.0))
-            .flex_shrink(0.0_f32)
-            .items_center()
-            .justify_center()
-            .border(1.0)
-            .border_radius(4.0);
-        if filled() {
-            s.background(theme::toggle_on())
-                .border_color(theme::toggle_on())
-        } else {
-            s.border_color(theme::control_border())
-        }
-    })
 }
 
 /// A small pill of dim text — the engine and the source, on the right of a row.

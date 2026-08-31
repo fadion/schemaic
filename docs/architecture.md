@@ -3208,6 +3208,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     to be compact says so with this metric and never with a literal.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
+    `check_box` — **the app's one checkbox**, drawn by every multi-select list there is (the import
+    review list and the dump modal's table picker), so a picker cannot quietly grow a second look;
+    it fills and empties **by style, never a rebuild**, which is why its `checked` predicate is
+    `Clone` (the fill and the tick each need their own copy inside their own reactive closure); and
+    `link_button`, the "Select all" (`accent`) / "None" (`text_muted`) pair that sits above such a
+    list — links rather than footer buttons, because they adjust the list the user is reading
+    instead of answering the modal, and `in_ring_button`-wrapped because the only other way to
+    change a selection is clicking every row, which is not a thing a keyboard can do —
     `section_title`/`centered_msg`/`toggle_icon` (whose `enabled` is **not optional**: every panel
     toggle in the footer needs it, so the ungated shims that passed `|| true` were only hiding the
     fact — see *The footer's panel toggles* below), `tip_when`, `measure_text_px`,
@@ -3407,7 +3415,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     capsules for the engine and the source. Every `ImportNote` it carries is joined into a third
     line shown only when there is one — a row can be both already-saved and password-less, and
     showing only the first hides the one that decides whether to tick it. Rows that repeat a saved
-    connection arrive unticked. The tick box changes **by style, never a rebuild**, and the
+    connection arrive unticked. The tick box is `widgets::check_box` — the app's one checkbox, which
+    was written here first and moved to `widgets` once the dump picker adopted it — and it changes
+    **by style, never a rebuild**; the
     selection is a `HashSet` of indices so a row's read is O(1) — the two rules `dump_view`'s table
     picker paid for. Indices are safe because `rows` only ever grows at the end or is reset
     wholesale by `open_import`.
@@ -3673,9 +3683,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     table is missing** in its error line. A click that names a table the server no longer reports
     (dropped or renamed since the tree was last refreshed) otherwise opened a full list with nothing
     ticked and a dead `Export` button, which reads as broken rather than as an answer.
-    The picker's rows read the selection through a `create_memo` of it as a `HashSet` and show or
-    hide their two glyphs with `s.hide()`, never a per-row `dyn_container`. `chosen` stays a `Vec`,
-    because that is what the request carries and what `All` resets from, but every row watches it, so
+    The picker's rows read the selection through a `create_memo` of it as a `HashSet` and draw
+    `widgets::check_box`, the app's one checkbox, which fills and empties by style (`s.hide()` on
+    the tick), never a per-row `dyn_container`. It wore a check-glyph-and-hollow-square pair of its
+    own until the import list's box was made shared: two spellings of "ticked" in two modals is the
+    inconsistency a shared widget exists to prevent. Its header went the same way — the count, then
+    `widgets::link_button`'s "Select all" / "None", where two `ActionKind::Quiet` buttons labelled
+    "All" / "None" used to be. `chosen` stays a `Vec`,
+    because that is what the request carries and what "Select all" resets from, but every row
+    watches it, so
     a single tick cost a linear `contains` per row *plus* a rebuild of every row — quadratic in the
     number of tables listed. The memo makes each row's read O(1) and the show-hide is the *Floem 0.2
     gotchas* rule (`display: none`/`flex` beats a rebuild), which here also means nothing is taken
@@ -6361,7 +6377,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   which is `#FFFFFF` in both themes precisely because it is drawn on the first — so a new filled
   control that has to show something inside itself takes the toggle's colours, not the accent's.
   Small glyphs drawn inside one also want `icons::CHECK_BOLD` over `icons::CHECK`: Lucide's
-  stroke-width 2 is tuned for ~16px and falls under a device pixel at 11.
+  stroke-width 2 is tuned for ~16px and falls under a device pixel at 11. The result is
+  `widgets::check_box`, and it is **the** checkbox: a multi-select list draws that, never a box of
+  its own, which is what the dump modal's table picker was until it adopted it.
 - **Menu labels carry no trailing ellipsis**, even when the entry opens a dialog. The platform
   convention says a `…` means "this will ask you something first", but this app doesn't keep it:
   of the ~110 menu labels in `schemaic-ui`, the only three that ever had one were added in a single

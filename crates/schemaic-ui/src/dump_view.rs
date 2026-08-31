@@ -27,10 +27,10 @@ use schemaic_core::intel::SqlDialect;
 use crate::theme;
 use crate::widgets::{
     ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, autohide, exit_action,
-    focus_root_with_ring, form_hint, form_section, form_separator, modal_footer_split, modal_h,
-    modal_pad_h, modal_title_owned, modal_w, panel_style,
+    focus_root_with_ring, form_hint, form_section, form_separator, link_button, modal_footer_split,
+    modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{DumpOutcome, DumpRequest, DumpTarget, Ui, icons};
+use crate::{DumpOutcome, DumpRequest, DumpTarget, Ui};
 
 /// The panel's nominal size, scaled like every other modal's.
 fn panel_w() -> f64 {
@@ -281,7 +281,7 @@ fn run_dump(ui: Ui) {
     });
 }
 
-/// One table row: a check mark when it is in, a hollow square when it is out.
+/// One table row: the app's [`crate::widgets::check_box`], then the table name.
 fn table_row(
     d: crate::DumpUi,
     chosen: Memo<std::collections::HashSet<String>>,
@@ -291,24 +291,16 @@ fn table_row(
     // selection, so a single tick used to cost one linear `contains` *per row*
     // over the whole selection and one view rebuild each — quadratic, and
     // visibly so at the few hundred tables the perf fixtures carry. The memo
-    // makes each row's read O(1), and the pair of glyphs is shown and hidden by
-    // style, which is the codebase's rule for a reactive show-hide: nothing is
+    // makes each row's read O(1), and the box is filled and emptied by style,
+    // which is the codebase's rule for a reactive show-hide: nothing is
     // constructed, so nothing takes the row apart under the pointer.
     let is_in = {
         let name = name.clone();
         move || chosen.with(|c| c.contains(&name))
     };
-    let (on_in, on_out) = (is_in.clone(), is_in.clone());
     let toggle_name = name.clone();
     h_stack((
-        icons::icon(icons::CHECK, 14.0).style(move |s| {
-            let s = s.color(theme::accent());
-            if on_in() { s } else { s.hide() }
-        }),
-        icons::icon(icons::SQUARE, 14.0).style(move |s| {
-            let s = s.color(theme::text_faint());
-            if on_out() { s.hide() } else { s }
-        }),
+        crate::widgets::check_box(is_in),
         text(name.clone()).style(|s| {
             s.font_family(crate::consts::MONO_FAMILY.to_string())
                 .font_size(theme::font_body())
@@ -341,7 +333,7 @@ fn table_picker(ui: Ui, ring: FocusRing) -> impl IntoView {
     let d = ui.dump;
     // The selection as a set, computed once per change instead of once per row:
     // the list is the one signal every row in it reads. `chosen` stays a `Vec`
-    // because it is what the request carries and what All resets from.
+    // because it is what the request carries and what "Select all" resets from.
     let chosen_set = create_memo(move |_| {
         d.chosen
             .with(|c| c.iter().cloned().collect::<std::collections::HashSet<_>>())
@@ -354,17 +346,20 @@ fn table_picker(ui: Ui, ring: FocusRing) -> impl IntoView {
             format!("{a} of {b} selected")
         }
     };
+    // Links, not buttons, and the import list's pair verbatim — same words, same
+    // colours, same order: they adjust the list the user is reading rather than
+    // answering the modal, whose two real buttons are in the footer.
     let head = h_stack((
         label(count).style(|s| s.color(theme::text_dim()).font_size(theme::font_label())),
         empty().style(|s| s.flex_grow(1.0_f32)),
-        action_button("All", ActionKind::Quiet, true, ring.clone(), TAB_ALL, {
+        link_button("Select all", theme::accent, ring.clone(), TAB_ALL, {
             move || d.chosen.set(d.tables.get_untracked())
         }),
-        action_button("None", ActionKind::Quiet, true, ring, TAB_NONE, move || {
+        link_button("None", theme::text_muted, ring, TAB_NONE, move || {
             d.chosen.set(Vec::new())
         }),
     ))
-    .style(|s| s.items_center().width_full().gap(theme::scaled(6.0)));
+    .style(|s| s.items_center().width_full().gap(theme::scaled(10.0)));
 
     let list = dyn_container(
         move || (d.listing.get(), d.tables.get()),
