@@ -1106,8 +1106,8 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         field("Database", draft.database, ring.clone(), 65).style(|s| s.width(conn_field_w())),
         form_hint(
             "Optional, and the database the connection opens in. Some hosted \
-             providers allow only their own — Aiven's is `defaultdb` — and refuse \
-             a connection that does not name it.",
+             providers allow only their own and refuse a connection that does \
+             not name it.",
         ),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
