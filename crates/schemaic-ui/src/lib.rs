@@ -1397,12 +1397,19 @@ impl Tab {
 
     /// Has nothing run here at all? — one panel, still idle, nothing pinned.
     ///
-    /// The results half of the blank-slate test that decides whether a new tab
-    /// can reuse this one in place. A tab now always holds a panel, so "the strip
-    /// is empty" stopped being the question; "the strip is the one it was born
-    /// with" is.
+    /// Two callers, one rule. It is the results half of the blank-slate test that
+    /// decides whether a new tab may reuse this one in place; and it is what
+    /// **hides the results strip**, because a bar holding one chip that says
+    /// nothing is chrome charging rent on a pane that has only "Run a query" to
+    /// show. A tab always holds a panel now, so "the strip is empty" stopped
+    /// being the question and "the strip is the one it was born with" is.
+    ///
+    /// **Tracked**, so the strip's own style can ask it — the same reason
+    /// `GridState::current_statement`'s reads are. It costs the other caller
+    /// nothing: `place_tab` runs inside an event handler, where there is no
+    /// effect to subscribe.
     pub fn results_untouched(&self) -> bool {
-        self.result_tabs.with_untracked(|v| {
+        self.result_tabs.with(|v| {
             v.len() == 1
                 && v.first()
                     .is_some_and(|p| !p.pinned && matches!(p.state, QueryState::Idle))
@@ -6034,8 +6041,9 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
     // Flat, full-height result tabs. Unlike the query strip, this one adds a
     // full-width **top** separator too (the query strip sits below the header,
     // which already provides one).
-    h_stack((scroller,)).style(|s| {
-        s.width_full()
+    h_stack((scroller,)).style(move |s| {
+        let s = s
+            .width_full()
             .flex_row()
             .height(tab_bar_h())
             .min_height(tab_bar_h())
@@ -6043,7 +6051,21 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
             .background(theme::bg_chrome())
             .border_top(1.0)
             .border_bottom(1.0)
-            .border_color(theme::border())
+            .border_color(theme::border());
+        // **Nothing has run: no bar.** The strip earns its 28px by holding
+        // results to choose between, and a tab that has never run one has a
+        // single chip saying nothing over a pane that says "Run a query" — two
+        // pieces of furniture for one empty state, and the borrowed height comes
+        // off the grid for the rest of the session. It appears with the first run
+        // — `results_untouched` is false from the moment a panel opens, `Running`
+        // included, so it is up before the rows are — and goes again only where
+        // the pane is empty for the same reason: every result closed, or the tab
+        // respawned. It cannot flicker under a tab that is working.
+        //
+        // By `hide()` rather than by not mounting it: the codebase's rule for a
+        // reactive show-hide, and the one that keeps the chips' state — and the
+        // hazards of building views inside a strip that is changing — out of it.
+        if tab.results_untouched() { s.hide() } else { s }
     })
 }
 
@@ -8985,6 +9007,8 @@ mod result_panel_tab_tests {
         assert!(t.results_untouched(), "a tab with nothing run");
 
         let first = t.begin_run(&["SELECT 1".to_string()])[0];
+        // `Running`, not yet landed — and already not a blank slate, which is
+        // what puts the strip on screen with the run rather than with its rows.
         assert!(!t.results_untouched(), "a result is in flight here");
 
         t.set_panel_state(first, QueryState::Failed("boom".into()));

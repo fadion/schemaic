@@ -8002,12 +8002,20 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
 
 ## The results strip (and keeping a result)
 
-**Every result is a `ResultPanel`, and the strip that lists them is always on screen.** A tab holds
-`result_tabs: RwSignal<Vec<ResultPanel>>` and `active_result: RwSignal<u64>` — a panel **id**, never
-an index — and a tab with nothing run yet holds one `Idle` panel, so the strip is never a bar with
-no chips in it. One run, one panel; a Run Everything batch, one per statement. There is no longer a
-"single-grid path" beside a "batch path": `results_view` and the tab's `results` signal are gone, and
-what replaced both is `results_multi`, which every result goes through.
+**Every result is a `ResultPanel`, and the strip that lists them is on screen from the first run.**
+A tab holds `result_tabs: RwSignal<Vec<ResultPanel>>` and `active_result: RwSignal<u64>` — a panel
+**id**, never an index — and a tab with nothing run yet holds one `Idle` panel, so the strip is
+never a bar with no chips in it. One run, one panel; a Run Everything batch, one per statement.
+There is no longer a "single-grid path" beside a "batch path": `results_view` and the tab's
+`results` signal are gone, and what replaced both is `results_multi`, which every result goes
+through.
+**Before the first run there is no bar at all** — `Tab::results_untouched` hides it with `s.hide()`,
+because a strip holding one chip that says nothing, over a pane that says "Run a query", is two
+pieces of furniture for one empty state and 28px off the grid for the rest of the session. It
+appears with the run rather than with its rows (a `Running` panel is already not untouched) and goes
+again only where the pane is empty for the same reason: every result closed, or the tab respawned.
+The affordance it carries is still discoverable, because by the time there is anything to pin the
+strip is up.
 
 **Pinning is what the strip is for.** `resultsel::after_run` is the rule — a run replaces the
 unpinned panels and leaves the pinned ones alone — so a result can be kept across later runs and
