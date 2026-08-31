@@ -264,8 +264,31 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
         .map_err(|_| DbError::Connect("timed out".to_string()))?
 }
 
-/// List the user databases on the server (excludes templates and the built-in
-/// `postgres` maintenance database), sorted by name.
+/// The databases worth putting in the schema tree.
+///
+/// Templates and `postgres` were always excluded as *plumbing*. The other two
+/// terms exclude what cannot be **opened**, which is the same idea and was
+/// missing: a managed provider keeps its own bookkeeping database on the server
+/// — Aiven's is `_aiven` — and the tree listed it, tried to expand it, and
+/// rendered the refusal as a red line under a database the user did not create,
+/// cannot use, and has no way to dismiss.
+///
+/// Asked of PostgreSQL rather than answered with a list of names to skip, so a
+/// second provider's bookkeeping database needs no second patch: `datallowconn`
+/// is the catalog saying connections are barred outright, and
+/// `has_database_privilege(…, 'CONNECT')` is it saying they are barred for *us*.
+///
+/// **Neither sees `pg_hba.conf`**, which is matched at connection time and can
+/// refuse a database the catalog says we may enter. Nothing queryable predicts
+/// that, so the expansion failure still has to read well.
+const DATABASE_LISTING: &str = "SELECT datname FROM pg_database \
+     WHERE datistemplate = false AND datname <> 'postgres' \
+     AND datallowconn AND has_database_privilege(current_user, oid, 'CONNECT') \
+     ORDER BY datname";
+
+/// List the user databases on the server (excludes templates, the built-in
+/// `postgres` maintenance database, and anything this role cannot connect to —
+/// see [`DATABASE_LISTING`]), sorted by name.
 ///
 /// **Bounded by [`crate::PING_TIMEOUT`], around the whole sequence.** This is
 /// the same connect [`ping`] makes, and it was bounded when it was called a ping
@@ -283,11 +306,7 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     let listing = async {
         let client = connect_maintenance(db).await?;
         let msgs = client
-            .simple_query(
-                "SELECT datname FROM pg_database \
-                 WHERE datistemplate = false AND datname <> 'postgres' \
-                 ORDER BY datname",
-            )
+            .simple_query(DATABASE_LISTING)
             .await
             .map_err(|e| DbError::Query(e.to_string()))?;
         let mut out = Vec::new();
@@ -3090,6 +3109,29 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             self.1.as_deref().map(|l| l as &dyn std::error::Error)
         }
+    }
+
+    /// The decision this pins lives in the SQL string, so the string is the
+    /// subject.
+    ///
+    /// A database the role cannot connect to is not a database the tree can
+    /// show: expanding it can only produce an error, under a row the user did
+    /// not create and cannot remove. Both terms are needed and they are not the
+    /// same question — `datallowconn` is "nobody may connect", the privilege
+    /// check is "this role may not" — and asking PostgreSQL beats a list of
+    /// provider-specific names to skip, which would need extending for every
+    /// managed service that keeps bookkeeping beside the user's data.
+    #[test]
+    fn the_listing_hides_databases_that_cannot_be_opened() {
+        assert!(DATABASE_LISTING.contains("datallowconn"));
+        assert!(DATABASE_LISTING.contains("has_database_privilege(current_user, oid, 'CONNECT')"));
+        // Still plumbing, still hidden.
+        assert!(DATABASE_LISTING.contains("datistemplate = false"));
+        assert!(DATABASE_LISTING.contains("datname <> 'postgres'"));
+        // By `oid`, not by name: `has_database_privilege` takes either, and a
+        // name would have to be quoted to survive one containing a capital or a
+        // space.
+        assert!(!DATABASE_LISTING.contains("privilege(current_user, datname"));
     }
 
     /// The probe exists to find a database, so it may only repeat itself for a
