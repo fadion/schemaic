@@ -646,16 +646,65 @@ impl TriggerScan {
     }
 }
 
+/// Where a scan through one script stands between the chunks it arrives in.
+///
+/// A script runner reads a file a block at a time and cannot hold it all, so it
+/// scans a *buffer* and drains the complete statements out of it. Almost nothing
+/// has to survive that drain — the buffer always restarts at a statement
+/// boundary, so [`TriggerScan`] is back at `Start` by construction — but the
+/// **delimiter** does: `DELIMITER $$` is itself a statement, so by the time the
+/// body it governs arrives, the directive that set it has been drained away.
+#[derive(Clone, Debug)]
+pub struct ScanState {
+    delim: Vec<u8>,
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        Self { delim: vec![b';'] }
+    }
+}
+
+impl ScanState {
+    /// A fresh scan, terminating statements at `;`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Byte offsets bounding each **complete** statement in `sql`, resuming from
+/// `state` and leaving it where the scan ended.
+///
+/// The difference from [`statement_bounds`] is the tail: no final `sql.len()` is
+/// pushed, so the bytes after the last offset are an *unfinished* statement the
+/// next chunk continues. That is what makes the answer safe to act on — a `;`
+/// inside an unterminated string produces no boundary, so those bytes stay in
+/// the caller's buffer rather than being executed as a statement of their own.
+pub fn statement_bounds_open(sql: &str, dialect: SqlDialect, state: &mut ScanState) -> Vec<usize> {
+    scan_bounds(sql, dialect, &mut state.delim, false)
+}
+
 /// Byte offsets bounding each top-level statement: `[0, after-`;`, …, len]`.
 /// `;` inside strings / identifiers / comments does not split, on MySQL a
 /// `DELIMITER` directive changes what does (see [`delimiter_directive`]), and on
 /// SQLite a `;` inside a `CREATE TRIGGER`'s `BEGIN … END` block does not split
 /// either (see [`TriggerScan`]).
 pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
+    let mut delim: Vec<u8> = vec![b';'];
+    let mut bounds = scan_bounds(sql, dialect, &mut delim, true);
+    bounds.push(sql.len());
+    bounds
+}
+
+/// The one scan both [`statement_bounds`] and [`statement_bounds_open`] are.
+///
+/// `delim` is in/out so a chunked caller can carry the terminator across a
+/// drain; `at_eof` says whether the end of `sql` is the end of the *script*,
+/// which is the only thing the two callers genuinely disagree about.
+fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool) -> Vec<usize> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut bounds = vec![0usize];
-    let mut delim: Vec<u8> = vec![b';'];
     let mut i = 0;
     // Where the current segment begins, for recognising a directive only at the
     // start of one.
@@ -674,8 +723,16 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
         if (seg..i).all(|k| b[k].is_ascii_whitespace())
             && let Some((end, token)) = delimiter_directive(sql, i, dialect)
         {
+            // Mid-script, a directive running to the end of the buffer with no
+            // newline behind it has not arrived in full, and acting on it is
+            // worse than waiting: the token would be a *prefix* of the real one,
+            // and a terminator of `$` never matches the `$$` the file meant.
+            // Leave the whole thing for the next chunk.
+            if !at_eof && b.get(end - 1) != Some(&b'\n') {
+                break;
+            }
             bounds.push(end);
-            delim = token.into_bytes();
+            *delim = token.into_bytes();
             i = end;
             seg = end;
             scan = TriggerScan::Start;
@@ -693,7 +750,7 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
             i = end;
             continue;
         }
-        if b[i..].starts_with(&delim) {
+        if b[i..].starts_with(delim.as_slice()) {
             if scan.inside_body() {
                 i += delim.len();
                 continue;
@@ -706,7 +763,6 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
         }
         i += 1;
     }
-    bounds.push(n);
     bounds
 }
 
@@ -786,13 +842,25 @@ pub fn statement_ranges(sql: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
     statement_bounds(sql, dialect)
         .windows(2)
         .map(|w| trim_range(sql, w[0], w[1]))
-        .filter(|&(lo, hi)| {
-            lo < hi
-                && segment_has_code(sql, lo, hi, dialect)
-                // The directive is the client's, not the server's.
-                && !is_delimiter_directive(sql, lo, hi, dialect)
-        })
+        .filter(|&(lo, hi)| is_runnable_segment(sql, lo, hi, dialect))
         .collect()
+}
+
+/// Is the **trimmed** segment `sql[lo..hi]` something to send to a server?
+///
+/// Three conditions that always travel together: it holds something, that
+/// something is code rather than comments and whitespace, and it is not the
+/// client-side `DELIMITER` directive (which the server has never heard of and
+/// would answer with a syntax error).
+///
+/// Public, and factored out of [`statement_ranges`], because a script runner
+/// asks the same question of a segment it found in a *buffer* rather than in a
+/// whole document — and two spellings of "is this a statement" is exactly how a
+/// runner comes to send `DELIMITER $$` to MySQL.
+pub fn is_runnable_segment(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool {
+    lo < hi
+        && segment_has_code(sql, lo, hi, dialect)
+        && !is_delimiter_directive(sql, lo, hi, dialect)
 }
 
 /// The uppercased first keyword of `sql` (skipping leading whitespace and
@@ -807,6 +875,43 @@ pub fn leading_keyword(sql: &str, dialect: SqlDialect) -> Option<String> {
 /// offset 0 of a comment-only string.
 pub fn leading_keyword_end(sql: &str, dialect: SqlDialect) -> Option<usize> {
     leading_keyword_span(sql, dialect).map(|(_, e)| e)
+}
+
+/// The first `n` upper-cased word tokens of `sql`, skipping string, quoted-
+/// identifier and comment content.
+///
+/// [`leading_keyword`]'s plural, and **bounded**, which is the point: classifying
+/// a statement needs its opening words and nothing else, while the private
+/// `word_tokens` tokenises to the end and allocates a `String` per word. Asked of
+/// a dump's extended `INSERT` that is sixteen megabytes of values to learn one
+/// word, times every statement in the file.
+///
+/// The bound also has to be generous enough for the longest header anyone
+/// actually writes, which is MySQL's view preamble:
+/// `CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER
+/// VIEW` puts `VIEW` eighth, with the back-quoted parts skipped as identifiers.
+pub fn leading_words(sql: &str, n: usize, dialect: SqlDialect) -> Vec<String> {
+    let b = sql.as_bytes();
+    let len = b.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < len && out.len() < n {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        if is_word_start(b[i]) {
+            let start = i;
+            i += 1;
+            while i < len && is_word_byte(b[i]) {
+                i += 1;
+            }
+            out.push(sql[start..i].to_ascii_uppercase());
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Byte range of the leading keyword, skipping whitespace and comments.
@@ -1156,6 +1261,45 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
 /// reached a truncated grid and been offered an "All rows" export.
 pub fn rerunnable_for_export(sql: &str, dialect: SqlDialect) -> bool {
     !contains_write(sql, dialect)
+}
+
+/// May this **script file** be run, and what has to be agreed to first?
+///
+/// Running a `.sql` file is a path executing user SQL, so it answers to the write
+/// guard like every other one — and, like [`rerunnable_for_export`], it answers a
+/// question [`run_verdict`] cannot be asked. `run_verdict` takes the statements;
+/// a script has tens of thousands of them, arriving a block at a time, and none
+/// of them read yet at the moment the user presses the button. There is no
+/// `&[String]` to hand it and no meaning to a confirmation raised at statement
+/// 30,000.
+///
+/// So the gate is **one decision at launch, strictly stronger than the guard on
+/// every axis** — never a second, laxer one:
+///
+/// - **A script is unconditionally a write.** `run_verdict` asks `contains_write`
+///   and lets a pure read through; here there is nothing to ask, so a read-only
+///   connection is refused *without* reading the file. A script that turned out
+///   to hold nothing but `SELECT`s is refused too, which is the safe direction.
+/// - **It never returns [`RunVerdict::Allow`]**, whatever `confirm_writes` says.
+///   That setting is about a statement the user typed and can see; a file they
+///   picked from a dialog is the case it was written for, not an exception to it.
+/// - **No database refuses outright**, rather than only when some statement
+///   `needs_database` — see [`GuardPolicy::no_database`] for what an unscoped
+///   `CREATE TABLE` does to a PostgreSQL server.
+///
+/// `file` names the file in the confirmation, because that is the only thing the
+/// user can still recognise at this point — they have read no statements either.
+pub fn script_verdict(policy: GuardPolicy, file: &str) -> RunVerdict {
+    if policy.read_only {
+        return RunVerdict::Block("Read-only connection.".to_string());
+    }
+    if policy.no_database {
+        return RunVerdict::Block("No database selected.".to_string());
+    }
+    RunVerdict::Confirm(format!(
+        "Run every statement in {file}? A script can create, alter and drop \
+         objects, and what it changes cannot be undone from here."
+    ))
 }
 
 /// Bounded Levenshtein edit distance between two ASCII strings.
@@ -1781,6 +1925,307 @@ mod tests {
         let s = b"$tag$ x $tag$";
         assert_eq!(super::skip_noncode(s, 0, SqlDialect::Sqlite), None);
         assert_eq!(super::skip_noncode(s, 0, SqlDialect::Postgres), Some(13));
+    }
+
+    /// Drive [`super::statement_bounds_open`] over `sql` cut into `chunk`-byte
+    /// pieces, the way a script runner reads a file, and return the statements
+    /// it emits.
+    ///
+    /// **This is the caller, not the function** — which is the whole point of
+    /// having it. The scan is only half the answer; the other half is the
+    /// buffer discipline (drain to the last boundary, carry the rest, and treat
+    /// whatever is left at EOF as the final statement), and every bug worth
+    /// catching here lives in the seam between the two.
+    fn chunked(sql: &str, dialect: SqlDialect, chunk: usize) -> Vec<String> {
+        let mut state = super::ScanState::new();
+        let mut buf = String::new();
+        let mut out: Vec<String> = Vec::new();
+        let emit = |buf: &str, lo: usize, hi: usize, out: &mut Vec<String>| {
+            let (lo, hi) = super::trim_range(buf, lo, hi);
+            if lo < hi
+                && super::segment_has_code(buf, lo, hi, dialect)
+                && !super::is_delimiter_directive(buf, lo, hi, dialect)
+            {
+                out.push(buf[lo..hi].to_string());
+            }
+        };
+        for piece in sql.as_bytes().chunks(chunk) {
+            buf.push_str(std::str::from_utf8(piece).expect("ASCII fixture"));
+            let bounds = super::statement_bounds_open(&buf, dialect, &mut state);
+            let cut = *bounds.last().expect("a scan always starts at 0");
+            for w in bounds.windows(2) {
+                emit(&buf, w[0], w[1], &mut out);
+            }
+            buf.drain(..cut);
+        }
+        // End of file: whatever is still held is the last statement, terminator
+        // or no terminator.
+        emit(&buf, 0, buf.len(), &mut out);
+        out
+    }
+
+    /// The fixture the chunked tests run on: every construct that can hide a
+    /// `;` from a naive split, plus a `DELIMITER` block, in the shape our own
+    /// dump writes.
+    const SCRIPT: &str = "-- a comment holding a ; semicolon\n\
+                          SELECT 'a;b' AS x;\n\
+                          INSERT INTO t VALUES (1), (2);\n\
+                          DELIMITER $$\n\
+                          CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW\n\
+                          BEGIN\n\
+                            SET NEW.a = 1;\n\
+                            SET NEW.b = 2;\n\
+                          END$$\n\
+                          DELIMITER ;\n\
+                          UPDATE t SET a = 3 WHERE id = 1;\n";
+
+    /// **The composition test.** Reading the script in blocks must produce
+    /// exactly the statements reading it whole does — at *every* block size, so
+    /// the boundary lands inside a comment, a string, a directive and a trigger
+    /// body in turn.
+    ///
+    /// A block size of 1 is not a silly edge here: it is the cheapest way to
+    /// assert that no construct in the fixture depends on arriving intact.
+    #[test]
+    fn a_chunked_scan_matches_the_whole_file_answer() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let whole: Vec<String> = super::statement_ranges(SCRIPT, dialect)
+                .iter()
+                .map(|&(lo, hi)| SCRIPT[lo..hi].to_string())
+                .collect();
+            for chunk in 1..=SCRIPT.len() {
+                assert_eq!(
+                    chunked(SCRIPT, dialect, chunk),
+                    whole,
+                    "{dialect:?} disagrees with itself at a {chunk}-byte block"
+                );
+            }
+        }
+    }
+
+    /// The delimiter is set by one statement and governs the *next* ones, so a
+    /// runner that drained the directive away before its body arrived would
+    /// terminate the trigger on the `;` inside it.
+    ///
+    /// Pinned on its own, and not left to the round-trip above, because it is
+    /// the one piece of state that has to survive the drain: the round-trip
+    /// says the answers agree, this says *why* they can.
+    #[test]
+    fn a_delimiter_survives_the_chunk_that_drained_it() {
+        // A block that ends exactly on the directive's newline — the drain that
+        // takes the directive and leaves the body for the next read.
+        let cut = SCRIPT.find("CREATE TRIGGER").expect("the fixture has one");
+        let stmts = chunked(SCRIPT, SqlDialect::MySql, cut);
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.starts_with("CREATE TRIGGER") && s.ends_with("END$$")),
+            "the trigger came out in pieces: {stmts:?}"
+        );
+    }
+
+    /// A block boundary inside a string literal must not end a statement, and
+    /// must not end one at the `;` the string is hiding either.
+    #[test]
+    fn a_semicolon_inside_a_string_split_across_blocks_does_not_split() {
+        let sql = "SELECT 'a;b' AS x; SELECT 2;";
+        // Every cut through the literal.
+        for chunk in 8..=12 {
+            let stmts = chunked(sql, SqlDialect::MySql, chunk);
+            assert_eq!(stmts.len(), 2, "at a {chunk}-byte block: {stmts:?}");
+            assert_eq!(stmts[0], "SELECT 'a;b' AS x;");
+        }
+    }
+
+    /// A directive that runs to the end of the buffer has not been read yet —
+    /// its token ends at the newline, and there is no newline. Acting on the
+    /// truncation would set the terminator to a *prefix* of the real one
+    /// (`DELIMITER $` for `DELIMITER $$`), which then never matches.
+    #[test]
+    fn a_directive_cut_by_the_buffer_end_is_not_read_yet() {
+        let mut state = super::ScanState::new();
+        let bounds =
+            super::statement_bounds_open("SELECT 1;\nDELIMITER $", SqlDialect::MySql, &mut state);
+        assert_eq!(bounds, vec![0, 9], "only the complete statement");
+        // And the proof it was not acted on: the next chunk completes the
+        // directive, and `$$` then terminates.
+        let bounds =
+            super::statement_bounds_open("DELIMITER $$\nSELECT 2$$", SqlDialect::MySql, &mut state);
+        assert_eq!(
+            bounds.len(),
+            3,
+            "the directive, then the statement it governs"
+        );
+    }
+
+    /// The whole-file answer is the open scan plus the final segment, so the
+    /// refactor that introduced [`super::statement_bounds_open`] cannot have
+    /// moved any boundary the rest of the app already depends on.
+    #[test]
+    fn statement_bounds_is_the_open_scan_plus_the_tail() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for sql in [
+                SCRIPT,
+                "SELECT 1;",
+                "SELECT 1",
+                "",
+                "DELIMITER $$\n",
+                "-- just a comment",
+            ] {
+                let mut state = super::ScanState::new();
+                let mut open = super::statement_bounds_open(sql, dialect, &mut state);
+                open.push(sql.len());
+                assert_eq!(
+                    open,
+                    super::statement_bounds(sql, dialect),
+                    "{dialect:?} on {sql:?}"
+                );
+            }
+        }
+    }
+
+    /// How much a verdict refuses, so two of them can be compared. The whole
+    /// point of [`super::script_verdict`] is that it is never *below*
+    /// [`super::run_verdict`] on this scale.
+    fn strength(v: &super::RunVerdict) -> u8 {
+        match v {
+            super::RunVerdict::Allow => 0,
+            super::RunVerdict::Confirm(_) => 1,
+            super::RunVerdict::Block(_) => 2,
+        }
+    }
+
+    /// Every policy a connection can be in, for the exhaustive tests below.
+    fn policies() -> Vec<super::GuardPolicy> {
+        let mut out = Vec::new();
+        for read_only in [false, true] {
+            for confirm_writes in [false, true] {
+                for no_database in [false, true] {
+                    for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+                        out.push(super::GuardPolicy {
+                            read_only,
+                            confirm_writes,
+                            no_database,
+                            dialect,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// **The invariant, as a test.** A script gate that ever came out *weaker*
+    /// than the run guard would be the second, laxer gate the architecture
+    /// forbids — so compare the two over every policy and a set of statement
+    /// lists that reaches each of `run_verdict`'s arms.
+    ///
+    /// The statements are what `run_verdict` gets; `script_verdict` never sees
+    /// them, which is exactly the asymmetry under test.
+    #[test]
+    fn the_script_gate_is_never_weaker_than_the_run_guard() {
+        let lists: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["SELECT 1".to_string()],
+            vec!["INSERT INTO t VALUES (1)".to_string()],
+            vec!["DELETE FROM t".to_string()],
+            vec!["CREATE TABLE t (a int)".to_string()],
+            vec!["SELECT 1".to_string(), "DROP TABLE t".to_string()],
+        ];
+        for policy in policies() {
+            let script = super::script_verdict(policy, "dump.sql");
+            for stmts in &lists {
+                let run = super::run_verdict(stmts, policy);
+                assert!(
+                    strength(&script) >= strength(&run),
+                    "script {script:?} is weaker than run {run:?} for {policy:?} on {stmts:?}"
+                );
+            }
+        }
+    }
+
+    /// A script never simply runs. `confirm_writes` off is the axis that makes
+    /// this worth pinning: there `run_verdict` returns `Allow` for a write, and
+    /// a script gate that merely delegated would inherit that.
+    #[test]
+    fn a_script_never_allows_whatever_the_settings_say() {
+        for policy in policies() {
+            assert_ne!(
+                super::script_verdict(policy, "dump.sql"),
+                super::RunVerdict::Allow,
+                "{policy:?}"
+            );
+        }
+    }
+
+    /// The file has not been read, so "does it write?" cannot be asked — and the
+    /// safe answer to a question you cannot ask is yes. A read-only connection
+    /// refuses every script, including one that holds nothing but `SELECT`s.
+    #[test]
+    fn a_read_only_connection_refuses_a_script_without_reading_it() {
+        let policy = super::GuardPolicy {
+            read_only: true,
+            confirm_writes: false,
+            no_database: false,
+            dialect: SqlDialect::MySql,
+        };
+        assert!(matches!(
+            super::script_verdict(policy, "reads-only.sql"),
+            super::RunVerdict::Block(_)
+        ));
+    }
+
+    /// Blocked, not confirmed: an unscoped script on PostgreSQL builds into a
+    /// maintenance database the schema tree can never show again.
+    #[test]
+    fn a_script_with_no_database_is_blocked_outright() {
+        let policy = super::GuardPolicy {
+            read_only: false,
+            confirm_writes: false,
+            no_database: true,
+            dialect: SqlDialect::Postgres,
+        };
+        assert!(matches!(
+            super::script_verdict(policy, "dump.sql"),
+            super::RunVerdict::Block(_)
+        ));
+    }
+
+    /// The confirmation names the file, because at this point it is the only
+    /// thing the user can recognise — they have read no statements either.
+    #[test]
+    fn the_confirmation_names_the_file() {
+        let policy = super::GuardPolicy {
+            read_only: false,
+            confirm_writes: false,
+            no_database: false,
+            dialect: SqlDialect::MySql,
+        };
+        match super::script_verdict(policy, "sakila-dump.sql") {
+            super::RunVerdict::Confirm(m) => assert!(m.contains("sakila-dump.sql"), "{m}"),
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+    }
+
+    /// The one place the two scans deliberately disagree, stated so a later
+    /// edit can't quietly flatten it: a directive with no newline behind it is
+    /// complete when the file ends there, and unfinished when a chunk does.
+    ///
+    /// This is why `"DELIMITER $$"` is not in the equivalence list above.
+    #[test]
+    fn only_the_end_of_a_file_can_complete_a_trailing_directive() {
+        let sql = "DELIMITER $$";
+        assert_eq!(
+            super::statement_bounds(sql, SqlDialect::MySql),
+            vec![0, 12, 12],
+            "at EOF there is nothing more coming, so the directive is whole"
+        );
+        let mut state = super::ScanState::new();
+        assert_eq!(
+            super::statement_bounds_open(sql, SqlDialect::MySql, &mut state),
+            vec![0],
+            "mid-script the token may still be growing"
+        );
     }
 
     /// `DELIMITER` is MySQL's client-side word. SQLite has no such directive, so

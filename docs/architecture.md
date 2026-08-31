@@ -2326,6 +2326,57 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     dialects, so the statement parses, the round-trip happens, and the squiggle is the *server*
     complaining about text the user is still filling in. A placeholder in an identifier position
     (`FROM :tbl`) is the case that does not parse — which is what `neutralize` exists to rescue.
+  - `script.rs` — reading a `.sql` script **back**, as a stream of statements. The counterpart to
+    `dump.rs`: that module decides what a replayable file holds and hands the app a plan to write
+    it, this one takes such a file apart a block at a time, so a dump far larger than memory can be
+    replayed. Until it existed the round trip did not close — Schemaic wrote `.sql` files only
+    another tool could read, because the import path takes CSV/JSON and `sqlfile::open_verdict`
+    refuses a `.sql` past 64 MB.
+    `Splitter` is the whole of it: `push` takes the next block's **bytes** and returns the
+    `Statement`s it completed, `finish` yields the last one (a script's final statement need not
+    carry a terminator, and a runner that dropped it would replay a dump one statement short,
+    silently). The splitting itself is `sql::statement_bounds_open` — the one boundary lexer, made
+    resumable — so what this module owns is the *discipline* around it: **it only ever drains up to
+    a boundary the scan actually found.** That single rule is what makes a block boundary landing
+    inside a string, a comment, a dollar-quoted body or a `DELIMITER` directive a non-event: an
+    unterminated construct yields no boundary, so those bytes stay in the buffer and are re-scanned
+    from a real statement start when the rest of the file arrives.
+    **`push` takes bytes rather than `&str` deliberately.** A block boundary lands on a byte offset,
+    which on a UTF-8 file is often mid-character, and a caller left to solve that itself is one that
+    will eventually call `from_utf8_lossy` per block — turning a character straddling the boundary
+    into two replacement characters *inside a string literal*, silently, on its way to the server.
+    The split sequence is held here and completed by the next block; a genuinely invalid byte costs
+    one `U+FFFD`, which is `sqlfile::decode`'s answer to the same question.
+    Each `Statement` carries the `line` and `offset` it started at, because the failure this has to
+    report is "statement 30,000 of a file you cannot open in the editor". Newlines are counted once
+    walking forward with the bounds rather than re-counted per statement, which would be quadratic
+    in a block holding thousands of small `INSERT`s. `pending` is the driver's backpressure signal
+    and `MAX_PENDING_BYTES` its ceiling: a file that reaches it is not a script with a long
+    statement, it is a file with no terminator in it at all.
+    `probe` is the other half, and is `import::read_sample`'s counterpart: what the Import modal's
+    second step shows once a file is picked. A CSV's sample can show the opening *rows*; a script's
+    can only show what its opening statements **do**, which is the thing worth knowing before
+    running one — a kind histogram (`INSERT ×400`, `DROP TABLE ×12`), how many statements destroy
+    something, and whether the file opens its own transaction (`dump.rs`'s *Replaying → One
+    transaction* put one there, and the runner must not wrap an already-wrapped file). It is bounded
+    by `PROBE_MAX_BYTES` — the same 8 MB as `SAMPLE_MAX_BYTES`, for the same reason: the user asked
+    to *look* at a file — and by `PROBE_MAX_STATEMENTS`. Either bound sets `Probe::more`, and every
+    count is then reported through `count_label` as a floor (`400+`), never rounded up to a total
+    that would have cost a full read to know. **A truncated read drops the statement it was cut in
+    half**: half an `INSERT` classifies as an `INSERT`, and `Splitter::finish` means "the file ended
+    here", which is not true of a byte the probe merely stopped at.
+    `statement_kind` is the vocabulary — the verb, plus the object for `CREATE`/`DROP`/`ALTER`,
+    where `CREATE TABLE` and `DROP TABLE` are not the same news. The object list is a **whitelist**,
+    so an unfamiliar shape degrades to the bare verb rather than to a guess: the alternative rule,
+    "skip the modifier words", is a list of every modifier three engines have, wrong the first time
+    a version adds one and wrong silently. The case that settles it is MySQL's view preamble
+    (`CREATE ALGORITHM=… DEFINER=…@… SQL SECURITY DEFINER VIEW`), which puts `VIEW` eighth once the
+    back-quoted account is skipped as an identifier — and which is what sets the floor on
+    `sql::leading_words`' bound. That function is `leading_keyword`'s plural and is bounded on
+    purpose: the private `word_tokens` tokenises to the end, which on a dump's sixteen-megabyte
+    extended `INSERT` allocates a `String` per word to learn one.
+    **The write guard for this path is `sql::script_verdict`**, not `run_verdict` — see the
+    invariant.
   - `sqlfile.rs` — the pure half of opening and saving a tab's SQL as a `.sql` file on disk: what a
     file's bytes become in the editor (`decode`), what the editor's text becomes on the way back
     (`encode`), what the tab is called once it has a file (`tab_title` — the file name *with* its
@@ -5925,6 +5976,26 @@ Re-introducing the anti-patterns these guard against is a regression:
   of the three returns rows, so each could otherwise have reached a truncated grid and been offered
   the scope (`a_row_returning_write_is_never_rerunnable_for_an_export`,
   `an_ordinary_read_is_rerunnable_for_an_export`).
+  **Running a `.sql` script is the third such path, and it is refused the other way round.**
+  `sql::script_verdict` gates `script.rs`'s runner. `run_verdict` takes the statements; a script has
+  tens of thousands of them, arriving a block at a time, and *none of them read* at the moment the
+  user presses the button — there is no `&[String]` to hand it, and a confirmation raised at
+  statement 30,000 would be a question about a file the user can no longer see the start of. So the
+  gate is one decision at launch, and it is strictly stronger than the verdict on every axis: a
+  script is **unconditionally** a write (the file has not been read, so "does it write?" cannot be
+  asked, and the safe answer to an unaskable question is yes), which means a read-only connection is
+  refused without opening it and a script of nothing but `SELECT`s is refused too; `no_database`
+  blocks outright rather than only when some statement `needs_database`, because an unscoped script
+  on PostgreSQL builds into a maintenance database the schema tree can never show again; and it
+  **never returns `Allow`**, whatever `confirm_writes` says — that setting is about a statement the
+  user typed and can see, and a file picked from a dialog is the case it was written for rather than
+  an exception to it. The relation is test-enforced rather than asserted:
+  `the_script_gate_is_never_weaker_than_the_run_guard` compares the two verdicts over every policy
+  and a set of statement lists reaching each of `run_verdict`'s arms, on a Allow &lt; Confirm &lt;
+  Block ordering. Note that this is the *inverse* asymmetry to `rerunnable_for_export` above — that
+  one drops the `Confirm` arm because there is no moment to ask, this one keeps only the `Confirm`
+  arm because there is exactly one — and both are stronger than the verdict, which is the property
+  that matters.
   **One tested function is asked by everything that re-runs**, and that is the shape of the fix
   rather than a tidy-up. `filter::rerun_statement(base, &GridQuery, dialect)` composes *what* would
   run (`build_query`, or the base verbatim when there is no filter or sort) with *whether it may*
