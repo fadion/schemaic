@@ -153,9 +153,9 @@ use schemaic_ui::{
     ActivityActions, ActivityState, ActivityUi, AiActions, AiEffort, AiModel, AiUi, ChatMessage,
     Confirm, ConnActions, ConnImportUi, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals,
     HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry, OverlayUi,
-    PendingRun, PlanState, ResultPanel, RightPanel, Role, RunGuard, SchemaActions, SchemaScope,
-    SchemaUi, SnippetActions, SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor,
-    TermUi, TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
+    PendingRun, PlanState, RightPanel, Role, RunGuard, SchemaActions, SchemaScope, SchemaUi,
+    SnippetActions, SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi,
+    TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -1906,19 +1906,40 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) else {
                 return;
             };
-            let results = tab.results;
             let view_err = tab.view_err;
             let load_gen = tab.load_gen;
+            // Which panel this run reports into. A view re-run keeps the panel it
+            // is re-reading (its table stays on screen throughout); a manual run
+            // opens a fresh one, which replaces the unpinned panels and leaves
+            // every pinned result where it is.
+            let panel = if is_view {
+                // **A kept result refuses a re-read.** A view re-run replaces the
+                // panel it re-reads, which on a pinned one is the snapshot the pin
+                // was for. The grid already withholds both offers that get here
+                // (the filter row and the capped notice's "read all rows"); this
+                // is the same rule at the funnel, where a stale affordance or a
+                // later caller cannot get round it.
+                if tab.shown_frozen() {
+                    return;
+                }
+                tab.shown_panel_id()
+            } else {
+                tab.begin_run(std::slice::from_ref(&sql)).first().copied()
+            };
+            // Report a failure into the panel this run owns — the fresh one for a
+            // manual run, and for a view re-run the bottom bar instead, which is
+            // where a filter's error goes rather than over the table it failed to
+            // replace.
+            let fail = move |msg: String| match (is_view, panel) {
+                (true, _) => view_err.set(Some(msg)),
+                (false, Some(id)) => tab.set_panel_state(id, QueryState::Failed(msg)),
+                (false, None) => {}
+            };
             // Resolve this tab's own connection (not necessarily the active one).
             let db = match db_for(tab.conn_id.get_untracked()) {
                 Ok(db) => db,
                 Err(e) => {
-                    if is_view {
-                        view_err.set(Some(e));
-                    } else {
-                        tab.result_tabs.set(Vec::new());
-                        results.set(QueryState::Failed(e));
-                    }
+                    fail(e);
                     return;
                 }
             };
@@ -1927,12 +1948,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let session = match session_for(&tab) {
                 Ok(s) => s,
                 Err(e) => {
-                    if is_view {
-                        view_err.set(Some(e));
-                    } else {
-                        tab.result_tabs.set(Vec::new());
-                        results.set(QueryState::Failed(e));
-                    }
+                    fail(e);
                     return;
                 }
             };
@@ -1977,12 +1993,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // read of a large table. Set here, on the last line before the
                 // spawn, so every early return above it leaves the flag alone.
                 tab.view_busy.set(true);
-            } else {
-                // A single run reverts the results pane to the one-grid view (any
-                // prior Run Everything tabs are cleared).
-                tab.result_tabs.set(Vec::new());
-                results.set(QueryState::Running);
             }
+            // A manual run's panel is already `Running` — `begin_run` opened it
+            // above, before any of the early returns, so the strip shows the
+            // question being asked whatever happens to it.
 
             let tokens_done = tokens.clone();
             let tx_sql = sql.clone();
@@ -2033,7 +2047,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // matters: the rebuild reads `results` untracked, so the new
                             // Arc must already be in place before the nonce changes.
                             QueryState::Loaded(_) => {
-                                results.set(state);
+                                if let Some(id) = panel {
+                                    tab.set_panel_state(id, state);
+                                    // The panel's rows are this statement's now,
+                                    // not the one it was opened with — see
+                                    // `Tab::set_panel_sql`.
+                                    tab.set_panel_sql(id, &tx_sql);
+                                }
                                 load_gen.update(|g| *g = g.wrapping_add(1));
                                 view_err.set(None);
                             }
@@ -2042,8 +2062,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // Cancelled/superseded → leave the table + error untouched.
                             _ => {}
                         }
-                    } else {
-                        results.set(state);
+                    } else if let Some(id) = panel {
+                        // The panel may have been closed while the statement ran,
+                        // in which case `set_panel_state` finds nothing and the
+                        // result lands nowhere — deliberately the same answer the
+                        // generation check above gives a superseded run.
+                        tab.set_panel_state(id, state);
                     }
                 },
             );
@@ -2361,17 +2385,43 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) else {
                 return;
             };
+            // One Running panel per statement, replacing the unpinned ones, and
+            // the first of them selected — `begin_run` is the same call a single
+            // run makes, which is what keeps a batch and a single run one thing.
+            // Before the two resolutions below, so a batch that never dispatches
+            // still reports into its own panels.
+            let n = stmts.len();
+            let panels = tab.begin_run(&stmts);
+            // A batch that can't reach its connection **stops at its first
+            // failure** like any other, so the first statement carries the
+            // message and the rest are cancelled — the same shape the run's own
+            // early stop produces, rather than sixty chips repeating one error.
+            let fail_batch = {
+                let panels = panels.clone();
+                move |msg: String| {
+                    for (i, id) in panels.iter().enumerate() {
+                        tab.set_panel_state(
+                            *id,
+                            if i == 0 {
+                                QueryState::Failed(msg.clone())
+                            } else {
+                                QueryState::Cancelled
+                            },
+                        );
+                    }
+                }
+            };
             let db = match db_for(tab.conn_id.get_untracked()) {
                 Ok(db) => db,
                 Err(e) => {
-                    tab.results.set(QueryState::Failed(e));
+                    fail_batch(e);
                     return;
                 }
             };
             let session = match session_for(&tab) {
                 Ok(s) => s,
                 Err(e) => {
-                    tab.results.set(QueryState::Failed(e));
+                    fail_batch(e);
                     return;
                 }
             };
@@ -2397,21 +2447,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             run_gen.set(generation);
             tokens.borrow_mut().insert(id, (generation, token.clone()));
 
-            // Dismiss any single-run error bar; seed one Running panel per
-            // statement (labelled "Result N") and select the first.
-            tab.results.set(QueryState::Idle);
-            let n = stmts.len();
-            tab.result_tabs.set(
-                (0..n)
-                    .map(|i| ResultPanel {
-                        label: format!("Result {}", i + 1),
-                        state: QueryState::Running,
-                    })
-                    .collect(),
-            );
-            tab.active_result.set(0);
-
-            let result_tabs = tab.result_tabs;
             let tokens_done = tokens.clone();
             let engine = tx_engine(&db);
             // The batch's effect on the transaction is folded per statement, in
@@ -2458,11 +2493,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         return;
                     }
                     tokens_done.borrow_mut().remove(&id);
-                    result_tabs.update(|panels| {
-                        for (p, st) in panels.iter_mut().zip(states) {
-                            p.state = st;
-                        }
-                    });
+                    // By id, statement for statement: the strip may have been
+                    // pinned, reordered or partly closed while the batch ran, and
+                    // a positional write would then land a statement's result on
+                    // somebody else's panel.
+                    for (pid, st) in panels.iter().zip(states) {
+                        tab.set_panel_state(*pid, st);
+                    }
                 },
             );
             let cap = row_limit.get_untracked();
@@ -4250,11 +4287,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 tab.path.set(shed.path);
                 tab.disk_sql.set(shed.disk_sql);
                 tab.file_format.set(shed.format);
-                // Also reset the results pane so the reopened tab is fully fresh
-                // (single-grid Idle state, no leftover Run-Everything tabs).
-                tab.results.set(QueryState::Idle);
-                tab.result_tabs.set(Vec::new());
-                tab.active_result.set(0);
+                // Also reset the results pane so the reopened tab is fully fresh:
+                // one empty result, and the pins go with the rest — they belong
+                // to the tab that was closed, not to the one respawning here.
+                tab.reset_results();
                 // Drop any temporary font zoom so the respawned tab starts at the
                 // user's configured size (the post-flash rebuild reads this).
                 tab.font_zoom.set(None);
@@ -4508,8 +4544,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let t = &v[i];
                 !t.pinned.get_untracked()
                     && t.query.get_untracked().trim().is_empty()
-                    && matches!(t.results.get_untracked(), QueryState::Idle)
-                    && t.result_tabs.get_untracked().is_empty()
+                    && t.results_untouched()
                     // A tab bound to a `.sql` file is not a blank slate even when
                     // the file is empty: reusing it would silently drop the
                     // binding, and the next Ctrl+S would go somewhere else.

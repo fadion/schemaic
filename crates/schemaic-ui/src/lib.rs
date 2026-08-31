@@ -64,8 +64,8 @@ use consts::*;
 use dividers::{h_resize_handle, v_resize_handle};
 use editor_pane::{QueryPaneParams, editor_placeholder, query_pane};
 use grid::{
-    GridCtx, grid_error_bar, grid_find_bar, grid_goto_bar, grid_selection_bar, loaded_view,
-    results_view, running_view,
+    GridCtx, Phase, grid_error_bar, grid_find_bar, grid_goto_bar, grid_selection_bar, loaded_view,
+    phase_of, running_view,
 };
 use history_panel::history_panel;
 // The modal overlays are imported by `modals`, which is the only thing that
@@ -87,7 +87,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::prelude::*;
-use floem::reactive::{Memo, Scope, create_effect, create_memo, untrack};
+use floem::reactive::{Memo, Scope, batch, create_effect, create_memo, untrack};
 use floem::style::{CursorStyle, Transition, Width};
 use floem::text::FamilyOwned;
 use floem::unit::Px;
@@ -1021,13 +1021,21 @@ pub struct Tab {
     /// Display number, e.g. "Query 3".
     pub label: usize,
     pub query: RwSignal<String>,
-    pub results: RwSignal<QueryState>,
-    /// Multi-statement run (Run Everything) results — one panel per statement,
-    /// each with its own state. Empty for single runs (Run / Run Current /
-    /// Ctrl+Enter), which use `results` and the legacy single-grid view.
+    /// This tab's results, one panel per statement — **every** run's, not only a
+    /// batch's, and never empty: a tab with nothing run yet holds one `Idle`
+    /// panel. The strip that renders them is always on screen, which is what
+    /// makes pinning one a visible affordance rather than a hidden mode.
+    ///
+    /// Order is `resultsel`'s: the pinned panels first, in pin order, then
+    /// whatever the last run left.
     pub result_tabs: RwSignal<Vec<ResultPanel>>,
-    /// Which `result_tabs` entry is shown.
-    pub active_result: RwSignal<usize>,
+    /// Which panel is shown, by [`ResultPanel::id`] — never an index, which
+    /// pinning and closing both move.
+    pub active_result: RwSignal<u64>,
+    /// The next panel id for this tab. Ids are per-tab and never reused, so a
+    /// result that lands after its panel was closed finds nothing rather than
+    /// something else's panel.
+    pub next_panel: RwSignal<u64>,
     /// The saved connection id this tab's query runs against.
     pub conn_id: RwSignal<u64>,
     /// The database `USE`d for this tab's queries (`None` before the connection's
@@ -1226,7 +1234,258 @@ impl Tab {
             .with_untracked(|panels| {
                 shown_panel(panels, self.active_result.get_untracked()).map(|p| p.state.clone())
             })
-            .unwrap_or_else(|| self.results.get_untracked())
+            .unwrap_or(QueryState::Idle)
+    }
+
+    /// This tab's shown result, for the editor — see [`ShownResult`].
+    pub fn shown(&self) -> ShownResult {
+        ShownResult {
+            panels: self.result_tabs,
+            active: self.active_result,
+        }
+    }
+
+    /// The shown panel, as far as the *strip's rules* are concerned.
+    pub fn shown_panel_id(&self) -> Option<u64> {
+        self.result_tabs
+            .with_untracked(|p| shown_panel(p, self.active_result.get_untracked()).map(|p| p.id))
+    }
+
+    /// Is the panel on screen a frozen (pinned) one? — the question every
+    /// affordance that writes or re-reads has to ask. See [`ResultPanel::frozen`].
+    pub fn shown_frozen(&self) -> bool {
+        let active = self.active_result.get_untracked();
+        self.result_tabs
+            .with_untracked(|p| shown_panel(p, active).is_some_and(|p| p.frozen()))
+    }
+
+    /// [`Tab::shown_frozen`]'s reactive half — is **panel `id`** frozen, as a
+    /// value that *changes*, for everything that has to follow a pin rather than
+    /// sample it.
+    ///
+    /// **The pair exists because the one-shot form was the wrong one for a view.**
+    /// Pinning the result on screen moves neither its id nor its phase, so it
+    /// does not rebuild the grid: a `bool` read in the grid's builder went on
+    /// saying "not pinned" for as long as that grid stayed mounted, and the
+    /// result the user had just pinned stayed editable until the user switched
+    /// away and back.
+    ///
+    /// **And it is about one panel, not about whichever panel is shown** — a
+    /// distinction that crashed the app. Asked the second way, running a query
+    /// with a pin present flipped this for the grid *being torn down*: the
+    /// answer changed in the same update pass that unmounted it, the edit-model
+    /// effect re-ran, the toolbar's `ai_menu` — a `dyn_container` keyed on that
+    /// model — rebuilt its child, and the new child's style effect read a
+    /// `GridState` signal whose scope had just been disposed. A grid must only
+    /// ever hear about its own panel, and a panel that has *gone* keeps its last
+    /// answer rather than reporting `false` on its way out, so closing the shown
+    /// result cannot flip it at teardown either.
+    ///
+    /// Only a caller acting *now*, inside an event handler, may take the
+    /// untracked [`Tab::shown_frozen`] instead.
+    pub fn panel_frozen_memo(&self, id: u64) -> Memo<bool> {
+        let panels = self.result_tabs;
+        create_memo(move |prev: Option<&bool>| {
+            panels.with(|v| match v.iter().find(|p| p.id == id) {
+                Some(p) => p.frozen(),
+                None => prev.copied().unwrap_or(false),
+            })
+        })
+    }
+
+    /// The strip, reduced to what [`schemaic_core::resultsel`] answers about.
+    ///
+    /// Every caller takes it from here rather than spelling the `map` again: the
+    /// tuple is built positionally, so a hand-rolled copy is what the compiler
+    /// cannot check when [`schemaic_core::resultsel::PanelRef`] changes shape.
+    pub(crate) fn panel_refs(&self) -> Vec<schemaic_core::resultsel::PanelRef> {
+        self.result_tabs
+            .with_untracked(|v| v.iter().map(|p| (p.id, p.pinned)).collect())
+    }
+
+    /// Start a run: replace the unpinned panels with one `Running` panel per
+    /// statement, and show the first of them. Returns the fresh ids, in
+    /// statement order, for the landing to write its states back into.
+    ///
+    /// The panels that go are disposed **deferred** — they are being removed from
+    /// under the views reading them, and disposing a scope inside the update that
+    /// unmounts its readers is the crash that rule exists to prevent.
+    pub fn begin_run(&self, stmts: &[String]) -> Vec<u64> {
+        let now = now_secs();
+        let mut next = self.next_panel.get_untracked();
+        let fresh: Vec<ResultPanel> = stmts
+            .iter()
+            .enumerate()
+            .map(|(i, sql)| {
+                let panel = ResultPanel::new(self.cx, next, sql, now, i + 1);
+                next += 1;
+                panel
+            })
+            .collect();
+        self.next_panel.set(next);
+        let ids: Vec<u64> = fresh.iter().map(|p| p.id).collect();
+        let order = schemaic_core::resultsel::after_run(&self.panel_refs(), &ids);
+        let active = schemaic_core::resultsel::active_after_run(&self.panel_refs(), &ids);
+        // **One notification, not two.** The list and the selection are one move,
+        // and separately they are not: between them `active_result` names a panel
+        // the list no longer holds, `shown_panel` falls through to its first-panel
+        // fallback, and the results body builds that panel's grid in full —
+        // `init_widths` sampling 200 rows and all — only to throw it away when the
+        // selection lands. With a pinned result present that happened on every
+        // single run.
+        batch(|| {
+            self.rebuild(&order, fresh);
+            if let Some(id) = active {
+                self.active_result.set(id);
+            }
+        });
+        ids
+    }
+
+    /// Rewrite the strip to `order`, keeping the panels it still names (plus any
+    /// of `adding` it names) and disposing the rest.
+    fn rebuild(&self, order: &[u64], adding: Vec<ResultPanel>) {
+        let mut dropped: Vec<Scope> = Vec::new();
+        self.result_tabs.update(|panels| {
+            let mut pool: Vec<ResultPanel> = std::mem::take(panels);
+            pool.extend(adding);
+            for id in order {
+                match pool.iter().position(|p| p.id == *id) {
+                    Some(at) => panels.push(pool.remove(at)),
+                    None => continue,
+                }
+            }
+            dropped.extend(pool.into_iter().map(|p| p.cx));
+        });
+        // Deferred, per the disposal rule: these scopes own signals the views
+        // being unmounted are still reading in this same update pass.
+        if !dropped.is_empty() {
+            floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                for cx in dropped {
+                    cx.dispose();
+                }
+            });
+        }
+    }
+
+    /// Report one panel's outcome, by id. A panel closed while its statement was
+    /// still running is simply gone, and its result lands nowhere — the same
+    /// answer the run-generation check gives a superseded run.
+    pub fn set_panel_state(&self, id: u64, state: QueryState) {
+        // Asked before writing, because `update` notifies whether or not the
+        // closure changed anything: a cancelled batch reports statement after
+        // statement into panels that are gone, and each of those would otherwise
+        // re-run the strip's `dyn_stack`, the body's key memo, every chip's
+        // reactive closures and the editor's error bar for a write that did
+        // nothing at all.
+        if !self.holds_panel(id) {
+            return;
+        }
+        self.result_tabs.update(|panels| {
+            if let Some(p) = panels.iter_mut().find(|p| p.id == id) {
+                p.state = state;
+            }
+        });
+    }
+
+    /// Is `id` still in the strip? — the pre-check the two by-id writers make so
+    /// a write that would match nothing doesn't notify anyway.
+    fn holds_panel(&self, id: u64) -> bool {
+        self.result_tabs
+            .with_untracked(|v| v.iter().any(|p| p.id == id))
+    }
+
+    /// Has nothing run here at all? — one panel, still idle, nothing pinned.
+    ///
+    /// The results half of the blank-slate test that decides whether a new tab
+    /// can reuse this one in place. A tab now always holds a panel, so "the strip
+    /// is empty" stopped being the question; "the strip is the one it was born
+    /// with" is.
+    pub fn results_untouched(&self) -> bool {
+        self.result_tabs.with_untracked(|v| {
+            v.len() == 1
+                && v.first()
+                    .is_some_and(|p| !p.pinned && matches!(p.state, QueryState::Idle))
+        })
+    }
+
+    /// Back to one empty result — a tab being respawned as a fresh one. Closes
+    /// **everything**, pins included: the tab this belongs to is not the tab that
+    /// pinned them.
+    pub fn reset_results(&self) {
+        let ids: Vec<u64> = self
+            .result_tabs
+            .with_untracked(|v| v.iter().map(|p| p.id).collect());
+        self.close_panels(&ids);
+    }
+
+    /// Pin or unpin a panel, moving it to the pinned block's boundary.
+    ///
+    /// The flag and the reordering are one move — batched, so no reader sees a
+    /// strip that is pinned but not yet sorted.
+    pub fn set_pinned(&self, id: u64, pinned: bool) {
+        batch(|| {
+            self.result_tabs.update(|panels| {
+                if let Some(p) = panels.iter_mut().find(|p| p.id == id) {
+                    p.pinned = pinned;
+                }
+            });
+            let order = schemaic_core::resultsel::pin_order(&self.panel_refs(), id, pinned);
+            self.rebuild(&order, Vec::new());
+        });
+    }
+
+    /// Close `ids`, landing the strip on [`schemaic_core::resultsel::active_after_removal`]'s
+    /// answer. A tab whose last panel goes gets a fresh idle one, so the strip is
+    /// never empty.
+    pub fn close_panels(&self, ids: &[u64]) {
+        let refs = self.panel_refs();
+        let next = schemaic_core::resultsel::active_after_removal(
+            &refs,
+            ids,
+            self.active_result.get_untracked(),
+        );
+        let order: Vec<u64> = refs
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !ids.contains(id))
+            .collect();
+        // Batched for `begin_run`'s reason: the list and the selection are one
+        // move, and a view that sees the half-applied state builds a grid nobody
+        // will look at.
+        batch(|| match next {
+            Some(id) => {
+                self.rebuild(&order, Vec::new());
+                self.active_result.set(id);
+            }
+            None => {
+                let id = self.next_panel.get_untracked();
+                self.next_panel.set(id + 1);
+                self.rebuild(&[id], vec![ResultPanel::idle(self.cx, id)]);
+                self.active_result.set(id);
+            }
+        });
+    }
+
+    /// Record the statement a panel's rows **actually came from**.
+    ///
+    /// A filter/sort re-run replaces a panel's result without opening a new panel
+    /// — that is what keeps its table on screen — so the statement it was born
+    /// with stops describing what is in it. The chip's tooltip reads this, which
+    /// matters most for a *pinned* filtered result: it is frozen, so the filter
+    /// row that would otherwise say `WHERE …` is not offered, and the tooltip is
+    /// then the only thing that can say what the rows are. The chip's **label**
+    /// deliberately doesn't move — it names the result, and a name that changes
+    /// under the pointer is a name nobody can point at.
+    pub fn set_panel_sql(&self, id: u64, sql: &str) {
+        if !self.holds_panel(id) {
+            return;
+        }
+        self.result_tabs.update(|panels| {
+            if let Some(p) = panels.iter_mut().find(|p| p.id == id) {
+                p.sql = sql.to_string();
+            }
+        });
     }
 
     /// `parent` is the app root scope; the tab creates its own child scope under
@@ -1244,9 +1503,12 @@ impl Tab {
             id,
             label: id,
             query: cx.create_rw_signal(initial.to_string()),
-            results: cx.create_rw_signal(QueryState::Idle),
-            result_tabs: cx.create_rw_signal(Vec::new()),
+            // One idle panel, so the strip has a chip from the first frame — an
+            // empty strip is a bar with nothing in it, which reads as broken
+            // rather than as "nothing has run".
+            result_tabs: cx.create_rw_signal(vec![ResultPanel::idle(cx, 0)]),
             active_result: cx.create_rw_signal(0),
+            next_panel: cx.create_rw_signal(1),
             conn_id: cx.create_rw_signal(conn_id),
             database: cx.create_rw_signal(database),
             source: cx.create_rw_signal(None),
@@ -1313,6 +1575,62 @@ impl Tab {
             Some(d) => self.query.with(|q| q != d),
             None => true,
         })
+    }
+}
+
+/// The result the editor is talking about: the shown panel's state, as one
+/// readable-and-dismissable handle.
+///
+/// The editor's error bar, its "AI fix" and its "Explain" all ask "what did the
+/// run say?", and its `.update` dismisses that answer when the text changes.
+/// They used to read a `RwSignal<QueryState>` on the tab, which stopped being
+/// the truth the moment every result became a panel — this is the same four
+/// operations against the panel the strip is showing, so there is one answer
+/// rather than a signal to keep in step with the strip.
+#[derive(Clone, Copy)]
+pub struct ShownResult {
+    panels: RwSignal<Vec<ResultPanel>>,
+    active: RwSignal<u64>,
+}
+
+impl ShownResult {
+    /// The shown result's state, tracked.
+    pub fn get(&self) -> QueryState {
+        let active = self.active.get();
+        self.panels
+            .with(|p| shown_panel(p, active).map(|p| p.state.clone()))
+            .unwrap_or(QueryState::Idle)
+    }
+
+    pub fn get_untracked(&self) -> QueryState {
+        let active = self.active.get_untracked();
+        self.panels
+            .with_untracked(|p| shown_panel(p, active).map(|p| p.state.clone()))
+            .unwrap_or(QueryState::Idle)
+    }
+
+    /// Dismiss a stale error: any edit to the text means the message no longer
+    /// describes it. A no-op unless the shown result actually failed — the strip
+    /// is not something typing should otherwise disturb.
+    ///
+    /// **And never on a kept result**, which is the same rule as everywhere else:
+    /// a pinned panel is a record of what happened, and typing in the editor is
+    /// not an event that happened to it. Without this, the one way to mutate a
+    /// frozen panel would be the keyboard.
+    pub fn dismiss_error(&self) {
+        let active = self.active.get_untracked();
+        let id = self
+            .panels
+            .with_untracked(|p| shown_panel(p, active).map(|p| p.id));
+        let Some(id) = id else { return };
+        self.panels.update(|panels| {
+            if let Some(p) = panels
+                .iter_mut()
+                .find(|p| p.id == id && !p.frozen() && matches!(p.state, QueryState::Failed(_)))
+            {
+                p.state = QueryState::Idle;
+            }
+        });
     }
 }
 
@@ -1515,12 +1833,138 @@ pub struct Confirm {
     pub resolve: Rc<dyn Fn(bool)>,
 }
 
-/// One statement's result within a multi-statement (Run Everything) run. The
-/// label names its tab; `state` is that statement's own lifecycle.
+/// One result in the results strip — one statement's, with its own lifecycle.
+///
+/// **Every result is one of these**, a single run's included: the strip is always
+/// on screen, so there is one representation of "a result" rather than a strip
+/// for a batch and a bare grid for everything else. A tab with nothing run yet
+/// holds one `Idle` panel, which is what the strip shows.
+///
+/// A panel the user has **pinned** survives the next run (`resultsel::after_run`)
+/// — the whole point of the strip — and pinning freezes it: see
+/// [`ResultPanel::frozen`].
 #[derive(Clone)]
 pub struct ResultPanel {
+    /// This panel's own child scope, under the tab's. Everything in [`PanelView`]
+    /// is created in it, so closing the panel can `dispose()` it and reclaim them
+    /// — the same rule a tab follows, and for the same reason.
+    pub cx: Scope,
+    /// Stable identity, unique within the tab. **Not the index**: panels are
+    /// closed, pinned and reordered, and an index would move under every one of
+    /// those — which is also why the strip's `dyn_stack` is keyed on it.
+    pub id: u64,
+    /// What the chip says: the statement, previewed (`history::preview`), or
+    /// "Result N" when there is nothing to preview.
     pub label: String,
+    /// The statement that produced it, in full — the chip's tooltip, and what
+    /// tells two pinned results of the same table apart.
+    pub sql: String,
     pub state: QueryState,
+    /// Kept: a run replaces the unpinned panels and leaves this one alone.
+    pub pinned: bool,
+    /// When the run that produced it was launched (epoch seconds), for the
+    /// tooltip's "4 min ago" — a pinned result's age is the thing that decides
+    /// whether it is still the "before" the user wanted.
+    pub ran_at: u64,
+    /// Per-panel grid state, restored when the strip comes back to it.
+    pub view: PanelView,
+}
+
+impl ResultPanel {
+    /// A fresh panel in the tab's scope, `Running` until its statement lands.
+    pub fn new(tab_cx: Scope, id: u64, sql: &str, ran_at: u64, ordinal: usize) -> ResultPanel {
+        let cx = tab_cx.create_child();
+        let preview = schemaic_core::history::preview(sql);
+        ResultPanel {
+            cx,
+            id,
+            label: if preview.trim().is_empty() {
+                format!("Result {ordinal}")
+            } else {
+                preview
+            },
+            sql: sql.to_string(),
+            state: QueryState::Running,
+            pinned: false,
+            ran_at,
+            view: PanelView::new(cx),
+        }
+    }
+
+    /// The empty panel a tab with nothing run yet shows, so the strip is never a
+    /// bar with no chips in it.
+    pub fn idle(tab_cx: Scope, id: u64) -> ResultPanel {
+        let cx = tab_cx.create_child();
+        ResultPanel {
+            cx,
+            id,
+            label: "Result 1".to_string(),
+            sql: String::new(),
+            state: QueryState::Idle,
+            pinned: false,
+            ran_at: 0,
+            view: PanelView::new(cx),
+        }
+    }
+
+    /// **Is this result frozen?** — i.e. pinned, and therefore not a thing to
+    /// write to or re-read.
+    ///
+    /// A pin exists to hold a result *as it was*, and two of the grid's
+    /// affordances would quietly destroy that. **Editing**: a write's `WHERE` is
+    /// the key columns and their original values ([`schemaic_core::model::RowEdit`]),
+    /// with no guard on the columns being set — so a commit from a snapshot taken
+    /// twenty minutes ago is a well-formed `UPDATE` that overwrites whatever
+    /// landed in between, and the 1-row safety net cannot see it (one row *is*
+    /// matched). **Server-side filter/sort**: it re-runs the statement and swaps
+    /// the result in, which is exactly the "before" the user asked to keep.
+    ///
+    /// Everything that only rearranges what is already held stays live —
+    /// client-side sort, find, copy, export, the formatters.
+    pub fn frozen(&self) -> bool {
+        self.pinned
+    }
+}
+
+/// Per-panel grid state: what the strip has to put back when it returns to a
+/// panel, rather than rebuild from scratch.
+///
+/// **Signals rather than plain fields on [`ResultPanel`].** The panel list is one
+/// signal holding a `Vec`, so writing a column width into it would clone and
+/// re-notify the whole strip on every mouse-move of a resize drag. These are
+/// written by the mounted grid at that rate, so they are the panel's own signals
+/// and the list never hears about them.
+///
+/// Selection is deliberately **not** here: it is where the user last clicked,
+/// which is not a property of the result, and restoring it puts a highlight
+/// somewhere nobody put it.
+#[derive(Clone, Copy)]
+pub struct PanelView {
+    /// Measured column widths, `None` until the grid has measured them once.
+    pub widths: RwSignal<Option<Vec<f64>>>,
+    /// The `grid_char_w()` those widths were measured against — see
+    /// `grid::GridState::widths_at`, which this restores along with them.
+    pub widths_at: RwSignal<f64>,
+    /// The client-side sort: `(column, ascending)`.
+    pub sort: RwSignal<Option<(usize, bool)>>,
+    /// The frozen (pinned-left) column's absolute index.
+    ///
+    /// **`frozen_col`, not `frozen`.** A *frozen column* and a *frozen result*
+    /// are different things one field apart here — `gctx.panel.frozen_col` is an
+    /// index, `gctx.panel_frozen` is whether the result is pinned — and the two
+    /// spelled the same way is a wrong-variable bug waiting for the next reader.
+    pub frozen_col: RwSignal<Option<usize>>,
+}
+
+impl PanelView {
+    fn new(cx: Scope) -> PanelView {
+        PanelView {
+            widths: cx.create_rw_signal(None),
+            widths_at: cx.create_rw_signal(0.0),
+            sort: cx.create_rw_signal(None),
+            frozen_col: cx.create_rw_signal(None),
+        }
+    }
 }
 
 // The chat message types live in `schemaic_core::transcript` alongside the
@@ -5027,7 +5471,7 @@ fn center(ui: Ui) -> impl IntoView {
                     insert_req: tab.insert_req,
                     syntax: tab.diagnostics,
                     fix_req: tab.fix_req,
-                    results: tab.results,
+                    results: tab.shown(),
                     run: run.clone(),
                     run_all: run_all.clone(),
                     run_guard,
@@ -5087,9 +5531,7 @@ fn center(ui: Ui) -> impl IntoView {
         move || active.get(),
         move |id| match tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) {
             Some(tab) => results_section(
-                tab.results,
-                tab.result_tabs,
-                tab.active_result,
+                tab,
                 cancel.clone(),
                 editor_collapsed,
                 toggle_collapse.clone(),
@@ -5124,9 +5566,17 @@ fn center(ui: Ui) -> impl IntoView {
                     commit: commit_edits.clone(),
                     export_file: export_file.clone(),
                     export_cancel: export_cancel.clone(),
-                    // `results_view` fills this in for the single-result path; the
-                    // multi-result path leaves it `None` (full-re-run on commit).
+                    // Two of the panel-scoped fields are filled in by the results
+                    // body, which is the only place that knows *which* panel is
+                    // being drawn — see `results_multi`.
                     sync_canonical: None,
+                    panel: None,
+                    // A placeholder: the body replaces it with a memo over the
+                    // panel it is actually drawing (`Tab::panel_frozen_memo`).
+                    // It cannot be answered here, because "frozen" is a fact
+                    // about *one* panel and this context outlives every one of
+                    // them.
+                    panel_frozen: create_memo(|_| false),
                     read_only,
                     tx_mode: tab.tx_mode,
                     conn_id: tab.conn_id,
@@ -5251,14 +5701,11 @@ fn center(ui: Ui) -> impl IntoView {
     })
 }
 
-// The RESULTS pane for one tab. Single runs use the legacy single-grid view
-// (`results`); a Run Everything batch shows a result-tab strip over the active
-// statement's grid (`result_tabs` non-empty).
+// The RESULTS pane for one tab: the strip of this tab's results, always on
+// screen, over the grid of whichever one is shown.
 #[allow(clippy::too_many_arguments)]
 fn results_section(
-    results: RwSignal<QueryState>,
-    result_tabs: RwSignal<Vec<ResultPanel>>,
-    active_result: RwSignal<usize>,
+    tab: Tab,
     cancel: Rc<dyn Fn()>,
     // Editor-collapse toggle: the intent flag (drives the expand/shrink icon) and
     // the action that flips it + kicks off the tween.
@@ -5278,18 +5725,13 @@ fn results_section(
     let (exporting, export_cancel) = (gctx.exporting, gctx.export_cancel.clone());
     let tab_id = gctx.tab_id;
     let view_err = gctx.view_err;
-    // A Run-Everything statement's own error, which the bottom bar carries for the
-    // same reason the editor's carries a single run's: a server error is one long
-    // line, and in the pane it ran clear across the window. Derived rather than a
-    // fourth signal to keep in step — the panels *are* the state, so switching
-    // result tabs and starting a new batch both fall out of them for free.
-    let batch_err = create_memo(move |_| {
-        let ai = active_result.get();
-        result_tabs.with(|v| shown_panel_error(v, ai))
-    });
+    let (result_tabs, active_result) = (tab.result_tabs, tab.active_result);
     // Everything the bottom bar can show, as one value — see `grid::BarSignals`.
+    // A *statement's* failure is not among them: it goes to the editor's error
+    // bar, which is the one place a run error is reported now that every result
+    // is a panel. It used to be reported in both, and before that in one each for
+    // a batch and a single run.
     let bars = crate::grid::BarSignals {
-        batch_err,
         commit_err,
         commit_note,
         view_err,
@@ -5308,43 +5750,48 @@ fn results_section(
     // One effect on the result state closes both, and it is the state itself
     // that is tracked rather than the grid's disposal: a `dyn_container` child's
     // cleanup is not somewhere a sibling's signals can be reached.
-    {
-        let (results, result_tabs) = (results, result_tabs);
-        create_effect(move |_| {
-            let ai = active_result.get();
-            let loaded = if result_tabs.with(|v| v.is_empty()) {
-                matches!(results.get(), QueryState::Loaded(_))
-            } else {
-                // Run Everything: the statement the strip is *showing* is the one
-                // whose grid is mounted. "Any statement in the batch" was the same
-                // bug one level along — switching from a loaded Result 1 to a
-                // failed Result 2 left the selection summary and the find bar over
-                // a pane with no grid under them.
-                result_tabs.with(|v| shown_panel_loaded(v, ai))
-            };
-            if !loaded {
-                sel_summary.set(None);
-                goto_open.set(false);
-                find_open.set(false);
-            }
-        });
-    }
+    create_effect(move |_| {
+        let ai = active_result.get();
+        // The result the strip is *showing* is the one whose grid is mounted.
+        // "Any result in the tab" was the same bug one level along — switching
+        // from a loaded Result 1 to a failed Result 2 left the selection summary
+        // and the find bar over a pane with no grid under them.
+        if !result_tabs.with(|v| shown_panel_loaded(v, ai)) {
+            sel_summary.set(None);
+            goto_open.set(false);
+            find_open.set(false);
+        }
+    });
+    // **And the bars that describe an operation are about the result it ran on.**
+    // `view_err`, `commit_err` and `commit_note` are tab-level and are cleared by
+    // the grid actions that supersede them — a new commit, a fresh filter re-run,
+    // a click on the filter bar — none of which switching results is. So a bad
+    // `WHERE` typed on the live result kept its red bar over a *pinned* snapshot
+    // the user then clicked, and a failed commit followed them onto a result that
+    // cannot be committed at all. Cleared on a change of shown panel, which is
+    // the moment they stop describing what is on screen.
+    //
+    // `commit_wait` is deliberately **not** cleared: it stands for a write still
+    // in flight and carries the one-click Rollback, so it belongs to the
+    // connection rather than to whichever result is on top of it.
+    create_effect(move |prev: Option<Option<u64>>| {
+        let ai = active_result.get();
+        let shown = result_tabs.with(|v| shown_panel(v, ai).map(|p| p.id));
+        if let Some(before) = prev
+            && before != shown
+        {
+            view_err.set(None);
+            commit_err.set(None);
+            commit_note.set(None);
+        }
+        shown
+    });
     // Properties + Live Monitor: both act on the tab's source table. Captured
     // before `gctx` moves.
     let open_monitor = gctx.open_monitor.clone();
     let open_properties = gctx.open_properties.clone();
     let (monitor_source, monitor_conn) = (gctx.source, gctx.conn_id);
-    let body = dyn_container(
-        move || !result_tabs.with(|v| v.is_empty()),
-        move |multi| {
-            if multi {
-                results_multi(result_tabs, active_result, cancel.clone(), gctx.clone()).into_any()
-            } else {
-                results_view(results, cancel.clone(), gctx.clone()).into_any()
-            }
-        },
-    )
-    .style(|s| {
+    let body = results_multi(tab, cancel, gctx).style(|s| {
         s.flex_grow(1.0_f32)
             .width_full()
             .flex_col()
@@ -5444,69 +5891,74 @@ fn results_section(
     })
 }
 
-/// The statement a Run-Everything strip is **showing**: the `active`th panel, or
-/// the first when that index is stale — a click that selected Result 7 outlives a
-/// later batch of three, and the strip is regenerated on every run.
+/// The result the strip is **showing**: the panel with id `active`, or the first
+/// one when that id is stale — a selected panel outlives the run that closes it,
+/// and something has to be on screen either way.
 ///
 /// One function so the pane, the error bar, the bars-clearing effect **and the
 /// AI panel** can't disagree about which statement they are describing.
-pub fn shown_panel(panels: &[ResultPanel], active: usize) -> Option<&ResultPanel> {
-    panels.get(active).or_else(|| panels.first())
-}
-
-/// The message the RESULTS error bar carries for a batch: the shown statement's
-/// own error, or `None` for one that is idle, running, cancelled or loaded.
-///
-/// A batch statement's error used to be the pane itself
-/// (`centered_msg(m, theme::error)`), and a server error is one long line: it
-/// rendered as unwrapped text across the middle of the window, out over the schema
-/// sidebar. It now goes where a single run's does — a one-lined red bar with
-/// **View** for the full text — while the pane says only that the statement failed.
-fn shown_panel_error(panels: &[ResultPanel], active: usize) -> Option<String> {
-    match shown_panel(panels, active).map(|p| &p.state) {
-        Some(QueryState::Failed(m)) => Some(m.clone()),
-        _ => None,
-    }
+pub fn shown_panel(panels: &[ResultPanel], active: u64) -> Option<&ResultPanel> {
+    panels
+        .iter()
+        .find(|p| p.id == active)
+        .or_else(|| panels.first())
 }
 
 /// Whether a grid is mounted under the strip — i.e. the **shown** statement
 /// loaded one. What the panel-level bars (find, go-to-row, the selection summary)
 /// are allowed to be up for.
-fn shown_panel_loaded(panels: &[ResultPanel], active: usize) -> bool {
+fn shown_panel_loaded(panels: &[ResultPanel], active: u64) -> bool {
     matches!(
         shown_panel(panels, active).map(|p| &p.state),
         Some(QueryState::Loaded(_))
     )
 }
 
-// Run Everything results: a result-tab strip over the active statement's grid.
-fn results_multi(
-    result_tabs: RwSignal<Vec<ResultPanel>>,
-    active_result: RwSignal<usize>,
-    cancel: Rc<dyn Fn()>,
-    gctx: GridCtx,
-) -> impl IntoView {
+// The results strip and the grid under it — **every** result, a single run's
+// included, since the strip is always on screen.
+fn results_multi(tab: Tab, cancel: Rc<dyn Fn()>, gctx: GridCtx) -> impl IntoView {
+    let (result_tabs, active_result) = (tab.result_tabs, tab.active_result);
+    let strip_ctx = gctx.clone();
+    let load_gen = gctx.load_gen;
+    // **The key is the shown panel's id, its phase, and the load nonce** — a
+    // deduped `Memo`, never the `QueryState` itself.
+    //
+    // The id is what makes switching results a remount: two panels can both be
+    // `Loaded` and they are different results. The phase is what keeps an
+    // *in-place commit splice* from being one: the splice replaces the panel's
+    // `Arc` (`Loaded` → `Loaded`) without touching id or nonce, so the key is
+    // unchanged and the grid — with its scroll, its selection and its column
+    // widths — is not rebuilt. A real run passes through `Running`, and a
+    // filter/sort re-run bumps the nonce; both rebuild, which is what they mean.
+    let key = create_memo(move |_| {
+        let ai = active_result.get();
+        let shown = result_tabs.with(|v| shown_panel(v, ai).map(|p| (p.id, phase_of(&p.state))));
+        (shown, load_gen.get())
+    });
     let body = dyn_container(
-        move || {
-            let ai = active_result.get();
-            result_tabs.with(|v| shown_panel(v, ai).map(|p| p.state.clone()))
-        },
-        move |state| match state {
-            None => empty().into_any(),
-            Some(QueryState::Idle) => empty().into_any(),
-            Some(QueryState::Running) => running_view(cancel.clone()).into_any(),
-            // The message itself goes to the panel-level error bar (see
-            // `shown_panel_error`), exactly as a single run's goes to the editor's
-            // — so the pane only notes the failure, as `grid_view` does under
-            // `Phase::Failed`. It used to *be* the pane, and one long server error
-            // then ran across the window and out over the schema sidebar.
-            Some(QueryState::Failed(_)) => {
-                centered_msg("Statement failed.", theme::text_dim).into_any()
+        move || key.get(),
+        move |(shown, _gen)| {
+            let Some((id, phase)) = shown else {
+                return empty().into_any();
+            };
+            // Read untracked: the memo above, not the `Arc`, drives rebuilds.
+            let panel = result_tabs.with_untracked(|v| v.iter().find(|p| p.id == id).cloned());
+            let state = panel.as_ref().map(|p| p.state.clone());
+            let mut gctx = gctx.clone();
+            gctx.panel = panel.as_ref().map(|p| p.view);
+            // A memo over **this** panel — created here, in the scope that dies
+            // with this grid, and keyed on the id rather than on "whichever is
+            // shown". See `Tab::panel_frozen_memo` for why the difference is a
+            // crash and not a nuance.
+            gctx.panel_frozen = tab.panel_frozen_memo(id);
+            if phase == Phase::Loaded {
+                // The splice sink, pointed at *this* panel: an in-place commit
+                // replaces the result this grid is showing, and only that one.
+                gctx.sync_canonical = Some(Rc::new(move |rs| {
+                    tab.set_panel_state(id, QueryState::Loaded(rs))
+                }));
             }
-            Some(QueryState::Cancelled) => {
-                centered_msg("Query cancelled.", theme::text_dim).into_any()
-            }
-            Some(QueryState::Loaded(rs)) => loaded_view(rs, gctx.clone()),
+            build_result_body(state, cancel.clone(), gctx)
         },
     )
     .style(|s| {
@@ -5517,7 +5969,7 @@ fn results_multi(
             .min_width(0.0)
     });
 
-    v_stack((result_tab_strip(result_tabs, active_result), body)).style(|s| {
+    v_stack((result_tab_strip(tab, strip_ctx), body)).style(|s| {
         s.flex_grow(1.0_f32)
             .width_full()
             .flex_col()
@@ -5526,23 +5978,51 @@ fn results_multi(
     })
 }
 
-// Result-tab strip (Run Everything): one chip per statement, click to switch.
-// Borrows the query tab bar's look (top-rounded, oversize-and-clip); no close /
-// "+" since the tabs are regenerated on each run.
-fn result_tab_strip(
-    result_tabs: RwSignal<Vec<ResultPanel>>,
-    active_result: RwSignal<usize>,
-) -> impl IntoView {
+/// What the pane shows for one panel's state.
+///
+/// `None` is a strip with nothing selectable in it, which the tab's idle panel
+/// means it can't be — kept as the same empty pane an `Idle` panel draws, since
+/// "no result" is what both of them are.
+fn build_result_body(
+    state: Option<QueryState>,
+    cancel: Rc<dyn Fn()>,
+    gctx: GridCtx,
+) -> floem::AnyView {
+    match state {
+        None => empty().into_any(),
+        // The tab's own opening state, and the only prompt in the app that says
+        // how to run something — it is the first thing on screen in a new tab.
+        Some(QueryState::Idle) => {
+            centered_msg("Run a query  (Ctrl+Enter)", theme::text_muted).into_any()
+        }
+        Some(QueryState::Running) => running_view(cancel).into_any(),
+        // The message itself goes to the panel-level error bar (see
+        // `shown_panel_error`), exactly as a single run's goes to the editor's
+        // — so the pane only notes the failure, as `grid_view` does under
+        // `Phase::Failed`. It used to *be* the pane, and one long server error
+        // then ran across the window and out over the schema sidebar.
+        Some(QueryState::Failed(_)) => {
+            centered_msg("Statement failed.", theme::text_dim).into_any()
+        }
+        Some(QueryState::Cancelled) => centered_msg("Query cancelled.", theme::text_dim).into_any(),
+        Some(QueryState::Loaded(rs)) => loaded_view(rs, gctx),
+    }
+}
+
+// The results strip: one chip per result, click to switch, right-click for the
+// same verbs the query strip offers (Pin, Close, Close others, Close all).
+// Borrows the query tab bar's look, and is **always on screen** — a pin is only a
+// visible affordance if the thing it acts on is.
+fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
+    let result_tabs = tab.result_tabs;
     let chips = dyn_stack(
-        move || {
-            result_tabs
-                .get()
-                .into_iter()
-                .enumerate()
-                .collect::<Vec<_>>()
-        },
-        |(i, p): &(usize, ResultPanel)| (*i, p.label.clone()),
-        move |(i, panel)| result_tab_chip(i, panel.label, result_tabs, active_result),
+        move || result_tabs.get(),
+        // **Keyed on the id alone.** The label is derived from the statement and
+        // never changes for a given panel, and the id is what survives pinning
+        // (which reorders) and closing (which renumbers nothing) — keying on the
+        // position would rebuild every chip to the right of a close.
+        |p: &ResultPanel| p.id,
+        move |panel| result_tab_chip(panel, tab, gctx.clone()),
     )
     .style(|s| s.flex_row().height_full());
 
@@ -5567,45 +6047,204 @@ fn result_tab_strip(
     })
 }
 
-fn result_tab_chip(
-    idx: usize,
-    label: String,
-    result_tabs: RwSignal<Vec<ResultPanel>>,
-    active_result: RwSignal<usize>,
-) -> impl IntoView {
-    // State is read reactively (the chip isn't rebuilt when only state changes,
-    // since it's keyed by label): a failed statement's tab tints red.
-    let is_err = move || {
-        result_tabs.with(|v| matches!(v.get(idx).map(|p| &p.state), Some(QueryState::Failed(_))))
+/// How much width a result chip's label may take: the chip's cap, less
+/// everything drawn beside the text — the 10px left inset, the label's own 6px
+/// right margin, and the 14px trailing glyph with its 7px margin.
+///
+/// Spelled out rather than left to flex shrink, because that is not what a
+/// `max_width` on the row does: the text lays out at its natural width and
+/// overflows the chip. The query strip pays the same arithmetic in
+/// `tabs::tab_title_avail`, and for the same reason — a title that eats its own
+/// × is a chip that cannot be closed.
+fn result_title_avail() -> f64 {
+    tab_max_w() - theme::scaled(37.0)
+}
+
+fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView {
+    let (result_tabs, active_result) = (tab.result_tabs, tab.active_result);
+    let id = panel.id;
+    // Read reactively rather than off the captured `panel`: the chip is keyed on
+    // the id, so it is *not* rebuilt when its statement lands or when it is
+    // pinned — both of which it has to show.
+    let state_of = move |f: fn(&QueryState) -> bool| {
+        move || result_tabs.with(|v| v.iter().find(|p| p.id == id).is_some_and(|p| f(&p.state)))
     };
-    // Colour is set on the tab container and cascades to the label.
-    container(text(label).style(|s| {
-        s.margin_horiz(theme::scaled(10.0))
-            .font_size(theme::font_body())
-    }))
-    .on_click_stop(move |_| active_result.set(idx))
-    .style(move |s| {
-        let s = s
-            .flex_row()
-            .items_center()
-            .border_right(1.0)
-            .border_color(theme::tab_separator());
-        let s = if active_result.get() == idx {
-            s.background(theme::tab_active())
-        } else {
-            s.background(theme::bg_chrome())
+    let is_err = state_of(|s| matches!(s, QueryState::Failed(_)));
+    let pinned =
+        move || result_tabs.with(|v| v.iter().find(|p| p.id == id).is_some_and(|p| p.pinned));
+    let is_active =
+        move || result_tabs.with(|v| shown_panel(v, active_result.get()).map(|p| p.id)) == Some(id);
+
+    // What this result is, in full: the statement, when it ran, and what holding
+    // on to it costs. The last is the whole reason the strip can say "keep this"
+    // without hand-waving about memory — see `ResultSet::retained_bytes`.
+    // Read off the *live* panel, not the captured one: a filter re-run rewrites
+    // the statement a panel's rows came from (`Tab::set_panel_sql`), and the
+    // result it is holding — the thing the size is about — arrives after the chip
+    // is built.
+    let tip = move || {
+        let Some(panel) = result_tabs.with_untracked(|v| v.iter().find(|p| p.id == id).cloned())
+        else {
+            return String::new();
         };
-        // The chip's own background is `tab_active`/`bg_chrome`, never
-        // `reject_bg`, so a failed statement's label needs the free-standing
-        // error colour rather than the red pill's foreground.
-        if is_err() {
-            s.color(theme::error())
-        } else if active_result.get() == idx {
-            s.color(theme::text())
+        let mut lines = vec![if panel.sql.trim().is_empty() {
+            "Nothing has run in this tab yet.".to_string()
         } else {
-            s.color(theme::tab_text()).hover(|s| s.color(theme::text()))
+            panel.sql.clone()
+        }];
+        let mut foot: Vec<String> = Vec::new();
+        if panel.ran_at > 0 {
+            foot.push(schemaic_core::history::relative_time(
+                panel.ran_at,
+                now_secs(),
+            ));
         }
-    })
+        if let QueryState::Loaded(rs) = &panel.state {
+            foot.push(schemaic_core::stats::format_bytes(
+                rs.retained_bytes() as u64
+            ));
+        }
+        if panel.pinned {
+            foot.push("kept — read-only".to_string());
+        }
+        if !foot.is_empty() {
+            lines.push(foot.join(" · "));
+        }
+        lines.join("\n")
+    };
+
+    // Trailing icon, on the query strip's rule and with its footprint: a
+    // clickable × normally, a non-clickable pin when pinned (a pinned result
+    // can't be closed — unpin it first).
+    //
+    // **Both glyphs, one hidden — not a `dyn_container` swapping them.** `pinned`
+    // reads the panel list, which is also what removes this chip, so a rebuild
+    // keyed on it would construct a child inside a view being torn down: the
+    // hazard under *Floem 0.2 gotchas*, and the reason `widgets::check_box` and
+    // the dump modal's picker both toggle by style. Nothing here reads a
+    // per-view signal today, so it did not crash; that is not a property to
+    // leave resting on what the next edit happens to add.
+    let icon_style = |s: floem::style::Style| {
+        s.flex_shrink(0.0_f32)
+            .margin_right(theme::scaled(7.0))
+            .color(theme::tab_close())
+    };
+    let pin_glyph = icons::icon(icons::PIN, 14.0).style(move |s| {
+        let s = icon_style(s);
+        if pinned() { s } else { s.hide() }
+    });
+    let close_glyph = icons::icon(icons::X, 14.0)
+        .on_click_stop(move |_| tab.close_panels(&[id]))
+        .style(move |s| {
+            let s = icon_style(s).hover(|s| s.color(theme::text()));
+            if pinned() { s.hide() } else { s }
+        });
+
+    // **The cap is on the label, not on the chip.** A statement is arbitrarily
+    // long, and `max_width` on the row only clips it: the text still lays itself
+    // out at its natural width, runs under the × and out over the next chip.
+    // Capping the *text* is what makes `text_ellipsis` fire — the query strip's
+    // rule (`tab_title_avail`), and this is its arithmetic.
+    let label = text(panel.label.clone()).style(|s| {
+        s.margin_left(theme::scaled(10.0))
+            .margin_right(theme::scaled(6.0))
+            .max_width(result_title_avail())
+            .font_size(theme::font_body())
+            .text_ellipsis()
+    });
+
+    // Colour is set on the tab container and cascades to the label.
+    h_stack((label, pin_glyph, close_glyph))
+        .on_click_stop(move |_| active_result.set(id))
+        // Middle-click closes, as it does on a query tab (and as there, a pinned
+        // one no-ops — `close_panels` is reached through the same guard).
+        .on_event(EventListener::PointerDown, move |e| {
+            if let Event::PointerDown(pe) = e
+                && pe.button.is_auxiliary()
+            {
+                if schemaic_core::resultsel::can_close(&tab.panel_refs(), id) {
+                    tab.close_panels(&[id]);
+                }
+                return EventPropagation::Stop;
+            }
+            EventPropagation::Continue
+        })
+        .on_secondary_click_stop(move |_| result_chip_menu(id, tab, &gctx))
+        .tooltip(move || text(tip()).style(crate::widgets::tooltip_style))
+        .style(move |s| {
+            let s = s
+                .flex_row()
+                .items_center()
+                .max_width(tab_max_w())
+                .border_right(1.0)
+                .border_color(theme::tab_separator());
+            let s = if is_active() {
+                s.background(theme::tab_active())
+            } else {
+                s.background(theme::bg_chrome())
+            };
+            // The chip's own background is `tab_active`/`bg_chrome`, never
+            // `reject_bg`, so a failed statement's label needs the free-standing
+            // error colour rather than the red pill's foreground.
+            if is_err() {
+                s.color(theme::error())
+            } else if is_active() {
+                s.color(theme::text())
+            } else {
+                s.color(theme::tab_text()).hover(|s| s.color(theme::text()))
+            }
+        })
+}
+
+/// The chip's right-click menu — the query strip's verbs, less the ones that are
+/// about a *query* (rename, duplicate, the file group).
+///
+/// The same rules answer both strips ([`schemaic_core::resultsel`] and
+/// `tabsel`), so "Close all" spares the pins here exactly as it does there, and
+/// an entry with nothing to act on is **dimmed rather than missing** — a menu
+/// that keeps its shape is the one the hand learns.
+fn result_chip_menu(id: u64, tab: Tab, gctx: &GridCtx) {
+    use schemaic_core::resultsel;
+    let refs = tab.panel_refs();
+    let pinned = refs.iter().any(|(i, p)| *i == id && *p);
+    let mut entries = vec![MenuEntry::action(
+        if pinned { "Unpin" } else { "Pin" },
+        move || tab.set_pinned(id, !pinned),
+    )];
+    // Omitted rather than dimmed when pinned, which is what the query strip does
+    // with the same entry: the pin above it is the way to get it back.
+    if resultsel::can_close(&refs, id) {
+        entries.push(MenuEntry::action("Close", move || tab.close_panels(&[id])));
+    }
+    entries.push(MenuEntry::Separator);
+    let others = resultsel::others_to_close(&refs, id);
+    entries.push(
+        // Asked again at the click, not captured: the strip can have moved while
+        // the menu stood open (a batch landing, another chip closed).
+        MenuEntry::action("Close other results", move || {
+            tab.close_panels(&resultsel::others_to_close(&tab.panel_refs(), id));
+        })
+        .disabled(others.is_empty()),
+    );
+    let all = resultsel::all_to_close(&refs);
+    entries.push(
+        MenuEntry::action("Close all results", move || {
+            tab.close_panels(&resultsel::all_to_close(&tab.panel_refs()));
+        })
+        .disabled(all.is_empty()),
+    );
+    (gctx.dismiss)();
+    gctx.popup_anchor.set(None); // right-click → open at the cursor
+    gctx.popup_width.set(170.0);
+    gctx.popup.set(Some(entries));
+}
+
+/// Now, in epoch seconds — for a result's age in the strip's tooltip.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ── Terminal panel ───────────────────────────────────────────────────────────
@@ -8223,58 +8862,57 @@ mod field_layout_tests {
 
 #[cfg(test)]
 mod result_strip_tests {
-    use super::{ResultPanel, shown_panel_error, shown_panel_loaded};
+    use super::{PanelView, ResultPanel, shown_panel, shown_panel_loaded};
+    use floem::reactive::Scope;
     use schemaic_core::model::QueryState;
     use std::sync::Arc;
 
-    fn panel(state: QueryState) -> ResultPanel {
+    fn panel(id: u64, state: QueryState) -> ResultPanel {
+        let cx = Scope::new();
         ResultPanel {
-            label: "Result 1".into(),
+            cx,
+            id,
+            label: format!("Result {id}"),
+            sql: String::new(),
             state,
+            pinned: false,
+            ran_at: 0,
+            view: PanelView::new(cx),
         }
     }
 
-    fn loaded() -> ResultPanel {
-        panel(QueryState::Loaded(Arc::new(
-            schemaic_core::model::ResultSet::default(),
-        )))
+    fn loaded(id: u64) -> ResultPanel {
+        panel(
+            id,
+            QueryState::Loaded(Arc::new(schemaic_core::model::ResultSet::default())),
+        )
     }
 
-    #[test]
-    fn the_shown_statements_error_is_the_one_the_bar_carries() {
-        let panels = vec![
-            loaded(),
-            panel(QueryState::Failed("Server error: 1064".into())),
-        ];
-        assert_eq!(shown_panel_error(&panels, 0), None);
-        assert_eq!(
-            shown_panel_error(&panels, 1).as_deref(),
-            Some("Server error: 1064")
-        );
-    }
-
-    /// Nothing to report for a statement that is still going, was cancelled, or
-    /// hasn't been dispatched — the pane says so itself.
-    #[test]
-    fn only_a_failure_puts_anything_in_the_bar() {
-        for state in [QueryState::Idle, QueryState::Running, QueryState::Cancelled] {
-            assert_eq!(shown_panel_error(&[panel(state)], 0), None);
-        }
-    }
-
-    /// A click that selected Result 7 outlives a later batch of three, and the
-    /// body already falls back to the first panel — the bar has to agree with it,
-    /// or it would report an error for a statement nobody is looking at.
+    /// A selected panel outlives the run that closed it, and every reader falls
+    /// back to the first one — the bars, the pane and the AI all have to agree
+    /// about which statement they are describing, or one of them reports on a
+    /// result nobody is looking at.
     #[test]
     fn a_stale_selection_reads_the_first_panel_as_the_body_does() {
-        let panels = vec![panel(QueryState::Failed("boom".into())), loaded()];
-        assert_eq!(shown_panel_error(&panels, 7).as_deref(), Some("boom"));
-        assert!(!shown_panel_loaded(&panels, 7));
+        let panels = vec![panel(1, QueryState::Failed("boom".into())), loaded(2)];
+        assert_eq!(shown_panel(&panels, 77).map(|p| p.id), Some(1));
+        assert!(!shown_panel_loaded(&panels, 77));
+    }
+
+    /// **The panel is found by id, not by position.** Pinning reorders the strip
+    /// and a run rewrites it, so an index would silently show a different result
+    /// than the one the user clicked — and the fallback above would hide it,
+    /// since a wrong index is a *valid* index.
+    #[test]
+    fn a_panel_is_found_by_its_id_wherever_it_has_moved_to() {
+        let panels = vec![loaded(9), panel(4, QueryState::Failed("boom".into()))];
+        assert_eq!(shown_panel(&panels, 4).map(|p| p.id), Some(4));
+        assert!(shown_panel_loaded(&panels, 9));
     }
 
     #[test]
     fn an_empty_strip_reports_nothing() {
-        assert_eq!(shown_panel_error(&[], 0), None);
+        assert!(shown_panel(&[], 0).is_none());
         assert!(!shown_panel_loaded(&[], 0));
     }
 
@@ -8285,9 +8923,294 @@ mod result_strip_tests {
     /// them.
     #[test]
     fn only_the_shown_statement_decides_whether_a_grid_is_mounted() {
-        let panels = vec![loaded(), panel(QueryState::Failed("boom".into()))];
-        assert!(shown_panel_loaded(&panels, 0));
-        assert!(!shown_panel_loaded(&panels, 1));
+        let panels = vec![loaded(1), panel(2, QueryState::Failed("boom".into()))];
+        assert!(shown_panel_loaded(&panels, 1));
+        assert!(!shown_panel_loaded(&panels, 2));
+    }
+
+    /// A pinned panel is a frozen one, which is what every write and re-read
+    /// affordance gates on. Stated here rather than left to each call site: the
+    /// two questions are the same question, and the first place they came apart
+    /// would be a commit against a snapshot.
+    #[test]
+    fn a_pinned_panel_is_frozen_and_an_ordinary_one_is_not() {
+        let mut p = loaded(1);
+        assert!(!p.frozen());
+        p.pinned = true;
+        assert!(p.frozen());
+    }
+}
+
+/// The strip's rules **as the tab applies them** — `resultsel` is unit-tested on
+/// its own, and every bug these guard was in the composition rather than in it.
+#[cfg(test)]
+mod result_panel_tab_tests {
+    use super::Tab;
+    use floem::prelude::{SignalGet, SignalUpdate, SignalWith};
+    use floem::reactive::Scope;
+    use schemaic_core::model::QueryState;
+
+    fn tab() -> Tab {
+        Tab::new(Scope::new(), 1, "", 7, None)
+    }
+
+    fn ids(t: &Tab) -> Vec<u64> {
+        t.result_tabs
+            .with_untracked(|v| v.iter().map(|p| p.id).collect())
+    }
+
+    /// **What decides whether a new tab silently eats this one.** `place_tab`
+    /// reuses a blank tab in place and disposes what was there, so an answer of
+    /// `true` over a tab holding a real result destroys it with no undo.
+    #[test]
+    fn only_an_untouched_tab_reads_as_a_blank_slate() {
+        let t = tab();
+        assert!(t.results_untouched(), "a tab with nothing run");
+
+        let first = t.begin_run(&["SELECT 1".to_string()])[0];
+        assert!(!t.results_untouched(), "a result is in flight here");
+
+        t.set_panel_state(first, QueryState::Failed("boom".into()));
+        assert!(!t.results_untouched(), "and a failed one still counts");
+
+        // Back to one idle panel — and *that* is a blank slate again, which is
+        // what makes a closed-and-respawned tab reusable.
+        t.reset_results();
+        assert!(t.results_untouched());
+
+        // A pinned idle panel is not: the user has said they want it kept, and
+        // reuse would throw it away.
+        let id = t.shown_panel_id().unwrap();
+        t.set_pinned(id, true);
+        assert!(!t.results_untouched());
+    }
+
+    /// The chip's name: the statement, or a positional fallback when there is no
+    /// statement to preview. A blank chip is unpointable-at, and whitespace-only
+    /// SQL is the input that produces one.
+    #[test]
+    fn a_chip_is_named_for_its_statement_or_by_its_position() {
+        let t = tab();
+        let ids = t.begin_run(&["  \n\t ".to_string(), "SELECT 1".to_string()]);
+        let labels: Vec<String> = t.result_tabs.with_untracked(|v| {
+            ids.iter()
+                .filter_map(|id| v.iter().find(|p| p.id == *id).map(|p| p.label.clone()))
+                .collect()
+        });
+        assert_eq!(labels[0], "Result 1", "nothing to preview → its position");
+        assert_eq!(labels[1], "SELECT 1");
+    }
+
+    #[test]
+    fn a_new_tab_shows_one_idle_result() {
+        let t = tab();
+        assert_eq!(ids(&t).len(), 1, "the strip is never empty");
+        assert!(t.results_untouched());
+        assert!(matches!(t.shown_result(), QueryState::Idle));
+    }
+
+    /// The feature, end to end at the tab: pin a result, run again, and the pin
+    /// is still there — with the fresh result shown, not the pin.
+    #[test]
+    fn a_pinned_result_survives_the_next_run_and_the_run_is_what_is_shown() {
+        let t = tab();
+        let first = t.begin_run(&["SELECT 1".to_string()])[0];
+        t.set_pinned(first, true);
+        let second = t.begin_run(&["SELECT 2".to_string()])[0];
+        assert_eq!(ids(&t), vec![first, second], "the pin leads the strip");
+        assert_eq!(t.shown_panel_id(), Some(second));
+        assert!(t.shown_panel_id() != Some(first));
+    }
+
+    /// And an *unpinned* one does not — this is the half that makes the pin mean
+    /// something, and the half a "keep the last N results" strip would fail.
+    #[test]
+    fn an_unpinned_result_is_replaced_by_the_next_run() {
+        let t = tab();
+        let first = t.begin_run(&["SELECT 1".to_string()])[0];
+        let second = t.begin_run(&["SELECT 2".to_string()])[0];
+        assert_eq!(ids(&t), vec![second]);
+        assert!(!ids(&t).contains(&first));
+    }
+
+    #[test]
+    fn a_batch_opens_one_panel_per_statement_and_shows_the_first() {
+        let t = tab();
+        let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(ids(&t), batch);
+        assert_eq!(t.shown_panel_id(), Some(batch[0]));
+    }
+
+    /// A statement's result is written by **id**, so a strip reordered by a pin
+    /// while the batch was running still lands each result on its own panel.
+    #[test]
+    fn a_result_lands_on_its_own_panel_after_the_strip_is_reordered() {
+        let t = tab();
+        let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        t.set_pinned(batch[1], true);
+        t.set_panel_state(batch[0], QueryState::Failed("boom".into()));
+        let state = t
+            .result_tabs
+            .with_untracked(|v| v.iter().find(|p| p.id == batch[1]).map(|p| p.state.clone()));
+        assert!(
+            matches!(state, Some(QueryState::Running)),
+            "the second statement's panel took the first's result"
+        );
+    }
+
+    /// A result landing after its panel was closed goes nowhere — the panel-level
+    /// equivalent of the run-generation check, and the reason `set_panel_state`
+    /// looks its panel up rather than trusting an index.
+    #[test]
+    fn a_result_for_a_closed_panel_lands_nowhere() {
+        let t = tab();
+        let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        t.close_panels(&[batch[0]]);
+        t.set_panel_state(batch[0], QueryState::Failed("boom".into()));
+        assert_eq!(ids(&t), vec![batch[1]]);
+    }
+
+    #[test]
+    fn closing_every_panel_leaves_one_idle_one() {
+        let t = tab();
+        let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        t.close_panels(&batch);
+        assert_eq!(ids(&t).len(), 1);
+        assert!(t.results_untouched(), "and it is a blank slate again");
+        assert_eq!(t.shown_panel_id(), ids(&t).first().copied());
+    }
+
+    /// "Close all" spares the pins, so the strip it leaves is the kept results —
+    /// and what is shown has to be one of *them*.
+    #[test]
+    fn close_all_leaves_the_pins_and_shows_one_of_them() {
+        let t = tab();
+        let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        t.set_pinned(batch[0], true);
+        let to_close = schemaic_core::resultsel::all_to_close(
+            &t.result_tabs
+                .with_untracked(|v| v.iter().map(|p| (p.id, p.pinned)).collect::<Vec<_>>()),
+        );
+        t.close_panels(&to_close);
+        assert_eq!(ids(&t), vec![batch[0]]);
+        assert_eq!(t.shown_panel_id(), Some(batch[0]));
+    }
+
+    /// A filter re-run rewrites the panel it re-reads rather than opening a new
+    /// one — that is what keeps its table on screen — so the statement the panel
+    /// reports has to move with it, or a pinned filtered result would describe
+    /// itself by the query it no longer holds.
+    /// **The regression this is here for**: pinning has to reach a grid that is
+    /// already mounted. Pinning moves neither the shown panel's id nor its
+    /// phase, so nothing rebuilds — a `bool` sampled where the grid is built
+    /// stayed `false`, and the result the user had just pinned went on offering
+    /// its editing, its row actions and its filter until they switched away and
+    /// back. The answer has to be a value that changes, so this holds the memo
+    /// to *changing* rather than to being right once.
+    #[test]
+    fn pinning_the_shown_result_is_visible_without_anything_being_rebuilt() {
+        let t = tab();
+        let first = t.begin_run(&["SELECT 1".to_string()])[0];
+        let frozen = t.panel_frozen_memo(first);
+        assert!(!frozen.get_untracked(), "a fresh result is not frozen");
+
+        t.set_pinned(first, true);
+        assert!(
+            frozen.get_untracked(),
+            "the pin did not reach a reader that was already looking"
+        );
+
+        t.set_pinned(first, false);
+        assert!(!frozen.get_untracked(), "and unpinning gives it back");
+    }
+
+    /// **The crash this is here for.** A grid is built for *one* panel, and its
+    /// answer must not move because a different panel became the shown one: that
+    /// change arrives in the same update pass that unmounts the grid, so a flip
+    /// re-ran its edit-model effect, rebuilt the toolbar's `ai_menu` and had the
+    /// new child read a `GridState` signal that had just been disposed. Running a
+    /// query with a pin present did exactly that, every time.
+    #[test]
+    fn a_panels_frozen_answer_ignores_what_the_strip_does_around_it() {
+        let t = tab();
+        let kept = t.begin_run(&["SELECT 1".to_string()])[0];
+        t.set_pinned(kept, true);
+        let kept_frozen = t.panel_frozen_memo(kept);
+        assert!(kept_frozen.get_untracked());
+
+        // The run that used to crash: a fresh panel appears, the shown panel
+        // changes, and the pinned panel's own answer must not move a millimetre.
+        let live = t.begin_run(&["SELECT 2".to_string()])[0];
+        let live_frozen = t.panel_frozen_memo(live);
+        assert!(kept_frozen.get_untracked(), "the pin is still a pin");
+        assert!(!live_frozen.get_untracked(), "and the new result is not");
+
+        // Nor when the strip merely switches between them.
+        t.active_result.set(kept);
+        assert!(kept_frozen.get_untracked());
+        assert!(!live_frozen.get_untracked());
+    }
+
+    /// And a panel that is *gone* keeps its last answer instead of reporting
+    /// `false` on its way out — closing the shown result would otherwise flip it
+    /// at teardown, which is the same hazard from the other direction.
+    #[test]
+    fn a_closed_panels_answer_does_not_change_as_it_leaves() {
+        let t = tab();
+        let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        t.set_pinned(batch[0], true);
+        let frozen = t.panel_frozen_memo(batch[0]);
+        assert!(frozen.get_untracked());
+
+        t.close_panels(&[batch[0], batch[1]]);
+        assert!(
+            frozen.get_untracked(),
+            "a departing panel's answer changed under the view being unmounted"
+        );
+    }
+
+    /// Typing dismisses the error bar by clearing the shown panel — which must
+    /// not reach a kept one, or the keyboard would be the one way to mutate a
+    /// frozen result.
+    #[test]
+    fn typing_clears_a_live_failure_but_never_a_kept_one() {
+        let t = tab();
+        let live = t.begin_run(&["SELECT 1".to_string()])[0];
+        t.set_panel_state(live, QueryState::Failed("boom".into()));
+        t.shown().dismiss_error();
+        assert!(matches!(t.shown_result(), QueryState::Idle));
+
+        let kept = t.begin_run(&["SELECT 2".to_string()])[0];
+        t.set_panel_state(kept, QueryState::Failed("boom".into()));
+        t.set_pinned(kept, true);
+        t.shown().dismiss_error();
+        assert!(
+            matches!(t.shown_result(), QueryState::Failed(_)),
+            "a kept failure is a record, not a stale bar"
+        );
+    }
+
+    #[test]
+    fn a_filtered_rerun_restates_its_panel_without_opening_one() {
+        let t = tab();
+        let first = t.begin_run(&["SELECT * FROM staff".to_string()])[0];
+        t.set_panel_sql(first, "SELECT * FROM staff WHERE active = 1");
+        assert_eq!(ids(&t), vec![first], "no second panel");
+        let sql = t
+            .result_tabs
+            .with_untracked(|v| v.iter().find(|p| p.id == first).map(|p| p.sql.clone()));
+        assert_eq!(sql.as_deref(), Some("SELECT * FROM staff WHERE active = 1"));
+    }
+
+    #[test]
+    fn a_reset_tab_drops_its_pins_too() {
+        let t = tab();
+        let first = t.begin_run(&["SELECT 1".to_string()])[0];
+        t.set_pinned(first, true);
+        t.reset_results();
+        assert!(t.results_untouched());
+        assert!(!ids(&t).contains(&first));
     }
 }
 

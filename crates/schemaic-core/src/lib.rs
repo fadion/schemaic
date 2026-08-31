@@ -40,6 +40,7 @@ pub mod plan;
 pub mod prompt;
 pub mod propose;
 pub mod resource;
+pub mod resultsel;
 pub mod rowjson;
 pub mod schema;
 pub mod search_history;

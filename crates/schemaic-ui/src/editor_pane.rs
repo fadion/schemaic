@@ -1739,7 +1739,9 @@ pub(crate) struct QueryPaneParams {
     /// fix", which sends the message it was showing rather than a bare "go".
     /// See [`Tab::fix_req`](crate::Tab::fix_req).
     pub fix_req: RwSignal<Option<String>>,
-    pub results: RwSignal<QueryState>,
+    /// The result the tab is showing — what the error bar reports on, and what
+    /// an edit dismisses. See [`crate::ShownResult`].
+    pub results: crate::ShownResult,
     /// The **guarded** run action ([`crate::TabsActions::run`]) — a held-back run
     /// lands in `run_guard` and nothing executes.
     pub run: Rc<dyn Fn(String)>,
@@ -3504,9 +3506,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
             // Any edit (typing, or the AI-fix Approve) dismisses a stale error
             // bar — the error no longer describes the current text.
-            if matches!(results.get_untracked(), QueryState::Failed(_)) {
-                results.set(QueryState::Idle);
-            }
+            results.dismiss_error();
             // Typing clears the picked-statement highlight (it no longer maps to
             // the edited text).
             highlight.set(None);
@@ -3863,14 +3863,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // buttons collide. Lives out here because the bar's content is rebuilt on
     // every `results` change and the width outlives that.
     let error_bar_w = RwSignal::new(0.0_f64);
+    // **The message, memoized — not the whole `QueryState`.** The shown result is
+    // now derived from the tab's panel list, so *any* write to it (each statement
+    // of a batch landing, a pin, a filter re-run restating its panel, a close)
+    // reaches this container; keyed on `QueryState`, which has no `PartialEq` to
+    // dedup on, every one of them rebuilt the bar — including on each keystroke,
+    // since typing clears a stale error through the same signal. `Option<String>`
+    // dedups, so the bar is rebuilt when the message actually changes.
+    let error_msg = create_memo(move |_| match results.get() {
+        QueryState::Failed(m) => Some(m),
+        _ => None,
+    });
     let error_bar = {
         let ai_fix = ai_fix.clone();
         dyn_container(
-            move || results.get(),
+            move || error_msg.get(),
             move |state| {
-                let msg = match state {
-                    QueryState::Failed(m) => m,
-                    _ => return empty().into_any(),
+                let Some(msg) = state else {
+                    return empty().into_any();
                 };
                 // Collapse to a single line: a multi-line error otherwise makes the
                 // text taller than the bar and spills out the top (`text_ellipsis`
@@ -3971,7 +3981,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             },
         )
         .style(move |s| {
-            if matches!(results.get(), QueryState::Failed(_)) {
+            if error_msg.with(Option::is_some) {
                 s.absolute()
                     .inset_left(float_inset())
                     .inset_right(float_inset())

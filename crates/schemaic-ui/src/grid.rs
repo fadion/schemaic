@@ -57,7 +57,7 @@ use crate::{ConnNode, FieldCfg, PopupAnchor, cell_editors, edit_field, icons, th
 /// for the results container so an Arc-only change (an inline-edit splice) doesn't
 /// rebuild the grid.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
+pub(crate) enum Phase {
     Idle,
     Running,
     Loaded,
@@ -65,7 +65,7 @@ enum Phase {
     Cancelled,
 }
 
-fn phase_of(qs: &QueryState) -> Phase {
+pub(crate) fn phase_of(qs: &QueryState) -> Phase {
     match qs {
         QueryState::Idle => Phase::Idle,
         QueryState::Running => Phase::Running,
@@ -73,53 +73,6 @@ fn phase_of(qs: &QueryState) -> Phase {
         QueryState::Failed(_) => Phase::Failed,
         QueryState::Cancelled => Phase::Cancelled,
     }
-}
-
-pub(crate) fn results_view(
-    results: RwSignal<QueryState>,
-    cancel: Rc<dyn Fn()>,
-    gctx: GridCtx,
-) -> impl IntoView {
-    // Key the container on the *phase* + a fresh-load nonce (a deduped Memo), not
-    // the whole QueryState. A commit splice replaces the loaded Arc (Loaded→Loaded)
-    // *without* bumping the nonce — the key is unchanged, so the grid is NOT rebuilt
-    // and scroll/selection survive. A real query (…→Running→Loaded) changes the
-    // phase, and a filter/sort re-run (Loaded→Loaded) bumps the nonce; both rebuild.
-    let load_gen = gctx.load_gen;
-    let phase = create_memo(move |_| (results.with(phase_of), load_gen.get()));
-    // Splice sink handed to the grid: replace the canonical result set in place.
-    // The phase Memo dedups, so this Loaded→Loaded set doesn't rebuild the grid;
-    // it only refreshes the canonical for a later rebuild (tab switch away/back).
-    let sync: Rc<dyn Fn(Arc<ResultSet>)> =
-        Rc::new(move |rs: Arc<ResultSet>| results.set(QueryState::Loaded(rs)));
-    dyn_container(
-        move || phase.get(),
-        move |(ph, _gen)| match ph {
-            Phase::Idle => centered_msg("Run a query  (Ctrl+Enter)", theme::text_muted).into_any(),
-            Phase::Running => running_view(cancel.clone()).into_any(),
-            // The error text now lives in the editor's error bar (with View /
-            // AI Fix), so Results just notes the failure.
-            Phase::Failed => centered_msg("Query failed.", theme::text_dim).into_any(),
-            Phase::Cancelled => centered_msg("Query cancelled.", theme::text_dim).into_any(),
-            Phase::Loaded => {
-                // The Arc is read untracked — the phase Memo, not the Arc, drives
-                // rebuilds; a splice updates the grid's live `rs` + this canonical.
-                let QueryState::Loaded(rs) = results.get_untracked() else {
-                    return empty().into_any();
-                };
-                let mut gctx = gctx.clone();
-                gctx.sync_canonical = Some(sync.clone());
-                loaded_view(rs, gctx)
-            }
-        },
-    )
-    .style(|s| {
-        s.flex_grow(1.0_f32)
-            .width_full()
-            .flex_col()
-            .min_height(0.0)
-            .min_width(0.0)
-    })
 }
 
 // "Running query…" with a Cancel button (kills the query server-side).
@@ -402,6 +355,15 @@ struct GridState {
     /// This tab's SQL dialect (from its connection's engine) — used to build
     /// engine-correct SQL for grid actions like Follow-FK.
     dialect: SqlDialect,
+    /// This result is a **kept** (pinned) one — see [`crate::ResultPanel::frozen`].
+    ///
+    /// Held here as well as gating the edit model, because the two re-reading
+    /// affordances left on a read-only grid do not go through that model: the
+    /// capped notice's "read all rows" and the export's "All rows" both re-run
+    /// the statement, and a re-run on a pinned panel replaces the very snapshot
+    /// the pin was for. A `Memo` for [`GridCtx::panel_frozen`]'s reason — the
+    /// grid is not rebuilt when a result is pinned.
+    kept: Memo<bool>,
     /// This tab's commit mode — see [`GridCtx::tx_mode`]. The export menu's, and
     /// held as the signal rather than resolved at build because the mode is
     /// toggled from the footer while the grid stays mounted.
@@ -543,7 +505,26 @@ fn export_finished(current: Option<ExportRun>, finished: ExportRun) -> Option<Ex
 
 impl GridState {
     fn new(rs: Arc<ResultSet>, gctx: &GridCtx, key_map: &HashMap<usize, ColKey>) -> Self {
-        let widths = init_widths(&rs, key_map);
+        // The panel's own widths if it has been on screen before, measured
+        // otherwise. Length-checked rather than trusted: a filter re-run keeps
+        // the same columns, but restoring an old vector onto a different shape
+        // would leave the header and the body disagreeing about where a column
+        // ends.
+        let saved = gctx
+            .panel
+            .and_then(|p| p.widths.get_untracked())
+            .filter(|w| w.len() == rs.col_count());
+        let measured_at = grid_char_w();
+        let (widths, widths_at) = match saved {
+            Some(w) => (
+                w,
+                gctx.panel
+                    .map(|p| p.widths_at.get_untracked())
+                    .filter(|at| *at > 0.0)
+                    .unwrap_or(measured_at),
+            ),
+            None => (init_widths(&rs, key_map), measured_at),
+        };
         // Seed each column's display formatter from the persisted rules, keyed by
         // (conn_id, the column's own table, its real name) — see `format_key`. A
         // column with no saved rule (or no table) starts on the smart default.
@@ -577,10 +558,10 @@ impl GridState {
             rs: RwSignal::new(rs),
             order: RwSignal::new(Arc::new(Vec::new())),
             widths: RwSignal::new(widths),
-            widths_at: RwSignal::new(grid_char_w()),
+            widths_at: RwSignal::new(widths_at),
             active: RwSignal::new(None),
             anchor: RwSignal::new(None),
-            frozen: RwSignal::new(None),
+            frozen: RwSignal::new(gctx.panel.and_then(|p| p.frozen_col.get_untracked())),
             scroll_to: RwSignal::new(None),
             vp: RwSignal::new(Rect::ZERO),
             focus_id: RwSignal::new(None),
@@ -620,6 +601,7 @@ impl GridState {
             conn_id: gctx.conn_id,
             connections: gctx.connections,
             dialect,
+            kept: gctx.panel_frozen,
             tx_mode: gctx.tx_mode,
             base_sql: gctx.base_sql,
             grid_query: gctx.grid_query,
@@ -717,9 +699,30 @@ impl GridState {
     /// With no filter or sort the base *is* the statement. With one, the rewrite
     /// already succeeded once — that is how the filter got applied — so this asks
     /// again rather than caching the answer.
+    /// **A kept result has no statement to re-run.** It is a snapshot, and every
+    /// re-run here lands in the panel it was launched from — so offering one on a
+    /// pinned panel offers to overwrite the thing that was pinned. Answered here,
+    /// in the funnel everything that re-runs already asks, rather than as a term
+    /// at each call site.
+    ///
+    /// **Its reads are tracked**, so the capped notice can ask this same function
+    /// instead of re-spelling its three terms — which is what it did, and why the
+    /// `kept` term above had to be written twice. Tracking costs the other two
+    /// callers nothing: both run inside click handlers, where there is no effect
+    /// to subscribe.
     fn current_statement(&self) -> Option<String> {
-        let base = self.base_sql.get_untracked()?;
-        rerun_statement(&base, &self.grid_query.get_untracked(), self.dialect)
+        if self.kept.get() {
+            return None;
+        }
+        let base = self.base_sql.get()?;
+        self.grid_query
+            .with(|q| rerun_statement(&base, q, self.dialect))
+    }
+
+    /// Is there a statement to re-run at all? — [`GridState::current_statement`]
+    /// as a predicate, for the affordances that have to *offer* the re-run.
+    fn rerunnable(&self) -> bool {
+        self.current_statement().is_some()
     }
 
     /// Append a cell-derived condition (`col = 'val'` / `IS NULL` / negated) to the
@@ -1982,8 +1985,7 @@ fn export_menu(
     // used to carry could be deleted with the whole suite still green, and
     // `save_export` re-read the same signal at click time without re-asking it.
     // One tested function, asked by everything that re-runs.
-    let rerunnable = gs.current_statement().is_some();
-    if !truncated || !rerunnable {
+    if !truncated || !gs.rerunnable() {
         return per_format(false);
     }
     let fetched = gs.rs.with_untracked(|rs| rs.row_count());
@@ -2595,9 +2597,30 @@ pub(crate) struct GridCtx {
     pub(crate) tab_id: usize,
     /// Stop the running export (the app owns the cancellation token).
     pub(crate) export_cancel: Rc<dyn Fn()>,
-    /// Splice sink: replace the tab's canonical result set (so a later rebuild is
-    /// fresh). `None` on the multi-result path (no splice — full re-run instead).
+    /// Splice sink: replace the shown panel's result set in place (so a later
+    /// rebuild is fresh). `None` where there is nothing loaded to splice into.
     pub(crate) sync_canonical: Option<SyncCanonicalFn>,
+    /// The shown panel's own view state — column widths, sort, frozen column —
+    /// seeded into this grid at build and written back as the user changes them,
+    /// so switching results and coming back returns to the table as it was left.
+    /// `None` outside the results strip.
+    pub(crate) panel: Option<crate::PanelView>,
+    /// Is the shown panel **frozen** (pinned)? — see [`crate::ResultPanel::frozen`].
+    ///
+    /// It lands in one place: the edit model, which is emptied for a frozen panel
+    /// the same way a read-only connection empties it. Everything downstream —
+    /// cell editing, row insert/delete, the commit, *and* server-side filter/sort,
+    /// which needs an `insert_target` — is already gated on that model, so a
+    /// pinned result cannot be written to or re-read without a second rule to
+    /// keep in step.
+    ///
+    /// **A `Memo`, not a `bool`, and that is the whole of it.** Pinning does not
+    /// change the shown panel's id or phase, so it does not rebuild the grid —
+    /// read once at build, the flag was still `false` under the user's hands and
+    /// the result stayed editable until something else happened to remount it
+    /// (switching away and back). Tracked, the edit-model effect recomputes on
+    /// the pin itself, exactly as it already does for `read_only`.
+    pub(crate) panel_frozen: Memo<bool>,
     /// The tab's connection is read-only → disable all inline editing (an empty
     /// `EditModel`, so no cell is editable / committable). Reactive.
     pub(crate) read_only: Memo<bool>,
@@ -2711,29 +2734,26 @@ pub(crate) fn grid_error_bar(
     error_fixable: RwSignal<bool>,
 ) -> impl IntoView {
     let BarSignals {
-        batch_err,
         commit_err,
         commit_note,
         view_err,
         commit_wait,
         ..
     } = bars;
-    // The batch error leads, because a failed statement has no grid mounted at
-    // all: a commit error left over from another result tab's grid would be
-    // reporting on something the user isn't looking at, and the statement's own
-    // failure would have nowhere to go. Then an error over the wait note — it
-    // describes a write that is already over, while the note describes one still in
-    // flight (and every path clears the note before reporting a failure anyway).
+    // **A statement's own failure is not here** — it goes to the editor's error
+    // bar, under the SQL that produced it and beside the Explain and AI-fix that
+    // act on it, which is where a single run's has always gone. This bar reports
+    // on what the *grid* did: a commit, a filter re-run, an export. An error over
+    // the wait note — it describes a write that is already over, while the note
+    // describes one still in flight (and every path clears the note before
+    // reporting a failure anyway).
     let current = move || {
-        // **Which of the three it is, carried.** A Run-Everything statement's own
-        // failure is a *statement* error — the one thing `intel::error_fix_range`
-        // was added to scope — while a commit error, a filter re-run failure or a
-        // failed export is not. The bar looked identical for all of them and so
-        // offered the same nothing.
-        batch_err
+        // None of these is a *statement* error, so none is fixable: `error_fix_range`
+        // scopes a fix to a statement in the buffer, and a commit, a filter re-run
+        // and a failed export are none of them that.
+        commit_err
             .get()
-            .map(|m| BarState::Error(m, true))
-            .or_else(|| commit_err.get().map(|m| BarState::Error(m, false)))
+            .map(|m| BarState::Error(m, false))
             .or_else(|| view_err.get().map(|m| BarState::Error(m, false)))
             .or_else(|| commit_wait.get().map(BarState::Wait))
             // Above the note and below the two problems. A running export is not
@@ -2850,9 +2870,6 @@ enum BarState {
 /// thinks it isn't is the two of them drawn on top of each other.
 #[derive(Clone, Copy)]
 pub(crate) struct BarSignals {
-    /// The shown Run-Everything statement's own failure — a batch has no editor
-    /// bar to put it in.
-    pub(crate) batch_err: Memo<Option<String>>,
     pub(crate) commit_err: RwSignal<Option<String>>,
     pub(crate) commit_note: RwSignal<Option<String>>,
     pub(crate) view_err: RwSignal<Option<String>>,
@@ -2874,8 +2891,7 @@ pub(crate) struct BarSignals {
 impl BarSignals {
     /// Is the bar up at all? **The one predicate.**
     pub(crate) fn any_up(&self) -> bool {
-        self.batch_err.with(Option::is_some)
-            || self.commit_err.with(Option::is_some)
+        self.commit_err.with(Option::is_some)
             || self.commit_note.with(Option::is_some)
             || self.view_err.with(Option::is_some)
             || self.commit_wait.with(Option::is_some)
@@ -3297,8 +3313,14 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let db_nodes = gctx.db_nodes;
     let read_only = gctx.read_only;
     let rs_model = rs.clone();
+    let frozen_panel = gctx.panel_frozen;
     create_effect(move |_| {
-        let model = if read_only.get() {
+        // A frozen (pinned) result is read-only for a stronger reason than a
+        // read-only connection is: the rows on screen are a *snapshot*, and a
+        // write keyed on them would be aimed at whatever the row holds now.
+        // **Tracked**, like `read_only` beside it: pinning doesn't rebuild the
+        // grid, so a flag read once here left the pinned result editable.
+        let model = if read_only.get() || frozen_panel.get() {
             EditModel::default()
         } else {
             analyze_edit(&rs_model, |db, ns, table| {
@@ -3481,8 +3503,25 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // channel) so no single scroll view both reads and writes the same signal —
     // that would re-enter layout and hang.
     let vscroll = RwSignal::new(0.0_f64);
-    // Click a header to sort by that column (ASC → DESC → reset).
-    let sort: RwSignal<SortState> = RwSignal::new(None);
+    // Click a header to sort by that column (ASC → DESC → reset). Restored from
+    // the panel, so a result the strip comes back to is sorted as it was left.
+    let sort: RwSignal<SortState> = RwSignal::new(
+        gctx.panel
+            .and_then(|p| p.sort.get_untracked())
+            .filter(|(ci, _)| *ci < ncols),
+    );
+    // **The other half of restoring it**: mirror what the user does back into the
+    // panel. Three effects rather than writes at each call site — a width is
+    // changed by a drag, by the double-click auto-fit, by the interface scale and
+    // by a column menu, and a rule kept at four call sites is a rule kept at
+    // three of them. They cost nothing when the panel is gone: the grid is
+    // unmounted with it, and these go with the grid.
+    if let Some(pv) = gctx.panel {
+        create_effect(move |_| pv.widths.set(Some(gs.widths.get())));
+        create_effect(move |_| pv.widths_at.set(gs.widths_at.get()));
+        create_effect(move |_| pv.frozen_col.set(gs.frozen.get()));
+        create_effect(move |_| pv.sort.set(sort.get()));
+    }
 
     // **The app's first focus ring outside an overlay.** It holds the toolbar
     // strip only: F6 enters it from the grid body, arrows and Tab walk it,
@@ -3501,6 +3540,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         sort,
         rs.database.clone(),
         row_total,
+        frozen_panel,
         strip.clone(),
     );
 
@@ -6552,6 +6592,9 @@ fn grid_toolbar(
     // `row_total` memo in `grid_view`, which is where those conditions are
     // decided. `None` means the line says only what it read.
     row_total: Memo<Option<schemaic_core::stats::RowCount>>,
+    // This result is a pinned snapshot — see `GridCtx::panel_frozen`. Tracked:
+    // the note has to appear on the pin, not on the next rebuild.
+    kept: Memo<bool>,
     strip: crate::widgets::FocusRing,
 ) -> impl IntoView {
     // Escape's way home. Deferred inside `refocus_grid`, which is what makes it
@@ -6682,6 +6725,23 @@ fn grid_toolbar(
             .min_width(0.0)
             .text_ellipsis()
     });
+    // **A pinned result says that it is one, here**, where the user is looking
+    // when they try to type into it. Nothing else on the panel would: the edit
+    // model is empty, so a cell simply refuses to open, and a control that does
+    // nothing with no explanation reads as a broken grid rather than as a kept
+    // result. (The chip's pin icon says *which* one is kept; this says what that
+    // means for the table under it.)
+    // Shown and hidden **by style, never a rebuild** — the codebase's rule for a
+    // reactive show-hide, and here it is also the safe construction: this line
+    // reacts to a pin, and a `dyn_container` that rebuilds while the grid around
+    // it is being torn down is how the strip crashed once already.
+    let kept_note = text("· kept — read-only").style(move |s| {
+        let s = s
+            .color(theme::text_muted())
+            .font_size(theme::font_label())
+            .flex_shrink(0.0_f32);
+        if kept.get() { s } else { s.hide() }
+    });
     // A column whose 512 MiB text arena filled up renders blank from that row
     // on. Said out loud, because the alternative is the user discovering empty
     // cells partway down a result with nothing to attribute them to — and unlike
@@ -6749,14 +6809,12 @@ fn grid_toolbar(
     // outright (see its doc for why a `Confirm` would be the wrong answer from a
     // link that says *read*), and the click below asks it again.
     let read_more = dyn_container(
-        move || {
-            truncated
-                && gs.base_sql.with(|b| {
-                    b.as_deref().is_some_and(|base| {
-                        rerun_statement(base, &gs.grid_query.get(), gs.dialect).is_some()
-                    })
-                })
-        },
+        // **The same question the click asks**, not a second spelling of it: this
+        // used to re-derive `base_sql` + `rerun_statement` inline, so the kept-result
+        // term had to be added in both places and the next term would too. A
+        // notice offering a read the click then refuses is exactly the dead
+        // affordance the guard exists to prevent.
+        move || truncated && gs.rerunnable(),
         move |show| {
             if !show {
                 return empty().into_any();
@@ -7360,6 +7418,7 @@ fn grid_toolbar(
 
     h_stack((
         stats,
+        kept_note,
         read_more,
         arena_note,
         caveat,
@@ -8982,7 +9041,6 @@ mod tests {
     fn the_export_bar_belongs_to_the_tab_that_started_it() {
         let exporting = RwSignal::new(None);
         let bars = |tab_id: usize| BarSignals {
-            batch_err: create_memo(move |_| None),
             commit_err: RwSignal::new(None),
             commit_note: RwSignal::new(None),
             view_err: RwSignal::new(None),

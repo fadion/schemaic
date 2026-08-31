@@ -4534,12 +4534,10 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
             // to the active tab's full query error (editor error bar).
             let tab =
                 tabs.with_untracked(|v| v.iter().find(|t| t.id == active.get_untracked()).copied());
-            let tab_error = tab
-                .map(|t| t.results.get_untracked())
-                .and_then(|st| match st {
-                    QueryState::Failed(m) => Some(m),
-                    _ => None,
-                });
+            let tab_error = tab.map(|t| t.shown_result()).and_then(|st| match st {
+                QueryState::Failed(m) => Some(m),
+                _ => None,
+            });
             let override_text = text_override.get_untracked();
             // "AI fix" belongs to a **statement** error. Most overrides are not
             // one — a commit error, a failed export, a server that didn't answer —

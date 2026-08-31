@@ -44,12 +44,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     protocol cells parsed into compact numeric variants *only where lossless* (`DECIMAL`/dates/JSON
     stay `Str`, so nothing is rounded or reformatted); `ResultSet` stores them columnar, so
     `CellRef` reads a cell without allocating, and **each column sits behind its own `Arc`** — the
-    grid's `rs` signal and the tab's canonical `QueryState::Loaded` hold the *same*
+    grid's `rs` signal and the shown panel's canonical `QueryState::Loaded` hold the *same*
     `Arc<ResultSet>` on purpose, so the post-commit splice mutates through `Arc::make_mut` at a
     strong count of 2; with the columns inline that deep-copied every arena (30 ms and ~160 MB at
     200k×50, on the UI thread, on the one path built to avoid a rebuild). `splice_rows` replaces
     only the column `Arc`s whose values actually changed, so an untouched column is never copied
-    (29.6 ms → 1.8 ms at 200k×50, measured).
+    (29.6 ms → 1.8 ms at 200k×50, measured). `retained_bytes` sums what a result costs to *hold* —
+    each column's arena plus its packed offset word per cell, as allocated — which is what the
+    results strip shows on a kept result, and the reason a result of nothing but NULLs is still
+    megabytes: the cost is per cell, not per character.
     **`ResultBuilder::take_chunk(capacity)` is the one way a load produces more than one result**:
     it closes off the rows pushed so far as a `ResultSet` and starts a fresh builder over the same
     columns, which is what lets an uncapped export reach the disk in blocks instead of holding the
@@ -2437,6 +2440,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       the bare name on MySQL/SQLite and inside PostgreSQL's `public`, `schema.table` outside it)
       rather than a separate `schema` field, because that spelling is already the identity an
       ER-diagram node id carries, so the diagram looks a colour up by node id with no reparsing.
+    - `resultsel.rs` — the same rules one strip lower: which **result** panel is shown, and which
+      ones a run is allowed to replace. `after_run` is the feature in one function — the pinned
+      panels, in their order, then the run's fresh ones — and `active_after_run` answers the other
+      half: a run shows *its own* first result, never the pin that survived it, because a query that
+      appears to do nothing is worse than one that scrolls the strip. `pin_order` keeps the pinned
+      block contiguous at the front (the invariant every other rule here is a filter rather than a
+      sort because of), and `can_close`/`all_to_close`/`others_to_close`/`active_after_removal` are
+      `tabsel`'s closing rules restated for panels — deliberately the same answers, since the two
+      strips sit one above the other and a user who has learned one has learned the other.
+      `active_after_removal` serves all three closes at once (one, others, all): the active panel
+      when it survives, else the nearest survivor to its right, else to its left. Written as one
+      function because three spellings of "where does the strip land" is three chances to disagree.
     - `tabsel.rs` — tab-selection rules for a strip that shows only the active connection's tabs, so
       every question (`pick_active`, `neighbor` after a close, `cycle`, `closing_would_empty`, `nth`
       for Ctrl+1‑9) is answered *within one connection*. `nth` especially: the Nth visible chip is
@@ -4304,8 +4319,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Escape closed the row panel out from under an open calendar. While it is up the toggle is lit,
     and **it pins its own hover**: it is the calendar's dismissal then, and `field_box`'s hover tint
     would otherwise repaint the accent border grey under the pointer.
-  - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `results_view`/`loaded_view` are the
-    entry points). `editor_pane.rs` — SQL editor pane
+  - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `loaded_view` is the entry point,
+    called from the results strip's body). `editor_pane.rs` — SQL editor pane
     (`query_pane` + the Ctrl+K bar, statement highlight, custom scrollbars). `compute_diagnostics`
     bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
     squiggles (red errors / amber typo warnings) with hover tooltips.
@@ -5385,8 +5400,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   restored either.
   **What the assistant knows about the result on screen, and how rows reach it.** `TurnContext`
   carries a `result` — `core::prompt::result_shape` over `Tab::shown_result`, which is
-  `shown_panel` again rather than a second fallback rule (a stale `active_result` shows panel 0 in
-  the pane, and the AI has to describe the same statement) — so columns, types, counts, the cap and
+  `shown_panel` again rather than a second fallback rule (a stale `active_result` shows the first
+  panel in the pane, and the AI has to describe the same statement) — so columns, types, counts, the cap and
   the elapsed time ride on every turn, and *no cell value ever does*. A failed run's error text rides
   only where the connection's `AiData` allows it, since the server quotes stored values into its
   messages; `ai_context` passes the level in beside the dialect. It is
@@ -5915,8 +5930,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   run (`build_query`, or the base verbatim when there is no filter or sort) with *whether it may*
   (`rerunnable_for_export`), so the guard is asked about the string that would actually be
   dispatched and there is no arrangement of base and filter that gets a write past it.
-  `GridState::current_statement` is a two-line wrapper over it, and the read-more link's predicate,
-  its click and `grid::export_menu` all ask the wrapper. Before this the export menu ANDed a
+  `GridState::current_statement` is a two-line wrapper over it, and the read-more link's predicate
+  (`rerunnable`, the same function as a `bool`), its click and `grid::export_menu` all ask the
+  wrapper. Its reads are **tracked** so the predicate can be that function rather than a second
+  spelling of it — which it had silently become again, and which is how the kept-result term came to
+  be written in two places. Tracking costs the other two callers nothing: both run inside click
+  handlers, where there is no effect to subscribe. Before this the export menu ANDed a
   separate `!rerunnable` term of its own — a term that could be deleted with the whole suite still
   green, which is exactly what it was worth — while the read-more link asked only whether `base_sql`
   was `Some`, so a `SELECT` followed by a `DELETE` left the link drawn over the new base and a
@@ -6601,6 +6620,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   class wins. Nest class overrides accordingly (dropdown popup restyle nests under `ListClass`).
 - **`DoubleClick` consumes the second `PointerUp`** — clear drag/press state in the double-click
   handler too, not only in `PointerUp`.
+- **A view must not subscribe to a signal that changes as part of unmounting it** — the change and
+  the teardown land in the same update pass, and whichever order they run in, a nested
+  `dyn_container` inside the doomed view rebuilds a child whose style/effect closures then read
+  signals whose scope has already been disposed. The symptom is floem's own
+  `Option::unwrap()` on a `None` in `floem_reactive::read`, with the panic pointing at whatever
+  signal the *new* child happened to read first — never at the subscription that caused it.
+  The results strip shipped this: the grid's "is this result pinned?" flag was a memo over
+  *whichever panel is shown*, so running a query while a result was pinned changed it for the grid
+  being torn down, re-ran that grid's edit-model effect, rebuilt the toolbar's `ai_menu` and read a
+  disposed `GridState` signal. The fix is not to defer or guard the read — it is to scope the
+  subscription to a fact about the view itself (`Tab::panel_frozen_memo(id)`, one panel), and to
+  have a departing entity keep its last answer rather than report a "gone" value on the way out.
+  The neighbouring rule (**show and hide with `.hide()`, never a rebuild**) is a defence against the
+  same hazard: a view that is never rebuilt has no new child to read a dead signal.
 - **A view's own `event_before_children` runs *before* its listeners, and a processed event stops
   there** (`context.rs::unconditional_view_event`) — so `on_event(KeyDown, …)` on a built-in view
   never sees a key that view handles itself. **`floem::views::text_input` handles Escape by calling
@@ -7955,6 +7988,111 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   tabindex and deferred, because the strip may have been rebuilt by the action just run and floem's
   focus request has no existence check — and still only when `keyboard_nav` is true.
 
+## The results strip (and keeping a result)
+
+**Every result is a `ResultPanel`, and the strip that lists them is always on screen.** A tab holds
+`result_tabs: RwSignal<Vec<ResultPanel>>` and `active_result: RwSignal<u64>` — a panel **id**, never
+an index — and a tab with nothing run yet holds one `Idle` panel, so the strip is never a bar with
+no chips in it. One run, one panel; a Run Everything batch, one per statement. There is no longer a
+"single-grid path" beside a "batch path": `results_view` and the tab's `results` signal are gone, and
+what replaced both is `results_multi`, which every result goes through.
+
+**Pinning is what the strip is for.** `resultsel::after_run` is the rule — a run replaces the
+unpinned panels and leaves the pinned ones alone — so a result can be kept across later runs and
+compared against them without a second tab and a second execution. That matters most where it is
+least recoverable: re-running is the only way to get a result back, and against a table that is
+changing, the "before" is simply gone. Right-click a chip for Pin/Unpin, Close, Close other results,
+Close all results; the pinned block sits at the front in pin order, a pinned chip shows a pin where
+its × would be, and "Close all" spares the pins — the query strip's rules, restated in
+`core::resultsel` and applied by `Tab::begin_run` / `set_pinned` / `close_panels`.
+
+- **A pinned result is frozen, and this is a safety rule rather than a nicety.** `ResultPanel::frozen`
+  is asked by exactly two things, and everything else follows from them. It empties the **edit
+  model** (the same way a read-only connection does), which stops cell editing, row insert/delete,
+  the commit *and* server-side filter/sort in one move, since all four are gated on that model. And
+  it makes `GridState::current_statement` return `None`, which withdraws the two affordances that
+  re-run without going near the edit model — the capped notice's "read all rows" and the export
+  menu's "All rows". The write half is the one that would have cost data: a grid write's `WHERE` is
+  the key columns and their **original** values (`model::RowEdit`) with no guard on the columns being
+  set, so a commit from a twenty-minute-old snapshot is a well-formed `UPDATE` that overwrites
+  whatever landed in between — and the 1-row safety net cannot see it, because exactly one row *is*
+  matched. The re-read half would have destroyed the snapshot itself. `run_query_core` asks
+  `Tab::shown_frozen` once more before a view re-run, at the funnel, so a stale affordance can't get
+  round it. The grid says so where the user is looking when they try to type: a `· kept — read-only`
+  note on the toolbar line, because a cell that silently refuses to open reads as a broken grid.
+  **The answer is a `Memo` over one panel (`Tab::panel_frozen_memo(id)`)**, and both halves of that
+  sentence are a bug that shipped.
+  *Not a sampled `bool`*: pinning the result on screen moves neither its id nor its phase, so it does
+  **not** rebuild the grid — a flag read in the grid's builder went on saying "not pinned" for as
+  long as that grid stayed mounted, leaving the just-pinned result editable, with its row actions and
+  its filter bar, until the user switched away and back. Tracked, the edit-model effect recomputes on
+  the pin itself, exactly as it already did for `read_only` beside it, and everything gated on that
+  model follows.
+  *And over **one panel**, not over "whichever panel is shown"*: asked the second way it **crashed the
+  app**, on the plainest gesture the feature has — run a query with a pin present. The shown panel
+  changes and the grid is unmounted in the same update pass, so a flip re-ran that grid's edit-model
+  effect on its way out, which rebuilt the toolbar's `ai_menu` (a `dyn_container` keyed on the model),
+  whose new child's style effect read a `GridState` signal whose scope had just been disposed —
+  `Option::unwrap()` on a `None` in `floem_reactive::read`. **A view must only subscribe to facts
+  about itself**, or a change that unmounts it races the change it is listening for; and a panel that
+  has *gone* keeps its last answer rather than reporting `false` on its way out, so closing the shown
+  result cannot flip it at teardown either. The `· kept — read-only` note is shown and hidden by
+  `s.hide()` for the same reason — the *Floem 0.2 gotchas* rule, and here also the safe construction.
+  `Tab::shown_frozen` is the untracked half of the pair, for callers acting *now* inside an event
+  handler; anything answering the question while a grid is mounted takes the memo.
+- **What a panel remembers.** `PanelView` — column widths (with the `grid_char_w` they were measured
+  against), the client-side sort, and the frozen column — as **signals in the panel's own child
+  scope**, not fields in the panel list: the grid writes a width on every mouse-move of a resize
+  drag, and through the list that would clone and re-notify the whole strip each time. `GridState::new`
+  seeds from them (length-checked against the column count, so a restore can't leave the header and
+  the body disagreeing) and four effects in `grid_view` mirror changes back. Selection is
+  deliberately *not* remembered: it is where the user last clicked, not a property of the result.
+  Nothing is persisted — a strip is session-only, like the results themselves.
+  The frozen column is `frozen_col`, spelled out because a *frozen column* and a *frozen result* are
+  different things one field apart (`gctx.panel.frozen_col` is an index, `gctx.panel_frozen` is
+  whether the result is pinned), and two `.frozen`s in one data path is a wrong-variable bug waiting
+  for its reader.
+- **The list and the selection move together, under `batch`.** `begin_run`, `close_panels` and
+  `set_pinned` each rewrite `result_tabs` *and* `active_result`; separately, the moment between them
+  has `active_result` naming a panel the list no longer holds, `shown_panel` falls through to its
+  first-panel fallback, and the body builds that panel's grid in full — `init_widths` sampling 200
+  rows across every column, `analyze_edit`, `column_editors` — only to throw it away when the
+  selection lands. With a pinned result present that was every run. `floem_reactive::batch` holds
+  the effects until both writes are in.
+- **A bar describes the result it ran on, so switching results clears it.** `view_err`, `commit_err`
+  and `commit_note` are tab-level and are cleared by the grid actions that supersede them (a new
+  commit, a fresh filter re-run, a click on the filter bar) — none of which switching results is, so
+  a bad `WHERE` typed on the live result kept its red bar over the pinned snapshot the user then
+  clicked, and a failed commit followed them onto a result that cannot be committed at all. An
+  effect beside the one that closes the find/goto/selection bars clears the three on a change of
+  shown panel. `commit_wait` is deliberately exempt: it stands for a write still in flight and
+  carries the one-click Rollback, so it belongs to the connection rather than to whatever result is
+  on top of it.
+- **The body's key is `(panel id, phase, load_gen)`, a deduped `Memo`.** The id makes switching
+  results a remount (two panels can both be `Loaded` and be different results); the phase is what
+  keeps an in-place commit splice from being one — it replaces the panel's `Arc` without touching
+  the id or the nonce, so the grid, its scroll and its selection survive, which is the whole point of
+  the splice. `sync_canonical` is pointed at *that panel*, so a splice lands on the result it came
+  from. A run passes through `Running` and a filter re-run bumps `load_gen`; both rebuild, which is
+  what they mean.
+- **Ids, not indices, all the way through.** Panels are pinned (which reorders), closed (which
+  renumbers) and replaced, so `shown_panel` finds by id with a first-panel fallback, the strip's
+  `dyn_stack` is keyed on the id, and a batch writes each statement's result back by id — a
+  positional write would land a statement's result on somebody else's panel when a pin reordered the
+  strip mid-run. A result whose panel was **closed** while it ran lands nowhere, which is
+  deliberately the same answer the run-generation check gives a superseded run.
+- **What a chip says.** The statement, previewed (`history::preview`), capped at
+  `result_title_avail()` — the chip's width less the 10px inset, the label's margin and the trailing
+  glyph. **The cap is on the label, not on the chip**: `max_width` on the row only clips, so the
+  text laid itself out at its natural width and ran under the × and out over the next chip, which is
+  the arithmetic `tabs::tab_title_avail` pays for the query strip and for the same reason. The
+  tooltip carries the full text, the run's
+  age (`history::relative_time`) and — for a loaded one — `ResultSet::retained_bytes`.
+  The last is what makes "keep this result" an informed choice: a pin holds its columns' arenas and
+  one 4-byte offset word per cell, which at the 200,000-row default cap is 40 MB across 50 columns
+  before a single character of text. Cheap to *hold* (the panel keeps an `Arc`, so nothing is
+  copied), not free to keep.
+
 ## Data grid (results grid)
 
 `grid_view` (in `grid.rs`) is built around `GridState` — a `Copy` bundle of `RwSignal`s created once
@@ -8127,7 +8265,7 @@ for keyboard nav.
   `clone_row`) and count them in the label: the same menu naming five rows in one entry and acting
   on one in the next is how four deletions go missing unnoticed. The grid's app
   context (`source`, `db_nodes`, `connections`/`active_conn`, `popup`, `summarize`, `dismiss`, …) is
-  bundled in `GridCtx`, threaded `results_section → results_view/multi → loaded_view → grid_view`,
+  bundled in `GridCtx`, threaded `results_section → results_multi → loaded_view → grid_view`,
   then stashed in `GridState` (whose `Rc` callbacks live in `RwSignal<Option<…>>` since it's `Copy`).
 - **Menu dismissal**: grid cells consume the pointer-down (drag-select), so the root handler never
   fires inside the grid; cell/header/gutter click handlers call `gs.dismiss` (closes both
@@ -8321,18 +8459,25 @@ for keyboard nav.
   **View**. **Every panel-level bar is cleared when the result stops being `Loaded`**, in one
   effect in `results_section`: their only writer lives inside `grid_view`, so a failed re-run left
   the previous total and a live-looking Go-to-row popup pinned to a panel saying "Query failed."
-  Under a Run Everything strip that means the **shown** statement (`shown_panel_loaded`), not "any
-  statement in the batch": only one grid is mounted, so switching from a loaded Result 1 to a failed
-  Result 2 was the same bug one level along.
-- **A failed batch statement reports in the error bar, not in the pane.** `grid_error_bar`'s first
-  source is `batch_err`, a memo over the shown panel (`shown_panel_error`), ahead of `commit_err` —
-  a failed statement has no grid mounted, so a commit error left over from another result tab would
-  be describing something off screen. The pane keeps only a dim "Statement failed.", the way
-  `grid_view` notes `Phase::Failed` while the editor bar carries a single run's message. It used to
-  *be* the pane (`centered_msg(m, theme::error)`), and a server error is one long line: it rendered
-  unwrapped across the middle of the window and out over the schema sidebar. A batch has no editor
-  bar to fall back on — `run_all` sets the tab's `results` to `Idle` — which is why the panel bar is
-  where this goes, **View** (`text::hides_detail`) and all.
+  That means the **shown** result (`shown_panel_loaded`), not "any result in the tab": only one grid
+  is mounted, so switching from a loaded Result 1 to a failed Result 2 was the same bug one level
+  along.
+- **A failed statement reports in the editor's error bar, and only there.** The pane keeps a dim
+  "Statement failed." — a server error is one long line, and as the pane it rendered unwrapped
+  across the middle of the window and out over the schema sidebar. The message goes under the SQL
+  that produced it, beside the **Explain** and **AI fix** that act on it (`intel::error_fix_range`
+  scopes the fix to the failing statement, so this works for one statement of a script as well as
+  for a whole run). It used to be split: a single run's went to the editor bar and a batch
+  statement's to the panel bar (`batch_err`), because `run_all` cleared the tab's `results` and left
+  a batch with no editor bar to fall back on. Once **every** result became a panel the two were the
+  same value, and the pair drew the same error twice — so `batch_err` is gone and `grid_error_bar`
+  now reports only on what the *grid* did: a commit, a filter re-run, an export. None of those is a
+  statement in the buffer, which is why nothing it carries is `fixable` any more.
+  The editor bar keys on a `Memo<Option<String>>` of the message rather than on the `QueryState`
+  itself: the shown result is derived from the panel list, so every write to it — each statement of
+  a batch landing, a pin, a filter re-run restating its panel — reaches that container, and
+  `QueryState` has no `PartialEq` to dedup on. Keyed on the state it rebuilt the bar on all of them,
+  including on every keystroke, since typing clears a stale error through the same signal.
 - **That bar has four states on two surfaces, and the surface is the message.** The red fill means
   an error; the ordinary chrome carries the wait note (a write taking long enough to explain, with
   its one-click `Rollback`), a plain **note** — something worth saying about an operation that

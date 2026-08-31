@@ -461,6 +461,12 @@ impl ColumnData {
         }
     }
 
+    /// This column's share of [`ResultSet::retained_bytes`]: the arena plus one
+    /// packed word per cell, both as *allocated* rather than as used.
+    fn retained_bytes(&self) -> usize {
+        self.arena.capacity() + self.ends.capacity() * std::mem::size_of::<u32>()
+    }
+
     /// Finalize the cell whose text has just been appended to `arena`, recording
     /// its tag + end offset as one packed word.
     ///
@@ -670,6 +676,26 @@ impl ResultSet {
     }
     pub fn col_count(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Roughly what this result costs to hold on to: every column's text arena
+    /// plus its packed offset word per cell.
+    ///
+    /// **What makes "keep this result" an informed choice rather than a
+    /// hopeful one.** A pinned panel survives every later run, so the strip says
+    /// what each one is holding; without a number, "weigh it against memory" is
+    /// advice nobody can act on. At the 200,000-row default cap the offsets alone
+    /// are 4 bytes per cell — 40 MB across 50 columns before a single character
+    /// of text — which is exactly the scale a user cannot guess at.
+    ///
+    /// The arenas and the offset words are the part that scales with the data
+    /// and the only part worth reporting; the `Vec`/`String` headers, the column
+    /// names and the few flags beside them are a fixed handful of bytes per
+    /// *column* and are deliberately not counted, so the number tracks the rows
+    /// rather than the schema. It is `capacity`, not `len`: what is retained is
+    /// what was allocated.
+    pub fn retained_bytes(&self) -> usize {
+        self.cols.iter().map(|c| c.retained_bytes()).sum()
     }
 
     /// Borrowed view of the cell at `(row, col)` in **data** (unsorted) order, or
@@ -1385,6 +1411,61 @@ mod tests {
             type_name: type_name.to_string(),
             origin: None,
         }
+    }
+
+    // ── What a kept result costs (the results strip's pin) ──
+
+    #[test]
+    fn an_empty_result_retains_nothing() {
+        assert_eq!(ResultSet::default().retained_bytes(), 0);
+        assert_eq!(
+            ResultSet::from_rows(vec![named("id", "INT")], vec![]).retained_bytes(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_results_retained_bytes_cover_the_text_it_holds() {
+        let rs = ResultSet::from_rows(
+            vec![named("name", "TEXT")],
+            vec![vec![Value::Str("hello".into())]],
+        );
+        assert!(
+            rs.retained_bytes() >= 5,
+            "the arena's five characters are unaccounted for: {}",
+            rs.retained_bytes()
+        );
+    }
+
+    /// The claim the strip's number is worth showing for: a result costs memory
+    /// per *cell*, not per character, so a wide result of nothing but NULLs is
+    /// still holding megabytes. Counting only the arena would report it as free.
+    #[test]
+    fn a_result_of_nothing_but_nulls_still_costs_a_word_per_cell() {
+        let cols = vec![named("a", "INT"), named("b", "INT"), named("c", "INT")];
+        let rows: Vec<Vec<Value>> = (0..100).map(|_| vec![Value::Null; 3]).collect();
+        let rs = ResultSet::from_rows(cols, rows);
+        assert!(
+            rs.retained_bytes() >= 100 * 3 * std::mem::size_of::<u32>(),
+            "300 empty cells reported as {} bytes",
+            rs.retained_bytes()
+        );
+    }
+
+    /// Monotone in the rows, which is what makes the figure a *comparison* the
+    /// user can act on — a pin holding twice the rows has to read as the larger.
+    #[test]
+    fn more_rows_retain_more_bytes() {
+        let cols = || vec![named("name", "TEXT")];
+        let rows = |n: usize| (0..n).map(|i| vec![Value::Str(format!("r{i}"))]).collect();
+        let small = ResultSet::from_rows(cols(), rows(10));
+        let large = ResultSet::from_rows(cols(), rows(1_000));
+        assert!(
+            large.retained_bytes() > small.retained_bytes(),
+            "{} is not more than {}",
+            large.retained_bytes(),
+            small.retained_bytes()
+        );
     }
 
     /// The happy path: a chunk carries the rows pushed since the last one, and
