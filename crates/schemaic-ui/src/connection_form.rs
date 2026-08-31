@@ -920,67 +920,83 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             // means the system's own roots, which is what a hosted server with a
             // publicly-signed certificate needs. The hint says so, because a
             // blank required-looking field reads as unfinished.
-            let ca = if m.verifies_certificate() {
-                v_stack((
-                    path_field(
-                        "CA certificate",
-                        draft.tls_ca_path,
-                        "Select CA certificate",
-                        ring.clone(),
-                        151,
-                    ),
-                    form_hint(
-                        "Leave empty to trust the certificate authorities your \
-                         operating system trusts, including any your organisation \
-                         installed. Name a file to trust that one instead.",
-                    ),
-                ))
-                .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
-                .into_any()
-            } else {
-                empty().into_any()
-            };
-
-            v_stack((
-                ca,
+            // Built as a list rather than a tuple so a hidden CA field is
+            // *absent* rather than an `empty()` child. A tuple keeps the slot,
+            // and the stack's 20px gap with it — which read as the group box
+            // having more padding above its first field than the SSH box does,
+            // on exactly the modes where the CA row is hidden.
+            let mut rows: Vec<floem::AnyView> = Vec::new();
+            if m.verifies_certificate() {
+                rows.push(
+                    v_stack((
+                        path_field(
+                            "CA certificate",
+                            draft.tls_ca_path,
+                            "Select CA certificate",
+                            ring.clone(),
+                            151,
+                        ),
+                        form_hint(
+                            "Leave empty to trust the certificate authorities your \
+                             operating system trusts, including any your organisation \
+                             installed. Name a file to trust that one instead.",
+                        ),
+                    ))
+                    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+                    .into_any(),
+                );
+            }
+            rows.push(
                 path_field(
                     "Client certificate",
                     draft.tls_client_cert_path,
                     "Select client certificate",
                     ring.clone(),
                     153,
-                ),
+                )
+                .into_any(),
+            );
+            rows.push(
                 path_field(
                     "Client key",
                     draft.tls_client_key_path,
                     "Select client key",
                     ring.clone(),
                     155,
-                ),
+                )
+                .into_any(),
+            );
+            rows.push(
                 masked_field(
                     "Client key passphrase",
                     draft.tls_client_key_passphrase,
                     ring,
                     157,
                 )
-                .style(|s| s.width(conn_field_w())),
+                .style(|s| s.width(conn_field_w()))
+                .into_any(),
+            );
+            rows.push(
                 form_hint(
                     "A client certificate and key are only needed where the server asks \
                      you to prove who you are (mutual TLS).",
-                ),
-            ))
-            // Grouped like the SSH block: outlined rather than tinted, since a
-            // fill reads as a *state* everywhere else in the app.
-            .style(|s| {
-                s.flex_col()
-                    .gap(theme::scaled(20.0))
-                    .width_full()
-                    .padding(theme::scaled(10.0))
-                    .border(1.0)
-                    .border_color(theme::border())
-                    .border_radius(6.0)
-            })
-            .into_any()
+                )
+                .into_any(),
+            );
+
+            v_stack_from_iter(rows)
+                // Grouped like the SSH block: outlined rather than tinted, since a
+                // fill reads as a *state* everywhere else in the app.
+                .style(|s| {
+                    s.flex_col()
+                        .gap(theme::scaled(20.0))
+                        .width_full()
+                        .padding(theme::scaled(10.0))
+                        .border(1.0)
+                        .border_color(theme::border())
+                        .border_radius(6.0)
+                })
+                .into_any()
         },
     )
     .style(|s| s.width_full());
