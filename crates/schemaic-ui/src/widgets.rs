@@ -4672,6 +4672,91 @@ pub(crate) fn toggle_icon_view(
         })
 }
 
+/// The app's checkbox: a filled square with a white check when ticked, an empty
+/// outline when not. **The one checkbox** — every multi-select list in the app
+/// draws its box through this, so a picker cannot quietly grow a second look.
+///
+/// One box that changes colour rather than two glyphs swapped, and both halves
+/// are style rather than a rebuild — nothing beside it can move by a pixel, and
+/// a row cannot take itself apart under the pointer mid-click. That is why
+/// `checked` is `Clone` rather than called once: the fill and the tick each need
+/// their own copy inside their own reactive style closure.
+///
+/// **The toggle's colours, not the accent's.** `toggle_on` + `toggle_handle_on`
+/// are what "this is on" already looks like everywhere else in the app, and they
+/// are a *pair*: the second is white in both themes precisely because it is
+/// drawn on the first. Reaching for `accent()` and `btn_primary_text()` instead
+/// looks right in a palette and is not — `btn_primary_text` is the light blue a
+/// Primary button's label wears on its own dark navy fill, and on a saturated
+/// box it left a check nobody could see. Add [`icons::CHECK_BOLD`] to that, and
+/// the tick had neither weight nor contrast.
+pub(crate) fn check_box(checked: impl Fn() -> bool + Clone + 'static) -> impl IntoView {
+    let filled = checked.clone();
+    container(icons::icon(icons::CHECK_BOLD, 11.0).style(move |s| {
+        let s = s.color(theme::toggle_handle_on());
+        if checked() { s } else { s.hide() }
+    }))
+    .style(move |s| {
+        let s = s
+            .width(theme::scaled(15.0))
+            .height(theme::scaled(15.0))
+            .flex_shrink(0.0_f32)
+            .items_center()
+            .justify_center()
+            .border(1.0)
+            .border_radius(4.0);
+        if filled() {
+            s.background(theme::toggle_on())
+                .border_color(theme::toggle_on())
+        } else {
+            s.border_color(theme::control_border())
+        }
+    })
+}
+
+/// A word of clickable text that keeps its Tab stop and its focus ring — the
+/// pair of links that sit above a [`check_box`] list and tick or untick all of
+/// it ("Select all" in `accent`, "None" in `text_muted`).
+///
+/// **Links, not footer buttons**: these adjust the list the user is reading,
+/// they are not the decision the modal is asking about — that decision has
+/// exactly two buttons and they are in the footer. The dump modal's table picker
+/// wore `action_button`s here until the import list gave the pair a shape, which
+/// put two quiet buttons and two links on the same job in two modals.
+///
+/// [`in_ring_button`] is what makes it more than a `text().on_click`: a link a
+/// keyboard user cannot reach is a control only half the users have, and these
+/// two are the only way to change the selection without clicking every row.
+pub(crate) fn link_button(
+    label: &'static str,
+    color: fn() -> floem::peniko::Color,
+    ring: FocusRing,
+    tabindex: u32,
+    action: impl Fn() + Clone + 'static,
+) -> AnyView {
+    let clicked = action.clone();
+    in_ring_button(
+        // **The colour lives on the container, not on the text.** `color` is
+        // inherited, so a child that sets its own shadows the parent's — and the
+        // hover below is on the parent, which is what left this link with no
+        // hover state at all. Every row-like control in the import modal and in
+        // `manage_modal` colours the parent and lets the label inherit.
+        container(text(label).style(|s| s.font_size(theme::font_hint())))
+            .on_click_stop(move |_| clicked())
+            .style(move |s| {
+                s.items_center()
+                    .padding_horiz(theme::scaled(2.0))
+                    .color(color())
+                    .hover(|s| s.color(theme::text()))
+            }),
+        ring,
+        tabindex,
+        true,
+        4.0,
+        action,
+    )
+}
+
 /// A 22px jump-to-bottom circle (chevron-down) that fades in only while `show()`
 /// is true and is inert (no pointer events) otherwise. Absolutely positioned
 /// bottom-right (10px/10px) inside its parent stack. Shared by the AI panel and
