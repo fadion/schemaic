@@ -3821,11 +3821,16 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
 
     // Connection switcher: shows the active connection's name; click toggles the
     // dropdown (rendered as an overlay so it floats above the app).
+    //
+    // **Elided at the same limit the menu rows use**, since it is the same name
+    // and nothing else in the header is free to move for it: the button has no
+    // width of its own, so a long name stretched it and pushed the environment
+    // badge and everything after it along the bar.
     let conn_label = move || {
         connections.with(|cs| {
             cs.iter()
                 .find(|c| c.id == active_conn.get())
-                .map(|c| c.name.clone())
+                .map(|c| schemaic_core::connection::elide_name(&c.name, consts::CONN_NAME_CHARS))
                 .unwrap_or_else(|| "No connection".to_string())
         })
     };

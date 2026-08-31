@@ -453,31 +453,41 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                                     .items_center()
                                     .justify_center()
                             });
-                    // Truncate long names to 15 chars (+ ellipsis) so the row —
-                    // and thus the fixed-width menu — never overflows past the
-                    // panel edge; the endpoint stays fully visible on the right.
+                    // **The three numbers here are one measurement** — 15 name
+                    // characters, 22 endpoint characters, and the 400px panel
+                    // below — so none of them moves alone.
                     //
-                    // **Both numbers here are one measurement**, so neither moves
-                    // alone: 15 chars against the 350px panel below. At 20 and
-                    // 300 a name that hit the limit still pushed `127.0.0.1:3306`
-                    // off the right edge — the truncation bounded the *name* and
-                    // nothing bounded the row, so the thing that fell off was the
-                    // endpoint, which is the half you cannot reconstruct from the
-                    // other. Five characters back and fifty pixels wider clears
-                    // the longest name the limit allows next to a full
-                    // `host:port`.
-                    let name = c.name.clone();
-                    let name = if name.chars().count() > 15 {
-                        format!("{}…", name.chars().take(15).collect::<String>())
-                    } else {
-                        name
-                    };
+                    // The panel holds *both caps at once plus the gap between
+                    // them*, which is the case that decides it: either limit
+                    // alone leaves room to spare, and a maxed name beside a maxed
+                    // endpoint is what closed the 20px spacer to nothing.
+                    //
+                    // **Bounding both halves is what keeps the menu at 350**, and
+                    // the panel's own width never did: it is a `min_width`, so a
+                    // row wider than it simply widens the panel. Only the name
+                    // was capped, and a local `127.0.0.1:3306` never reached the
+                    // edge — so the row looked correct until a hosted endpoint
+                    // arrived. `pg-397b033c-jonidashi-b5ac.b.aivencloud.com:10863`
+                    // is 48 characters: it pushed the whole menu out past the
+                    // panel, and clipped the port off the right of it.
+                    //
+                    // So the width is not the thing to tune when the menu looks
+                    // too wide — a menu wider than 350 is a row that outgrew its
+                    // cap, and the cap is what moves.
+                    let name = schemaic_core::connection::elide_name(
+                        &c.name,
+                        crate::consts::CONN_NAME_CHARS,
+                    );
+                    // Elided from the *host*, never the port: two services on one
+                    // provider share the whole host but the leading id, and
+                    // differ in the port.
+                    let endpoint = schemaic_core::connection::elide_endpoint(&c.endpoint(), 22);
                     h_stack((
                         dot,
                         // Name in the connection-list text colour; the dot carries status.
                         text(name).style(|s| s.color(theme::conn_list_text())),
                         empty().style(|s| s.flex_grow(1.0_f32).min_width(20.0)),
-                        text(c.endpoint())
+                        text(endpoint)
                             .style(|s| s.color(theme::text_faint()).font_size(theme::font_label())),
                     ))
                     .on_click_stop(move |_| {
@@ -526,9 +536,11 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
             .style(|s| {
                 panel_style(s)
                     .background(theme::bg_chrome())
-                    // Paired with the 15-char name limit above — see the note
-                    // there. Neither number moves without the other.
-                    .min_width(theme::scaled(350.0))
+                    // Paired with the name and endpoint limits above — see the
+                    // note there. None of the three moves without the others,
+                    // and this one is a floor rather than a cap: the limits are
+                    // what stop a row pushing past it.
+                    .min_width(theme::scaled(400.0))
                     .padding_vert(theme::scaled(6.0))
                     .margin_left(theme::scaled(36.0))
                     // 3px below the switcher button (which sits ~HEADER_H-7 down).
