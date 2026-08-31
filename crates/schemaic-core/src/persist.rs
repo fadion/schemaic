@@ -1323,7 +1323,7 @@ mod tests {
             Environment::None,
             "→ default"
         );
-        assert_eq!(back.connections[0].tls.mode, SslMode::Prefer, "→ default");
+        assert_eq!(back.connections[0].tls.mode, SslMode::Disable, "→ default");
         assert_eq!(
             back.connections[0].tls.ca_path, "/etc/ca.crt",
             "the rest of the TLS block survives the unknown mode"

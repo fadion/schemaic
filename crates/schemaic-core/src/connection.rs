@@ -372,15 +372,23 @@ impl Default for SshTunnel {
 #[serde(from = "SslModeRaw")]
 pub enum SslMode {
     /// Never negotiate TLS; connect in plaintext.
+    ///
+    /// **The default**, which is a decision about the form as much as the wire.
+    /// It is exactly what every connection did before this setting existed, so
+    /// no saved connection changes behaviour; and it is the one mode that needs
+    /// no fields, so the form stays quiet until somebody asks for TLS rather
+    /// than showing three certificate paths to everyone connecting to
+    /// `127.0.0.1`.
+    ///
+    /// The cost is real and worth stating: a *new* connection to a provider that
+    /// requires TLS fails until the mode is raised. `Prefer` would have
+    /// connected — it never refuses a server plaintext would have reached — at
+    /// the price of being the louder default for the local connections that are
+    /// most of them.
+    #[default]
     Disable,
     /// Encrypt when the server offers it, fall back to plaintext when it does
     /// not, and verify nothing.
-    ///
-    /// The default, and the reason it can be: it never refuses a server that a
-    /// plaintext connection would have reached, so every connection saved before
-    /// this setting existed keeps working while gaining encryption wherever the
-    /// server already offered it.
-    #[default]
     Prefer,
     /// Encryption is mandatory — fail rather than fall back — but the
     /// certificate is not checked.
@@ -643,8 +651,8 @@ pub struct Connection {
     #[serde(default)]
     pub ssh: SshTunnel,
     /// How the transport to the server is secured ([`Tls`]). Defaults to
-    /// [`SslMode::Prefer`], which is what makes the field safe to add to
-    /// connections saved before it existed.
+    /// [`SslMode::Disable`], which is what every connection saved before this
+    /// field existed was already doing.
     #[serde(default)]
     pub tls: Tls,
     /// Optional identity colour (a `#rrggbb` hex), shown as a dot across the
@@ -2002,20 +2010,21 @@ mod tls_tests {
         }
     }
 
+    /// The default is the mode that changes nothing and shows nothing: exactly
+    /// what every connection did before the setting existed, and the only mode
+    /// with no fields under it.
     #[test]
-    fn prefer_is_the_default_and_never_mandates_tls() {
-        assert_eq!(SslMode::default(), SslMode::Prefer);
-        assert_eq!(Tls::default().mode, SslMode::Prefer);
-        // The property that makes Prefer safe as the default for connections
-        // saved before this setting existed: it can encrypt, but it can never
-        // refuse a server that plaintext would have reached.
-        assert!(SslMode::Prefer.negotiates_tls());
-        assert!(!SslMode::Prefer.requires_tls());
+    fn disable_is_the_default_and_negotiates_nothing() {
+        assert_eq!(SslMode::default(), SslMode::Disable);
+        assert_eq!(Tls::default().mode, SslMode::Disable);
         assert!(!SslMode::Disable.negotiates_tls());
+        // …and therefore plans no handshake at all, which is what keeps the
+        // certificate fields out of the form until somebody asks for TLS.
+        assert!(Tls::default().plan().is_none());
     }
 
     #[test]
-    fn a_connection_saved_before_tls_existed_reads_as_prefer() {
+    fn a_connection_saved_before_tls_existed_stays_in_plaintext() {
         let json = r#"{
             "id": 7,
             "name": "legacy",
@@ -2026,7 +2035,11 @@ mod tls_tests {
         }"#;
         let c: Connection = serde_json::from_str(json).unwrap();
         assert_eq!(c.tls, Tls::default());
-        assert_eq!(c.tls.mode, SslMode::Prefer);
+        assert_eq!(
+            c.tls.mode,
+            SslMode::Disable,
+            "a saved connection must not start negotiating something it never did"
+        );
     }
 
     /// A mode written by a newer build must degrade to the default rather than
