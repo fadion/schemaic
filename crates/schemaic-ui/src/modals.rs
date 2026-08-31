@@ -99,11 +99,38 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let trigger_open = ui.ddl.trigger;
             let routine_open = ui.ddl.routine;
             let event_open = ui.ddl.event;
+            let dump_open = ui.dump.target;
+            let script_open = ui.script.target;
             stack((
                 error_modal_overlay(ui.clone()),
                 crate::snippet_edit::snippet_edit_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
-                crate::dump_view::dump_overlay(ui.clone()),
+                // Export and Import-a-script share one tuple element: this stack
+                // is at Floem's 16-arity `ViewTuple` limit, and the two are the
+                // same journey in opposite directions — both open on a database
+                // node and only ever one at a time.
+                //
+                // **The style is not decoration, it is the reason the modal is
+                // in the right place.** A member overlay is
+                // `absolute().inset(0)` *against its parent*, so nesting one a
+                // level deeper re-parents it to this stack — and an unstyled
+                // stack is an ordinary flow child of the layer, sized by its
+                // content wherever it happens to sit. Shipped without this, the
+                // Export panel rendered inside the schema tree's column,
+                // clipped to it. Every grouped element here therefore fills the
+                // layer exactly while one of its own members is open, which is
+                // the same rule the trigger/routine/event group below states.
+                stack((
+                    crate::dump_view::dump_overlay(ui.clone()),
+                    crate::script_view::script_overlay(ui.clone()),
+                ))
+                .style(move |s| {
+                    if dump_open.get().is_some() || script_open.get().is_some() {
+                        s.absolute().inset(0.0)
+                    } else {
+                        s
+                    }
+                }),
                 table_designer::table_designer_overlay(ui.clone()),
                 view_editor::view_editor_overlay(ui.clone()),
                 // The trigger, routine and event editors share one tuple
@@ -240,6 +267,7 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let tx_prompt = ui.overlay.tx_prompt;
     let import_open = ui.import.target;
     let dump_open = ui.dump.target;
+    let script_open = ui.script.target;
     let snippet_edit = ui.overlay.snippet_edit;
     let editors = ddl_editors_up(ui.ddl);
     move || {
@@ -250,6 +278,11 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
             // `inset(0)` resolves against a box this predicate keeps at zero by
             // zero otherwise, and the modal renders nothing at all.
             || dump_open.get().is_some()
+            // The script loader shares Export's tuple element, so it is painted
+            // in this group and has to be in this list for the same reason —
+            // and it is the *second* signal in that element, which is the shape
+            // most likely to be forgotten.
+            || script_open.get().is_some()
             // The snippet editor is painted in this group, so it has to be in
             // this list — the event editor shipped missing from exactly here and
             // rendered nothing at all, because the wrapper's `inset(0)` resolved
@@ -388,6 +421,10 @@ mod modal_backdrop_gate {
         "plan_view.rs",
         "properties.rs",
         "routine_editor.rs",
+        // In the layer's DDL group, sharing `dump_view.rs`'s tuple element (the
+        // stack is at floem's 16-arity limit and the two never open together),
+        // raised by `ddl_modals_up`'s `script_open.get().is_some()` arm.
+        "script_view.rs",
         "settings.rs",
         // In the layer's DDL group, raised by `ddl_modals_up`'s
         // `snippet_edit.get().is_some()` arm.
@@ -525,5 +562,113 @@ mod modal_backdrop_gate {
                  under it"
             );
         }
+    }
+}
+
+/// **Every `stack` in the layer is styled**, because a member overlay's
+/// `absolute().inset(0)` resolves against *its parent*.
+///
+/// A group exists only to fit floem's 16-arity `ViewTuple` limit, so it is
+/// natural to write one as a bare `stack((a, b))` and think nothing has changed.
+/// Something has: the members are now one level deeper, and an unstyled stack is
+/// an ordinary flow child of the layer, sized by its content wherever it happens
+/// to sit. The Export and Import-a-script group shipped that way for one build
+/// and painted its panel **inside the schema tree's column**, clipped to it.
+///
+/// The two existing groups both carried the fill-only-when-open style, and the
+/// third did not — the drift a comment cannot catch and this can.
+#[cfg(test)]
+mod modal_group_gate {
+    use std::path::{Path, PathBuf};
+
+    fn this_file() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("modals.rs")
+    }
+
+    /// `modal_layer`'s body, from its signature to the closing brace in column 0.
+    fn layer_body(src: &str) -> &str {
+        let start = src
+            .find("pub(crate) fn modal_layer(")
+            .expect("the layer's signature is gone");
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("the layer's closing brace is gone");
+        &src[start..end]
+    }
+
+    /// The byte index just past the `)` that closes the `stack(` beginning at
+    /// `at`, by counting parentheses. Approximate by design — the same licence
+    /// `menu_order_gate` takes — and safe here because the region holds no
+    /// string literal carrying an unbalanced parenthesis.
+    fn end_of_call(body: &str, at: usize) -> usize {
+        let bytes = body.as_bytes();
+        let open = at + "stack".len();
+        let mut depth = 0usize;
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses after the `stack(` at byte {at}");
+    }
+
+    #[test]
+    fn every_stack_in_the_modal_layer_is_styled() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let body = layer_body(&src);
+
+        let mut found = 0usize;
+        let mut unstyled: Vec<usize> = Vec::new();
+        let mut at = 0usize;
+        while let Some(i) = body[at..].find("stack((") {
+            let i = at + i;
+            // `h_stack((` / `v_stack((` are not groups of the layer.
+            let is_bare = i == 0
+                || !body.as_bytes()[i - 1].is_ascii_alphanumeric()
+                    && body.as_bytes()[i - 1] != b'_';
+            if is_bare {
+                found += 1;
+                let close = end_of_call(body, i);
+                let rest = body[close..].trim_start();
+                if !rest.starts_with(".style(") {
+                    // Line number within the file, for a message that can be
+                    // acted on without counting bytes.
+                    let line = src[..src.find(body).unwrap_or(0) + i]
+                        .bytes()
+                        .filter(|&b| b == b'\n')
+                        .count()
+                        + 1;
+                    unstyled.push(line);
+                }
+            }
+            at = i + "stack((".len();
+        }
+
+        assert!(
+            unstyled.is_empty(),
+            "these `stack`s in `modal_layer` are not followed by `.style(…)`, at \
+             lines {unstyled:?}.\nA group's members are `absolute().inset(0)` against \
+             *the group*, so an unstyled one is a flow child sized by its content — the \
+             panel then renders wherever that box lands (it rendered inside the schema \
+             tree). Give it the fill-only-when-open style its siblings have: \
+             `.style(|s| if <any member open> {{ s.absolute().inset(0.0) }} else {{ s }})`."
+        );
+        // And the scan is still finding them, or it passes by seeing nothing —
+        // the vacuous-pass trap `menu_order_gate` fell into once.
+        assert!(
+            found >= 5,
+            "only {found} `stack`s found in `modal_layer` — has it moved or been \
+             renamed? The gate is then passing without checking anything."
+        );
     }
 }

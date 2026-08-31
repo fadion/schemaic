@@ -37,6 +37,7 @@ mod plan_view;
 mod properties;
 mod routine_editor;
 mod schema_tree;
+mod script_view;
 /// The tree-node key builders. Public because the persisted expanded-node set is
 /// the app's to edit (collapsing a database drops every `tbl:<db>:*` key), and
 /// the format belongs to exactly one module.
@@ -218,6 +219,46 @@ pub struct DumpRequest {
     pub tables: Vec<String>,
     pub opts: schemaic_core::dump::DumpOptions,
     pub dialect: SqlDialect,
+}
+
+/// The database a script modal is open on — the load half of [`DumpTarget`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptTarget {
+    pub conn_id: u64,
+    pub database: String,
+    /// The PostgreSQL namespace the entry was opened on, when it was. It does
+    /// **not** scope the run: a script's statements name their own objects, and
+    /// pretending otherwise would promise a containment this cannot deliver. It
+    /// is carried so the modal can say which node was right-clicked.
+    pub schema: Option<String>,
+    pub dialect: SqlDialect,
+}
+
+/// What to run, and where. The load half of [`DumpRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptRequest {
+    pub path: std::path::PathBuf,
+    pub conn_id: u64,
+    /// The database the script runs *in*. Always present, because the run is
+    /// launched from a database or schema node — and because
+    /// `sql::script_verdict` blocks outright without one.
+    pub database: String,
+    pub dialect: SqlDialect,
+}
+
+/// How far a running script has got.
+///
+/// **Bytes, not statements**, and not for want of a count: a file's statement
+/// total cannot be known without reading the file, which is the thing being
+/// done. Its byte length is known at `open`, so it is the one denominator that
+/// is honest from the first message. See `schemaic_core::script::probe`, which
+/// reports every count it *can* give as a floor for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScriptProgress {
+    pub bytes_done: u64,
+    /// `0` when the file's length could not be read, which the label must treat
+    /// as "unknown" rather than dividing by.
+    pub bytes_total: u64,
 }
 
 /// How far a running dump has got — one message per table, as it starts.
@@ -1696,6 +1737,47 @@ pub struct DumpTarget {
     pub dialect: SqlDialect,
 }
 
+/// The script modal's state — the same Copy-bundle shape [`DumpUi`] uses, and
+/// reset the same way on every open.
+///
+/// **Its own bundle rather than an arm of [`ImportUi`]**, though the user
+/// reaches both through *Import*. The two share the word and the frame and
+/// almost nothing else: a CSV import is twenty-odd signals about delimiters,
+/// headers, null tokens and a column mapping, and a script has no columns to map
+/// and no dialect to sniff. Folding it in would have meant branching every one
+/// of those signals on a scope that leaves them all unread.
+#[derive(Clone, Copy)]
+pub struct ScriptUi {
+    /// The database being loaded into, and the open flag.
+    pub target: RwSignal<Option<ScriptTarget>>,
+    /// The chosen file. `None` until one is picked.
+    pub path: RwSignal<Option<std::path::PathBuf>>,
+    /// True while the probe is reading the file's opening statements.
+    pub probing: RwSignal<bool>,
+    /// What the probe found — the second step's whole content.
+    pub probe: RwSignal<Option<schemaic_core::script::Probe>>,
+    /// True while the run itself is going. Guards a second launch and is what
+    /// turns every exit into a cancel, exactly as [`DumpUi::running`] does.
+    pub running: RwSignal<bool>,
+    pub progress: RwSignal<Option<ScriptProgress>>,
+    pub error: RwSignal<Option<String>>,
+    /// The finished sentence, once a run succeeds.
+    pub done: RwSignal<Option<String>>,
+    /// Bumped on every open, so a late outcome can't report into a modal that
+    /// has since been reopened on another database.
+    pub generation: RwSignal<u64>,
+}
+
+/// Delivers a [`schemaic_core::script::Probe`] back onto the UI thread.
+pub type ScriptProbeDoneFn = Rc<dyn Fn(Result<schemaic_core::script::Probe, String>)>;
+/// Read the opening statements of a `.sql` file, off the UI thread, so the modal
+/// can say what the file will do before it does it.
+pub type ScriptProbeFn = Rc<dyn Fn(std::path::PathBuf, SqlDialect, ScriptProbeDoneFn)>;
+/// Delivers a finished run's outcome back onto the UI thread.
+pub type ScriptDoneFn = Rc<dyn Fn(schemaic_core::script::RunOutcome)>;
+/// Run a `.sql` script against a database.
+pub type ScriptFn = Rc<dyn Fn(ScriptRequest, ScriptDoneFn)>;
+
 /// The dump modal's state — the same Copy-bundle shape [`ImportUi`] uses, reset
 /// on open rather than owned by a per-open scope, and for the same reason.
 #[derive(Clone, Copy)]
@@ -2867,6 +2949,16 @@ pub struct SchemaActions {
     /// Stop the import [`SchemaActions::import_run`] is running, rolling it back.
     /// A no-op when nothing is running.
     pub import_cancel: Rc<dyn Fn()>,
+    /// Read a `.sql` file's opening statements so the modal can report what the
+    /// file will do before running it.
+    pub script_probe: ScriptProbeFn,
+    /// Run a `.sql` script against a database, statement by statement.
+    pub script_run: ScriptFn,
+    /// Stop the script [`SchemaActions::script_run`] is running. **What has
+    /// already been applied stays applied** unless the file opened its own
+    /// transaction — which is why the outcome carries a count rather than a
+    /// reassurance.
+    pub script_cancel: Rc<dyn Fn()>,
     /// Apply an approved DDL plan, then re-introspect the database it changed.
     pub run_ddl: DdlFn,
     /// Read a MySQL view's `ALGORITHM`, which no bulk query reports.
@@ -3603,6 +3695,9 @@ pub struct Ui {
     pub import: ImportUi,
     /// The schema + data dump modal (opened from a database's context menu).
     pub dump: DumpUi,
+    /// The script-load modal — **Import** on a database or namespace node, the
+    /// inverse of the *Export* directly above it in the same menu.
+    pub script: ScriptUi,
     /// The schema-editing modals: the table designer and the DDL preview.
     pub ddl: DdlUi,
     // Connections — grouped (review §3.3).

@@ -18,6 +18,7 @@ mod dump;
 mod heap;
 mod logging;
 mod mcp;
+mod script;
 mod secrets;
 mod update;
 
@@ -3201,6 +3202,94 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let dump_token = dump_token.clone();
         Rc::new(move || {
             if let Some(t) = dump_token.borrow().as_ref() {
+                t.cancel();
+            }
+        })
+    };
+
+    // ── Running a `.sql` script ──────────────────────────────────────────────
+    //
+    // The dump's mirror image, and wired the same way for the same reasons: the
+    // work is in `script.rs`, progress is a channel because `create_ext_action`
+    // is one-shot, and the cancel slot is its own rather than shared — a running
+    // export's Stop must not reach a load the user cannot see.
+    let (script_tx, script_rx) = crossbeam_channel::unbounded::<schemaic_ui::ScriptProgress>();
+    let script_stream = create_signal_from_channel(script_rx);
+    let script_progress: RwSignal<Option<schemaic_ui::ScriptProgress>> = RwSignal::new(None);
+    create_effect(move |_| {
+        if let Some(p) = script_stream.get() {
+            script_progress.set(Some(p));
+        }
+    });
+    let script_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+
+    let script_probe: schemaic_ui::ScriptProbeFn = {
+        let handle = handle.clone();
+        Rc::new(
+            move |path: std::path::PathBuf,
+                  dialect: schemaic_core::intel::SqlDialect,
+                  done: schemaic_ui::ScriptProbeDoneFn| {
+                let report = create_ext_action(
+                    cx,
+                    move |r: Result<schemaic_core::script::Probe, String>| (done)(r),
+                );
+                // Off the UI thread and blocking: the probe reads up to
+                // `PROBE_MAX_BYTES` off a disk, which is exactly the pause the
+                // modal must not take on the thread drawing it.
+                handle.spawn_blocking(move || {
+                    let out = std::fs::File::open(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|f| {
+                            schemaic_core::script::probe(f, dialect).map_err(|e| e.to_string())
+                        });
+                    report(out);
+                });
+            },
+        )
+    };
+
+    let script_run: schemaic_ui::ScriptFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let script_token = script_token.clone();
+        let script_tx = script_tx.clone();
+        Rc::new(
+            move |req: schemaic_ui::ScriptRequest, done: schemaic_ui::ScriptDoneFn| {
+                use schemaic_core::script::RunOutcome;
+                let db = match (db_for)(req.conn_id) {
+                    Ok(db) => db,
+                    // Nothing ran, and the report must say so rather than name a
+                    // statement it never reached.
+                    Err(e) => {
+                        return (done)(RunOutcome::Failed {
+                            message: e,
+                            ran: 0,
+                            at: None,
+                        });
+                    }
+                };
+                let token = CancellationToken::new();
+                *script_token.borrow_mut() = Some(token.clone());
+                let report = {
+                    let script_token = script_token.clone();
+                    create_ext_action(cx, move |o: RunOutcome| {
+                        *script_token.borrow_mut() = None;
+                        (done)(o);
+                    })
+                };
+                let tx = script_tx.clone();
+                handle.spawn(async move {
+                    let outcome = script::run(db, req, token, tx).await;
+                    report(outcome);
+                });
+            },
+        )
+    };
+
+    let script_cancel: Rc<dyn Fn()> = {
+        let script_token = script_token.clone();
+        Rc::new(move || {
+            if let Some(t) = script_token.borrow().as_ref() {
                 t.cancel();
             }
         })
@@ -8876,6 +8965,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             dump_tables,
             dump_run,
             dump_cancel,
+            script_probe,
+            script_run,
+            script_cancel,
             run_ddl,
             view_algorithm,
             trigger_functions,
@@ -8929,6 +9021,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             disable_fk_checks: RwSignal::new(true),
             running: RwSignal::new(false),
             progress: dump_progress,
+            error: RwSignal::new(None),
+            done: RwSignal::new(None),
+            generation: RwSignal::new(0),
+        },
+        // The load half of `dump` above, and the same bundle rule.
+        script: schemaic_ui::ScriptUi {
+            target: RwSignal::new(None),
+            path: RwSignal::new(None),
+            probing: RwSignal::new(false),
+            probe: RwSignal::new(None),
+            running: RwSignal::new(false),
+            progress: script_progress,
             error: RwSignal::new(None),
             done: RwSignal::new(None),
             generation: RwSignal::new(0),
