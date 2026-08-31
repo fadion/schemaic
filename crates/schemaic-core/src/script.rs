@@ -394,6 +394,105 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
     })
 }
 
+/// How the reading half of a run ended — the file side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadEnd {
+    /// The file was read to its end and every statement handed over.
+    Eof,
+    /// The user stopped it.
+    Cancelled,
+    /// The file could not be read: a disk error, a revoked permission, a
+    /// vanished network mount.
+    Failed(String),
+    /// One statement grew past [`MAX_PENDING_BYTES`] — a file with no statement
+    /// terminator in it at all, rather than a script with a long statement.
+    NoTerminator,
+    /// The executor stopped consuming, so reading stopped too. **Carries no
+    /// cause on purpose**: the executor has the real one.
+    Stopped,
+}
+
+/// How the executing half of a run ended — the server side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecEnd {
+    /// Every statement the reader handed over was run.
+    Done,
+    /// The server refused one.
+    Failed {
+        message: String,
+        sql: String,
+        line: u64,
+    },
+    /// The connection could not be opened at all, so nothing ran.
+    Connect(String),
+    /// The executor saw the cancellation itself, mid-statement.
+    Cancelled,
+}
+
+/// What to report about a finished run.
+///
+/// **Every arm carries `ran`**, including the failures. A script is not
+/// transactional unless the file said so, so "it stopped" always leaves the
+/// question "how much of it happened?" — and that number is the answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    Done {
+        ran: usize,
+    },
+    Cancelled {
+        ran: usize,
+    },
+    Failed {
+        message: String,
+        ran: usize,
+        /// The statement the server refused and the line it began on. `None`
+        /// when the failure was not a statement's — a file that could not be
+        /// read has none to name.
+        at: Option<(String, u64)>,
+    },
+}
+
+/// Which half's ending the user is told about.
+///
+/// **Cancel is the reader's to declare, and so is every failure the reader can
+/// see.** That second clause is where this parts company with
+/// [`crate::dump::dump_verdict`], and the two must not be made to match: there
+/// the *database* reads and the *file* is written, so a full disk fails the
+/// writer and the reader only ever learns "nobody is reading any more". Here the
+/// halves are swapped. A file that stops being readable is invisible to the
+/// executor — it sees a channel close, which is indistinguishable from a script
+/// that simply ended — so a reader failure outranks even the server error it
+/// caused. A truncated read hands over half a statement, the server answers
+/// "syntax error near…", and reporting *that* would name the file's last line as
+/// the problem when the disk is.
+///
+/// The remaining order follows the same rule the dump's does: whichever half
+/// holds the true cause describes it.
+pub fn run_outcome(read: ReadEnd, exec: ExecEnd, ran: usize) -> RunOutcome {
+    let failed =
+        |message: String, at: Option<(String, u64)>| RunOutcome::Failed { message, ran, at };
+    match (read, exec) {
+        // Either half may witness the stop; neither is a finished run.
+        (ReadEnd::Cancelled, _) | (_, ExecEnd::Cancelled) => RunOutcome::Cancelled { ran },
+        // The reader's own failures outrank the server error they cause — see
+        // the doc above, and `a_read_failure_outranks_the_server_error_it_caused`.
+        (ReadEnd::Failed(e), _) => failed(e, None),
+        (ReadEnd::NoTerminator, _) => failed(
+            "This file holds no statement terminator, so it is not a SQL script \
+             Schemaic can run. Check that you picked the file you meant."
+                .to_string(),
+            None,
+        ),
+        (_, ExecEnd::Connect(e)) => failed(e, None),
+        (_, ExecEnd::Failed { message, sql, line }) => failed(message, Some((sql, line))),
+        (ReadEnd::Eof, ExecEnd::Done) => RunOutcome::Done { ran },
+        // The reader stopped because the executor did, and the executor says it
+        // finished: the statements it was given all ran. Reachable when the
+        // driver stops feeding for its own reasons rather than on a failure.
+        (ReadEnd::Stopped, ExecEnd::Done) => RunOutcome::Done { ran },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,5 +903,160 @@ mod tests {
     fn an_empty_file_probes_to_nothing() {
         let p = probed("");
         assert_eq!(p, Probe::default());
+    }
+
+    // ── the ending split ─────────────────────────────────────────────────────
+
+    fn refused() -> ExecEnd {
+        ExecEnd::Failed {
+            message: "syntax error at or near \"VALUE\"".into(),
+            sql: "INSERT INTO t VALUE (1)".into(),
+            line: 412,
+        }
+    }
+
+    /// **The bug this function exists to prevent.** Cancelling closes the
+    /// channel, which the executor cannot tell from a script that simply ended
+    /// — so on its own it reports a clean finish over a half-applied file.
+    #[test]
+    fn a_cancelled_read_is_not_a_finished_run() {
+        assert_eq!(
+            run_outcome(ReadEnd::Cancelled, ExecEnd::Done, 4_000),
+            RunOutcome::Cancelled { ran: 4_000 }
+        );
+    }
+
+    /// Same shape, different cause: a file that stops being readable is equally
+    /// invisible to the executor.
+    #[test]
+    fn a_file_that_could_not_be_read_is_not_a_finished_run() {
+        match run_outcome(
+            ReadEnd::Failed("The device is not ready.".into()),
+            ExecEnd::Done,
+            120,
+        ) {
+            RunOutcome::Failed { message, ran, at } => {
+                assert!(message.contains("device is not ready"), "{message}");
+                assert_eq!(ran, 120);
+                assert_eq!(at, None, "a disk error names no statement");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// **Where this parts company with `dump_verdict`, and the reason the two
+    /// must not be unified.** A truncated read hands over half a statement, the
+    /// server answers "syntax error", and reporting the server would name the
+    /// file's last line as the problem when the disk is.
+    #[test]
+    fn a_read_failure_outranks_the_server_error_it_caused() {
+        match run_outcome(
+            ReadEnd::Failed("The device is not ready.".into()),
+            refused(),
+            9,
+        ) {
+            RunOutcome::Failed { message, .. } => {
+                assert!(message.contains("device is not ready"), "{message}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// A file with no terminator in it is a different sentence from a disk
+    /// error, and the user needs to hear which it was — most likely they picked
+    /// the wrong file.
+    #[test]
+    fn a_file_with_no_statement_terminator_says_so() {
+        match run_outcome(ReadEnd::NoTerminator, ExecEnd::Done, 0) {
+            RunOutcome::Failed { message, at, .. } => {
+                assert!(
+                    message.to_lowercase().contains("terminator")
+                        || message.to_lowercase().contains(";"),
+                    "the message should name the missing terminator: {message}"
+                );
+                assert_eq!(at, None);
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// The ordinary failure: the server refused a statement, the reader stopped
+    /// because the executor did, and the report names the statement and its
+    /// line — the whole reason a `Statement` carries one.
+    #[test]
+    fn a_refused_statement_is_reported_with_its_line() {
+        match run_outcome(ReadEnd::Stopped, refused(), 411) {
+            RunOutcome::Failed { message, ran, at } => {
+                assert!(message.contains("syntax error"), "{message}");
+                assert_eq!(ran, 411);
+                assert_eq!(at, Some(("INSERT INTO t VALUE (1)".into(), 412)));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// Nothing ran, so there is no statement to name.
+    #[test]
+    fn a_connection_failure_names_no_statement() {
+        match run_outcome(ReadEnd::Stopped, ExecEnd::Connect("refused".into()), 0) {
+            RunOutcome::Failed { at, ran, .. } => {
+                assert_eq!(at, None);
+                assert_eq!(ran, 0);
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// The only way to a clean finish is both halves ending cleanly.
+    #[test]
+    fn a_clean_run_is_the_only_way_to_done() {
+        assert_eq!(
+            run_outcome(ReadEnd::Eof, ExecEnd::Done, 7),
+            RunOutcome::Done { ran: 7 }
+        );
+        for read in [
+            ReadEnd::Cancelled,
+            ReadEnd::Failed("x".into()),
+            ReadEnd::NoTerminator,
+        ] {
+            assert!(
+                !matches!(
+                    run_outcome(read.clone(), ExecEnd::Done, 7),
+                    RunOutcome::Done { .. }
+                ),
+                "{read:?} reported a finished run"
+            );
+        }
+    }
+
+    /// **Every arm carries `ran`.** A script is not transactional unless the
+    /// file said so, so "it stopped" always leaves "how much of it happened?" —
+    /// and an arm that dropped the count would drop the only answer.
+    #[test]
+    fn every_outcome_reports_how_many_statements_ran() {
+        let reads = [
+            ReadEnd::Eof,
+            ReadEnd::Cancelled,
+            ReadEnd::Failed("disk".into()),
+            ReadEnd::NoTerminator,
+            ReadEnd::Stopped,
+        ];
+        let execs = [
+            ExecEnd::Done,
+            ExecEnd::Cancelled,
+            ExecEnd::Connect("refused".into()),
+            refused(),
+        ];
+        for read in &reads {
+            for exec in &execs {
+                let ran = 1234;
+                let got = match run_outcome(read.clone(), exec.clone(), ran) {
+                    RunOutcome::Done { ran } => ran,
+                    RunOutcome::Cancelled { ran } => ran,
+                    RunOutcome::Failed { ran, .. } => ran,
+                };
+                assert_eq!(got, ran, "{read:?} + {exec:?} lost the count");
+            }
+        }
     }
 }
