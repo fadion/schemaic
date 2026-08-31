@@ -3745,11 +3745,43 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does
     for query runs) instead of closing — the transaction rolls back, so a cancelled import writes
     nothing.
+  - `script_view.rs` — the **script-load** modal, **Import** to the user, over `core::script`; the
+    inverse of `dump_view.rs` below, and the entry directly *above* it in the two menus that carry
+    both (a database's and a PostgreSQL namespace's), where the group reads
+    **`Import → Export → Create ▸`**. Those menus could write a `.sql` file nothing here could read
+    back, which is the hole this closes. **Import leads and the order is not alphabetical**: it is
+    the entry that changes the database, so it takes the slot furthest from where the pointer rests
+    after a right-click — the reasoning that keeps `Drop` last everywhere else in these menus.
+    **One word, two scopes.** *Import* on a **table** is `import_view`'s CSV/JSON loader; *Import* on
+    a **database** is this. A script has no table to load into because its statements name their own,
+    so the scope of the node picks the loader — and the namespace a namespace-node open carries is
+    for the **title only**, since nothing can confine someone else's `CREATE TABLE` to `sales`.
+    **Its own `ScriptUi` bundle rather than an arm of `ImportUi`**, though the user reaches both
+    through one word: a CSV import is twenty-odd signals about delimiters, headers, null tokens and a
+    column mapping, and a script reads none of them. Folding it in would have meant branching every
+    one of those on a scope that leaves them all unread; sharing the entry point and the frame is the
+    part the user can see, and is what was actually asked for.
+    The panel is `dump_view`'s shape because the two are one journey in opposite directions — pick a
+    file, see what it holds, run it with progress and a stop, read the outcome — and it shares that
+    modal's rules: it **stays open while the run goes** (its signals are the run's only channel, so
+    closing would hide work in flight), every exit routes through one `exit_action` so the footer,
+    Escape and the ✕ cannot disagree, and the dismissive slot wears **Stop** in `Danger` while
+    running. The second step is `core::script::probe`'s readout — the kind histogram, what the file
+    destroys, and whether it opens its own transaction — with every count printed through
+    `count_label`, so a bounded probe says `400+` rather than a total it did not earn.
+    **Run is `ActionKind::Danger`, not `Primary`.** Every other modal's confirming button is the safe
+    one; this runs a file the user has read a *summary* of, against a database, with no undo.
+    The guard is `sql::script_verdict`, asked in the same synchronous step that launches
+    (`widgets::accept_launch`) — see the write-guard invariant for why it is stricter than
+    `run_verdict` rather than a second, laxer gate.
   - `dump_view.rs` — the **schema + data dump** modal, **Export** to the user, over `core::dump`.
     Three entry points and one modal: a database's schema context menu and a PostgreSQL namespace's,
-    both next to *Generate DDL* (the two answer the same question at different depths — one hands you
-    the structure as text to read, the other writes the structure *and* the rows to a file you can
-    replay), and a **table's, directly below *Import***, where the two are the file pair. The table
+    where it is the middle of **`Import → Export → Create ▸`** — the three entries about the node as
+    a whole, behind their own separator — and a **table's, directly below *Import***. All three pair
+    it with the import it is the round trip of. It is the one label that sits inside a writing group
+    without writing anything, which is why `menu_order_gate` exempts it from the skeleton by name:
+    it writes a *file* and never the server, so it can never be the irreversible entry the ordering
+    exists to place. The table
     entry passes `open_dump`'s `preselect`, which ticks that one table instead of all of them, and
     deliberately passes **no namespace**: the picker still lists the whole database, because
     narrowing to the table's own namespace would hide the neighbours its foreign keys point at. It is
@@ -5656,6 +5688,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     can be completed must not depend on how its file was found. Four `is_file` checks and one small
     read, cheap enough to run inside a file-picker callback where the two directory walks would
     not be.
+  - `script.rs` — the I/O half of `core::script`, and `dump.rs`'s mirror image: that module reads a
+    database and writes a file, this reads a file and writes a database. Two halves at once — a
+    **blocking reader** walks the file in `BLOCK`-sized reads, feeds `script::Splitter` and pushes
+    completed statements into a bounded channel, while `Db::run_script` pulls from the other end.
+    Each reports how it ended and `script::run_outcome` decides which ending the user hears, which is
+    **not** the same precedence `dump_verdict` uses (see `core::script`).
+    `tx` is moved into the reader and dropped when it returns, so *every* exit — end of file, cancel,
+    disk error — closes the channel and lets the executor finish; and `ReadEnd::Stopped` is returned
+    with no message on purpose when the send fails, because that means the executor went away and it
+    is the one holding the reason.
+    **The bounded channel is the progress design.** The reader cannot get more than `SCRIPT_QUEUE`
+    statements ahead of the server, so `Splitter::consumed` tracks what has actually been applied
+    closely enough to report from — which is why there is no progress channel out of the executor,
+    and why a 2 GB file read at disk speed cannot pile up ahead of a server applying it one statement
+    at a time. Progress is reported in **bytes**: a file's statement total cannot be known without
+    reading it, and its byte length is known at `open`.
   - `dump.rs` — the I/O half of `core::dump`: introspect, plan, write. Its shape is `export_file`'s
     `AllRows` branch with one difference that drives the whole module — an export is one statement
     into one file and a dump is **many**, so the writer has to outlive each table. A single blocking

@@ -1105,25 +1105,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
-                    // Next to *Generate DDL*, and deliberately: the two answer
-                    // the same question at different depths — one hands you the
-                    // structure as text to read, the other writes the structure
-                    // *and* the rows to a file you can replay.
-                    {
-                        let dui = import_ui.clone();
-                        let db = menu.name.clone();
-                        entries.push(MenuEntry::action("Export", move || {
-                            let ctx = crate::table_designer::edit_ctx(&dui);
-                            crate::dump_view::open_dump(
-                                dui.clone(),
-                                ctx.conn_id,
-                                db.clone(),
-                                None,
-                                None,
-                                ctx.dialect,
-                            );
-                        }));
-                    }
                     // ER diagram of the whole database (every related table).
                     let edb = menu.name.clone();
                     entries.push(MenuEntry::action("ER Diagram", move || {
@@ -1201,9 +1182,50 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     let n = menu.name.clone();
                     entries.push(MenuEntry::action("Hide", move || (th)(n.clone())));
                     // ── Write ─────────────────────────────────────────────────
-                    // Schema editing gets its own group — it's the one entry here
-                    // that writes.
+                    // ── The whole-database group: Import, Export, Create ──────
+                    //
+                    // The three entries that are *about the database as a
+                    // whole*, together and behind their own separator, rather
+                    // than Export filed with the read entries and Import with
+                    // the writing ones. Import and Export are one round trip and
+                    // read as a pair; Create is the third thing you come to a
+                    // database node to do.
+                    //
+                    // **Import leads, and the order is not alphabetical.** It is
+                    // the entry that changes the database, so it takes the slot
+                    // furthest from the pointer's resting place after a
+                    // right-click — the same reasoning that keeps Drop last in
+                    // every other menu here.
                     entries.push(MenuEntry::Separator);
+                    {
+                        let iui = import_ui.clone();
+                        let db = menu.name.clone();
+                        entries.push(MenuEntry::action("Import", move || {
+                            let ctx = crate::table_designer::edit_ctx(&iui);
+                            crate::script_view::open_script(
+                                iui.clone(),
+                                ctx.conn_id,
+                                db.clone(),
+                                None,
+                                ctx.dialect,
+                            );
+                        }));
+                    }
+                    {
+                        let dui = import_ui.clone();
+                        let db = menu.name.clone();
+                        entries.push(MenuEntry::action("Export", move || {
+                            let ctx = crate::table_designer::edit_ctx(&dui);
+                            crate::dump_view::open_dump(
+                                dui.clone(),
+                                ctx.conn_id,
+                                db.clone(),
+                                None,
+                                None,
+                                ctx.dialect,
+                            );
+                        }));
+                    }
                     // On PostgreSQL a database node stands for its `public`
                     // namespace (other namespaces get their own node), so a new
                     // table lands where the tree says it will.
@@ -1350,8 +1372,41 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
-                    // The namespace's own export — the picker is filtered to it,
-                    // so a `sales` export carries no `public` table.
+                    // A namespace is introspected as part of its database, so
+                    // refreshing targets the database.
+                    let rf = refresh_db.clone();
+                    let refresh_database = database.clone();
+                    entries.push(MenuEntry::action("Refresh", move || {
+                        (rf)(refresh_database.clone())
+                    }));
+                    // ── Import, Export, Create ────────────────────────────────
+                    //
+                    // The database node's group, repeated here so a namespace is
+                    // not a second-class node with its own idiom. This was also
+                    // the one menu where `Create` sat between two read entries
+                    // with no boundary at all.
+                    entries.push(MenuEntry::Separator);
+                    // The namespace is carried for the modal's **title only**: a
+                    // script's statements name their own objects, so this cannot
+                    // promise to confine the run to `sales` the way the Export
+                    // below it confines the file.
+                    {
+                        let iui = import_ui.clone();
+                        let db = database.clone();
+                        let ns = menu.name.clone();
+                        entries.push(MenuEntry::action("Import", move || {
+                            let ctx = crate::table_designer::edit_ctx(&iui);
+                            crate::script_view::open_script(
+                                iui.clone(),
+                                ctx.conn_id,
+                                db.clone(),
+                                Some(ns.clone()),
+                                ctx.dialect,
+                            );
+                        }));
+                    }
+                    // This one *is* confined: the picker is filtered to the
+                    // namespace, so a `sales` export carries no `public` table.
                     {
                         let dui = import_ui.clone();
                         let db = database.clone();
@@ -1368,17 +1423,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             );
                         }));
                     }
-                    // A namespace is introspected as part of its database, so
-                    // refreshing targets the database.
-                    let rf = refresh_db.clone();
-                    let refresh_database = database.clone();
-                    entries.push(MenuEntry::action("Refresh", move || {
-                        (rf)(refresh_database.clone())
-                    }));
-                    // The writing group, set off the way every other menu here
-                    // sets its own off. This was the one menu where `Create` sat
-                    // between two read entries with no boundary at all.
-                    entries.push(MenuEntry::Separator);
                     entries.extend(create_submenu(
                         &import_ui,
                         &database,
@@ -5921,15 +5965,16 @@ mod menu_order_gate {
                 arms.push(b.arm.clone());
                 highest = (0, String::new());
             }
-            // **`Export` is deliberately outside the skeleton**, the one label
-            // with two honest homes. On a database or a namespace it sits with
-            // `Generate DDL`, among the read entries that hand you what the node
-            // holds; on a table it sits directly below `Import`, because there
-            // the two are the file pair and separating them would be the
-            // surprise. Neither placement can be wrong in the way this gate
-            // exists to catch: it writes a file and never the server, so it is
-            // never the irreversible entry — and the position that actually
-            // matters is still pinned, by
+            // **`Export` is deliberately outside the skeleton**, and it is the
+            // one label that legitimately sits *inside* the writing group
+            // without writing anything. On a database or a namespace it is the
+            // middle of `Import → Export → Create ▸`, the three entries about
+            // the node as a whole; on a table it sits directly below `Import`.
+            // Both placements pair it with the import it is the round trip of,
+            // which is the thing a reader is looking for, and neither can be
+            // wrong in the way this gate exists to catch: it writes a *file* and
+            // never the server, so it is never the irreversible entry. The
+            // position that actually matters is still pinned, by
             // `drop_is_the_last_entry_before_ai_explain`.
             if b.label == "Export" {
                 continue;
