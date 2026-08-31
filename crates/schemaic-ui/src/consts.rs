@@ -62,6 +62,20 @@ pub(crate) fn row_h() -> f64 {
 pub(crate) fn tree_row_h() -> f64 {
     scaled(24.0)
 }
+/// How many characters of a connection's name are shown before it is elided
+/// ([`schemaic_core::connection::elide_name`]).
+///
+/// A **character** count, so it is a `const` rather than one of this module's
+/// scaled `fn`s: it does not measure the interface, it measures the text.
+///
+/// Shared by the two surfaces that print a connection name — the header's
+/// switcher button and the connection menu's rows — because they show the same
+/// name and would look broken disagreeing about where it stops. The menu's copy
+/// is also one of three numbers held together by its panel width; see the note
+/// in `overlays::conn_menu_overlay`. The button has no such pairing and only
+/// needs a stop, so it follows the menu rather than setting its own.
+pub(crate) const CONN_NAME_CHARS: usize = 15;
+
 /// Size of the schema tree's chevrons and database/table glyphs — the **base**,
 /// which [`crate::icons::icon`] scales at the call site. [`schema_icon`] is the
 /// same number already scaled, for the indent arithmetic below; handing *that*

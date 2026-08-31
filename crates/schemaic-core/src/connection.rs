@@ -931,6 +931,67 @@ impl Connection {
     }
 }
 
+/// Shorten a connection's *name* to `max_chars` for a narrow row.
+///
+/// Plain right-hand elision, unlike [`elide_endpoint`]: a name has no part that
+/// must survive, and its beginning is what distinguishes two of them.
+///
+/// One function because it is applied on two surfaces — the header's switcher
+/// button and the connection menu's rows — and they show the same name. Written
+/// out twice they would eventually disagree about where it stops, which reads as
+/// a bug in whichever one you are looking at.
+pub fn elide_name(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    format!("{}…", first_chars(name, max_chars))
+}
+
+/// Shorten an endpoint to `max_chars` for a narrow row, **keeping the port**.
+///
+/// Eliding from the right is the ordinary way and the wrong one here: it eats
+/// the port, which is the half that cannot be reconstructed from the other. A
+/// hosted provider's host is long and largely boilerplate — two services on the
+/// same provider differ in the leading id and the port, and share everything
+/// between — so the host is cut from the *right* and the port kept whole.
+///
+/// The split is the last colon, and only when what follows it is a port. A
+/// SQLite endpoint is a file name ([`Connection::endpoint`]), and
+/// `notes:2024.sqlite` must not be read as a host reached on port
+/// `2024.sqlite`.
+pub fn elide_endpoint(endpoint: &str, max_chars: usize) -> String {
+    if endpoint.chars().count() <= max_chars {
+        return endpoint.to_string();
+    }
+
+    // `rfind`, not `find`: an IPv6 host is full of colons and only the last one
+    // can separate the port.
+    let port = endpoint
+        .rfind(':')
+        .map(|i| (&endpoint[..i], &endpoint[i..]))
+        .filter(|(_, port)| port.len() > 1 && port[1..].bytes().all(|b| b.is_ascii_digit()));
+
+    let Some((host, port)) = port else {
+        // No port to protect: elide the whole thing from the right.
+        let keep = max_chars.saturating_sub(1);
+        return format!("{}…", first_chars(endpoint, keep));
+    };
+
+    // One character of host and the ellipsis are the floor; the port is never
+    // sacrificed to the caller's width, since a row missing it is worse than a
+    // row one character too wide.
+    let room = max_chars
+        .saturating_sub(port.chars().count())
+        .saturating_sub(1)
+        .max(1);
+    format!("{}…{port}", first_chars(host, room))
+}
+
+/// The first `n` characters of `s`, counted in characters rather than bytes.
+fn first_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 /// The last path component of `path`, splitting on both separators.
 ///
 /// Both, deliberately: `connections.json` is portable and the app runs on
@@ -1672,6 +1733,74 @@ mod tests {
         assert_eq!(t.auth, SshAuth::Password);
         assert_eq!(t.key_path, "");
         assert_eq!(t.key_passphrase, "");
+    }
+
+    #[test]
+    fn a_long_name_is_elided_and_a_short_one_is_not() {
+        assert_eq!(elide_name("Aiven PgSQL", 15), "Aiven PgSQL");
+        // At the limit exactly: eliding here spends a character to save none.
+        assert_eq!(elide_name("Aiven PgSQL2131", 15), "Aiven PgSQL2131");
+        assert_eq!(elide_name("Aiven PgSQL21312314", 15), "Aiven PgSQL2131…");
+    }
+
+    /// Counted in characters, not bytes — a name is user text, and cutting an
+    /// accented or non-Latin one mid-character would panic on the slice.
+    #[test]
+    fn a_name_is_elided_by_character_not_byte() {
+        assert_eq!(elide_name("ökonomi-datenbank", 6), "ökonom…");
+        assert_eq!(elide_name("データベース接続", 4), "データベ…");
+    }
+
+    /// **The port is the half that must survive.** A hosted endpoint is long
+    /// enough to overflow the connection menu, and eliding it from the right —
+    /// the ordinary way — drops the port, which is the part you cannot guess:
+    /// two Aiven services differ only there.
+    #[test]
+    fn a_long_endpoint_is_elided_but_keeps_its_port() {
+        let long = "pg-397b033c-jonidashi-b5ac.b.aivencloud.com:10863";
+        let out = elide_endpoint(long, 20);
+        assert!(out.ends_with(":10863"), "{out}");
+        assert!(out.starts_with("pg-"), "{out}");
+        assert_eq!(out.chars().count(), 20, "{out}");
+        assert!(out.contains('…'), "{out}");
+    }
+
+    #[test]
+    fn an_endpoint_that_fits_is_left_alone() {
+        assert_eq!(elide_endpoint("127.0.0.1:3306", 20), "127.0.0.1:3306");
+        // Exactly at the limit is still fitting; eliding here would spend a
+        // character to save none.
+        assert_eq!(elide_endpoint("127.0.0.1:3306", 14), "127.0.0.1:3306");
+    }
+
+    /// The last colon is the port only if what follows it is one. A SQLite
+    /// endpoint is a file name, and `notes:2024.sqlite` must not be read as a
+    /// host on port `2024.sqlite`.
+    #[test]
+    fn a_name_that_is_not_host_port_is_elided_as_a_whole() {
+        assert_eq!(
+            elide_endpoint("averyverylongfilename.sqlite", 12),
+            "averyverylo…"
+        );
+        assert_eq!(elide_endpoint("notes:2024.sqlite", 10), "notes:202…");
+    }
+
+    /// IPv6 hosts are full of colons; only the last one can be the port.
+    #[test]
+    fn an_ipv6_endpoint_splits_on_the_last_colon() {
+        let out = elide_endpoint("[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:5432", 18);
+        assert!(out.ends_with(":5432"), "{out}");
+        assert_eq!(out.chars().count(), 18, "{out}");
+    }
+
+    /// A limit too small for both halves keeps the port and one character of
+    /// host, rather than returning something with no port in it — the caller's
+    /// width is a suggestion, the port is not.
+    #[test]
+    fn the_port_wins_when_there_is_no_room_for_both() {
+        let out = elide_endpoint("averylonghost.example.com:5432", 4);
+        assert!(out.ends_with(":5432"), "{out}");
+        assert!(out.starts_with('a'), "{out}");
     }
 
     #[test]
