@@ -4503,9 +4503,14 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
-/// "View" modal for the editor error bar: same backdrop + panel chrome as
-/// `find_overlay`, but no input — the active tab's full error, centered and
-/// scrollable. Click-away or Escape closes.
+/// "View" modal for an error too long for the surface that raised it: same
+/// backdrop + panel chrome as `find_overlay`, but no input — the full text,
+/// centered and scrollable. Click-away or Escape closes.
+///
+/// Three surfaces reach it now: the editor error bar (which supplies no text and
+/// falls back to the active tab's error), the grid's commit error, and the
+/// schema tree's failed database — each with a row too narrow to print a server
+/// error in.
 pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
     let open = ui.overlay.error_modal_open;
     let text_override = ui.overlay.error_modal_text;
