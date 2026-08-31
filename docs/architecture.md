@@ -6620,6 +6620,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   class wins. Nest class overrides accordingly (dropdown popup restyle nests under `ListClass`).
 - **`DoubleClick` consumes the second `PointerUp`** — clear drag/press state in the double-click
   handler too, not only in `PointerUp`.
+- **`.tooltip()` wraps the view; it does not decorate it.** `tooltip(child, tip)` builds a *new*
+  view and makes the old one its child, so everything chained after it lands on the wrapper and
+  everything before it stays on the inner view. Split a control across that line and it comes apart:
+  the style — background, border, padding, height — paints the wrapper while the listeners sit on a
+  content-sized box inside it. **The results strip shipped exactly that**: chip styled after
+  `.tooltip()`, click handlers before, so the chip you saw was the wrapper and the chip that
+  answered a click was the text, and clicking the padding did nothing. `activity_panel`'s clock
+  button was bitten from the other side — `on_move`/`on_resize` on the inner container reported a
+  bare 16px glyph box, and its menu hung 3px under that instead of under the padded control.
+  So: **style and listeners on the same view, and put the tooltip on the innermost thing that
+  should carry it** (the query strip and the results strip both tooltip their *label*), or chain
+  `.style()` before `.tooltip()` when the wrapper is genuinely what you want to place.
 - **A view must not subscribe to a signal that changes as part of unmounting it** — the change and
   the teardown land in the same update pass, and whichever order they run in, a nested
   `dyn_container` inside the doomed view rebuilds a child whose style/effect closures then read
@@ -8085,8 +8097,13 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
   `result_title_avail()` — the chip's width less the 10px inset, the label's margin and the trailing
   glyph. **The cap is on the label, not on the chip**: `max_width` on the row only clips, so the
   text laid itself out at its natural width and ran under the × and out over the next chip, which is
-  the arithmetic `tabs::tab_title_avail` pays for the query strip and for the same reason. The
-  tooltip carries the full text, the run's
+  the arithmetic `tabs::tab_title_avail` pays for the query strip and for the same reason.
+  **The chip's hitbox is the view that carries both the style and the listeners**, which is why the
+  tooltip goes on the *label* and the inset is `padding_left` on the chip rather than a margin on
+  the label: chained after `.tooltip()`, the chip's style painted a wrapper while the handlers sat
+  on a text-sized box inside it, and every click outside the words was swallowed (see
+  **`.tooltip()` wraps the view** under *Floem 0.2 gotchas*). The query strip is built the same way,
+  which is why its tabs never had it. The tooltip carries the full text, the run's
   age (`history::relative_time`) and — for a loaded one — `ResultSet::retained_bytes`.
   The last is what makes "keep this result" an informed choice: a pin holds its columns' arenas and
   one 4-byte offset word per cell, which at the 200,000-row default cap is 40 MB across 50 columns

@@ -6048,8 +6048,8 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
 }
 
 /// How much width a result chip's label may take: the chip's cap, less
-/// everything drawn beside the text — the 10px left inset, the label's own 6px
-/// right margin, and the 14px trailing glyph with its 7px margin.
+/// everything drawn beside the text — the chip's 10px left padding, the label's
+/// own 6px right margin, and the 14px trailing glyph with its 7px margin.
 ///
 /// Spelled out rather than left to flex shrink, because that is not what a
 /// `max_width` on the row does: the text lays out at its natural width and
@@ -6145,13 +6145,23 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
     // out at its natural width, runs under the × and out over the next chip.
     // Capping the *text* is what makes `text_ellipsis` fire — the query strip's
     // rule (`tab_title_avail`), and this is its arithmetic.
-    let label = text(panel.label.clone()).style(|s| {
-        s.margin_left(theme::scaled(10.0))
-            .margin_right(theme::scaled(6.0))
-            .max_width(result_title_avail())
-            .font_size(theme::font_body())
-            .text_ellipsis()
-    });
+    let label = text(panel.label.clone())
+        .style(|s| {
+            s.margin_right(theme::scaled(6.0))
+                .max_width(result_title_avail())
+                .font_size(theme::font_body())
+                .text_ellipsis()
+        })
+        // **The tooltip goes on the label, not on the chip** — and this is the
+        // whole of a bug that survived two attempts at it. `tooltip()` does not
+        // decorate a view, it *wraps* it: `h_stack(…).on_click_stop(…).tooltip(…)
+        // .style(…)` puts the background, the border, the height and the padding
+        // on the wrapper and leaves the click listeners on the stack inside it.
+        // The chip you see is the wrapper; the chip that listens is a
+        // content-sized box within it, so clicking anywhere but the text hit the
+        // wrapper and nothing happened. The query strip tooltips its label too,
+        // which is why editor tabs never had it.
+        .tooltip(move || text(tip()).style(crate::widgets::tooltip_style));
 
     // Colour is set on the tab container and cascades to the label.
     h_stack((label, pin_glyph, close_glyph))
@@ -6170,11 +6180,18 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
             EventPropagation::Continue
         })
         .on_secondary_click_stop(move |_| result_chip_menu(id, tab, &gctx))
-        .tooltip(move || text(tip()).style(crate::widgets::tooltip_style))
         .style(move |s| {
+            // **The chip is the hitbox, so the chip has to be the whole chip** —
+            // which means the style and the listeners must land on the *same*
+            // view (see the label's tooltip note for what happens when they
+            // don't). `height_full` claims the strip's height and `padding_left`
+            // puts the label's inset inside this box, where a `margin_left` on
+            // the label left it outside.
             let s = s
                 .flex_row()
                 .items_center()
+                .height_full()
+                .padding_left(theme::scaled(10.0))
                 .max_width(tab_max_w())
                 .border_right(1.0)
                 .border_color(theme::tab_separator());
