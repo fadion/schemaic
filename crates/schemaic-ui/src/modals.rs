@@ -87,6 +87,11 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
         // entry's business — but the failure is worth remembering, because it is
         // the same one the DDL preview and the popup menu each hit.
         manage_modal(ui.clone()),
+        // **Directly above Manage Connections**, which is what raises it: the
+        // import modal is a question asked about the list behind it, and closing
+        // it returns to that list. Same rule the confirm at the foot of this
+        // tuple states — whatever can raise a question comes first.
+        crate::connection_import::conn_import_overlay(ui.clone()),
         // Error modal + open-transaction prompt and the schema editors share one
         // tuple element, for the same 16-arity reason as monitor/ERD below (and
         // with the same fill-only-when-open wrapper, or it would eat every click).
@@ -314,6 +319,11 @@ fn settings_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
 pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let find_open = ui.overlay.find_open;
     let manage_open = ui.conn.manage_open;
+    // Its own term, like `manage_open`'s: it is a loose child of the layer with
+    // no group wrapper, and it can outlive the modal that raised it — closing
+    // Manage Connections while the import list is up must not take the backdrop
+    // out from under it.
+    let conn_import_open = ui.conn.import.open;
     let plan_open = ui.overlay.plan_open;
     // Its own entry in the layer, above every group — so its own term here, the
     // same way `find`, `manage` and `plan` each have one. It used to be counted
@@ -325,6 +335,7 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     move || {
         find_open.get()
             || manage_open.get()
+            || conn_import_open.get()
             || plan_open.get()
             || confirm.get().is_some()
             || ddl()
@@ -361,6 +372,9 @@ mod modal_backdrop_gate {
     /// finding nothing.
     const PAINTS_A_BACKDROP: &[&str] = &[
         "connection_form.rs",
+        // A loose child of the layer, directly above `connection_form.rs`'s
+        // modal, which is what raises it.
+        "connection_import.rs",
         "ddl_preview.rs",
         // In the layer's DDL group, raised by `ddl_modals_up`'s
         // `dump_open.get().is_some()` arm.
@@ -499,6 +513,7 @@ mod modal_backdrop_gate {
             "settings()",
             "find_open.get()",
             "manage_open.get()",
+            "conn_import_open.get()",
             "plan_open.get()",
             "confirm.get()",
         ] {

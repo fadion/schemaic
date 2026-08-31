@@ -12,6 +12,7 @@ pub use ai_panel::mark_messages_seen;
 mod cell_editors;
 mod completion;
 mod connection_form;
+mod connection_import;
 mod consts;
 pub mod contrast;
 mod ddl_preview;
@@ -2549,6 +2550,57 @@ pub struct ConnUi {
     pub draft: DraftSignals,
     /// Result of the Manage-Connections "Test" button (draft connectivity).
     pub conn_test: RwSignal<TestState>,
+    /// The Import Connections modal, raised from the same list.
+    pub import: ConnImportUi,
+}
+
+/// The Import Connections modal's signals (Copy bundle).
+///
+/// A second modal rather than a section of Manage Connections: what it shows is
+/// a *review list* of proposals, and every control on it — the paste field,
+/// Choose a file, Scan installed clients, Select all, Import — is about the
+/// whole list rather than about the one connection the form beside it is
+/// editing.
+#[derive(Clone, Copy)]
+pub struct ConnImportUi {
+    /// Whether the modal is open.
+    pub open: RwSignal<bool>,
+    /// True while this machine is being searched for source files. The walk is
+    /// short, but it is filesystem work on a home directory whose size we don't
+    /// control, so the list says what it is doing rather than appearing empty.
+    pub scanning: RwSignal<bool>,
+    /// Whether a scan of the installed clients has **finished** in this opening.
+    ///
+    /// The empty list means three different things and they need three
+    /// different sentences (`connection_import::empty_message`): before a scan
+    /// it is an invitation, during one it is progress, after one it is the
+    /// answer — and without this bool, pressing *Scan installed clients* on a
+    /// machine with none of them installed leaves the screen byte-for-byte
+    /// identical, which reads as a dead button.
+    pub scanned: RwSignal<bool>,
+    /// Every connection on offer, in `conn_import`'s order.
+    pub rows: RwSignal<Vec<schemaic_core::conn_import::Imported>>,
+    /// Which of them are ticked, **by index into `rows`**.
+    ///
+    /// A set, so a row's read is O(1) — the dump modal's table picker learned
+    /// that the hard way, quadratically.
+    ///
+    /// **Indices are safe only because `rows` never reorders.** Every source
+    /// appends through `conn_import::merge_rows`, which pushes at the end and
+    /// answers a repeat with the position already holding it; the sole thing
+    /// that clears `rows` is `open_import`, which resets this set in the same
+    /// breath. A source that replaced the list instead would leave every ticked
+    /// index pointing at a different connection.
+    pub chosen: RwSignal<std::collections::HashSet<usize>>,
+    /// Entries a source held that are not on offer, so the modal can say what it
+    /// left behind instead of quietly shortening the list.
+    pub skipped: RwSignal<Vec<schemaic_core::conn_import::Skipped>>,
+    /// The paste field's contents.
+    pub paste: RwSignal<String>,
+    /// Why the pasted text isn't a connection URL, if it isn't one.
+    pub paste_error: RwSignal<Option<String>>,
+    /// The sentence shown after connections are added.
+    pub done: RwSignal<Option<String>>,
 }
 
 /// Connection-management callbacks (owned by the app).
@@ -2572,6 +2624,23 @@ pub struct ConnActions {
     /// timer, so this is how a recovered server gets noticed without switching
     /// connections — it's what the header's "Not connected" retry calls.
     pub recheck_conn: Rc<dyn Fn()>,
+    /// Open the Import Connections modal, empty.
+    ///
+    /// It deliberately does **not** scan: the modal offers three ways in — a
+    /// pasted URL, a file, and the installed clients — and only the third one
+    /// touches the filesystem, so it is the one the user asks for rather than
+    /// the one that happens because a dialog opened.
+    pub open_import: Rc<dyn Fn()>,
+    /// Search this machine for the files DBeaver, the JetBrains IDEs and the
+    /// command-line clients keep their connections in.
+    pub scan_installed_clients: Rc<dyn Fn()>,
+    /// Parse whatever is in the paste field and add it to the review list.
+    pub add_pasted_url: Rc<dyn Fn()>,
+    /// Pick a source file by hand, for a layout the search doesn't cover (a
+    /// project's own `.idea/dataSources.xml`, an exported file, a `.env`).
+    pub choose_import_file: Rc<dyn Fn()>,
+    /// Save the ticked rows as real connections — the only step that writes.
+    pub import_chosen: Rc<dyn Fn()>,
 }
 
 /// Query-history signals (Copy bundle). The full list across all connections;

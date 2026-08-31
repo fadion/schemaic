@@ -137,6 +137,15 @@ pub const SQUARE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" h
 /// Lucide `check`.
 pub const CHECK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"#;
 
+/// [`CHECK`] at stroke-width 3, for drawing *inside* something small.
+///
+/// Lucide's weight is tuned for a ~16px glyph on a flat background. In an 11px
+/// box the same path renders under one device pixel and the antialiasing eats
+/// most of what is left — a filled checkbox that reads as a plain coloured
+/// square with nothing in it. Nowhere else needs this, which is why [`CHECK`]
+/// keeps the family weight rather than being thickened for everyone.
+pub const CHECK_BOLD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"#;
+
 /// Lucide `circle-check`.
 pub const CIRCLE_CHECK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>"#;
 

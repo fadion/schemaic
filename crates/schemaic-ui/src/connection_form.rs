@@ -521,6 +521,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     let draft = ui.conn.draft;
     let select_conn = ui.conn_actions.select_conn.clone();
     let new_conn = ui.conn_actions.new_conn.clone();
+    let open_import = ui.conn_actions.open_import.clone();
     let save_conn = ui.conn_actions.save_conn.clone();
     let duplicate_conn = ui.conn_actions.duplicate_conn.clone();
     let delete_conn = ui.conn_actions.delete_conn.clone();
@@ -785,7 +786,11 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                     let new_c = new_c.clone();
                     move |_| (new_c)()
                 })
-                .style(|s| menu_item_style(s).justify_center()),
+                // Left-aligned, at `menu_item_style`'s own 12px inset — which is
+                // the padding the connection rows above it use, so the glyph
+                // starts on the same column as their colour dots rather than
+                // floating in the middle of the pane.
+                .style(menu_item_style),
                 ring.clone(),
                 NAV_TAB + 1,
                 true,
@@ -793,7 +798,39 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 move || (new_c)(),
             );
 
-            let left = v_stack((list, add)).style(|s| {
+            // **Below New connection, and quieter than it.** Import is the
+            // first-run action — the one that matters on a list with nothing in
+            // it — but it is also the one nobody presses twice, so it reads as
+            // dim text rather than accent: the row above stays the obvious way
+            // to add a connection on every day after the first.
+            let import_c = open_import.clone();
+            let import = in_ring_button(
+                container(
+                    h_stack((
+                        icons::icon(icons::DOWNLOAD, 15.0),
+                        text("Import from another client")
+                            .style(|s| s.font_size(theme::font_label())),
+                    ))
+                    .style(|s| {
+                        s.flex_row()
+                            .items_center()
+                            .gap(theme::scaled(8.0))
+                            .color(theme::text_dim())
+                    }),
+                )
+                .on_click_stop({
+                    let import_c = import_c.clone();
+                    move |_| (import_c)()
+                })
+                .style(menu_item_style),
+                ring.clone(),
+                NAV_TAB + 2,
+                true,
+                0.0,
+                move || (import_c)(),
+            );
+
+            let left = v_stack((list, add, import)).style(|s| {
                 s.width(theme::scaled(210.0))
                     .flex_shrink(0.0_f32)
                     .height_full()

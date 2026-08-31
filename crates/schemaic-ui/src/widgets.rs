@@ -1524,7 +1524,42 @@ pub(crate) fn action_button(
     tabindex: u32,
     on_click: impl Fn() + 'static,
 ) -> AnyView {
-    action_button_inner(label, None, kind, enabled, ring, tabindex, on_click)
+    action_button_inner(
+        text(label.into()).into_any(),
+        None,
+        kind,
+        enabled,
+        ring,
+        tabindex,
+        on_click,
+    )
+}
+
+/// [`action_button`] whose **label is reactive** while the button itself is not.
+///
+/// For the footer action that counts what it is about to do ("Import 3"). Read
+/// naively that is a `dyn_container` over the count, which rebuilds the button
+/// — and its focus-ring registration — on every tick of a selection the user is
+/// still making. Splitting the two lets the enabled state stay keyed on the
+/// cheap question ("is anything selected at all") while only the words change
+/// underneath.
+pub(crate) fn action_button_dyn(
+    label: impl Fn() -> String + 'static,
+    kind: ActionKind,
+    enabled: bool,
+    ring: FocusRing,
+    tabindex: u32,
+    on_click: impl Fn() + 'static,
+) -> AnyView {
+    action_button_inner(
+        floem::views::label(label).into_any(),
+        None,
+        kind,
+        enabled,
+        ring,
+        tabindex,
+        on_click,
+    )
 }
 
 /// [`action_button`] with a leading icon — the preview footer's Copy and Open in
@@ -1539,7 +1574,15 @@ pub(crate) fn action_button_icon(
     tabindex: u32,
     on_click: impl Fn() + 'static,
 ) -> AnyView {
-    action_button_inner(label, Some(icon), kind, enabled, ring, tabindex, on_click)
+    action_button_inner(
+        text(label.into()).into_any(),
+        Some(icon),
+        kind,
+        enabled,
+        ring,
+        tabindex,
+        on_click,
+    )
 }
 
 type ColorFn = fn() -> floem::peniko::Color;
@@ -1598,8 +1641,11 @@ fn action_style(s: floem::style::Style, kind: ActionKind, enabled: bool) -> floe
 }
 
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
+/// The button, over whatever view its caller built for the label — a fixed
+/// `text` for the two spellings above, a reactive `label` for
+/// [`action_button_dyn`].
 fn action_button_inner(
-    label: impl Into<String>,
+    face: AnyView,
     icon: Option<&'static str>,
     kind: ActionKind,
     enabled: bool,
@@ -1615,7 +1661,7 @@ fn action_button_inner(
     };
     let on_click = Rc::new(on_click);
     let pressed = on_click.clone();
-    let button = h_stack((glyph, text(label.into())))
+    let button = h_stack((glyph, face))
         .on_click_stop(move |_| {
             if enabled {
                 on_click()
