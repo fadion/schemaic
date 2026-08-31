@@ -13,6 +13,7 @@
 
 mod ai;
 mod claude_cli;
+mod conn_sources;
 mod dump;
 mod heap;
 mod logging;
@@ -50,6 +51,7 @@ use floem::reactive::{
     RwSignal, Scope, SignalGet, SignalTrack, SignalUpdate, SignalWith, create_effect, create_memo,
 };
 use floem::window::{Icon, WindowConfig};
+use schemaic_core::conn_import;
 use schemaic_core::connection::{ConnStatus, Connection};
 use schemaic_core::edit::analyze_edit;
 use schemaic_core::health;
@@ -149,11 +151,11 @@ use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiScale, UiThemeKind};
 use schemaic_ui::{
     ActivityActions, ActivityState, ActivityUi, AiActions, AiEffort, AiModel, AiUi, ChatMessage,
-    Confirm, ConnActions, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals, HistoryActions,
-    HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry, OverlayUi, PendingRun,
-    PlanState, ResultPanel, RightPanel, Role, RunGuard, SchemaActions, SchemaScope, SchemaUi,
-    SnippetActions, SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi,
-    TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
+    Confirm, ConnActions, ConnImportUi, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals,
+    HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry, OverlayUi,
+    PendingRun, PlanState, ResultPanel, RightPanel, Role, RunGuard, SchemaActions, SchemaScope,
+    SchemaUi, SnippetActions, SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor,
+    TermUi, TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -650,8 +652,24 @@ fn message_shell(msg: &str) -> schemaic_term::ShellConfig {
     }
 }
 
-/// Build the system-prompt context for the assistant: the active connection,
-/// a db→tables outline, and the current query buffer.
+/// Fold one source's result into the import review list — the rows and the
+/// entries it could not offer.
+///
+/// **The one way anything gets onto that list**: the paste field, the file
+/// picker and the client scan all come through here, so the three cannot
+/// disagree about ticking, about duplicate rows, or about a skipped entry
+/// reported twice. Both rules themselves live in `conn_import`
+/// (`merge_rows`/`merge_skipped`), where they are unit-tested; this is the
+/// signal plumbing around them.
+fn add_import_result(ui: ConnImportUi, scan: conn_import::ImportScan) {
+    let mut tick = Vec::new();
+    ui.rows
+        .update(|rows| tick = conn_import::merge_rows(rows, scan.found));
+    ui.chosen.update(|c| c.extend(tick));
+    ui.skipped
+        .update(|s| conn_import::merge_skipped(s, scan.skipped));
+}
+
 /// First name of the form `base`, `base 1`, `base 2`, … not already present.
 fn unique_name(base: &str, existing: &[String]) -> String {
     if !existing.iter().any(|e| e == base) {
@@ -1382,6 +1400,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let conn_menu_open = RwSignal::new(false);
     let manage_open = RwSignal::new(false);
     let conn_test = RwSignal::new(TestState::Idle);
+    // The Import Connections modal, raised from the same list.
+    let import_ui = ConnImportUi {
+        open: RwSignal::new(false),
+        scanning: RwSignal::new(false),
+        scanned: RwSignal::new(false),
+        rows: RwSignal::new(Vec::new()),
+        chosen: RwSignal::new(std::collections::HashSet::new()),
+        skipped: RwSignal::new(Vec::new()),
+        paste: RwSignal::new(String::new()),
+        paste_error: RwSignal::new(None),
+        done: RwSignal::new(None),
+    };
     let find_open = RwSignal::new(false);
     let find_query = RwSignal::new(String::new());
     let error_modal_open = RwSignal::new(false);
@@ -6916,6 +6946,222 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // ---- Import connections from other clients ----------------------------
+    //
+    // The parsing is `schemaic_core::conn_import` and the file-finding is
+    // `conn_sources`; what lives here is the two things only the app can do —
+    // running the search off the UI thread, and turning an accepted proposal
+    // into a saved connection with an id, a unique name and a keyring entry.
+
+    // Search this machine, off the UI thread, and load the result into the
+    // modal. `spawn_blocking` rather than `spawn`: this is filesystem work on a
+    // home directory whose size we don't control, and the async runtime's worker
+    // threads are the ones every query is waiting on.
+    let scan_installed_clients: Rc<dyn Fn()> = {
+        let handle = handle.clone();
+        Rc::new(move || {
+            if import_ui.scanning.get_untracked() {
+                return;
+            }
+            import_ui.scanning.set(true);
+            import_ui.done.set(None);
+            let existing = connections.get_untracked();
+            let send = create_ext_action(cx, move |scan: conn_import::ImportScan| {
+                import_ui.scanning.set(false);
+                import_ui.scanned.set(true);
+                // Appended, like the other two sources: a scan is one of three
+                // ways into this list, not the list itself, so it must not
+                // discard a URL the user pasted before pressing it. Everything
+                // not already saved arrives ticked — the common case is "take
+                // the lot".
+                add_import_result(import_ui, scan);
+            });
+            handle.spawn_blocking(move || {
+                let files = conn_sources::discover();
+                send(conn_import::scan(&files, &existing));
+            });
+        })
+    };
+
+    // Open **empty**. The modal offers three ways in and only one of them reads
+    // the filesystem, so that one is asked for rather than performed because a
+    // dialog opened.
+    let open_import: Rc<dyn Fn()> = Rc::new(move || {
+        import_ui.paste.set(String::new());
+        import_ui.paste_error.set(None);
+        import_ui.rows.set(Vec::new());
+        import_ui.chosen.set(std::collections::HashSet::new());
+        import_ui.skipped.set(Vec::new());
+        import_ui.scanned.set(false);
+        import_ui.done.set(None);
+        import_ui.open.set(true);
+    });
+
+    // Add whatever is in the paste field to the review list — one URL per line.
+    //
+    // Appended to the scan's results rather than replacing them, through the
+    // same `add_import_result` as the other two sources, so the ticking rule is
+    // theirs too: a pasted URL naming a connection the user already has arrives
+    // unticked like any other.
+    let add_pasted_url: Rc<dyn Fn()> = Rc::new(move || {
+        let text = import_ui.paste.get_untracked();
+        if text.trim().is_empty() {
+            import_ui
+                .paste_error
+                .set(Some(conn_import::UrlError::Empty.message()));
+            return;
+        }
+        let existing = connections.get_untracked();
+        let file = conn_import::SourceFile {
+            source: conn_import::ImportSource::Url,
+            path: String::new(),
+            text,
+        };
+        let scan = conn_import::scan(&[file], &existing);
+        // A paste that produced nothing at all is answered under the field,
+        // where the text that failed still is — and the field keeps it, so it
+        // can be corrected rather than retyped.
+        if scan.found.is_empty() {
+            import_ui.paste_error.set(Some(
+                scan.skipped
+                    .first()
+                    .map(|s| s.reason.message())
+                    .unwrap_or_else(|| conn_import::UrlError::Empty.message()),
+            ));
+            return;
+        }
+        // A *partly* good paste clears the field, so the lines that failed have
+        // to be reported somewhere else: they go to the skipped list with every
+        // other entry a source held and this app could not offer. Dropping them
+        // silently is how three good lines out of five reads as five.
+        import_ui.paste_error.set(None);
+        import_ui.paste.set(String::new());
+        import_ui.done.set(None);
+        add_import_result(import_ui, scan);
+    });
+
+    // Read a source file the user pointed at, for a layout `conn_sources`
+    // doesn't search — a project's own `.idea/dataSources.xml`, an export, a
+    // `.env`. Which parser to use is decided from the file's name.
+    let choose_import_file: Rc<dyn Fn()> = Rc::new(move || {
+        use floem::file::FileDialogOptions;
+        use floem::file_action::open_file;
+        open_file(
+            FileDialogOptions::new().title("Choose a connections file"),
+            move |picked| {
+                let Some(path) = picked.and_then(|i| i.path.first().cloned()) else {
+                    return;
+                };
+                let source = conn_sources::source_for_path(&path);
+                let Some(file) = conn_sources::read_source(&path, source) else {
+                    // The one read the user asked for by name, so its failure is
+                    // theirs to see — unlike the search, which opens files nobody
+                    // named.
+                    import_ui
+                        .paste_error
+                        .set(Some(format!("{} could not be read.", path.display())));
+                    return;
+                };
+                let existing = connections.get_untracked();
+                let mut scan = conn_import::scan(&[file], &existing);
+                // **Then complete it from the password files.** Read on its own,
+                // a hand-picked DataGrip export arrives with every password
+                // blank while `~/.pgpass` on the same machine holds them — and
+                // whether a row can be completed must not depend on how its file
+                // was found. Applied *after* `scan` rather than by handing it
+                // both files: `scan` would offer `.pgpass`'s own servers as rows
+                // too, and the user asked to import one file.
+                for pw in conn_sources::password_sources() {
+                    conn_import::fill_missing_passwords(
+                        &mut scan.found,
+                        &conn_import::pgpass_entries(&pw.text),
+                    );
+                }
+                import_ui.paste_error.set(None);
+                import_ui.done.set(None);
+                add_import_result(import_ui, scan);
+            },
+        )
+    });
+
+    // **The only step that writes.** Everything above builds proposals.
+    //
+    // Each accepted row takes a fresh id (`Connection::next_id` over the list as
+    // it grows, so two rows in one press can't share one — the ids are the
+    // keyring account strings), a name that doesn't collide with a saved one,
+    // and an identity colour, exactly as New connection and Duplicate do.
+    let import_chosen: Rc<dyn Fn()> = {
+        let load_schema = load_schema.clone();
+        let reset_activity = reset_activity.clone();
+        Rc::new(move || {
+            let picked: Vec<Connection> = import_ui.rows.with_untracked(|rows| {
+                import_ui.chosen.with_untracked(|chosen| {
+                    let mut idx: Vec<usize> = chosen.iter().copied().collect();
+                    // The set has no order; import in the order the list showed.
+                    idx.sort_unstable();
+                    idx.iter()
+                        .filter_map(|i| rows.get(*i))
+                        .map(|r| r.connection.clone())
+                        .collect()
+                })
+            });
+            if picked.is_empty() {
+                return;
+            }
+            let added = picked.len();
+            // **Was the active id pointing at nothing?** On a fresh install
+            // `Connection::startup_active_id` answers `next_id(&[])` — the id the
+            // first connection saved this session is about to take — so the active
+            // connection is about to come into existence below and nothing has
+            // loaded it. `save_conn` handles the same case for a hand-created
+            // connection; this is the second creator, and without the check the
+            // headline path of this whole feature (a new user importing their
+            // servers) ends with an empty schema tree and "Not connected".
+            let active = active_conn.get_untracked();
+            let was_dangling = connections.with_untracked(|cs| !cs.iter().any(|c| c.id == active));
+            connections.update(|cs| {
+                for conn in picked {
+                    let names: Vec<String> = cs.iter().map(|c| c.name.clone()).collect();
+                    let used_colors: Vec<String> =
+                        cs.iter().filter_map(|c| c.color.clone()).collect();
+                    let mut conn = conn;
+                    conn.id = Connection::next_id(cs);
+                    conn.name = unique_name(&conn.name, &names);
+                    conn.color = Some(pick_connection_color(&used_colors));
+                    // The same sanitising a saved form goes through: a SQLite row
+                    // carries no server, whatever the source file had in it.
+                    cs.push(conn.sanitized());
+                }
+            });
+            persist_conns(Some(active));
+            // The active id now names one of the connections just added, and nothing
+            // has connected to it — see `was_dangling` above.
+            if was_dangling
+                && let Some(conn) =
+                    connections.with_untracked(|cs| cs.iter().find(|c| c.id == active).cloned())
+            {
+                load_schema(conn);
+                (reset_activity)();
+            }
+            // The list behind this modal has just grown, so the imported rows must
+            // stop offering themselves: re-marking is cheaper and more honest than
+            // removing them, since the row stays visible with "Already saved" on it.
+            let existing = connections.get_untracked();
+            import_ui.rows.update(|rows| {
+                for r in rows.iter_mut() {
+                    r.notes
+                        .retain(|n| *n != conn_import::ImportNote::AlreadySaved);
+                }
+                conn_import::mark_existing(rows, &existing);
+            });
+            import_ui.chosen.set(std::collections::HashSet::new());
+            import_ui.done.set(Some(match added {
+                1 => "Added 1 connection.".to_string(),
+                n => format!("Added {n} connections."),
+            }));
+        })
+    };
+
     // Save the form (create or update); reload schema if the active conn changed.
     let save_conn: Rc<dyn Fn()> = {
         let load_schema = load_schema.clone();
@@ -8697,6 +8943,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             manage_open,
             draft,
             conn_test,
+            import: import_ui,
         },
         conn_actions: Rc::new(ConnActions {
             switch_conn,
@@ -8708,6 +8955,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             delete_conn,
             test_conn,
             recheck_conn: check_conn.clone(),
+            open_import,
+            scan_installed_clients,
+            add_pasted_url,
+            choose_import_file,
+            import_chosen,
         }),
         ai: AiUi {
             messages: ai_messages,

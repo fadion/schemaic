@@ -1715,6 +1715,57 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     quote, a comma or a `)`.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
+  - `conn_import.rs` — reading connections **out of other tools**: a pasted URL/DSN, DBeaver's
+    `data-sources.json`, DataGrip's (or any JetBrains IDE's) `dataSources.xml`, and the three
+    plain-text files the command-line clients read — `~/.my.cnf`, `~/.pgpass`,
+    `~/.pg_service.conf`. Pure over *text*: `conn_sources` in the app finds and reads the files,
+    this decides what they mean, which is what makes the whole surface unit-testable. Every parser
+    answers with `Imported` values carrying **`id: 0`** and a *suggested* name — an import is a
+    proposal, and the app assigns the real id and uniquifies the name only when the user accepts a
+    row. Nothing here touches the keyring.
+    `scan` is the one entry point, and its **order is the design**: `.pgpass` passwords are applied
+    (`fill_missing_passwords`) after every source has parsed, so a `*:*:*:me:secret` line can
+    complete the twelve server-only rows DataGrip just handed over; `dedupe` collapses repeats
+    *after* that, keeping the **first** description of a server, so the survivor is the one that
+    already has both the name a human chose and the password; and `mark_existing` runs last, so a
+    row that repeats a saved connection is shown with `ImportNote::AlreadySaved` and left unticked
+    rather than hidden — a stale saved copy is exactly the case where the import is the one worth
+    keeping. `same_endpoint` is that identity, and deliberately *not* the app's `conn_id`, which a
+    row that has never been saved cannot have: engine + host + port + database + user, or the file
+    path on SQLite (separators normalised, since a JDBC URL writes `/` on a platform whose paths
+    use `\`). The **user is part of it** — two logins on one server are two connections.
+    `merge_rows`/`merge_skipped` fold one source's result into a list already on screen, and they
+    live here rather than at the three call sites because a paste, a picked file and a scan all add
+    to the same list: the moment they disagree about ticking or about duplicates, the user gets a
+    different answer depending on which button they pressed. `merge_rows` **appends, never
+    replaces** — the UI keys its selection by index into that list, so growth at the end is the
+    whole of what makes those indices safe — and answers a repeat with the position already holding
+    it, ticking through `Imported::preselected` so a row duplicating a *saved* connection arrives
+    unticked whatever produced it. `merge_skipped` is the other half, and exists because it was
+    missing: without it a second scan turned three Oracle data sources into "6 entries were not
+    imported", naming each one twice. `fill_missing_passwords` **retracts
+    `ImportNote::NoPassword`** when it fills — the order inside `scan` would do on its own, but a
+    caller completing an already-scanned row (a hand-picked file, whose passwords arrive
+    afterwards) would otherwise show "No password in the source" on a row that has one.
+    `parse_url` accepts more than a strict URL parser would, because the strings people hold are
+    not strict URLs: a `DATABASE_URL=…` line lifted out of a `.env` (with `export`, with quotes), a
+    `jdbc:` wrapper, SQLAlchemy's `postgresql+psycopg2`, libpq's comma-separated host list, a
+    bracketed IPv6 literal, and the `?user=&password=&sslmode=` parameters JDBC carries instead of
+    a userinfo. A scheme it doesn't know is `UrlError::UnknownScheme`, *except* when only digits
+    follow it — that is `localhost:3306`, and calling its host an unknown engine sends the reader
+    looking in the wrong place.
+    A driver this app has no engine for is `Skipped` **by name** rather than bent onto the nearest
+    engine: a MySQL connection silently pointed at an Oracle server is a worse answer than an
+    honest omission, and the modal says how many were left behind. DBeaver names its engine twice
+    and only the *driver* distinguishes MariaDB (it ships under the `mysql` provider); its rows are
+    sorted by name because the file is a JSON object keyed by internal ids, so "the order in the
+    file" is not an order anyone chose. The DataGrip reader is a narrow element scan
+    (`<data-source>`'s `name`, `<jdbc-url>`, `<user-name>`, `<driver-ref>`) rather than a real XML
+    parse — `schemaic-core` has no XML dependency, and if JetBrains ever moves that shape this
+    reports zero connections rather than wrong ones. `.my.cnf`'s `[client]` is the base every
+    client group inherits, so a `[client_prod]` is read *layered on it* (what
+    `--defaults-group-suffix` does); `[mysqld]` is the server's own configuration and is not a
+    client at all.
   - `connection.rs` — the saved-connection model. A `Connection` is a database **server**, not one
     database — the sidebar lists all of its databases. **SQLite is the exception to that whole
     sentence**: there is no server, so `Connection::file` is the entire target and
@@ -3332,6 +3383,44 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     behind the SSH key and all three certificate paths; folding them together also fixed the
     original, whose picker sat two Tab stops from the field it fills in while its own comment
     claimed otherwise.
+  - `connection_import.rs` — the **Import Connections** modal, over `core::conn_import` and the
+    app's `conn_sources`. Raised from the Manage Connections list ("Import from another client",
+    below New connection and quieter than it: it is the first-run action, and the one nobody
+    presses twice), and painted *directly above* that modal in `modals.rs` — the question is about
+    the list behind it, so closing returns to it. Its own term in `modal_backdrop_up`, like
+    `manage_open`'s, because it is a loose child of the layer and can outlive the modal that raised
+    it.
+    **Three ways in, and the modal opens empty.** A pasted *Connection URL* at the top, then
+    *Choose a file…* and *Scan installed clients* beneath it, then — only once one of them has
+    produced something — the review list. Opening does **not** scan: the walk reads the user's home
+    directory, and a dialog that goes through it because it was opened is doing something nobody
+    asked for. The three sources all append through the app's one `add_import_rows`, so a scan
+    cannot discard a URL pasted before it and the three cannot disagree about ticking or about
+    duplicates. `empty_message` (pure, tested) is why the scan button doesn't look dead on a
+    machine with none of those clients: an empty list means three different things — an invitation,
+    progress, an answer — and `ConnImportUi::scanned` is the bool that tells the first from the
+    third.
+    A review list, not a form: a row is a *proposal* with a tick box, its name, where it points
+    (`row_target`, mono — `user@host:port/db`, or the file's name on SQLite; pure and tested, and
+    deliberately **not** a `scheme://` URL, since this project has no URL builder on purpose and
+    one written to fill a label is what the next reader copies for something that matters), and
+    capsules for the engine and the source. Every `ImportNote` it carries is joined into a third
+    line shown only when there is one — a row can be both already-saved and password-less, and
+    showing only the first hides the one that decides whether to tick it. Rows that repeat a saved
+    connection arrive unticked. The tick box changes **by style, never a rebuild**, and the
+    selection is a `HashSet` of indices so a row's read is O(1) — the two rules `dump_view`'s table
+    picker paid for. Indices are safe because `rows` only ever grows at the end or is reset
+    wholesale by `open_import`.
+    The footer is rebuilt on **whether anything is selected**, not on how many — an Import button
+    left enabled over an empty selection imports nothing while looking like it worked, but keying
+    the container on the *count* rebuilt both buttons (and their focus-ring registrations) on every
+    tick of a selection still being made. The count is needed for the label alone, so it goes
+    through `widgets::action_button_dyn`, whose label is reactive while the button around it is
+    not. The "Added N connections." line shows only while nothing is selected, which is exactly the
+    window between an import finishing and the user asking for another — so it can never sit beside
+    an enabled Import describing a *previous* press. `skipped_sentence` (pure, tested) names up to
+    three left-out entries and counts the rest, returning `None` for an empty list so a stray
+    "0 entries were not imported" can't reach the screen.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
     panel's edges) and `v_resize_handle` (the editor/results split), plus the `DelayedHover` they
     share. Not `window_chrome::resize_zones`, which resizes the *window* and is mounted outside the
@@ -5438,6 +5527,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   one is a change the user was promised and wouldn't get. The tag is advertised from the constant
   the app extracts on (`the_proposal_tool_advertises_the_tag_the_app_looks_for`), so the two can't
   drift into a block nothing picks up.
+  - `conn_sources.rs` — the I/O half of connection import: which paths on *this* machine are worth
+    opening, and reading them. Deliberately only that half — nothing here interprets the bytes,
+    which is what keeps `core::conn_import` unit-tested and leaves the part that cannot be (a walk
+    of the user's home directory) small enough to read. `discover` returns the sources in the order
+    `conn_import::scan` relies on: the two GUI clients first, because they are the only sources
+    carrying a name a human chose, then the plain-text files, whose value is the passwords they can
+    lend to the rows above them.
+    **Every root is probed on every platform** — no `cfg` branches, even though the locations are
+    per-OS: an absent `~/Library` on Linux costs one failed `read_dir`, and a `cfg` costs a path
+    only a third of the developers can exercise. DBeaver is two levels of wildcard
+    (`DBeaverData/workspace<N>/<project>/.dbeaver/data-sources.json`) and both are real — taking
+    only `General` misses every connection of anyone who made a second project. JetBrains is
+    `JetBrains/<Product><Version>/options/dataSources.xml` and is **not** filtered by product,
+    since the file's shape is identical under IntelliJ or PhpStorm. Per-project
+    `.idea/dataSources.xml` files are not searched at all: they are wherever the user keeps code,
+    and the modal's "Choose a file…" opens one directly. `PGPASSFILE`/`PGSERVICEFILE` are honoured,
+    because libpq reads them first. Reads are capped at 4 MiB and a file that fails is silently
+    skipped — this runs over paths the user never named — *except* one they picked by hand, which
+    goes through the same `read_source` and is reported by the modal.
+    `password_sources` is the narrow half of that walk — today just `~/.pgpass` — for the one path
+    that reads a single file: a hand-picked DataGrip export would otherwise arrive with twelve
+    blank passwords that libpq's file, on the same machine, holds every one of, and whether a row
+    can be completed must not depend on how its file was found. Four `is_file` checks and one small
+    read, cheap enough to run inside a file-picker callback where the two directory walks would
+    not be.
   - `dump.rs` — the I/O half of `core::dump`: introspect, plan, write. Its shape is `export_file`'s
     `AllRows` branch with one difference that drives the whole module — an export is one statement
     into one file and a dump is **many**, so the writer has to outlive each table. A single blocking
@@ -6239,6 +6353,15 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **No pointer cursor on buttons/icons** — native apps keep the arrow cursor; a pointer feels
   web-like. Use the default; reserve `CursorStyle::Text` for text inputs (a genuine hyperlink may
   keep `Pointer`).
+- **`btn_primary_text` is not "white on the accent".** It is the *label* colour of the Primary
+  button, chosen against `btn_primary`'s own dark navy fill — `#8EA7EA`, a light blue. Painting it
+  on a saturated fill leaves a glyph nobody can see, which is exactly how the import list's
+  checkbox shipped its first draft: a filled blue square with an invisible tick in it. The pair
+  that *does* mean "on, and read me against it" is `toggle_on` + `toggle_handle_on`, the second of
+  which is `#FFFFFF` in both themes precisely because it is drawn on the first — so a new filled
+  control that has to show something inside itself takes the toggle's colours, not the accent's.
+  Small glyphs drawn inside one also want `icons::CHECK_BOLD` over `icons::CHECK`: Lucide's
+  stroke-width 2 is tuned for ~16px and falls under a device pixel at 11.
 - **Menu labels carry no trailing ellipsis**, even when the entry opens a dialog. The platform
   convention says a `…` means "this will ask you something first", but this app doesn't keep it:
   of the ~110 menu labels in `schemaic-ui`, the only three that ever had one were added in a single
