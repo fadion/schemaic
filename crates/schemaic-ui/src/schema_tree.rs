@@ -1383,6 +1383,12 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let ot_tables = open_table;
     let otc_tables = open_table_col;
     let toggle_tables = on_toggle;
+    // The shared "View" error modal — the same one both error bars open. Lifted
+    // out of the closure because `RwSignal` is `Copy`, so the failed-row arm
+    // needs no clone of the whole `Ui`.
+    let err_open = node_ui.overlay.error_modal_open;
+    let err_text = node_ui.overlay.error_modal_text;
+    let err_fixable = node_ui.overlay.error_modal_fixable;
     let children = dyn_container(
         move || {
             (
@@ -1414,7 +1420,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         .padding_vert(theme::scaled(3.0))
                 })
                 .into_any(),
-                SchemaState::Failed(e) => info_row(e, theme::error).into_any(),
+                SchemaState::Failed(e) => failed_row(e, err_open, err_text, err_fixable).into_any(),
                 SchemaState::Loaded(schema) => {
                     let db = database.clone();
                     let child_ctx = |indent_levels: u32| SchemaTreeCtx {
@@ -2613,6 +2619,57 @@ fn tree_row_static(s: floem::style::Style, pad_left: f64) -> floem::style::Style
         .padding_left(pad_left)
         .padding_right(theme::scaled(8.0))
         .font_size(theme::font_body())
+}
+
+/// The row under a database that could not be opened: a fixed red label, and
+/// "View" for the server's actual words.
+///
+/// The message used to be printed inline, which is the one place in the app a
+/// raw server error is rendered at whatever length it happens to be. In a
+/// sidebar a few hundred pixels wide that meant `connection failed: db error:
+/// FATAL: pg_hba.conf rejects connection for host "14` — cut mid-token, mid-IP,
+/// with the part naming the cause off the right edge, under a database the user
+/// may not even have created.
+///
+/// So it says the one thing that is always true and always fits, and puts the
+/// detail behind the same "View" the editor and grid error bars use — one
+/// pattern for "there is more to this error than the room here allows", and one
+/// modal that can already be selected from and copied.
+fn failed_row(
+    msg: String,
+    open: RwSignal<bool>,
+    detail: RwSignal<Option<String>>,
+    fixable: RwSignal<bool>,
+) -> impl IntoView {
+    container(
+        h_stack((
+            text("Failed to connect")
+                .style(|s| s.color(theme::error()).font_size(theme::font_label())),
+            text("View")
+                .on_click_stop(move |_| {
+                    // Not a statement failure, so the modal offers no "AI fix" —
+                    // the flag rides with the text because the modal reads a
+                    // stale one otherwise.
+                    fixable.set(false);
+                    detail.set(Some(msg.clone()));
+                    open.set(true);
+                })
+                .style(|s| {
+                    s.color(theme::err_fix_btn())
+                        .font_size(theme::font_label())
+                        .margin_left(theme::scaled(8.0))
+                        // The hover the same word gets on both error bars, and
+                        // no cursor change — per *UI conventions*.
+                        .hover(|s| s.color(theme::err_fix_btn_hover()))
+                }),
+        ))
+        .style(|s| s.flex_row().items_center()),
+    )
+    .style(|s| {
+        s.min_width(tree_row_min_w())
+            .padding_left(leaf_pad())
+            .padding_vert(theme::scaled(3.0))
+    })
 }
 
 // A non-interactive status line inside the tree (Loading / error / empty).
