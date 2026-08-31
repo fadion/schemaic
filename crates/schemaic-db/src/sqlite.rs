@@ -1140,6 +1140,62 @@ pub(crate) async fn import_rows(
 /// menus hide what SQLite can't express and the emitter writes nothing for it, so
 /// a plan that arrives is one made of statements this engine has. Anything that
 /// slipped through still fails at the engine rather than half-applying.
+/// SQLite's arm of [`crate::Db::run_script`]. See there for why nothing is
+/// wrapped in a transaction and why the connection is pinned.
+///
+/// **The pragma is not touched here**, and that is the difference from
+/// [`run_ddl`] rather than an omission. That function turns foreign-key
+/// enforcement off because the twelve-step rebuild *it* generates passes through
+/// states no single statement could, and it verifies with `foreign_key_check`
+/// before committing. A script is the user's file: it may carry its own
+/// `PRAGMA foreign_keys = OFF` (`dump::fk_guard_sql` writes one), and silently
+/// disabling enforcement for a file that did not ask would load rows the
+/// database would otherwise have refused — with no commit of ours to check
+/// before, because the transaction, if there is one, is the file's.
+///
+/// Blocking, because `rusqlite` is: the whole loop runs inside one
+/// `block_in_place` and pulls from the channel with `blocking_recv`, so the
+/// connection never crosses an await point.
+pub(crate) async fn run_script(
+    db: &Db,
+    mut rx: tokio::sync::mpsc::Receiver<schemaic_core::script::Statement>,
+    cancel: CancellationToken,
+) -> (schemaic_core::script::ExecEnd, usize) {
+    use schemaic_core::script::ExecEnd;
+    tokio::task::block_in_place(|| {
+        let conn = match open(db) {
+            Ok(c) => c,
+            Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+        };
+        let mut ran = 0usize;
+        let end = loop {
+            if cancel.is_cancelled() {
+                break ExecEnd::Cancelled;
+            }
+            // There is no statement to interrupt mid-flight the way MySQL's
+            // `KILL` does, so between statements is the granularity available —
+            // the same one `run_ddl` works at.
+            let Some(st) = rx.blocking_recv() else {
+                break ExecEnd::Done;
+            };
+            match conn.execute_batch(&st.sql) {
+                Ok(()) => ran += 1,
+                Err(e) => {
+                    break ExecEnd::Failed {
+                        // The shadow-table rename `run_ddl` applies is not
+                        // wanted here: no rebuild of ours is running, so every
+                        // name in this message is one the user's own file wrote.
+                        message: e.to_string(),
+                        sql: st.sql,
+                        line: st.line,
+                    };
+                }
+            }
+        };
+        (end, ran)
+    })
+}
+
 pub(crate) async fn run_ddl(
     db: &Db,
     stmts: &[String],
@@ -7711,5 +7767,186 @@ mod designer_path_tests {
             rows.next()
                 .unwrap_or_else(|e| panic!("{:?} failed mid-scan: {e}\n{sql}", snip.name));
         }
+    }
+
+    // ── run_script: the streaming executor ───────────────────────────────────
+    //
+    // SQLite is the one backend whose DB layer is tested directly, so it is
+    // where the executor's contract gets exercised against a real engine rather
+    // than asserted in prose. Everything here is in-memory: no server, no file.
+
+    /// Feed `stmts` through [`run_script`] and wait for the verdict.
+    async fn script(
+        db: &Db,
+        stmts: &[(&str, u64)],
+        cancel: CancellationToken,
+    ) -> (schemaic_core::script::ExecEnd, usize) {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::SCRIPT_QUEUE);
+        for (sql, line) in stmts {
+            tx.send(schemaic_core::script::Statement {
+                sql: (*sql).to_string(),
+                line: *line,
+                offset: 0,
+            })
+            .await
+            .expect("the executor is still receiving");
+        }
+        drop(tx);
+        run_script(db, rx, cancel).await
+    }
+
+    /// The happy path, and what makes it a *script* runner: the statements land
+    /// in order and every one takes effect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_runs_every_statement_in_order() {
+        let (keeper, db) = shared_memory("script_runs_in_order");
+        let (end, ran) = script(
+            &db,
+            &[
+                ("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);", 1),
+                ("INSERT INTO t VALUES (1, 'one');", 2),
+                ("INSERT INTO t VALUES (2, 'two');", 3),
+                ("UPDATE t SET b = 'ONE' WHERE a = 1;", 4),
+            ],
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(end, schemaic_core::script::ExecEnd::Done);
+        assert_eq!(ran, 4);
+        let got: Vec<String> = keeper
+            .prepare("SELECT b FROM t ORDER BY a")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got, vec!["ONE".to_string(), "two".to_string()]);
+    }
+
+    /// **A refused statement stops the run and is named with its line.** The
+    /// line is why `script::Statement` carries one: this is a file too big to
+    /// open in the editor, so "statement 3" would be no answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_statement_stops_the_run_and_names_its_line() {
+        let (_keeper, db) = shared_memory("script_stops_on_error");
+        let (end, ran) = script(
+            &db,
+            &[
+                ("CREATE TABLE t (a INTEGER PRIMARY KEY);", 1),
+                ("INSERT INTO t VALUES (1);", 2),
+                ("INSERT INTO nope VALUES (1);", 412),
+                ("INSERT INTO t VALUES (2);", 413),
+            ],
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(ran, 2, "the two before the failure");
+        match end {
+            schemaic_core::script::ExecEnd::Failed { message, sql, line } => {
+                assert!(message.contains("nope"), "{message}");
+                assert_eq!(sql, "INSERT INTO nope VALUES (1);");
+                assert_eq!(line, 412);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// **Nothing after the failure runs.** Stopping is the point: a dump whose
+    /// `CREATE TABLE` failed must not go on to insert thousands of rows into
+    /// whatever else is named.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_after_a_failure_is_executed() {
+        let (keeper, db) = shared_memory("script_halts_after_error");
+        script(
+            &db,
+            &[
+                ("CREATE TABLE t (a INTEGER PRIMARY KEY);", 1),
+                ("INSERT INTO nope VALUES (1);", 2),
+                ("INSERT INTO t VALUES (99);", 3),
+            ],
+            CancellationToken::new(),
+        )
+        .await;
+        let n: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "the statement after the failure ran anyway");
+    }
+
+    /// A cancelled run runs nothing and says it was cancelled — not that it
+    /// finished, which is the confusion `script::run_outcome` exists to keep
+    /// straight one level up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_run_reports_a_cancel_not_a_finish() {
+        let (_keeper, db) = shared_memory("script_cancelled");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (end, ran) = script(&db, &[("CREATE TABLE t (a INTEGER);", 1)], cancel).await;
+        assert_eq!(end, schemaic_core::script::ExecEnd::Cancelled);
+        assert_eq!(ran, 0);
+    }
+
+    /// **The file's own transaction is the file's**, and this is why `run_ddl`
+    /// could not be reused: it wraps its plan, and a script carrying
+    /// `BEGIN` … `COMMIT` would then be running inside a second transaction.
+    /// The proof is that the file's `COMMIT` succeeds — with an outer
+    /// transaction open, SQLite would have refused the inner `BEGIN`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_scripts_own_transaction_is_left_to_the_script() {
+        let (keeper, db) = shared_memory("script_own_tx");
+        let (end, ran) = script(
+            &db,
+            &[
+                ("CREATE TABLE t (a INTEGER);", 1),
+                ("BEGIN;", 2),
+                ("INSERT INTO t VALUES (1);", 3),
+                ("COMMIT;", 4),
+            ],
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(end, schemaic_core::script::ExecEnd::Done, "ran {ran}");
+        let n: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// **Enforcement is not silently switched off**, the one place this
+    /// deliberately differs from `run_ddl`. A script that violates a foreign key
+    /// is refused, because the file did not ask for the guard to be lifted and
+    /// there is no commit of ours to check before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_does_not_get_foreign_keys_turned_off_for_it() {
+        let (_keeper, db) = shared_memory("script_keeps_fks");
+        let (end, ran) = script(
+            &db,
+            &[
+                ("PRAGMA foreign_keys = ON;", 1),
+                ("CREATE TABLE parent (id INTEGER PRIMARY KEY);", 2),
+                (
+                    "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id));",
+                    3,
+                ),
+                ("INSERT INTO child VALUES (1, 999);", 4),
+            ],
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(ran, 3, "the orphan insert must not have counted");
+        assert!(
+            matches!(end, schemaic_core::script::ExecEnd::Failed { line: 4, .. }),
+            "the orphan row was accepted: {end:?}"
+        );
+    }
+
+    /// An empty script connects, runs nothing and finishes. The user picked an
+    /// empty file, which is not an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_script_finishes_having_run_nothing() {
+        let (_keeper, db) = shared_memory("script_empty");
+        let (end, ran) = script(&db, &[], CancellationToken::new()).await;
+        assert_eq!(end, schemaic_core::script::ExecEnd::Done);
+        assert_eq!(ran, 0);
     }
 }

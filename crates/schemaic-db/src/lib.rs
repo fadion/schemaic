@@ -4033,6 +4033,105 @@ impl Db {
     }
 }
 
+/// How many statements the driver may run ahead of the server.
+///
+/// The bound is the whole progress design: with the reader unable to get more
+/// than this far in front, `script::Splitter::consumed` is within a few
+/// statements of what the server has actually applied, so the driver can report
+/// progress from the file position alone and no second channel is needed. It is
+/// also the backpressure — reading a 2 GB file as fast as the disk allows, into
+/// a queue the server drains one statement at a time, is how a load comes to
+/// hold the whole file in memory after all.
+pub const SCRIPT_QUEUE: usize = 64;
+
+impl Db {
+    /// Run a `.sql` script: execute every statement the reader hands over, in
+    /// order, on **one connection**, stopping at the first the server refuses.
+    ///
+    /// Returns how the executing half ended and how many statements ran; the
+    /// driver folds that together with how the *reading* half ended through
+    /// [`schemaic_core::script::run_outcome`], which is where the precedence
+    /// between the two lives.
+    ///
+    /// **One pinned connection, and this is the second exception to
+    /// one-connection-per-operation** (the first being a Manual-mode tab's
+    /// `Session`). A script's statements are not independent: a dump opens with
+    /// `SET FOREIGN_KEY_CHECKS = 0`, may carry its own `BEGIN` … `COMMIT`, and
+    /// on MySQL switches the terminator around a routine — every one of those is
+    /// *session* state, so a fresh connection per statement would apply the
+    /// guard to a connection that is already gone and then fail the load on the
+    /// first child row.
+    ///
+    /// **Nothing is wrapped in a transaction here, deliberately.** `run_ddl`
+    /// wraps on all three engines, which is why it cannot be reused: the file
+    /// decides. `dump.rs`'s *Replaying → One transaction* already writes
+    /// `BEGIN`/`COMMIT` into the file when the user asked for it, and a second
+    /// `BEGIN` around that is not what any of the three engines does with a
+    /// nested one. `script::Probe::own_transaction` is what lets the UI say
+    /// which kind of file this is before the run starts.
+    pub async fn run_script(
+        &self,
+        database: &str,
+        rx: tokio::sync::mpsc::Receiver<schemaic_core::script::Statement>,
+        cancel: CancellationToken,
+    ) -> (schemaic_core::script::ExecEnd, usize) {
+        match self.engine {
+            Engine::Postgres => pg::run_script(self, database, rx, cancel).await,
+            Engine::Sqlite => sqlite::run_script(self, rx, cancel).await,
+            Engine::MySql => self.run_script_mysql(database, rx, cancel).await,
+        }
+    }
+
+    async fn run_script_mysql(
+        &self,
+        database: &str,
+        mut rx: tokio::sync::mpsc::Receiver<schemaic_core::script::Statement>,
+        cancel: CancellationToken,
+    ) -> (schemaic_core::script::ExecEnd, usize) {
+        use schemaic_core::script::ExecEnd;
+        let mut conn = match self.open(Some(database), false).await {
+            Ok(c) => c,
+            Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+        };
+        let conn_id = conn.id();
+        // Best-effort, as in `run_ddl`: a server without the variable keeps its
+        // own default rather than failing the load over the bound.
+        let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
+        let mut ran = 0usize;
+        let end = loop {
+            // Cancel has to be reachable **while waiting for the next
+            // statement**, not only while one is running. A load stalled on a
+            // slow disk spends most of its life here, and a Stop that only
+            // landed between statements would look ignored.
+            let next = tokio::select! {
+                s = rx.recv() => s,
+                _ = cancel.cancelled() => break ExecEnd::Cancelled,
+            };
+            let Some(st) = next else { break ExecEnd::Done };
+            let step = tokio::select! {
+                r = conn.query_drop(&st.sql) => r.map_err(|e| DbError::Query(e.to_string())),
+                _ = cancel.cancelled() => {
+                    self.kill_query(conn_id).await;
+                    Err(DbError::Cancelled)
+                }
+            };
+            match step {
+                Ok(()) => ran += 1,
+                Err(DbError::Cancelled) => break ExecEnd::Cancelled,
+                Err(e) => {
+                    break ExecEnd::Failed {
+                        message: e.to_string(),
+                        sql: st.sql,
+                        line: st.line,
+                    };
+                }
+            }
+        };
+        let _ = conn.disconnect().await;
+        (end, ran)
+    }
+}
+
 /// Where an import is writing, and what its `INSERT`s name.
 ///
 /// `columns` are bare names (unquoted); the quoting is the export path's, applied

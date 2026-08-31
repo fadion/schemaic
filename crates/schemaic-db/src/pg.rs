@@ -564,6 +564,55 @@ pub(crate) async fn run_ddl(
     Ok(())
 }
 
+/// PostgreSQL's arm of [`crate::Db::run_script`]. See there for why nothing is
+/// wrapped in a transaction and why the connection is pinned.
+///
+/// `batch_execute` rather than a prepared statement for the reason `run_ddl`
+/// gives above: `BEGIN` is not preparable and neither are several DDL forms, and
+/// a script is mostly made of exactly those.
+pub(crate) async fn run_script(
+    db: &Db,
+    database: &str,
+    mut rx: tokio::sync::mpsc::Receiver<schemaic_core::script::Statement>,
+    cancel: CancellationToken,
+) -> (schemaic_core::script::ExecEnd, usize) {
+    use schemaic_core::script::ExecEnd;
+    let client = match connect_to(db, database).await {
+        Ok(c) => c,
+        Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+    };
+    // Best-effort and session-scoped. Outside any transaction, unlike `run_ddl`'s
+    // copy, because here there may be no transaction to put it in — the file
+    // decides — and a `SET` that reverted with a `COMMIT` the file happened to
+    // carry would leave the rest of the load unbounded.
+    let _ = client
+        .batch_execute(&crate::lock_wait_sql(crate::Engine::Postgres))
+        .await;
+    let mut ran = 0usize;
+    let end = loop {
+        let next = tokio::select! {
+            s = rx.recv() => s,
+            _ = cancel.cancelled() => break ExecEnd::Cancelled,
+        };
+        let Some(st) = next else { break ExecEnd::Done };
+        let step = tokio::select! {
+            r = client.batch_execute(&st.sql) => r.map_err(|e| e.to_string()),
+            _ = cancel.cancelled() => break ExecEnd::Cancelled,
+        };
+        match step {
+            Ok(()) => ran += 1,
+            Err(message) => {
+                break ExecEnd::Failed {
+                    message,
+                    sql: st.sql,
+                    line: st.line,
+                };
+            }
+        }
+    };
+    (end, ran)
+}
+
 pub(crate) async fn run_statement(
     db: &Db,
     client: &Client,

@@ -2375,6 +2375,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `sql::leading_words`' bound. That function is `leading_keyword`'s plural and is bounded on
     purpose: the private `word_tokens` tokenises to the end, which on a dump's sixteen-megabyte
     extended `INSERT` allocates a `String` per word to learn one.
+    `run_outcome(ReadEnd, ExecEnd, ran)` is the two halves' ending split, and it is `dump.rs`'s
+    `dump_verdict` **inverted rather than copied** — the one thing to know before touching it. In a
+    dump the *database* reads and the *file* is written, so a full disk fails the writer and the
+    reader only ever learns "nobody is reading any more"; the writer therefore describes it. In a
+    load the halves swap: a file that stops being readable is invisible to the executor, which sees
+    a channel close it cannot tell from a script that simply ended. So here a **reader** failure
+    outranks even the server error it caused — a truncated read hands over half a statement, the
+    server answers "syntax error near…", and reporting that would name the file's last line as the
+    problem when the disk is. Cancel is either half's to witness and neither's to call a finish.
+    **Every arm carries `ran`**: a script is not transactional unless the file said so, so "it
+    stopped" always leaves "how much of it happened?", and that count is the only answer — which is
+    why an exhaustive test asserts no arm drops it.
     **The write guard for this path is `sql::script_verdict`**, not `run_verdict` — see the
     invariant.
   - `sqlfile.rs` — the pure half of opening and saving a tab's SQL as a `.sql` file on disk: what a
@@ -2759,8 +2771,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   statement it is the same string and the same one round trip, terminator included.
   `fetch_query`/`stream_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/
   `prepare_check`
-  (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`fetch_table_stats`/
+  (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`run_script`/`fetch_table_stats`/
   `count_rows` are `Db` methods taking the target DB per call.
+  **`Db::run_script` is `stream_query` inverted** — it takes a bounded
+  `Receiver<script::Statement>` where that one takes a Sender — and it is the load half of the
+  round trip `dump.rs` opens. It executes each statement in order on one pinned connection, stops
+  at the first the server refuses, and returns `(script::ExecEnd, ran)` for the driver to fold
+  against how the *reading* half ended. Three arms, all of them minimal by design: no transaction
+  of ours on any engine, and no pragma on SQLite. See the connection invariant for why it can be
+  neither `Session` nor `run_ddl`, and `core::script` for the module it serves. Cancellation is
+  selected on **while waiting for the next statement** as well as while one runs — a load stalled
+  on a slow disk spends most of its life waiting, and a Stop that only landed between statements
+  would look ignored.
   **`Db::stream_query` is the whole-table export, and the row cap is the thing it exists to
   escape**: it runs `sql` uncapped and hands the rows to a *bounded*
   `tokio::sync::mpsc::Sender<ExportChunk>` in blocks of `chunk_rows` as they arrive, returning how
@@ -6099,15 +6121,32 @@ Re-introducing the anti-patterns these guard against is a regression:
   **Read AST identifiers unquoted** — `Ident`/`ObjectNamePart`'s `Display` re-adds the quoting, so a
   `` `t` ``/`"t"` name comes back quote-wrapped and never matches the catalog (which is keyed on bare
   names). Go through `intel::object_name_parts`, or `Ident::value` for a lone identifier.
-- **One connection per operation — except a Manual-mode tab.** Every `Db` method opens a fresh
+- **One connection per operation — except a Manual-mode tab, and a running script.** Every `Db` method opens a fresh
   connection, runs, and disconnects; that statelessness is why a dropped connection is never a
-  problem. The *single* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one
+  problem. The *first* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one
   connection (`schemaic_db::Session`, one `Conn`/`Client` behind a `tokio::Mutex`) for the life of
   its transaction, held in the app's `sessions` map (tab id → `Arc<Session>`). Only the tab's own
   work routes there — run, Run Everything, grid writes, and the post-write re-fetch (which *must*,
   since no other connection can see uncommitted rows). Read-only side channels (schema
   introspection, live-validate `PREPARE`, EXPLAIN, Live Monitor, AI/MCP) stay on fresh connections so
   a long transaction can't block them. Don't add a second connection-caching path; extend `Session`.
+  **The second exception is `Db::run_script`**, and it is a genuine one rather than a long call:
+  the connection is pinned for the length of the whole file. A script's statements are not
+  independent. A dump opens with `SET FOREIGN_KEY_CHECKS = 0` (`dump::fk_guard_sql`), may carry its
+  own `BEGIN` … `COMMIT`, and on MySQL switches the terminator around a routine — all *session*
+  state, so a fresh connection per statement would apply the guard to a connection already gone and
+  then fail the load on the first child row. It is not `Session`: that type's automatic `BEGIN` is
+  Manual mode's semantics, and a script's transactions belong to the file. For the same reason it is
+  **not `run_ddl`**, which on all three engines takes `&[String]` (the whole plan in memory) and
+  wraps it in a transaction of its own — a second `BEGIN` around a file that already carries one is
+  not what any of the three engines does. `run_script` therefore wraps nothing, and on SQLite it
+  also leaves `PRAGMA foreign_keys` alone, where `run_ddl` turns enforcement off for its rebuild:
+  silently lifting the guard for a file that never asked would load rows the database would have
+  refused, with no commit of ours to check before. The statements arrive over a bounded channel
+  (`SCRIPT_QUEUE`), which is both the backpressure and the progress design — the reader cannot get
+  more than a queue ahead, so `script::Splitter::consumed` tracks what the server has applied
+  closely enough that the driver reports progress from the file position alone, with no second
+  channel.
   **A streamed whole-table export fits this rule rather than bending it.** `Db::stream_query`
   connects, runs and disconnects like every other `Db` method; what is new is only how *long* that
   takes, and the bounded channel is what keeps that bounded in memory too — a server faster than the
