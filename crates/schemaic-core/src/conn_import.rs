@@ -497,8 +497,17 @@ fn strip_env_assignment(s: &str) -> &str {
     s
 }
 
+/// `s` without `prefix`, matched case-insensitively, or `None`.
+///
+/// **`get`, not `[..]`.** A byte-length guard says nothing about char
+/// boundaries, so slicing at `prefix.len()` panicked on any text whose first
+/// bytes are one multi-byte character — and every caller here is fed text a
+/// user pasted or a third-party file supplied. `parse_url("日本語")` was a
+/// process kill on the UI thread; the same input through `parse_datagrip`,
+/// `parse_dbeaver` and `scan` reached it too.
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    (s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix))
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
         .then(|| &s[prefix.len()..])
 }
 
@@ -1574,6 +1583,50 @@ mod tests {
         assert_eq!(c.password, "s3cret");
         assert_eq!(c.database, "shop");
         assert_eq!(c.name, "shop@db.internal");
+    }
+
+    /// **The panic this module shipped.** `strip_prefix_ci` guarded on
+    /// `s.len() >= prefix.len()` — a *byte* length — and then sliced at
+    /// `prefix.len()`, which is a char boundary only by luck. Any text opening
+    /// with a multi-byte character killed the process from the paste field,
+    /// which is the very first thing anyone does with this feature.
+    ///
+    /// Every call path is exercised, because the guard is in a helper three of
+    /// them reach through different callers.
+    #[test]
+    fn non_ascii_text_is_refused_rather_than_panicking() {
+        // The paste field, and `scan`'s URL source through it.
+        assert!(parse_url("日本語").is_err());
+        assert!(parse_url("é").is_err());
+        assert!(parse_url("→").is_err());
+        let scan = parse_url_scan("日本語\nmysql://h/d\n");
+        assert_eq!(scan.found.len(), 1);
+        assert_eq!(scan.skipped.len(), 1);
+
+        // The two file parsers, whose entries carry names and URLs from files
+        // this app did not write.
+        let scan =
+            parse_datagrip("<data-source name=\"café\"><jdbc-url>日本語</jdbc-url></data-source>");
+        assert_eq!(scan.skipped.len(), 1);
+        let scan = parse_dbeaver(
+            r#"{"connections":{"1":{"name":"café","provider":"mysql","configuration":{"url":"日本語"}}}}"#,
+        );
+        assert_eq!(scan.found.len() + scan.skipped.len(), 1);
+    }
+
+    /// The module's 69 tests contained no non-ASCII byte at all, which is why
+    /// the panic above shipped. This is the *positive* half: text outside ASCII
+    /// must survive the round trip, not merely fail to crash.
+    #[test]
+    fn non_ascii_names_and_values_survive_an_import() {
+        let c = url("mysql://señor:contraseña@db.münchen.example:3307/données");
+        assert_eq!(c.host, "db.münchen.example");
+        assert_eq!(c.user, "señor");
+        assert_eq!(c.password, "contraseña");
+        assert_eq!(c.database, "données");
+
+        let scan = parse_my_cnf("[client]\nhost=db.münchen.example\nuser=señor\n");
+        assert_eq!(scan.found[0].connection.host, "db.münchen.example");
     }
 
     #[test]
