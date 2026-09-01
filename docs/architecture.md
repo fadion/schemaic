@@ -7508,6 +7508,29 @@ Re-introducing the anti-patterns these guard against is a regression:
   `.style(…)` applied *after* `.clip()` — and both panels now carry it on all three of the text, the
   `Clip` and the surface container. Adding a background container around a wrapping text view is
   what turns the omitted second style into a visible bug.
+- **`tooltip()` re-parents its child, so every style chained *after* it lands on the wrapper and not
+  on your view.** It is not a decorator: `floem::views::tooltip` (floem-0.2.0,
+  `src/views/tooltip.rs:45-51`) mints its own `ViewId` and calls `id.set_children(vec![child])`, so
+  the view you wrote is no longer the view the next `.style()` in the chain sees. That is the
+  general hazard with **any constructor that wraps rather than decorates**, and the `.clip()` bullet
+  above is the same fact read from the other end — but the two fail in *opposite* directions, so
+  neither rule generalises from the other: with `.clip()` you must style **after** to reach the
+  wrapper, with `.tooltip()` you must style **before** to reach your own view. The connection
+  switcher's rows chained `menu_item_style` after `.tooltip(…)`, so the whole shared row style —
+  `width_full()`, `flex_row()`, the gap, the horizontal padding — went on the tooltip wrapper while
+  the `h_stack` underneath kept `width: auto` and sized to its own content. Its `flex_grow` spacer
+  therefore never saw free space, collapsed to its 20px floor, and each connection's `host:port` sat
+  a fixed 20px past its own name at a different offset per row instead of flush at the panel's edge.
+  Two things hide it. The **hover background is in that same shared style**, so it sat on the
+  full-width wrapper and every row highlighted edge to edge — the one cue that would have said "this
+  row is narrow" was displaced along with everything else. And it presents as a *width* bug, which
+  makes the panel's `min_width(400)` the natural suspect; the panel is innocent, and taffy
+  right-aligns under a `min_width` perfectly well — the tree was rebuilt headlessly on taffy 0.4.4
+  and the `min_width` variant lands the endpoints flush at the same right edge the explicit-`width`
+  variant does. So do not go looking for a definite width here; the fix is the **order** — style the
+  child, *then* wrap, then give the wrapper `width_full()` so the row has a width to resolve its own
+  `width_full()` against. This is the only menu in the app whose rows carry a tooltip, which is why
+  it is the only one that had it.
 - **`s.hide()`/`s.flex()` (display none/flex) beat height/scale for a reactive show-hide** — adds/
   removes the element from layout cleanly (no clip/overflow/leftover space). Prefer it to animating
   height when you don't need the animation.
