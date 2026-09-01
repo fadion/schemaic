@@ -594,6 +594,97 @@ impl TableDraft {
     }
 }
 
+// ── The desired state of a database ──────────────────────────────────────────
+
+/// The whole desired shape of one **database** — the container the rest of this
+/// module's objects live in, which until now could only be made from a shell.
+///
+/// There is no `original` and no diff: a database is created or dropped and
+/// never altered from here. Renaming one is not an operation either engine
+/// offers (MySQL withdrew `RENAME DATABASE` in 5.1.23 as unsafe, PostgreSQL's
+/// `ALTER DATABASE … RENAME TO` needs every session off it), so the editor
+/// offers what the servers do and nothing more.
+///
+/// **Every option field is per-engine, and both are optional.** The form only
+/// shows the ones its dialect has, and `None` means "let the server choose",
+/// which is the answer that always works — a `CREATE DATABASE` with no clauses
+/// inherits the server or template default on all three.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DatabaseDraft {
+    pub name: String,
+    /// **MySQL only**, `CHARACTER SET`. `None` on PostgreSQL, which has no
+    /// one-clause spelling of this that is safe to offer: `ENCODING` there is
+    /// refused unless the locale clauses and `TEMPLATE template0` agree with it,
+    /// so a form field for it would mostly produce `new encoding is incompatible
+    /// with the encoding of the template database`.
+    pub charset: Option<String>,
+    /// **MySQL only**, `COLLATE`. `None` on PostgreSQL for the reason above —
+    /// `LC_COLLATE` there carries the same template restriction.
+    pub collation: Option<String>,
+    /// **PostgreSQL only**, `OWNER`. `None` on MySQL, which has no owner: a
+    /// database there is reached through grants and belongs to nobody.
+    pub owner: Option<String>,
+}
+
+impl DatabaseDraft {
+    /// A blank draft, with every per-engine option left to the server.
+    pub fn blank(name: impl Into<String>) -> DatabaseDraft {
+        DatabaseDraft {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// What stops this draft being applied, in the form's own words — empty when
+    /// nothing does.
+    ///
+    /// Only the name, because only the name has an answer the form can know.
+    /// A character set that doesn't exist, an owner role that doesn't, a name
+    /// already taken — every one of those is the *server's* question, and
+    /// guessing at them here would mean a form that refuses what the server
+    /// would have accepted. The one thing a client can be sure of is that a
+    /// database with no name is not a request.
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.name.trim().is_empty() {
+            out.push("The name can't be empty.".to_string());
+        }
+        out
+    }
+
+    /// `CREATE DATABASE …`, with only the clauses this draft actually sets.
+    ///
+    /// The same rule [`Change::AlterSequence`] follows: a restated clause the
+    /// user didn't choose is a decision nobody reviewed, and here it is also a
+    /// decision that can *fail* — see the field docs for what PostgreSQL does
+    /// with an `ENCODING` it wasn't asked for.
+    pub fn create_sql(&self, dialect: SqlDialect) -> String {
+        let q = |s: &str| ddl_ident_in(s, dialect);
+        let mut out = format!("CREATE DATABASE {}", q(&self.name));
+        // **A charset is a string literal here, not an identifier.** MySQL's
+        // grammar takes either, but a backticked `utf8mb4` is an identifier in a
+        // slot that means a character-set *name*, and the quoted form is what
+        // `mysqldump` writes. It also keeps a typo in the form field from
+        // becoming a syntax error rather than the server's own "Unknown
+        // character set" — which is the message that tells the user what to fix.
+        if let Some(cs) = self.charset.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(&format!(
+                " CHARACTER SET {}",
+                ddl_string(cs.trim(), dialect)
+            ));
+        }
+        if let Some(coll) = self.collation.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(&format!(" COLLATE {}", ddl_string(coll.trim(), dialect)));
+        }
+        // An owner *is* a role identifier, so this one is quoted as one.
+        if let Some(owner) = self.owner.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(&format!(" OWNER {}", q(owner.trim())));
+        }
+        out.push(';');
+        out
+    }
+}
+
 // ── The desired state of a view ──────────────────────────────────────────────
 
 /// The whole desired shape of one view: a name, a `SELECT`, and the options that
@@ -2310,6 +2401,57 @@ pub enum Change {
         kind: ObjectKind,
         comment: Option<String>,
     },
+    /// `CREATE DATABASE`. **Server-level** — see the group note below.
+    CreateDatabase(Box<DatabaseDraft>),
+    /// `DROP DATABASE`. **Server-level**, and the most destructive change in
+    /// this enum: everything every other variant here can drop, at once.
+    ///
+    /// Never `IF EXISTS`: the name comes off a tree node, so a database that
+    /// isn't there means the tree is stale and the user is about to be told a
+    /// drop succeeded that dropped nothing.
+    DropDatabase {
+        name: String,
+    },
+    /// `CREATE SCHEMA` — a **namespace inside** the current database, which is
+    /// PostgreSQL's alone. Unlike the two above this runs in the database it is
+    /// about, so it is not server-level; it is grouped with them because it is
+    /// the same act one level down and the menus offer them together.
+    CreateSchema {
+        name: String,
+        /// `AUTHORIZATION`. `None` leaves the schema owned by whoever ran it.
+        owner: Option<String>,
+    },
+    /// `DROP SCHEMA`, never `CASCADE` — the same call [`Change::DropObject`]
+    /// makes, and for the same reason: cascading here drops every table in the
+    /// namespace, which is a far larger act than the one the menu asked for. Let
+    /// the server refuse and name what is still in there.
+    DropSchema {
+        name: String,
+    },
+}
+
+/// Is `change` **server-level** — about a database as a whole rather than about
+/// anything inside one?
+///
+/// The distinction is not cosmetic, and it is the reason these two arms are
+/// asked about separately everywhere downstream:
+///
+/// - `CREATE DATABASE` has nothing to connect *to* yet, and `DROP DATABASE`
+///   cannot run on a connection to the database it drops.
+/// - On PostgreSQL neither may run inside a transaction block, which is what
+///   every other plan in this module is wrapped in (`pg::run_ddl`).
+///
+/// So a set holding one of these takes a different route to the server
+/// (`Db::run_server_ddl`) and a different refresh afterwards — re-listing the
+/// connection's databases rather than re-introspecting one that may be gone.
+/// [`Change::CreateSchema`] and [`Change::DropSchema`] are deliberately **not**
+/// server-level: a namespace is created inside its database, on the ordinary
+/// path, in the ordinary transaction.
+pub fn is_server_level(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::CreateDatabase(_) | Change::DropDatabase { .. }
+    )
 }
 
 /// The refusal for a view **rename** that would strand its dependents, or
@@ -2648,6 +2790,15 @@ impl Change {
                 Some(_) => format!("Set the {}'s comment", kind.label()),
                 None => format!("Clear the {}'s comment", kind.label()),
             },
+            // The database and namespace lines name the object rather than
+            // saying "the database", because unlike every arm above them the
+            // preview's subject is not something the user right-clicked: a
+            // create was typed into a form, and a drop is the one plan here
+            // whose target it is worth reading twice.
+            Change::CreateDatabase(d) => format!("Create database {}", d.name),
+            Change::DropDatabase { name } => format!("Drop database {name}"),
+            Change::CreateSchema { name, .. } => format!("Create schema {name}"),
+            Change::DropSchema { name } => format!("Drop schema {name}"),
         }
     }
 
@@ -2970,6 +3121,41 @@ impl Change {
             Change::RestartSequence { to } => vec![format!(
                 "Restarts the counter at {to}. Values already handed out are not \
                  changed, so a key it reaches again collides."
+            )],
+            // **The largest single act in this module, and the sentence says so
+            // in the terms the user can check.** It names the database, because
+            // this is the one plan where reading the wrong name and clicking
+            // Apply costs everything — and it names the *contents* rather than
+            // the operation, because "drops the database" is a sentence someone
+            // who meant to drop a table would also read as fine.
+            //
+            // No row count. Every other drop in here gets one from
+            // `stats::drop_prompt`, but a whole database's is the sum of a
+            // schema fetch this change has never made, and a figure that arrived
+            // as `~0` on a stale tree would be worse than none.
+            Change::DropDatabase { name } => vec![format!(
+                "Drops the database {name} and everything in it — every table and \
+                 all its rows, every view, index, routine and trigger. Nothing is \
+                 kept and there is no undo: the only way back is a backup taken \
+                 before this runs."
+            )],
+            // A namespace's drop is never `CASCADE`, so the server refuses while
+            // anything is in it — which makes this the rare drop whose worst case
+            // is a *refusal*. The sentence says that, rather than borrowing the
+            // database line's weight for something that cannot silently destroy.
+            //
+            // **It names no engine**, though only PostgreSQL has namespaces
+            // today. `risks` takes a `dialect` precisely so a consequence can be
+            // stated per engine, and a hardcoded "PostgreSQL refuses…" inside an
+            // arm that ignores its `dialect` is the defect `view_drop_cost` was
+            // extracted to fix — a sentence that becomes false for the second
+            // engine to arrive, with no comparison left to grep for. What is
+            // true of any engine with namespaces is that *the server* refuses,
+            // which is also the thing the reader needs to know.
+            Change::DropSchema { name } => vec![format!(
+                "Drops the schema {name}. The server refuses while it still holds \
+                 tables, views or routines, so this either takes an empty schema \
+                 or fails — Schemaic never sends CASCADE."
             )],
             _ => Vec::new(),
         }
@@ -3360,7 +3546,12 @@ impl ChangeSet {
     /// has to go before the column it constrains.
     fn emit_mysql(&self) -> Vec<String> {
         let d = self.dialect;
-        let mut out = self.view_statements();
+        // A container is **created** before anything that could live inside it
+        // and **dropped** after everything that could — see
+        // `container_creates`/`container_drops` for the asymmetry. The drops go
+        // on at the very end of this function.
+        let mut out = self.container_creates();
+        out.extend(self.view_statements());
         // Functions before triggers: a trigger can't be created until the
         // function it executes exists. Today a change set only ever holds one
         // kind, so nothing depends on this yet — which is exactly why it's worth
@@ -3519,6 +3710,8 @@ impl ChangeSet {
                 ));
             }
         }
+        // …and the container goes last of all, after everything that lived in it.
+        out.extend(self.container_drops());
         out
     }
 
@@ -3531,7 +3724,10 @@ impl ChangeSet {
     fn emit_postgres(&self) -> Vec<String> {
         let d = self.dialect;
         let q = |s: &str| ddl_ident_in(s, d);
-        let mut out = self.view_statements();
+        // Created first, dropped last — see `emit_mysql`, which orders these the
+        // same way, and `container_drops` for why the two ends differ.
+        let mut out = self.container_creates();
+        out.extend(self.view_statements());
         // Functions before triggers: a trigger can't be created until the
         // function it executes exists. Today a change set only ever holds one
         // kind, so nothing depends on this yet — which is exactly why it's worth
@@ -3688,6 +3884,8 @@ impl ChangeSet {
                 out.push(format!("ALTER TABLE {} RENAME TO {};", self.qname(), q(to)));
             }
         }
+        // …and the container goes last of all, after everything that lived in it.
+        out.extend(self.container_drops());
         out
     }
 
@@ -4264,6 +4462,78 @@ impl ChangeSet {
             }
         }
         out
+    }
+
+    /// The database and namespace statements — the only ones in this emitter
+    /// that **do not address [`ChangeSet::table`]**.
+    ///
+    /// Every other builder here qualifies against `self.qname()`, because every
+    /// other change is about a table or an object sitting in one. These four are
+    /// about the container itself, so each carries its own name and this is the
+    /// one place where `table`/`schema` are deliberately unread — see
+    /// [`server_level`], which is how such a set is built.
+    ///
+    /// Called from the MySQL and PostgreSQL emitters on the same rule
+    /// [`ChangeSet::object_statements`] follows: from *both*, so a change set
+    /// arriving at the wrong one emits SQL that server can reject rather than
+    /// being silently dropped on the floor. SQLite has neither concept
+    /// ([`supports_database_editing`]), and its emitter filters on
+    /// [`supports_change`], so nothing reaches it there either way.
+    ///
+    /// **A create and a drop go to opposite ends of the plan**, which is why
+    /// this is two functions and not one — see [`ChangeSet::container_drops`].
+    fn container_creates(&self) -> Vec<String> {
+        let d = self.dialect;
+        let q = |s: &str| ddl_ident_in(s, d);
+        let mut out = Vec::new();
+        for c in &self.changes {
+            match c {
+                Change::CreateDatabase(draft) => out.push(draft.create_sql(d)),
+                Change::CreateSchema { name, owner } => {
+                    let auth = owner
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|o| format!(" AUTHORIZATION {}", q(o.trim())))
+                        .unwrap_or_default();
+                    out.push(format!("CREATE SCHEMA {}{auth};", q(name)));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `DROP DATABASE` / `DROP SCHEMA` — [`ChangeSet::container_creates`]'s other
+    /// half, and emitted at the **end** of the plan where those are emitted at
+    /// the start.
+    ///
+    /// The asymmetry is the point, and the two were one function until a review
+    /// caught it. A container has to exist *before* anything inside it is
+    /// created and has to survive *until* everything inside it is done with:
+    /// emitting a `DROP SCHEMA sales` first would take the namespace away from
+    /// every statement after it that names `sales.orders`, and the server would
+    /// answer `schema "sales" does not exist` for the rest of the plan. Same
+    /// shape as the clause ordering in [`ChangeSet::emit_mysql`], where
+    /// constraints come off first and columns are added last.
+    ///
+    /// Unreachable today — [`server_level`] builds single-change sets and
+    /// [`diff`] never produces a container change — so this is the ordering
+    /// being right rather than a bug being fixed. It is written down because a
+    /// single function with a comment claiming the position was universally safe
+    /// is exactly what a later edit builds a real bug on.
+    ///
+    /// No `CASCADE`, ever — see [`Change::DropSchema`].
+    fn container_drops(&self) -> Vec<String> {
+        let d = self.dialect;
+        let q = |s: &str| ddl_ident_in(s, d);
+        self.changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::DropDatabase { name } => Some(format!("DROP DATABASE {};", q(name))),
+                Change::DropSchema { name } => Some(format!("DROP SCHEMA {};", q(name))),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -5188,6 +5458,36 @@ pub fn common_types(dialect: SqlDialect) -> &'static [&'static str] {
 /// types are.
 pub const MYSQL_ENGINES: [&str; 4] = ["InnoDB", "MyISAM", "MEMORY", "ARCHIVE"];
 
+/// MySQL character sets offered beside the free-text field, `utf8mb4` first
+/// because it is the only one worth choosing for new work — the others are here
+/// to be *recognised* when matching an existing database, not recommended.
+///
+/// A **shortcut, not a picker**, the same standing [`common_types`] has: the
+/// server is the authority on what a character set is, the list of them is
+/// per-server and per-version, and the field stays free text so a build with a
+/// set this list has never heard of is one keystroke rather than a dead end.
+pub const MYSQL_CHARSETS: [&str; 6] = ["utf8mb4", "utf8mb3", "latin1", "ascii", "binary", "utf16"];
+
+/// MySQL collations offered beside the free-text field.
+///
+/// **Deliberately not filtered by the chosen character set**, though a collation
+/// really does belong to one. Filtering would make this a picker — it would have
+/// to be right, which needs the server's own `SHOW COLLATION` for that version —
+/// and a wrong filter hides the answer the user wanted. As a shortcut it only
+/// has to be *useful*: these are the five anybody types, the server rejects a
+/// mismatched pair with a clear message, and the field is free text either way.
+///
+/// `utf8mb4_0900_ai_ci` is MySQL 8's default and does not exist on MariaDB;
+/// `utf8mb4_general_ci` exists on both. Both are listed rather than one chosen,
+/// because which server is on the other end is not this constant's business.
+pub const MYSQL_COLLATIONS: [&str; 5] = [
+    "utf8mb4_general_ci",
+    "utf8mb4_unicode_ci",
+    "utf8mb4_0900_ai_ci",
+    "utf8mb4_bin",
+    "latin1_swedish_ci",
+];
+
 // ── Type + default equivalence ───────────────────────────────────────────────
 
 /// A declared type taken apart: its base keyword(s) and whatever was inside the
@@ -5988,6 +6288,93 @@ pub fn supports_view_editing(dialect: SqlDialect) -> bool {
                 replay: Vec::new(),
             },
         )
+}
+
+/// Can `dialect` create and drop **databases** — the container everything else
+/// in this module lives in?
+///
+/// True on MySQL and PostgreSQL. False on SQLite, where a database is a file:
+/// see [`supports_change`]'s arm for why that is a refusal rather than a
+/// filesystem action wearing a DDL preview.
+///
+/// Computed from [`supports_change`] rather than written as a `match`, for the
+/// reason `CLAUDE.md` gives about constants standing in for capabilities: a
+/// literal here would be the same engine test with nothing left to grep for.
+pub fn supports_database_editing(dialect: SqlDialect) -> bool {
+    supports_change(dialect, &Change::CreateDatabase(Box::default()))
+        && supports_change(
+            dialect,
+            &Change::DropDatabase {
+                name: String::new(),
+            },
+        )
+}
+
+/// Can `dialect` create and drop **namespaces inside** a database?
+///
+/// PostgreSQL only. MySQL's `CREATE SCHEMA` is a synonym for `CREATE DATABASE`
+/// and means the level above this one; SQLite has no namespaces at all. The
+/// distinction from [`supports_database_editing`] is the whole point of having
+/// two predicates: on MySQL the first is true and this one is false, and a
+/// single "supports containers" answer would have offered `Create schema` there
+/// and quietly made a database.
+///
+/// **Named for the namespace, not for the word the UI shows.** The obvious name
+/// — `supports_schema_editing` — belonged to a *different* predicate that was
+/// deleted from this module: it answered "can this engine edit schema objects at
+/// all", which is the whole of `ddl.rs` rather than one statement in it. Reusing
+/// it would give a reader of `docs/architecture.md` the same name for the two
+/// opposite scopes, one of which that document records as gone. The menu entry
+/// is still labelled `Schema`, because that is what PostgreSQL calls it.
+pub fn supports_namespace_editing(dialect: SqlDialect) -> bool {
+    supports_change(
+        dialect,
+        &Change::CreateSchema {
+            name: String::new(),
+            owner: None,
+        },
+    ) && supports_change(
+        dialect,
+        &Change::DropSchema {
+            name: String::new(),
+        },
+    )
+}
+
+/// Does a container on `dialect` have an **owner** — a role `CREATE DATABASE
+/// OWNER` / `CREATE SCHEMA AUTHORIZATION` names?
+///
+/// PostgreSQL's do. A MySQL database belongs to nobody: it is reached through
+/// grants, and there is no column anywhere that says whose it is. SQLite has
+/// neither roles nor databases.
+///
+/// **An exhaustive `match` rather than a probe of [`supports_change`]**, because
+/// unlike its neighbours this is not a question about a statement the engine
+/// can or cannot run — the change is the same `CreateDatabase` either way, and
+/// what differs is whether a *field* of it means anything. The two callers are
+/// the editor's Owner row and the role fetch that fills its menu, and both need
+/// the answer before there is a change to ask about.
+pub fn supports_owners(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does `dialect` take a **character set and collation** on `CREATE DATABASE`?
+///
+/// MySQL does. PostgreSQL has clauses that look like these and are not offered:
+/// `ENCODING` and `LC_COLLATE` there are refused unless `TEMPLATE template0` and
+/// the locale clauses all agree, so a form field for either would mostly produce
+/// *"new encoding is incompatible with the encoding of the template database"* —
+/// see [`DatabaseDraft`]'s fields. SQLite has no `CREATE DATABASE` at all.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn supports_database_charset(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
 }
 
 /// Can `dialect` redefine a view **in place**, with `CREATE OR REPLACE VIEW`?
@@ -7132,6 +7519,33 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
         return match dialect {
             SqlDialect::MySql => true,
             SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        };
+    }
+    // **A namespace inside a database is PostgreSQL's alone.** MySQL spells
+    // `CREATE SCHEMA` as a synonym for `CREATE DATABASE` — the same statement
+    // under another name, one level up from what this change means — so
+    // accepting it there would emit a plan that creates a *database* while the
+    // preview says "schema", which is the one thing a preview may not do.
+    // SQLite has neither the statement nor the concept. Exhaustive, so a fourth
+    // engine has to answer for itself.
+    if matches!(
+        change,
+        Change::CreateSchema { .. } | Change::DropSchema { .. }
+    ) {
+        return match dialect {
+            SqlDialect::Postgres => true,
+            SqlDialect::MySql | SqlDialect::Sqlite => false,
+        };
+    }
+    // **A database is a file on SQLite, and a file is not DDL.** Creating one
+    // means writing a path the connection form owns, and dropping one means
+    // deleting the user's file off disk — neither is a statement this module
+    // could emit, and offering them would put an irreversible filesystem action
+    // behind a SQL preview that had no SQL in it. Absent, not dimmed.
+    if is_server_level(change) {
+        return match dialect {
+            SqlDialect::MySql | SqlDialect::Postgres => true,
+            SqlDialect::Sqlite => false,
         };
     }
     if dialect != SqlDialect::Sqlite {
@@ -8620,6 +9034,23 @@ pub fn single(table: &str, schema: Option<&str>, dialect: SqlDialect, change: Ch
         flavour: ServerFlavour::Unknown,
         changes: vec![change],
     }
+}
+
+/// A one-change set for a **container** — a database or a namespace, the four
+/// changes [`ChangeSet::database_statements`] writes.
+///
+/// Its own constructor rather than a [`single`] call at each site, because
+/// `single`'s first argument is a *table* and these changes have none. `subject`
+/// lands in [`ChangeSet::table`] so the preview's title and any diagnostic can
+/// name what the plan is about, and it is the one case where that field is
+/// **not** the thing the statements address — each of these changes carries its
+/// own name, and nothing here reads `qname()`.
+///
+/// Callers still ask [`supports_change`] first: this builds the set, it does not
+/// judge it, and `emit` on an engine that has no such statement writes nothing
+/// while the change list still reads as a plan.
+pub fn server_level(subject: &str, dialect: SqlDialect, change: Change) -> ChangeSet {
+    single(subject, None, dialect, change)
 }
 
 #[cfg(test)]
@@ -17505,5 +17936,404 @@ mod event_tests {
              @schemaic_collation_connection = @@SESSION.collation_connection;"
         );
         assert!(!sql.iter().any(|s| s.contains("time_zone")));
+    }
+}
+
+/// The container the rest of this module's objects live in: `CREATE`/`DROP
+/// DATABASE`, and PostgreSQL's `CREATE`/`DROP SCHEMA`.
+#[cfg(test)]
+mod database_tests {
+    use super::*;
+    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+
+    fn create_db(draft: DatabaseDraft, d: SqlDialect) -> ChangeSet {
+        let name = draft.name.clone();
+        server_level(&name, d, Change::CreateDatabase(Box::new(draft)))
+    }
+
+    fn drop_db(name: &str, d: SqlDialect) -> ChangeSet {
+        server_level(name, d, Change::DropDatabase { name: name.into() })
+    }
+
+    #[test]
+    fn a_database_with_no_options_is_one_bare_create() {
+        assert_eq!(
+            create_db(DatabaseDraft::blank("shop"), MySql).emit(),
+            vec!["CREATE DATABASE `shop`;".to_string()]
+        );
+        assert_eq!(
+            create_db(DatabaseDraft::blank("shop"), Postgres).emit(),
+            vec!["CREATE DATABASE \"shop\";".to_string()]
+        );
+    }
+
+    /// Only what the form was given. The clause set is per-engine and every
+    /// field is optional, so an emitter that restated a default would be making
+    /// a choice the user never reviewed — and on PostgreSQL an unasked-for
+    /// `ENCODING` is a choice the *server* rejects.
+    #[test]
+    fn a_database_carries_only_the_clauses_it_was_given() {
+        let d = DatabaseDraft {
+            name: "shop".into(),
+            charset: Some("utf8mb4".into()),
+            collation: None,
+            owner: None,
+        };
+        assert_eq!(
+            create_db(d, MySql).emit(),
+            vec!["CREATE DATABASE `shop` CHARACTER SET 'utf8mb4';".to_string()]
+        );
+        let d = DatabaseDraft {
+            name: "shop".into(),
+            charset: Some("utf8mb4".into()),
+            collation: Some("utf8mb4_unicode_ci".into()),
+            owner: None,
+        };
+        assert_eq!(
+            create_db(d, MySql).emit(),
+            vec![
+                "CREATE DATABASE `shop` CHARACTER SET 'utf8mb4' COLLATE 'utf8mb4_unicode_ci';"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// **A charset is a string literal and an owner is an identifier**, and the
+    /// two are quoted differently on purpose — see `DatabaseDraft::create_sql`.
+    /// Quoting the charset as an identifier parses on MySQL and means something
+    /// subtly different; quoting the owner as a string does not parse at all.
+    #[test]
+    fn a_charset_is_a_literal_and_an_owner_is_an_identifier() {
+        let sql = create_db(
+            DatabaseDraft {
+                name: "shop".into(),
+                charset: Some("utf8mb4".into()),
+                ..Default::default()
+            },
+            MySql,
+        )
+        .emit();
+        assert!(sql[0].contains("CHARACTER SET 'utf8mb4'"), "{}", sql[0]);
+        assert!(!sql[0].contains("CHARACTER SET `utf8mb4`"), "{}", sql[0]);
+
+        let sql = create_db(
+            DatabaseDraft {
+                name: "shop".into(),
+                owner: Some("app".into()),
+                ..Default::default()
+            },
+            Postgres,
+        )
+        .emit();
+        assert_eq!(sql, vec!["CREATE DATABASE \"shop\" OWNER \"app\";"]);
+    }
+
+    /// Blank and whitespace-only option fields are the form's resting state, not
+    /// a request for `CHARACTER SET ''`.
+    #[test]
+    fn blank_option_fields_add_no_clause() {
+        let sql = create_db(
+            DatabaseDraft {
+                name: "shop".into(),
+                charset: Some(String::new()),
+                collation: Some("   ".into()),
+                owner: Some("  ".into()),
+            },
+            MySql,
+        )
+        .emit();
+        assert_eq!(sql, vec!["CREATE DATABASE `shop`;"]);
+    }
+
+    #[test]
+    fn dropping_a_database_is_one_unwrapped_statement() {
+        assert_eq!(
+            drop_db("shop", MySql).emit(),
+            vec!["DROP DATABASE `shop`;".to_string()]
+        );
+        assert_eq!(
+            drop_db("shop", Postgres).emit(),
+            vec!["DROP DATABASE \"shop\";".to_string()]
+        );
+    }
+
+    /// The gate `dropping_an_event_is_destructive_and_says_why` exists for,
+    /// applied to the largest drop in the module: `is_destructive` is
+    /// `!risks().is_empty()`, so an emptied arm silently turns this into an
+    /// ordinary change the preview applies with no warning above Apply.
+    ///
+    /// It also pins that the sentence **names the database**. This is the one
+    /// plan where reading past the wrong name costs everything, and a generic
+    /// "drops the database" would read as fine to someone who meant a table.
+    #[test]
+    fn dropping_a_database_is_destructive_and_names_it() {
+        let cs = drop_db("shop", MySql);
+        assert!(cs.changes[0].is_destructive(MySql));
+        let risks = cs.destructive();
+        assert_eq!(risks.len(), 1);
+        assert!(risks[0].contains("shop"), "{}", risks[0]);
+        assert!(risks[0].contains("no undo"), "{}", risks[0]);
+        // And a create is not destructive — the pair, so neither half can drift
+        // into the other's answer.
+        assert!(
+            !create_db(DatabaseDraft::blank("shop"), MySql).changes[0].is_destructive(MySql),
+            "creating a database destroys nothing"
+        );
+    }
+
+    /// **The seam this feature is built on**, and the one a later edit is most
+    /// likely to break: a container change carries its own name, so the change
+    /// set's `table` is deliberately unread. `server_level` puts the subject
+    /// there for the preview's title, and an emitter that reached for
+    /// `qname()` — as every other builder in this module does — would emit a
+    /// plan addressing the wrong object while the change list still read right.
+    #[test]
+    fn a_container_change_ignores_the_change_sets_subject() {
+        let cs = server_level(
+            "the title",
+            MySql,
+            Change::DropDatabase {
+                name: "shop".into(),
+            },
+        );
+        assert_eq!(cs.emit(), vec!["DROP DATABASE `shop`;"]);
+        let cs = server_level(
+            "the title",
+            Postgres,
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+        );
+        assert_eq!(cs.emit(), vec!["CREATE SCHEMA \"sales\";"]);
+    }
+
+    #[test]
+    fn a_schema_takes_authorization_only_when_it_is_given_one() {
+        let bare = server_level(
+            "sales",
+            Postgres,
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+        );
+        assert_eq!(bare.emit(), vec!["CREATE SCHEMA \"sales\";"]);
+        let owned = server_level(
+            "sales",
+            Postgres,
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: Some("app".into()),
+            },
+        );
+        assert_eq!(
+            owned.emit(),
+            vec!["CREATE SCHEMA \"sales\" AUTHORIZATION \"app\";"]
+        );
+    }
+
+    /// `DROP SCHEMA … CASCADE` drops every table in the namespace. Schemaic
+    /// never sends it — the same call `Change::DropObject` makes — so the worst
+    /// this plan can do is be refused, and the risk sentence promises exactly
+    /// that. Both halves are asserted together, because the sentence becomes a
+    /// lie the moment the keyword is added.
+    #[test]
+    fn dropping_a_schema_never_cascades_and_says_so() {
+        let cs = server_level(
+            "sales",
+            Postgres,
+            Change::DropSchema {
+                name: "sales".into(),
+            },
+        );
+        assert_eq!(cs.emit(), vec!["DROP SCHEMA \"sales\";"]);
+        let risks = cs.destructive();
+        assert_eq!(risks.len(), 1);
+        assert!(risks[0].contains("CASCADE"), "{}", risks[0]);
+    }
+
+    /// A database is server-level and a namespace is not — the classification
+    /// that decides which connection the plan runs on, whether it may sit in a
+    /// transaction, and what is refreshed afterwards. Getting it backwards for
+    /// `CreateSchema` would send an ordinary in-database statement down the
+    /// untransacted maintenance-connection path.
+    #[test]
+    fn only_the_database_changes_are_server_level() {
+        assert!(is_server_level(&Change::CreateDatabase(Box::default())));
+        assert!(is_server_level(&Change::DropDatabase {
+            name: "shop".into()
+        }));
+        assert!(!is_server_level(&Change::CreateSchema {
+            name: "sales".into(),
+            owner: None,
+        }));
+        assert!(!is_server_level(&Change::DropSchema {
+            name: "sales".into()
+        }));
+        assert!(!is_server_level(&Change::DropTable));
+    }
+
+    /// The two capabilities are **not** one capability, which is the whole
+    /// reason there are two: MySQL has databases and no namespaces, and its
+    /// `CREATE SCHEMA` is a synonym for `CREATE DATABASE` — so a single answer
+    /// would have offered `Create schema` on MySQL and quietly made a database.
+    #[test]
+    fn mysql_has_databases_but_no_namespaces() {
+        assert!(supports_database_editing(MySql));
+        assert!(!supports_namespace_editing(MySql));
+        assert!(supports_database_editing(Postgres));
+        assert!(supports_namespace_editing(Postgres));
+    }
+
+    /// SQLite has neither: a database there is a file, so both would be
+    /// filesystem actions wearing a SQL preview with no SQL in it.
+    #[test]
+    fn sqlite_has_neither_databases_nor_namespaces() {
+        assert!(!supports_database_editing(Sqlite));
+        assert!(!supports_namespace_editing(Sqlite));
+        for c in [
+            Change::CreateDatabase(Box::default()),
+            Change::DropDatabase {
+                name: "shop".into(),
+            },
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+            Change::DropSchema {
+                name: "sales".into(),
+            },
+        ] {
+            assert!(!supports_change(Sqlite, &c), "SQLite accepted {c:?}");
+        }
+    }
+
+    /// The two option capabilities answer for **different** engines, which is
+    /// the only reason there are two of them: PostgreSQL has owners and no
+    /// offerable charset, MySQL has the charset and no owners. One "does this
+    /// engine have database options" predicate would have put an `OWNER` clause
+    /// in a MySQL form and an `ENCODING` in a PostgreSQL one.
+    #[test]
+    fn owners_and_charsets_belong_to_different_engines() {
+        assert!(supports_owners(Postgres));
+        assert!(!supports_owners(MySql));
+        assert!(!supports_owners(Sqlite));
+
+        assert!(supports_database_charset(MySql));
+        assert!(!supports_database_charset(Postgres));
+        assert!(!supports_database_charset(Sqlite));
+    }
+
+    /// The shortcut lists are only useful if what they offer is what the field
+    /// accepts — a menu entry that has to be edited after picking it is worse
+    /// than no entry. So every one of them survives the round trip into the
+    /// clause the emitter writes.
+    #[test]
+    fn every_offered_charset_and_collation_lands_in_the_clause() {
+        for cs in MYSQL_CHARSETS {
+            let sql = create_db(
+                DatabaseDraft {
+                    name: "shop".into(),
+                    charset: Some(cs.into()),
+                    ..Default::default()
+                },
+                MySql,
+            )
+            .emit();
+            assert_eq!(
+                sql,
+                vec![format!("CREATE DATABASE `shop` CHARACTER SET '{cs}';")]
+            );
+        }
+        for coll in MYSQL_COLLATIONS {
+            let sql = create_db(
+                DatabaseDraft {
+                    name: "shop".into(),
+                    collation: Some(coll.into()),
+                    ..Default::default()
+                },
+                MySql,
+            )
+            .emit();
+            assert_eq!(
+                sql,
+                vec![format!("CREATE DATABASE `shop` COLLATE '{coll}';")]
+            );
+        }
+    }
+
+    /// `utf8mb4` first, because the list is read top-down and it is the only
+    /// character set worth choosing for new work — the rest are here to be
+    /// recognised when matching an existing database, not recommended.
+    #[test]
+    fn utf8mb4_leads_the_charset_list() {
+        assert_eq!(MYSQL_CHARSETS[0], "utf8mb4");
+        assert!(MYSQL_COLLATIONS[0].starts_with("utf8mb4_"));
+    }
+
+    /// **A container is created before its contents and dropped after them**,
+    /// which is why `container_creates` and `container_drops` are two functions
+    /// emitted at opposite ends rather than one loop at the front.
+    ///
+    /// Nothing builds such a set today — `server_level` makes single-change sets
+    /// and `diff` never produces a container change — so this is asserted by
+    /// hand-building the mixed set a later edit could produce. Emitted at the
+    /// front, the `DROP SCHEMA` would take the namespace away from the statement
+    /// after it and the server would answer `schema "sales" does not exist` for
+    /// the rest of the plan.
+    #[test]
+    fn a_container_is_created_first_and_dropped_last() {
+        let mut cs = server_level("sales", Postgres, Change::DropTable);
+        cs.schema = Some("sales".into());
+        cs.table = "orders".into();
+        cs.changes.push(Change::DropSchema {
+            name: "sales".into(),
+        });
+        let sql = cs.emit();
+        assert_eq!(
+            sql,
+            vec![
+                "DROP TABLE \"sales\".\"orders\";".to_string(),
+                "DROP SCHEMA \"sales\";".to_string(),
+            ],
+            "the namespace must outlive the table in it"
+        );
+
+        // And the create is the mirror image: the namespace first, so the table
+        // has somewhere to land.
+        let mut cs = server_level("sales", Postgres, Change::TruncateTable);
+        cs.schema = Some("sales".into());
+        cs.table = "orders".into();
+        cs.changes.insert(
+            0,
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+        );
+        assert_eq!(
+            cs.emit(),
+            vec![
+                "CREATE SCHEMA \"sales\";".to_string(),
+                "TRUNCATE TABLE \"sales\".\"orders\";".to_string(),
+            ]
+        );
+    }
+
+    /// A refused change reaches `unsupported()` rather than being dropped in
+    /// silence — the rule the whole preview rests on: what `emit` leaves out,
+    /// the modal says out loud and Apply refuses. Without this a SQLite
+    /// `Create database` would open a preview with an empty script and an inert
+    /// Apply, which is exactly the bug `supports_change`'s `TruncateTable` arm
+    /// was added to fix.
+    #[test]
+    fn a_container_change_sqlite_refuses_is_withheld_not_silent() {
+        let cs = server_level("shop", Sqlite, Change::CreateDatabase(Box::default()));
+        assert!(cs.emit().is_empty());
+        assert!(
+            !cs.unsupported().is_empty(),
+            "SQLite emitted nothing and said nothing"
+        );
     }
 }
