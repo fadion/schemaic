@@ -6468,19 +6468,22 @@ pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
 ///   plain refresh, which always works, rather than to a statement the server
 ///   may refuse.
 ///
-/// The remaining case this cannot see is a view that has never been populated
-/// (`WITH NO DATA`): `pg_class.relispopulated` isn't in the schema model, and
-/// the server refuses `CONCURRENTLY` on one. That failure is a clear message
-/// from the engine about a view with no rows in it, which is a better outcome
-/// than never offering the non-blocking form at all.
-pub fn supports_concurrent_refresh(indexes: &[crate::schema::IndexInfo]) -> bool {
-    indexes.iter().any(|i| {
-        i.unique
-            && i.predicate.is_none()
-            && !i.lossy
-            && !i.columns.is_empty()
-            && i.columns.iter().all(|c| !c.expression)
-    })
+/// **A view that has never been populated (`WITH NO DATA`) is asked about
+/// too**, through `populated`. PostgreSQL refuses `CONCURRENTLY` on one, and
+/// the menu offers a single entry with no plain-refresh fallback — so a
+/// `WITH NO DATA` view that happens to carry a unique index made *Refresh view*
+/// fail every time, with no way to reach the form that would have worked. That
+/// was written off here as "a clear message from the engine"; it is a clear
+/// message about an action the user cannot perform any other way.
+pub fn supports_concurrent_refresh(populated: bool, indexes: &[crate::schema::IndexInfo]) -> bool {
+    populated
+        && indexes.iter().any(|i| {
+            i.unique
+                && i.predicate.is_none()
+                && !i.lossy
+                && !i.columns.is_empty()
+                && i.columns.iter().all(|c| !c.expression)
+        })
 }
 
 /// Is this a **materialized** view — the object [`Change::RefreshView`] acts on,
@@ -6510,7 +6513,10 @@ pub fn is_materialized_view(t: &crate::schema::TableInfo) -> bool {
 /// **view**; that answers about the **engine**, and a menu entry needs both.
 pub fn refresh_view_change(t: &crate::schema::TableInfo) -> Option<Change> {
     is_materialized_view(t).then(|| Change::RefreshView {
-        concurrently: supports_concurrent_refresh(&t.indexes),
+        concurrently: supports_concurrent_refresh(
+            t.view_options.as_ref().is_none_or(|o| o.populated),
+            &t.indexes,
+        ),
     })
 }
 
@@ -14195,28 +14201,42 @@ mod tests {
                 vec![i]
             };
 
-            assert!(supports_concurrent_refresh(&idx(|_| {})));
+            assert!(supports_concurrent_refresh(true, &idx(|_| {})));
             // No index at all — the case a materialized view is in by default.
-            assert!(!supports_concurrent_refresh(&[]));
-            assert!(!supports_concurrent_refresh(&idx(|i| i.unique = false)));
+            assert!(!supports_concurrent_refresh(true, &[]));
+            assert!(!supports_concurrent_refresh(
+                true,
+                &idx(|i| i.unique = false)
+            ));
             // Partial: covers a subset of the rows, which is exactly what the
             // server checks for.
-            assert!(!supports_concurrent_refresh(&idx(
-                |i| i.predicate = Some("active".into())
-            )));
+            assert!(!supports_concurrent_refresh(
+                true,
+                &idx(|i| i.predicate = Some("active".into()))
+            ));
             // An expression key is not a column, and the server's requirement is
             // spelled in columns — `lower(name)` is refused.
-            assert!(!supports_concurrent_refresh(&idx(
-                |i| i.columns = vec![IndexColumn::expr("lower(name)")]
-            )));
+            assert!(!supports_concurrent_refresh(
+                true,
+                &idx(|i| i.columns = vec![IndexColumn::expr("lower(name)")])
+            ));
             // Lossy: what was read back is not the whole index, so none of the
             // checks above was made against the whole of it.
-            assert!(!supports_concurrent_refresh(&idx(|i| i.lossy = true)));
-            assert!(!supports_concurrent_refresh(&idx(|i| i.columns.clear())));
+            assert!(!supports_concurrent_refresh(true, &idx(|i| i.lossy = true)));
+            assert!(!supports_concurrent_refresh(
+                true,
+                &idx(|i| i.columns.clear())
+            ));
             // One qualifying index among several is enough.
             let mut many = idx(|i| i.unique = false);
             many.extend(idx(|i| i.name = "mv_uk".into()));
-            assert!(supports_concurrent_refresh(&many));
+            assert!(supports_concurrent_refresh(true, &many));
+            // **And a view created `WITH NO DATA` takes neither form**, index
+            // or no index: PostgreSQL refuses `CONCURRENTLY` on an unpopulated
+            // view, and the menu has one entry with no plain fallback — so the
+            // qualifying index above made *Refresh view* fail every time.
+            assert!(!supports_concurrent_refresh(false, &idx(|_| {})));
+            assert!(!supports_concurrent_refresh(false, &many));
         }
 
         /// What the designer refuses to hand to the preview.
