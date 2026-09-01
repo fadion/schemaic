@@ -2250,6 +2250,24 @@ pub enum Change {
     DropView {
         materialized: bool,
     },
+    /// Rebuild a **materialized** view's stored rows by re-running its query —
+    /// PostgreSQL's `REFRESH MATERIALIZED VIEW`, the one thing that can be done
+    /// to such a view here that isn't dropping it.
+    ///
+    /// It is a change rather than a statement the menu sends itself, for the
+    /// reason `TruncateTable` is one: it re-runs a query of unknown cost against
+    /// live data, and the preview is where the user sees which statement — plain
+    /// or `CONCURRENTLY` — is about to run.
+    ///
+    /// `concurrently` is **not a preference**. PostgreSQL takes an `ACCESS
+    /// EXCLUSIVE` lock for a plain refresh, so every reader of the view blocks
+    /// until it finishes; `CONCURRENTLY` avoids that but the server requires a
+    /// unique index over the whole view to do it, and refuses without one. So the
+    /// flag is [`supports_concurrent_refresh`]'s answer about *this* view's
+    /// indexes, decided before the change is built.
+    RefreshView {
+        concurrently: bool,
+    },
     /// Create a trigger that doesn't exist yet.
     CreateTrigger(Box<TriggerDraft>),
     /// Redefine an existing trigger — always a `DROP` followed by a `CREATE`,
@@ -2676,6 +2694,20 @@ impl Change {
                     if *materialized { "materialized " } else { "" }
                 )
             }
+            // The lock is the half a reader can't see in the SQL, and it is the
+            // one that decides whether this is safe to run now: a plain refresh
+            // blocks every reader of the view for as long as its query takes.
+            // Said here rather than in `risks`, which is what `is_destructive`
+            // reads — a refresh destroys nothing, and dressing it in the drop
+            // colours would spend the warning that Drop needs.
+            Change::RefreshView { concurrently } => format!(
+                "Rebuild the materialized view's rows{}",
+                if *concurrently {
+                    " without blocking readers"
+                } else {
+                    " — readers are blocked until it finishes"
+                }
+            ),
             Change::CreateTrigger(d) => format!("Create trigger {}", d.info.name),
             Change::ReplaceTrigger { draft } => {
                 let server = draft.original.as_deref().unwrap_or(&draft.info.name);
@@ -4066,6 +4098,16 @@ impl ChangeSet {
                 Change::DropView { materialized } => {
                     out.push(drop_view_sql(&self.qname(), *materialized))
                 }
+                // Gated here rather than left to the emitter that called it:
+                // `emit_sqlite`'s `supported()` filter is the *only*
+                // `supports_change` in any of the three, and this builder runs
+                // before even that one — so without this guard an engine with no
+                // materialized view would be handed a statement it has no word
+                // for. The arm simply doesn't match when the answer is no, and
+                // `unsupported()` is what then reports the omission.
+                Change::RefreshView { concurrently } if supports_change(d, c) => {
+                    out.push(refresh_view_sql(&self.qname(), *concurrently))
+                }
                 // MySQL has no `ALTER VIEW … RENAME`; `RENAME TABLE` is what it
                 // renames a view with. Spelled out per engine rather than
                 // `_ =>`, which silently handed SQLite MySQL's statement.
@@ -4921,6 +4963,21 @@ fn drop_view_sql(qname: &str, materialized: bool) -> String {
     format!(
         "DROP {}VIEW {qname};",
         if materialized { "MATERIALIZED " } else { "" }
+    )
+}
+
+/// `REFRESH MATERIALIZED VIEW`, with no `WITH [NO] DATA` clause.
+///
+/// `WITH DATA` is the default and saying it adds nothing; `WITH NO DATA` is the
+/// opposite of what this action is for — it leaves the view unscannable, so
+/// every query against it fails until someone refreshes it again. There is no
+/// spelling of this for the other two engines: neither has a materialized view,
+/// which is why [`supports_change`] answers for the statement rather than this
+/// helper taking a dialect.
+fn refresh_view_sql(qname: &str, concurrently: bool) -> String {
+    format!(
+        "REFRESH MATERIALIZED VIEW {}{qname};",
+        if concurrently { "CONCURRENTLY " } else { "" }
     )
 }
 
@@ -6388,6 +6445,75 @@ pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
 }
 
+/// Can this materialized view be refreshed **without locking out its readers**
+/// — i.e. does `REFRESH MATERIALIZED VIEW CONCURRENTLY` apply to it?
+///
+/// PostgreSQL requires *at least one* `UNIQUE` index that names only columns and
+/// covers every row, and refuses the statement outright without one: *"cannot
+/// refresh materialized view … concurrently"*. So this is a question about the
+/// view's indexes, not about the engine — the caller has already established
+/// that it is looking at a materialized view, which only one engine has.
+///
+/// Four things disqualify an index, and the last is the conservative one:
+///
+/// - not `UNIQUE` — the server needs the key to match old rows against new ones;
+/// - **partial** ([`IndexInfo::predicate`]) — it covers a subset of the rows,
+///   and the server checks exactly that;
+/// - an **expression** key ([`IndexColumn::expression`](crate::schema::IndexColumn::expression))
+///   — `lower(name)` is not a column, and the server's requirement is spelled in
+///   columns;
+/// - **[`lossy`](IndexInfo::lossy)** — an index whose keys could not all be read
+///   back, so what is in `columns` is not the whole index and none of the three
+///   checks above was made against the whole of it. Uncertainty resolves to the
+///   plain refresh, which always works, rather than to a statement the server
+///   may refuse.
+///
+/// The remaining case this cannot see is a view that has never been populated
+/// (`WITH NO DATA`): `pg_class.relispopulated` isn't in the schema model, and
+/// the server refuses `CONCURRENTLY` on one. That failure is a clear message
+/// from the engine about a view with no rows in it, which is a better outcome
+/// than never offering the non-blocking form at all.
+pub fn supports_concurrent_refresh(indexes: &[crate::schema::IndexInfo]) -> bool {
+    indexes.iter().any(|i| {
+        i.unique
+            && i.predicate.is_none()
+            && !i.lossy
+            && !i.columns.is_empty()
+            && i.columns.iter().all(|c| !c.expression)
+    })
+}
+
+/// Is this a **materialized** view — the object [`Change::RefreshView`] acts on,
+/// and the one view form no editor here can open?
+///
+/// One definition, because two callers already ask it for opposite purposes:
+/// the schema tree's menu, to offer the refresh, and `view_editor`'s
+/// `is_editable_view`, to withhold the editor. Asked of the *object* rather than
+/// of the engine — only PostgreSQL sets the flag, so nothing here needs a
+/// dialect.
+pub fn is_materialized_view(t: &crate::schema::TableInfo) -> bool {
+    t.is_view && t.view_options.as_ref().is_some_and(|o| o.materialized)
+}
+
+/// The refresh `t` takes, or `None` if `t` is not a materialized view.
+///
+/// **The whole decision in one place, so it can be tested as one.** The two
+/// halves — is there anything to refresh, and which of the two statements does
+/// this view take — were assembled in the schema menu's closure, which closes
+/// over a `Ui` and so cannot be reached from a test at all. What that leaves
+/// untested is not either predicate but their *composition with the caller*: the
+/// wrong table's indexes, or an inverted flag, is invisible to a test of
+/// [`supports_concurrent_refresh`] alone and turns a non-blocking refresh into
+/// one that locks every reader out.
+///
+/// The caller still asks [`supports_change`] as well. This answers about the
+/// **view**; that answers about the **engine**, and a menu entry needs both.
+pub fn refresh_view_change(t: &crate::schema::TableInfo) -> Option<Change> {
+    is_materialized_view(t).then(|| Change::RefreshView {
+        concurrently: supports_concurrent_refresh(&t.indexes),
+    })
+}
+
 /// Can `dialect` rename a view with a statement, leaving its body alone?
 ///
 /// PostgreSQL has `ALTER VIEW … RENAME TO` and MySQL renames one with
@@ -7532,6 +7658,18 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
         change,
         Change::CreateSchema { .. } | Change::DropSchema { .. }
     ) {
+        return match dialect {
+            SqlDialect::Postgres => true,
+            SqlDialect::MySql | SqlDialect::Sqlite => false,
+        };
+    }
+    // **A materialized view is PostgreSQL's alone, and so is the statement that
+    // rebuilds one.** MySQL and SQLite have no such object — not a missing
+    // emitter arm, an object that cannot exist — so there is nothing for them to
+    // refresh and no word for it either. Asked before the blanket answer below
+    // for the same reason a scheduled event is: "everything but SQLite" is the
+    // wrong shape here. Exhaustive, so a fourth engine has to say for itself.
+    if matches!(change, Change::RefreshView { .. }) {
         return match dialect {
             SqlDialect::Postgres => true,
             SqlDialect::MySql | SqlDialect::Sqlite => false,
@@ -13913,6 +14051,172 @@ mod tests {
                 Change::DropView { materialized: true },
             );
             assert_eq!(cs.script(), r#"DROP MATERIALIZED VIEW "city_stats";"#);
+        }
+
+        /// The statement itself, both forms, and the fact that it destroys
+        /// nothing — `destructive()` is what colours the modal's Apply and
+        /// demands a confirmation, and a refresh may not spend either.
+        #[test]
+        fn refreshing_a_materialized_view_emits_one_statement() {
+            let cs = single(
+                "city_stats",
+                Some("public"),
+                Postgres,
+                Change::RefreshView {
+                    concurrently: false,
+                },
+            );
+            assert_eq!(
+                cs.script(),
+                r#"REFRESH MATERIALIZED VIEW "city_stats";"#,
+                "{}",
+                cs.script()
+            );
+            assert!(cs.destructive().is_empty(), "{:?}", cs.destructive());
+            // The lock is what the summary has to say, since the SQL doesn't.
+            assert!(
+                cs.changes[0].summary().contains("blocked"),
+                "{}",
+                cs.changes[0].summary()
+            );
+
+            let cs = single(
+                "city_stats",
+                Some("sales"),
+                Postgres,
+                Change::RefreshView { concurrently: true },
+            );
+            assert_eq!(
+                cs.script(),
+                r#"REFRESH MATERIALIZED VIEW CONCURRENTLY "sales"."city_stats";"#,
+                "{}",
+                cs.script()
+            );
+            // The promise this form makes to the user, and the one thing the SQL
+            // alone doesn't tell them. Asserted in its own right rather than
+            // left to the plain arm's `contains("blocked")`, which only catches
+            // the two branches being swapped whole.
+            let s = cs.changes[0].summary();
+            assert!(s.contains("without blocking readers"), "{s}");
+            assert!(!s.contains("blocked"), "{s}");
+        }
+
+        /// **The composition, not the two predicates.** `supports_concurrent_refresh`
+        /// and "is this a materialized view" are each pinned above; what this
+        /// pins is that one function puts them together over *one* table's own
+        /// indexes, which is the seam the schema menu used to hold in a closure
+        /// no test could reach.
+        #[test]
+        fn the_refresh_a_view_takes_is_decided_from_that_view() {
+            use crate::schema::{IndexInfo, ViewOptions};
+            let matview = |indexes: Vec<IndexInfo>| TableInfo {
+                name: "city_stats".into(),
+                is_view: true,
+                view_options: Some(ViewOptions {
+                    materialized: true,
+                    ..Default::default()
+                }),
+                indexes,
+                ..Default::default()
+            };
+
+            // No index → the plain, blocking form.
+            assert_eq!(
+                refresh_view_change(&matview(vec![])),
+                Some(Change::RefreshView {
+                    concurrently: false
+                })
+            );
+            // A whole unique index → the non-blocking one.
+            assert_eq!(
+                refresh_view_change(&matview(vec![IndexInfo::plain("mv_pk", vec!["id"], true)])),
+                Some(Change::RefreshView { concurrently: true })
+            );
+            // And nothing at all for anything that isn't a materialized view —
+            // a `REFRESH MATERIALIZED VIEW` at a plain one is an error from the
+            // server, which is what makes this the gate and not a formality.
+            let mut plain = matview(vec![]);
+            plain.view_options = Some(ViewOptions::default());
+            assert!(!is_materialized_view(&plain));
+            assert_eq!(refresh_view_change(&plain), None);
+
+            let mut table = matview(vec![]);
+            table.is_view = false;
+            assert_eq!(refresh_view_change(&table), None);
+
+            // A view whose options were never read is not assumed to be one.
+            let mut unread = matview(vec![]);
+            unread.view_options = None;
+            assert_eq!(refresh_view_change(&unread), None);
+        }
+
+        /// **A word only one engine has.** MySQL and SQLite have no materialized
+        /// view, so the change is refused rather than emitted in some
+        /// approximate spelling — and the refusal is checked at the *emitter*,
+        /// not only at `supports_change`, because `view_statements` runs outside
+        /// both of the filters that would otherwise have caught it.
+        #[test]
+        fn a_refresh_cannot_reach_an_engine_without_materialized_views() {
+            for d in [MySql, Sqlite] {
+                let c = Change::RefreshView {
+                    concurrently: false,
+                };
+                assert!(!supports_change(d, &c), "{d:?}");
+                let cs = single("city_stats", None, d, c);
+                // No statement — and the copied script says the plan is
+                // incomplete rather than looking like it did nothing, which is
+                // `withheld_header`'s whole job.
+                assert!(cs.emit().is_empty(), "{d:?}: {:?}", cs.emit());
+                assert!(cs.script().starts_with("-- INCOMPLETE"), "{d:?}");
+            }
+            assert!(supports_change(
+                Postgres,
+                &Change::RefreshView {
+                    concurrently: false
+                }
+            ));
+        }
+
+        /// Which index makes the non-blocking refresh legal. PostgreSQL wants a
+        /// `UNIQUE` index over every row, named by columns — and everything this
+        /// model can't be sure about resolves to "no", because the plain refresh
+        /// always works and the concurrent one is refused outright.
+        #[test]
+        fn a_concurrent_refresh_needs_one_whole_unique_index() {
+            use crate::schema::{IndexColumn, IndexInfo};
+            let idx = |f: fn(&mut IndexInfo)| {
+                let mut i = IndexInfo {
+                    name: "mv_pk".into(),
+                    columns: vec![IndexColumn::plain("id")],
+                    unique: true,
+                    ..Default::default()
+                };
+                f(&mut i);
+                vec![i]
+            };
+
+            assert!(supports_concurrent_refresh(&idx(|_| {})));
+            // No index at all — the case a materialized view is in by default.
+            assert!(!supports_concurrent_refresh(&[]));
+            assert!(!supports_concurrent_refresh(&idx(|i| i.unique = false)));
+            // Partial: covers a subset of the rows, which is exactly what the
+            // server checks for.
+            assert!(!supports_concurrent_refresh(&idx(
+                |i| i.predicate = Some("active".into())
+            )));
+            // An expression key is not a column, and the server's requirement is
+            // spelled in columns — `lower(name)` is refused.
+            assert!(!supports_concurrent_refresh(&idx(
+                |i| i.columns = vec![IndexColumn::expr("lower(name)")]
+            )));
+            // Lossy: what was read back is not the whole index, so none of the
+            // checks above was made against the whole of it.
+            assert!(!supports_concurrent_refresh(&idx(|i| i.lossy = true)));
+            assert!(!supports_concurrent_refresh(&idx(|i| i.columns.clear())));
+            // One qualifying index among several is enough.
+            let mut many = idx(|i| i.unique = false);
+            many.extend(idx(|i| i.name = "mv_uk".into()));
+            assert!(supports_concurrent_refresh(&many));
         }
 
         /// What the designer refuses to hand to the preview.
