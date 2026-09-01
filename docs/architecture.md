@@ -3480,6 +3480,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   case with no expected text (`timestamptz`, whose rendering follows the server's `TimeZone`) still
   asserts the NULL row and the write back; both matrix tests assert a **floor** on how many cases
   ran, since a matrix that walked nothing at all is otherwise a pair of passes.
+  **`editable.rs` is the other half nothing else reaches.** Every `edit::analyze_edit` unit test
+  hands the ladder a `ColumnOrigin` written out by hand, so what they prove is that it works on
+  metadata a test *imagined*; whether a real driver reports `org_table` for an aliased column, a
+  `table_oid` for each side of a join, a primary-key flag at all, or anything whatsoever for an
+  expression is decided on the wire, and the two halves used to meet only inside the running app.
+  `Scratch::edit_model` closes that seam — it runs the query, introspects the scratch database and
+  builds the model from both, which is the app's own composition. Each rung of the ladder has a test
+  and so does each refusal, and the refusals are the ones that matter: a wrong key does not fail
+  loudly, it writes to a row nobody asked for, with only the 1-row net behind it. Removing the
+  `NOT NULL` guard from the unique-index rung fails `a_nullable_unique_index_is_no_key_at_all` on all
+  three legs and nothing else — checked, not assumed.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
   tier stays pure by construction. With the feature on, an unreachable server is a **failure** —
