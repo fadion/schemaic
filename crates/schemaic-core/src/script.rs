@@ -69,8 +69,12 @@ pub struct Splitter {
     /// An incomplete UTF-8 sequence cut by a block boundary, waiting for its
     /// remaining bytes. See [`push`](Self::push).
     carry: Vec<u8>,
-    /// File offset of `buf[0]`.
+    /// Decoded-byte offset of `buf[0]`, for [`Statement::offset`].
     offset: u64,
+    /// **File** bytes handed to this splitter so far. Distinct from `offset`
+    /// because lossy decoding is not length-preserving; see
+    /// [`consumed`](Self::consumed).
+    raw: u64,
     /// 1-based line of `buf[0]`.
     line: u64,
 }
@@ -84,6 +88,7 @@ impl Splitter {
             buf: String::new(),
             carry: Vec::new(),
             offset: 0,
+            raw: 0,
             line: 1,
         }
     }
@@ -139,13 +144,35 @@ impl Splitter {
                 }
             }
         }
-        self.push_str(&text)
+        // **Counted in the file's bytes, not the decoded text's.** An invalid
+        // byte becomes a three-byte `U+FFFD`, so counting the decoded form made
+        // a latin-1 file report more progress than it had — "5.2 MB of 4.9 MB".
+        self.raw += bytes.len() as u64;
+        self.split(&text)
     }
 
     /// [`push`](Self::push) for text that is already decoded.
     ///
     /// The whole of the splitting logic; `push` is this plus the UTF-8 carry.
     pub fn push_str(&mut self, text: &str) -> Vec<Statement> {
+        self.raw += text.len() as u64;
+        self.split(text)
+    }
+
+    /// The splitting itself, with no byte accounting — the half both
+    /// [`push`](Self::push) and [`push_str`](Self::push_str) share, so the file
+    /// position is counted exactly once whichever door was used.
+    ///
+    /// **Cost.** The buffer is re-scanned from its start on every block, so a
+    /// statement spanning *m* blocks costs O(m²·block). That is fine for a dump,
+    /// whose statements are far smaller than one block, and is why the driver
+    /// grows its reads with [`pending`](Self::pending): a file with no
+    /// terminator in it at all would otherwise re-scan a quarter of a gigabyte
+    /// a thousand times before [`MAX_PENDING_BYTES`] refused it. Resuming the
+    /// scan mid-buffer instead is not free — the scanner would have to carry
+    /// "inside an unterminated string that began at *s*" across the call, and
+    /// getting that wrong mis-splits a file rather than merely slowing it down.
+    fn split(&mut self, text: &str) -> Vec<Statement> {
         self.buf.push_str(text);
         let bounds = sql::statement_bounds_open(&self.buf, self.dialect, &mut self.state);
         let cut = bounds.last().expect("a scan always starts at 0").at;
@@ -213,9 +240,17 @@ impl Splitter {
         self.buf.len() + self.carry.len()
     }
 
-    /// Bytes of the file consumed so far, for a progress reading.
+    /// Bytes **of the file** turned into statements so far, for a progress
+    /// reading against the file's length.
+    ///
+    /// Counted from what was handed in rather than from the decoded buffer,
+    /// because lossy decoding is not length-preserving: an invalid byte becomes
+    /// a three-byte `U+FFFD`, and the decoded count therefore ran *ahead* of the
+    /// file on a mis-encoded dump. Subtracting what is still held can only make
+    /// this an under-estimate, which is the safe direction for a progress bar —
+    /// and it is exact at the end, where nothing is held.
     pub fn consumed(&self) -> u64 {
-        self.offset
+        self.raw.saturating_sub(self.pending() as u64)
     }
 }
 
@@ -702,6 +737,27 @@ mod tests {
             sp.finish();
             assert_eq!(sp.consumed(), SCRIPT.len() as u64, "at a {block}-byte read");
         }
+    }
+
+    /// **Progress is the file's bytes, not the decoded text's.** Lossy decoding
+    /// is not length-preserving — one invalid byte becomes a three-byte
+    /// `U+FFFD` — so counting the buffer made a mis-encoded dump report more
+    /// progress than it had, and a label read "5.2 MB of 4.9 MB".
+    ///
+    /// `consumed_reaches_the_length_of_the_file` could not catch this: its
+    /// fixture is ASCII, where the two counts are equal.
+    #[test]
+    fn consumed_counts_the_files_bytes_even_when_they_do_not_decode() {
+        // Three bytes in, one of them invalid — six bytes of decoded text.
+        let raw = b"\xFF';\xFF';";
+        let mut sp = Splitter::new(SqlDialect::MySql);
+        sp.push(raw);
+        sp.finish();
+        assert_eq!(
+            sp.consumed(),
+            raw.len() as u64,
+            "progress ran past the end of the file"
+        );
     }
 
     /// An empty file is not an error and is not a statement.
