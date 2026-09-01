@@ -1323,7 +1323,18 @@ mod tests {
             Environment::None,
             "→ default"
         );
-        assert_eq!(back.connections[0].tls.mode, SslMode::Disable, "→ default");
+        // **Not `→ default`, which is what this line used to assert.** The two
+        // above degrade to a default because a wrong guess about SSH auth or an
+        // environment badge costs a re-pick. This one decides whether the
+        // password goes on the wire in the clear, so the unknown value resolves
+        // to the *strictest* rung: a rollback that cannot connect until the
+        // mode is corrected, rather than one that silently connects in
+        // plaintext and then saves `"Disable"` over the user's choice.
+        assert_eq!(
+            back.connections[0].tls.mode,
+            SslMode::STRICTEST,
+            "→ strictest, not default"
+        );
         assert_eq!(
             back.connections[0].tls.ca_path, "/etc/ca.crt",
             "the rest of the TLS block survives the unknown mode"
