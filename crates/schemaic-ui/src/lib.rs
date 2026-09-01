@@ -1417,11 +1417,6 @@ pub struct Tab {
     /// supersedes the view run, whose own landing then returns early and never
     /// reaches its clear.
     pub view_busy: RwSignal<bool>,
-    /// Bumped on every fresh full result load (including a filter/sort re-run) so
-    /// the results grid rebuilds even on a `Loaded`→`Loaded` transition — an
-    /// in-place commit splice deliberately does NOT bump it, so it still avoids a
-    /// rebuild. Part of the results-view container key.
-    pub load_gen: RwSignal<u64>,
     /// The `.sql` file this tab is bound to, or `None` for a scratch tab. Set by
     /// Open (Ctrl+O) and by Save As, and persisted with the tab. A tab with a path
     /// takes its title from the file name and shows a modified dot when it has
@@ -1647,6 +1642,23 @@ impl Tab {
         });
     }
 
+    /// Rebuild **this panel's** grid on its next read, even if its state went
+    /// `Loaded` → `Loaded`.
+    ///
+    /// What a filter/sort re-run bumps. Per panel, because the tab-wide nonce it
+    /// replaces rebuilt whichever panel was *shown* — losing that result's
+    /// scroll and selection for a re-run that landed somewhere else entirely.
+    pub fn bump_panel_load(&self, id: u64) {
+        if !self.holds_panel(id) {
+            return;
+        }
+        self.result_tabs.update(|panels| {
+            if let Some(p) = panels.iter_mut().find(|p| p.id == id) {
+                p.load_gen = p.load_gen.wrapping_add(1);
+            }
+        });
+    }
+
     /// Is `id` still in the strip? — the pre-check the two by-id writers make so
     /// a write that would match nothing doesn't notify anyway.
     fn holds_panel(&self, id: u64) -> bool {
@@ -1801,7 +1813,6 @@ impl Tab {
             row_cap_override: cx.create_rw_signal(None),
             view_err: cx.create_rw_signal(None),
             view_busy: cx.create_rw_signal(false),
-            load_gen: cx.create_rw_signal(0),
             path: cx.create_rw_signal(None),
             disk_sql: cx.create_rw_signal(None),
             file_format: cx.create_rw_signal(schemaic_core::sqlfile::SqlFormat::default()),
@@ -2209,6 +2220,16 @@ pub struct ResultPanel {
     pub ran_at: u64,
     /// Per-panel grid state, restored when the strip comes back to it.
     pub view: PanelView,
+    /// Fresh-load nonce, **per panel**: part of the results body's rebuild key,
+    /// so a filter/sort re-run rebuilds the grid despite `Loaded` → `Loaded`
+    /// while an in-place commit splice (which does not bump it) still skips the
+    /// rebuild.
+    ///
+    /// It was one nonce on the *tab*, which is one panel too coarse: a filter
+    /// re-run landing on any panel bumped it, so the panel actually on screen
+    /// was rebuilt too and lost its scroll position and its selection. The
+    /// widths, the sort and a frozen column survive a rebuild; those two do not.
+    pub load_gen: u64,
 }
 
 impl ResultPanel {
@@ -2229,6 +2250,7 @@ impl ResultPanel {
             pinned: false,
             ran_at,
             view: PanelView::new(cx),
+            load_gen: 0,
         }
     }
 
@@ -2245,6 +2267,7 @@ impl ResultPanel {
             pinned: false,
             ran_at: 0,
             view: PanelView::new(cx),
+            load_gen: 0,
         }
     }
 
@@ -5960,7 +5983,6 @@ fn center(ui: Ui) -> impl IntoView {
                     row_cap_override: tab.row_cap_override,
                     view_err: tab.view_err,
                     view_busy: tab.view_busy,
-                    load_gen: tab.load_gen,
                     apply_view: apply_view.clone(),
                     db_nodes,
                     stats_gen,
@@ -6336,7 +6358,6 @@ fn shown_panel_loaded(panels: &[ResultPanel], active: u64) -> bool {
 fn results_multi(tab: Tab, cancel: Rc<dyn Fn()>, gctx: GridCtx) -> impl IntoView {
     let (result_tabs, active_result) = (tab.result_tabs, tab.active_result);
     let strip_ctx = gctx.clone();
-    let load_gen = gctx.load_gen;
     // **The key is the shown panel's id, its phase, and the load nonce** — a
     // deduped `Memo`, never the `QueryState` itself.
     //
@@ -6349,13 +6370,15 @@ fn results_multi(tab: Tab, cancel: Rc<dyn Fn()>, gctx: GridCtx) -> impl IntoView
     // filter/sort re-run bumps the nonce; both rebuild, which is what they mean.
     let key = create_memo(move |_| {
         let ai = active_result.get();
-        let shown = result_tabs.with(|v| shown_panel(v, ai).map(|p| (p.id, phase_of(&p.state))));
-        (shown, load_gen.get())
+        // **The nonce is the shown panel's own**, so a filter re-run landing on
+        // a different panel cannot rebuild this one out from under its scroll
+        // position and its selection.
+        result_tabs.with(|v| shown_panel(v, ai).map(|p| (p.id, phase_of(&p.state), p.load_gen)))
     });
     let body = dyn_container(
         move || key.get(),
-        move |(shown, _gen)| {
-            let Some((id, phase)) = shown else {
+        move |shown| {
+            let Some((id, phase, _gen)) = shown else {
                 return empty().into_any();
             };
             // Read untracked: the memo above, not the `Arc`, drives rebuilds.
@@ -9398,6 +9421,7 @@ mod result_strip_tests {
             pinned: false,
             ran_at: 0,
             view: PanelView::new(cx),
+            load_gen: 0,
         }
     }
 
@@ -9790,6 +9814,45 @@ mod result_panel_tab_tests {
             .result_tabs
             .with_untracked(|v| v.iter().find(|p| p.id == first).map(|p| p.sql.clone()));
         assert_eq!(sql.as_deref(), Some("SELECT * FROM staff WHERE active = 1"));
+    }
+
+    /// **A re-run's rebuild is that panel's**, and it used to be the tab's: one
+    /// `load_gen` on the tab meant a filter re-run landing on any panel rebuilt
+    /// whichever panel was *shown*, losing that result's scroll position and
+    /// selection. The widths, the sort and a frozen column survive a rebuild;
+    /// those two do not.
+    ///
+    /// The other half matters as much: an in-place commit splice deliberately
+    /// does **not** bump the nonce, so it still skips the rebuild — getting that
+    /// wrong leaves a stale table on screen, which is why the nonce exists.
+    #[test]
+    fn a_filtered_rerun_rebuilds_its_own_panel_and_no_other() {
+        let t = tab();
+        let batch = t.begin_run(&["SELECT 1".to_string(), "SELECT 2".to_string()]);
+        let load_of = |id: u64| {
+            t.result_tabs
+                .with_untracked(|v| v.iter().find(|p| p.id == id).map(|p| p.load_gen))
+        };
+        assert_eq!(load_of(batch[0]), Some(0));
+        assert_eq!(load_of(batch[1]), Some(0));
+
+        t.bump_panel_load(batch[1]);
+        assert_eq!(load_of(batch[1]), Some(1), "the panel that re-ran");
+        assert_eq!(
+            load_of(batch[0]),
+            Some(0),
+            "the panel on screen must not be rebuilt for someone else's re-run"
+        );
+
+        // A commit splice writes the panel's state and bumps nothing, so the
+        // grid is not rebuilt and the rows are replaced in place.
+        t.set_panel_state(batch[1], QueryState::Cancelled);
+        assert_eq!(load_of(batch[1]), Some(1), "a state write is not a re-run");
+
+        // A panel that is gone takes no bump, as with every other by-id writer.
+        t.close_panels(&[batch[1]]);
+        t.bump_panel_load(batch[1]);
+        assert_eq!(load_of(batch[1]), None);
     }
 
     #[test]

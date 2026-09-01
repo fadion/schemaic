@@ -280,6 +280,20 @@ pub(crate) async fn connect_maintenance_avoiding(
 /// dropped should degrade to the old behaviour rather than lock the user out of
 /// the server, and the guesses cost nothing when the first attempt succeeds.
 ///
+/// **What a *stale* configured name costs, stated rather than fixed.** One that
+/// is retryable (`3D000` — dropped or renamed) is tried first on **every**
+/// server-level operation, for ever: one failed connect each time, inside the
+/// `PING_TIMEOUT` that bounds the whole sequence, so on the hosted providers
+/// this field exists for that is a wasted WAN TLS handshake per listing.
+/// Invisible on loopback (~2 ms) and never measured on a real link.
+///
+/// Not cached, deliberately: remembering the failure means per-`Db` state on a
+/// handle whose whole design is that it has none — every method connects, runs
+/// and disconnects — and a cache that outlives the database being recreated is a
+/// connection that stays broken after the user has fixed it. The honest fix is
+/// for the *form* to notice a name the server rejects and say so, which is a
+/// different feature.
+///
 /// Split out from the connect loop so the order is a decision with a test on it
 /// rather than a literal in the middle of an I/O function.
 ///

@@ -1913,7 +1913,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             };
             let view_err = tab.view_err;
-            let load_gen = tab.load_gen;
             // Which panel this run reports into. A view re-run keeps the panel it
             // is re-reading (its table stays on screen throughout); a manual run
             // opens a fresh one, which replaces the unpinned panels and leaves
@@ -2059,8 +2058,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     // not the one it was opened with — see
                                     // `Tab::set_panel_sql`.
                                     tab.set_panel_sql(id, &tx_sql);
+                                    // **This panel's nonce, not the tab's.** One
+                                    // nonce on the tab rebuilt whichever panel
+                                    // was *shown* — losing that result's scroll
+                                    // and selection for a re-run that landed
+                                    // somewhere else. See `ResultPanel::load_gen`.
+                                    tab.bump_panel_load(id);
                                 }
-                                load_gen.update(|g| *g = g.wrapping_add(1));
                                 view_err.set(None);
                             }
                             // Error → keep the current table, show the message in the bar.
