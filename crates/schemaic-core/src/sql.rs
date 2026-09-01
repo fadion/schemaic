@@ -672,6 +672,21 @@ impl ScanState {
     }
 }
 
+/// A statement boundary: the offset just past its terminator, and how many of
+/// those bytes are the **client's** delimiter rather than the server's.
+///
+/// `strip` is `0` for `;` and for the boundary a `DELIMITER` directive itself
+/// makes, and `delim.len()` when a custom terminator closed the statement.
+/// **The distinction is not cosmetic**: `;` is a statement separator every
+/// engine accepts at the end of what it is sent, while `$$` is a word the
+/// *client* invented — MySQL lexes `END$$` as one identifier and answers a
+/// syntax error. See [`executable_statements`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub at: usize,
+    pub strip: usize,
+}
+
 /// Byte offsets bounding each **complete** statement in `sql`, resuming from
 /// `state` and leaving it where the scan ended.
 ///
@@ -680,7 +695,7 @@ impl ScanState {
 /// next chunk continues. That is what makes the answer safe to act on — a `;`
 /// inside an unterminated string produces no boundary, so those bytes stay in
 /// the caller's buffer rather than being executed as a statement of their own.
-pub fn statement_bounds_open(sql: &str, dialect: SqlDialect, state: &mut ScanState) -> Vec<usize> {
+pub fn statement_bounds_open(sql: &str, dialect: SqlDialect, state: &mut ScanState) -> Vec<Bound> {
     scan_bounds(sql, dialect, &mut state.delim, false)
 }
 
@@ -691,9 +706,66 @@ pub fn statement_bounds_open(sql: &str, dialect: SqlDialect, state: &mut ScanSta
 /// either (see [`TriggerScan`]).
 pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
     let mut delim: Vec<u8> = vec![b';'];
-    let mut bounds = scan_bounds(sql, dialect, &mut delim, true);
+    let mut bounds: Vec<usize> = scan_bounds(sql, dialect, &mut delim, true)
+        .into_iter()
+        .map(|b| b.at)
+        .collect();
     bounds.push(sql.len());
     bounds
+}
+
+/// Every runnable statement of `sql`, **as the text to send to a server**.
+///
+/// [`statement_ranges`]' text with the client's `DELIMITER` token removed, and
+/// the one form any path that *executes* should use. A range keeps the
+/// terminator because the editor selects and highlights with it; a server must
+/// not see it. `;` is left alone — every engine accepts a trailing one, and
+/// removing it would change what tens of existing call sites send.
+///
+/// **The bug this exists to stop is the whole point of `DELIMITER`.** A dump
+/// carrying a trigger or routine is written `DELIMITER $$` … `END$$`, which is
+/// the only way a compound body holding its own semicolons can be split at all
+/// — and `END$$` handed to MySQL lexes as a single identifier, so the body never
+/// closes and the server answers a syntax error. Every such file therefore
+/// failed at its first routine, half-loaded, on both the script runner and Run
+/// Everything.
+pub fn executable_statements(sql: &str, dialect: SqlDialect) -> Vec<String> {
+    let mut delim: Vec<u8> = vec![b';'];
+    let bounds = scan_bounds(sql, dialect, &mut delim, true);
+    let mut out = Vec::new();
+    let mut prev = 0usize;
+    for bound in bounds.iter().skip(1).copied().chain(std::iter::once(Bound {
+        at: sql.len(),
+        strip: 0,
+    })) {
+        if let Some(text) = executable_range(sql, prev, bound, dialect) {
+            out.push(text.to_string());
+        }
+        prev = bound.at;
+    }
+    out
+}
+
+/// One segment as the server should receive it, or `None` when it is not a
+/// statement at all (blank, comment-only, or the `DELIMITER` directive itself).
+///
+/// Shared by [`executable_statements`] and `core::script`'s streaming splitter,
+/// so the text a script runner sends and the text Run Everything sends cannot
+/// come out different.
+pub fn executable_range(sql: &str, from: usize, bound: Bound, dialect: SqlDialect) -> Option<&str> {
+    let (lo, hi) = trim_range(sql, from, bound.at);
+    if !is_runnable_segment(sql, lo, hi, dialect) {
+        return None;
+    }
+    // Strip only when the trimmed end really is the terminator this bound
+    // recorded — trailing whitespace between the two would mean it is not.
+    let hi = if hi == bound.at {
+        hi.saturating_sub(bound.strip)
+    } else {
+        hi
+    };
+    let (lo, hi) = trim_range(sql, lo, hi);
+    (lo < hi).then(|| &sql[lo..hi])
 }
 
 /// The one scan both [`statement_bounds`] and [`statement_bounds_open`] are.
@@ -701,10 +773,10 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
 /// `delim` is in/out so a chunked caller can carry the terminator across a
 /// drain; `at_eof` says whether the end of `sql` is the end of the *script*,
 /// which is the only thing the two callers genuinely disagree about.
-fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool) -> Vec<usize> {
+fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool) -> Vec<Bound> {
     let b = sql.as_bytes();
     let n = b.len();
-    let mut bounds = vec![0usize];
+    let mut bounds = vec![Bound { at: 0, strip: 0 }];
     let mut i = 0;
     // Where the current segment begins, for recognising a directive only at the
     // start of one.
@@ -731,7 +803,9 @@ fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool
             if !at_eof && b.get(end - 1) != Some(&b'\n') {
                 break;
             }
-            bounds.push(end);
+            // The directive's own segment is dropped whole by
+            // `is_runnable_segment`, so there is nothing to strip off it.
+            bounds.push(Bound { at: end, strip: 0 });
             *delim = token.into_bytes();
             i = end;
             seg = end;
@@ -755,7 +829,16 @@ fn scan_bounds(sql: &str, dialect: SqlDialect, delim: &mut Vec<u8>, at_eof: bool
                 i += delim.len();
                 continue;
             }
-            bounds.push(i + delim.len());
+            // `;` is the server's own separator and stays; anything else is a
+            // word the client invented and must not be sent.
+            bounds.push(Bound {
+                at: i + delim.len(),
+                strip: if delim.as_slice() == b";" {
+                    0
+                } else {
+                    delim.len()
+                },
+            });
             i += delim.len();
             seg = i;
             scan = TriggerScan::Start;
@@ -1952,9 +2035,9 @@ mod tests {
         for piece in sql.as_bytes().chunks(chunk) {
             buf.push_str(std::str::from_utf8(piece).expect("ASCII fixture"));
             let bounds = super::statement_bounds_open(&buf, dialect, &mut state);
-            let cut = *bounds.last().expect("a scan always starts at 0");
+            let cut = bounds.last().expect("a scan always starts at 0").at;
             for w in bounds.windows(2) {
-                emit(&buf, w[0], w[1], &mut out);
+                emit(&buf, w[0].at, w[1].at, &mut out);
             }
             buf.drain(..cut);
         }
@@ -2010,6 +2093,13 @@ mod tests {
     /// Pinned on its own, and not left to the round-trip above, because it is
     /// the one piece of state that has to survive the drain: the round-trip
     /// says the answers agree, this says *why* they can.
+    ///
+    /// **`END$$` is right here and wrong to send.** This asserts the *bounds* —
+    /// a range carries its terminator, which is what the editor selects and
+    /// highlights. What a server receives is
+    /// [`super::executable_statements`]' answer, and
+    /// `a_client_delimiter_is_never_sent_to_the_server` is where that is pinned.
+    /// Confusing the two is precisely how `END$$` reached MySQL.
     #[test]
     fn a_delimiter_survives_the_chunk_that_drained_it() {
         // A block that ends exactly on the directive's newline — the drain that
@@ -2046,7 +2136,11 @@ mod tests {
         let mut state = super::ScanState::new();
         let bounds =
             super::statement_bounds_open("SELECT 1;\nDELIMITER $", SqlDialect::MySql, &mut state);
-        assert_eq!(bounds, vec![0, 9], "only the complete statement");
+        assert_eq!(
+            bounds.iter().map(|b| b.at).collect::<Vec<_>>(),
+            vec![0, 9],
+            "only the complete statement"
+        );
         // And the proof it was not acted on: the next chunk completes the
         // directive, and `$$` then terminates.
         let bounds =
@@ -2073,7 +2167,10 @@ mod tests {
                 "-- just a comment",
             ] {
                 let mut state = super::ScanState::new();
-                let mut open = super::statement_bounds_open(sql, dialect, &mut state);
+                let mut open: Vec<usize> = super::statement_bounds_open(sql, dialect, &mut state)
+                    .iter()
+                    .map(|b| b.at)
+                    .collect();
                 open.push(sql.len());
                 assert_eq!(
                     open,
@@ -2081,6 +2178,64 @@ mod tests {
                     "{dialect:?} on {sql:?}"
                 );
             }
+        }
+    }
+
+    /// **The bug the whole `DELIMITER` machinery exists to avoid, reintroduced
+    /// at the last step.** A statement is split correctly and then handed to the
+    /// server with the *client's* terminator still on it: `END$$` lexes as one
+    /// identifier in MySQL, the compound body never closes, and every dump
+    /// carrying a trigger or routine fails at its first one — half-loaded.
+    ///
+    /// Confirmed against MariaDB before this was written:
+    /// `mariadb -e "SELECT 1$$"` → `ERROR 1054: Unknown column '1$$'`.
+    #[test]
+    fn a_client_delimiter_is_never_sent_to_the_server() {
+        let s = "DELIMITER $$\n\
+                 CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW\n\
+                 BEGIN\n  SET NEW.a = 1;\n  SET NEW.b = 2;\nEND$$\n\
+                 DELIMITER ;\n\
+                 UPDATE t SET a = 3;\n";
+        let stmts = super::executable_statements(s, SqlDialect::MySql);
+        assert_eq!(stmts.len(), 2, "{stmts:?}");
+        assert!(stmts[0].starts_with("CREATE TRIGGER"), "{}", stmts[0]);
+        assert!(
+            stmts[0].ends_with("END"),
+            "the client's delimiter reached the server: {:?}",
+            stmts[0]
+        );
+        // And the body's own semicolons are untouched — the reason the
+        // directive was used in the first place.
+        assert!(stmts[0].contains("SET NEW.a = 1;"), "{}", stmts[0]);
+    }
+
+    /// **`;` stays.** Every engine accepts a trailing one, and stripping it
+    /// would change what every existing call site sends — the blast radius this
+    /// fix deliberately does not have.
+    #[test]
+    fn an_ordinary_semicolon_is_left_on_the_statement() {
+        let stmts = super::executable_statements("SELECT 1; SELECT 2;", SqlDialect::MySql);
+        assert_eq!(
+            stmts,
+            vec!["SELECT 1;".to_string(), "SELECT 2;".to_string()]
+        );
+    }
+
+    /// A terminator with whitespace in front of it still comes off, and takes
+    /// the whitespace with it.
+    #[test]
+    fn a_delimiter_is_stripped_along_with_the_space_before_it() {
+        let stmts = super::executable_statements("DELIMITER $$\nSELECT 1 $$\n", SqlDialect::MySql);
+        assert_eq!(stmts, vec!["SELECT 1".to_string()]);
+    }
+
+    /// The other two engines have no client delimiter at all, so nothing is ever
+    /// stripped there — a `$$` in PostgreSQL is dollar-quoting, which is data.
+    #[test]
+    fn only_the_engine_with_the_directive_strips_anything() {
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let stmts = super::executable_statements("SELECT 1;", dialect);
+            assert_eq!(stmts, vec!["SELECT 1;".to_string()], "{dialect:?}");
         }
     }
 
@@ -2222,7 +2377,10 @@ mod tests {
         );
         let mut state = super::ScanState::new();
         assert_eq!(
-            super::statement_bounds_open(sql, SqlDialect::MySql, &mut state),
+            super::statement_bounds_open(sql, SqlDialect::MySql, &mut state)
+                .iter()
+                .map(|b| b.at)
+                .collect::<Vec<_>>(),
             vec![0],
             "mid-script the token may still be growing"
         );
