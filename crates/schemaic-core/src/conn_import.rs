@@ -1033,7 +1033,23 @@ fn xml_unescape(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         let after = &rest[i..];
-        let Some(semi) = after.find(';').filter(|n| *n <= 12) else {
+        // **Bounded, or this is quadratic.** `find(';')` scanned the whole
+        // remainder and only *then* was the answer rejected for being too far
+        // away, while the loop advanced one byte — so a file of `&` costs
+        // O(n²): measured 258 ms at 128 k `&`, and about four and a half
+        // minutes at `conn_sources::MAX_BYTES`, on the UI thread, with no
+        // progress and no cancel. The longest entity accepted is 12 bytes plus
+        // the `&` and the `;`, so nothing past that window can be one.
+        //
+        // Cut on a character boundary, and never fall back to the whole
+        // remainder: the cap is a byte count, and `get(..14)` answering `None`
+        // on a multi-byte character would put the quadratic scan straight back
+        // for exactly the text that is hardest to reason about.
+        let window = match after.char_indices().find(|(at, _)| *at >= 14) {
+            Some((at, _)) => &after[..at],
+            None => after,
+        };
+        let Some(semi) = window.find(';').filter(|n| *n <= 12) else {
             out.push('&');
             rest = &after[1..];
             continue;
@@ -1078,7 +1094,7 @@ fn xml_unescape(s: &str) -> String {
 /// differ in what their keys *mean*, not in how they are written, and two
 /// scanners would be two sets of edge cases with one of them untested. Pairs
 /// before the first section are returned under an empty name.
-fn ini_sections(text: &str) -> Vec<(String, Vec<(String, String)>)> {
+fn ini_sections(text: &str, flavour: IniFlavour) -> Vec<(String, Vec<(String, String)>)> {
     let mut out: Vec<(String, Vec<(String, String)>)> = vec![(String::new(), Vec::new())];
     for line in strip_bom(text).lines() {
         let line = line.trim();
@@ -1100,13 +1116,46 @@ fn ini_sections(text: &str) -> Vec<(String, Vec<(String, String)>)> {
             None => (line, ""),
             Some((k, v)) => (k, v),
         };
-        let value = unquote(value.trim());
+        let value = unquote(ini_value(value.trim(), flavour));
         out.last_mut()
             .expect("seeded above")
             .1
             .push((key.trim().to_string(), value));
     }
     out
+}
+
+/// Which file's rules [`ini_sections`] is reading by.
+///
+/// The two sources share a *shape* and not a grammar, which is exactly the trap
+/// one scanner for both walks into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IniFlavour {
+    /// `.my.cnf`: `#` starts a comment anywhere on the line, so
+    /// `password=hunter2 # prod` is the password `hunter2`. Read whole, it
+    /// imported `"hunter2 # prod"` — a connection that fails "access denied"
+    /// against a server the `mysql` client reaches from the very same file.
+    MyCnf,
+    /// `.pg_service.conf`: libpq honours `#` only at the start of a line, so a
+    /// `#` inside a value **is** part of it. Stripping here would corrupt a
+    /// password rather than fix one.
+    PgService,
+}
+
+/// The value half of an INI line, with a trailing comment taken off where the
+/// file's own reader would take one off.
+///
+/// A quoted value is left whole: quoting is how `#` is written into a MySQL
+/// option value, and cutting inside the quotes would be the same bug pointed
+/// the other way. [`unquote`] runs after this and removes the quotes.
+fn ini_value(v: &str, flavour: IniFlavour) -> &str {
+    if flavour == IniFlavour::PgService || v.starts_with(['"', '\'']) {
+        return v;
+    }
+    match v.split_once('#') {
+        Some((before, _)) => before.trim_end(),
+        None => v,
+    }
 }
 
 fn unquote(v: &str) -> String {
@@ -1144,7 +1193,7 @@ fn ini_get(pairs: &[(String, String)], key: &str) -> Option<String> {
 /// file has.
 pub fn parse_my_cnf(text: &str) -> ImportScan {
     let mut out = ImportScan::default();
-    let sections = ini_sections(text);
+    let sections = ini_sections(text, IniFlavour::MyCnf);
     let base: Vec<(String, String)> = sections
         .iter()
         .filter(|(name, _)| name == "client")
@@ -1224,7 +1273,7 @@ fn my_cnf_connection(pairs: &[(String, String)]) -> Option<Connection> {
 /// plain-text source that arrives already named the way its author named it.
 pub fn parse_pg_service(text: &str) -> ImportScan {
     let mut out = ImportScan::default();
-    for (name, pairs) in ini_sections(text) {
+    for (name, pairs) in ini_sections(text, IniFlavour::PgService) {
         if name.is_empty() {
             continue;
         }
@@ -2230,6 +2279,51 @@ mod tests {
         assert_eq!(xml_unescape("a & b"), "a & b");
     }
 
+    /// **The scan for the closing `;` is bounded, or the decoder is quadratic.**
+    /// It used to read the whole remainder and only then reject the answer for
+    /// being too far away, while advancing one byte — measured 258 ms at 128 k
+    /// `&`, and about four and a half minutes at the 4 MiB a `dataSources.xml`
+    /// may reach, on the UI thread with no progress and no cancel.
+    ///
+    /// Asserted as a **ratio between two sizes**, not an absolute time, so it
+    /// is not a wall-clock test that flakes on a loaded machine or on a slower
+    /// runner: quadrupling the input quadruples a linear cost and multiplies a
+    /// quadratic one by sixteen. Measured against the unfixed decoder, the
+    /// ratio was 15.5; the fixed one is ~4.
+    #[test]
+    fn the_entity_decoder_is_linear_in_the_number_of_ampersands() {
+        let time = |n: usize| {
+            let hostile = "&".repeat(n);
+            let start = std::time::Instant::now();
+            let out = xml_unescape(&hostile);
+            let took = start.elapsed();
+            assert_eq!(out.len(), n, "nothing decodes, so nothing is lost");
+            took.as_secs_f64()
+        };
+        // Warm the allocator so the first call is not the slow one.
+        time(10_000);
+        let small = time(100_000);
+        let big = time(400_000);
+        let ratio = big / small.max(f64::EPSILON);
+        assert!(
+            ratio < 8.0,
+            "quadratic again: 4x the input cost {ratio:.1}x the time \
+             ({small:.3}s -> {big:.3}s)"
+        );
+    }
+
+    /// And the bound is a *window*, not a slice — a multi-byte character
+    /// straddling it must neither panic nor send the scan back to the whole
+    /// remainder.
+    #[test]
+    fn the_bounded_entity_scan_lands_on_a_character_boundary() {
+        assert_eq!(
+            xml_unescape("&日本語日本語日本語;x"),
+            "&日本語日本語日本語;x"
+        );
+        assert_eq!(xml_unescape("&amp;日本語"), "&日本語");
+    }
+
     // -- .my.cnf ------------------------------------------------------------
 
     #[test]
@@ -2336,6 +2430,37 @@ mod tests {
     #[test]
     fn a_byte_order_mark_does_not_stop_a_pasted_url() {
         assert_eq!(url("\u{feff}mysql://h/d").host, "h");
+    }
+
+    /// `mysql` reads `password=hunter2 # prod` as `hunter2`; this read the
+    /// whole rest of the line, so the imported connection failed "access
+    /// denied" against a server the CLI reaches from the very same file.
+    #[test]
+    fn a_trailing_comment_in_my_cnf_is_not_part_of_the_value() {
+        let scan = parse_my_cnf(
+            "[client]\nhost=db.example # the prod box\npassword=hunter2 # prod\nuser=app\n",
+        );
+        let c = &scan.found[0].connection;
+        assert_eq!(c.password, "hunter2");
+        assert_eq!(c.host, "db.example");
+    }
+
+    /// Quoting is how a `#` is written *into* a MySQL option value, so a quoted
+    /// value is left whole — cutting inside the quotes would be the same bug
+    /// pointed the other way.
+    #[test]
+    fn a_quoted_my_cnf_value_may_contain_a_hash() {
+        let scan = parse_my_cnf("[client]\nhost=h\nuser=u\npassword=\"hunter#2\"\n");
+        assert_eq!(scan.found[0].connection.password, "hunter#2");
+    }
+
+    /// **And the same strip must not reach `.pg_service.conf`.** libpq honours
+    /// `#` only at the start of a line, so there a `#` inside a value is part
+    /// of it — one scanner for two files that share a shape and not a grammar.
+    #[test]
+    fn a_hash_inside_a_pg_service_value_is_part_of_the_value() {
+        let scan = parse_pg_service("[svc]\nhost=pg.example\nuser=app\npassword=hunter#2\n");
+        assert_eq!(scan.found[0].connection.password, "hunter#2");
     }
 
     #[test]
