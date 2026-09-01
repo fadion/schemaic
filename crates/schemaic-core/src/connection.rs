@@ -584,12 +584,25 @@ pub struct Tls {
     /// Private key for `client_cert_path`, PEM.
     #[serde(default)]
     pub client_key_path: String,
-    /// Passphrase decrypting `client_key_path`, if the key is encrypted (may be
-    /// empty). A secret: it lives in the OS keyring, not in `connections.json`
-    /// — see [`crate::secrets::SecretKind::TlsKeyPassphrase`].
-    #[serde(default)]
-    pub client_key_passphrase: String,
 }
+
+// **There was a `client_key_passphrase` here, and it has been withdrawn.**
+//
+// It was collected, masked, and written to the OS keyring — and `TlsPlan`
+// carried no passphrase at all, so both drivers loaded an encrypted key with no
+// secret and failed with "<path> is not a PEM private key", blaming the file.
+// No combination of a correct passphrase and a correct file could succeed.
+//
+// Wiring it means decrypting PKCS#8 PBES2 ourselves (`rustls-pki-types` does
+// not) and handing the drivers the plaintext key: a real feature with a new
+// crypto dependency, and one that cannot be verified without a live mutual-TLS
+// server. Shipping a form row that guarantees failure is the worse of the two,
+// so the row is gone and `db::tls::preflight` now refuses an encrypted key by
+// name, telling the user how to decrypt it. `TODO.md` carries the feature.
+//
+// Older `connections.json` files may still hold the key; serde ignores it. A
+// keyring entry an older build wrote is swept by
+// `secrets::RETIRED_SECRET_SUFFIXES`.
 
 impl Tls {
     /// Should the handshake offer a client certificate?
@@ -2188,7 +2201,6 @@ mod tls_tests {
             ca_path: "/etc/ca.crt".into(),
             client_cert_path: "/etc/client.crt".into(),
             client_key_path: "/etc/client.key".into(),
-            client_key_passphrase: "pw".into(),
         };
         let back: Connection = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.tls, c.tls);
@@ -2341,7 +2353,6 @@ mod tls_tests {
             ca_path: "/etc/ca.crt".into(),
             client_cert_path: "/c.crt".into(),
             client_key_path: "/c.key".into(),
-            client_key_passphrase: "pw".into(),
         };
         let p = t.plan().expect("handshakes");
         assert_eq!(p.root_ca.as_deref(), Some("/etc/ca.crt"));
@@ -2441,7 +2452,6 @@ mod tls_tests {
             ca_path: "/etc/ca.crt".into(),
             client_cert_path: "/etc/client.crt".into(),
             client_key_path: "/etc/client.key".into(),
-            client_key_passphrase: "pw".into(),
         };
         let mut edited = conn();
         edited.tls = t;
@@ -2459,7 +2469,6 @@ mod tls_tests {
             ca_path: "/etc/ca.crt".into(),
             client_cert_path: "/etc/client.crt".into(),
             client_key_path: "/etc/client.key".into(),
-            client_key_passphrase: "pw".into(),
         };
         let copy = c.duplicate(9, "copy".into(), None);
         assert_eq!(copy.tls, c.tls);

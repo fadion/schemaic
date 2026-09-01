@@ -1,10 +1,14 @@
 //! Secret handling for saved connections — keeps credentials out of the plaintext
 //! `connections.json` by storing them in the OS keyring instead.
 //!
-//! Four secrets per connection can be stored: the database password, the SSH
-//! tunnel password, the SSH key passphrase, and the TLS client-key passphrase.
-//! Each is keyed in the keyring by the connection id + a kind suffix (see
-//! [`account`]).
+//! Three secrets per connection can be stored: the database password, the SSH
+//! tunnel password and the SSH key passphrase. Each is keyed in the keyring by
+//! the connection id + a kind suffix (see [`account`]).
+//!
+//! A fourth — the TLS client-key passphrase — was collected and stored by an
+//! earlier build for a feature that could never work, and is withdrawn; see
+//! [`RETIRED_SECRET_SUFFIXES`], which is how an entry it wrote is cleaned off
+//! the machines that have one.
 //!
 //! This module is the *pure, testable* layer: it defines the [`SecretStore`]
 //! seam and the transforms over a [`ConnectionsFile`] (hydrate on load, sanitize
@@ -33,20 +37,31 @@ pub enum SecretKind {
     SshPassword,
     /// The SSH private-key passphrase ([`crate::connection::SshTunnel::key_passphrase`]).
     SshPassphrase,
-    /// The TLS client-key passphrase
-    /// ([`crate::connection::Tls::client_key_passphrase`]).
-    TlsKeyPassphrase,
+}
+
+/// Account suffixes this app **no longer writes**, swept wherever entries are
+/// deleted.
+///
+/// A withdrawn secret is not the same as one that was never there. `tls_key
+/// _passphrase` was collected and stored by an earlier build for a feature that
+/// could not work (see `connection::Tls`), so a user who typed one has an entry
+/// in their keyring that nothing would ever read and nothing would ever delete.
+/// Removing the [`SecretKind`] arm alone would strand it there permanently.
+pub const RETIRED_SECRET_SUFFIXES: [&str; 1] = ["tls_key_passphrase"];
+
+/// The keyring account for a retired secret of a connection.
+fn retired_account(id: u64, suffix: &str) -> String {
+    format!("conn.{id}.{suffix}")
 }
 
 impl SecretKind {
     /// Every kind, so callers can iterate a connection's secrets uniformly —
     /// which is what makes adding one here enough to have it hydrated, sanitized
     /// and forgotten everywhere.
-    pub const ALL: [SecretKind; 4] = [
+    pub const ALL: [SecretKind; 3] = [
         SecretKind::DbPassword,
         SecretKind::SshPassword,
         SecretKind::SshPassphrase,
-        SecretKind::TlsKeyPassphrase,
     ];
 
     fn suffix(self) -> &'static str {
@@ -54,7 +69,6 @@ impl SecretKind {
             SecretKind::DbPassword => "password",
             SecretKind::SshPassword => "ssh_password",
             SecretKind::SshPassphrase => "ssh_passphrase",
-            SecretKind::TlsKeyPassphrase => "tls_key_passphrase",
         }
     }
 }
@@ -70,7 +84,6 @@ fn field(conn: &Connection, kind: SecretKind) -> &str {
         SecretKind::DbPassword => &conn.password,
         SecretKind::SshPassword => &conn.ssh.password,
         SecretKind::SshPassphrase => &conn.ssh.key_passphrase,
-        SecretKind::TlsKeyPassphrase => &conn.tls.client_key_passphrase,
     }
 }
 
@@ -80,7 +93,6 @@ fn set_field(conn: &mut Connection, kind: SecretKind, value: String) {
         SecretKind::DbPassword => conn.password = value,
         SecretKind::SshPassword => conn.ssh.password = value,
         SecretKind::SshPassphrase => conn.ssh.key_passphrase = value,
-        SecretKind::TlsKeyPassphrase => conn.tls.client_key_passphrase = value,
     }
 }
 
@@ -229,6 +241,13 @@ pub fn sanitize_file(
 ) -> ConnectionsFile {
     let mut disk = file.clone();
     for conn in &mut disk.connections {
+        // A secret this app no longer writes still has to be cleaned up on
+        // whatever machine an older build wrote it — see
+        // `RETIRED_SECRET_SUFFIXES`. Every save, not only a delete: a user who
+        // typed a TLS key passphrase may never delete that connection.
+        for suffix in RETIRED_SECRET_SUFFIXES {
+            store.delete(&retired_account(conn.id, suffix));
+        }
         for kind in SecretKind::ALL {
             let acct = account(conn.id, kind);
             let value = field(conn, kind).to_string();
@@ -252,6 +271,9 @@ pub fn sanitize_file(
 pub fn forget(id: u64, store: &dyn SecretStore) {
     for kind in SecretKind::ALL {
         store.delete(&account(id, kind));
+    }
+    for suffix in RETIRED_SECRET_SUFFIXES {
+        store.delete(&retired_account(id, suffix));
     }
 }
 
@@ -349,10 +371,6 @@ mod tests {
             account(1, SecretKind::SshPassphrase),
             "conn.1.ssh_passphrase"
         );
-        assert_eq!(
-            account(1, SecretKind::TlsKeyPassphrase),
-            "conn.1.tls_key_passphrase"
-        );
         assert_ne!(
             account(1, SecretKind::DbPassword),
             account(2, SecretKind::DbPassword)
@@ -372,33 +390,47 @@ mod tests {
         assert_eq!(names.len(), total, "two kinds share one keyring account");
     }
 
-    /// The TLS client key's passphrase is a password like the other three, and
-    /// the invariant is the same one: after a save it is in the keyring and
-    /// **not** in `connections.json`.
+    /// **A withdrawn secret has to be cleaned off the machines that stored
+    /// it.** The TLS client-key passphrase was collected and written to the
+    /// keyring by an earlier build for a feature that could never work; removing
+    /// the `SecretKind` arm alone would strand that entry there permanently,
+    /// unread and undeletable through the app.
+    ///
+    /// Swept on every ordinary save, not only on delete: a user who typed one
+    /// may never delete that connection.
     #[test]
-    fn a_tls_key_passphrase_is_kept_out_of_the_json() {
+    fn a_retired_secret_is_deleted_from_the_keyring() {
         let store = MemStore::new();
-        let mut c = conn(4);
-        c.tls.client_key_passphrase = "let me in".to_string();
+        assert!(store.set("conn.4.tls_key_passphrase", "let me in"));
+        assert!(store.stored("conn.4.tls_key_passphrase").is_some());
+
         let file = ConnectionsFile {
-            connections: vec![c],
+            connections: vec![conn(4)],
             active: Some(4),
         };
-
-        let clean = sanitize(&file, &store);
+        sanitize(&file, &store);
         assert_eq!(
-            clean.connections[0].tls.client_key_passphrase, "",
-            "blanked in the file"
-        );
-        assert_eq!(
-            store.stored("conn.4.tls_key_passphrase").as_deref(),
-            Some("let me in"),
-            "and stored in the keyring"
+            store.stored("conn.4.tls_key_passphrase"),
+            None,
+            "an ordinary save must clear it"
         );
 
-        let mut back = clean;
-        hydrate_file(&mut back, &store);
-        assert_eq!(back.connections[0].tls.client_key_passphrase, "let me in");
+        // And the delete path too, for a connection that is removed before it
+        // is ever saved again.
+        assert!(store.set("conn.5.tls_key_passphrase", "let me in"));
+        forget(5, &store);
+        assert_eq!(store.stored("conn.5.tls_key_passphrase"), None);
+    }
+
+    /// The sweep list and the live list must not overlap, or a save would delete
+    /// a secret it had just written.
+    #[test]
+    fn no_retired_suffix_is_also_a_live_one() {
+        for suffix in RETIRED_SECRET_SUFFIXES {
+            for kind in SecretKind::ALL {
+                assert_ne!(account(9, kind), retired_account(9, suffix), "{suffix}");
+            }
+        }
     }
 
     /// Sanitize a file that wasn't hydrated from this store (the common case in
@@ -463,7 +495,6 @@ mod tests {
                 (7, SecretKind::DbPassword),
                 (7, SecretKind::SshPassword),
                 (7, SecretKind::SshPassphrase),
-                (7, SecretKind::TlsKeyPassphrase),
             ]
         );
         assert!(

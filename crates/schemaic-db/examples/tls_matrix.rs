@@ -242,7 +242,6 @@ async fn main() {
                     ca_path: ca_path.clone(),
                     client_cert_path: client_cert.clone(),
                     client_key_path: client_key.clone(),
-                    ..Tls::default()
                 };
                 // `TLS_DATABASE` reaches this through the connection's own
                 // `database` field, so the ping exercises the same resolution

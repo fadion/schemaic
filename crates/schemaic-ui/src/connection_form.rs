@@ -1019,20 +1019,20 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 )
                 .into_any(),
             );
-            rows.push(
-                masked_field(
-                    "Client key passphrase",
-                    draft.tls_client_key_passphrase,
-                    ring,
-                    157,
-                )
-                .style(|s| s.width(conn_field_w()))
-                .into_any(),
-            );
+            // **There was a "Client key passphrase" row here.** It was
+            // collected, masked and written to the keyring, and nothing ever
+            // read it: `TlsPlan` carries no passphrase, so an encrypted key
+            // failed with "<path> is not a PEM private key" whatever was typed,
+            // blaming the file. A row that guarantees failure is worse than no
+            // row — see `connection::Tls` for the decision, and
+            // `db::tls::preflight`, which now refuses an encrypted key by name
+            // and says how to decrypt it.
+            let _ = ring;
             rows.push(
                 form_hint(
                     "A client certificate and key are only needed where the server asks \
-                     you to prove who you are (mutual TLS).",
+                     you to prove who you are (mutual TLS). The key must not be \
+                     passphrase-protected.",
                 )
                 .into_any(),
             );
@@ -1272,7 +1272,6 @@ fn conn_form(
         draft.tls_ca_path.track();
         draft.tls_client_cert_path.track();
         draft.tls_client_key_path.track();
-        draft.tls_client_key_passphrase.track();
         // The SQLite target is a connection parameter like any other: pointing at
         // a different file invalidates a Test result exactly as a different host
         // does. So is the database: on PostgreSQL it decides whether the connect

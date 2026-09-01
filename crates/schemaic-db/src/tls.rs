@@ -306,6 +306,15 @@ fn default_roots() -> &'static DefaultRoots {
         // bytes. That is exactly why this case leaves the driver's own roots
         // switched **on**: its built-in set *is* this set, so both engines still
         // verify against the same anchors without anything being copied.
+        //
+        // **Which is true only because the workspace and the driver take the
+        // same `webpki-roots` major.** They did not: the workspace held 0.26
+        // and `mysql_async` 1.0, so this arm quietly verified PostgreSQL
+        // against one Mozilla snapshot and MySQL against another, under a
+        // module doc promising the opposite. `cargo deny`'s `multiple-versions`
+        // is set to `warn`, so it reports a second copy rather than failing the
+        // build — this comment is the reason to act on that warning when it
+        // names `webpki-roots`.
         let mut bundled = RootCertStore::empty();
         bundled.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         DefaultRoots {
@@ -380,7 +389,28 @@ fn parse_certs(path: &str, pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, D
 fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, DbError> {
     let pem = std::fs::read(path)
         .map_err(|e| DbError::Connect(format!("cannot read key file {path}: {e}")))?;
-    PrivateKeyDer::from_pem_slice(&pem)
+    parse_key(path, &pem)
+}
+
+/// [`read_key`] without the read, so the refusal below can be asserted without a
+/// file.
+///
+/// **An encrypted key is named, not blamed on the file.** Schemaic does not
+/// decrypt one: the form used to collect a passphrase, store it in the keyring,
+/// and hand it to nobody — `TlsPlan` carries no passphrase — so the connect
+/// failed with `"<path> is not a PEM private key"`, which sends the user to
+/// check a file that is perfectly good. The row is gone (see
+/// `schemaic_core::connection::Tls`) and this says what to do instead.
+fn parse_key(path: &str, pem: &[u8]) -> Result<PrivateKeyDer<'static>, DbError> {
+    if let Ok(text) = std::str::from_utf8(pem)
+        && text.contains("ENCRYPTED PRIVATE KEY")
+    {
+        return Err(DbError::Connect(format!(
+            "{path} is a passphrase-protected private key, which Schemaic cannot open. \
+             Decrypt it first: openssl pkcs8 -in {path} -out client-key.pem"
+        )));
+    }
+    PrivateKeyDer::from_pem_slice(pem)
         .map_err(|e| DbError::Connect(format!("{path} is not a PEM private key: {e}")))
 }
 
@@ -624,6 +654,32 @@ mod tests {
         assert!(parse_certs("/tmp/notes.crt", b"# nothing here\n").is_err());
     }
 
+    /// **An encrypted client key is named as such.** The form used to collect a
+    /// passphrase for one, store it in the OS keyring, and hand it to nobody —
+    /// `TlsPlan` has no passphrase field — so the connect failed with
+    /// "<path> is not a PEM private key", sending the user to check a file that
+    /// is perfectly good. The row is withdrawn; this is what replaced it.
+    #[test]
+    fn a_passphrase_protected_key_is_named_rather_than_called_malformed() {
+        let encrypted = b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBxxxx\n\
+                          -----END ENCRYPTED PRIVATE KEY-----\n";
+        let err = parse_key("/tmp/client.key", encrypted)
+            .expect_err("an encrypted key cannot be opened here");
+        let DbError::Connect(msg) = err else {
+            panic!("a connect error is what preflight reports");
+        };
+        assert!(msg.contains("passphrase"), "{msg}");
+        assert!(msg.contains("openssl pkcs8"), "the way out: {msg}");
+        assert!(
+            !msg.contains("is not a PEM private key"),
+            "that message blames the file: {msg}"
+        );
+
+        // An ordinary malformed key keeps the old message, which is right for it.
+        let err = parse_key("/tmp/client.key", b"hello").expect_err("not a key");
+        assert!(format!("{err:?}").contains("not a PEM private key"));
+    }
+
     /// A named CA file that isn't there is a *connect* error naming the path,
     /// not a panic and not a silent fall back to the public roots — which would
     /// quietly verify against 150 CAs the user did not choose.
@@ -658,7 +714,12 @@ mod tests {
                 assert_eq!(roots.certs.len(), roots.store.len());
             }
             // Fallen back: there is nothing to hand over, because the driver's
-            // own built-in set already *is* this set.
+            // own built-in set already *is* this set — which holds only while
+            // the workspace and `mysql_async` resolve `webpki-roots` to one
+            // version. They did not (0.26 here, 1.0 there), so this arm
+            // verified the two engines against two Mozilla snapshots while
+            // asserting they agreed. Nothing in the crate can see that, so the
+            // guard is the dependency: see the workspace `Cargo.toml`.
             RootSource::Bundled => assert!(roots.certs.is_empty()),
         }
     }
