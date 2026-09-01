@@ -1613,6 +1613,40 @@ impl Tab {
         });
     }
 
+    /// Report a whole batch's outcomes, by id, in **one** `update`.
+    ///
+    /// **The notification count is the cost, not the work.** A landing batch
+    /// wrote its panels one at a time, and every one of those writes re-ran the
+    /// strip's `dyn_stack`, the body's key memo, every chip's reactive closures
+    /// and the editor's error bar — measured 0.67 ms → **263 ms** at 400
+    /// statements, against a pre-range version that wrote them in one
+    /// `result_tabs.update`.
+    ///
+    /// **Not `floem::reactive::batch`**, which makes it *worse* (816 ms at 400,
+    /// measured): `add_pending_effect` dedups with a linear scan, so batching N
+    /// notifications turns the cost quadratic instead of removing it. One
+    /// `update` is the fix, because one `update` is one notification.
+    ///
+    /// By id and not by position, for the reason `set_panel_state` gives: the
+    /// strip may have been pinned, reordered or partly closed while the batch
+    /// ran. A panel that is gone takes no state, exactly as before.
+    pub fn set_panel_states(&self, states: impl IntoIterator<Item = (u64, QueryState)>) {
+        let states: Vec<(u64, QueryState)> = states.into_iter().collect();
+        // The same pre-check `set_panel_state` makes, over the whole batch: a
+        // cancelled run reports into panels that are all gone, and an `update`
+        // notifies whether or not its closure changed anything.
+        if states.is_empty() || !states.iter().any(|(id, _)| self.holds_panel(*id)) {
+            return;
+        }
+        self.result_tabs.update(|panels| {
+            for (id, state) in states {
+                if let Some(p) = panels.iter_mut().find(|p| p.id == id) {
+                    p.state = state;
+                }
+            }
+        });
+    }
+
     /// Is `id` still in the strip? — the pre-check the two by-id writers make so
     /// a write that would match nothing doesn't notify anyway.
     fn holds_panel(&self, id: u64) -> bool {
@@ -1839,6 +1873,22 @@ impl ShownResult {
         self.panels
             .with_untracked(|p| shown_panel(p, active).map(|p| p.state.clone()))
             .unwrap_or(QueryState::Idle)
+    }
+
+    /// Is the shown result a **frozen** (pinned) snapshot? Tracked, like
+    /// [`Self::get`].
+    ///
+    /// The editor's error bar asks it. A kept failure's message cannot be typed
+    /// away — that is the point of a pin — so **AI fix** and **Explain** stayed
+    /// on offer over it and resolved a stale message against the *current*
+    /// buffer: the model was asked to repair live SQL for an error from a
+    /// statement no longer in it, and Explain additionally moved the statement
+    /// highlight. The frozen exemption was created without revisiting the two
+    /// consumers the "typing dismisses it" rule existed to protect.
+    pub fn frozen(&self) -> bool {
+        let active = self.active.get();
+        self.panels
+            .with(|p| shown_panel(p, active).is_some_and(|p| p.frozen()))
     }
 
     /// Dismiss a stale error: any edit to the text means the message no longer
@@ -5624,6 +5674,39 @@ fn center(ui: Ui) -> impl IntoView {
             }
         }
     });
+    // **A failed statement un-collapses the editor.**
+    //
+    // A statement's own error lives in the editor's error bar, under the SQL
+    // that produced it and beside the Explain and AI fix that act on it — and
+    // *Collapse the editor*, a button in the RESULTS pane itself, sets that pane
+    // to height 0. So the server's text, **View**, **AI fix** and **Explain**
+    // were all unreachable for exactly the run that needed them, with nothing on
+    // screen saying why the chip had gone red.
+    //
+    // Revealing the bar in place is not an option: two recorded Floem hazards
+    // say a child overflowing up out of a zero-height parent is painted and
+    // never hit-tested, so the buttons would be visible and dead. Restoring the
+    // pane is the honest move, and it is what the user would do by hand.
+    //
+    // The per-tab `results_maximized` is written too, so the state the mirror
+    // above restores on a tab switch agrees with what is on screen. Guarded on
+    // the transition into `Failed`, so a second read of the same error does not
+    // fight a user who deliberately re-collapses it.
+    create_effect(move |was_failed: Option<bool>| {
+        let id = active.get();
+        // `shown()`, whose reads are **tracked** — `shown_result()` samples, so
+        // this effect would never re-run when a statement actually failed.
+        let failed = tabs
+            .with(|v| v.iter().find(|t| t.id == id).map(|t| t.shown()))
+            .is_some_and(|s| matches!(s.get(), QueryState::Failed(_)));
+        if failed && was_failed != Some(true) && editor_collapsed.get_untracked() {
+            editor_collapsed.set(false);
+            if let Some(tab) = active_tab() {
+                tab.results_maximized.set(false);
+            }
+        }
+        failed
+    });
     // Reveal the AI panel + send a message (the grid cell "AI Summary" builds a
     // context-rich prompt itself, so this just reveals + forwards).
     let summarize: Rc<dyn Fn(String)> = {
@@ -6329,10 +6412,64 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
     let scroller =
         wheel_hscroll(chips).style(|s| s.flex_shrink(1.0_f32).min_width(0.0).height_full());
 
+    // **What the pins are holding**, at the strip's right edge, and only once
+    // that is news.
+    //
+    // Pinning removed the 200k row cap as *the* memory bound and put nothing in
+    // its place: a pin survives every later run, ten of them at 200k x 50
+    // measured 2.00 GB live, and `retained_bytes` had exactly one consumer — a
+    // per-chip tooltip nobody opens ten of. The policy is
+    // `resultsel::pin_verdict`, which warns rather than refuses: pinning is a
+    // deliberate act with a deliberate cost, and an app that silently declines
+    // to keep what it was asked to keep is worse than one that says the price.
+    let kept_note = dyn_container(
+        move || {
+            let (kept, bytes) = result_tabs.with(|v| {
+                v.iter()
+                    .filter(|p| p.pinned)
+                    .fold((0usize, 0u64), |(n, b), p| {
+                        let add = match &p.state {
+                            QueryState::Loaded(rs) => rs.retained_bytes() as u64,
+                            _ => 0,
+                        };
+                        (n + 1, b + add)
+                    })
+            });
+            // Asked about the strip as it stands: every pin here is one the user
+            // already made, so the "addition" is nothing.
+            match schemaic_core::resultsel::pin_verdict(bytes, 0) {
+                schemaic_core::resultsel::PinVerdict::Fine => None,
+                schemaic_core::resultsel::PinVerdict::Heavy(total) => Some((kept, total)),
+            }
+        },
+        |heavy| {
+            match heavy {
+            None => empty().into_any(),
+            Some((kept, total)) => text(format!(
+                "{kept} pinned · {}",
+                schemaic_core::stats::format_bytes(total)
+            ))
+            .tooltip(|| {
+                text(
+                    "Pinned results are held in memory until you close them.                      Close the ones you are done with to give it back.",
+                )
+                .style(crate::widgets::tooltip_style)
+            })
+            .style(|s| {
+                s.font_size(theme::font_label())
+                    .color(theme::text_muted())
+                    .padding_horiz(theme::scaled(10.0))
+                    .flex_shrink(0.0_f32)
+            })
+            .into_any(),
+        }
+        },
+    );
+
     // Flat, full-height result tabs. Unlike the query strip, this one adds a
     // full-width **top** separator too (the query strip sits below the header,
     // which already provides one).
-    h_stack((scroller,)).style(move |s| {
+    h_stack((scroller, kept_note)).style(move |s| {
         let s = s
             .width_full()
             .flex_row()
@@ -6477,7 +6614,7 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
         .tooltip(move || text(tip()).style(crate::widgets::tooltip_style));
 
     // Colour is set on the tab container and cascades to the label.
-    h_stack((label, pin_glyph, close_glyph))
+    let chip = h_stack((label, pin_glyph, close_glyph))
         .on_click_stop(move |_| active_result.set(id))
         // Middle-click closes, as it does on a query tab (and as there, a pinned
         // one no-ops — `close_panels` is reached through the same guard).
@@ -6523,7 +6660,24 @@ fn result_tab_chip(panel: ResultPanel, tab: Tab, gctx: GridCtx) -> impl IntoView
             } else {
                 s.color(theme::tab_text()).hover(|s| s.color(theme::text()))
             }
-        })
+        });
+
+    // **Reveal the shown chip**, exactly as the query strip one row above does
+    // (`tabs.rs`, with the same comment). The strip had none, and its case is
+    // the stronger of the two: its selection is set *programmatically* on every
+    // run and every close, and pins fill it up — so a fresh run's chip landed
+    // past the right edge and the strip appeared not to have responded at all.
+    //
+    // Deferred one tick, and that is load-bearing rather than cautious:
+    // `Id::scroll_to` refuses on a hidden subtree, and a freshly-mounted chip
+    // has not been laid out yet.
+    let cid = chip.id();
+    create_effect(move |_| {
+        if is_active() {
+            floem::action::exec_after(std::time::Duration::ZERO, move |_| cid.scroll_to(None));
+        }
+    });
+    chip
 }
 
 /// The chip's right-click menu — the query strip's verbs, less the ones that are
@@ -9389,6 +9543,44 @@ mod result_panel_tab_tests {
             matches!(state, Some(QueryState::Running)),
             "the second statement's panel took the first's result"
         );
+    }
+
+    /// **The bulk writer must answer exactly as the one-at-a-time writer did.**
+    /// It exists only to cut the notification count (0.67 ms → 263 ms at 400
+    /// statements was the cost of writing one at a time), so any difference in
+    /// *outcome* would be a regression bought with performance.
+    ///
+    /// Both halves of `set_panel_state`'s contract, over a strip that was
+    /// pinned, reordered and partly closed while the batch ran: results land by
+    /// id, and a closed panel takes nothing.
+    #[test]
+    fn a_batch_written_at_once_lands_exactly_where_one_at_a_time_would() {
+        let t = tab();
+        let batch = t.begin_run(&[
+            "SELECT 1".to_string(),
+            "SELECT 2".to_string(),
+            "SELECT 3".to_string(),
+        ]);
+        // Pin the last, which moves it; close the middle one.
+        t.set_pinned(batch[2], true);
+        t.close_panels(&[batch[1]]);
+
+        t.set_panel_states([
+            (batch[0], QueryState::Failed("one".into())),
+            (batch[1], QueryState::Failed("two".into())),
+            (batch[2], QueryState::Failed("three".into())),
+        ]);
+
+        let state = |id: u64| {
+            t.result_tabs
+                .with_untracked(|v| v.iter().find(|p| p.id == id).map(|p| p.state.clone()))
+        };
+        assert!(
+            matches!(state(batch[0]), Some(QueryState::Failed(ref m)) if m == "one"),
+            "reordering must not move a result"
+        );
+        assert!(matches!(state(batch[2]), Some(QueryState::Failed(ref m)) if m == "three"));
+        assert!(state(batch[1]).is_none(), "a closed panel takes nothing");
     }
 
     /// A result landing after its panel was closed goes nowhere — the panel-level

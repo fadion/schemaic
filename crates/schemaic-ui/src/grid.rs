@@ -30,7 +30,7 @@ use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::edit::{self, EditModel, analyze_edit, refetch_key, refetch_template, row_key};
 use schemaic_core::export::{ExportFormat, suggested_filename};
-use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_statement};
+use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_of};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
@@ -683,7 +683,7 @@ impl GridState {
     /// executed a second time**, for a re-run that changes nothing about the
     /// query itself — the capped notice's "read N rows", the export's "All rows".
     ///
-    /// A two-line wrapper over [`rerun_statement`], which is where both halves
+    /// A two-line wrapper over [`rerun_of`], which is where all three halves
     /// of the decision live and are tested: the rewrite, and the write guard.
     /// The guard is not spelled out again here on purpose — a term a caller can
     /// delete is a term the suite cannot hold, and this call site had no test at
@@ -711,12 +711,15 @@ impl GridState {
     /// callers nothing: both run inside click handlers, where there is no effect
     /// to subscribe.
     fn current_statement(&self) -> Option<String> {
-        if self.kept.get() {
-            return None;
-        }
-        let base = self.base_sql.get()?;
+        // **`filter::rerun_of`, not a `return None` here.** The frozen term was
+        // a line in this method and nothing could reach it: deleting it left the
+        // workspace green while a pinned result regained "read all rows" and the
+        // "All rows" export, both of which re-run into the panel and destroy the
+        // pin. The memo that computes `kept` was tested; its consumer was not.
+        let kept = self.kept.get();
+        let base = self.base_sql.get();
         self.grid_query
-            .with(|q| rerun_statement(&base, q, self.dialect))
+            .with(|q| rerun_of(kept, base.as_deref(), q, self.dialect))
     }
 
     /// Is there a statement to re-run at all? — [`GridState::current_statement`]
@@ -2708,9 +2711,13 @@ pub(crate) struct GridCtx {
 /// (via a text override). Absolute → overlays the panel out of flow.
 ///
 /// It carries three things, and the **surface is the message**:
-/// - an **error** in the red fill: the shown Run-Everything statement's own
-///   failure (`batch_err` — a batch has no editor bar to put it in), else a commit
-///   write-back or a filter/sort re-run;
+/// - an **error** in the red fill: a commit write-back, or a filter/sort re-run.
+///   **Not a statement's own failure** — that goes to the editor's error bar,
+///   under the SQL that produced it and beside the Explain and AI fix that act on
+///   it, and the body below says so. (This paragraph named `batch_err`, which
+///   was deleted when a batch's statement errors moved there; it is the doc
+///   whoever fixes that bar reads first, and it contradicted the code thirty
+///   lines below it.);
 /// - a **wait note** for a write that is taking long enough to need explaining
 ///   ([`arm_wait_note`]), on the ordinary chrome surface, with a one-click
 ///   `Rollback` when exactly one transaction of the user's own could be the
