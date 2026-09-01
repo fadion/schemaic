@@ -3491,6 +3491,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   loudly, it writes to a row nobody asked for, with only the 1-row net behind it. Removing the
   `NOT NULL` guard from the unique-index rung fails `a_nullable_unique_index_is_no_key_at_all` on all
   three legs and nothing else — checked, not assumed.
+  **`writeback.rs` asserts the number the 1-row net reads, where `model.rs` asserts the verdict
+  given one.** Two of its claims exist only at this seam. `CLIENT_FOUND_ROWS`: MySQL counts
+  *changed* rows by default, so an edit setting a cell to the value it already holds affects 0, the
+  net reads that as "the row is gone" and rolls back a perfectly good batch —
+  `an_update_to_an_unchanged_value_still_counts_as_one_row` is the only thing anywhere that can
+  tell the flag is still set, and clearing it fails exactly the two MySQL legs. And `Rollback::note`:
+  the same doomed batch runs twice on the MySQL legs, once on `InnoDB` and once on `MyISAM`, and the
+  error has to promise a complete rollback in the first case and admit the surviving rows in the
+  second. **`ddl.rs`** carries the designer's round trip — introspect → draft → diff → emit → run →
+  introspect — whose real subject is the *asymmetric* failure: an emitter writing something the
+  introspector reads back differently leaves a table that is correct on the server and permanently
+  dirty in the designer, and neither half's own tests can see it. Breaking `ddl::defaults_equal`
+  fails all fifteen of them with `AlterColumn { from: X, to: X }`, which is that symptom exactly.
+  **Two capability differences are recorded as leg data rather than discovered per test**, since a
+  test asserting one answer would be wrong on two servers out of three: `Target::non_transactional`
+  (MySQL's `MyISAM`, which accepts `BEGIN` and ignores it) and `Target::transactional_ddl`
+  (PostgreSQL wraps a DDL plan, so a refused one applies **nothing** and `DdlError::applied` is 0,
+  while MySQL commits each `ALTER` as it runs and the count is what the preview reports).
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
   tier stays pure by construction. With the feature on, an unreachable server is a **failure** —
