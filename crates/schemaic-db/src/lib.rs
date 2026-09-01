@@ -5024,6 +5024,60 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 mod tests {
     use super::*;
 
+    // ── The server-level DDL runner ───────────────────────────────────────
+
+    /// The runner for the two most destructive statements this app emits had
+    /// **no test at all**. Two of its decisions need no server and are three
+    /// lines each under the house rule, so they are here.
+    ///
+    /// The SQLite arm returns before any I/O: a database there is a file, and
+    /// the refusal has to be a message rather than an invented filesystem
+    /// action. `supports_database_editing` refuses the change long before this,
+    /// so reaching here at all means something upstream let it through — which
+    /// is exactly when a backstop earns its place.
+    #[tokio::test]
+    async fn sqlite_refuses_server_level_ddl_without_touching_anything() {
+        let db = Db::from_parts(
+            Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "file:server_ddl_test?mode=memory&cache=shared".to_string(),
+        );
+        let err = db
+            .run_server_ddl(
+                None,
+                &["CREATE DATABASE shop;".to_string()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("SQLite has no databases to create");
+        assert!(err.message.contains("file"), "{}", err.message);
+        assert_eq!(err.applied, 0, "nothing ran");
+    }
+
+    /// And an empty plan is a no-op on every engine — it must not open a
+    /// connection to find that out. Asserted on SQLite, where a connect would
+    /// otherwise be the one thing that *could* succeed and so would hide the
+    /// early return.
+    #[tokio::test]
+    async fn an_empty_server_level_plan_runs_nothing() {
+        let db = Db::from_parts(
+            Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "/nonexistent/path/that/cannot/be/opened.db".to_string(),
+        );
+        assert!(
+            db.run_server_ddl(None, &[], CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
     // ── The connection's own database ─────────────────────────────────────
 
     /// **`open(None)` and "no database at all" must not be the same
