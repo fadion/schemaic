@@ -28,6 +28,7 @@ use schemaic_core::edit::{EditModel, analyze_edit};
 use schemaic_core::export::ident_sql;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::ResultSet;
+use schemaic_core::schema::DbSchema;
 use schemaic_db::{Db, DbError};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +37,22 @@ use crate::endpoint::Target;
 /// Every namespace this tier creates begins with this, and nothing without it is
 /// ever dropped.
 pub const PREFIX: &str = "schemaic_it_";
+
+/// What [`Scratch::alt_namespace`]'s second namespace is called, on whichever
+/// level this server keeps its namespaces.
+const ALT: &str = "alt";
+
+/// A place a table can live, on either shape of server: a database, plus the
+/// schema inside it where the server has that level.
+///
+/// The pair rather than a string because it is exactly what every namespace-aware
+/// API here already takes — `fetch_table`, `ImportTarget`, `RowEdit` — and
+/// collapsing the two is the mistake those APIs are shaped to prevent.
+#[derive(Clone, Debug)]
+pub struct Namespace {
+    pub database: String,
+    pub schema: Option<String>,
+}
 
 /// How many rows a fixture statement may return. Fixture data is seeded by the
 /// test that reads it, so anything approaching this is a bug in the test.
@@ -51,6 +68,11 @@ pub struct Scratch {
     /// The namespace a table here reports, from [`Target::namespace`].
     pub namespace: Option<&'static str>,
     dialect: SqlDialect,
+    /// Further scratch **databases** this test made — the MySQL family's answer
+    /// to [`Scratch::alt_namespace`], where a database *is* the namespace. Empty
+    /// on PostgreSQL, whose second namespace is a schema inside this one. Dropped
+    /// before [`Scratch::database`] is.
+    extra_databases: Vec<String>,
     /// Set by [`Scratch::teardown`], so the drop guard does not run twice.
     torn: bool,
 }
@@ -98,6 +120,7 @@ impl Scratch {
             database: name,
             namespace: target.namespace,
             dialect,
+            extra_databases: Vec::new(),
             torn: false,
         }
     }
@@ -139,19 +162,121 @@ impl Scratch {
     /// last loaded.
     pub async fn edit_model(&self, sql: &str) -> (ResultSet, EditModel) {
         let rs = self.exec(sql).await;
-        let schema = self
-            .db
-            .fetch_schema(&self.database, CancellationToken::new())
-            .await
-            .unwrap_or_else(|e| panic!("live tier could not introspect {}: {e}", self.database));
-        let model = analyze_edit(&rs, |_db, ns, table| {
-            schema
-                .tables
+
+        // **Every database the result names, not just this one.** The lookup
+        // `analyze_edit` is given takes a database, a namespace and a table, and
+        // a helper that answered from one database while ignoring the first
+        // argument would hand `alt.orders` the *primary* namespace's `orders` —
+        // collapsing precisely the identity the namespace tests exist to check,
+        // inside the helper those tests call.
+        let mut databases: Vec<String> = rs
+            .columns
+            .iter()
+            .filter_map(|c| c.origin.as_ref().map(|o| o.database.clone()))
+            .collect();
+        databases.sort();
+        databases.dedup();
+        if databases.is_empty() {
+            databases.push(self.database.clone());
+        }
+
+        let mut loaded: Vec<(String, DbSchema)> = Vec::new();
+        for db in databases {
+            let schema = self
+                .db
+                .clone()
+                .with_database(Some(&db))
+                .fetch_schema(&db, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("live tier could not introspect {db}: {e}"));
+            loaded.push((db, schema));
+        }
+
+        let model = analyze_edit(&rs, |db, ns, table| {
+            loaded
                 .iter()
-                .find(|t| t.name == table && t.schema.as_deref() == ns)
+                .find(|(name, _)| name == db)
+                .and_then(|(_, schema)| {
+                    schema
+                        .tables
+                        .iter()
+                        .find(|t| t.name == table && t.schema.as_deref() == ns)
+                })
                 .cloned()
         });
         (rs, model)
+    }
+
+    /// A **second** namespace, whatever that means on this server.
+    ///
+    /// PostgreSQL has a level between database and table, so this is a schema
+    /// beside `public` in the same database. MySQL has none — a database *is* the
+    /// namespace — so it is a second scratch database, carrying the same prefix
+    /// and dropped by the same guard. Returned as the pair every namespace-aware
+    /// API takes, so a test can be written once for both.
+    ///
+    /// It exists because "two namespaces may hold same-named tables" is a rule
+    /// about *identity*, and the failure it guards against — one namespace's key
+    /// addressing another's rows — cannot happen with only one namespace to
+    /// test in.
+    pub async fn alt_namespace(&mut self) -> Namespace {
+        match self.namespace {
+            Some(_) => {
+                let sql = format!("CREATE SCHEMA {}", ident_sql(ALT, self.dialect));
+                self.exec(&sql).await;
+                Namespace {
+                    database: self.database.clone(),
+                    schema: Some(ALT.to_string()),
+                }
+            }
+            None => {
+                let name = format!("{}_{ALT}", self.database);
+                assert_scratch_name(&name);
+                let sql = format!("CREATE DATABASE {}", ident_sql(&name, self.dialect));
+                self.base
+                    .fetch_query(None, &sql, 1, CancellationToken::new())
+                    .await
+                    .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+                self.extra_databases.push(name.clone());
+                Namespace {
+                    database: name,
+                    schema: None,
+                }
+            }
+        }
+    }
+
+    /// Run a statement inside `ns`, which may be [`Scratch::alt_namespace`]'s.
+    pub async fn exec_in(&self, ns: &Namespace, sql: &str) -> ResultSet {
+        self.db
+            .clone()
+            .with_database(Some(&ns.database))
+            .fetch_query(Some(&ns.database), sql, ROW_CAP, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "live tier statement failed: {e}
+statement: {sql}"
+                )
+            })
+    }
+
+    /// `table`, quoted and qualified into `ns`.
+    pub fn qualified_in(&self, ns: &Namespace, table: &str) -> String {
+        let outer = ns.schema.as_deref().unwrap_or(&ns.database);
+        format!(
+            "{}.{}",
+            ident_sql(outer, self.dialect),
+            ident_sql(table, self.dialect)
+        )
+    }
+
+    /// This scratch's own namespace, as the same pair.
+    pub fn namespace_ref(&self) -> Namespace {
+        Namespace {
+            database: self.database.clone(),
+            schema: self.namespace.map(str::to_string),
+        }
     }
 
     /// `table`, quoted and qualified so a statement cannot land outside the
@@ -172,6 +297,16 @@ impl Scratch {
     /// really gone.
     pub async fn teardown(mut self) {
         self.torn = true;
+        // Before the database this handle is attached to, so a failure to drop an
+        // extra is still reported rather than orphaned by an early return.
+        for name in std::mem::take(&mut self.extra_databases) {
+            assert_scratch_name(&name);
+            let sql = format!("DROP DATABASE {}", ident_sql(&name, self.dialect));
+            self.base
+                .fetch_query(None, &sql, 1, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("live tier could not drop {name}: {e}"));
+        }
         let sql = self.drop_sql();
         self.base
             .fetch_query(None, &sql, 1, CancellationToken::new())
@@ -208,15 +343,26 @@ impl Drop for Scratch {
         }
         let base = self.base.clone();
         let name = self.database.clone();
-        let sql = self.drop_sql();
+        let mut plan: Vec<String> = self
+            .extra_databases
+            .iter()
+            .inspect(|n| assert_scratch_name(n))
+            .map(|n| format!("DROP DATABASE {}", ident_sql(n, self.dialect)))
+            .collect();
+        plan.push(self.drop_sql());
         let outcome = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
-            rt.block_on(base.fetch_query(None, &sql, 1, CancellationToken::new()))
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            rt.block_on(async {
+                for sql in &plan {
+                    base.fetch_query(None, sql, 1, CancellationToken::new())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
         })
         .join();
 

@@ -28,8 +28,10 @@ mod cases;
 mod ddl;
 mod editable;
 mod endpoint;
+mod namespaces;
 mod runtime;
 mod scratch;
+mod streaming;
 mod suite;
 mod triggers;
 mod views;
@@ -111,6 +113,16 @@ live_suite!(
         a_manual_transaction_is_invisible_until_it_commits,
         a_rolled_back_manual_transaction_leaves_nothing,
         a_cancelled_query_stops_at_the_server,
+    ],
+    streaming: [
+        a_streamed_export_delivers_every_row,
+        a_statement_with_no_rows_to_export_is_refused,
+        a_failed_export_reports_the_failure_to_the_writer,
+    ],
+    namespaces: [
+        same_named_tables_in_two_namespaces_stay_distinct,
+        a_result_names_the_namespace_it_read_from,
+        an_edit_lands_in_the_namespace_it_was_read_from,
     ],
     views: [
         an_introspected_view_diffs_to_nothing_against_its_own_draft,

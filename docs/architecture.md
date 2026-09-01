@@ -3535,6 +3535,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   still stands, because a driver may reasonably start attributing a view's columns to the table
   underneath, and the key the resolver then picks has to identify exactly one row — which the test
   checks by counting what it matches.
+  **`streaming.rs` and `namespaces.rs`** close the last two. The export's assertions are about
+  completeness and about how a failure reaches the *writer*: a channel that simply closes reads as
+  "the table ended", so a half-written file would be reported as finished — both failure tests check
+  the channel, not just the return value. `namespaces.rs` needs two namespaces to exist at all,
+  which is what `Scratch::alt_namespace` is for: a schema on PostgreSQL, a second scratch database
+  on MySQL, so one test means the same thing on both. What it guards is silent — the statement
+  succeeds, one row is affected, the net is satisfied, and the wrong table changed — so it asserts
+  on the table that must *not* have moved. Collapsing the schema out of `analyze_edit`'s grouping
+  key fails three PostgreSQL tests including that one; the MySQL legs are correctly unmoved, their
+  namespace being the database, and that half rests on the same assertion's `database` comparison.
   **What the tier deliberately does not cover: SSH tunnels and TLS.** Not an oversight and not
   difficulty in the tests — the obstacle is that both need a server configured *before* it starts,
   and GitHub Actions brings `services:` containers up before any step runs, so the repository is not
