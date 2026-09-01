@@ -28,7 +28,9 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::script::{Probe, RunOutcome};
+use schemaic_core::script::{
+    DestructionNotice, Probe, ProbeSummary, RunOutcome, destruction_notice, summary_kind,
+};
 use schemaic_core::sql::{GuardPolicy, RunVerdict, script_verdict};
 
 use crate::theme;
@@ -268,15 +270,24 @@ fn probe_body(p: &Probe) -> impl IntoView {
         })
         .collect();
 
-    let summary = if p.statements == 0 {
-        "This file holds no statements Schemaic can run.".to_string()
-    } else {
-        format!(
+    // **Matched exhaustively over a core classifier, not written as an `if`
+    // over one field.** The `== 0` branch this replaces never consulted
+    // `Probe::more`, so a file whose first statement is bigger than the probe's
+    // look was described as holding nothing runnable — a claim about a file the
+    // probe had not finished reading.
+    let summary = match summary_kind(p) {
+        ProbeSummary::NothingToRun => "This file holds no statements Schemaic can run.".to_string(),
+        ProbeSummary::CutOffBeforeFirst => format!(
+            "The first {} of this file is one unfinished statement, so there is nothing to \
+             summarise yet. Running it sends the file whole.",
+            schemaic_core::stats::format_bytes(p.bytes_read),
+        ),
+        ProbeSummary::Counted => format!(
             "{} {} read from the first {}.",
             p.count_label(p.statements),
             schemaic_core::text::plural(p.statements, "statement", "statements"),
             schemaic_core::stats::format_bytes(p.bytes_read),
-        )
+        ),
     };
 
     v_stack((
@@ -294,21 +305,25 @@ fn probe_body(p: &Probe) -> impl IntoView {
         // reactive wrapper to react to.
         {
             let mut rows: Vec<floem::AnyView> = Vec::new();
-            // Only when there is destruction to report: a permanent "destroys
-            // nothing" line would be one more thing to read past on every file.
-            if p.destructive > 0 {
-                rows.push(
-                    // **This sentence is the confirmation**, so it says the
-                    // irreversible thing plainly and counts widely — DELETE
-                    // included. There is no second "are you sure" step: the
-                    // file was chosen deliberately and this panel says what it
-                    // will do before Run is pressed.
+            // **This sentence is the confirmation**, so it says the irreversible
+            // thing plainly and counts widely — DELETE included. There is no
+            // second "are you sure" step: the file was chosen deliberately and
+            // this panel says what it will do before Run is pressed.
+            //
+            // Matched exhaustively over `destruction_notice` rather than gated
+            // on `p.destructive > 0`, because that gate was one state short: a
+            // probe that stopped early and saw no DROP in the prefix rendered
+            // *nothing*, on exactly the large file the sentence exists for. A
+            // fourth state can now only be added by making this match fail to
+            // compile.
+            match destruction_notice(p) {
+                Some(DestructionNotice::Found(n)) => rows.push(
                     text(format!(
                         "{} {} in this file {} data — DROP, TRUNCATE or DELETE. \
                          That cannot be undone from here.",
-                        p.count_label(p.destructive),
-                        schemaic_core::text::plural(p.destructive, "statement", "statements"),
-                        schemaic_core::text::plural(p.destructive, "destroys", "destroy"),
+                        p.count_label(n),
+                        schemaic_core::text::plural(n, "statement", "statements"),
+                        schemaic_core::text::plural(n, "destroys", "destroy"),
                     ))
                     .style(|s| {
                         s.font_size(theme::font_label())
@@ -316,7 +331,26 @@ fn probe_body(p: &Probe) -> impl IntoView {
                             .padding_top(theme::scaled(8.0))
                     })
                     .into_any(),
-                );
+                ),
+                // Not muted, and not softer than the line above: "we did not
+                // look" is a warning, not a hint.
+                Some(DestructionNotice::Unread) => rows.push(
+                    text(format!(
+                        "Only the first {} of this file was read, and nothing in it destroys \
+                         data — but the rest was not looked at. It may DROP, TRUNCATE or \
+                         DELETE, and that cannot be undone from here.",
+                        schemaic_core::stats::format_bytes(p.bytes_read),
+                    ))
+                    .style(|s| {
+                        s.font_size(theme::font_label())
+                            .color(theme::error())
+                            .padding_top(theme::scaled(8.0))
+                    })
+                    .into_any(),
+                ),
+                // Read whole, destroys nothing: a permanent "destroys nothing"
+                // line would be one more thing to read past on every file.
+                None => {}
             }
             // **Same size as the warning above it, not a hint.** Whether the
             // file wraps itself is what decides the meaning of a Stop half way
