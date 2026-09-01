@@ -196,8 +196,13 @@ fn open_blank(ui: &Ui, database: &str, schema: Option<&str>, body: &str) {
 /// Whether this tree node is a view Schemaic can edit — the entry point's
 /// enabled/disabled test, and the reason a materialized view doesn't open a
 /// half-populated form: PostgreSQL has no `CREATE OR REPLACE` for one.
+///
+/// The materialized half is `ddl::is_materialized_view`'s, spelled once: the
+/// schema menu asks the same question to *offer* `Refresh view`, and two
+/// hand-written copies of "is this a materialized view" are two chances for the
+/// editor and the menu to disagree about the same node.
 pub(crate) fn is_editable_view(info: Option<&schemaic_core::schema::TableInfo>) -> bool {
-    info.is_some_and(|t| t.is_view && !t.view_options.as_ref().is_some_and(|o| o.materialized))
+    info.is_some_and(|t| t.is_view && !schemaic_core::ddl::is_materialized_view(t))
 }
 
 // ── the form ─────────────────────────────────────────────────────────────────
