@@ -217,12 +217,94 @@ impl ImportScan {
         self.skipped.extend(other.skipped);
     }
 
+    /// **Every skipped entry's display name is redacted here, at the point it
+    /// is made.**
+    ///
+    /// An entry that could not be parsed has no name of its own, so both
+    /// parsers fall back to the raw text — a whole DSN line, or a whole
+    /// `jdbc-url` — and the modal renders it inside *"N entries were not
+    /// imported"*, where it stays across further scans. A Redis or Oracle URL
+    /// with a password in its userinfo therefore put that password on screen,
+    /// and the module holds itself to precisely the opposite rule for the rows
+    /// it *does* show (`a_target_never_becomes_a_url`).
+    ///
+    /// Doing it in the constructor rather than at the two call sites is the
+    /// point: fixing one site left the other live, and a third would be added
+    /// by whoever writes the next parser.
     fn skip(&mut self, name: impl Into<String>, reason: SkipReason) {
         self.skipped.push(Skipped {
-            name: name.into(),
+            name: redacted(&name.into()),
             reason,
         });
     }
+}
+
+/// `name` with anything that could be a password replaced by `…`.
+///
+/// Two shapes, because those are the two a failed entry's fallback name can
+/// have: a URL's `scheme://user:secret@host` userinfo, and a
+/// `password=`/`pwd=`/`pass=` parameter in a query string or a DSN. Everything
+/// else — a DataGrip entry name, a file path, a driver name — passes through
+/// unchanged, which is most of what reaches here.
+fn redacted(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    // The userinfo half. `://` then everything up to the last `@` before the
+    // next `/`; a `:` inside it separates the login from the secret.
+    let rest = match name.split_once("://") {
+        Some((scheme, after)) => {
+            let end = after.find('/').unwrap_or(after.len());
+            match after[..end].rfind('@') {
+                Some(at) => {
+                    let userinfo = &after[..at];
+                    out.push_str(scheme);
+                    out.push_str("://");
+                    match userinfo.split_once(':') {
+                        Some((user, _)) => {
+                            out.push_str(user);
+                            out.push_str(":…");
+                        }
+                        None => out.push_str(userinfo),
+                    }
+                    out.push('@');
+                    &after[at + 1..]
+                }
+                None => {
+                    out.push_str(scheme);
+                    out.push_str("://");
+                    after
+                }
+            }
+        }
+        None => name,
+    };
+    // The parameter half, over whatever is left. Split on the characters a
+    // query string or a DSN separates parameters with, so one `password=` value
+    // cannot swallow the rest of the line. `split_inclusive` keeps each
+    // separator on the end of its own part, so the text is rebuilt exactly.
+    const SEPS: [char; 4] = ['&', '?', ';', ' '];
+    for part in rest.split_inclusive(SEPS) {
+        let (body, sep) = match part.chars().next_back().filter(|c| SEPS.contains(c)) {
+            Some(c) => (&part[..part.len() - c.len_utf8()], Some(c)),
+            None => (part, None),
+        };
+        match body.split_once('=') {
+            Some((key, value)) if !value.is_empty() && is_password_key(key) => {
+                out.push_str(key);
+                out.push_str("=…");
+            }
+            _ => out.push_str(body),
+        }
+        if let Some(c) = sep {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Does this parameter name hold a secret? The same spellings [`apply_params`]
+/// reads a password out of.
+fn is_password_key(k: &str) -> bool {
+    matches!(normalize_key(k).as_str(), "password" | "pwd" | "pass")
 }
 
 /// One source file, already read. The app does the finding and the reading; this
@@ -1942,6 +2024,68 @@ mod tests {
         );
         let scan = parse_pg_service("[svc]\nhost=h\nsslmode=allow\n");
         assert_eq!(scan.found[0].connection.tls.mode, SslMode::Prefer);
+    }
+
+    /// **A password must not be rendered back at the user in the "not
+    /// imported" sentence.** An entry that fails to parse has no name of its
+    /// own, so both parsers fall back to the raw text — a whole DSN line, or a
+    /// whole `jdbc-url` — and the modal keeps it on screen across further
+    /// scans. The module already holds itself to the opposite rule for the rows
+    /// it *does* show.
+    ///
+    /// Asserted through the two parsers, because the two sites were separately
+    /// wrong and a fix at one of them left the other live. The redaction is in
+    /// `ImportScan::skip`, which is where the name is made.
+    #[test]
+    fn a_skipped_entry_never_renders_a_password() {
+        let scan = parse_url_scan("redis://admin:hunter2@cache.example:6379/0\n");
+        assert_eq!(scan.skipped.len(), 1);
+        assert!(
+            !scan.skipped[0].name.contains("hunter2"),
+            "{}",
+            scan.skipped[0].name
+        );
+        assert!(
+            scan.skipped[0].name.contains("cache.example"),
+            "still identifiable"
+        );
+
+        // DataGrip: no `name` attribute, so the whole `jdbc-url` is the
+        // fallback. A different site from the one above, surviving a fix to it.
+        let scan = parse_datagrip(
+            "<data-source><jdbc-url>jdbc:oracle:thin:@//db.example:1521/orcl?password=hunter2</jdbc-url></data-source>",
+        );
+        assert_eq!(scan.skipped.len(), 1);
+        assert!(
+            !scan.skipped[0].name.contains("hunter2"),
+            "{}",
+            scan.skipped[0].name
+        );
+    }
+
+    /// And redaction leaves everything else alone — most of what reaches
+    /// `skip` is an ordinary name.
+    #[test]
+    fn redaction_does_not_disturb_a_name_that_holds_no_secret() {
+        for name in [
+            "Analytics (prod)",
+            "C:\\Users\\me\\AppData\\Roaming\\DBeaverData\\data-sources.json",
+            "jdbc:oracle:thin:@//db.example:1521/orcl",
+            "postgres://reader@pg.example:5432/world",
+            "/home/me/.pgpass",
+        ] {
+            assert_eq!(redacted(name), name);
+        }
+        // A password parameter loses only its value, and the rest of the query
+        // survives — one secret must not swallow the line.
+        assert_eq!(
+            redacted("mysql://h/d?user=app&password=hunter2&ssl-mode=REQUIRED"),
+            "mysql://h/d?user=app&password=…&ssl-mode=REQUIRED"
+        );
+        assert_eq!(
+            redacted("mysql://root:hunter2@h:3306/shop"),
+            "mysql://root:…@h:3306/shop"
+        );
     }
 
     #[test]
