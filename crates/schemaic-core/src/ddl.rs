@@ -6780,6 +6780,32 @@ pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
 /// An exhaustive `match` rather than the `!= Postgres` this shipped as: that
 /// spelling hands a fourth engine MySQL's answer silently, and there is no
 /// comparison left in the tree to grep for when someone comes looking.
+/// Does `dialect` roll a **whole DDL plan** back when one statement of it is
+/// stopped or fails?
+///
+/// The capability behind *"may this apply be cancelled"*, which the preview
+/// modal used to answer `false` for every engine and every plan.
+///
+/// PostgreSQL and SQLite have transactional DDL, and `Db::run_ddl` wraps the
+/// plan on both — so a cancel leaves the database exactly as it was and the
+/// report has nothing to admit to. MySQL does not: each statement commits as it
+/// runs, so a stopped plan is a half-migrated table whose *only* reader is the
+/// modal's own error line, and closing it would leave a stale schema tree with
+/// no indication anything happened. That is why the modal refuses every exit
+/// while applying, and it stays true where it is true.
+///
+/// The cost of getting it wrong is asymmetric, which is why this is asked of a
+/// capability rather than assumed: a refused exit on PostgreSQL traps the user
+/// inside a modal over an unbounded operation (`REFRESH MATERIALIZED VIEW` is
+/// one statement and can run for hours); an allowed exit on MySQL loses the
+/// report of a half-applied plan.
+pub fn ddl_rolls_back_as_a_whole(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql => false,
+    }
+}
+
 pub fn supports_sequence_resync(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,

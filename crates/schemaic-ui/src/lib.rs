@@ -857,6 +857,14 @@ pub struct DdlPreview {
     /// editor" hand over; `statements` is what goes on the wire.
     pub script: String,
     pub read_only: bool,
+    /// The engine this plan is for.
+    ///
+    /// Carried on the preview rather than looked up at each exit, so the
+    /// question *"may this apply be stopped"* is asked of the plan that is
+    /// actually running — a connection switch behind the modal must not change
+    /// the answer half way through. Read through
+    /// `ddl::ddl_rolls_back_as_a_whole`, never matched on here.
+    pub dialect: SqlDialect,
 }
 
 /// Where a DDL plan runs, and therefore what has to be re-read afterwards.
@@ -3137,6 +3145,14 @@ pub struct SchemaActions {
     pub script_cancel: Rc<dyn Fn()>,
     /// Apply an approved DDL plan, then re-introspect the database it changed.
     pub run_ddl: DdlFn,
+    /// Stop the DDL plan [`SchemaActions::run_ddl`] is applying.
+    ///
+    /// **Only meaningful where the engine rolls a plan back as a whole** —
+    /// `ddl::ddl_rolls_back_as_a_whole`, which is what the modal's exit asks
+    /// before offering this. On MySQL each statement has already committed, so
+    /// stopping would leave a half-migrated table whose only report is the
+    /// modal that would then be closing; that arm still refuses.
+    pub ddl_cancel: Rc<dyn Fn()>,
     /// Read a MySQL view's `ALGORITHM`, which no bulk query reports.
     pub view_algorithm: ViewAlgoFn,
     pub trigger_functions: TriggerFnFn,

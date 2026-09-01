@@ -571,10 +571,22 @@ impl Db {
     }
 
     /// Best-effort server-side cancel: connect afresh and `KILL QUERY <id>`.
+    ///
+    /// **Bounded by [`CANCEL_TIMEOUT`].** The whole reason this is reached is
+    /// that something is not responding, and it answers that by opening a
+    /// *fresh* connection — full TCP, a TLS handshake, and on `prefer` possibly
+    /// a second connect — to a host that may be gone. Unbounded, a Stop against
+    /// a dead server hangs inside a modal whose every exit maps to that same
+    /// Stop, and the only way out is killing the process.
     pub(crate) async fn kill_query(&self, conn_id: u32) {
-        if let Ok(mut killer) = self.open_serverless(false).await {
-            let _ = killer.query_drop(format!("KILL QUERY {conn_id}")).await;
-            let _ = killer.disconnect().await;
+        let kill = async {
+            if let Ok(mut killer) = self.open_serverless(false).await {
+                let _ = killer.query_drop(format!("KILL QUERY {conn_id}")).await;
+                let _ = killer.disconnect().await;
+            }
+        };
+        if tokio::time::timeout(CANCEL_TIMEOUT, kill).await.is_err() {
+            tracing::debug!("kill query timed out after {CANCEL_TIMEOUT:?}");
         }
     }
 }
@@ -1358,6 +1370,21 @@ fn err_clone(e: &DbError) -> DbError {
 /// on one engine only would put a five-second cap on PostgreSQL query connects
 /// and nothing on MySQL's, which is a worse asymmetry than the one it fixes.
 pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a **cancel** may take before it is given up on.
+///
+/// A cancel is best-effort by construction — its result is discarded on every
+/// path — but "best-effort" and "unbounded" are not the same word. Both engines
+/// cancel by opening a *second* connection (MySQL to send `KILL QUERY`,
+/// PostgreSQL because that is what the cancellation protocol is), which is a
+/// full TCP connect plus a TLS handshake to a host that, by the time anyone is
+/// pressing Stop, may be gone.
+///
+/// Unbounded that hangs *inside a modal whose every exit maps to the same
+/// Stop*, with the global shortcuts gated off behind `modal_up()`: there is no
+/// way out but killing the process. Five seconds matches [`PING_TIMEOUT`],
+/// which is the app's existing answer to "the server is not responding".
+pub const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Db {
     /// Lightweight reachability check: connect and run `SELECT 1`, all bounded by
@@ -4316,9 +4343,12 @@ impl Db {
             Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
         };
         let conn_id = conn.id();
-        // Best-effort, as in `run_ddl`: a server without the variable keeps its
-        // own default rather than failing the load over the bound.
-        let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
+        // **No lock bound is set here.** See `pg::run_script` for the whole
+        // reasoning: `DDL_LOCK_WAIT_SECS` is documented for the Apply modal's
+        // short reviewed plan, and a restore that dies at statement N with N−1
+        // applied and no transaction of ours to roll back is worse than
+        // waiting. `mysql <` sets nothing either, and Stop here kills the
+        // running statement server-side.
         let mut ran = 0usize;
         let end = loop {
             // Cancel has to be reachable **while waiting for the next
@@ -4330,19 +4360,39 @@ impl Db {
                 _ = cancel.cancelled() => break ExecEnd::Cancelled,
             };
             let Some(st) = next else { break ExecEnd::Done };
-            let step = tokio::select! {
-                r = conn.query_drop(&st.sql) => r.map_err(|e| DbError::Query(e.to_string())),
-                _ = cancel.cancelled() => {
-                    self.kill_query(conn_id).await;
-                    Err(DbError::Cancelled)
+            // **The killed statement is awaited, not dropped.** `KILL QUERY` is
+            // a request — MySQL documents that it may be ignored during an
+            // online `ALTER`'s commit phase — so throwing the future away left
+            // `ran` a floor while the panel presents it as the count. Scoped so
+            // the borrow of `st.sql` ends before the `Failed` arm moves it.
+            let step = {
+                let mut fut = std::pin::pin!(conn.query_drop(&st.sql));
+                let raced = tokio::select! {
+                    r = fut.as_mut() => Some(r),
+                    _ = cancel.cancelled() => None,
+                };
+                match raced {
+                    Some(Ok(())) => pg::ScriptStep::Ran,
+                    Some(Err(e)) => pg::ScriptStep::Failed(e.to_string()),
+                    None => {
+                        self.kill_query(conn_id).await;
+                        pg::ScriptStep::Cancelled {
+                            ran: fut.await.is_ok(),
+                        }
+                    }
                 }
             };
             match step {
-                Ok(()) => ran += 1,
-                Err(DbError::Cancelled) => break ExecEnd::Cancelled,
-                Err(e) => {
+                pg::ScriptStep::Ran => ran += 1,
+                pg::ScriptStep::Cancelled { ran: landed } => {
+                    if landed {
+                        ran += 1;
+                    }
+                    break ExecEnd::Cancelled;
+                }
+                pg::ScriptStep::Failed(message) => {
                     break ExecEnd::Failed {
-                        message: e.to_string(),
+                        message,
                         sql: st.sql,
                         line: st.line,
                     };
