@@ -722,23 +722,28 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 /// dimmed means "not here".
 fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
     let ctx = crate::table_designer::edit_ctx(ui);
-    blank_space_entries(ctx.dialect, ctx.read_only, ctx.exists)
-        .into_iter()
-        .map(|e| {
-            let ui = ui.clone();
-            let refresh = ui.schema_actions.refresh_schema.clone();
-            widgets::MenuEntry::action(e.label, move || match e.kind {
-                // The read-only refusal lives in `open_for_new` itself, so every
-                // one of this action's four homes is guarded by construction
-                // rather than by each remembering to ask.
-                BlankKind::CreateDatabase => {
-                    crate::database_editor::open_for_new(&ui, crate::ContainerKind::Database, None)
-                }
-                BlankKind::Refresh => (refresh)(),
-            })
-            .disabled(e.disabled)
+    blank_space_entries(
+        ctx.dialect,
+        ctx.read_only,
+        ctx.exists,
+        ui.conn.conn_status.get_untracked().is_down(),
+    )
+    .into_iter()
+    .map(|e| {
+        let ui = ui.clone();
+        let refresh = ui.schema_actions.refresh_schema.clone();
+        widgets::MenuEntry::action(e.label, move || match e.kind {
+            // The read-only refusal lives in `open_for_new` itself, so every
+            // one of this action's four homes is guarded by construction
+            // rather than by each remembering to ask.
+            BlankKind::CreateDatabase => {
+                crate::database_editor::open_for_new(&ui, crate::ContainerKind::Database, None)
+            }
+            BlankKind::Refresh => (refresh)(),
         })
-        .collect()
+        .disabled(e.disabled)
+    })
+    .collect()
 }
 
 /// What a blank-space entry does.
@@ -781,10 +786,23 @@ pub(crate) struct BlankEntry {
 /// It is the first thing a new user can click. `exists` is asked of the
 /// *connection*, never of whether it connected — an entry must not vanish
 /// because a server is down.
+/// **And dimmed on a connection that is down**, which is the same answer as
+/// read-only for the same reason: the form would open, preview real SQL and
+/// fail at Apply with a connect error — four steps to learn what the header
+/// already says in one. `ConnStatus::is_down` is deliberately false for
+/// `Unknown` (startup, a tunnel still coming up), so the entry does not flicker
+/// while a connection is settling.
+///
+/// Dimmed and **not absent**: that is the app's convention (absent means "not on
+/// this engine", dimmed means "not here"), and losing the entry outright on a
+/// server that is momentarily down is the wrong-fix signal this finding came
+/// with. `Refresh` stays live — a down connection is the one most worth
+/// re-reading.
 pub(crate) fn blank_space_entries(
     dialect: schemaic_core::intel::SqlDialect,
     read_only: bool,
     connection_exists: bool,
+    down: bool,
 ) -> Vec<BlankEntry> {
     if !connection_exists || !schemaic_core::ddl::supports_database_editing(dialect) {
         return Vec::new();
@@ -808,7 +826,7 @@ pub(crate) fn blank_space_entries(
         BlankEntry {
             label: "Create database",
             kind: BlankKind::CreateDatabase,
-            disabled: read_only,
+            disabled: read_only || down,
         },
     ]
 }
@@ -3544,7 +3562,7 @@ mod tests {
     use schemaic_core::intel::SqlDialect;
 
     fn blank_labels(d: SqlDialect, read_only: bool) -> Vec<&'static str> {
-        blank_space_entries(d, read_only, true)
+        blank_space_entries(d, read_only, true, false)
             .into_iter()
             .map(|e| e.label)
             .collect()
@@ -3565,7 +3583,7 @@ mod tests {
                 ["Refresh", "Create database"],
                 "{d:?}"
             );
-            let kinds: Vec<BlankKind> = blank_space_entries(d, false, true)
+            let kinds: Vec<BlankKind> = blank_space_entries(d, false, true, false)
                 .into_iter()
                 .map(|e| e.kind)
                 .collect();
@@ -3583,8 +3601,8 @@ mod tests {
     /// carries Refresh, which is where someone looking for it goes.
     #[test]
     fn blank_space_raises_nothing_where_there_is_no_database_to_create() {
-        assert!(blank_space_entries(SqlDialect::Sqlite, false, true).is_empty());
-        assert!(blank_space_entries(SqlDialect::Sqlite, true, true).is_empty());
+        assert!(blank_space_entries(SqlDialect::Sqlite, false, true, false).is_empty());
+        assert!(blank_space_entries(SqlDialect::Sqlite, true, true, false).is_empty());
     }
 
     /// **And no menu at all with no saved connection.** `edit_ctx` falls back
@@ -3602,13 +3620,16 @@ mod tests {
     fn blank_space_offers_nothing_when_there_is_no_connection_to_create_in() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
             assert!(
-                blank_space_entries(d, false, false).is_empty(),
+                blank_space_entries(d, false, false, false).is_empty(),
                 "{d:?}: a fresh install has nothing to create a database in"
             );
         }
         // And the moment there is one, the menu is back — including on a
         // connection that is down, which this cannot see and must not punish.
-        assert_eq!(blank_space_entries(SqlDialect::MySql, false, true).len(), 2);
+        assert_eq!(
+            blank_space_entries(SqlDialect::MySql, false, true, false).len(),
+            2
+        );
     }
 
     /// The live gate: `Create database` opens an editor that ends at a real
@@ -3617,10 +3638,32 @@ mod tests {
     /// entry a read-only connection has every right to.
     #[test]
     fn a_read_only_connection_can_refresh_but_not_create() {
-        let entries = blank_space_entries(SqlDialect::MySql, true, true);
+        let entries = blank_space_entries(SqlDialect::MySql, true, true, false);
         assert_eq!(entries.len(), 2);
         assert!(!entries[0].disabled, "Refresh is a read");
         assert!(entries[1].disabled, "Create database must be dimmed");
+    }
+
+    /// **A connection that is down gets the same answer as a read-only one.**
+    /// Found in the GUI pass: on a disconnected connection the entry was live,
+    /// so the form opened, previewed real SQL and failed at Apply with a connect
+    /// error — four steps to learn what the header says in one, beside a Retry
+    /// button.
+    ///
+    /// Dimmed and **not absent**, which is this finding's own wrong-fix signal:
+    /// a server that is momentarily down must not cost the user the menu. And
+    /// `Refresh` stays live — a down connection is the one most worth
+    /// re-reading, and it is how you get back.
+    #[test]
+    fn a_connection_that_is_down_cannot_create_but_can_still_refresh() {
+        let entries = blank_space_entries(SqlDialect::MySql, false, true, true);
+        assert_eq!(entries.len(), 2, "the menu must not disappear");
+        assert!(!entries[0].disabled, "Refresh is how you come back");
+        assert!(entries[1].disabled, "Create database must be dimmed");
+
+        // Down *and* read-only is still one dimmed entry, not a contradiction.
+        let both = blank_space_entries(SqlDialect::MySql, true, true, true);
+        assert!(both[1].disabled);
     }
 
     /// **This menu's half of `overlays::menu_order_gate`.**
@@ -3647,7 +3690,7 @@ mod tests {
         };
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             for read_only in [false, true] {
-                let groups: Vec<u8> = blank_space_entries(d, read_only, true)
+                let groups: Vec<u8> = blank_space_entries(d, read_only, true, false)
                     .iter()
                     .map(|e| group(e.label))
                     .collect();

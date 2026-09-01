@@ -1104,7 +1104,13 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             // blank-space menu, which is the same gate on the other home.
             let ctx = crate::table_designer::edit_ctx(&ui);
             if ctx.exists && schemaic_core::ddl::supports_database_editing(ctx.dialect) {
-                let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn);
+                // Dimmed on a **down** connection as well as a read-only one —
+                // the same answer the tree's blank-space menu gives, and for the
+                // reason `schema_tree::blank_space_entries` states: the form
+                // would open, preview real SQL and fail at Apply with a connect
+                // error the header already showed.
+                let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn)
+                    || ui.conn.conn_status.get_untracked().is_down();
                 let create_ui = ui.clone();
                 items.push(
                     container(text("Create database").style(move |s| {
