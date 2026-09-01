@@ -941,6 +941,22 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 .font_size(theme::font_hint())
                 .color(theme::text_muted())
         }),
+        // **What this engine does that the line above does not say.** Today
+        // that is one thing: on MySQL/MariaDB `Verify CA` also checks the host
+        // name, so the picker's two verifying rungs are one there. Said here
+        // rather than left for the connect to reveal — see `SslMode::caveat`,
+        // which is also where the condition for taking it out again lives.
+        label(move || {
+            mode.get()
+                .caveat(&draft.db_type.get())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .style(|s| {
+            s.width_full()
+                .font_size(theme::font_hint())
+                .color(theme::text_dim())
+        }),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
 

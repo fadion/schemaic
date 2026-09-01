@@ -61,7 +61,7 @@ underneath a configured connection:
 | Server presents | disable | prefer | require | verify-ca | verify-full |
 |---|---|---|---|---|---|
 | `good` | plaintext | TLS | TLS | TLS | TLS |
-| `wrongname` | plaintext | TLS | TLS | TLS | **reject: hostname** |
+| `wrongname` | plaintext | TLS | TLS | TLS (PG) / **reject: hostname** (MySQL) | **reject: hostname** |
 | `expired` | plaintext | TLS | TLS | **reject: expired** | **reject: expired** |
 | `otherca` | plaintext | TLS | TLS | **reject: unknown CA** | **reject: unknown CA** |
 | nothing (TLS off) | plaintext | plaintext | **reject: no TLS** | **reject: no TLS** | **reject: no TLS** |
@@ -69,6 +69,19 @@ underneath a configured connection:
 The `wrongname` row is the one that earns the whole test-bed: it is the only
 case that can tell `verify-ca` and `verify-full` apart, and a form that
 collapses them looks correct until someone points it at a real endpoint.
+
+**And on MySQL/MariaDB it is currently the same cell in both columns**, which
+is exactly what running this row found. `mysql_async` 0.37 implements its
+"skip domain validation" toggle by matching `"NotValidForName"` in the
+verifier's error text, and rustls 0.23 raises `NotValidForNameContext`, whose
+`Display` has no such substring — so the arm never fires and `verify-ca` also
+rejects a name mismatch there. Measured twice against the same server, same CA,
+same binary, differing only in the name dialled. The form says so
+(`SslMode::caveat`), and `db::tls`'s
+`the_driver_still_reads_the_verifier_error_by_its_words` turns red the day the
+drivers agree again — at which point this paragraph and that column come back
+out. PostgreSQL is unaffected: Schemaic's own verifier there names both
+spellings.
 
 The last row is what users hit on a misconfigured RDS. Produce it by deleting
 the `99-schemaic-tls.cnf` drop-in and restarting, or by pointing the connection

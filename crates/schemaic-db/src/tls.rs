@@ -345,12 +345,36 @@ fn file_root_store(path: &str) -> Result<RootCertStore, DbError> {
 /// The file is read here rather than through `pem_file_iter` so the error can
 /// name the path: "cannot read certificate file …" is the message for the most
 /// common way to misconfigure this, and the library's own is not.
+/// **A file with no `CERTIFICATE` section is an error, not an empty list.**
+/// `pem_slice_iter` yields nothing for a DER `.crt` — which is what Windows'
+/// *Export certificate* writes by default — so `Ok(vec![])` came back and
+/// `preflight` passed it, defeating the one thing preflight is for. The engines
+/// then disagreed about the same file: PostgreSQL failed with `client
+/// certificate rejected` naming nothing, and MySQL **succeeded with the
+/// identity presented**, because `mysql_async` decides PEM-vs-DER by asking
+/// whether the bytes are UTF-8 and hands the raw file to rustls when they are
+/// not. `file_root_store` twenty lines above already had this check; the client
+/// certificate did not.
 fn read_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, DbError> {
     let pem = std::fs::read(path)
         .map_err(|e| DbError::Connect(format!("cannot read certificate file {path}: {e}")))?;
-    CertificateDer::pem_slice_iter(&pem)
+    parse_certs(path, &pem)
+}
+
+/// [`read_certs`] without the read, so the decision above can be asserted
+/// without a file — the suite's no-filesystem rule, and the reason the
+/// emptiness check was untestable where it was missing.
+fn parse_certs(path: &str, pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, DbError> {
+    let certs = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| DbError::Connect(format!("{path} is not a PEM certificate file: {e}")))
+        .map_err(|e| DbError::Connect(format!("{path} is not a PEM certificate file: {e}")))?;
+    if certs.is_empty() {
+        return Err(DbError::Connect(format!(
+            "{path} holds no PEM certificate — a DER file has to be converted first \
+             (openssl x509 -inform der -in {path} -out cert.pem)"
+        )));
+    }
+    Ok(certs)
 }
 
 fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, DbError> {
@@ -571,6 +595,35 @@ mod tests {
         }
     }
 
+    /// **A file with no PEM certificate in it is an error, not an empty list.**
+    ///
+    /// `read_certs` returned `Ok(vec![])` for a DER `.crt` — which is what
+    /// Windows' *Export certificate* writes by default — so `preflight`
+    /// **passed** it, defeating the one thing preflight exists for. The engines
+    /// then disagreed about the same file: PostgreSQL failed with `client
+    /// certificate rejected` naming nothing, and MySQL succeeded *with the
+    /// identity presented*, because `mysql_async` decides PEM-vs-DER by asking
+    /// whether the bytes are UTF-8. `file_root_store` twenty lines away already
+    /// had this check.
+    ///
+    /// The DER stand-in is a byte string that is not UTF-8 and holds no PEM
+    /// header, which is exactly the shape of the real file.
+    #[test]
+    fn a_certificate_file_with_no_pem_section_is_refused_rather_than_empty() {
+        let der = [0x30u8, 0x82, 0x02, 0x5c, 0x30, 0x82, 0x01, 0xc5, 0xa0, 0x03];
+        let err = parse_certs("/tmp/client.crt", &der)
+            .expect_err("a DER file must not pass as zero certificates");
+        let DbError::Connect(msg) = err else {
+            panic!("a connect error is what preflight reports");
+        };
+        assert!(msg.contains("/tmp/client.crt"), "{msg}");
+        assert!(msg.contains("DER"), "{msg}");
+
+        // An empty file and a file of comments take the same door.
+        assert!(parse_certs("/tmp/empty.crt", b"").is_err());
+        assert!(parse_certs("/tmp/notes.crt", b"# nothing here\n").is_err());
+    }
+
     /// A named CA file that isn't there is a *connect* error naming the path,
     /// not a panic and not a silent fall back to the public roots — which would
     /// quietly verify against 150 CAs the user did not choose.
@@ -742,12 +795,65 @@ mod tests {
 
         let err = file_root_store(path.to_str().unwrap())
             .expect_err("a file with no certificates in it is not a trust store");
-        assert!(format!("{err:?}").contains("no certificates"), "{err:?}");
+        // The refusal moved one layer down — `read_certs` now rejects a file
+        // with no PEM section rather than returning an empty list, so the CA
+        // path and the client-certificate path answer the same way about the
+        // same file. What matters here is unchanged: it is refused, and the
+        // message names the file.
+        assert!(
+            format!("{err:?}").contains("not-a-cert.pem"),
+            "the message has to name the file: {err:?}"
+        );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The assumption `skip_domain_validation` rests on, pinned — and it is
+    /// false today.**
+    ///
+    /// `mysql_async` 0.37 does not ask rustls to skip the name check. It runs
+    /// the full verification and then *forgives* the failure by matching the
+    /// error's text: `e.to_string().contains("NotValidForName")`. rustls 0.23
+    /// raises `CertificateError::NotValidForNameContext { .. }`, whose `Display`
+    /// reads "certificate not valid for name …" and contains no such substring
+    /// — so the arm never fires and `Verify CA` on MySQL/MariaDB also rejects a
+    /// host-name mismatch. Measured twice against the same server, same CA,
+    /// same binary, differing only in the name dialled.
+    ///
+    /// The test asserts what is true **now**, so it turns red the day the
+    /// drivers agree again — which is the day `SslMode::caveat`'s sentence and
+    /// the test-bed README's `wrongname` row come back out. Asserting the
+    /// property we *want* would leave a red test standing over somebody else's
+    /// release schedule; asserting the property we *have* makes the fix
+    /// announce itself.
+    #[test]
+    fn the_driver_still_reads_the_verifier_error_by_its_words() {
+        let e = rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
+        assert!(
+            e.to_string().contains("NotValidForName"),
+            "the bare variant is the one spelling the driver does recognise: {e}"
+        );
+
+        // And the one rustls actually raises, which it does not.
+        let ctx =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext {
+                expected: rustls::pki_types::ServerName::try_from("db.example")
+                    .expect("a name")
+                    .to_owned(),
+                presented: vec!["other.example".to_string()],
+            });
+        assert!(
+            !ctx.to_string().contains("NotValidForName"),
+            "the drivers agree again — take out `SslMode::caveat`'s sentence, restore the \
+             test-bed README's `wrongname` row, and delete this test: {ctx}"
+        );
     }
 
     /// MySQL's two toggles are the plan's two booleans, and crossing them is the
     /// bug that would make `verify-ca` check the name instead of the chain.
+    ///
+    /// **Green while the bug it names was live**, which is why the test above
+    /// exists: this asserts the flag Schemaic sets, and the defect is in what
+    /// the driver does with it.
     #[test]
     fn the_mysql_toggles_are_not_crossed() {
         let ca = mysql_ssl_opts(&plan_for(SslMode::VerifyCa));
