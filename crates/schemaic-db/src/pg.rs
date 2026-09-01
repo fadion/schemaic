@@ -206,17 +206,28 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 /// Postgres cancellation opens a *second* connection, so a server configured to
 /// refuse plaintext refuses this one too — a `NoTls` cancel would simply stop
 /// working for every TLS user, silently, since the result is discarded.
+/// **Bounded by [`crate::CANCEL_TIMEOUT`].** Cancellation opens a second
+/// connection, so against a host that has gone away it hangs — inside a modal
+/// whose every exit maps to this same cancel.
 pub(crate) async fn cancel_query(db: &Db, token: &tokio_postgres::CancelToken) {
-    match db.tls_plan() {
-        None => {
-            let _ = token.cancel_query(NoTls).await;
-        }
-        Some(plan) => match crate::tls::pg_connector(plan) {
-            Ok(connector) => {
-                let _ = token.cancel_query(connector).await;
+    let ask = async {
+        match db.tls_plan() {
+            None => {
+                let _ = token.cancel_query(NoTls).await;
             }
-            Err(e) => tracing::debug!("cancel skipped, TLS setup failed: {e:?}"),
-        },
+            Some(plan) => match crate::tls::pg_connector(plan) {
+                Ok(connector) => {
+                    let _ = token.cancel_query(connector).await;
+                }
+                Err(e) => tracing::debug!("cancel skipped, TLS setup failed: {e:?}"),
+            },
+        }
+    };
+    if tokio::time::timeout(crate::CANCEL_TIMEOUT, ask)
+        .await
+        .is_err()
+    {
+        tracing::debug!("cancel timed out after {:?}", crate::CANCEL_TIMEOUT);
     }
 }
 
@@ -664,6 +675,22 @@ pub(crate) async fn run_server_ddl(
 /// `batch_execute` rather than a prepared statement for the reason `run_ddl`
 /// gives above: `BEGIN` is not preparable and neither are several DDL forms, and
 /// a script is mostly made of exactly those.
+/// How one statement of a script ended, so the borrow of its SQL can be
+/// released before the failure arm moves it.
+///
+/// `Cancelled { ran }` is the point: a cancel is a request, and the statement it
+/// interrupted may have landed anyway. Both engines' script loops answer in
+/// these three shapes.
+pub(crate) enum ScriptStep {
+    Ran,
+    /// The user stopped it; `ran` says whether the in-flight statement
+    /// nevertheless completed.
+    Cancelled {
+        ran: bool,
+    },
+    Failed(String),
+}
+
 pub(crate) async fn run_script(
     db: &Db,
     database: &str,
@@ -675,13 +702,18 @@ pub(crate) async fn run_script(
         Ok(c) => c,
         Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
     };
-    // Best-effort and session-scoped. Outside any transaction, unlike `run_ddl`'s
-    // copy, because here there may be no transaction to put it in — the file
-    // decides — and a `SET` that reverted with a `COMMIT` the file happened to
-    // carry would leave the rest of the load unbounded.
-    let _ = client
-        .batch_execute(&crate::lock_wait_sql(crate::Engine::Postgres))
-        .await;
+    // **No lock bound is set here, and that is the change.** This used to apply
+    // `DDL_LOCK_WAIT_SECS`, a constant documented for the Apply modal — a short
+    // reviewed plan whose refusal costs nothing. A user's `.sql` file is not
+    // that: a restore dying at statement N with N−1 applied and no transaction
+    // of ours to roll back is far worse than waiting. Measured, the one
+    // constant meant three different things anyway — 10 s on PostgreSQL, 50 s
+    // on MariaDB (metadata 10, rows 50), 15 s on SQLite's busy timeout — so it
+    // was not even one bound.
+    //
+    // `psql -f` and `mysql <` set nothing, which is what this replaces, and the
+    // escape hatch here is better than theirs: Stop cancels the running
+    // statement on the server.
     let mut ran = 0usize;
     let end = loop {
         let next = tokio::select! {
@@ -698,16 +730,42 @@ pub(crate) async fn run_script(
         // looking for. Every other long operation in this file already does
         // this; the script arm was the one that did not.
         let pg_cancel = client.cancel_token();
-        let step = tokio::select! {
-            r = client.batch_execute(&st.sql) => r.map_err(|e| e.to_string()),
-            _ = cancel.cancelled() => {
-                cancel_query(db, &pg_cancel).await;
-                break ExecEnd::Cancelled;
+        // **The cancelled statement is awaited, not dropped.** A cancel is a
+        // request: the server may already have committed the statement by the
+        // time it arrives, and dropping the future left `ran` a *floor* while
+        // `RunOutcome`'s own doc calls it "the answer" and the panel calls it
+        // "the message, not a footnote". The plain `select!` race is the other
+        // way in — this crate already has that written down at
+        // `sqlite.rs`'s read loop.
+        //
+        // Scoped so the borrow of `st.sql` ends before the `Failed` arm needs
+        // to move it.
+        let step = {
+            let mut fut = std::pin::pin!(client.batch_execute(&st.sql));
+            let raced = tokio::select! {
+                r = fut.as_mut() => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            match raced {
+                Some(Ok(())) => ScriptStep::Ran,
+                Some(Err(e)) => ScriptStep::Failed(e.to_string()),
+                None => {
+                    cancel_query(db, &pg_cancel).await;
+                    ScriptStep::Cancelled {
+                        ran: fut.await.is_ok(),
+                    }
+                }
             }
         };
         match step {
-            Ok(()) => ran += 1,
-            Err(message) => {
+            ScriptStep::Ran => ran += 1,
+            ScriptStep::Cancelled { ran: landed } => {
+                if landed {
+                    ran += 1;
+                }
+                break ExecEnd::Cancelled;
+            }
+            ScriptStep::Failed(message) => {
                 break ExecEnd::Failed {
                     message,
                     sql: st.sql,

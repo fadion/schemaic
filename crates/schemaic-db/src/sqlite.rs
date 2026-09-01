@@ -1150,24 +1150,48 @@ pub(crate) async fn run_script(
     cancel: CancellationToken,
 ) -> (schemaic_core::script::ExecEnd, usize) {
     use schemaic_core::script::ExecEnd;
-    tokio::task::block_in_place(|| {
+    // **Stop reaches a statement already running**, which this path used to say
+    // was impossible. The comment here claimed SQLite has nothing like MySQL's
+    // `KILL`; the module's own doc says the opposite two hundred lines above
+    // (`get_interrupt_handle` is "the direct analogue of `KILL QUERY`, with the
+    // difference that it needs no second connection") and two call sites in
+    // this same file already use it. A `.sql` file's one long statement — a
+    // `CREATE INDEX` over a loaded table, an `INSERT … SELECT` — is exactly the
+    // case, and the modal cannot be closed while it runs.
+    //
+    // Same shape as `fetch_query` and the streaming export: the blocking half
+    // hands its interrupt handle out as soon as the connection is open, and an
+    // async watcher fires it when the token trips.
+    let (tx, handle) = tokio::sync::oneshot::channel::<rusqlite::InterruptHandle>();
+    let watcher = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let Ok(h) = handle.await else { return };
+            cancel.cancelled().await;
+            h.interrupt();
+        })
+    };
+    let out = tokio::task::block_in_place(|| {
         let conn = match open(db) {
             Ok(c) => c,
             Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
         };
+        let _ = tx.send(conn.get_interrupt_handle());
         let mut ran = 0usize;
         let end = loop {
             if cancel.is_cancelled() {
                 break ExecEnd::Cancelled;
             }
-            // There is no statement to interrupt mid-flight the way MySQL's
-            // `KILL` does, so between statements is the granularity available —
-            // the same one `run_ddl` works at.
             let Some(st) = rx.blocking_recv() else {
                 break ExecEnd::Done;
             };
             match conn.execute_batch(&st.sql) {
                 Ok(()) => ran += 1,
+                // An interrupt surfaces as an ordinary error, so the token is
+                // what tells the two apart — reporting `SQLITE_INTERRUPT` as a
+                // failure would name the user's own Stop as a fault in their
+                // file.
+                Err(_) if cancel.is_cancelled() => break ExecEnd::Cancelled,
                 Err(e) => {
                     break ExecEnd::Failed {
                         // The shadow-table rename `run_ddl` applies is not
@@ -1181,7 +1205,11 @@ pub(crate) async fn run_script(
             }
         };
         (end, ran)
-    })
+    });
+    // A run that finished normally leaves the watcher parked on a token that
+    // will never trip.
+    watcher.abort();
+    out
 }
 
 /// Run a DDL plan, all or nothing.
@@ -7888,6 +7916,44 @@ mod designer_path_tests {
         let (end, ran) = script(&db, &[("CREATE TABLE t (a INTEGER);", 1)], cancel).await;
         assert_eq!(end, schemaic_core::script::ExecEnd::Cancelled);
         assert_eq!(ran, 0);
+    }
+
+    /// **Stop reaches a statement that is already running**, which this path
+    /// used to say was impossible. The comment claimed SQLite had no analogue
+    /// of `KILL QUERY`; the module's own doc says the opposite and two other
+    /// call sites in this file already use `get_interrupt_handle`. A `.sql`
+    /// file's one long statement is exactly the case, and the modal cannot be
+    /// closed while it runs.
+    ///
+    /// A recursive CTE counting to a hundred million is the long statement: it
+    /// needs no data, no file and no sleep, and SQLite's interrupt lands inside
+    /// it. Without the interrupt this test hangs rather than failing, which is
+    /// the honest shape — the bug *is* "it never stops" — so it is bounded by a
+    /// timeout that fails it instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_interrupts_a_statement_that_is_already_running() {
+        let (_keeper, db) = shared_memory("script_interrupt");
+        let cancel = CancellationToken::new();
+        let fire = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            fire.cancel();
+        });
+        let run = script(
+            &db,
+            &[(
+                "CREATE TABLE t AS WITH RECURSIVE c(x) AS \
+                 (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000000) \
+                 SELECT count(*) AS n FROM c;",
+                1,
+            )],
+            cancel,
+        );
+        let (end, ran) = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("Stop did not interrupt the running statement");
+        assert_eq!(end, schemaic_core::script::ExecEnd::Cancelled);
+        assert_eq!(ran, 0, "the interrupted statement did not complete");
     }
 
     /// **The file's own transaction is the file's**, and this is why `run_ddl`

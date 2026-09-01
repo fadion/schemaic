@@ -6848,12 +6848,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // The token the running apply observes, so the preview modal's exit can
+    // stop it where stopping means something — see `ddl::ddl_rolls_back_as_a_whole`.
+    // The same shape as `script_token` above, and for the same reason: the token
+    // belongs to the run, and the UI holds only a way to fire it.
+    let ddl_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+
+    // Fire the apply's token. The *decision* whether an exit may reach this is
+    // `ddl::ddl_rolls_back_as_a_whole`, asked in the modal; this only does it.
+    let ddl_cancel: Rc<dyn Fn()> = {
+        let ddl_token = ddl_token.clone();
+        Rc::new(move || {
+            if let Some(t) = ddl_token.borrow().as_ref() {
+                t.cancel();
+            }
+        })
+    };
+
     let run_ddl: schemaic_ui::DdlFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
         let refresh_db = refresh_db.clone();
         let refresh_schema = refresh_schema.clone();
         let guard_tx = guard_tx.clone();
+        let ddl_token = ddl_token.clone();
         Rc::new(
             move |req: schemaic_ui::DdlRunRequest, done: schemaic_ui::DdlDoneFn| {
                 let db = match db_for(req.conn_id) {
@@ -6872,6 +6890,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let refresh_db = refresh_db.clone();
                     let refresh_schema = refresh_schema.clone();
                     let done = done.clone();
+                    let ddl_token = ddl_token.clone();
                     Rc::new(move || {
                         let db = db.clone();
                         let req = req.clone();
@@ -6880,6 +6899,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let refresh_schema = refresh_schema.clone();
                         let database = req.database.clone();
                         let scope = req.scope;
+                        let token = CancellationToken::new();
+                        *ddl_token.borrow_mut() = Some(token.clone());
                         let report = create_ext_action(
                             cx,
                             move |(changed, res): (bool, Result<(), String>)| {
@@ -6924,12 +6945,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 // which has nothing to avoid yet.
                                 schemaic_ui::DdlScope::Server => {
                                     let avoid = Some(database.as_str()).filter(|d| !d.is_empty());
-                                    db.run_server_ddl(avoid, &statements, CancellationToken::new())
-                                        .await
+                                    db.run_server_ddl(avoid, &statements, token).await
                                 }
                                 schemaic_ui::DdlScope::Database => {
-                                    db.run_ddl(&database, &statements, CancellationToken::new())
-                                        .await
+                                    db.run_ddl(&database, &statements, token).await
                                 }
                             };
                             let changed = schemaic_db::ddl_changed_schema(&out);
@@ -9048,6 +9067,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             script_probe,
             script_run,
             script_cancel,
+            ddl_cancel,
             run_ddl,
             view_algorithm,
             trigger_functions,

@@ -17,6 +17,7 @@ use floem::AnyView;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::text::plural;
 
 use crate::widgets::{
@@ -137,6 +138,10 @@ pub(crate) fn preview_of(
         statements: cs.emit(),
         script: cs.editor_script(),
         read_only,
+        // Off the change set, like `scope` above and for the same reason: a
+        // caller that had to remember to say is a caller that will one day
+        // forget.
+        dialect: cs.dialect,
     }
 }
 
@@ -376,7 +381,20 @@ fn apply(ui: Ui) {
     let Some(p) = d.preview.get_untracked() else {
         return;
     };
-    if !crate::widgets::accept_launch(d.applying.get_untracked(), p.read_only) {
+    // **Asked live, not read off the stamp.** `p.read_only` was copied into the
+    // preview when it was *built*, so flipping the connection read-only from
+    // the status bar while a `DROP DATABASE` plan was on screen did not stop
+    // Apply — the modal that now routes `DROP DATABASE`/`DROP SCHEMA` is
+    // exactly where that costs most. `script_view::policy` reads the flag at
+    // the moment Run is pressed, and two destructive modals must not answer the
+    // same question two different ways. The stamp stays, because the note
+    // beside the footer is about the preview as opened; the *guard* is this.
+    let read_only = ui.conn.connections.with_untracked(|cs| {
+        cs.iter()
+            .find(|c| c.id == p.conn_id)
+            .is_some_and(|c| c.read_only)
+    }) || p.read_only;
+    if !crate::widgets::accept_launch(d.applying.get_untracked(), read_only) {
         return;
     }
     // The guard belongs on the action, not only on the disabled button — the
@@ -439,18 +457,36 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     // Closing returns to the designer when it's still open behind — the draft is
     // untouched, so Cancel here means "not yet", not "throw it away".
     //
-    // While an apply is in flight, every exit refuses. `run_ddl` is handed a
-    // fresh token nothing holds, and on MySQL each DDL statement has already
-    // committed, so there is nothing to cancel — and `d.error` is the *only*
-    // reader of "statement 3 of 5 failed, 2 already stuck". Closing would leave
-    // a half-migrated table, a stale schema tree and no indication at all. The
-    // footer button was already disabled for this reason; Escape and the ✕
-    // weren't.
-    let exit = move || {
-        if exit_action(d.applying.get_untracked(), false) == ExitAction::Close {
-            d.preview.set(None);
-        }
+    // While an apply is in flight, the exit **depends on the engine**, and that
+    // is the change. It used to refuse unconditionally, on the argument that
+    // `run_ddl` was handed a fresh token nothing held and that on MySQL each
+    // statement has already committed — so there is nothing to cancel, `d.error`
+    // is the only reader of "statement 3 of 5 failed, 2 already stuck", and
+    // closing would leave a half-migrated table with no indication at all. The
+    // second half of that is still exactly right, and MySQL still refuses.
+    //
+    // The first half was not. PostgreSQL and SQLite roll a plan back as a whole
+    // (`ddl::ddl_rolls_back_as_a_whole`), so a Stop there leaves the database as
+    // it was and has nothing to orphan — and the range put *Refresh view* behind
+    // this modal, which is a single statement that can run for hours (measured
+    // 15 s on a toy matview) with `lock_timeout` bounding only the lock, not the
+    // rebuild. Refusing every exit over that is a trap, not a guard.
+    let exit_dialect = move || {
+        d.preview
+            .with_untracked(|p| p.as_ref().map(|p| p.dialect))
+            .unwrap_or(SqlDialect::MySql)
     };
+    let cancel_apply = ui.schema_actions.clone();
+    // An `Rc` rather than a bare closure: it now holds the actions bundle, so it
+    // is no longer `Copy` and the three exits share one.
+    let exit: Rc<dyn Fn()> = Rc::new(move || {
+        let cancellable = schemaic_core::ddl::ddl_rolls_back_as_a_whole(exit_dialect());
+        match exit_action(d.applying.get_untracked(), cancellable) {
+            ExitAction::Close => d.preview.set(None),
+            ExitAction::Cancel => (cancel_apply.ddl_cancel)(),
+            ExitAction::Ignore => {}
+        }
+    });
 
     dyn_container(
         move || (d.preview.get().is_some(), d.applied.get()),
@@ -458,6 +494,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             if !open {
                 return empty().into_any();
             }
+            let exit = exit.clone();
             let ui = ui.clone();
             let Some(p) = d.preview.get_untracked() else {
                 return empty().into_any();
@@ -646,11 +683,13 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             );
 
             let ring_actions = ring.clone();
+            let footer_exit = exit.clone();
             let actions = dyn_container(
                 move || (d.applying.get(), d.applied.get()),
                 move |(busy, applied)| {
                     let ui = ui.clone();
                     let ring = ring_actions.clone();
+                    let exit = footer_exit.clone();
                     if applied {
                         return action_button(
                             "Close",
@@ -658,30 +697,51 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             true,
                             ring,
                             ACTION_TAB + 20,
-                            exit,
+                            {
+                                let exit = exit.clone();
+                                move || exit()
+                            },
                         );
                     }
                     let p = match d.preview.get_untracked() {
                         Some(p) => p,
                         None => return empty().into_any(),
                     };
+                    // **The footer says what pressing it does**, which is what
+                    // makes an enabled button during an apply an answer rather
+                    // than a trapdoor — the same rule the export modal's footer
+                    // follows. While a *stoppable* apply runs it reads Stop, in
+                    // Danger; where the engine cannot roll the plan back it
+                    // stays disabled, because there is nothing to stop and the
+                    // half-applied report would have nowhere to go.
+                    let stoppable =
+                        busy && schemaic_core::ddl::ddl_rolls_back_as_a_whole(p.dialect);
                     h_stack((
                         // "Back" only when there's somewhere to go back *to*. A
                         // context-menu shortcut opens this modal with nothing
                         // behind it, where Back would point at nowhere.
                         action_button(
-                            if d.designer.get_untracked().is_some()
+                            if stoppable {
+                                "Stop"
+                            } else if d.designer.get_untracked().is_some()
                                 || d.view.get_untracked().is_some()
                             {
                                 "Back"
                             } else {
                                 "Cancel"
                             },
-                            ActionKind::Neutral,
-                            !busy,
+                            if stoppable {
+                                ActionKind::Danger
+                            } else {
+                                ActionKind::Neutral
+                            },
+                            !busy || stoppable,
                             ring.clone(),
                             ACTION_TAB + 20,
-                            exit,
+                            {
+                                let exit = exit.clone();
+                                move || exit()
+                            },
                         ),
                         action_button(
                             if busy { "Applying…" } else { "Apply" },
@@ -723,7 +783,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 }
             });
 
-            let close_x: Rc<dyn Fn()> = Rc::new(exit);
+            let close_x: Rc<dyn Fn()> = exit.clone();
             let panel = v_stack((
                 // **The title names where the plan is going, not just what it is
                 // about.** The modal has always carried `conn_id` and
@@ -747,7 +807,10 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             .style(|s| panel_style(s).width(panel_w()).height(modal_h(PANEL_H)));
 
             focus_root_with_ring(container(panel), root_ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| exit())
+                .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
+                    let exit = exit.clone();
+                    move |_| exit()
+                })
                 .style(|s| {
                     s.size_full()
                         .flex_col()
@@ -1043,5 +1106,85 @@ mod tests {
         }
 
         scope.dispose();
+    }
+    /// **`preview_of` decides which runner a plan takes and which refresh
+    /// follows it**, and it is a pure `(&ChangeSet, …) -> DdlPreview`. Its two
+    /// ingredients were tested in isolation and the composition was not: a
+    /// caller that had to *say* which scope it wanted is one that will one day
+    /// say the wrong thing, and a `DROP DATABASE` down the in-database route
+    /// runs on a connection pointed at the database it just removed.
+    #[test]
+    fn a_previews_scope_and_dialect_come_off_the_change_set() {
+        use schemaic_core::ddl::{Change, DatabaseDraft};
+
+        let server = schemaic_core::ddl::server_level(
+            "shop",
+            SqlDialect::Postgres,
+            Change::DropDatabase {
+                name: "shop".into(),
+            },
+        );
+        let p = preview_of(1, "shop", "shop", &server, false);
+        assert_eq!(p.scope, crate::DdlScope::Server);
+        assert_eq!(p.dialect, SqlDialect::Postgres);
+
+        // And a create, whose `database` is empty rather than its target — the
+        // emptiness test this replaced would have read the two the same way.
+        let create = schemaic_core::ddl::server_level(
+            "shop",
+            SqlDialect::MySql,
+            Change::CreateDatabase(Box::new(DatabaseDraft::blank("shop"))),
+        );
+        let p = preview_of(1, "", "shop", &create, false);
+        assert_eq!(p.scope, crate::DdlScope::Server);
+        assert_eq!(p.dialect, SqlDialect::MySql);
+
+        // An ordinary in-database plan is the other half, and the one a wrong
+        // answer here would send down the server-level runner.
+        let table =
+            schemaic_core::ddl::single("orders", None, SqlDialect::MySql, Change::TruncateTable);
+        let p = preview_of(1, "shop", "orders", &table, false);
+        assert_eq!(p.scope, crate::DdlScope::Database);
+        assert_eq!(p.dialect, SqlDialect::MySql);
+    }
+
+    /// **Whether the preview's exits may stop an apply is the engine's
+    /// question**, and the modal used to answer `false` for all three. The two
+    /// wrong answers cost very differently, which is why this is pinned per
+    /// engine rather than left to the exit's `bool`.
+    #[test]
+    fn only_an_engine_that_rolls_a_plan_back_may_have_its_apply_stopped() {
+        use crate::widgets::{ExitAction, exit_action};
+        use schemaic_core::ddl::ddl_rolls_back_as_a_whole;
+
+        // MySQL: each statement has already committed, so a Stop would orphan
+        // the "3 of 5 failed, 2 already stuck" report the modal is the only
+        // reader of. This arm must keep refusing.
+        assert!(!ddl_rolls_back_as_a_whole(SqlDialect::MySql));
+        assert_eq!(
+            exit_action(true, ddl_rolls_back_as_a_whole(SqlDialect::MySql)),
+            ExitAction::Ignore
+        );
+
+        // PostgreSQL and SQLite wrap the plan, so a Stop leaves the database as
+        // it was — and `Refresh view` behind this modal is a single statement
+        // that can run for hours.
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(ddl_rolls_back_as_a_whole(d), "{d:?}");
+            assert_eq!(
+                exit_action(true, ddl_rolls_back_as_a_whole(d)),
+                ExitAction::Cancel,
+                "{d:?}"
+            );
+        }
+
+        // Nothing in flight closes on every engine, as it always did.
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(
+                exit_action(false, ddl_rolls_back_as_a_whole(d)),
+                ExitAction::Close,
+                "{d:?}"
+            );
+        }
     }
 }
