@@ -3633,6 +3633,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     a `menu_row: RwSignal<Option<u64>>` created in the modal's **stable scope** beside `save_flash`
     and `test_flash` and for the same reason — the clearing effect outlives the open/close
     `dyn_container`, and a signal built inside it would be disposed out from under that effect.
+    Those two flashes are the transient confirmations standing in for the safe actions' labels (a
+    check on **Save**, the result icon on **Test**), and the stable scope was only half of what they
+    needed. `save_gen` — the generation the deferred clear checks itself against — stayed inside the
+    form the `dyn_container` disposes, so closing the modal inside `SAVE_FLASH` left the pending
+    `exec_after` reading `None` from a dead generation: it declined to clear, and the check was
+    still on the button the next time the modal opened. What answers it is an effect on `open` that
+    **withdraws the confirmation when the modal closes**, rather than hoisting `save_gen` out beside
+    the flash — a check reporting a save from a previous visit is wrong even while its two seconds
+    are still running (the guard-scope gotcha below states the general rule). **Test has the same
+    shape and is deliberately not fixed**: `test_gen` is already in the stable scope so its timer
+    does fire, but a close-and-reopen inside `TEST_FLASH` still shows the previous visit's result
+    icon, and `test_flash` is also driven by `conn_test` state that would likely need resetting with
+    it.
     **`tls_fields` is always visible on a networked engine, not behind a toggle like the SSH
     block**: a database that enforces TLS is the ordinary case rather than the advanced one, and a
     checkbox marked "use SSL" is the control that leaves people believing a connection is verified
@@ -7484,6 +7497,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   terminal cursor-blink tick reschedules forever; at shutdown the scope disposes its signals and the
   last timer panics on `get_untracked`. Guard every read with `try_get_untracked` and stop
   rescheduling once any returns `None`.
+- **A deferred action's generation guard must live in the same scope as the state it clears, or in a
+  longer-lived one.** The idiom above usually has a second half: the timer compares itself against a
+  generation before acting (`if save_gen.try_get_untracked() == Some(g)`), which asks *did something
+  newer happen?* and stands down on `Some(newer)` and on `None` alike. Put that guard in a
+  shorter-lived scope than the signal it clears and the question inverts into a permanent refusal —
+  every late timer reads `None` from a disposed generation and declines to do the one thing it was
+  armed for. Manage Connections' `save_flash` was correctly hoisted into the modal's stable scope so
+  that a late timer would never fire on a dead signal, but `save_gen` stayed inside `conn_form`,
+  which the open/close `dyn_container` disposes: close the modal inside the 2s `SAVE_FLASH` and the
+  check mark was still sitting on the Save button the next time it opened. Hoisting the flash out
+  was necessary and not sufficient. **And a transient confirmation is better withdrawn when the
+  surface showing it goes away** than left to its own timer, which is the fix taken there — a check
+  reporting a save from a previous visit is wrong even while its two seconds are still running.
 - **`.clip()` makes a flex item shrink-to-content — it won't stretch to its parent**, so a
   `flex_grow` spacer inside it collapses (right-aligned children stop reaching the edge). Put
   `.clip()` on a container with a *definite* size (the fixed-width `v_stack`), not the flex row you
