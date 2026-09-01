@@ -28,6 +28,7 @@ mod cases;
 mod ddl;
 mod editable;
 mod endpoint;
+mod runtime;
 mod scratch;
 mod suite;
 mod writeback;
@@ -96,6 +97,18 @@ live_suite!(
         a_renamed_column_keeps_its_data,
         a_retyped_column_reads_back_as_the_new_type,
         a_refused_plan_says_where_it_stopped,
+    ],
+    runtime: [
+        a_script_runs_every_statement_in_order,
+        a_script_holds_one_connection_so_session_state_carries,
+        a_refused_statement_stops_the_run_and_names_its_line,
+        an_empty_script_finishes_having_run_nothing,
+        an_import_loads_every_row,
+        a_reader_error_rolls_the_whole_import_back,
+        a_refused_row_rolls_the_whole_import_back,
+        a_manual_transaction_is_invisible_until_it_commits,
+        a_rolled_back_manual_transaction_leaves_nothing,
+        a_cancelled_query_stops_at_the_server,
     ],
     writeback: [
         a_staged_update_writes_exactly_the_row_it_names,

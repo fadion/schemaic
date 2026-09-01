@@ -3509,6 +3509,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (MySQL's `MyISAM`, which accepts `BEGIN` and ignores it) and `Target::transactional_ddl`
   (PostgreSQL wraps a DDL plan, so a refused one applies **nothing** and `DdlError::applied` is 0,
   while MySQL commits each `ALTER` as it runs and the count is what the preview reports).
+  **`runtime.rs` covers the four paths that need a connection to *behave*** — `.sql` scripts, bulk
+  imports, the pinned manual-transaction `Session`, and cancelling a statement already running — and
+  every one of them is an exception to something, which is precisely what a pure test cannot check.
+  That `run_script` holds **one** connection for a whole file is asserted by making a temporary
+  table in one statement and reading it in the next: under a connection per statement the second
+  fails, and so would a dump's opening `SET FOREIGN_KEY_CHECKS = 0`. That a `Session`'s transaction
+  is real is asserted from a *second* connection, which must not see the uncommitted row. The
+  cancellation test asserts `DbError::Cancelled` **specifically** and that the call returned well
+  before the five-second sleep would have ended: asking only "did it fail, and quickly?" is
+  satisfied by a sleep statement the server does not understand, which is how that test passed on
+  all three legs while cancelling nothing — pointing `Target::sleep_sql` at an undefined function
+  now fails it, and did not before.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
   tier stays pure by construction. With the feature on, an unreachable server is a **failure** —
