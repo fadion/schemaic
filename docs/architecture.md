@@ -1160,7 +1160,32 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     column) degrades to the pre-flag behaviour rather than losing its checks.
     **Views** ride the same rails: `ViewDraft` (name + body + the `ViewOptions` it
     carries) → `diff_view` → `Change::{CreateView, ReplaceView, RenameView, DropView}`
-    → the same preview. One engine rule each lives here. MySQL's `CREATE OR REPLACE VIEW`
+    → the same preview. One engine rule each lives here.
+    `Change::RefreshView` is the exception to the draft-and-diff shape, and joins
+    `TruncateTable` in coming straight off the context menu: a **materialized** view's rows
+    are not part of its definition, so there is nothing to diff — the whole change is which
+    of the two statements to send. `supports_concurrent_refresh` decides that from the
+    view's own indexes, because `CONCURRENTLY` is a *capability of the view* rather than a
+    preference: PostgreSQL takes an `ACCESS EXCLUSIVE` lock for the plain form, and refuses
+    the concurrent one without a `UNIQUE` index that is neither partial nor keyed on an
+    expression. Schemaic adds a fourth condition the server never states — the index must
+    not be `IndexInfo::lossy`, because there what was read back is not the whole index and
+    the other three were checked against a fragment. Uncertainty resolves to the plain
+    refresh, which always works.
+    A never-populated view is the one case the model can't see (`pg_class.relispopulated`
+    isn't in it) and the server's own refusal is the answer there. **`refresh_view_change`
+    is the whole decision** — is there anything to refresh, and which form does it take —
+    in one function over one `TableInfo`, because the two halves used to be assembled in the
+    schema menu's closure, which closes over a `Ui` and so could not be tested at all; what
+    that left uncovered was never either predicate but their composition with the caller.
+    `supports_change` gates
+    the change to PostgreSQL exhaustively, and `view_statements` asks it again at the
+    emitter: `emit_sqlite`'s `supported()` filter is the only `supports_change` in any of
+    the three emitters, and this builder runs before even that one, so an engine with no
+    materialized view would otherwise be handed a
+    statement it has no word for. It carries no `risks`, so the preview's Apply stays
+    `Primary` and no confirmation is asked; the lock is stated in `summary()` instead,
+    where the SQL alone doesn't show it. MySQL's `CREATE OR REPLACE VIEW`
     replaces the *whole* view, so the emitter restates `ALGORITHM`/`DEFINER`/
     `SQL SECURITY`/`CHECK OPTION` — omitting the security type silently turns a
     `DEFINER` view into an `INVOKER` one, which is a privilege change, the same class
@@ -4027,7 +4052,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     block for MySQL, the re-create toggle for PostgreSQL, and a SQLite-only "Column names" field
     for `ViewOptions::column_list`. `needs_algorithm` asked `!= Postgres`, which sent a SQLite
     connection off to fetch a `SHOW CREATE VIEW` algorithm; it asks `== MySql`.
-    `is_editable_view` is the entry point's gate — a materialized view is drop-only.
+    `is_editable_view` is the entry point's gate — a materialized view reaches no editor, and
+    the two things its context menu can still do to it are **Drop** and **Refresh view**
+    (`ObjectEntries::refresh_view`, over `ddl::refresh_view_change`), neither of which opens a
+    form. Its materialized half is `ddl::is_materialized_view`, the same predicate the menu
+    asks to *offer* the refresh: two hand-written copies are two chances for the editor and
+    the menu to disagree about one node.
   - `window_chrome.rs` — the client-side window decorations: the caption buttons (minimize /
     maximize-restore / close), the drag strip, and the eight resize zones. Draws what
     `core::window_chrome::Chrome` decides, and contains no `cfg!(target_os = …)` of its own.
@@ -8018,6 +8048,12 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   arm pushes `Collapse all` after `Refresh` where the skeleton closes the read group with `Refresh`,
   and the table arm's write group is `Import` → `Edit table` → `Triggers` where the skeleton lists
   Create/Edit/Import/Triggers. Order *within* group 4 is not checked; `Drop` being last is.
+  **The near-collision the table is load-bearing for is `Refresh` (group 2) beside
+  `Refresh view` (group 4)**, which a materialized view's menu carries both of: the first
+  re-introspects the *database* into the tree, the second re-runs the view's query on the
+  server and replaces every row it stores. Nothing but `group` keeps them on opposite sides
+  of the separator, and a `Refresh view` sorted into the read group would put a write where
+  the eye expects a reload.
   **`Export` is the one label the gate skips outright**, and it is an exemption rather than a third
   deviation: it has two honest homes — with `Generate DDL` on a database or a namespace, among the
   read entries that hand you what the node holds; directly below `Import` on a table, where the two

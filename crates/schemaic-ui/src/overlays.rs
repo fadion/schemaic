@@ -193,14 +193,15 @@ fn create_submenu(
 /// all** — as opposed to offering dimmed.
 ///
 /// The distinction is the one [`create_children`] already draws: a **missing**
-/// entry reads as "not supported", a **dimmed** one as "not here". For these
-/// three the first is what's true of a view, so a view's menu simply doesn't
-/// carry them; a read-only connection or a schema that hasn't loaded still dims,
-/// because there the action is real and merely unavailable.
+/// entry reads as "not supported", a **dimmed** one as "not here". For `import`
+/// and `truncate` the first is what's true of a view, so a view's menu simply
+/// doesn't carry them; a read-only connection or a schema that hasn't loaded
+/// still dims, because there the action is real and merely unavailable.
 ///
 /// Separate from the menu builder so the rule can be asserted at all — the
-/// builder needs a `Ui` — and because one of the three is **not uniform** and is
-/// exactly the kind of thing a later edit flattens.
+/// builder needs a `Ui` — and because two of the five are **not uniform**
+/// (`triggers` and `refresh_view`), which is exactly the kind of thing a later
+/// edit flattens.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ObjectEntries {
     pub import: bool,
@@ -209,6 +210,17 @@ pub(crate) struct ObjectEntries {
     /// Whether **Edit table** / **Edit view** is offered — false on an engine
     /// this build can't emit schema DDL for.
     pub edit: bool,
+    /// Whether **Refresh view** is offered. Only a materialized view has stored
+    /// rows to rebuild, and only one engine has a materialized view — so this is
+    /// the narrowest entry in the struct and the only one that is false for a
+    /// plain view *and* for a table.
+    ///
+    /// **Named for the whole label, not for `Refresh`.** The menu's other
+    /// `Refresh` re-introspects the database into the tree and sits three groups
+    /// above this one; a field that dropped the disambiguating word is an
+    /// invitation to wire the read entry to it, which would put a server write
+    /// where the eye expects a reload.
+    pub refresh_view: bool,
 }
 
 /// See [`ObjectEntries`]. `materialized` is only meaningful on PostgreSQL, which
@@ -259,6 +271,20 @@ pub(crate) fn object_entries(
         } else {
             schemaic_core::ddl::supports_table_design(dialect)
         },
+        // **The one entry that is about the view's rows rather than its
+        // definition.** A plain view stores nothing, so there is nothing to
+        // rebuild; a table stores its rows but they are not the output of a
+        // query. Gated on the capability as well as on `materialized` — the
+        // flag can only be set by an engine that has the object, but this menu
+        // asks what can be *emitted*, the same pairing Truncate makes.
+        refresh_view: is_view
+            && materialized
+            && schemaic_core::ddl::supports_change(
+                dialect,
+                &schemaic_core::ddl::Change::RefreshView {
+                    concurrently: false,
+                },
+            ),
     }
 }
 
@@ -1930,13 +1956,30 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // A view Schemaic can edit — read before `info` is moved
                         // into the Import entry below.
                         let editable_view = crate::view_editor::is_editable_view(info.as_ref());
-                        let materialized = is_view && !editable_view;
+                        // **Read, not inferred.** This was `is_view &&
+                        // !editable_view`, which is true today only because a
+                        // materialized view is the one thing `is_editable_view`
+                        // refuses — give it a second reason to refuse and every
+                        // entry gated on this (Triggers, and now Refresh view,
+                        // which sends a statement a plain view answers with an
+                        // error) starts believing an ordinary view is one.
+                        let materialized = info
+                            .as_ref()
+                            .is_some_and(schemaic_core::ddl::is_materialized_view);
                         // Read here for the same reason `editable_view` is: the
                         // Import entry below moves `info` into its closure.
                         let triggers = info
                             .as_ref()
                             .map(|i| i.triggers.clone())
                             .unwrap_or_default();
+                        // The whole refresh decision, made in `core` over this
+                        // view's own indexes rather than assembled here — see
+                        // `ddl::refresh_view_change`, which exists so the
+                        // composition is testable at all. `None` for anything
+                        // that is not a materialized view.
+                        let refresh_change = info
+                            .as_ref()
+                            .and_then(schemaic_core::ddl::refresh_view_change);
                         // What a view cannot have at all is **absent**, not
                         // dimmed — see `object_entries`, which owns that split
                         // and is where the PostgreSQL-view-has-triggers case is
@@ -2069,6 +2112,42 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 // `view_has_no_triggers` above, and decides
                                 // whether this entry exists rather than dimming it.
                                 .disabled(!has_columns),
+                            );
+                        }
+                        // **Not the `Refresh` above.** That one re-reads the
+                        // database's schema into the tree and is in the read
+                        // group; this re-runs the view's query on the server and
+                        // replaces every row it stores, so it belongs here with
+                        // the entries that write. The label says which — and it
+                        // is only ever in the menu for a materialized view, the
+                        // only object that has stored rows to rebuild.
+                        //
+                        // No confirmation: it destroys nothing (`Change::risks`
+                        // is empty, so the preview's Apply stays `Primary`), and
+                        // the consequence that *is* worth knowing — a plain
+                        // refresh locks readers out for the duration — is the
+                        // change summary the preview opens on.
+                        //
+                        // Both halves have to say yes, and they answer different
+                        // questions: `offers.refresh_view` is the **engine's** —
+                        // can this dialect emit the statement — and
+                        // `refresh_change` is the **view's**, carrying which of
+                        // the two forms this one takes. Matched as a pair so
+                        // neither can be taken for the other.
+                        if let (true, Some(change)) = (offers.refresh_view, refresh_change) {
+                            let ui = import_ui.clone();
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            entries.push(
+                                MenuEntry::action("Refresh view", move || {
+                                    crate::ddl_preview::preview_change(
+                                        &ui,
+                                        &db,
+                                        &tbl,
+                                        ns.as_deref(),
+                                        change.clone(),
+                                    );
+                                })
+                                .disabled(read_only),
                             );
                         }
                         // Truncate and drop are the two that can't be taken back
@@ -5246,9 +5325,11 @@ mod object_menu_tests {
     /// stayed green.
     ///
     /// A matrix has content where an isolated `true` has none, because what it
-    /// pins is the **shape of the disagreement**: `triggers` is the one entry
-    /// where the engines differ (MySQL takes no trigger on a view; a
-    /// *materialized* view takes none anywhere), and `edit`/`import`/`truncate`
+    /// pins is the **shape of the disagreement**: `triggers` and `refresh_view`
+    /// are the two entries
+    /// where the engines differ (MySQL takes no trigger on a view and a
+    /// *materialized* view takes none anywhere; only PostgreSQL has a
+    /// materialized view to refresh), and `edit`/`import`/`truncate`
     /// are asserted *and* asserted to be the same everywhere, which is the claim
     /// that would break if a fourth engine were sorted onto the wrong side.
     ///
@@ -5260,7 +5341,7 @@ mod object_menu_tests {
     /// two siblings). This test is what pins the *menu's* half: which question
     /// each entry asks, and about which object.
     #[test]
-    fn the_object_menu_matrix_is_the_same_everywhere_except_a_views_triggers() {
+    fn the_object_menu_matrix_is_the_same_everywhere_except_triggers_and_refresh() {
         for d in [MySql, Postgres, Sqlite] {
             // A base table: everything, on every engine.
             let t = object_entries(false, d, false);
@@ -5284,6 +5365,18 @@ mod object_menu_tests {
             // And a materialized view takes none anywhere: the server refuses
             // outright (`relation "mv" cannot have triggers`).
             assert!(!object_entries(true, d, true).triggers, "{d:?} matview");
+
+            // **The second real disagreement, and the narrowest entry here.**
+            // `Refresh view` rebuilds *stored* rows, which only a materialized
+            // view has and only PostgreSQL can produce — so it is off for a
+            // table and for a plain view on every engine, and on for a
+            // materialized view on exactly one.
+            assert!(!t.refresh_view && !v.refresh_view, "{d:?}: {t:?} {v:?}");
+            assert_eq!(
+                object_entries(true, d, true).refresh_view,
+                d == Postgres,
+                "{d:?} matview refresh"
+            );
         }
     }
 }
@@ -6224,9 +6317,15 @@ mod menu_order_gate {
             //    Create/Edit/Import/Triggers, the second recorded deviation.
             //    `drop_is_the_last_entry_before_ai_explain` is what pins the part
             //    of the group order that matters.
+            // `Refresh view` is **group 4 and `Refresh` is group 2**, and the
+            // near-collision is the point: one reloads the tree, the other
+            // rewrites the view's stored rows on the server. A materialized
+            // view's menu carries both, and this table is what keeps them on
+            // opposite sides of the separator.
             CREATE_SUBMENU | "Create {}" | "Import" | "Edit table" | "Edit view"
             | "Edit column" | "Edit index" | "Edit primary key" | "Edit foreign key"
-            | "Edit {}" | "Triggers" | "Truncate" | "Drop" | "Drop index" | "Drop foreign key" => 4,
+            | "Edit {}" | "Triggers" | "Refresh view" | "Truncate" | "Drop" | "Drop index"
+            | "Drop foreign key" => 4,
             _ => return None,
         })
     }
