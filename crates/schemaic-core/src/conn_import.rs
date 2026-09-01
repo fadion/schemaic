@@ -1687,24 +1687,45 @@ pub fn dedupe(found: Vec<Imported>) -> Vec<Imported> {
 /// so a row duplicating a *saved* connection arrives unticked whatever produced
 /// it. Re-adding a server the user already has is the one outcome nobody wants
 /// by accident, and it must not depend on how the row got here.
-pub fn merge_rows(into: &mut Vec<Imported>, found: Vec<Imported>) -> Vec<usize> {
-    let mut tick = Vec::new();
+/// **A repeat is reported separately from an append, and only appends are
+/// ticked.** One `Vec<usize>` could not tell the two apart, so a second source
+/// naming a server already on the list re-ticked it — including a row the user
+/// had deliberately *un*ticked, and Import then created the connection they had
+/// just refused. Reproduced through the real functions. Repeats are still
+/// reported, because a paste matching an existing row has to do something
+/// visible; what a caller may do with one is reveal it, never re-select it.
+pub fn merge_rows(into: &mut Vec<Imported>, found: Vec<Imported>) -> Merged {
+    let mut out = Merged::default();
     for row in found {
-        let at = match into
+        match into
             .iter()
             .position(|k| same_endpoint(&k.connection, &row.connection))
         {
-            Some(i) => i,
+            Some(i) => out.repeated.push(i),
             None => {
+                let preselected = row.preselected();
                 into.push(row);
-                into.len() - 1
+                if preselected {
+                    out.added.push(into.len() - 1);
+                }
             }
-        };
-        if into[at].preselected() {
-            tick.push(at);
         }
     }
-    tick
+    out
+}
+
+/// What one [`merge_rows`] call did to the review list.
+///
+/// Two lists rather than one, because the caller has to treat them differently
+/// — see [`merge_rows`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Merged {
+    /// Indices of rows this call **appended** and that should be ticked.
+    /// Already excludes anything [`Imported::preselected`] refuses.
+    pub added: Vec<usize>,
+    /// Indices of rows already on the list that this call named again. **Their
+    /// tick belongs to the user**: a second source must not undo an untick.
+    pub repeated: Vec<usize>,
 }
 
 /// Fold more skipped entries into the ones already being reported, **without
@@ -2970,7 +2991,8 @@ mod tests {
             ],
         );
         assert_eq!(list.len(), 3);
-        assert_eq!(tick, [1, 2], "the indices of what was appended");
+        assert_eq!(tick.added, [1, 2], "the indices of what was appended");
+        assert!(tick.repeated.is_empty());
     }
 
     #[test]
@@ -2983,8 +3005,44 @@ mod tests {
             vec![imported(at("A", 3306, "D", "u"), ImportSource::Url)],
         );
         assert_eq!(list.len(), 1, "no second row for one server");
-        assert_eq!(tick, [0]);
+        assert!(tick.added.is_empty(), "nothing was appended");
+        assert_eq!(tick.repeated, [0], "and the caller is told which row it is");
         assert_eq!(list[0].source, ImportSource::DBeaver, "the first survives");
+    }
+
+    /// **A second source must not undo an untick.** `merge_rows` reported one
+    /// list of indices, so a repeat came back looking exactly like an append and
+    /// the caller's `chosen.extend` — additive only — re-selected a row the user
+    /// had just cleared. Import then created the connection they refused.
+    #[test]
+    fn a_repeat_never_re_ticks_a_row_the_user_cleared() {
+        let mut list: Vec<Imported> = Vec::new();
+        let first = merge_rows(
+            &mut list,
+            vec![
+                imported(at("a", 3306, "d", "u"), ImportSource::DBeaver),
+                imported(at("b", 3306, "d", "u"), ImportSource::DBeaver),
+            ],
+        );
+        assert_eq!(first.added, [0, 1]);
+
+        // The user unticks row 0; the app's selection is now {1}.
+        let mut chosen = vec![1usize];
+
+        // A second source names the same two servers.
+        let second = merge_rows(
+            &mut list,
+            vec![
+                imported(at("a", 3306, "d", "u"), ImportSource::MyCnf),
+                imported(at("b", 3306, "d", "u"), ImportSource::MyCnf),
+            ],
+        );
+        assert!(second.added.is_empty(), "no new rows for the same servers");
+        chosen.extend(second.added);
+        chosen.sort_unstable();
+        chosen.dedup();
+        assert_eq!(chosen, [1], "row 0 stayed unticked");
+        assert_eq!(second.repeated, [0, 1]);
     }
 
     #[test]
@@ -2993,7 +3051,7 @@ mod tests {
         already.note(ImportNote::AlreadySaved);
         let mut list: Vec<Imported> = Vec::new();
         assert!(
-            merge_rows(&mut list, vec![already]).is_empty(),
+            merge_rows(&mut list, vec![already]).added.is_empty(),
             "appended, but not ticked"
         );
         assert_eq!(list.len(), 1);
@@ -3003,7 +3061,7 @@ mod tests {
             &mut list,
             vec![imported(at("a", 3306, "d", "u"), ImportSource::Url)],
         );
-        assert!(tick.is_empty());
+        assert!(tick.added.is_empty());
     }
 
     #[test]

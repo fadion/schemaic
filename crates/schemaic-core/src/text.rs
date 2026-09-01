@@ -19,6 +19,43 @@ pub fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
+/// Read a text file somebody else's tool wrote, whatever it encoded it in.
+///
+/// **A config file that is not UTF-8 must not simply vanish.** `read_to_string`
+/// answers `Err(InvalidData)` for a cp1252 `~/.my.cnf` (an accented comment is
+/// enough) and for the UTF-16LE that Notepad's *Save as → Unicode* writes — and
+/// the scan turned that into `None`, so the file disappeared from the list with
+/// no note anywhere, under a modal saying the files are "in known places". At
+/// its worst the vanished file is `~/.pgpass`, the one that holds passwords.
+///
+/// Three encodings, decided by BOM and then by fallback:
+///
+/// - **UTF-16**, LE or BE, by its BOM. Nothing else identifies it, and a
+///   UTF-16 file read as UTF-8 is a NUL between every character rather than a
+///   decode failure — so guessing here is not optional, it is the difference
+///   between reading the file and reading nonsense.
+/// - **UTF-8**, the overwhelming case, including a BOM'd one
+///   ([`strip_bom`] takes that off downstream).
+/// - **Anything else, lossily.** A mis-encoded byte should cost one character,
+///   not the file — `sqlfile::decode`'s choice for the same problem. A cp1252
+///   `.my.cnf` then parses correctly except for the accented byte, which is
+///   almost always in a comment.
+pub fn decode_text_file(bytes: &[u8]) -> String {
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The UTF-16 half of [`decode_text_file`], byte order supplied by the caller.
+/// A trailing odd byte is dropped: the file is truncated, and losing half a
+/// character is a better answer than losing all of it.
+fn decode_utf16(bytes: &[u8], word: fn([u8; 2]) -> u16) -> String {
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| word([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&units)
+}
+
 /// Pick the singular or plural noun for a count: `plural(1, "row", "rows")` →
 /// `"row"`; `0` or `2+` → `"rows"`. Returns only the noun form (not the number),
 /// so the call site keeps control of how the count itself is rendered — a row
@@ -90,6 +127,61 @@ mod tests {
         assert_eq!("\u{feff}x".trim(), "\u{feff}x");
         // Mid-text is left alone.
         assert_eq!(strip_bom("x\u{feff}y"), "x\u{feff}y");
+    }
+
+    /// **A config file that is not UTF-8 vanished from the scan**, silently, and
+    /// worst of all when it was `~/.pgpass`. Both of the encodings measured are
+    /// covered: cp1252 (an accented comment is enough) and the UTF-16LE
+    /// Notepad's *Save as → Unicode* writes.
+    #[test]
+    fn a_client_config_file_is_read_whatever_it_was_encoded_in() {
+        // Plain UTF-8, and UTF-8 with a BOM — `strip_bom` takes that off later.
+        assert_eq!(
+            decode_text_file(b"[client]\nhost=h\n"),
+            "[client]\nhost=h\n"
+        );
+        assert_eq!(
+            decode_text_file("\u{feff}[client]".as_bytes()),
+            "\u{feff}[client]"
+        );
+
+        // UTF-16LE, which is not a decode *failure* when read as UTF-8 — it is
+        // a NUL between every character, so guessing here is the difference
+        // between reading the file and reading nonsense.
+        let mut le = vec![0xFF, 0xFE];
+        for u in "[client]\nhost=h\n".encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_text_file(&le), "[client]\nhost=h\n");
+
+        let mut be = vec![0xFE, 0xFF];
+        for u in "[client]".encode_utf16() {
+            be.extend_from_slice(&u.to_be_bytes());
+        }
+        assert_eq!(decode_text_file(&be), "[client]");
+
+        // cp1252: `password=café` with the accent as a single 0xE9 byte. One
+        // replacement character, and every other line intact — which is what
+        // makes the file usable rather than absent.
+        let cp1252 = b"[client]\nuser=caf\xE9\npassword=pw\n";
+        let out = decode_text_file(cp1252);
+        assert!(out.contains("password=pw"), "{out}");
+        assert!(out.starts_with("[client]"), "{out}");
+        assert!(
+            out.contains('\u{fffd}'),
+            "the bad byte costs one char: {out}"
+        );
+    }
+
+    /// A truncated UTF-16 file loses half a character, not all of them.
+    #[test]
+    fn an_odd_trailing_byte_does_not_swallow_the_file() {
+        let mut le = vec![0xFF, 0xFE];
+        for u in "ab".encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        le.push(0x63);
+        assert_eq!(decode_text_file(&le), "ab");
     }
 
     #[test]

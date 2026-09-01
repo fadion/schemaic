@@ -89,15 +89,66 @@ pub fn password_sources() -> Vec<SourceFile> {
 /// they pressed. A file they *did* name goes through the same function, and the
 /// modal says so when nothing comes back.
 pub fn read_source(path: &Path, source: ImportSource) -> Option<SourceFile> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_BYTES {
-        return None;
+    open_source(path, source).ok()
+}
+
+/// Why a source file could not be read — **one cause per message**, for the
+/// path where the user named the file.
+///
+/// [`read_source`] answers `None` for all of these because it runs over files
+/// nobody asked about. *Choose a file…* is the other caller, and it reported
+/// one sentence — "<path> could not be read." — for three different problems,
+/// two of which are actionable and one of which was not even true: a non-UTF-8
+/// file *can* be read, and now is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceError {
+    /// There is nothing at that path, or it is a directory.
+    NotAFile,
+    /// Larger than [`MAX_BYTES`].
+    TooBig(u64),
+    /// The read itself failed — a permission, a vanished network mount.
+    Unreadable(String),
+}
+
+impl SourceError {
+    /// The sentence for the modal, naming the file and what to do about it.
+    pub fn message(&self, path: &Path) -> String {
+        let p = path.display();
+        match self {
+            SourceError::NotAFile => format!("{p} is not a file."),
+            SourceError::TooBig(bytes) => format!(
+                "{p} is {}, past the {} this reads.",
+                schemaic_core::stats::format_bytes(*bytes),
+                schemaic_core::stats::format_bytes(MAX_BYTES),
+            ),
+            SourceError::Unreadable(why) => format!("{p} could not be read: {why}"),
+        }
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(SourceFile {
+}
+
+/// [`read_source`] with the failure kept. See [`SourceError`].
+///
+/// **Bytes, then decoded** — never `read_to_string`. That answers
+/// `Err(InvalidData)` for a cp1252 `~/.my.cnf` or a UTF-16LE `my.ini`, and the
+/// scan turned that into `None`, so the file vanished from the list with no note
+/// anywhere while the modal said the files are "in known places". At its worst
+/// the vanished file is `~/.pgpass`. `text::decode_text_file` reads all three.
+pub fn open_source(path: &Path, source: ImportSource) -> Result<SourceFile, SourceError> {
+    let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => SourceError::NotAFile,
+        _ => SourceError::Unreadable(e.to_string()),
+    })?;
+    if !meta.is_file() {
+        return Err(SourceError::NotAFile);
+    }
+    if meta.len() > MAX_BYTES {
+        return Err(SourceError::TooBig(meta.len()));
+    }
+    let bytes = std::fs::read(path).map_err(|e| SourceError::Unreadable(e.to_string()))?;
+    Ok(SourceFile {
         source,
         path: path.to_string_lossy().into_owned(),
-        text,
+        text: schemaic_core::text::decode_text_file(&bytes),
     })
 }
 

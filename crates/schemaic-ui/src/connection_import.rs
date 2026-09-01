@@ -179,7 +179,37 @@ fn source_buttons(ui: Ui, ring: FocusRing) -> impl IntoView {
     let choose = ui.conn_actions.choose_import_file.clone();
     let scan = ui.conn_actions.scan_installed_clients.clone();
     let scanning = ui.conn.import.scanning;
+    let file_error = ui.conn.import.file_error;
 
+    // **Under the buttons, not under the paste field.** A failed *Choose a
+    // file…* used to be written into `paste_error`, so a file button's failure
+    // was rendered in the **Connection URL** field's error slot — and stayed
+    // there over a good URL typed afterwards, because only a paste clears that
+    // signal. See `ConnImportUi::file_error`.
+    let message = dyn_container(
+        move || file_error.get(),
+        move |err| match err {
+            Some(e) => text(e)
+                .style(|s| {
+                    s.font_size(theme::font_label())
+                        .color(theme::error())
+                        .width_full()
+                })
+                .into_any(),
+            None => empty().into_any(),
+        },
+    );
+
+    v_stack((row_of_buttons(choose, scan, scanning, ring), message))
+        .style(|s| s.flex_col().width_full().gap(theme::scaled(6.0)))
+}
+
+fn row_of_buttons(
+    choose: Rc<dyn Fn()>,
+    scan: Rc<dyn Fn()>,
+    scanning: RwSignal<bool>,
+    ring: FocusRing,
+) -> impl IntoView {
     h_stack((
         action_button_icon(
             "Choose a file…",
