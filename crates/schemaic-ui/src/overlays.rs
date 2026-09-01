@@ -558,7 +558,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     // alone leaves room to spare, and a maxed name beside a maxed
                     // endpoint is what closed the 20px spacer to nothing.
                     //
-                    // **Bounding both halves is what keeps the menu at 350**, and
+                    // **Bounding both halves is what keeps the menu at 400**, and
                     // the panel's own width never did: it is a `min_width`, so a
                     // row wider than it simply widens the panel. Only the name
                     // was capped, and a local `127.0.0.1:3306` never reached the
@@ -568,7 +568,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     // panel, and clipped the port off the right of it.
                     //
                     // So the width is not the thing to tune when the menu looks
-                    // too wide — a menu wider than 350 is a row that outgrew its
+                    // too wide — a menu wider than 400 is a row that outgrew its
                     // cap, and the cap is what moves.
                     let name = schemaic_core::connection::elide_name(
                         &c.name,
@@ -601,13 +601,33 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                         text(endpoint)
                             .style(|s| s.color(theme::text_faint()).font_size(theme::font_label())),
                     ))
+                    // **`menu_item_style` goes on the row, ahead of `.tooltip`,
+                    // and the tooltip is widened to match.** `tooltip()` is not a
+                    // decorator: it mints its own `ViewId` and re-parents the row
+                    // under it, so a style chained *after* it lands on that
+                    // wrapper and the row itself keeps `width: auto`. The row
+                    // then sized to its own content, the spacer above never saw
+                    // free space to take, and each endpoint sat 20px past its own
+                    // name at a different offset per row.
+                    //
+                    // It reads as a *panel* bug and is not one: the hover
+                    // background is part of `menu_item_style` too, so it was on
+                    // the full-width wrapper and every row highlighted edge to
+                    // edge — the one cue that would have said the row was narrow.
+                    // The panel's `min_width` is a red herring for the same
+                    // reason; taffy right-aligns under it perfectly well. This is
+                    // the only menu in the app whose rows carry a tooltip, which
+                    // is why it is the only one that had this.
+                    .style(menu_item_style)
+                    .style(|s| s.padding_vert(theme::scaled(8.0)))
                     .tooltip(move || text(tip.clone()).style(crate::widgets::tooltip_style))
                     .on_click_stop(move |_| {
                         (switch)(id);
                         open.set(false);
                     })
-                    .style(menu_item_style)
-                    .style(|s| s.padding_vert(theme::scaled(8.0)))
+                    // The wrapper `tooltip()` inserted, given the width the row
+                    // resolves its own `width_full` against.
+                    .style(|s| s.width_full())
                 },
             )
             .style(|s| s.flex_col());
