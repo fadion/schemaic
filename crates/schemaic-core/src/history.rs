@@ -370,6 +370,31 @@ pub fn clear_conn(entries: &mut Vec<HistoryEntry>, conn_id: u64) {
     entries.retain(|e| e.conn_id != conn_id);
 }
 
+/// Drop the single entry `(conn_id, sql)` names — the history panel's row menu.
+/// Returns whether anything went.
+///
+/// **`(conn_id, sql)` is the identity, and it is [`push`]'s to give.** `push`
+/// drops any earlier entry with the same pair before inserting, so at most one
+/// can be in the log at a time; this predicate is the same one read backwards.
+/// [`HistoryEntry::run_id`] would look like the better key and is not — it says
+/// so itself: it is `0` on everything written before it existed, so it
+/// identifies a *run*, not an entry, and deleting by it would take every legacy
+/// row at once.
+///
+/// The `retain` is deliberately not a "find the first and remove it": a log that
+/// somehow holds duplicates (`push` cannot make one, a hand-edited
+/// `history.json` can) would otherwise leave a copy behind for the user to
+/// delete again, which reads as the delete having failed.
+///
+/// The boolean exists because the app rewrites the whole file on every mutation
+/// — see [`push`]'s. A right-click on a row that is already gone should not
+/// spend that write.
+pub fn remove(entries: &mut Vec<HistoryEntry>, conn_id: u64, sql: &str) -> bool {
+    let before = entries.len();
+    entries.retain(|e| !(e.conn_id == conn_id && e.sql == sql));
+    entries.len() != before
+}
+
 /// How many entries [`clear_conn`] would delete for `conn_id`.
 ///
 /// This exists so the confirmation modal's count and the deletion itself can't
@@ -1081,6 +1106,72 @@ mod tests {
         clear_conn(&mut v, 1);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].conn_id, 2);
+    }
+
+    /// The row menu deletes **one** entry, so the predicate has to be narrower
+    /// than `clear_conn`'s in both directions: it must not take the same
+    /// statement recorded against a different connection, and it must not take a
+    /// different statement on the same one.
+    #[test]
+    fn remove_takes_one_entry_and_leaves_its_neighbours() {
+        let mut v = vec![entry(1, "a", 1), entry(2, "a", 2), entry(1, "b", 3)];
+        assert!(remove(&mut v, 1, "a"));
+        assert_eq!(v.len(), 2);
+        assert!(
+            v.iter().any(|e| e.conn_id == 2 && e.sql == "a"),
+            "the same SQL on another connection is a different entry"
+        );
+        assert!(
+            v.iter().any(|e| e.conn_id == 1 && e.sql == "b"),
+            "and so is other SQL on this one"
+        );
+    }
+
+    /// The app persists the whole file on every mutation, so "nothing matched"
+    /// has to be distinguishable from "deleted" — otherwise a right-click on a
+    /// stale row rewrites `history.json` for no reason.
+    #[test]
+    fn remove_reports_whether_anything_went() {
+        let mut v = vec![entry(1, "a", 1)];
+        assert!(!remove(&mut v, 2, "a"), "wrong connection");
+        assert!(!remove(&mut v, 1, "z"), "wrong statement");
+        assert!(!remove(&mut Vec::new(), 1, "a"), "empty log");
+        assert_eq!(v.len(), 1, "a miss must not delete anything");
+        assert!(remove(&mut v, 1, "a"));
+        assert!(!remove(&mut v, 1, "a"), "and it is gone the second time");
+    }
+
+    /// `(conn_id, sql)` is the identity [`push`] itself maintains — it drops any
+    /// earlier entry with the same pair — so the two have to agree about what
+    /// one entry is. This is the seam: `remove` is only correct *because* of
+    /// what `push` guarantees, and neither function says so alone.
+    #[test]
+    fn remove_undoes_a_push_and_a_push_undoes_a_remove() {
+        let mut v = vec![entry(1, "a", 1), entry(2, "b", 2)];
+        let before = v.clone();
+
+        push(&mut v, entry(1, "c", 3));
+        assert!(remove(&mut v, 1, "c"));
+        assert_eq!(v, before, "removing the pushed entry restores the log");
+
+        assert!(remove(&mut v, 1, "a"));
+        push(&mut v, entry(1, "a", 4));
+        assert_eq!(
+            v.iter().filter(|e| e.conn_id == 1 && e.sql == "a").count(),
+            1,
+            "and re-running a deleted statement records it once, not twice"
+        );
+    }
+
+    /// A log that somehow holds duplicates (a hand-edited `history.json`, since
+    /// `push` cannot produce them) must not leave one behind for the user to
+    /// delete twice.
+    #[test]
+    fn remove_takes_every_copy_of_a_duplicated_entry() {
+        let mut v = vec![entry(1, "a", 1), entry(1, "a", 2), entry(1, "b", 3)];
+        assert!(remove(&mut v, 1, "a"));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].sql, "b");
     }
 
     #[test]

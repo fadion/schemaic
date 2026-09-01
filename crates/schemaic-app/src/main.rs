@@ -1649,6 +1649,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // Delete one history entry (the row's menu), persisting. The write is
+    // skipped when nothing matched — a row already gone shouldn't cost a full
+    // rewrite of the file, which is what `remove`'s bool is for.
+    let remove_history: Rc<dyn Fn(schemaic_core::history::HistoryEntry)> = {
+        Rc::new(move |entry: schemaic_core::history::HistoryEntry| {
+            let mut hit = false;
+            history_entries.update(|v| {
+                hit = schemaic_core::history::remove(v, entry.conn_id, &entry.sql);
+            });
+            if hit {
+                persist::save_json(
+                    "history.json",
+                    &schemaic_core::history::HistoryFile {
+                        entries: history_entries.get_untracked(),
+                    },
+                );
+            }
+        })
+    };
+
     // ── The snippet library ─────────────────────────────────────────────────
     //
     // One persisted list across every connection; which of them a connection may
@@ -9284,6 +9304,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         history_actions: Rc::new(HistoryActions {
             clear: clear_history,
             open: open_history,
+            remove: remove_history,
         }),
         snippets: SnippetsUi {
             items: snippet_library,

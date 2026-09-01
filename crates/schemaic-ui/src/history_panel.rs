@@ -22,7 +22,8 @@ use schemaic_core::intel::SqlDialect;
 use crate::consts::SEARCH_DEBOUNCE_MS;
 use crate::theme::{font_body, font_label};
 use crate::widgets::{
-    autohide, debounced, highlight_sql_mono, highlight_text, section_title, toolbar_icon,
+    MenuEntry, autohide, debounced, highlight_sql_mono, highlight_text, menu_panel_width,
+    section_title, toolbar_icon,
 };
 use crate::{FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
 
@@ -41,6 +42,28 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let open_history = ui.history_actions.open.clone();
     let clear = ui.history_actions.clear.clone();
     let db_colors = ui.db_colors;
+    let overlay = ui.overlay;
+    let menus = crate::widgets::MenuFlags::of(&ui);
+
+    // The row menu, raised at the pointer through the app-wide popup channel —
+    // the same route the snippet library's rows take. Built here rather than
+    // inside `history_row` so the row keeps taking only what it draws with:
+    // `overlay` and `menus` are panel-wide and Copy, and threading them through
+    // every row would say otherwise.
+    let open_menu: Rc<dyn Fn(HistoryEntry)> = {
+        let open = open_history.clone();
+        let remove = ui.history_actions.remove.clone();
+        Rc::new(move |entry: HistoryEntry| {
+            menus.close_except(Some(crate::widgets::MenuId::Popup));
+            overlay.popup_anchor.set(None);
+            let entries = row_menu(&entry, &open, &remove);
+            // Measured, not a constant — `popup_width` is the panel's
+            // `min_width`, so a number picked by eye is a floor the rows can't
+            // pull back in. Same reasoning as the snippet library's.
+            overlay.popup_width.set(menu_panel_width(&entries));
+            overlay.popup_menu.set(Some(entries));
+        })
+    };
 
     // Which lexer colours the previews. The list is filtered to the **active
     // connection**, so every row on screen ran against it and its dialect is the
@@ -106,6 +129,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
             }
             let now = now_millis();
             let oh = open_history.clone();
+            let om = open_menu.clone();
             let term = {
                 let t = q.trim();
                 (!t.is_empty()).then(|| t.to_string())
@@ -119,13 +143,21 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
                 .enumerate()
                 .flat_map(|(gi, (bucket, group))| {
                     let header = group_header(bucket, group.len(), gi == 0);
-                    let (oh, term) = (oh.clone(), term.clone());
+                    let (oh, om, term) = (oh.clone(), om.clone(), term.clone());
                     std::iter::once(header).chain(
                         group
                             .into_iter()
                             .map(move |e| {
-                                history_row(e, now, oh.clone(), db_colors, term.clone(), dialect)
-                                    .into_any()
+                                history_row(
+                                    e,
+                                    now,
+                                    oh.clone(),
+                                    om.clone(),
+                                    db_colors,
+                                    term.clone(),
+                                    dialect,
+                                )
+                                .into_any()
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -271,20 +303,46 @@ fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::An
         .into_any()
 }
 
+/// A history row's right-click menu: what the single click already does, and the
+/// delete that has nowhere else to live.
+///
+/// **Delete is not behind the shared confirm** that the panel's trash button
+/// uses. That one clears a whole connection's log at once; this removes the one
+/// row under the pointer, and the statement comes back the next time it is run —
+/// so a modal would cost more than the mistake.
+fn row_menu(
+    entry: &HistoryEntry,
+    open: &Rc<dyn Fn(HistoryEntry)>,
+    remove: &Rc<dyn Fn(HistoryEntry)>,
+) -> Vec<MenuEntry> {
+    let (open, open_entry) = (open.clone(), entry.clone());
+    let (remove, remove_entry) = (remove.clone(), entry.clone());
+    vec![
+        MenuEntry::action("Open in new tab", move || (open)(open_entry.clone())),
+        // The separator before the destructive entry, as in the snippet
+        // library's row menu.
+        MenuEntry::Separator,
+        MenuEntry::action("Delete", move || (remove)(remove_entry.clone())),
+    ]
+}
+
 /// One history row: the database + when it ran, the SQL preview (monospace,
 /// syntax-coloured, ≤3 wrapped lines, clipped), then how the run went. Clicking
-/// opens the full SQL in a new tab.
+/// opens the full SQL in a new tab; right-clicking raises [`row_menu`].
 #[allow(clippy::too_many_arguments)]
 fn history_row(
     entry: HistoryEntry,
     now: u64,
     open_history: Rc<dyn Fn(HistoryEntry)>,
+    open_menu: Rc<dyn Fn(HistoryEntry)>,
     db_colors: RwSignal<Vec<DbColorRule>>,
     term: Option<String>,
     dialect: SqlDialect,
 ) -> impl IntoView {
     // Full entry for the click handler — restores SQL + database + tab name.
     let entry_click = entry.clone();
+    // And for the menu, which offers that same open plus the delete.
+    let entry_menu = entry.clone();
     let preview = history::preview_for_highlight(&entry.sql, dialect);
     let db = entry.database.clone().unwrap_or_else(|| "—".to_string());
     let when = history::relative_time(entry.ts, now);
@@ -440,6 +498,7 @@ fn history_row(
 
     container(inner)
         .on_click_stop(move |_| (open_history)(entry_click.clone()))
+        .on_secondary_click_stop(move |_| (open_menu)(entry_menu.clone()))
         .style(|s| {
             s.width_full()
                 .padding_horiz(theme::scaled(12.0))
