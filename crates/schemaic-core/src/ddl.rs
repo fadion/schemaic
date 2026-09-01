@@ -658,6 +658,18 @@ impl DatabaseDraft {
     /// user didn't choose is a decision nobody reviewed, and here it is also a
     /// decision that can *fail* — see the field docs for what PostgreSQL does
     /// with an `ENCODING` it wasn't asked for.
+    ///
+    /// **Each optional clause is gated on the capability that answers for it**,
+    /// not merely on the field being set. The form asks
+    /// [`supports_database_charset`] and [`supports_owners`] before showing the
+    /// rows, so on the engine that built a draft the two agree — but the draft
+    /// is a value that outlives the form it came from, and this function takes
+    /// the dialect as an argument, which is a promise that any dialect is a
+    /// legal one to ask. It was using it for quoting alone, so a draft made on
+    /// MySQL and emitted for PostgreSQL wrote `CHARACTER SET`, and one made on
+    /// PostgreSQL and emitted for MySQL wrote `OWNER` — both rejected by the
+    /// live servers (measured), and `database_editor` asserts the opposite as
+    /// fact.
     pub fn create_sql(&self, dialect: SqlDialect) -> String {
         let q = |s: &str| ddl_ident_in(s, dialect);
         let mut out = format!("CREATE DATABASE {}", q(&self.name));
@@ -667,17 +679,21 @@ impl DatabaseDraft {
         // `mysqldump` writes. It also keeps a typo in the form field from
         // becoming a syntax error rather than the server's own "Unknown
         // character set" — which is the message that tells the user what to fix.
-        if let Some(cs) = self.charset.as_deref().filter(|s| !s.trim().is_empty()) {
-            out.push_str(&format!(
-                " CHARACTER SET {}",
-                ddl_string(cs.trim(), dialect)
-            ));
-        }
-        if let Some(coll) = self.collation.as_deref().filter(|s| !s.trim().is_empty()) {
-            out.push_str(&format!(" COLLATE {}", ddl_string(coll.trim(), dialect)));
+        if supports_database_charset(dialect) {
+            if let Some(cs) = self.charset.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(
+                    " CHARACTER SET {}",
+                    ddl_string(cs.trim(), dialect)
+                ));
+            }
+            if let Some(coll) = self.collation.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(" COLLATE {}", ddl_string(coll.trim(), dialect)));
+            }
         }
         // An owner *is* a role identifier, so this one is quoted as one.
-        if let Some(owner) = self.owner.as_deref().filter(|s| !s.trim().is_empty()) {
+        if supports_owners(dialect)
+            && let Some(owner) = self.owner.as_deref().filter(|s| !s.trim().is_empty())
+        {
             out.push_str(&format!(" OWNER {}", q(owner.trim())));
         }
         out.push(';');
@@ -4528,7 +4544,15 @@ impl ChangeSet {
         let d = self.dialect;
         let q = |s: &str| ddl_ident_in(s, d);
         let mut out = Vec::new();
-        for c in &self.changes {
+        // **Filtered on `supports_change`, exactly as `view_statements` is.**
+        // Without it a MySQL set emitted ``DROP SCHEMA `sales`;`` under an
+        // INCOMPLETE header saying that very change had been left out — and on
+        // MariaDB `SCHEMA` is a synonym for `DATABASE`, so the statement the
+        // risk sentence promised the server would refuse removed a database and
+        // the table in it (measured). Not reachable through today's menus
+        // (`supports_namespace_editing` is false on MySQL); this is the guard
+        // against the edit that makes it reachable.
+        for c in self.changes.iter().filter(|c| supports_change(d, c)) {
             match c {
                 Change::CreateDatabase(draft) => out.push(draft.create_sql(d)),
                 Change::CreateSchema { name, owner } => {
@@ -4568,8 +4592,11 @@ impl ChangeSet {
     fn container_drops(&self) -> Vec<String> {
         let d = self.dialect;
         let q = |s: &str| ddl_ident_in(s, d);
+        // See `container_creates`: filtered on `supports_change`, or a refusal
+        // the header already reported still reaches the wire.
         self.changes
             .iter()
+            .filter(|c| supports_change(d, c))
             .filter_map(|c| match c {
                 Change::DropDatabase { name } => Some(format!("DROP DATABASE {};", q(name))),
                 Change::DropSchema { name } => Some(format!("DROP SCHEMA {};", q(name))),
@@ -18659,6 +18686,149 @@ mod database_tests {
         assert!(
             !cs.unsupported().is_empty(),
             "SQLite emitted nothing and said nothing"
+        );
+    }
+
+    /// **The same rule, on the engine where breaking it destroys a database.**
+    /// SQLite's refusal was pinned above and MySQL's namespace refusal was not,
+    /// and the container builders carried no `supports_change` filter at all —
+    /// so a MySQL set emitted ``DROP SCHEMA `sales`;`` under an INCOMPLETE
+    /// header saying that change had been left out, with Copy and *Open in
+    /// editor* enabled. On MariaDB `SCHEMA` is a synonym for `DATABASE`, so the
+    /// statement the risk sentence promised the server would refuse removed a
+    /// database and the table in it (measured).
+    ///
+    /// Not reachable through today's menus. This is the guard against the edit
+    /// that makes it reachable.
+    #[test]
+    fn a_namespace_change_mysql_refuses_never_reaches_the_script() {
+        for change in [
+            Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+            Change::DropSchema {
+                name: "sales".into(),
+            },
+        ] {
+            let cs = server_level("sales", MySql, change.clone());
+            assert!(
+                cs.emit().is_empty(),
+                "MySQL emitted {:?} for {change:?}",
+                cs.emit()
+            );
+            assert!(
+                !cs.unsupported().is_empty(),
+                "and said nothing about it: {change:?}"
+            );
+        }
+    }
+
+    /// **The witness in the other direction.** Every refusal above pins
+    /// `supports_change == false ⟹ emit() empty`; nothing pinned the converse,
+    /// so a filter that refused *everything* would have passed the whole file.
+    /// The list is written out rather than derived, so a new container change
+    /// has to be added here on purpose.
+    #[test]
+    fn every_container_change_the_engine_accepts_emits_a_statement() {
+        for (d, change) in [
+            (
+                MySql,
+                Change::CreateDatabase(Box::new(DatabaseDraft::blank("shop"))),
+            ),
+            (
+                MySql,
+                Change::DropDatabase {
+                    name: "shop".into(),
+                },
+            ),
+            (
+                Postgres,
+                Change::CreateDatabase(Box::new(DatabaseDraft::blank("shop"))),
+            ),
+            (
+                Postgres,
+                Change::DropDatabase {
+                    name: "shop".into(),
+                },
+            ),
+            (
+                Postgres,
+                Change::CreateSchema {
+                    name: "sales".into(),
+                    owner: None,
+                },
+            ),
+            (
+                Postgres,
+                Change::DropSchema {
+                    name: "sales".into(),
+                },
+            ),
+        ] {
+            assert!(
+                supports_change(d, &change),
+                "fixture is wrong: {d:?} refuses {change:?}"
+            );
+            let cs = server_level("shop", d, change.clone());
+            assert!(
+                !cs.emit().is_empty(),
+                "{d:?} accepts {change:?} and emitted nothing"
+            );
+            assert!(cs.unsupported().is_empty(), "{d:?} / {change:?}");
+        }
+    }
+
+    /// `create_sql` takes a dialect, which is a promise that any dialect is a
+    /// legal one to ask — and it was using it for **quoting only**. A draft is
+    /// a value that outlives the form it came from, so a MySQL draft emitted
+    /// for PostgreSQL wrote `CHARACTER SET` and a PostgreSQL one emitted for
+    /// MySQL wrote `OWNER`; both are rejected by the live servers, and
+    /// `database_editor` asserts the opposite as fact.
+    #[test]
+    fn create_sql_emits_only_the_clauses_the_engine_has_a_grammar_for() {
+        let full = DatabaseDraft {
+            name: "shop".into(),
+            charset: Some("utf8mb4".into()),
+            collation: Some("utf8mb4_0900_ai_ci".into()),
+            owner: Some("app".into()),
+        };
+
+        let my = full.create_sql(MySql);
+        assert!(my.contains("CHARACTER SET"), "{my}");
+        assert!(my.contains("COLLATE"), "{my}");
+        assert!(!my.contains("OWNER"), "MySQL has no owners: {my}");
+
+        let pg = full.create_sql(Postgres);
+        assert!(pg.contains("OWNER"), "{pg}");
+        assert!(
+            !pg.contains("CHARACTER SET") && !pg.contains("COLLATE"),
+            "PostgreSQL refuses both unless TEMPLATE agrees: {pg}"
+        );
+    }
+
+    /// **The only client-side gate on the *Preview SQL* button, and it had no
+    /// test at all** — stubbing it to `Vec::new()` left the workspace green
+    /// while the form offered Preview on a nameless draft. Every sibling
+    /// `validate` in this module has one.
+    #[test]
+    fn a_database_draft_is_refused_only_for_the_one_thing_a_client_can_know() {
+        assert!(!DatabaseDraft::blank("").validate().is_empty());
+        assert!(!DatabaseDraft::blank("   ").validate().is_empty());
+        assert!(DatabaseDraft::blank("shop").validate().is_empty());
+        // Everything else is the *server's* question — a character set that
+        // does not exist, an owner role that does not, a name already taken.
+        // Guessing at them here means a form that refuses what the server would
+        // have accepted.
+        assert!(
+            DatabaseDraft {
+                name: "shop".into(),
+                charset: Some("no_such_charset".into()),
+                collation: Some("no_such_collation".into()),
+                owner: Some("no_such_role".into()),
+            }
+            .validate()
+            .is_empty()
         );
     }
 }

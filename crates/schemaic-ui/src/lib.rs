@@ -673,6 +673,11 @@ pub enum ContainerKind {
 impl ContainerKind {
     /// The word the modal title, the confirm and the preview subject all use, so
     /// one edit changes them together.
+    ///
+    /// It named three callers and had one: both Drop confirms hard-coded
+    /// `"Drop database"` / `"Drop schema"`, which are the two modals where the
+    /// wording is the last thing a user reads before something irreversible.
+    /// They go through here now, so the claim is true.
     pub fn label(self) -> &'static str {
         match self {
             ContainerKind::Database => "database",

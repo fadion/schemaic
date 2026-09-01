@@ -1404,7 +1404,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             MenuEntry::action_colored("Drop", theme::error, move || {
                                 let (ui, db) = (ui.clone(), db.clone());
                                 confirm.set(Some(crate::Confirm {
-                                    title: "Drop database".to_string(),
+                                    title: format!(
+                                        "Drop {}",
+                                        crate::ContainerKind::Database.label()
+                                    ),
                                     // The plain-language cost is the change's
                                     // own (`Change::risks`), so this question
                                     // and the preview's warning cannot drift
@@ -1645,7 +1648,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             MenuEntry::action_colored("Drop", theme::error, move || {
                                 let (ui, db, ns) = (ui.clone(), db.clone(), ns.clone());
                                 confirm.set(Some(crate::Confirm {
-                                    title: "Drop schema".to_string(),
+                                    title: format!("Drop {}", crate::ContainerKind::Schema.label()),
                                     message: container_drop_prompt(
                                         &schemaic_core::ddl::Change::DropSchema {
                                             name: ns.clone(),
