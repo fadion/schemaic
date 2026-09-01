@@ -595,9 +595,21 @@ pub(crate) async fn run_script(
             _ = cancel.cancelled() => break ExecEnd::Cancelled,
         };
         let Some(st) = next else { break ExecEnd::Done };
+        // **The running statement is cancelled on the server, not just dropped
+        // here.** PostgreSQL does not abort a backend when the client stops
+        // reading (`client_connection_check_interval` is 0 by default), so
+        // without this a Stop during a long `CREATE INDEX` left the index being
+        // built and autocommitted while the report said the run stopped one
+        // statement earlier — short by exactly the statement the user would go
+        // looking for. Every other long operation in this file already does
+        // this; the script arm was the one that did not.
+        let pg_cancel = client.cancel_token();
         let step = tokio::select! {
             r = client.batch_execute(&st.sql) => r.map_err(|e| e.to_string()),
-            _ = cancel.cancelled() => break ExecEnd::Cancelled,
+            _ = cancel.cancelled() => {
+                cancel_query(db, &pg_cancel).await;
+                break ExecEnd::Cancelled;
+            }
         };
         match step {
             Ok(()) => ran += 1,
