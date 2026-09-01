@@ -3870,10 +3870,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // dedup on, every one of them rebuilt the bar — including on each keystroke,
     // since typing clears a stale error through the same signal. `Option<String>`
     // dedups, so the bar is rebuilt when the message actually changes.
-    let error_msg = create_memo(move |_| match results.get() {
-        QueryState::Failed(m) => Some(m),
-        _ => None,
-    });
+    // **`ShownResult::bar_message`, not a `match` here.** This was
+    // `shown_panel_error`, which had two tests; both went with it when the
+    // decision moved inline into a file with no test module, and "only a failure
+    // puts anything in the bar" stopped being guarded anywhere.
+    let error_msg = create_memo(move |_| crate::ShownResult::bar_message(&results.get()));
     // **Whether the shown failure is a frozen one**, which decides whether the
     // two AI actions are offered at all — see `ShownResult::frozen`. A separate
     // memo rather than a term in the one above, so a pin does not rebuild the

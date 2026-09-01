@@ -722,7 +722,7 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 /// dimmed means "not here".
 fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
     let ctx = crate::table_designer::edit_ctx(ui);
-    blank_space_entries(ctx.dialect, ctx.read_only)
+    blank_space_entries(ctx.dialect, ctx.read_only, ctx.exists)
         .into_iter()
         .map(|e| {
             let ui = ui.clone();
@@ -772,11 +772,21 @@ pub(crate) struct BlankEntry {
 /// no database to create, and a lone `Refresh` popping up on blank space reads
 /// as a misfire rather than an offer. The gear menu still carries Refresh, which
 /// is where someone looking for it goes.
+///
+/// **And empty when there is no saved connection at all.** With none,
+/// `edit_ctx` falls back to `SqlDialect::default()` — MySQL — and
+/// `read_only: false`, so this offered `Create database` on a fresh install:
+/// the form opened, previewed real ``CREATE DATABASE `foo`;`` against a
+/// connection id that names nothing, and Apply failed with an internal string.
+/// It is the first thing a new user can click. `exists` is asked of the
+/// *connection*, never of whether it connected — an entry must not vanish
+/// because a server is down.
 pub(crate) fn blank_space_entries(
     dialect: schemaic_core::intel::SqlDialect,
     read_only: bool,
+    connection_exists: bool,
 ) -> Vec<BlankEntry> {
-    if !schemaic_core::ddl::supports_database_editing(dialect) {
+    if !connection_exists || !schemaic_core::ddl::supports_database_editing(dialect) {
         return Vec::new();
     }
     vec![
@@ -2408,6 +2418,9 @@ fn count_row(cols: usize, keys: usize, indent_levels: u32) -> impl IntoView {
         capsule(format!("{cols} {}", plural(cols, "col", "cols"))),
         capsule(format!("{keys} {}", plural(keys, "key", "keys"))),
     ))
+    // See `failed_row`: the counts are a row, so a secondary click on them is
+    // not a click on blank space.
+    .on_secondary_click_stop(|_| {})
     .style(move |s| {
         s.flex_row()
             .gap(theme::scaled(5.0))
@@ -2784,6 +2797,15 @@ fn failed_row(
         ))
         .style(|s| s.flex_row().items_center()),
     )
+    // **Stops the blank-space menu.** That handler's correctness rests on
+    // floem's propagation: every row raises its own menu with
+    // `on_secondary_click_stop`, so what reaches the tree's box is a click that
+    // landed on no row. These three status rows raised none, so right-clicking
+    // "Failed to connect" — which is exactly what someone does looking for a
+    // retry — offered `Create database` on a connection that has not connected.
+    // Additive listeners, not a hit test: a hit test would be a second answer to
+    // a question propagation already answers.
+    .on_secondary_click_stop(|_| {})
     .style(|s| {
         s.min_width(tree_row_min_w())
             .padding_left(leaf_pad())
@@ -2799,13 +2821,15 @@ fn info_row(
     color: impl Fn() -> floem::peniko::Color + 'static,
 ) -> impl IntoView {
     let msg = msg.into();
-    container(text(msg).style(move |s| s.color(color()).font_size(theme::font_label()))).style(
-        move |s| {
+    container(text(msg).style(move |s| s.color(color()).font_size(theme::font_label())))
+        // See `failed_row`: a status row is a row, so a secondary click on one
+        // is not a click on blank space.
+        .on_secondary_click_stop(|_| {})
+        .style(move |s| {
             s.min_width(tree_row_min_w())
                 .padding_left(leaf_pad())
                 .padding_vert(theme::scaled(3.0))
-        },
-    )
+        })
 }
 
 // The schema-tree table-name filter. Non-empty ⇒ databases force-expand and
@@ -3512,7 +3536,7 @@ mod tests {
     use schemaic_core::intel::SqlDialect;
 
     fn blank_labels(d: SqlDialect, read_only: bool) -> Vec<&'static str> {
-        blank_space_entries(d, read_only)
+        blank_space_entries(d, read_only, true)
             .into_iter()
             .map(|e| e.label)
             .collect()
@@ -3533,7 +3557,7 @@ mod tests {
                 ["Create database", "Refresh"],
                 "{d:?}"
             );
-            let kinds: Vec<BlankKind> = blank_space_entries(d, false)
+            let kinds: Vec<BlankKind> = blank_space_entries(d, false, true)
                 .into_iter()
                 .map(|e| e.kind)
                 .collect();
@@ -3551,8 +3575,32 @@ mod tests {
     /// carries Refresh, which is where someone looking for it goes.
     #[test]
     fn blank_space_raises_nothing_where_there_is_no_database_to_create() {
-        assert!(blank_space_entries(SqlDialect::Sqlite, false).is_empty());
-        assert!(blank_space_entries(SqlDialect::Sqlite, true).is_empty());
+        assert!(blank_space_entries(SqlDialect::Sqlite, false, true).is_empty());
+        assert!(blank_space_entries(SqlDialect::Sqlite, true, true).is_empty());
+    }
+
+    /// **And no menu at all with no saved connection.** `edit_ctx` falls back
+    /// to `SqlDialect::default()` — MySQL — and `read_only: false` when there is
+    /// none, so this offered `Create database` on a fresh install: the form
+    /// opened, previewed real ``CREATE DATABASE `foo`;`` against a connection id
+    /// that names nothing, and Apply failed with an internal string. It is the
+    /// very first thing a new user can click.
+    ///
+    /// **The wrong fix would be to key on whether it connected.** A connection
+    /// that merely failed to reach its server must keep its menu — the fix for
+    /// that is to try again, not to lose the entry — so the question is whether
+    /// the connection *exists*.
+    #[test]
+    fn blank_space_offers_nothing_when_there_is_no_connection_to_create_in() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(
+                blank_space_entries(d, false, false).is_empty(),
+                "{d:?}: a fresh install has nothing to create a database in"
+            );
+        }
+        // And the moment there is one, the menu is back — including on a
+        // connection that is down, which this cannot see and must not punish.
+        assert_eq!(blank_space_entries(SqlDialect::MySql, false, true).len(), 2);
     }
 
     /// The live gate: `Create database` opens an editor that ends at a real
@@ -3561,7 +3609,7 @@ mod tests {
     /// entry a read-only connection has every right to.
     #[test]
     fn a_read_only_connection_can_refresh_but_not_create() {
-        let entries = blank_space_entries(SqlDialect::MySql, true);
+        let entries = blank_space_entries(SqlDialect::MySql, true, true);
         assert_eq!(entries.len(), 2);
         assert!(entries[0].disabled, "Create database must be dimmed");
         assert!(!entries[1].disabled, "Refresh is a read");

@@ -1875,6 +1875,24 @@ impl ShownResult {
             .unwrap_or(QueryState::Idle)
     }
 
+    /// The message the **editor's error bar** should show for this result, or
+    /// `None`.
+    ///
+    /// **One line, and it needs a name.** `a24d3cc` deleted `shown_panel_error`
+    /// along with its two tests, and the decision moved into an inline
+    /// `create_memo` in `editor_pane.rs` — a file with no test module at all —
+    /// so "only a failure puts anything in the bar" became a property nothing
+    /// guarded. Widening it (a `Cancelled` carrying a message, a `Loaded` with a
+    /// warning) would put text in the red bar for a run that did not fail, and
+    /// with it a *View*, an *AI fix* and an *Explain* that all act on an error
+    /// there isn't one of.
+    pub fn bar_message(state: &QueryState) -> Option<String> {
+        match state {
+            QueryState::Failed(m) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
     /// Is the shown result a **frozen** (pinned) snapshot? Tracked, like
     /// [`Self::get`].
     ///
@@ -4695,10 +4713,28 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .unwrap_or_else(|| "No connection".to_string())
         })
     };
+    // **The full name, on hover.** Eliding at 15 characters removed the one
+    // surface in the chrome that showed a connection's whole name, so two
+    // connections sharing a 15-character prefix became indistinguishable in both
+    // places a connection is chosen. Display-only — nothing truncated ever
+    // reaches a connect — but "which of these two is prod" is exactly the
+    // question the header is there to answer. Empty when nothing was cut, so an
+    // ordinary name raises no tooltip at all.
+    let conn_tip = move || {
+        connections.with(|cs| {
+            cs.iter()
+                .find(|c| c.id == active_conn.get())
+                .map(|c| c.name.clone())
+                .filter(|n| schemaic_core::connection::elide_name(n, consts::CONN_NAME_CHARS) != *n)
+                .unwrap_or_default()
+        })
+    };
     let switcher = move || {
         container(
             h_stack((
-                label(conn_label).style(|s| s.color(theme::text())),
+                label(conn_label)
+                    .style(|s| s.color(theme::text()))
+                    .tooltip(move || text(conn_tip()).style(crate::widgets::tooltip_style)),
                 icons::icon(icons::CHEVRON_DOWN, 16.0)
                     .style(move |s| s.color(active_conn_color(connections, active_conn))),
             ))
@@ -9581,6 +9617,35 @@ mod result_panel_tab_tests {
         );
         assert!(matches!(state(batch[2]), Some(QueryState::Failed(ref m)) if m == "three"));
         assert!(state(batch[1]).is_none(), "a closed panel takes nothing");
+    }
+
+    /// **Only a failure puts anything in the editor's error bar** — the
+    /// property whose two tests were deleted with `shown_panel_error` when the
+    /// decision moved into an inline memo in a file with no test module.
+    ///
+    /// Every other state is `None`, and the list is written out so a state added
+    /// later has to be classified on purpose. Widening it would put text in the
+    /// red bar for a run that did not fail, and with it a *View*, an *AI fix*
+    /// and an *Explain* acting on an error there isn't one of.
+    #[test]
+    fn only_a_failed_result_reaches_the_error_bar() {
+        assert_eq!(
+            super::ShownResult::bar_message(&QueryState::Failed("boom".into())).as_deref(),
+            Some("boom")
+        );
+        assert!(super::ShownResult::bar_message(&QueryState::Idle).is_none());
+        assert!(super::ShownResult::bar_message(&QueryState::Running).is_none());
+        assert!(super::ShownResult::bar_message(&QueryState::Cancelled).is_none());
+        // A `Loaded` result carries rows, not a message — including one that was
+        // truncated or that wrote nothing, which are outcomes and not errors.
+        let t = tab();
+        let id = t.begin_run(&["SELECT 1".to_string()])[0];
+        t.set_panel_state(id, QueryState::Failed("boom".into()));
+        assert_eq!(
+            super::ShownResult::bar_message(&t.shown_result()).as_deref(),
+            Some("boom"),
+            "and it is the shown panel's own message"
+        );
     }
 
     /// A result landing after its panel was closed goes nowhere — the panel-level
