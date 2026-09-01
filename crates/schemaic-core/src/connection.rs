@@ -420,7 +420,20 @@ impl From<SslModeRaw> for SslMode {
             SslModeRaw::Require => SslMode::Require,
             SslModeRaw::VerifyCa => SslMode::VerifyCa,
             SslModeRaw::VerifyFull => SslMode::VerifyFull,
-            SslModeRaw::Unknown => SslMode::default(),
+            // **The strictest, not the default.** Everywhere else in this file
+            // an unknown value degrades to `default()`, and that is right for a
+            // panel width or a colour. Here the default is `Disable`: a mode
+            // written by a newer build — a Velopack rollback, or a second
+            // machine still on stable — would load as *plaintext*. `tls_plan()`
+            // then returns `None`, every operation puts the password on the
+            // wire in the clear, the CA and certificate paths survive so the
+            // form still looks configured, and the next ordinary save writes
+            // `"Disable"` over the user's choice permanently.
+            //
+            // Resolving upwards can only fail *loudly* — a connection that
+            // refuses until the mode is corrected — which is the direction a
+            // guess about encryption has to fall.
+            SslModeRaw::Unknown => SslMode::STRICTEST,
         }
     }
 }
@@ -435,6 +448,44 @@ impl SslMode {
         SslMode::VerifyCa,
         SslMode::VerifyFull,
     ];
+
+    /// The mode that protects most — the answer to *"we do not know which of
+    /// these it should be"*.
+    ///
+    /// Named rather than spelled `VerifyFull` at the call sites, so adding a
+    /// rung above it is one edit and not a grep.
+    pub const STRICTEST: SslMode = SslMode::VerifyFull;
+
+    /// Where a mode sits on the ladder, weakest first.
+    ///
+    /// Private, and there is no `Ord` derive, because a bare `mode > other` at
+    /// a call site is exactly the variant-matching this type's doc argues
+    /// against: it reads as a *comparison* and means *"protects more"*. Ask
+    /// [`stronger_of`](Self::stronger_of) instead.
+    fn rung(self) -> u8 {
+        match self {
+            SslMode::Disable => 0,
+            SslMode::Prefer => 1,
+            SslMode::Require => 2,
+            SslMode::VerifyCa => 3,
+            SslMode::VerifyFull => 4,
+        }
+    }
+
+    /// Whichever of two modes protects more.
+    ///
+    /// **The rule for merging two sources that disagree**, which is what an
+    /// import is: a URL says `verify-full`, the client's own SSL block says
+    /// nothing, and the answer must not be the weaker of the two. Everything
+    /// that folds one description of a connection onto another goes through
+    /// this, so the direction is decided once.
+    pub fn stronger_of(self, other: SslMode) -> SslMode {
+        if other.rung() > self.rung() {
+            other
+        } else {
+            self
+        }
+    }
 
     /// Human label for the picker.
     pub fn label(self) -> &'static str {
@@ -2042,16 +2093,48 @@ mod tls_tests {
         );
     }
 
-    /// A mode written by a newer build must degrade to the default rather than
-    /// fail the deserialize — which, because `connections.json` is one document,
-    /// would take out *every* connection and not just this field.
+    /// A mode written by a newer build must not fail the deserialize — which,
+    /// because `connections.json` is one document, would take out *every*
+    /// connection and not just this field.
+    ///
+    /// **And it must not land on `Disable`.** This test used to assert
+    /// `SslMode::default()`, which reads as care and is the weakest rung there
+    /// is: a Velopack rollback, or a second machine still on stable, silently
+    /// turned an encrypted connection into a plaintext one — password on the
+    /// wire, CA and certificate paths still filled in so the form looked
+    /// configured, and the next ordinary save persisting `"Disable"` over the
+    /// user's choice. Resolving upwards can only fail loudly instead.
     #[test]
-    fn an_unknown_ssl_mode_degrades_instead_of_failing_the_file() {
+    fn an_unknown_ssl_mode_degrades_upwards_rather_than_into_plaintext() {
         let json = r#"{"mode":"VerifyFullPlusSomethingNew","ca_path":"/ca.crt"}"#;
         let t: Tls = serde_json::from_str(json).unwrap();
-        assert_eq!(t.mode, SslMode::default());
+        assert_eq!(t.mode, SslMode::STRICTEST);
+        assert!(t.mode.requires_tls(), "a guess must never be plaintext");
         // …and the rest of the block still parses.
         assert_eq!(t.ca_path, "/ca.crt");
+    }
+
+    /// The ladder's merge rule, in one place: whichever protects more, in
+    /// either argument order, and reflexive.
+    #[test]
+    fn the_stronger_of_two_modes_is_the_one_that_protects_more() {
+        use SslMode::*;
+        for (a, b, want) in [
+            (Disable, VerifyFull, VerifyFull),
+            (VerifyFull, Require, VerifyFull),
+            (Prefer, Disable, Prefer),
+            (Require, VerifyCa, VerifyCa),
+            (VerifyCa, VerifyCa, VerifyCa),
+        ] {
+            assert_eq!(a.stronger_of(b), want, "{a:?} / {b:?}");
+            assert_eq!(b.stronger_of(a), want, "{b:?} / {a:?}");
+        }
+        // `ALL` is the ladder in order, and `STRICTEST` is its top.
+        assert_eq!(SslMode::ALL.last().copied(), Some(SslMode::STRICTEST));
+        for m in SslMode::ALL {
+            assert_eq!(m.stronger_of(SslMode::STRICTEST), SslMode::STRICTEST);
+            assert_eq!(m.stronger_of(SslMode::Disable), m);
+        }
     }
 
     #[test]
