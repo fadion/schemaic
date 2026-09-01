@@ -236,15 +236,76 @@ pub struct ScriptTarget {
 }
 
 /// What to run, and where. The load half of [`DumpRequest`].
+///
+/// **Only [`ScriptRequest::approved`] can build one**, and it is the write
+/// guard. The fields are readable and none of them is settable, so there is no
+/// spelling of "run this file" that does not go through `sql::script_verdict`
+/// first — which is what the previous shape could not promise. The guard was an
+/// exhaustive `match` in the launcher whose `Block` arm returned; deleting that
+/// one `return` left the whole workspace green while a read-only connection ran
+/// the file, because every test asked the *function* and none asked the seam.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptRequest {
-    pub path: std::path::PathBuf,
-    pub conn_id: u64,
+    path: std::path::PathBuf,
+    conn_id: u64,
+    database: String,
+    dialect: SqlDialect,
+}
+
+impl ScriptRequest {
+    /// The guard and the request, in one step: `Err` is the message for the
+    /// error bar, `Ok` is a run that has passed `sql::script_verdict`.
+    ///
+    /// The `Confirm` arm is an `Ok` here, and that is the decision this app has
+    /// already written down: the script panel *is* the confirmation, and it is
+    /// a better one than the verdict's sentence — it names the statement counts
+    /// and, in red, how many of them destroy data, above a button marked Run.
+    /// What must not happen is that arm being reached silently, so it is
+    /// matched rather than caught by a wildcard.
+    pub fn approved(
+        policy: schemaic_core::sql::GuardPolicy,
+        path: std::path::PathBuf,
+        file_name: &str,
+        conn_id: u64,
+        database: String,
+        dialect: SqlDialect,
+    ) -> Result<ScriptRequest, String> {
+        match schemaic_core::sql::script_verdict(policy, file_name) {
+            // Refused with no override, by design: the read-only block has
+            // none, and here it applies to a file nobody has read.
+            schemaic_core::sql::RunVerdict::Block(why) => Err(why),
+            schemaic_core::sql::RunVerdict::Confirm(_) => Ok(()),
+            // `script_verdict` never returns this; matched rather than caught
+            // by a wildcard so that if it ever does, the change is made here on
+            // purpose.
+            schemaic_core::sql::RunVerdict::Allow => Ok(()),
+        }
+        .map(|()| ScriptRequest {
+            path,
+            conn_id,
+            database,
+            dialect,
+        })
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn conn_id(&self) -> u64 {
+        self.conn_id
+    }
+
     /// The database the script runs *in*. Always present, because the run is
     /// launched from a database or schema node — and because
     /// `sql::script_verdict` blocks outright without one.
-    pub database: String,
-    pub dialect: SqlDialect,
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    pub fn dialect(&self) -> SqlDialect {
+        self.dialect
+    }
 }
 
 /// How far a running script has got.
@@ -9612,6 +9673,96 @@ mod panel_toggle_tests {
                     !(t.enabled && t.tip.is_some()),
                     "fits={fits} offered={offered} produced {t:?}"
                 );
+            }
+        }
+    }
+}
+
+/// **The write guard, at the seam rather than at the function.**
+///
+/// `sql::script_verdict` had three tests and all three asked the function. The
+/// gap was its composition with the launcher — an exhaustive `match` whose
+/// `Block` arm returned — so deleting one `return` left the workspace green
+/// while a read-only connection ran a whole `.sql` file. That is CLAUDE.md's
+/// named shape, reproduced exactly.
+///
+/// Making `ScriptRequest`'s fields private and its constructor the guard is
+/// what moves the property from "the launcher remembers to check" to "there is
+/// nothing to run without a check". These tests then pin the constructor, which
+/// is now the only door.
+#[cfg(test)]
+mod script_launch_gate {
+    use super::*;
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::sql::GuardPolicy;
+
+    fn policy(read_only: bool, no_database: bool, confirm_writes: bool) -> GuardPolicy {
+        GuardPolicy {
+            read_only,
+            confirm_writes,
+            dialect: SqlDialect::MySql,
+            no_database,
+        }
+    }
+
+    fn request(policy: GuardPolicy) -> Result<ScriptRequest, String> {
+        ScriptRequest::approved(
+            policy,
+            std::path::PathBuf::from("/tmp/dump.sql"),
+            "dump.sql",
+            7,
+            "shop".to_string(),
+            SqlDialect::MySql,
+        )
+    }
+
+    /// A script is unconditionally a write, so a read-only connection is
+    /// refused *without the file being read* — and there is no override.
+    #[test]
+    fn a_read_only_connection_cannot_produce_a_runnable_request() {
+        let err = request(policy(true, false, false)).expect_err("read-only must refuse");
+        assert!(err.to_lowercase().contains("read-only"), "{err}");
+    }
+
+    /// And no database refuses outright rather than only when some statement
+    /// needs one — see `GuardPolicy::no_database`.
+    #[test]
+    fn no_database_cannot_produce_a_runnable_request_either() {
+        assert!(request(policy(false, true, false)).is_err());
+    }
+
+    /// The `Confirm` arm is an `Ok`, and that is a decision this app has
+    /// written down: the panel is the confirmation. What must not happen is the
+    /// arm being reached silently.
+    #[test]
+    fn an_ordinary_connection_produces_a_request_carrying_what_it_was_given() {
+        let r = request(policy(false, false, false)).expect("a plain connection may run a script");
+        assert_eq!(r.path(), std::path::Path::new("/tmp/dump.sql"));
+        assert_eq!(r.conn_id(), 7);
+        assert_eq!(r.database(), "shop");
+        assert_eq!(r.dialect(), SqlDialect::MySql);
+    }
+
+    /// **The property the whole shape exists for**, asserted over every policy
+    /// rather than the two above: a request exists exactly when the verdict is
+    /// not a `Block`. A caller cannot widen this, because a caller cannot build
+    /// a `ScriptRequest` at all.
+    #[test]
+    fn a_request_exists_exactly_when_the_verdict_is_not_a_block() {
+        for read_only in [false, true] {
+            for no_database in [false, true] {
+                for confirm_writes in [false, true] {
+                    let policy = policy(read_only, no_database, confirm_writes);
+                    let blocked = matches!(
+                        schemaic_core::sql::script_verdict(policy, "dump.sql"),
+                        schemaic_core::sql::RunVerdict::Block(_)
+                    );
+                    assert_eq!(
+                        request(policy).is_err(),
+                        blocked,
+                        "{policy:?} disagreed with its own verdict"
+                    );
+                }
             }
         }
     }

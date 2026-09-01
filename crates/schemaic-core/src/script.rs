@@ -442,6 +442,47 @@ pub enum ProbeSummary {
     Counted,
 }
 
+/// What a run that stopped part-way leaves behind on the server.
+///
+/// **The report has to answer this, and the `Failed` arm did not ask it.** The
+/// cancel report carried the caveat *"unless the file opened its own
+/// transaction"*; the failure report said only *"N statements ran before it"*.
+/// Schemaic's own dumps written under *Replaying → One transaction* do open
+/// one, and all three engines send no `COMMIT` on the failure path — so a run
+/// the server rolled back read as partly applied, and a user who edited the
+/// file to skip the first N and re-ran lost all N, silently.
+///
+/// The app already holds the answer in [`Probe::own_transaction`] and nothing
+/// read it after the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Durability {
+    /// The file opened its own transaction, so a stop or a failure rolled the
+    /// whole run back: **nothing is applied**, including the statements that
+    /// succeeded.
+    RolledBack,
+    /// The file opened no transaction of its own, and Schemaic adds none — so
+    /// every statement that ran is applied and stays applied.
+    Applied,
+    /// The file was never probed, or the probe stopped before it could tell.
+    /// Say so rather than guessing either way.
+    Unknown,
+}
+
+/// Which of the three states a probe leaves the report in. See [`Durability`].
+///
+/// `None` — no probe at all — is [`Durability::Unknown`], not "applied": a
+/// missing probe is an absence of evidence, and the two wrong answers here cost
+/// very differently (re-running a rolled-back file is free; re-running an
+/// applied one is duplicate rows).
+pub fn durability(probe: Option<&Probe>) -> Durability {
+    match probe {
+        Some(p) if p.own_transaction => Durability::RolledBack,
+        // The probe read the file whole and found no `BEGIN`, so there is none.
+        Some(p) if !p.more => Durability::Applied,
+        _ => Durability::Unknown,
+    }
+}
+
 /// Which of the three states a probe is in. See [`ProbeSummary`].
 pub fn summary_kind(p: &Probe) -> ProbeSummary {
     match (p.statements, p.more) {
@@ -1230,6 +1271,46 @@ mod tests {
         assert!(p.more);
         assert_eq!(summary_kind(&p), ProbeSummary::CutOffBeforeFirst);
         assert_eq!(destruction_notice(&p), Some(DestructionNotice::Unread));
+    }
+
+    /// **What a run that stopped part-way left behind**, which the failure
+    /// report never asked. The cancel report hedged and the failure report said
+    /// nothing at all, though the app has held the answer since the probe — so
+    /// a run the server rolled back read as partly applied, and a user who
+    /// edited the file to skip the first N and re-ran lost all N.
+    #[test]
+    fn a_file_that_wraps_itself_is_reported_as_rolled_back() {
+        let wrapped = probed("START TRANSACTION;\nINSERT INTO t VALUES (1);\nCOMMIT;");
+        assert_eq!(durability(Some(&wrapped)), Durability::RolledBack);
+
+        let plain = probed("INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);");
+        assert_eq!(durability(Some(&plain)), Durability::Applied);
+    }
+
+    /// The two ways the answer is genuinely unknown, kept apart from
+    /// `Applied` — the two wrong answers cost very differently, since re-running
+    /// a rolled-back file is free and re-running an applied one is duplicate
+    /// rows.
+    #[test]
+    fn an_unread_or_truncated_file_says_it_does_not_know() {
+        assert_eq!(durability(None), Durability::Unknown);
+        let truncated = Probe {
+            statements: 2000,
+            more: true,
+            own_transaction: false,
+            ..Probe::default()
+        };
+        assert_eq!(
+            durability(Some(&truncated)),
+            Durability::Unknown,
+            "a `BEGIN` past the probe's reach is still a `BEGIN`"
+        );
+        // …but a truncated probe that *did* see one is certain.
+        let truncated = Probe {
+            own_transaction: true,
+            ..truncated
+        };
+        assert_eq!(durability(Some(&truncated)), Durability::RolledBack);
     }
 
     /// Past the statement ceiling every count is a floor, and says so.

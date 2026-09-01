@@ -4113,12 +4113,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let refocus = refocus.clone();
                     Rc::new(move || {
                         let sql = query.get_untracked();
-                        let (lo, hi) = statement_range(
+                        // **`executable_at`, not `statement_range`.** The third
+                        // executing path, and the one `029a15d` left on the
+                        // ranges: a range carries its terminator, which is right
+                        // for selecting and highlighting and wrong to send when
+                        // that terminator is the client's `DELIMITER` token.
+                        // A caret inside a trigger sent `…END$$`, which MySQL
+                        // lexes as one identifier; a caret on the directive line
+                        // sent `DELIMITER $$` to the server.
+                        if let Some(stmt) = schemaic_core::sql::executable_at(
                             &sql,
                             run_menu_offset.get_untracked(),
                             dialect.get_untracked(),
-                        );
-                        if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.trim().is_empty()) {
+                        ) {
                             (run)(stmt.to_string());
                         }
                         // Down with the menu, as on Escape and Run Everything. The

@@ -3256,7 +3256,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(
             move |req: schemaic_ui::ScriptRequest, done: schemaic_ui::ScriptDoneFn| {
                 use schemaic_core::script::RunOutcome;
-                let db = match (db_for)(req.conn_id) {
+                let db = match (db_for)(req.conn_id()) {
                     Ok(db) => db,
                     // Nothing ran, and the report must say so rather than name a
                     // statement it never reached.
