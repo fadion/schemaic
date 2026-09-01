@@ -4811,7 +4811,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-ai"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "schemaic-core",
  "serde_json",
@@ -4819,7 +4819,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-app"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "crossbeam-channel",
  "floem",
@@ -4842,7 +4842,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-core"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "csv",
@@ -4855,7 +4855,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-db"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "futures-util",
  "mysql_async",
@@ -4878,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-term"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4889,7 +4889,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-ui"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "floem",
  "floem_renderer",
