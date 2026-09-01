@@ -13,6 +13,10 @@
 use crate::intel::SqlDialect;
 use crate::model::Value;
 use crate::schema::TableInfo;
+// A UTF-8 BOM lands inside the first header name, where it silently breaks
+// name-matching on the very first column. The same three bytes broke the script
+// splitter and the connection-file parsers, so the strip is shared.
+use crate::text::strip_bom;
 
 /// The file formats import accepts.
 ///
@@ -710,12 +714,6 @@ fn reader_for<R: std::io::Read>(r: R, cfg: &ReadConfig) -> csv::Reader<R> {
         // hard read error that says nothing about where the problem is.
         .flexible(true)
         .from_reader(r)
-}
-
-/// A UTF-8 BOM is invisible in an editor but lands inside the first header name,
-/// where it silently breaks name-matching on the very first column.
-fn strip_bom(s: &str) -> &str {
-    s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
 /// How many bytes the **preview** may read, whatever the file's shape.
