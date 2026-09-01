@@ -1128,18 +1128,6 @@ pub(crate) async fn import_rows(
     })
 }
 
-/// Run a DDL plan, all or nothing.
-///
-/// **SQLite's DDL is transactional**, which MySQL's is not, so this backend can
-/// do what the MySQL path cannot: wrap the whole plan in one transaction and
-/// roll it back whole. That is why every [`crate::DdlError`] from here carries
-/// `applied: 0` — a half-applied plan is a state this engine never leaves behind,
-/// so there is no partial progress for the report to have to admit to.
-///
-/// What may reach here is decided in `core::ddl::supports_change`, not here: the
-/// menus hide what SQLite can't express and the emitter writes nothing for it, so
-/// a plan that arrives is one made of statements this engine has. Anything that
-/// slipped through still fails at the engine rather than half-applying.
 /// SQLite's arm of [`crate::Db::run_script`]. See there for why nothing is
 /// wrapped in a transaction and why the connection is pinned.
 ///
@@ -1196,6 +1184,22 @@ pub(crate) async fn run_script(
     })
 }
 
+/// Run a DDL plan, all or nothing.
+///
+/// **SQLite's DDL is transactional**, which MySQL's is not, so this backend can
+/// do what the MySQL path cannot: wrap the whole plan in one transaction and
+/// roll it back whole. That is why every [`crate::DdlError`] from here carries
+/// `applied: 0` — a half-applied plan is a state this engine never leaves behind,
+/// so there is no partial progress for the report to have to admit to.
+///
+/// What may reach here is decided in `core::ddl::supports_change`, not here: the
+/// menus hide what SQLite can't express and the emitter writes nothing for it, so
+/// a plan that arrives is one made of statements this engine has. Anything that
+/// slipped through still fails at the engine rather than half-applying.
+///
+/// **Not to be confused with [`run_script`] above**, which wraps nothing and
+/// leaves `PRAGMA foreign_keys` alone: that runs the *user's* file, this runs a
+/// plan Schemaic generated.
 pub(crate) async fn run_ddl(
     db: &Db,
     stmts: &[String],
