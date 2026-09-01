@@ -1,4 +1,23 @@
-//! Small pure text helpers shared by the UI's display strings.
+//! Small pure text helpers shared by the UI's display strings and by the
+//! parsers that read user files.
+
+/// Drop a leading UTF-8 BOM, which every Windows editor writes and no parser
+/// wants.
+///
+/// **Shared because three modules read files a user picked** and each one broke
+/// differently on the same three bytes: `import`'s CSV put U+FEFF inside the
+/// first header name, `script`'s splitter sent it to the server on statement 1
+/// *and* excluded that statement from the destructive count, and
+/// `conn_import`'s INI scanner read `<BOM>[client]` as a bare key in the
+/// unnamed section, so a `.my.cnf` imported zero rows and reported nothing
+/// skipped. `str::trim` does not remove it — U+FEFF is not whitespace — which
+/// is why each of them looked correct.
+///
+/// One only: a second BOM further into the text is data, and a file that opens
+/// with two of them is not one this can repair.
+pub fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
 
 /// Pick the singular or plural noun for a count: `plural(1, "row", "rows")` →
 /// `"row"`; `0` or `2+` → `"rows"`. Returns only the noun form (not the number),
@@ -59,6 +78,19 @@ pub fn hides_detail(msg: &str, fits_chars: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leading_bom_comes_off_and_nothing_else_does() {
+        assert_eq!(strip_bom("\u{feff}[client]"), "[client]");
+        assert_eq!(strip_bom("[client]"), "[client]");
+        assert_eq!(strip_bom(""), "");
+        // Only the first — a second is data.
+        assert_eq!(strip_bom("\u{feff}\u{feff}x"), "\u{feff}x");
+        // Not whitespace, and not something `trim` would have caught.
+        assert_eq!("\u{feff}x".trim(), "\u{feff}x");
+        // Mid-text is left alone.
+        assert_eq!(strip_bom("x\u{feff}y"), "x\u{feff}y");
+    }
 
     #[test]
     fn a_short_one_line_message_hides_nothing() {

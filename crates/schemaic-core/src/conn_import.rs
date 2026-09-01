@@ -42,6 +42,10 @@ use crate::connection::{
     Connection, Environment, SshAuth, SshTunnel, SslMode, Tls, default_port, is_postgres,
     is_sqlite, same_engine,
 };
+// Every source here is a file somebody else's tool wrote, on a platform where
+// the editors write a BOM. Each parser strips one at its own door, so calling a
+// parser directly is as safe as going through `scan`.
+use crate::text::strip_bom;
 
 /// The engine labels this module writes into `Connection::db_type`.
 ///
@@ -335,7 +339,7 @@ impl UrlError {
 /// The connection comes back with `id: 0` and a suggested name; see the module
 /// docs.
 pub fn parse_url(input: &str) -> Result<Connection, UrlError> {
-    let raw = strip_env_assignment(input.trim());
+    let raw = strip_env_assignment(strip_bom(input).trim());
     if raw.is_empty() {
         return Err(UrlError::Empty);
     }
@@ -657,7 +661,7 @@ fn looks_like_drive_path(s: &str) -> bool {
 /// this deliberately does not touch.
 pub fn parse_dbeaver(json: &str) -> ImportScan {
     let mut out = ImportScan::default();
-    let root: serde_json::Value = match serde_json::from_str(json) {
+    let root: serde_json::Value = match serde_json::from_str(strip_bom(json)) {
         Ok(v) => v,
         Err(e) => {
             out.skip("", SkipReason::Unreadable(e.to_string()));
@@ -828,7 +832,7 @@ fn overlay(dst: &mut String, v: Option<String>) {
 /// Passwords are in the OS credential store, not here.
 pub fn parse_datagrip(xml: &str) -> ImportScan {
     let mut out = ImportScan::default();
-    for block in elements(xml, "data-source") {
+    for block in elements(strip_bom(xml), "data-source") {
         let name = attribute(block.head, "name").unwrap_or_default();
         let url = child_text(block.body, "jdbc-url").unwrap_or_default();
         if url.trim().is_empty() {
@@ -1022,7 +1026,7 @@ fn xml_unescape(s: &str) -> String {
 /// before the first section are returned under an empty name.
 fn ini_sections(text: &str) -> Vec<(String, Vec<(String, String)>)> {
     let mut out: Vec<(String, Vec<(String, String)>)> = vec![(String::new(), Vec::new())];
-    for line in text.lines() {
+    for line in strip_bom(text).lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
@@ -1254,7 +1258,7 @@ fn wild(pattern: &str, value: &str) -> bool {
 /// only reason this can't be `split(':')`.
 pub fn pgpass_entries(text: &str) -> Vec<PgpassEntry> {
     let mut out = Vec::new();
-    for line in text.lines() {
+    for line in strip_bom(text).lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -2051,6 +2055,53 @@ mod tests {
         let scan = parse_my_cnf("!includedir /etc/mysql/conf.d/\n[client]\nhost=h\nuser=u\n");
         assert_eq!(scan.found.len(), 1);
         assert_eq!(scan.found[0].connection.host, "h");
+    }
+
+    /// A BOM is what Notepad writes, and `str::trim` does not remove it — so
+    /// `<BOM>[client]` was read as a bare key in the unnamed section and the
+    /// whole file imported **zero rows with zero skipped entries**, which the
+    /// modal renders as "nothing to import" for a file full of servers.
+    ///
+    /// Asserted through the parsers rather than over `strip_bom`, because that
+    /// helper was already right in `import.rs` while all four of these were
+    /// wrong.
+    #[test]
+    fn a_byte_order_mark_does_not_empty_a_client_config_file() {
+        let scan = parse_my_cnf("\u{feff}[client]\nhost=db.example\nuser=app\npassword=pw\n");
+        assert_eq!(scan.found.len(), 1, "{:?}", scan.skipped);
+        assert_eq!(scan.found[0].connection.host, "db.example");
+
+        let scan = parse_pg_service("\u{feff}[prod]\nhost=pg.example\nuser=app\n");
+        assert_eq!(scan.found.len(), 1, "{:?}", scan.skipped);
+        assert_eq!(scan.found[0].connection.host, "pg.example");
+    }
+
+    /// The `.pgpass` half is quieter and worse: the file parses, but the first
+    /// line's host carries the BOM, so it matches no connection and the real
+    /// password sits unused while every row keeps its "no password" note.
+    #[test]
+    fn a_byte_order_mark_does_not_give_pgpass_a_host_that_can_never_match() {
+        let entries = pgpass_entries("\u{feff}db.example:5432:shop:app:hunter2\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, "db.example");
+    }
+
+    /// And the two JSON/XML sources, where the BOM makes `serde_json` refuse
+    /// the whole file with a parse error the user cannot act on.
+    #[test]
+    fn a_byte_order_mark_does_not_make_a_client_export_unreadable() {
+        let scan = parse_dbeaver(&format!("\u{feff}{DBEAVER}"));
+        assert!(!scan.found.is_empty(), "{:?}", scan.skipped);
+
+        let scan = parse_datagrip(&format!("\u{feff}{DATAGRIP}"));
+        assert!(!scan.found.is_empty(), "{:?}", scan.skipped);
+    }
+
+    /// The paste field takes one too — copying a URL out of a Windows tool can
+    /// carry it.
+    #[test]
+    fn a_byte_order_mark_does_not_stop_a_pasted_url() {
+        assert_eq!(url("\u{feff}mysql://h/d").host, "h");
     }
 
     #[test]

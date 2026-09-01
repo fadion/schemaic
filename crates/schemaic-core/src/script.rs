@@ -77,6 +77,9 @@ pub struct Splitter {
     raw: u64,
     /// 1-based line of `buf[0]`.
     line: u64,
+    /// Nothing has been decoded yet, so the next non-empty text may open with a
+    /// BOM. See [`split`](Self::split).
+    at_start: bool,
 }
 
 impl Splitter {
@@ -90,6 +93,7 @@ impl Splitter {
             offset: 0,
             raw: 0,
             line: 1,
+            at_start: true,
         }
     }
 
@@ -173,6 +177,31 @@ impl Splitter {
     /// "inside an unterminated string that began at *s*" across the call, and
     /// getting that wrong mis-splits a file rather than merely slowing it down.
     fn split(&mut self, text: &str) -> Vec<Statement> {
+        // **The BOM comes off here, not at the caller.** Every Windows editor
+        // writes one, U+FEFF is valid UTF-8 so `push` keeps it, and
+        // `sql::trim_range` trims ASCII only — so it merged into the first word
+        // (`is_word_start(0xEF)` is true by invariant) and statement 1 went to
+        // the server as `\u{feff}DROP …`. Worse than the syntax error: `probe`
+        // then read the kind as `\u{feff}DROP`, which `is_destructive` does not
+        // match, so the red confirmation did not render for a file whose first
+        // statement was `DROP DATABASE`. Doing it inside the splitter is what
+        // makes the probe and the runner unable to disagree.
+        //
+        // `offset` moves on by the bytes dropped so a statement's offset still
+        // points into the file. `raw` is untouched: it counts what was handed
+        // in, and the BOM really was handed in.
+        let text = if self.at_start && !text.is_empty() {
+            self.at_start = false;
+            match text.strip_prefix('\u{feff}') {
+                Some(rest) => {
+                    self.offset += '\u{feff}'.len_utf8() as u64;
+                    rest
+                }
+                None => text,
+            }
+        } else {
+            text
+        };
         self.buf.push_str(text);
         let bounds = sql::statement_bounds_open(&self.buf, self.dialect, &mut self.state);
         let cut = bounds.last().expect("a scan always starts at 0").at;
@@ -920,6 +949,66 @@ mod tests {
             .own_transaction
         );
         assert!(!probed("INSERT INTO t VALUES (1);").own_transaction);
+    }
+
+    /// **The composition, not the strip.** A splitter round-trip over a BOM'd
+    /// file would go green against the fix's description while the thing that
+    /// mattered — the red confirmation the modal renders — stayed silent, so
+    /// the assertion is made where the failure was: `probe`.
+    ///
+    /// Every Windows tool writes the BOM, so this is the first file a Windows
+    /// user picks. Before the strip, `statement_kind` read `\u{feff}DROP`,
+    /// `is_destructive` did not match it, and `<BOM>DROP DATABASE production;`
+    /// probed to `destructive = 0`.
+    #[test]
+    fn a_byte_order_mark_does_not_hide_what_the_first_statement_destroys() {
+        let p = probed("\u{feff}DROP DATABASE production;\nSELECT 1;");
+        assert_eq!(p.destructive, 1, "{:?}", p.kinds);
+        assert_eq!(
+            p.kinds,
+            vec![("DROP DATABASE".to_string(), 1), ("SELECT".to_string(), 1)]
+        );
+    }
+
+    /// The other half the BOM broke: a file that wraps itself read as one that
+    /// does not, so the runner would have added a transaction of its own and
+    /// the panel would have told the user a Stop leaves work behind when it
+    /// does not.
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_scripts_own_transaction() {
+        assert!(
+            probed("\u{feff}START TRANSACTION;\nINSERT INTO t VALUES (1);\nCOMMIT;")
+                .own_transaction
+        );
+    }
+
+    /// And the statement itself is clean, whatever read size the driver used —
+    /// U+FEFF is three bytes, so a one-byte read splits it across three calls.
+    #[test]
+    fn a_byte_order_mark_never_reaches_the_server() {
+        for block in 1..=8 {
+            let got: Vec<String> = run("\u{feff}SELECT 1;\nSELECT 2;\n", SqlDialect::MySql, block)
+                .into_iter()
+                .map(|s| s.sql)
+                .collect();
+            assert_eq!(
+                got,
+                vec!["SELECT 1;", "SELECT 2;"],
+                "at a {block}-byte read"
+            );
+        }
+    }
+
+    /// Only the first three bytes, and only at the start of the file: a U+FEFF
+    /// inside a string literal is the user's data.
+    #[test]
+    fn a_byte_order_mark_inside_the_file_is_left_alone() {
+        let got = run(
+            "SELECT '\u{feff}' AS bom;\n",
+            SqlDialect::MySql,
+            SCRIPT.len(),
+        );
+        assert_eq!(got[0].sql, "SELECT '\u{feff}' AS bom;");
     }
 
     /// A SQLite trigger body opens with `BEGIN`, but it is *inside* a
