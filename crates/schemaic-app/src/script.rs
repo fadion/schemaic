@@ -34,6 +34,12 @@ use tokio_util::sync::CancellationToken;
 /// tens of statements in a block of this size, which the queue then meters out.
 const BLOCK: usize = 256 * 1024;
 
+/// The largest single read, however much is being held.
+///
+/// The read grows with what is pending (see the loop below); this stops that
+/// from turning into one 256 MB allocation at the ceiling.
+const MAX_BLOCK: usize = 32 * 1024 * 1024;
+
 /// Run a script to completion, reporting progress as the file is consumed.
 ///
 /// Returns the outcome rather than reporting it, so the caller owns the single
@@ -90,7 +96,21 @@ fn read(
         if token.is_cancelled() {
             return ReadEnd::Cancelled;
         }
-        let n = match file.read(&mut block) {
+        // **The read grows with what is still unfinished**, and that is what
+        // keeps the splitter's cost linear. `Splitter::split` re-scans its
+        // buffer from the start on every block, so a statement spanning *m*
+        // blocks costs O(m²·block) — nothing for a dump, whose statements are
+        // far smaller than one block, but a file with *no* terminator in it (a
+        // CSV renamed `.sql`, a dump truncated inside a string) grows the buffer
+        // to `MAX_PENDING_BYTES` and would re-scan a quarter of a gigabyte a
+        // thousand times before being refused: minutes of a pinned thread before
+        // the message saying the file is not a script. Doubling the read makes
+        // the number of re-scans logarithmic instead.
+        let want = BLOCK.max(splitter.pending() / 2).min(MAX_BLOCK);
+        if block.len() < want {
+            block.resize(want, 0);
+        }
+        let n = match file.read(&mut block[..want]) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => return ReadEnd::Failed(e.to_string()),
