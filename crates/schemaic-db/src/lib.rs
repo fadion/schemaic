@@ -834,6 +834,21 @@ impl Db {
         }
     }
 
+    /// The roles a database or namespace could be owned by — read lazily, when
+    /// the database editor opens on PostgreSQL.
+    ///
+    /// The same shape [`Db::trigger_functions`] uses, and with the same
+    /// standing: it feeds a *shortcut* beside a free-text field, so an empty
+    /// list costs the user a menu and never a value. Empty on the two engines
+    /// with no such concept — a MySQL database belongs to nobody (it is reached
+    /// through grants) and SQLite has neither roles nor databases.
+    pub async fn roles(&self) -> Result<Vec<String>, DbError> {
+        match self.engine {
+            Engine::Postgres => pg::roles(self).await,
+            Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
+        }
+    }
+
     /// A MySQL routine's body **as written**, plus the session state it was
     /// written under — read lazily, when the routine editor opens.
     ///
@@ -4025,6 +4040,80 @@ impl Db {
                     schemaic_core::ddl::applied_count(stmts, i, dialect),
                     e,
                 ));
+                break;
+            }
+        }
+        let _ = conn.disconnect().await;
+        out
+    }
+
+    /// Run a **server-level** DDL plan — `CREATE DATABASE` / `DROP DATABASE`,
+    /// the two changes `ddl::is_server_level` marks.
+    ///
+    /// Separate from [`Db::run_ddl`] because neither statement can take that
+    /// function's two commitments:
+    ///
+    /// - It connects **without** naming the target. A database being created
+    ///   cannot be connected to, and one being dropped must not be — PostgreSQL
+    ///   refuses outright, and MySQL leaves the session pointed at a database
+    ///   that no longer exists. `avoid` is the target, so the PostgreSQL arm can
+    ///   keep it out of the maintenance candidates.
+    /// - There is **no transaction**. PostgreSQL refuses both statements inside
+    ///   one, which is precisely what `run_ddl` wraps every plan in. Nothing is
+    ///   lost: a server-level plan is one statement, so there is no second one
+    ///   for a rollback to protect.
+    ///
+    /// SQLite has no such statement at all — a database there is a file — and
+    /// `ddl::supports_database_editing` refuses the change long before this, so
+    /// its arm reports that rather than inventing a filesystem action.
+    pub async fn run_server_ddl(
+        &self,
+        avoid: Option<&str>,
+        stmts: &[String],
+        cancel: CancellationToken,
+    ) -> Result<(), DdlError> {
+        let fail = |at: usize, applied: usize, e: DbError| DdlError {
+            message: e.to_string(),
+            at,
+            applied,
+        };
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        match self.engine {
+            Engine::Postgres => return pg::run_server_ddl(self, avoid, stmts, cancel).await,
+            Engine::Sqlite => {
+                return Err(fail(
+                    0,
+                    0,
+                    DbError::Query(
+                        "SQLite has no databases to create or drop — a database there is a \
+                         file, which Schemaic does not create or delete for you."
+                            .to_string(),
+                    ),
+                ));
+            }
+            Engine::MySql => {}
+        }
+        // `None`: the server-level connection, which is what makes `DROP
+        // DATABASE` on the connection's own default database work at all.
+        let mut conn = self.open(None, false).await.map_err(|e| fail(0, 0, e))?;
+        let conn_id = conn.id();
+        let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
+        let mut out = Ok(());
+        for (i, sql) in stmts.iter().enumerate() {
+            let step = tokio::select! {
+                r = conn.query_drop(sql) => r.map_err(|e| DbError::Query(e.to_string())),
+                _ = cancel.cancelled() => {
+                    self.kill_query(conn_id).await;
+                    Err(DbError::Cancelled)
+                }
+            };
+            if let Err(e) = step {
+                // No session-guard scaffolding on this path — every statement
+                // here is one the user reviewed — so what applied is simply how
+                // many ran, and `ddl::applied_count` has nothing to discount.
+                out = Err(fail(i, i, e));
                 break;
             }
         }
