@@ -663,10 +663,14 @@ fn message_shell(msg: &str) -> schemaic_term::ShellConfig {
 /// (`merge_rows`/`merge_skipped`), where they are unit-tested; this is the
 /// signal plumbing around them.
 fn add_import_result(ui: ConnImportUi, scan: conn_import::ImportScan) {
-    let mut tick = Vec::new();
+    let mut merged = conn_import::Merged::default();
     ui.rows
-        .update(|rows| tick = conn_import::merge_rows(rows, scan.found));
-    ui.chosen.update(|c| c.extend(tick));
+        .update(|rows| merged = conn_import::merge_rows(rows, scan.found));
+    // **`added` only.** `chosen` is additive here, so extending it with the
+    // repeats re-ticked rows the user had deliberately cleared — and Import
+    // then created the connections they had just refused. A repeat's tick
+    // belongs to the user; see `conn_import::Merged`.
+    ui.chosen.update(|c| c.extend(merged.added));
     ui.skipped
         .update(|s| conn_import::merge_skipped(s, scan.skipped));
 }
@@ -1411,6 +1415,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         skipped: RwSignal::new(Vec::new()),
         paste: RwSignal::new(String::new()),
         paste_error: RwSignal::new(None),
+        file_error: RwSignal::new(None),
         done: RwSignal::new(None),
     };
     let find_open = RwSignal::new(false);
@@ -7197,6 +7202,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             });
         })
     };
+    // **`scanning` had exactly one clearing site**, inside the callback above —
+    // which never runs if the blocking closure panics, because tokio absorbs
+    // the unwind. *Scan installed clients* then read "Scanning…" and stayed
+    // disabled for the rest of the session, with no way back but a restart, and
+    // its reachable trigger was a parser panic on non-ASCII text. Reopening the
+    // modal resets six signals and did not reset this one; it does now, which
+    // is the second site.
 
     // Open **empty**. The modal offers three ways in and only one of them reads
     // the filesystem, so that one is asked for rather than performed because a
@@ -7204,6 +7216,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let open_import: Rc<dyn Fn()> = Rc::new(move || {
         import_ui.paste.set(String::new());
         import_ui.paste_error.set(None);
+        import_ui.file_error.set(None);
+        // See `scan_installed_clients`: this is the second clearing site, and
+        // the only one a user can reach when the first never ran.
+        import_ui.scanning.set(false);
         import_ui.rows.set(Vec::new());
         import_ui.chosen.set(std::collections::HashSet::new());
         import_ui.skipped.set(Vec::new());
@@ -7268,15 +7284,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     return;
                 };
                 let source = conn_sources::source_for_path(&path);
-                let Some(file) = conn_sources::read_source(&path, source) else {
-                    // The one read the user asked for by name, so its failure is
-                    // theirs to see — unlike the search, which opens files nobody
-                    // named.
-                    import_ui
-                        .paste_error
-                        .set(Some(format!("{} could not be read.", path.display())));
-                    return;
+                // The one read the user asked for by name, so its failure is
+                // theirs to see — unlike the search, which opens files nobody
+                // named. **Its own message and its own slot:** one sentence for
+                // three causes, written into the *paste* field's error line,
+                // where it then outlived the URL typed after it.
+                let file = match conn_sources::open_source(&path, source) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        import_ui.file_error.set(Some(e.message(&path)));
+                        return;
+                    }
                 };
+                import_ui.file_error.set(None);
                 let existing = connections.get_untracked();
                 let mut scan = conn_import::scan(&[file], &existing);
                 // **Then complete it from the password files.** Read on its own,
@@ -7378,10 +7398,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 conn_import::mark_existing(rows, &existing);
             });
             import_ui.chosen.set(std::collections::HashSet::new());
-            import_ui.done.set(Some(match added {
-                1 => "Added 1 connection.".to_string(),
-                n => format!("Added {n} connections."),
-            }));
+            // **And say what did not come across.** Every imported connection
+            // lands `read_only: false` and `Environment::None`, whatever the
+            // source tool had marked it — those are Schemaic's own two ways of
+            // making a production server visibly dangerous, and a server
+            // DBeaver marks read-only and types `prod` arrived writable and
+            // unbadged with nothing on screen about it. The blank is a
+            // deliberate choice (`conn_import::blank`) and it is still the
+            // right one — guessing another tool's guard rails is worse — but a
+            // deliberate choice the user is not told about is indistinguishable
+            // from an oversight.
+            //
+            // Said once, here, rather than as a note on every row: it is true
+            // of all of them, and a badge repeated twelve times is read zero
+            // times.
+            import_ui.done.set(Some(format!(
+                "{} Read-only and the environment badge are not carried over — set them                  in Manage connections for anything that matters.",
+                match added {
+                    1 => "Added 1 connection.".to_string(),
+                    n => format!("Added {n} connections."),
+                }
+            )));
         })
     };
 

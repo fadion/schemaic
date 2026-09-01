@@ -3330,6 +3330,14 @@ pub struct ConnImportUi {
     pub paste: RwSignal<String>,
     /// Why the pasted text isn't a connection URL, if it isn't one.
     pub paste_error: RwSignal<Option<String>>,
+    /// Why the file the user picked could not be read.
+    ///
+    /// **Its own slot, because it is not the paste field's news.** A failed
+    /// *Choose a file…* used to write into `paste_error`, so a file button's
+    /// failure was rendered under the **Connection URL** field — and stayed
+    /// there over a good URL typed afterwards, since only a paste clears that
+    /// signal.
+    pub file_error: RwSignal<Option<String>>,
     /// The sentence shown after connections are added.
     pub done: RwSignal<Option<String>>,
 }
