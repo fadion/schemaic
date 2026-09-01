@@ -511,6 +511,29 @@ impl SslMode {
         }
     }
 
+    /// What this mode does on **this engine** that [`Self::description`] does
+    /// not say, or `None` when the description is the whole truth.
+    ///
+    /// **One caveat today, and it is a live driver defect rather than a design
+    /// choice.** On MySQL/MariaDB, `Verify CA` also rejects a host-name
+    /// mismatch, so the two verifying modes are one mode there: `mysql_async`
+    /// 0.37 implements its "skip domain validation" toggle by string-matching
+    /// `"NotValidForName"` in the verifier's error text, and rustls 0.23 now
+    /// raises `NotValidForNameContext`, whose `Display` does not contain that
+    /// substring. Measured twice against the same server, same CA, same binary,
+    /// differing only in the name dialled.
+    ///
+    /// Said in the form rather than left for the connect to reveal, because the
+    /// picker's own line otherwise describes a rung this engine does not have.
+    /// `db::tls`'s `the_driver_still_reads_the_verifier_error_by_its_words`
+    /// fails when the drivers fix this, which is when the caveat comes out.
+    pub fn caveat(self, db_type: &str) -> Option<&'static str> {
+        (self == SslMode::VerifyCa && !is_postgres(db_type) && !is_sqlite(db_type)).then_some(
+            "On MySQL and MariaDB this also checks the host name, so it behaves as Verify full \
+             — a driver limitation, not a setting.",
+        )
+    }
+
     /// Does this mode attempt TLS at all?
     pub fn negotiates_tls(self) -> bool {
         !matches!(self, SslMode::Disable)
@@ -2112,6 +2135,26 @@ mod tls_tests {
         assert!(t.mode.requires_tls(), "a guess must never be plaintext");
         // …and the rest of the block still parses.
         assert_eq!(t.ca_path, "/ca.crt");
+    }
+
+    /// **The one rung whose words do not match its effect on every engine.**
+    /// `Verify CA` on MySQL/MariaDB also rejects a host-name mismatch — a live
+    /// driver defect, measured — so the form says so rather than letting the
+    /// connect reveal it. Nothing else carries a caveat, and PostgreSQL carries
+    /// none at all.
+    #[test]
+    fn only_verify_ca_on_mysql_needs_a_caveat() {
+        assert!(SslMode::VerifyCa.caveat("MySQL").is_some());
+        assert!(SslMode::VerifyCa.caveat("MariaDB").is_some());
+        assert!(SslMode::VerifyCa.caveat("PostgreSQL").is_none());
+        assert!(SslMode::VerifyCa.caveat("SQLite").is_none());
+        for m in SslMode::ALL {
+            if m == SslMode::VerifyCa {
+                continue;
+            }
+            assert!(m.caveat("MySQL").is_none(), "{m:?}");
+            assert!(m.caveat("PostgreSQL").is_none(), "{m:?}");
+        }
     }
 
     /// The ladder's merge rule, in one place: whichever protects more, in
