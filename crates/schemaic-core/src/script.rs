@@ -362,8 +362,93 @@ pub fn statement_kind(sql: &str, dialect: SqlDialect) -> Option<String> {
 /// It stays a *count*, not a verdict. Whether a `DELETE` is missing a `WHERE` is
 /// `sql::first_unsafe`'s question, and answering it a second time here in
 /// different words is exactly the drift that predicate exists to prevent.
-fn is_destructive(kind: &str) -> bool {
-    kind.starts_with("DROP") || kind == "TRUNCATE" || kind == "DELETE"
+/// **Takes the statement, not only its kind.** `statement_kind` is deliberately
+/// coarse — every `ALTER TABLE` is one word pair — and the question here is
+/// finer than the pair can carry: `ALTER TABLE t DROP COLUMN c` permanently
+/// removes a column and every value in it, and read through the kind alone it
+/// is indistinguishable from `ALTER TABLE t ADD COLUMN c`. A migration script
+/// full of the first raised no red line at all.
+///
+/// `REPLACE` is counted for the same reason `DELETE` is: on MySQL it deletes
+/// the conflicting row before inserting, so a `REPLACE`-shaped load is a
+/// delete-shaped load.
+///
+/// **Out of scope, stated rather than half-done:** PostgreSQL's
+/// `WITH d AS (DELETE FROM t …) SELECT …` classifies as `WITH` and is not
+/// counted. Answering it means parsing the CTE list, which is `crate::intel`'s
+/// job and not something to approximate with a substring search — a net that
+/// matched the word `DELETE` anywhere would count the string literal in
+/// `INSERT INTO log VALUES ('DELETE')`, and a warning that fires on a comment
+/// is one users learn to dismiss.
+fn is_destructive(sql: &str, kind: &str, dialect: SqlDialect) -> bool {
+    if kind.starts_with("DROP") || kind == "TRUNCATE" || kind == "DELETE" || kind == "REPLACE" {
+        return true;
+    }
+    // `ALTER … DROP …` — the object word is `TABLE` here, so the decision has
+    // to look past the pair the histogram prints. Bounded by `KIND_WORDS` like
+    // every other look at a statement's head, and read through `leading_words`
+    // so a `DROP` inside a comment or a string cannot reach it.
+    kind.starts_with("ALTER")
+        && sql::leading_words(sql, KIND_WORDS, dialect)
+            .iter()
+            .skip(1)
+            .any(|w| w == "DROP")
+}
+
+/// What the modal's red confirmation should say about a probe.
+///
+/// **The gate was `p.destructive > 0` at the call site, and that is one state
+/// short.** `Probe::more` records that the counts are floors over a *prefix*,
+/// and a prefix with no `DROP` in it says nothing about the rest of an 8 GB
+/// dump — so the file most in need of the sentence was the one file that
+/// rendered none of it. Deciding here, in three states the view matches
+/// exhaustively, is what stops a fourth state being added later and silently
+/// falling into "render nothing".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DestructionNotice {
+    /// Statements that destroy or delete data were found. A floor when
+    /// [`Probe::more`]; print it through [`Probe::count_label`].
+    Found(usize),
+    /// None in what was read — **and the probe stopped early**, so what the
+    /// rest of the file does is simply unknown.
+    Unread,
+}
+
+/// Which of the three states a probe is in. See [`DestructionNotice`].
+pub fn destruction_notice(p: &Probe) -> Option<DestructionNotice> {
+    match (p.destructive, p.more) {
+        (0, false) => None,
+        (0, true) => Some(DestructionNotice::Unread),
+        (n, _) => Some(DestructionNotice::Found(n)),
+    }
+}
+
+/// What the modal's summary line should say about a probe.
+///
+/// Same shape and same reason as [`DestructionNotice`]: the view's `== 0`
+/// branch never consulted [`Probe::more`], so a file whose first statement is
+/// bigger than the probe's look was described as holding *"no statements
+/// Schemaic can run"* — a claim about a file the probe never finished reading,
+/// on the panel whose whole job is to say what the file will do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSummary {
+    /// The file was read whole and holds nothing this app can run.
+    NothingToRun,
+    /// The probe's bound was reached before one complete statement. The file is
+    /// not empty; the look was too short to reach a terminator.
+    CutOffBeforeFirst,
+    /// Statements were found — [`Probe::statements`] of them, a floor when
+    /// [`Probe::more`].
+    Counted,
+}
+
+/// Which of the three states a probe is in. See [`ProbeSummary`].
+pub fn summary_kind(p: &Probe) -> ProbeSummary {
+    match (p.statements, p.more) {
+        (0, false) => ProbeSummary::NothingToRun,
+        (0, true) => ProbeSummary::CutOffBeforeFirst,
+        _ => ProbeSummary::Counted,
+    }
 }
 
 /// How much of a script the probe reads before answering.
@@ -461,7 +546,7 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
         if kind == "BEGIN" || kind == "START" {
             own_transaction = true;
         }
-        if is_destructive(&kind) {
+        if is_destructive(&s.sql, &kind, dialect) {
             destructive += 1;
         }
         *counts.entry(kind).or_default() += 1;
@@ -923,6 +1008,43 @@ mod tests {
         assert_eq!(p.destructive, 2, "{:?}", p.kinds);
     }
 
+    /// **A migration script's real shape.** `ALTER TABLE … DROP COLUMN`
+    /// permanently removes a column and every value in it, and the histogram's
+    /// coarse `ALTER TABLE` cannot tell it from `ADD COLUMN` — so a file of
+    /// nothing but column drops raised no red line at all.
+    #[test]
+    fn dropping_a_column_counts_as_something_the_script_destroys() {
+        let p = probed(
+            "ALTER TABLE users DROP COLUMN legacy_email;\
+             ALTER TABLE orders DROP COLUMN notes, DROP COLUMN memo;\
+             ALTER TABLE t ADD COLUMN c int;",
+        );
+        assert_eq!(p.destructive, 2, "{:?}", p.kinds);
+        // The histogram stays coarse on purpose — the count is what widened.
+        assert_eq!(p.kinds, vec![("ALTER TABLE".to_string(), 3)]);
+    }
+
+    /// MySQL's `REPLACE` deletes the conflicting row before inserting, so a
+    /// `REPLACE`-shaped load is a delete-shaped load.
+    #[test]
+    fn a_replace_counts_because_it_deletes_first() {
+        let p = probed("REPLACE INTO t VALUES (1, 'a'); INSERT INTO t VALUES (2, 'b');");
+        assert_eq!(p.destructive, 1, "{:?}", p.kinds);
+    }
+
+    /// And the net is drawn through `leading_words`, so a `DROP` that is only a
+    /// word in a comment or a string cannot widen it — a warning that fires on
+    /// a comment is one users learn to dismiss.
+    #[test]
+    fn the_word_drop_in_a_comment_or_a_string_does_not_count() {
+        let p = probed(
+            "ALTER TABLE t ADD COLUMN c int; -- was going to DROP COLUMN d\n\
+             ALTER TABLE t ADD COLUMN note text DEFAULT 'DROP COLUMN';\
+             INSERT INTO log VALUES ('DELETE');",
+        );
+        assert_eq!(p.destructive, 0, "{:?}", p.kinds);
+    }
+
     /// And nothing else is swept in with it: a script of reads and inserts
     /// raises no warning, or the warning stops meaning anything.
     #[test]
@@ -1025,6 +1147,89 @@ mod tests {
         assert_eq!(p.statements, 1, "{:?}", p.kinds);
         assert_eq!(p.kinds, vec![("CREATE TRIGGER".to_string(), 1)]);
         assert!(!p.own_transaction);
+    }
+
+    /// **The state the view's `p.destructive > 0` gate could not express.** A
+    /// probe that stopped early and found nothing destructive in the prefix
+    /// knows nothing about the rest of the file — and the rest of the file is
+    /// most of it, which is exactly when the sentence matters. Before this the
+    /// panel rendered no warning at all for that case.
+    #[test]
+    fn a_truncated_probe_that_found_nothing_says_it_did_not_look_at_it_all() {
+        let mut p = Probe {
+            statements: 2000,
+            more: true,
+            destructive: 0,
+            ..Probe::default()
+        };
+        assert_eq!(destruction_notice(&p), Some(DestructionNotice::Unread));
+        // And once it *has* found some, the count is what it reports — the `+`
+        // that makes it a floor is `count_label`'s half of the sentence.
+        p.destructive = 3;
+        assert_eq!(destruction_notice(&p), Some(DestructionNotice::Found(3)));
+        assert_eq!(p.count_label(3), "3+");
+    }
+
+    /// The quiet state: a whole file read, nothing destructive in it. A
+    /// permanent "destroys nothing" line would be one more thing to read past
+    /// on every file, so this is the one case that renders nothing.
+    #[test]
+    fn a_file_read_whole_with_nothing_destructive_renders_no_warning() {
+        let p = Probe {
+            statements: 12,
+            more: false,
+            destructive: 0,
+            ..Probe::default()
+        };
+        assert_eq!(destruction_notice(&p), None);
+        // Read whole, with destruction, is still a report.
+        let p = Probe {
+            destructive: 1,
+            ..p
+        };
+        assert_eq!(destruction_notice(&p), Some(DestructionNotice::Found(1)));
+    }
+
+    /// The summary's mirror image of the same omission: `statements == 0` was
+    /// read as "this file holds nothing runnable" without ever consulting
+    /// `more`, so a file whose first statement is larger than the probe's look
+    /// was described as empty.
+    #[test]
+    fn a_probe_cut_off_before_its_first_statement_does_not_claim_the_file_is_empty() {
+        let cut = Probe {
+            statements: 0,
+            more: true,
+            ..Probe::default()
+        };
+        assert_eq!(summary_kind(&cut), ProbeSummary::CutOffBeforeFirst);
+
+        let empty = Probe {
+            statements: 0,
+            more: false,
+            ..Probe::default()
+        };
+        assert_eq!(summary_kind(&empty), ProbeSummary::NothingToRun);
+
+        let found = Probe {
+            statements: 3,
+            more: false,
+            ..Probe::default()
+        };
+        assert_eq!(summary_kind(&found), ProbeSummary::Counted);
+    }
+
+    /// And the state is reachable, not merely representable: a real file whose
+    /// opening statement runs past the probe's byte bound.
+    #[test]
+    fn a_single_statement_larger_than_the_probe_is_cut_off_rather_than_absent() {
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        sql.push_str(&"(1),".repeat((PROBE_MAX_BYTES as usize / 4) + 16));
+        sql.push_str("(2);");
+        let p = probed(&sql);
+        assert_eq!(p.statements, 0);
+        assert!(p.more);
+        assert_eq!(summary_kind(&p), ProbeSummary::CutOffBeforeFirst);
+        assert_eq!(destruction_notice(&p), Some(DestructionNotice::Unread));
     }
 
     /// Past the statement ceiling every count is a floor, and says so.
