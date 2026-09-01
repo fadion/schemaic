@@ -2375,7 +2375,6 @@ pub struct DraftSignals {
     pub tls_ca_path: RwSignal<String>,
     pub tls_client_cert_path: RwSignal<String>,
     pub tls_client_key_path: RwSignal<String>,
-    pub tls_client_key_passphrase: RwSignal<String>,
     /// Chosen identity colour (a `#rrggbb` hex), or `None` for no colour.
     pub color: RwSignal<Option<String>>,
     /// Draw the identity colour as a prominent editor frame (off by default).
@@ -2415,7 +2414,6 @@ impl DraftSignals {
             tls_ca_path: cx.create_rw_signal(String::new()),
             tls_client_cert_path: cx.create_rw_signal(String::new()),
             tls_client_key_path: cx.create_rw_signal(String::new()),
-            tls_client_key_passphrase: cx.create_rw_signal(String::new()),
             color: cx.create_rw_signal(None),
             prominent_color: cx.create_rw_signal(false),
             read_only: cx.create_rw_signal(false),
@@ -2448,8 +2446,6 @@ impl DraftSignals {
         self.tls_client_cert_path
             .set(c.tls.client_cert_path.clone());
         self.tls_client_key_path.set(c.tls.client_key_path.clone());
-        self.tls_client_key_passphrase
-            .set(c.tls.client_key_passphrase.clone());
         self.color.set(c.color.clone());
         self.prominent_color.set(c.prominent_color);
         self.read_only.set(c.read_only);
@@ -2482,7 +2478,6 @@ impl DraftSignals {
         self.tls_ca_path.set(String::new());
         self.tls_client_cert_path.set(String::new());
         self.tls_client_key_path.set(String::new());
-        self.tls_client_key_passphrase.set(String::new());
         self.color.set(None);
         self.prominent_color.set(false);
         self.read_only.set(false);
@@ -2533,7 +2528,6 @@ impl DraftSignals {
                 ca_path: self.tls_ca_path.get_untracked().trim().to_string(),
                 client_cert_path: self.tls_client_cert_path.get_untracked().trim().to_string(),
                 client_key_path: self.tls_client_key_path.get_untracked().trim().to_string(),
-                client_key_passphrase: self.tls_client_key_passphrase.get_untracked(),
             },
             color: self.color.get_untracked(),
             prominent_color: self.prominent_color.get_untracked(),
