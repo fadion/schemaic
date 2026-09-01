@@ -2526,10 +2526,6 @@ pub(crate) struct GridCtx {
     /// A view re-run is in flight (tab-level) — see [`crate::Tab::view_busy`].
     /// The capped notice's read-more offer reads it to stop offering itself twice.
     pub(crate) view_busy: RwSignal<bool>,
-    /// Fresh-load nonce (tab-level): part of the results-view container key so a
-    /// `Loaded`→`Loaded` filter/sort re-run rebuilds the grid, while an in-place
-    /// commit splice (which doesn't bump it) still skips the rebuild.
-    pub(crate) load_gen: RwSignal<u64>,
     /// Re-run the active tab with a rewritten (filtered/sorted) statement — no
     /// history, preserves `base_sql`/`grid_query` (see `TabsActions::apply_view`).
     pub(crate) apply_view: ApplyViewFn,
