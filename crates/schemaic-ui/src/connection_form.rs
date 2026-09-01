@@ -965,7 +965,14 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         move || mode.get(),
         move |m| {
             if !m.negotiates_tls() {
-                return empty().into_any();
+                // **`hide()`, not a bare `empty()`.** An empty view is still a
+                // flex child, so it takes a slot in the 20px-gap column above —
+                // and the fix for that one row survived one level up: with
+                // `Disable` chosen *and* the tunnel off, the two empty slots
+                // contributed 40px above the next section where every other
+                // inter-field gap is 20. `display:none` takes the box out of
+                // layout entirely.
+                return empty().style(|s| s.hide()).into_any();
             }
             let ring = ring_files.clone();
 
@@ -1079,7 +1086,11 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         move || ssh_enabled.get(),
         move |on| {
             if !on {
-                return empty().into_any();
+                // `hide()` rather than a bare `empty()` — see `tls_fields`. This
+                // is the slot that put a 40px gap above **SSL / TLS** on the
+                // default form, since the tunnel is off by default and the range
+                // put a visible section on the far side of it.
+                return empty().style(|s| s.hide()).into_any();
             }
             let ring = ring_ssh.clone();
             // Authentication method picker (150px), matching the settings dropdowns.

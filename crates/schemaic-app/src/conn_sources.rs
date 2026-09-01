@@ -97,7 +97,7 @@ pub fn read_source(path: &Path, source: ImportSource) -> Option<SourceFile> {
 ///
 /// [`read_source`] answers `None` for all of these because it runs over files
 /// nobody asked about. *Choose a file…* is the other caller, and it reported
-/// one sentence — "<path> could not be read." — for three different problems,
+/// one sentence — `"<path> could not be read."` — for three different problems,
 /// two of which are actionable and one of which was not even true: a non-UTF-8
 /// file *can* be read, and now is.
 #[derive(Clone, Debug, PartialEq, Eq)]
