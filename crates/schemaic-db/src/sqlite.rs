@@ -4071,8 +4071,10 @@ mod tests {
             Some(("main", None, "files")),
             schemaic_core::intel::SqlDialect::Sqlite,
         );
+        // The tuple, not the whole `VALUES` clause: rows are batched into one
+        // multi-row `INSERT` now, so `VALUES` is followed by a newline.
         assert!(
-            sql.contains("VALUES (1, NULL, NULL, NULL)"),
+            sql.contains("(1, NULL, NULL, NULL)"),
             "the placeholder must not be a SQL literal: {sql}"
         );
         // …and the loss is disclosed, in the file for SQL and through the tally

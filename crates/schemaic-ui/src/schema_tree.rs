@@ -789,18 +789,26 @@ pub(crate) fn blank_space_entries(
     if !connection_exists || !schemaic_core::ddl::supports_database_editing(dialect) {
         return Vec::new();
     }
+    // **Skeleton order: read (group 2) before write (group 4).** This shipped
+    // the other way round, which is a *cross-group* inversion — the one thing
+    // `overlays::menu_order_gate` exists to catch, and it could not see this
+    // menu because it scans `overlays.rs` alone. Every other menu in the app
+    // puts Refresh above the writing entries, and a user who has learned one
+    // menu has learned them all; a blank-space menu that inverts the pair is the
+    // drift `8a85fa1` was written about. `blank_space_is_a_subsequence_of_the_
+    // skeleton` below is this menu's half of that gate.
     vec![
-        BlankEntry {
-            label: "Create database",
-            kind: BlankKind::CreateDatabase,
-            disabled: read_only,
-        },
         // Never dimmed: re-reading the schema is a read, and a read-only
         // connection is the one most worth re-reading.
         BlankEntry {
             label: "Refresh",
             kind: BlankKind::Refresh,
             disabled: false,
+        },
+        BlankEntry {
+            label: "Create database",
+            kind: BlankKind::CreateDatabase,
+            disabled: read_only,
         },
     ]
 }
@@ -3554,7 +3562,7 @@ mod tests {
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(
                 blank_labels(d, false),
-                ["Create database", "Refresh"],
+                ["Refresh", "Create database"],
                 "{d:?}"
             );
             let kinds: Vec<BlankKind> = blank_space_entries(d, false, true)
@@ -3563,7 +3571,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 kinds,
-                [BlankKind::CreateDatabase, BlankKind::Refresh],
+                [BlankKind::Refresh, BlankKind::CreateDatabase],
                 "{d:?}"
             );
         }
@@ -3611,7 +3619,43 @@ mod tests {
     fn a_read_only_connection_can_refresh_but_not_create() {
         let entries = blank_space_entries(SqlDialect::MySql, true, true);
         assert_eq!(entries.len(), 2);
-        assert!(entries[0].disabled, "Create database must be dimmed");
-        assert!(!entries[1].disabled, "Refresh is a read");
+        assert!(!entries[0].disabled, "Refresh is a read");
+        assert!(entries[1].disabled, "Create database must be dimmed");
+    }
+
+    /// **This menu's half of `overlays::menu_order_gate`.**
+    ///
+    /// That gate reads `overlays.rs` and nothing else — `this_file()` hard-codes
+    /// the path — so a second top-level menu built in this file was outside it
+    /// entirely, and its own vacuity guard (`arms.len() == 7`) counts arms of
+    /// the builder it already reads, so it cannot notice a third source either.
+    /// This menu shipped inverting skeleton groups 4 and 2, which is exactly the
+    /// cross-group drift the gate exists to catch.
+    ///
+    /// Asserted over the values rather than over the source, because unlike the
+    /// context menus these entries *are* data.
+    #[test]
+    fn blank_space_is_a_subsequence_of_the_skeleton() {
+        // The skeleton groups these two labels sit in — the numbers in
+        // `overlays::menu_order_gate::group`, which this must not disagree with.
+        let group = |label: &str| match label {
+            "Refresh" => 2,
+            "Create database" => 4,
+            other => panic!(
+                "`{other}` has no place in the menu skeleton — put it in a group in                  `overlays::menu_order_gate::group` first, and mirror the number here"
+            ),
+        };
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            for read_only in [false, true] {
+                let groups: Vec<u8> = blank_space_entries(d, read_only, true)
+                    .iter()
+                    .map(|e| group(e.label))
+                    .collect();
+                assert!(
+                    groups.windows(2).all(|w| w[0] <= w[1]),
+                    "{d:?} read_only={read_only}: {groups:?} is not the skeleton's order"
+                );
+            }
+        }
     }
 }
