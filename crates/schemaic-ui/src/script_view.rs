@@ -161,14 +161,32 @@ fn run_script(ui: Ui) {
     if !crate::widgets::accept_launch(s.running.get_untracked(), false) {
         return;
     }
-    // Refused outright, with no override: the read-only block has none by
-    // design, and here it applies to a file nobody has read.
-    if let RunVerdict::Block(why) = script_verdict(
+    // **Matched exhaustively, so a new arm cannot be ignored by accident** —
+    // which is what happened to `Confirm` for a build: the `if let` above this
+    // read only `Block`, so a verdict of "ask first" ran the file anyway.
+    match script_verdict(
         policy(&ui, target.dialect, target.conn_id),
         &file_name(&path),
     ) {
-        s.error.set(Some(why));
-        return;
+        // Refused with no override, by design: the read-only block has none,
+        // and here it applies to a file nobody has read.
+        RunVerdict::Block(why) => {
+            s.error.set(Some(why));
+            return;
+        }
+        // **The panel is the confirmation, and that is a decision rather than
+        // an omission.** A typed `DELETE` gets a "Run anyway" bar because
+        // nothing else stood between typing it and running it. Here the user
+        // chose a file from a dialog and is looking at a panel that names what
+        // it will do — the statement counts, and in red the number that destroy
+        // or delete data — above a button labelled Run. Asking again would be a
+        // second question about the same act, and the verdict's own message is
+        // vaguer than the one already on screen. What must not happen is this
+        // arm being reached *silently*, which is why it is written out.
+        RunVerdict::Confirm(_) => {}
+        // `script_verdict` never returns this; matched rather than caught by a
+        // wildcard so that if it ever does, the change is made here on purpose.
+        RunVerdict::Allow => {}
     }
     s.running.set(true);
     s.error.set(None);
@@ -280,8 +298,13 @@ fn probe_body(p: &Probe) -> impl IntoView {
             // nothing" line would be one more thing to read past on every file.
             if p.destructive > 0 {
                 rows.push(
+                    // **This sentence is the confirmation**, so it says the
+                    // irreversible thing plainly and counts widely — DELETE
+                    // included. There is no second "are you sure" step: the
+                    // file was chosen deliberately and this panel says what it
+                    // will do before Run is pressed.
                     text(format!(
-                        "{} {} in this file {} something — DROP or TRUNCATE. \
+                        "{} {} in this file {} data — DROP, TRUNCATE or DELETE. \
                          That cannot be undone from here.",
                         p.count_label(p.destructive),
                         schemaic_core::text::plural(p.destructive, "statement", "statements"),

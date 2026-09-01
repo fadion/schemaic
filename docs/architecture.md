@@ -2366,8 +2366,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `probe` is the other half, and is `import::read_sample`'s counterpart: what the Import modal's
     second step shows once a file is picked. A CSV's sample can show the opening *rows*; a script's
     can only show what its opening statements **do**, which is the thing worth knowing before
-    running one — a kind histogram (`INSERT ×400`, `DROP TABLE ×12`), how many statements destroy
-    something, and whether the file opens its own transaction (`dump.rs`'s *Replaying → One
+    running one — a kind histogram (`INSERT ×400`, `DROP TABLE ×12`), how many statements destroy or
+    delete data (`is_destructive`, and see the write-guard invariant for why that count *is* the
+    confirmation and why its net therefore includes `DELETE`), and whether the file opens its own
+    transaction (`dump.rs`'s *Replaying → One
     transaction* put one there, and the runner must not wrap an already-wrapped file). It is bounded
     by `PROBE_MAX_BYTES` — the same 8 MB as `SAMPLE_MAX_BYTES`, for the same reason: the user asked
     to *look* at a file — and by `PROBE_MAX_STATEMENTS`. Either bound sets `Probe::more`, and every
@@ -6081,8 +6083,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   and a set of statement lists reaching each of `run_verdict`'s arms, on a Allow &lt; Confirm &lt;
   Block ordering. Note that this is the *inverse* asymmetry to `rerunnable_for_export` above — that
   one drops the `Confirm` arm because there is no moment to ask, this one keeps only the `Confirm`
-  arm because there is exactly one — and both are stronger than the verdict, which is the property
-  that matters.
+  arm — and both are stronger than the verdict, which is the property that matters.
+  **What satisfies that `Confirm` is `script_view`'s panel, not a bar**, and the distinction is
+  worth stating because getting it wrong is a silent hole rather than a visible one. A typed
+  `DELETE` raises "Run anyway" because nothing stood between typing it and running it; a script was
+  chosen from a file dialog and is run from a panel that first names the statement counts and, in
+  red, how many of them destroy or delete data — `script::is_destructive`, whose net is drawn wide
+  (it counts `DELETE`, which no dump writes and a hand-written script does) precisely because that
+  sentence *is* the confirmation. `run_script` matches the verdict **exhaustively** so this is a
+  decision on the page rather than a fall-through: for one build the call site was an
+  `if let RunVerdict::Block(..)`, so a verdict of "ask first" ran the file anyway, and the three
+  tests over `script_verdict` all passed because every one of them exercised the function alone —
+  the defect living, as ever here, at its composition with the caller.
   **One tested function is asked by everything that re-runs**, and that is the shape of the fix
   rather than a tidy-up. `filter::rerun_statement(base, &GridQuery, dialect)` composes *what* would
   run (`build_query`, or the base verbatim when there is no filter or sort) with *whether it may*
