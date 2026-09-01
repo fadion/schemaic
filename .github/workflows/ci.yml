@@ -53,8 +53,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Formatting
         run: cargo fmt --all -- --check
+      # `--features schemaic-db/live-tests` is what compiles the live engine
+      # tier. The `test` job below cannot: that target declares the feature
+      # `required-features`, so `cargo test --workspace` skips it entirely, and
+      # without this it would be the one code in the repository no push
+      # compiles — bitrotting quietly until the `live` job failed to build. It
+      # needs no server to type-check, so it costs this job nothing.
       - name: Clippy (warnings = errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features schemaic-db/live-tests -- -D warnings
       # Clippy does not check rustdoc, so a doc comment linking to a renamed or
       # deleted item shipped silently. `[workspace.lints.rustdoc]` allows links
       # from a public item to a private one (real references in an unpublished
@@ -109,3 +115,75 @@ jobs:
         run: cargo build --workspace
       - name: Test
         run: cargo test --workspace
+
+  # The DB layer against real servers. Everything above this line is pure — the
+  # `test` job's `cargo test --workspace` does not build the live target at all —
+  # so this job is the only thing in CI that has ever connected to MySQL,
+  # MariaDB or PostgreSQL. SQLite was the one backend covered directly, and the
+  # two engines that ship most were covered by hand.
+  #
+  # **It blocks, like every other job here.** An advisory live tier stops being
+  # read within a month, and a suite nobody reads is worse than none: it looks
+  # like coverage.
+  #
+  # Linux only, and out of the `test` matrix on purpose — the Windows and macOS
+  # legs stay pure and fast, and a server that failed to come up cannot mask a
+  # compile break on a platform nobody develops on.
+  live:
+    name: Live engines (MySQL + MariaDB + PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      # MariaDB is a leg of its own rather than a MySQL stand-in: the two
+      # diverge in exactly what the DB layer reads — `information_schema`,
+      # `CHECK` clause escaping, JSON, sequences — and a MySQL 8 quirk in
+      # `CHECK_CLAUSE` has already hidden behind a MariaDB that returned
+      # runnable text.
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: schemaic
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: schemaic
+        # 3307, matching the local test bed, so the defaults in
+        # `tests/live/endpoint.rs` describe both places.
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: schemaic
+          POSTGRES_PASSWORD: schemaic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U schemaic"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v5
+      # No GUI packages: this builds `schemaic-db` and `schemaic-core` only,
+      # neither of which pulls in floem.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # **The root account, not `schemaic`.** A `MYSQL_USER` created by the image
+      # is granted rights on `MYSQL_DATABASE` alone, so it cannot create the
+      # scratch database each test works in. PostgreSQL's `POSTGRES_USER` is the
+      # cluster superuser and needs no such exception.
+      - name: Test (live)
+        run: cargo test -p schemaic-db --features live-tests
+        env:
+          SCHEMAIC_IT_MARIADB_USER: root
+          SCHEMAIC_IT_MARIADB_PASSWORD: schemaic
+          SCHEMAIC_IT_MYSQL_USER: root
+          SCHEMAIC_IT_MYSQL_PASSWORD: schemaic
+          SCHEMAIC_IT_PG_USER: schemaic
+          SCHEMAIC_IT_PG_PASSWORD: schemaic

@@ -3457,6 +3457,45 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
   statement-per-row round-trips.
+  **`tests/live/` is the DB layer against real servers**, and it exists because the pure suite can
+  only reach the *decisions*: SQLite is testable directly (in-memory, shared-cache), so it is the
+  one backend whose wire layer was covered at all, while MySQL, MariaDB and PostgreSQL — the
+  engines that ship most — were covered by hand. `main.rs` holds a macro that expands **one** suite
+  (`suite.rs`) into a module per server, so a claim cannot hold on MySQL and quietly rot on
+  PostgreSQL, and a failure reads `mysql::introspection_finds_the_seeded_table` rather than a loop
+  that stopped at the first leg. What genuinely differs between servers is read off the leg's
+  `Target` (`namespace`) rather than branched on the engine — the same reason production code asks
+  a capability instead of comparing a dialect. **MariaDB is a leg of its own**, not a MySQL
+  stand-in: the divergences are in exactly what this crate reads, which is how a MySQL 8
+  `CHECK_CLAUSE` escaping quirk once hid behind a MariaDB that returned runnable text.
+  **The type matrix (`cases.rs`) is what the tier is for.** A value's journey from a column to a
+  cell is decided by the driver, the wire protocol and this crate's decoding together, and `core`'s
+  tests can only assert what `Value` does with text it is *given*. Each case is a column type, a
+  literal and the text the grid must show; each is asserted twice — that it renders, and that the
+  same text written back through `export::sql_literal` reads back identically. The second is the one
+  that bites, because a lossy rendering *looks* right: reintroducing the historical `bit_cell`
+  defect (a bit-field's number wrapped in `Value::Str` rather than `Value::UInt`) leaves the
+  rendering matrix green — `"170"` and `170` are the same cell — and fails the write back on both
+  MySQL legs with `ERROR 1406: Data too long`, which is exactly how that bug reached a release. A
+  case with no expected text (`timestamptz`, whose rendering follows the server's `TimeZone`) still
+  asserts the NULL row and the write back; both matrix tests assert a **floor** on how many cases
+  ran, since a matrix that walked nothing at all is otherwise a pair of passes.
+  **It is gated as a *target*, not at runtime.** The manifest declares the target
+  `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
+  tier stays pure by construction. With the feature on, an unreachable server is a **failure** —
+  a harness that noticed a missing endpoint and returned would report a green suite that asserted
+  nothing, which is the decoration the testing rules already name. The one exclusion is
+  `SCHEMAIC_IT_ENGINES`, which a developer has to type, and which is refused outright when `CI` is
+  set: libtest has no runtime skip, so an excluded leg reports as a *pass*, and that is tolerable
+  only where a human chose it. Endpoints come from one environment variable per field (no URL to
+  parse, no password to encode), defaulting to this project's own test bed.
+  **Nothing here touches a database it did not create.** `scratch.rs` generates every name with the
+  `schemaic_it_` prefix, the process id and the leg, and both the create and the drop path assert
+  the prefix — the drop guard runs during unwinding, where nothing else is checking anything, and
+  it deliberately does not panic while panicking (a second panic would abort and take the real
+  failure's message with it). CI runs the tier as a blocking `live` job with three service
+  containers; the lint job compiles it via `--features schemaic-db/live-tests`, since otherwise it
+  would be the one code in the repository no push compiles.
 - `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
 - `schemaic-term` — terminal panel + shell (`shell.rs`).
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:

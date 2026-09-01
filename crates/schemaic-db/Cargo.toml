@@ -4,6 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The live engine tier (`tests/live/`). Off by default, and the `[[test]]` entry
+# below declares it `required-features`, so `cargo test --workspace` does not
+# build the target at all and the pure suite stays pure by construction.
+#
+# **Nothing in this tier skips.** With the feature on, a server that cannot be
+# reached is a failure, never a quiet pass — a harness that returns early when
+# an endpoint is missing reads green having asserted nothing, which is the
+# decoration this project has already been bitten by. The one way to run less
+# than everything is to name the legs explicitly in `SCHEMAIC_IT_ENGINES`, which
+# a developer has to type.
+live-tests = []
+
 [dependencies]
 schemaic-core = { workspace = true }
 thiserror = { workspace = true }
@@ -22,11 +35,26 @@ tokio-postgres-rustls = { workspace = true }
 ssh-key = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
 # For `examples/tls_matrix.rs` only: it prints the crate's own debug logs, which
 # is where "N trust anchors from the OS store" comes from — the first thing to
 # check when a verified connection fails and the server looks fine.
-[dev-dependencies]
 tracing-subscriber = { workspace = true }
+# The three below are already ordinary dependencies, and are repeated here
+# because an integration test in `tests/` links against the crate rather than
+# into it: it can reach this crate's public API and its *dev*-dependencies, and
+# nothing else.
+schemaic-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# The live tier is one target rather than one per engine: the suite is written
+# once against `Db` and run for each server, so a claim cannot hold on MySQL and
+# quietly rot on PostgreSQL.
+[[test]]
+name = "live"
+path = "tests/live/main.rs"
+required-features = ["live-tests"]
 
 [lints]
 workspace = true
