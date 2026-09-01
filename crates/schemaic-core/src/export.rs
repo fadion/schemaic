@@ -1215,9 +1215,35 @@ pub fn all_rows_label(size: &str, sorted: bool, manual_tx: bool) -> String {
     }
 }
 
-/// [`export_inserts`], streamed. One statement per row and no batching, so a row
-/// carries no state into the next — the table and column lists are computed once
-/// and repeated verbatim.
+/// How much SQL one `INSERT` may carry before the emitter closes it and starts
+/// another.
+///
+/// **The reason this exists at all is the round trip.** Schemaic's own Import
+/// replays a script one statement at a time, one network round trip each, so a
+/// file of one `INSERT` per row costs one round trip per row: measured on
+/// MariaDB over loopback, 20 000 rows took **17 401 ms** against **162 ms** for
+/// the same rows batched — 107x, extrapolating to hours for a million rows at a
+/// real 20 ms RTT. Batching in the *runner* was the wrong end: it would break
+/// the per-statement line number the panel reports a failure by. The file is
+/// where the shape belongs, and it is the shape `mysqldump` writes.
+///
+/// 512 KiB is the smallest bound that makes the cost disappear and stays well
+/// inside every engine's limit — MySQL's `max_allowed_packet` was 4 MB on 5.7
+/// and is 64 MB now, PostgreSQL has no statement limit, and SQLite's
+/// `SQLITE_MAX_SQL_LENGTH` is a megabyte on the most conservative builds. A
+/// batch is closed *before* the row that would cross it, so one enormous row
+/// still gets a statement of its own rather than being split.
+pub const INSERT_BATCH_BYTES: usize = 512 * 1024;
+
+/// And a row ceiling, for the same reason from the other direction: a table of
+/// narrow rows would otherwise put tens of thousands of tuples in one `VALUES`.
+/// Older SQLite builds cap a compound `VALUES` at `SQLITE_MAX_COMPOUND_SELECT`
+/// (500), and a parser is happier with a statement it can hold.
+pub const INSERT_BATCH_ROWS: usize = 250;
+
+/// [`export_inserts`], streamed. Rows are batched into multi-row `INSERT`s (see
+/// [`INSERT_BATCH_BYTES`]); the table and column lists are computed once and
+/// repeated verbatim per statement.
 pub fn export_inserts_to<W: Write>(
     w: &mut W,
     rs: &ResultSet,
@@ -1242,6 +1268,12 @@ pub fn export_inserts_to<W: Write>(
 ///
 /// A comment and not a refusal, either way: the script still runs, and the one
 /// thing it must not do is pretend the placeholder was the data.
+///
+/// **A batch spans chunks**, which is what keeps that byte-equality gate
+/// meaningful: flushing at every chunk boundary would make a streamed export and
+/// a one-go export of the same rows differ in nothing but how the source
+/// happened to page them. A `-- NOTE:` closes the open statement first, since a
+/// comment cannot appear inside a `VALUES` list.
 pub fn export_inserts_chunks<W: Write>(
     w: &mut W,
     src: &mut dyn RowChunks,
@@ -1257,6 +1289,9 @@ pub fn export_inserts_chunks<W: Write>(
     let mut noted: Vec<bool> = Vec::new();
     let mut first = true;
     let mut tally = ExportTally::default();
+    // The statement being built, carried **across chunks** — see the doc above.
+    let mut open_rows = 0usize;
+    let mut open_bytes = 0usize;
     while let Some(c) = src.next_chunk()? {
         if first {
             cols =
@@ -1280,6 +1315,8 @@ pub fn export_inserts_chunks<W: Write>(
             for &ci in &fresh {
                 noted[ci] = true;
             }
+            // A comment cannot sit inside a `VALUES` list.
+            close_batch(w, &mut open_rows)?;
             writeln!(
                 w,
                 "-- NOTE: binary column{} {} exported as NULL — a text export cannot carry raw bytes.",
@@ -1295,10 +1332,12 @@ pub fn export_inserts_chunks<W: Write>(
             if di >= c.rs.row_count() {
                 continue;
             }
-            write!(w, "INSERT INTO {table_sql} ({cols}) VALUES (")?;
+            // The tuple is built before anything is written, because whether it
+            // fits inside the open statement is what decides where it goes.
+            let mut tuple = String::from("(");
             for ci in 0..c.rs.columns.len() {
                 if ci > 0 {
-                    w.write_all(b", ")?;
+                    tuple.push_str(", ");
                 }
                 let lit =
                     c.rs.cell(di, ci)
@@ -1310,13 +1349,46 @@ pub fn export_inserts_chunks<W: Write>(
                             }
                         })
                         .unwrap_or_else(|| "NULL".to_string());
-                w.write_all(lit.as_bytes())?;
+                tuple.push_str(&lit);
             }
-            w.write_all(b");\n")?;
+            tuple.push(')');
+
+            // Closed *before* the row that would cross the bound, so one very
+            // wide row gets a statement of its own rather than being split.
+            if open_rows > 0
+                && (open_bytes + tuple.len() + 2 > INSERT_BATCH_BYTES
+                    || open_rows >= INSERT_BATCH_ROWS)
+            {
+                close_batch(w, &mut open_rows)?;
+            }
+            if open_rows == 0 {
+                let head = format!("INSERT INTO {table_sql} ({cols}) VALUES\n");
+                open_bytes = head.len();
+                w.write_all(head.as_bytes())?;
+            } else {
+                w.write_all(b",\n")?;
+                open_bytes += 2;
+            }
+            w.write_all(tuple.as_bytes())?;
+            open_bytes += tuple.len();
+            open_rows += 1;
             tally.rows += 1;
         }
     }
+    close_batch(w, &mut open_rows)?;
     Ok(tally)
+}
+
+/// End the `INSERT` currently being built, if there is one.
+///
+/// Every path that must not write inside a `VALUES` list goes through this: the
+/// `-- NOTE:` comment, the batch bounds, and the end of the export.
+fn close_batch<W: Write>(w: &mut W, open_rows: &mut usize) -> io::Result<()> {
+    if *open_rows > 0 {
+        w.write_all(b";\n")?;
+        *open_rows = 0;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1411,6 +1483,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **One `INSERT` per row is one network round trip per row**, because
+    /// Schemaic's own Import replays a script statement by statement: measured
+    /// on MariaDB over loopback, 20 000 rows took 17 401 ms against 162 ms for
+    /// the same rows batched. The file is where the shape belongs — batching in
+    /// the runner would break the per-statement line number a failure is
+    /// reported by.
+    ///
+    /// The bound is bytes, and the batch is closed *before* the row that would
+    /// cross it, so one enormous row still gets a statement of its own rather
+    /// than being split across two.
+    #[test]
+    fn rows_are_batched_into_multi_row_inserts() {
+        let rs = ResultSet::from_rows(
+            vec![col("id")],
+            (0..1000).map(|i| vec![Value::Int(i)]).collect(),
+        );
+        let order: Vec<usize> = (0..1000).collect();
+        let sql = export_inserts(&rs, &order, Some(("shop", None, "t")), MySql);
+
+        // 1000 rows at the 250-row ceiling is four statements, not a thousand.
+        assert_eq!(sql.matches("INSERT INTO").count(), 4, "{sql}");
+        assert_eq!(sql.matches(";\n").count(), 4);
+        // Every row is still there, once.
+        for i in 0..1000 {
+            assert!(sql.contains(&format!("({i})")), "row {i} is missing");
+        }
+        // And it is a script: nothing left open at the end.
+        assert!(sql.trim_end().ends_with(';'), "{}", &sql[sql.len() - 40..]);
+
+        // The byte bound: rows wide enough that two do not fit take one
+        // statement each, rather than one being cut in half.
+        let wide = "x".repeat(INSERT_BATCH_BYTES / 2);
+        let rs = ResultSet::from_rows(
+            vec![col("id")],
+            (0..3).map(|_| vec![Value::Str(wide.clone())]).collect(),
+        );
+        let sql = export_inserts(&rs, &[0, 1, 2], Some(("shop", None, "t")), MySql);
+        assert_eq!(
+            sql.matches("INSERT INTO").count(),
+            3,
+            "a row that does not fit beside another takes a statement of its own"
+        );
+    }
+
+    /// A single row is still a single statement, and reads as one — the shape
+    /// every other test in this module and every fixture on disk was written
+    /// against.
+    #[test]
+    fn one_row_is_one_ordinary_insert() {
+        let rs = ResultSet::from_rows(vec![col("id")], vec![vec![Value::Int(7)]]);
+        assert_eq!(
+            export_inserts(&rs, &[0], Some(("shop", None, "t")), MySql),
+            "INSERT INTO `shop`.`t` (`id`) VALUES\n(7);\n"
+        );
+        // No rows: no statement at all, not an `INSERT` with an empty `VALUES`.
+        let empty = ResultSet::from_rows(vec![col("id")], vec![]);
+        assert_eq!(
+            export_inserts(&empty, &[], Some(("shop", None, "t")), MySql),
+            ""
+        );
     }
 
     /// **One empty chunk and no chunk at all are different things**, and the
@@ -1552,9 +1686,22 @@ mod tests {
             let out = String::from_utf8(buf).expect("utf-8");
             assert!(out.contains("one"), "{}: {out}", format.label());
             assert!(out.contains("two"), "{}: {out}", format.label());
-            // Nothing invented for the missing index: two data rows, not three.
+            // Nothing invented for the missing index: two data *rows*, not
+            // three. Counted as tuples rather than as statements — rows are
+            // batched into one multi-row `INSERT` now, so a statement count
+            // measures the batching and not the rows.
             if format == ExportFormat::Sql {
-                assert_eq!(out.matches("INSERT INTO").count(), 2, "{out}");
+                assert_eq!(out.matches("INSERT INTO").count(), 1, "{out}");
+                assert_eq!(
+                    out.matches(
+                        "),
+("
+                    )
+                    .count()
+                        + 1,
+                    2,
+                    "{out}"
+                );
             }
             if format == ExportFormat::Json {
                 let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -2177,7 +2324,7 @@ mod tests {
         };
         assert_eq!(export_csv(&rs, &[0]), "flags\n10\n");
         assert!(
-            export_inserts(&rs, &[0], None, MySql).contains("VALUES (10)"),
+            export_inserts(&rs, &[0], None, MySql).contains("(10)"),
             "{}",
             export_inserts(&rs, &[0], None, MySql)
         );

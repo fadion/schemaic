@@ -6421,6 +6421,16 @@ mod menu_order_gate {
         assert!(out_of_order.is_empty(), "{}", out_of_order.join("\n"));
 
         // And the scan is still finding the menus, or it passes by seeing nothing.
+        //
+        // **This counts arms of the builder it already reads**, so it can say
+        // the scan has not gone blind *inside this file* and nothing more. A
+        // top-level menu built elsewhere is outside the gate entirely —
+        // `this_file()` hard-codes `src/overlays.rs` — and one already was:
+        // `schema_tree::blank_space_entries`, which shipped inverting groups 4
+        // and 2. Its own half of this gate is
+        // `schema_tree::tests::blank_space_is_a_subsequence_of_the_skeleton`,
+        // and a third source needs the same, because this number will not
+        // notice it either.
         assert_eq!(
             arms.len(),
             7,
