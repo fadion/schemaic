@@ -2332,6 +2332,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     replayed. Until it existed the round trip did not close — Schemaic wrote `.sql` files only
     another tool could read, because the import path takes CSV/JSON and `sqlfile::open_verdict`
     refuses a `.sql` past 64 MB.
+    **What a statement is and what a server may be *sent* are two different strings**, and
+    conflating them shipped a bug: a range carries its terminator — right for the editor, which
+    selects and highlights with it — but when that terminator is the client's `DELIMITER` token it
+    must come off. `END$$` lexes as a single identifier in MySQL, so the compound body never closes;
+    every dump carrying a trigger or routine failed at its first one, half-loaded, on *both* this
+    runner and Run Everything (which had it all along). `sql::Bound` now records how many of a
+    boundary's bytes are the client's, `;` keeping `strip: 0` because every engine accepts a trailing
+    one, and `sql::executable_statements` / `executable_range` are the single answer to "what is
+    sent" that both paths ask. Confirmed against MariaDB: `CREATE TRIGGER … END$$` is a 1064,
+    `… END` creates the trigger.
     `Splitter` is the whole of it: `push` takes the next block's **bytes** and returns the
     `Statement`s it completed, `finish` yields the last one (a script's final statement need not
     carry a terminator, and a runner that dropped it would replay a dump one statement short,

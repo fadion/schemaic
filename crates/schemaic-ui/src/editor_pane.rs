@@ -43,7 +43,7 @@ use schemaic_core::model::QueryState;
 use schemaic_core::pairs::{self, PairAction};
 use schemaic_core::params;
 use schemaic_core::prompt::{self, FixOrigin};
-use schemaic_core::sql::{statement_range, statement_ranges};
+use schemaic_core::sql::statement_range;
 use schemaic_core::text_ops::{
     find_matches, matches_at, move_line, offset_of_line, replace_all, soft_tab_indent,
     soft_tab_outdent, toggle_line_comment,
@@ -4137,10 +4137,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let refocus = refocus.clone();
                     Rc::new(move || {
                         let sql = query.get_untracked();
-                        let stmts: Vec<String> = statement_ranges(&sql, dialect.get_untracked())
-                            .into_iter()
-                            .filter_map(|(lo, hi)| sql.get(lo..hi).map(|s| s.to_string()))
-                            .collect();
+                        // **`executable_statements`, not the ranges.** A range
+                        // carries its terminator — right for selecting and
+                        // highlighting, wrong to send when that terminator is
+                        // the client's `DELIMITER` token. `END$$` lexes as one
+                        // identifier in MySQL, so pasting a dump's trigger block
+                        // in here and pressing Run Everything failed at the
+                        // trigger with a syntax error.
+                        let stmts = schemaic_core::sql::executable_statements(
+                            &sql,
+                            dialect.get_untracked(),
+                        );
                         (run_all)(stmts);
                         highlight.set(None);
                         run_menu.set(None);

@@ -148,7 +148,7 @@ impl Splitter {
     pub fn push_str(&mut self, text: &str) -> Vec<Statement> {
         self.buf.push_str(text);
         let bounds = sql::statement_bounds_open(&self.buf, self.dialect, &mut self.state);
-        let cut = *bounds.last().expect("a scan always starts at 0");
+        let cut = bounds.last().expect("a scan always starts at 0").at;
         let mut out = Vec::new();
         // Newlines are counted once, walking forward with the windows, rather
         // than re-counted from the buffer start per statement — which would be
@@ -156,12 +156,16 @@ impl Splitter {
         let mut walked = 0usize;
         let mut line = self.line;
         for w in bounds.windows(2) {
-            let (lo, hi) = sql::trim_range(&self.buf, w[0], w[1]);
+            let lo = sql::trim_range(&self.buf, w[0].at, w[1].at).0;
             line += newlines(&self.buf[walked..lo]) as u64;
             walked = lo;
-            if sql::is_runnable_segment(&self.buf, lo, hi, self.dialect) {
+            // **Through `sql::executable_range`, not by slicing the bounds.**
+            // The client's `DELIMITER` token has to come off, and a script
+            // runner sending a different string from Run Everything is exactly
+            // the drift that function exists to prevent.
+            if let Some(text) = sql::executable_range(&self.buf, w[0].at, w[1], self.dialect) {
                 out.push(Statement {
-                    sql: self.buf[lo..hi].to_string(),
+                    sql: text.to_string(),
                     line,
                     offset: self.offset + lo as u64,
                 });
@@ -184,9 +188,15 @@ impl Splitter {
             self.carry.clear();
             self.buf.push('\u{FFFD}');
         }
-        let (lo, hi) = sql::trim_range(&self.buf, 0, self.buf.len());
-        let out = sql::is_runnable_segment(&self.buf, lo, hi, self.dialect).then(|| Statement {
-            sql: self.buf[lo..hi].to_string(),
+        let lo = sql::trim_range(&self.buf, 0, self.buf.len()).0;
+        // No terminator was found, so there is none to strip — but the same
+        // function decides what counts as a statement.
+        let end = sql::Bound {
+            at: self.buf.len(),
+            strip: 0,
+        };
+        let out = sql::executable_range(&self.buf, 0, end, self.dialect).map(|text| Statement {
+            sql: text.to_string(),
             line: self.line + newlines(&self.buf[..lo]) as u64,
             offset: self.offset + lo as u64,
         });
@@ -525,13 +535,14 @@ mod tests {
     /// **The composition test.** However the file is cut up, the statements must
     /// be the ones reading it whole gives — at every block size, so the boundary
     /// falls inside a comment, a string, a directive and a trigger body in turn.
+    ///
+    /// Compared against `executable_statements`, not `statement_ranges`: what a
+    /// runner sends is the text with the client's delimiter off, and comparing
+    /// against the ranges is what let `END$$` reach a server for one release.
     #[test]
     fn a_script_read_in_blocks_yields_what_reading_it_whole_does() {
         for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
-            let whole: Vec<String> = sql::statement_ranges(SCRIPT, dialect)
-                .iter()
-                .map(|&(lo, hi)| SCRIPT[lo..hi].to_string())
-                .collect();
+            let whole: Vec<String> = sql::executable_statements(SCRIPT, dialect);
             for block in 1..=SCRIPT.len() {
                 let got: Vec<String> = run(SCRIPT, dialect, block)
                     .into_iter()
