@@ -4232,10 +4232,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         // and pressing Ctrl+T bound the new tab straight back into it, past
         // every list that had stopped showing it.
         let remembered = last_db.with_untracked(|m| m.get(&conn_id).cloned());
+        // The connection's own **Database** field, which the form says is where
+        // this connection opens — second only to what the user last switched to
+        // here. See `schema::first_bindable`.
+        let configured = connections.with_untracked(|cs| {
+            cs.iter()
+                .find(|c| c.id == conn_id)
+                .map(|c| c.database.clone())
+        });
         let names: Vec<String> =
             db_nodes.with_untracked(|v| v.iter().map(|n| n.database.clone()).collect());
         let database = hidden_dbs.with_untracked(|h| {
-            schemaic_core::schema::tab_target(remembered.as_deref(), &names, h).map(str::to_string)
+            schemaic_core::schema::tab_target(
+                remembered.as_deref(),
+                configured.as_deref(),
+                &names,
+                h,
+            )
+            .map(str::to_string)
         });
         (conn_id, database)
     });
@@ -6220,7 +6234,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // here of all places.
                         if let Some(first) = hidden_dbs
                             .with_untracked(|h| {
-                                schemaic_core::schema::first_bindable(&names, h).map(str::to_string)
+                                schemaic_core::schema::first_bindable(
+                                    Some(conn_send.database.as_str()),
+                                    &names,
+                                    h,
+                                )
+                                .map(str::to_string)
                             })
                             .as_ref()
                         {

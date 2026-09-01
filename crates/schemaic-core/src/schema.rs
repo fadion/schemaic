@@ -670,19 +670,35 @@ pub fn db_contributes(
 /// Falls back to the first name when **every** database is hidden: a connection
 /// whose databases are all put away should still open a usable tab, and the
 /// exception is then honest — the user is inside the one thing they can see.
+/// **The connection's own database comes first, and that is what the form
+/// promises.** The **Database** field says the connection opens there, and this
+/// function ignored it entirely: every unbound tab landed in the
+/// alphabetically-first *listed* database instead, so a connection configured
+/// for `world` opened in `actdemo`. Every client the importer reads from opens
+/// in the named database, and `conn_import` now fills the field from those
+/// files, so the promise arrives pre-made and was being broken on the first
+/// run.
+///
+/// It must still be a database this connection actually has and has not put
+/// away: a stale name would bind every tab to something the tree does not show,
+/// which is the failure the visibility filter below exists to prevent.
 pub fn first_bindable<'a>(
+    configured: Option<&str>,
     names: &'a [String],
     hidden: &std::collections::HashSet<String>,
 ) -> Option<&'a str> {
-    names
-        .iter()
-        .find(|n| db_visible(hidden, n))
+    configured
+        .filter(|c| !c.trim().is_empty())
+        .and_then(|c| names.iter().find(|n| n.as_str() == c))
+        .filter(|n| db_visible(hidden, n))
+        .or_else(|| names.iter().find(|n| db_visible(hidden, n)))
         .or_else(|| names.first())
         .map(String::as_str)
 }
 
 /// The database a **new tab** on this connection should bind to: the one the
-/// user last switched to here, if it is still there and still visible, else
+/// user last switched to here, if it is still there and still visible, else the
+/// connection's configured one, else
 /// [`first_bindable`].
 ///
 /// **The whole decision, not half of it.** The remembered branch used to test
@@ -703,11 +719,12 @@ pub fn first_bindable<'a>(
 /// impossible; this function only has to be told the right one.
 pub fn tab_target<'a>(
     last: Option<&'a str>,
+    configured: Option<&str>,
     names: &'a [String],
     hidden: &std::collections::HashSet<String>,
 ) -> Option<&'a str> {
     last.filter(|name| names.iter().any(|n| n == name) && db_visible(hidden, name))
-        .or_else(|| first_bindable(names, hidden))
+        .or_else(|| first_bindable(configured, names, hidden))
 }
 
 /// The database name the QUERY toolbar's selector may show, given the databases
@@ -5104,22 +5121,22 @@ mod tests {
         let hidden = |v: &[&str]| -> std::collections::HashSet<String> {
             v.iter().map(|s| s.to_string()).collect()
         };
-        assert_eq!(first_bindable(&names, &hidden(&[])), Some("actdemo"));
+        assert_eq!(first_bindable(None, &names, &hidden(&[])), Some("actdemo"));
         assert_eq!(
-            first_bindable(&names, &hidden(&["actdemo"])),
+            first_bindable(None, &names, &hidden(&["actdemo"])),
             Some("bigschema")
         );
         assert_eq!(
-            first_bindable(&names, &hidden(&["actdemo", "bigschema"])),
+            first_bindable(None, &names, &hidden(&["actdemo", "bigschema"])),
             Some("sakila")
         );
         // Everything hidden: a usable tab beats no tab, and the exception is
         // then honest — the user is inside the one thing they can see.
         assert_eq!(
-            first_bindable(&names, &hidden(&["actdemo", "bigschema", "sakila"])),
+            first_bindable(None, &names, &hidden(&["actdemo", "bigschema", "sakila"])),
             Some("actdemo")
         );
-        assert_eq!(first_bindable(&[], &hidden(&[])), None);
+        assert_eq!(first_bindable(None, &[], &hidden(&[])), None);
 
         // The composed property, over the whole decision rather than the
         // fallback alone. `tab_target` is what a new tab actually asks — the
@@ -5128,10 +5145,60 @@ mod tests {
         // hiding the database they are in and pressing Ctrl+T.
         let h = hidden(&["actdemo"]);
         for last in [None, Some("actdemo"), Some("sakila"), Some("gone")] {
-            let bound = tab_target(last, &names, &h).unwrap();
+            let bound = tab_target(last, None, &names, &h).unwrap();
             assert!(db_contributes(&h, bound, Some(bound)), "{last:?}");
             assert!(!db_contributes(&h, "actdemo", Some(bound)), "{last:?}");
         }
+    }
+
+    /// **The connection's own Database field is what the form promises**, and
+    /// it was ignored entirely: an unbound tab landed in the alphabetically
+    /// first *listed* database, so a connection configured for `sakila` opened
+    /// in `actdemo`. Every client the importer reads from opens in the named
+    /// database, and `conn_import` now fills the field from those files — so
+    /// the promise arrives pre-made and was broken on the first run.
+    #[test]
+    fn a_tab_opens_in_the_connections_configured_database() {
+        let names: Vec<String> = ["actdemo", "bigschema", "sakila"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hidden = |v: &[&str]| -> std::collections::HashSet<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            first_bindable(Some("sakila"), &names, &hidden(&[])),
+            Some("sakila")
+        );
+        // Blank means "no preference", which is the pre-range behaviour and
+        // most saved connections.
+        assert_eq!(
+            first_bindable(Some(""), &names, &hidden(&[])),
+            Some("actdemo")
+        );
+        // A stale name would otherwise bind every tab to something the tree
+        // does not show.
+        assert_eq!(
+            first_bindable(Some("gone"), &names, &hidden(&[])),
+            Some("actdemo")
+        );
+        // And it does not override the eye. Putting a database away is as
+        // explicit as typing it in the form, and it is the more recent of the
+        // two; the app must never move a tab *into* a hidden database.
+        assert_eq!(
+            first_bindable(Some("sakila"), &names, &hidden(&["sakila"])),
+            Some("actdemo")
+        );
+        // What the user last switched to on this connection still wins — the
+        // field says where the connection *opens*, not where it stays.
+        assert_eq!(
+            tab_target(Some("bigschema"), Some("sakila"), &names, &hidden(&[])),
+            Some("bigschema")
+        );
+        assert_eq!(
+            tab_target(None, Some("sakila"), &names, &hidden(&[])),
+            Some("sakila")
+        );
     }
 
     /// The remembered database wins **when it is still bindable**, and the three
@@ -5148,12 +5215,12 @@ mod tests {
         };
         // Remembered, present, visible → it.
         assert_eq!(
-            tab_target(Some("sakila"), &names, &hidden(&[])),
+            tab_target(Some("sakila"), None, &names, &hidden(&[])),
             Some("sakila")
         );
         // Remembered but since hidden → the first visible one, not back into it.
         assert_eq!(
-            tab_target(Some("sakila"), &names, &hidden(&["sakila"])),
+            tab_target(Some("sakila"), None, &names, &hidden(&["sakila"])),
             Some("actdemo")
         );
         // Remembered but gone from this connection → the same fallback. (Before
@@ -5161,12 +5228,12 @@ mod tests {
         // a name picked on one server that happens to exist, hidden, on
         // another.)
         assert_eq!(
-            tab_target(Some("gone"), &names, &hidden(&[])),
+            tab_target(Some("gone"), None, &names, &hidden(&[])),
             Some("actdemo")
         );
         // Nothing remembered → `first_bindable`, unchanged.
         assert_eq!(
-            tab_target(None, &names, &hidden(&["actdemo"])),
+            tab_target(None, None, &names, &hidden(&["actdemo"])),
             Some("bigschema")
         );
         // Everything hidden: the remembered one is as good as any, and both
@@ -5174,14 +5241,15 @@ mod tests {
         assert_eq!(
             tab_target(
                 Some("sakila"),
+                None,
                 &names,
                 &hidden(&["actdemo", "bigschema", "sakila"])
             ),
             Some("actdemo")
         );
         // No databases loaded yet.
-        assert_eq!(tab_target(Some("sakila"), &[], &hidden(&[])), None);
-        assert_eq!(tab_target(None, &[], &hidden(&[])), None);
+        assert_eq!(tab_target(Some("sakila"), None, &[], &hidden(&[])), None);
+        assert_eq!(tab_target(None, None, &[], &hidden(&[])), None);
     }
 
     #[test]

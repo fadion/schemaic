@@ -592,8 +592,19 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     // statement must not be run from — so keying on emptiness
                     // handed the user a tab bound to the database the script
                     // drops, where PostgreSQL answers `cannot drop the currently
-                    // open database`. The escape hatch has to open somewhere the
-                    // script can actually run.
+                    // open database`.
+                    //
+                    // **What `None` buys, stated honestly, because this comment
+                    // used to claim more.** It stops the tab being bound to the
+                    // *target*. It does not guarantee the run happens elsewhere:
+                    // an unbound tab runs in the connection's own configured
+                    // database (`Db::open`'s fallback), and if that database is
+                    // the one being dropped, PostgreSQL refuses with exactly the
+                    // message above. That is a loud, correct refusal naming the
+                    // problem, and the fix is one the user can make — switch the
+                    // tab's database — which is why the escape hatch does not
+                    // try to pick a database on their behalf out of a list it
+                    // does not have here.
                     let open_db = match p.scope {
                         crate::DdlScope::Server => None,
                         crate::DdlScope::Database => {
