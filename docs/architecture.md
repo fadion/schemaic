@@ -1878,6 +1878,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     tree's reload gates on (see `schema.rs`'s `SchemaState::begin_refresh`) — everything that
     decides which server the next query reaches and nothing else, so a rename or a colour can't
     blank the tree and a repointed host can't leave another server's databases on it.
+    **`Tls` and `SslMode` are the transport half**, and they live here rather than in
+    `schemaic-db` for the reason the module exists: this is the saved connection, and the mode is a
+    saved field. Five rungs — `Disable` / `Prefer` / `Require` / `VerifyCa` / `VerifyFull` — asked
+    through four predicates (`negotiates_tls`, `requires_tls`, `verifies_certificate`,
+    `verifies_hostname`) rather than matched at a call site, plus `stronger_of`, which is the rule
+    for merging two descriptions of one connection and the direction an *import* must move
+    (`conn_import` had a DBeaver SSL block silently clamping a URL's `verify-full` down to
+    `require`). `Tls::plan` collapses the five into the four decisions a handshake is made of —
+    `TlsPlan` — which is what `schemaic_db::tls` translates for the two drivers; `Prefer` alone
+    carries `fallback_to_plaintext`, and `hostname_override` is what keeps a **tunnelled**
+    `verify-full` checking the far end's certificate instead of `127.0.0.1`. The `SslModeRaw` shim
+    is the one `#[serde(other)]` on this type that does **not** degrade to `default()`: an unknown
+    mode resolves to `STRICTEST`, because the default is `Disable` and a Velopack rollback reading a
+    newer build's file would otherwise turn an encrypted connection into a plaintext one, silently,
+    and then persist that on the next save. `caveat` is the one place a rung's words and its effect
+    are allowed to differ per engine, and it carries exactly one sentence today — see
+    `db/tls.rs` for the driver defect behind it. **The connection's `database`** is the other field
+    the same range added: a *default*, never an override, resolved by `Connection::default_database`
+    and honoured by `schema::first_bindable` (which is what makes a tab open where the form says it
+    will) — and deliberately not the same thing as "no database at all", which `schemaic_db`'s
+    `Scope::Server` spells separately.
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -2091,7 +2112,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →
     move secrets into the store, blank the disk copy; keep plaintext only if the store is
-    unavailable) and `forget` (delete). The real keyring-backed store lives in `schemaic-app`'s
+    unavailable) and `forget` (delete). `RETIRED_SECRET_SUFFIXES` is the fourth transform and the
+    least obvious: a secret this app **stopped writing** still has to be cleaned off the machines
+    that stored it, so every save and every delete sweeps it. Its one member is the TLS client-key
+    passphrase, collected and stored by an earlier build for a feature that could never work —
+    `TlsPlan` carried no passphrase, so an encrypted key always failed blaming the file — and
+    removing the `SecretKind` arm alone would have stranded that entry in the keyring, unread and
+    undeletable through the app. The real keyring-backed store lives in `schemaic-app`'s
     `secrets` module (the heavy `keyring`/D-Bus dep stays out of core); pure + unit-tested via an
     in-memory fake.
   - `rowjson.rs` — the per-field model behind the grid's whole-row **view/edit panel**. A `ColSpec`
@@ -2992,6 +3019,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   what `pg::run_ddl` wraps every plan in. So this path connects without naming the target and
   runs untransacted, and nothing is given up by either: a server-level plan is one statement, so
   there is no second one for a rollback to protect and no scaffolding for `applied` to discount.
+  **On MySQL "without naming the target" is `open_serverless`, not `open(None)`**, and the two were
+  the same spelling for a release. `Db::open(None)` used to mean *"this operation needs no database
+  scope"*; since a connection gained a configured **Database** it means *"the caller named none, so
+  use the connection's"* — so `DROP DATABASE shop` on a connection configured for `shop` went out
+  on a session pointed at its own target, and every later operation answered `ERROR 1049`. The two
+  readings now have two names (`Scope::Database` / `Scope::Server`), which is the only thing that
+  keeps them apart: eleven call sites were written under the first reading and most are harmless
+  only because their SQL happens to be qualified.
   The PostgreSQL arm takes the target through `connect_maintenance_avoiding`, since the
   *configured* database is the first maintenance candidate and dropping it would otherwise pick,
   before anything else, the one connection that cannot perform the statement
@@ -3337,18 +3372,61 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   which would make `verify-full` mean `verify-ca` for every tunnelled connection. **The `prefer`
   retry**: a server without TLS fails the handshake rather than declining it, so "encrypt if you
   can" exists only as a second attempt in `Db::open`, and offering that second attempt to anything
-  above `Prefer` would let the strongest half of the setting report success in plaintext.
+  above `Prefer` would let the strongest half of the setting report success in plaintext. **The
+  retry inspects the error**, and that is not a detail: its only condition used to be
+  `fallback_to_plaintext`, so `prefer` retried after a wrong password (twelve connect attempts for
+  ten pings, measured) and after anything an attacker can provoke mid-handshake — one injected RST
+  and the whole operation was in cleartext. `should_retry_plaintext` matches the one variant the
+  mode exists for, `NoClientSslFlagFromServer`.
   PostgreSQL needs no such retry — its driver negotiates the downgrade itself — which is why the
   mapping is `pg_ssl_mode`, not a shared retry. Cancellation goes through `pg::cancel_query` rather
   than a bare `NoTls`: cancelling opens a *second* connection, and a plaintext one is refused by
-  exactly the servers this setting exists for, with the failure discarded.
+  exactly the servers this setting exists for, with the failure discarded. That is a property of a
+  **set of call sites**, not of the function — the function was right the whole time two of the ten
+  sites bypassed it — so the gate is `session::pg_cancel_gate`, which scans the crate for a
+  `cancel_query` outside the module that defines the helper. Both cancels are bounded by
+  `CANCEL_TIMEOUT`: best-effort and unbounded are not the same word, and a Stop against a host that
+  has gone away hangs inside a modal whose every exit maps to that same Stop.
+  **Two things the ladder cannot deliver, said out loud rather than left to a connect.**
+  `verify-ca` on MySQL/MariaDB also rejects a host-name mismatch: `mysql_async` 0.37 implements its
+  skip-domain-validation toggle by matching `"NotValidForName"` in the verifier's error *text*, and
+  rustls 0.23 raises `NotValidForNameContext`, whose `Display` has no such substring — so the two
+  verifying rungs are one mode there. `SslMode::caveat` puts that under the picker, and
+  `the_driver_still_reads_the_verifier_error_by_its_words` pins what is true **now**, so it turns
+  red the day the drivers agree again. And a **passphrase-protected client key** is refused by name
+  (`parse_key`), with the `openssl pkcs8` command to fix it: the form used to collect a passphrase
+  for one and hand it to nobody, so an encrypted key failed with "is not a PEM private key",
+  blaming a file that was perfectly good. `read_certs` refuses a file with **no PEM section** for
+  the same reason — a DER `.crt` is what Windows' *Export certificate* writes, it came back as
+  `Ok(vec![])`, and `preflight` passed it while PostgreSQL rejected the identity and MySQL
+  presented it.
+  **How any of this is verified, since none of it can be tested purely:** the unit tests here cover
+  the decisions and nothing pure covers a handshake. `db/examples/tls_matrix.rs` walks every mode
+  against a live server and prints what each one did, and `scripts/tls-testbed/` is what it is
+  pointed at — a local CA and a deliberately-broken certificate set (`wrongname`, `expired`,
+  `otherca`), because a real hosted endpoint gives you exactly one case, the happy path, and cannot
+  serve an expired certificate because you asked. `swap-server-cert.sh` moves the server from one
+  to the next; the README carries the matrix the harness reproduces.
+  **The harness reports the transport, not just the connect**, and that is the whole of its
+  usefulness: a `ping()` says only "the server let me in", and printing that for a plaintext
+  connection and a TLS one alike would have reported `prefer` falling back after a wrong password
+  as a pass — so every successful cell asks the server (`Ssl_cipher`, `pg_stat_ssl`). Its negative
+  control (`TLS_WRONG_CA`) has no derived default for the same reason: rewriting `ca.crt` in
+  `TLS_CA` is a no-op for any other file name, so column B silently became column A while the
+  matrix read clean. The test-bed's accounts are `localhost`-only, scoped to one sandbox database,
+  and dropped by teardown: the README prints their password, and it is still a credential.
   **Trust anchors are the OS store** (`default_roots`, `rustls-native-certs`), read **once** —
   one-connection-per-operation puts this on the path of every query and health poll, and
   enumerating the Windows store per connection would be a cost paid thousands of times for an
   answer that cannot change mid-session. `webpki-roots` remains only as a fallback for a machine
   with nothing readable, and as a *fallback* rather than a union on purpose: reading the OS store
   is worth doing because an administrator's decisions there bind, so a CA they removed has to stop
-  being trusted. Keeping the two engines on one set is the part that takes work — `mysql_async`
+  being trusted. **The workspace's `webpki-roots` must stay on `mysql_async`'s major**, and that is
+  a real constraint rather than tidiness: the bundled arm is the one case where the driver's own
+  built-in roots are deliberately left switched *on*, because they **are** our set — which was
+  false while the workspace held 0.26 and the driver 1.0, so the two engines verified against two
+  Mozilla snapshots under a promise of one. Nothing in the crate can see that; the guard is the
+  dependency. Keeping the two engines on one set is the part that takes work — `mysql_async`
   adds its own compiled-in roots to whatever it is given, so `mysql_ssl_opts` sets
   `with_disable_built_in_roots` and passes the anchors as raw DER buffers, which its loader
   accepts only because DER trips no PEM section (pinned by a test, since it is an assumption about
@@ -6285,7 +6363,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`). Never hand-roll a second
   scanner — five drifting copies was the original bug. **It's dialect-aware:** `skip_noncode`/
   `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`/
-  `first_statement`,
+  `first_statement`, `statement_bounds_open` (the resumable form the script splitter feeds),
+  `executable_statements`/`executable_range`/`executable_at`,
   `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
   `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
   is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`; SQLite takes `"x"`,
@@ -6296,8 +6375,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   sent `… BEGIN UPDATE log SET n = 1;` and `END;` as two statements. A private `TriggerScan` state
   machine counts block openers (`BEGIN`, `CASE`) against `END`, so a `CASE … END` inside the body
   can't end it early — the same thing `sqlite3_complete()` does for SQLite's own shell. MySQL and
-  PostgreSQL boundaries are deliberately untouched: MySQL's trigger bodies go behind `DELIMITER`,
-  and changing that would silently alter what Run Everything sends a server. The other half of that
+  PostgreSQL boundaries are deliberately untouched: MySQL's trigger bodies go behind `DELIMITER`.
+  **What Run Everything sends did change, on purpose**, and that is the other half of this
+  invariant: a *range* keeps its terminator, because the editor selects and highlights with it, and
+  a server must never see the client's `DELIMITER` token — `END$$` lexes as one identifier on MySQL
+  and failed every dump carrying a trigger. So the three paths that **execute** go through
+  `executable_range` rather than slicing the ranges: `executable_statements` (Run Everything),
+  `core::script`'s streaming splitter (the script runner), and `executable_at` (Run Current, which
+  was left behind by the first two and shipped a release sending `…END$$`). Anything that
+  *executes* uses one of those three; anything that selects, highlights or measures keeps
+  `statement_range`. The other half of that
   is `ddl::client_script` — what `ChangeSet::editor_script` and a routine's `Generate DDL` both go
   through — which asks `== MySql` before reaching for `DELIMITER $$` so a SQLite plan is never
   handed a directive the engine has never heard of, and **terminates every statement** on the way
@@ -8974,8 +9061,14 @@ for keyboard nav.
   container. The other two bar states are left standing on purpose, and that is the interesting
   half. A stalled write's note (`commit_wait`) is **live, not stale** — the Rollback it offers is the
   more urgent action, so it may sit on top of a running export for as long as the write is out. A
-  batch statement's own failure (`batch_err`) means **no grid is mounted** to export from, so it
-  cannot coincide. `GridCtx::exporting` / `GridState::exporting` is `Option<grid::ExportRun>` —
+  statement's own failure means **no grid is mounted** to export from, so it cannot coincide —
+  and it is not this bar's message any more anyway: `batch_err` is gone, and a statement failure
+  goes to the editor's error bar, under the SQL that produced it and beside the Explain and AI fix
+  that act on it. (Which is why a failure now *un-collapses* the editor: `Collapse the editor` is a
+  button in the RESULTS pane and it sets that pane to height 0, so the message, **View**, **AI
+  fix** and **Explain** were all unreachable for exactly the run that needed them. Revealing the
+  bar in place is not available — a child overflowing out of a zero-height parent is painted and
+  never hit-tested.) `GridCtx::exporting` / `GridState::exporting` is `Option<grid::ExportRun>` —
   `{ id, tab }` — and it answers two questions that used to be one `bool`, each of which had its own
   failure. **`tab` is why the flag may outlive a tab switch.** The export's cancellation token is
   app-global (`main::export_token`), so a flag with a shorter life than the token is a Cancel that

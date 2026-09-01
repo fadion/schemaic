@@ -66,14 +66,20 @@ substitute for the statement, and none of these is a style preference.
 
 - **The write guard lives on the run action**, not in a caller of it — every path executing user
   SQL goes through `TabsActions::run`/`run_all` and `sql::run_verdict`, or through a refusal
-  *strictly stronger* than it (`sql::rerunnable_for_export`, which has no `Confirm` arm). Never a
-  second, laxer gate.
+  *strictly stronger* than it. There are **two** such refusals now:
+  `sql::rerunnable_for_export`, which has no `Confirm` arm, and `sql::script_verdict`, which treats
+  a whole `.sql` file as a write without reading it. Never a second, laxer gate — and the script
+  one is reached only through `ScriptRequest::approved`, because the guard being a *step* the
+  launcher had to remember is how one `return` came to be all that stood between a read-only
+  connection and a file.
 - **One SQL boundary lexer** — everything scanning SQL for string/comment/quote boundaries builds
   on `core::sql::skip_noncode`, and it is dialect-aware.
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new
   hand-rolled scanner. The DB stays the semantic authority.
-- **One connection per operation** — every `Db` method connects, runs, disconnects. The single
-  exception is a `TxMode::Manual` tab's pinned `Session`.
+- **One connection per operation** — every `Db` method connects, runs, disconnects. **Two**
+  exceptions, both because their statements are not independent: a `TxMode::Manual` tab's pinned
+  `Session`, and `Db::run_script`, which holds one connection for a whole `.sql` file (a dump's
+  `SET FOREIGN_KEY_CHECKS`, its own `BEGIN`, its `DELIMITER` — all session state).
 - **Connection identity is the `Db` handle / `conn_id`**, never a `mysql://user:pass@host` URL. No
   credential in a URL, argv or log.
 - **Connection secrets persist to the OS keyring**, not `connections.json` — saves route through
@@ -82,7 +88,10 @@ substitute for the statement, and none of these is a style preference.
 - **Themable colours reach reactive styles as `fn() -> Color`**, never a captured `Color`.
 - **Pure logic lives in `schemaic-core` with unit tests**; the UI/app keep thin wrappers.
 - **Generated DDL is never run silently, and never emitted from a second differ** — draft →
-  `ddl::diff` → `emit` → the preview modal → `Db::run_ddl`.
+  `ddl::diff` → `emit` → the preview modal → `Db::run_ddl`, or `Db::run_server_ddl` for a plan
+  about a **container** (`CREATE`/`DROP DATABASE`/`SCHEMA`), which needs a connection attached to
+  no database. Which runner a plan takes is read off the change set by `ddl_preview::preview_of`,
+  never chosen by the caller.
 - **Write-back is transactional with a 1-row safety net**, and the report never claims more than
   the engine delivered (`GridWrite::plan`, `one_row_verdict`, `Rollback::note`).
 - **A destructive modal action guards its own launch**, in the same step that launches it
