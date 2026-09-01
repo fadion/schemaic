@@ -67,6 +67,16 @@ pub struct Target {
     /// table for good — which is why `DdlError::applied` exists and why the
     /// preview's failure message counts it.
     pub transactional_ddl: bool,
+    /// How a trigger on this server says "uppercase the name being inserted".
+    ///
+    /// **The two engines model a trigger differently, not just spell it
+    /// differently.** MySQL carries the body on the trigger itself; PostgreSQL
+    /// has no body at all and calls a function with its own lifetime — dropping
+    /// the trigger leaves it behind. So a leg supplies either a body or the SQL
+    /// that creates a function plus the name to call, and never both.
+    pub trigger_body: Option<&'static str>,
+    pub trigger_function_ddl: Option<&'static str>,
+    pub trigger_function_name: Option<&'static str>,
     /// A statement that does nothing for `runtime::SLEEP_SECS` seconds, in this
     /// server's spelling — what the cancellation test interrupts. There is no
     /// portable way to ask a server to wait.
@@ -88,6 +98,9 @@ pub static MARIADB: Target = Target {
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
     transactional_ddl: false,
+    trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
+    trigger_function_ddl: None,
+    trigger_function_name: None,
     sleep_sql: "SELECT SLEEP(5)",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
@@ -103,6 +116,9 @@ pub static MYSQL: Target = Target {
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
     transactional_ddl: false,
+    trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
+    trigger_function_ddl: None,
+    trigger_function_name: None,
     sleep_sql: "SELECT SLEEP(5)",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
@@ -118,6 +134,11 @@ pub static POSTGRES: Target = Target {
     binary_type: "bytea",
     non_transactional: None,
     transactional_ddl: true,
+    trigger_body: None,
+    trigger_function_ddl: Some(
+        "CREATE FUNCTION upper_name() RETURNS trigger AS $$          BEGIN NEW.name := UPPER(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql",
+    ),
+    trigger_function_name: Some("upper_name"),
     sleep_sql: "SELECT pg_sleep(5)",
     types: cases::POSTGRES,
     extra_types: &[],

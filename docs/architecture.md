@@ -3521,6 +3521,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   satisfied by a sleep statement the server does not understand, which is how that test passed on
   all three legs while cancelling nothing — pointing `Target::sleep_sql` at an undefined function
   now fails it, and did not before.
+  **`views.rs` and `triggers.rs`** carry the same round trip for the two objects the engines model
+  differently. A view's body is never the text that went in — MySQL fully qualifies and back-quotes
+  it, PostgreSQL re-prints it from the parse tree — so the identity diff is doing real work there;
+  perturbing `ViewDraft::from_table`'s body by one space fails it on all three legs. A trigger is
+  the object they disagree about most (MySQL carries the body, PostgreSQL calls a function with its
+  own lifetime), so every trigger test ends by making it fire or proving it no longer does: a
+  trigger that sits in the catalogue doing nothing is the failure that reads as success everywhere
+  else. Dropping `TriggerDraft::from_info`'s `original` — the same identity-field class as
+  `ColumnDraft::original` — fails the trigger round trips on every leg. **A view result is
+  read-only on all three**, and that is asserted rather than assumed: the test that meant to check
+  it returned early instead and was a no-op on every leg until a probe said so. Its other branch
+  still stands, because a driver may reasonably start attributing a view's columns to the table
+  underneath, and the key the resolver then picks has to identify exactly one row — which the test
+  checks by counting what it matches.
+  **What the tier deliberately does not cover: SSH tunnels and TLS.** Not an oversight and not
+  difficulty in the tests — the obstacle is that both need a server configured *before* it starts,
+  and GitHub Actions brings `services:` containers up before any step runs, so the repository is not
+  checked out yet and a generated certificate or key pair does not exist. Covering them in CI means
+  baking custom images, committing a test CA and key pair, or dropping those servers out of
+  `services:` and starting them with `docker run` inside a step: a CI restructure, decided on its
+  own terms. Until then they keep the instrument they have — `db/examples/tls_matrix.rs` over
+  `scripts/tls-testbed/`, which reports the transport each mode actually negotiated and is better
+  at that than a pass/fail test would be. Also uncovered, for ordinary reasons of nobody having
+  needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
   tier stays pure by construction. With the feature on, an unreachable server is a **failure** —
