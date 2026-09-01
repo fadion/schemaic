@@ -29,15 +29,16 @@ use floem::reactive::create_effect;
 
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::script::{
-    DestructionNotice, Probe, ProbeSummary, RunOutcome, destruction_notice, summary_kind,
+    DestructionNotice, Durability, Probe, ProbeSummary, RunOutcome, destruction_notice,
+    summary_kind,
 };
-use schemaic_core::sql::{GuardPolicy, RunVerdict, script_verdict};
+use schemaic_core::sql::GuardPolicy;
 
 use crate::theme;
 use crate::widgets::{
-    ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, autohide, control_button,
-    exit_action, focus_root_with_ring, form_hint, form_section, form_separator, modal_footer_split,
-    modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
+    ACTION_TAB, ActionKind, ExitAction, FocusRing, action_button, autohide, exit_action,
+    focus_root_with_ring, form_hint, form_section, form_separator, modal_footer_split, modal_h,
+    modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
 use crate::{ScriptRequest, ScriptTarget, Ui};
 
@@ -87,8 +88,9 @@ pub(crate) fn open_script(
 ///
 /// `no_database` is `false` because the modal is only reachable from a database
 /// node, and `confirm_writes` is passed as the user set it even though
-/// [`script_verdict`] does not consult it — a policy assembled with a *made-up*
-/// value would be one that quietly starts lying the day the verdict does.
+/// [`schemaic_core::sql::script_verdict`] does not consult it — a policy
+/// assembled with a *made-up* value would be one that quietly starts lying the
+/// day the verdict does.
 fn policy(ui: &Ui, dialect: SqlDialect, conn_id: u64) -> GuardPolicy {
     GuardPolicy {
         read_only: ui.conn.connections.with_untracked(|cs| {
@@ -110,6 +112,15 @@ fn pick_file(ui: Ui) {
     let Some(target) = s.target.get_untracked() else {
         return;
     };
+    // **Not while a run is going**, and this is the half that has to be right:
+    // the button below is also dimmed, but a dimmed button is a statement about
+    // the pixels and this is a statement about the state. Picking file B mid-run
+    // replaced the panel's statement counts *and its red destructive sentence* —
+    // the thing this modal calls the confirmation — with file B's, over file A's
+    // progress, so the warning on screen was about a file that was not running.
+    if s.running.get_untracked() {
+        return;
+    }
     let dialog = FileDialogOptions::new()
         .title("Run a SQL script")
         .allowed_types(vec![FileSpec {
@@ -163,46 +174,34 @@ fn run_script(ui: Ui) {
     if !crate::widgets::accept_launch(s.running.get_untracked(), false) {
         return;
     }
-    // **Matched exhaustively, so a new arm cannot be ignored by accident** —
-    // which is what happened to `Confirm` for a build: the `if let` above this
-    // read only `Block`, so a verdict of "ask first" ran the file anyway.
-    match script_verdict(
+    // **The guard is the constructor**, so there is no shape this function can
+    // be rewritten into that runs the file without asking `script_verdict`.
+    // It used to be an exhaustive `match` here whose `Block` arm returned —
+    // correct, and deleting that one `return` left the whole workspace green
+    // while a read-only connection ran the file. Every test asked the function;
+    // none could ask the seam, because the seam was a `return` in a view.
+    let name = file_name(&path);
+    let request = match ScriptRequest::approved(
         policy(&ui, target.dialect, target.conn_id),
-        &file_name(&path),
+        path,
+        &name,
+        target.conn_id,
+        target.database.clone(),
+        target.dialect,
     ) {
-        // Refused with no override, by design: the read-only block has none,
-        // and here it applies to a file nobody has read.
-        RunVerdict::Block(why) => {
+        Ok(r) => r,
+        Err(why) => {
             s.error.set(Some(why));
             return;
         }
-        // **The panel is the confirmation, and that is a decision rather than
-        // an omission.** A typed `DELETE` gets a "Run anyway" bar because
-        // nothing else stood between typing it and running it. Here the user
-        // chose a file from a dialog and is looking at a panel that names what
-        // it will do — the statement counts, and in red the number that destroy
-        // or delete data — above a button labelled Run. Asking again would be a
-        // second question about the same act, and the verdict's own message is
-        // vaguer than the one already on screen. What must not happen is this
-        // arm being reached *silently*, which is why it is written out.
-        RunVerdict::Confirm(_) => {}
-        // `script_verdict` never returns this; matched rather than caught by a
-        // wildcard so that if it ever does, the change is made here on purpose.
-        RunVerdict::Allow => {}
-    }
+    };
     s.running.set(true);
     s.error.set(None);
     s.done.set(None);
     s.progress.set(None);
     let opened = s.generation.get_untracked();
-    let name = file_name(&path);
     (ui.schema_actions.script_run)(
-        ScriptRequest {
-            path,
-            conn_id: target.conn_id,
-            database: target.database.clone(),
-            dialect: target.dialect,
-        },
+        request,
         Rc::new(move |outcome| {
             // Closing does not stop the run, so by the time it reports the modal
             // may be open on another database.
@@ -220,10 +219,18 @@ fn run_script(ui: Ui) {
                 // transactional unless the file said so, so a stopped run has
                 // very often changed the database — and the number of statements
                 // that landed is the only thing that says how much.
+                //
+                // **Both stopping arms carry the same durability sentence**, and
+                // that is the fix: the cancel arm hedged ("unless the file
+                // opened its own transaction") and the failure arm said nothing
+                // at all, though the app has known the answer since the probe.
+                // A dump written under *Replaying → One transaction* rolls the
+                // whole run back, and a user who edits the file to skip the
+                // first N and re-runs loses all N.
                 RunOutcome::Cancelled { ran } => s.error.set(Some(format!(
-                    "Stopped after {ran} {}. Any statement that already ran is still applied \
-                     unless {name} opened its own transaction.",
-                    schemaic_core::text::plural(ran, "statement", "statements")
+                    "Stopped after {ran} {}. {}",
+                    schemaic_core::text::plural(ran, "statement", "statements"),
+                    durability_sentence(s.probe.get_untracked().as_ref(), &name),
                 ))),
                 RunOutcome::Failed { message, ran, at } => {
                     let where_ = match at {
@@ -233,13 +240,34 @@ fn run_script(ui: Ui) {
                         None => String::new(),
                     };
                     s.error.set(Some(format!(
-                        "Failed{where_}: {message} — {ran} {} ran before it.",
-                        schemaic_core::text::plural(ran, "statement", "statements")
+                        "Failed{where_}: {message} — {ran} {} ran before it. {}",
+                        schemaic_core::text::plural(ran, "statement", "statements"),
+                        durability_sentence(s.probe.get_untracked().as_ref(), &name),
                     )))
                 }
             }
         }),
     );
+}
+
+/// What a part-way stop left behind, in one sentence both stopping arms use.
+///
+/// The decision is `script::durability`; this is only its words, so the two
+/// reports cannot say different things about the same fact.
+fn durability_sentence(probe: Option<&Probe>, name: &str) -> String {
+    match schemaic_core::script::durability(probe) {
+        Durability::RolledBack => format!(
+            "{name} opened its own transaction, so the server rolled the whole run back — \
+             nothing was applied, including the statements that succeeded."
+        ),
+        Durability::Applied => {
+            format!("{name} opened no transaction, so every statement that ran is still applied.")
+        }
+        Durability::Unknown => format!(
+            "Any statement that already ran is still applied unless {name} opened its own \
+             transaction."
+        ),
+    }
 }
 
 fn file_name(path: &std::path::Path) -> String {
@@ -410,10 +438,25 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
             // The file row, in the table-import modal's shape: the button first,
             // what is chosen to its right. One spelling of "pick a file", so the
             // two Imports do not look like two features.
+            // Dimmed while a run goes, in the shape a disabled control takes
+            // everywhere else here — it keeps its place rather than
+            // disappearing, so the row does not move. The refusal itself is in
+            // `pick_file`; this is only what it looks like.
             let pick_ui = ui.clone();
-            let pick = control_button("Choose file…", ring.clone(), TAB_PICK, move || {
-                pick_file(pick_ui.clone())
-            });
+            let pick_ring = ring.clone();
+            let pick = dyn_container(
+                move || s.running.get(),
+                move |running| {
+                    let pick_ui = pick_ui.clone();
+                    crate::widgets::control_button_enabled(
+                        "Choose file…",
+                        !running,
+                        pick_ring.clone(),
+                        TAB_PICK,
+                        move || pick_file(pick_ui.clone()),
+                    )
+                },
+            );
             let chosen = dyn_container(
                 move || (s.path.get(), s.probing.get()),
                 |(path, probing)| match (path, probing) {
@@ -453,11 +496,25 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
                 // run is scoped to the connection, not to the database, and
                 // nothing here can confine it: the statements name their own
                 // targets. Saying so is the only honest option.
-                form_hint(
-                    "The script may create and select a different database from the one you're \
-                     importing into. It may also create more than one database. Check the script \
-                     to make sure it does what you expect.",
-                ),
+                form_hint(match target.schema.as_deref() {
+                    // **Namespaces get their own sentence, because the run does
+                    // not enter one.** Opened from a PostgreSQL schema node, the
+                    // run still uses the server's `search_path`, so an
+                    // unqualified `CREATE TABLE` lands in `public` — measured.
+                    // The hint used to speak only of databases, under a title
+                    // that named the namespace as though it were the scope.
+                    Some(ns) => format!(
+                        "The script may create and select a different database from the one \
+                         you're importing into. It may also create more than one database. \
+                         Opening this from {ns} does not put the script in it either: anything \
+                         the file does not qualify goes wherever the server's search_path says. \
+                         Check the script to make sure it does what you expect."
+                    ),
+                    None => "The script may create and select a different database from the one \
+                             you're importing into. It may also create more than one database. \
+                             Check the script to make sure it does what you expect."
+                        .to_string(),
+                }),
                 form_separator(theme::scaled(16.0)),
                 dyn_container(
                     move || s.probe.get(),
@@ -590,10 +647,14 @@ pub(crate) fn script_overlay(ui: Ui) -> impl IntoView {
             .style(|st| st.width_full());
 
             let close_x: Rc<dyn Fn()> = exit_x.clone();
-            let title = match target.schema.as_deref() {
-                Some(ns) => format!("Import into {}.{ns}", target.database),
-                None => format!("Import into {}", target.database),
-            };
+            // **The database only, never `db.namespace`.** The title used to
+            // name the schema the entry was opened on, which reads as scope and
+            // is not: the run uses the server's own `search_path`, so measured
+            // on PG 16.15 an unqualified `CREATE TABLE` under a title saying
+            // *"Import into schemaic.sales"* landed in `public`. Which node was
+            // right-clicked is said in the hint below instead, where it can be
+            // said truthfully.
+            let title = format!("Import into {}", target.database);
             let panel = v_stack((
                 modal_title_owned(title, close_x, ring.clone()),
                 autohide(scroll(body.style(|st| {

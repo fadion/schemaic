@@ -862,6 +862,41 @@ pub fn trim_range(sql: &str, lo: usize, hi: usize) -> (usize, usize) {
     (lo, hi)
 }
 
+/// The statement containing `offset`, **as the text to send to a server** — or
+/// `None` when there is nothing runnable there.
+///
+/// [`statement_range`]'s segment put through [`executable_range`], which is the
+/// third executing path and the one that was left behind. Run Everything and
+/// the script runner were wired to `executable_statements`/`executable_range`;
+/// **Run Current** still sliced `statement_range` and sent the result, so a
+/// caret inside a trigger sent `…END$$` — which MySQL lexes as one identifier —
+/// and a caret on the `DELIMITER $$` line sent the client directive itself.
+///
+/// Deliberately a *new* function rather than a change to `statement_range`:
+/// that one has fifteen call sites and only this one may change behaviour. A
+/// range keeps its terminator because the editor selects and highlights with
+/// it; only the path that executes wants it off.
+pub fn executable_at(sql: &str, offset: usize, dialect: SqlDialect) -> Option<&str> {
+    let offset = offset.min(sql.len());
+    let mut delim: Vec<u8> = vec![b';'];
+    let mut bounds = scan_bounds(sql, dialect, &mut delim, true);
+    bounds.push(Bound {
+        at: sql.len(),
+        strip: 0,
+    });
+    let mut k = 0;
+    for (w, b) in bounds.iter().enumerate().take(bounds.len() - 1) {
+        if b.at <= offset {
+            k = w;
+        }
+    }
+    // The same fallback `statement_range` makes: a caret sitting after the
+    // final `;` is in a blank segment and means the statement before it.
+    let (lo, hi) = trim_range(sql, bounds[k].at, bounds[k + 1].at);
+    let k = if lo == hi && k > 0 { k - 1 } else { k };
+    executable_range(sql, bounds[k].at, bounds[k + 1], dialect)
+}
+
 /// The trimmed byte range of the statement containing `offset`.
 pub fn statement_range(sql: &str, offset: usize, dialect: SqlDialect) -> (usize, usize) {
     let offset = offset.min(sql.len());
@@ -2234,6 +2269,96 @@ mod tests {
     fn a_delimiter_is_stripped_along_with_the_space_before_it() {
         let stmts = super::executable_statements("DELIMITER $$\nSELECT 1 $$\n", SqlDialect::MySql);
         assert_eq!(stmts, vec!["SELECT 1".to_string()]);
+    }
+
+    /// **The third executing path, which the fix above missed.** Run Everything
+    /// and the script runner were wired to `executable_statements`; *Run
+    /// Current* still sliced `statement_range` and sent that, so a caret inside
+    /// a trigger sent `…END$$` and a caret on the directive line sent
+    /// `DELIMITER $$` itself.
+    ///
+    /// Asserted against `executable_statements` for the same file, so the two
+    /// paths cannot answer differently — which is the property that was broken,
+    /// not either function on its own.
+    #[test]
+    fn running_the_statement_under_the_caret_sends_what_run_everything_would() {
+        let s = "DELIMITER $$\n\
+                 CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW\n\
+                 BEGIN\n  SET NEW.a = 1;\nEND$$\n\
+                 DELIMITER ;\n\
+                 UPDATE t SET a = 3;\n";
+        let whole = super::executable_statements(s, SqlDialect::MySql);
+        assert_eq!(whole.len(), 2, "{whole:?}");
+
+        // A caret anywhere in the trigger body sends the trigger, without the
+        // client's terminator on it.
+        let body = s.find("SET NEW.a").expect("fixture");
+        assert_eq!(
+            super::executable_at(s, body, SqlDialect::MySql),
+            Some(whole[0].as_str())
+        );
+
+        // A caret on the `DELIMITER` line itself has nothing to run — the
+        // directive is the client's, and it used to be sent to the server.
+        assert_eq!(super::executable_at(s, 2, SqlDialect::MySql), None);
+
+        // **What the old spelling did**, pinned so that "simplifying"
+        // `executable_at` back to a slice of `statement_range` fails here
+        // rather than at a server. This is the assertion that would have been
+        // red: it is exactly what *Run Current* sent.
+        let (lo, hi) = super::statement_range(s, body, SqlDialect::MySql);
+        assert!(
+            s[lo..hi].ends_with("END$$"),
+            "the range is right to highlight and wrong to send: {:?}",
+            &s[lo..hi]
+        );
+        let (lo, hi) = super::statement_range(s, 2, SqlDialect::MySql);
+        assert_eq!(
+            &s[lo..hi],
+            "DELIMITER $$",
+            "and on the directive line it is the directive"
+        );
+
+        // And every caret position in the file agrees with one of the two, or
+        // with nothing.
+        for at in 0..=s.len() {
+            if !s.is_char_boundary(at) {
+                continue;
+            }
+            match super::executable_at(s, at, SqlDialect::MySql) {
+                None => {}
+                Some(got) => assert!(
+                    whole.iter().any(|w| w == got),
+                    "at {at}: Run Current would send {got:?}, which Run Everything never sends"
+                ),
+            }
+        }
+    }
+
+    /// The ordinary case is unchanged: one statement in, the same statement
+    /// out, terminator included — and a caret past the last `;` still means the
+    /// statement before it, as `statement_range` has always answered.
+    #[test]
+    fn the_caret_picks_the_statement_it_is_in_and_falls_back_to_the_one_before() {
+        let s = "SELECT 1;\nSELECT 2;\n";
+        assert_eq!(
+            super::executable_at(s, 3, SqlDialect::MySql),
+            Some("SELECT 1;")
+        );
+        assert_eq!(
+            super::executable_at(s, 13, SqlDialect::MySql),
+            Some("SELECT 2;")
+        );
+        assert_eq!(
+            super::executable_at(s, s.len(), SqlDialect::MySql),
+            Some("SELECT 2;"),
+            "a caret after the final terminator means the statement before it"
+        );
+        assert_eq!(super::executable_at("   \n", 0, SqlDialect::MySql), None);
+        assert_eq!(
+            super::executable_at("-- just a comment\n", 4, SqlDialect::MySql),
+            None
+        );
     }
 
     /// The other two engines have no client delimiter at all, so nothing is ever

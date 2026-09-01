@@ -52,7 +52,7 @@ pub(crate) async fn run(
 ) -> RunOutcome {
     let (tx, rx) = tokio::sync::mpsc::channel(SCRIPT_QUEUE);
     let reader = {
-        let (path, dialect, token) = (req.path.clone(), req.dialect, token.clone());
+        let (path, dialect, token) = (req.path().to_path_buf(), req.dialect(), token.clone());
         tokio::task::spawn_blocking(move || read(path, dialect, tx, token, progress))
     };
 
@@ -60,7 +60,7 @@ pub(crate) async fn run(
     // whether that is the end of the file, a cancel or a disk error — and the
     // reader ends when the executor drops `rx`, which is what a refused
     // statement does.
-    let (exec_end, ran) = db.run_script(&req.database, rx, token).await;
+    let (exec_end, ran) = db.run_script(req.database(), rx, token).await;
     let read_end = reader.await.unwrap_or_else(|e| {
         // A panicked or aborted reader is a failure of ours, not of the file's,
         // and saying so beats reporting a clean end of stream.
