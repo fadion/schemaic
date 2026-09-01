@@ -7,8 +7,14 @@ Neon/Supabase/RDS instance gives you exactly one case: the happy path with a
 public CA. It cannot serve you an expired certificate or a hostname mismatch
 because you asked it to.
 
-Nothing here is a secret: the CA, the keys and the test users are throwaway,
-generated locally, and never leave the machine.
+Nothing here is a secret: the CA, the keys and the test accounts are throwaway,
+generated locally, and never leave the machine. **They are still credentials.**
+The password below is printed in this file, so the accounts are created for
+`localhost`/`127.0.0.1` only and granted rights on one sandbox database — not,
+as they once were, at host `%` with `ALL PRIVILEGES ON *.*` on a server whose
+`bind_address` is `0.0.0.0`. `client.key` is `0600` like every other key here;
+the copies made for a Windows app are chowned to you. Teardown drops the
+accounts and removes the copies.
 
 ## Install
 
@@ -137,10 +143,23 @@ whether the bug is in our option mapping or in the server configuration.
 
     sudo bash setup-tls-testbed.sh --teardown
 
-Removes the certificates, both drop-in config files, the `/etc/hosts` entry, and
-restores `pg_hba.conf` from its backup. Postgres falls back to its packaged
-certificate; MariaDB/MySQL goes back to plaintext. The test users are left
-alone — drop them by hand if you want them gone.
+Removes, in full:
+
+- the certificate directory (`/etc/schemaic-tls` by default);
+- both drop-in config files, so Postgres falls back to its packaged certificate
+  and MariaDB/MySQL goes back to plaintext;
+- `/etc/mysql/ssl`, **restored from the snapshot setup takes** if that directory
+  already held anything — setup writes over `{ca,server}.{crt,key}` there;
+- `pg_hba.conf`, restored from its backup;
+- the `/etc/hosts` entry;
+- the MariaDB/MySQL accounts `schemaic_ssl` and `schemaic_x509`, and their
+  sandbox database — they authenticate with a password this file prints, so
+  leaving them behind is not a tidiness question;
+- the client copies written into the Windows profile, `client.key` included.
+
+PostgreSQL's test roles are left alone — drop them by hand if you want them
+gone. (`cert` auth matches a role name against the certificate CN, so they carry
+no password.)
 
 ## What this cannot cover
 

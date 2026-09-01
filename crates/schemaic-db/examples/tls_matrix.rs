@@ -23,6 +23,26 @@
 //! | `TLS_USER` / `TLS_PASSWORD` | `schemaic` / `schemaic` |
 //! | `TLS_MYSQL_PORT` / `TLS_PG_PORT` | `3306` / `5432` (`0` skips the engine) |
 //! | `TLS_DATABASE` | unset — probe for a maintenance database |
+//! | `TLS_CLIENT_CERT` / `TLS_CLIENT_KEY` | unset — no client certificate |
+//!
+//! **Every cell that connects says which transport it got**, not just that it
+//! got in: `TLS (TLSv1.3)` or `PLAINTEXT`, asked of the server after the ping
+//! (`Ssl_cipher` on MySQL, `pg_stat_ssl` on PostgreSQL). Printing "connected"
+//! for both is what made this harness report MySQL's `prefer` falling back to
+//! plaintext after a *wrong password* as a pass — and it is the one live
+//! instrument in the repository, so nothing else in the TLS group could be
+//! verified while it could not tell the two apart.
+//!
+//! **`TLS_WRONG_CA` has no silent default.** It used to be derived by rewriting
+//! `ca.crt` in `TLS_CA`, which is a no-op for any other file name and yields
+//! the empty string under the documented `TLS_CA=os` — so column B became
+//! column A and the negative control vanished while the matrix read clean. It
+//! is now refused loudly instead.
+//!
+//! **Set `TLS_CLIENT_CERT`/`TLS_CLIENT_KEY` to exercise mutual TLS.** Without
+//! them the test-bed's `schemaic_x509` account and `--pg-clientcert` are
+//! exercised by nothing, which is why a DER client certificate silently passing
+//! the preflight went unobserved.
 //!
 //! **Set `TLS_DATABASE` against a hosted provider.** Without it the check is a
 //! ping, and a Postgres ping has to reach *some* database, so it tries
@@ -81,6 +101,43 @@ fn port(key: &str, fallback: u16) -> u16 {
         .unwrap_or(fallback)
 }
 
+/// **Whether the connection that just succeeded is actually encrypted.**
+///
+/// A ping answers "the server let me in", and the harness printed that same
+/// word for a plaintext connection and a TLS one — in the nine cells the
+/// README's matrix distinguishes. It would have reported MySQL's `prefer`
+/// falling back to plaintext after a wrong password as a pass, which is the
+/// defect that made every other cell here unverifiable.
+///
+/// One extra round trip per successful cell, asking each engine its own way.
+async fn transport(db: &Db, engine: &str) -> String {
+    let sql = match engine {
+        "PostgreSQL" => {
+            "SELECT ssl::text || coalesce(' ' || version, '')              FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+        }
+        _ => "SHOW STATUS LIKE 'Ssl_cipher'",
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let Ok(rs) = db.fetch_query(None, sql, 1, cancel).await else {
+        // The handshake is what the table is about; a server that let us in and
+        // then refused this query is still a connection worth reporting.
+        return "connected (transport unknown)".to_string();
+    };
+    // MySQL answers a two-column `Variable_name / Value` row; PostgreSQL a
+    // single column. The last cell of the first row is the answer either way.
+    let last = rs.columns.len().saturating_sub(1);
+    let answer = rs
+        .cell(0, last)
+        .map(|c| c.text().to_string())
+        .unwrap_or_default();
+    match answer.trim() {
+        // MySQL leaves `Ssl_cipher` empty on a plaintext session; PostgreSQL
+        // says `false`.
+        "" | "false" | "f" => "PLAINTEXT".to_string(),
+        other => format!("TLS ({other})"),
+    }
+}
+
 fn connection(db_type: &str, host: &str, port: u16, tls: Tls) -> Connection {
     Connection {
         id: 1,
@@ -118,7 +175,45 @@ async fn main() {
 
     let host = env("TLS_HOST", "schemaic-tls.test");
     let ca = ca_setting("TLS_CA", "/etc/schemaic-tls/ca.crt");
-    let wrong_ca = ca_setting("TLS_WRONG_CA", &ca.replace("ca.crt", "otherca.crt"));
+    // **The derived default collapses, and it has to say so.** `ca.replace(…)`
+    // is a no-op whenever `TLS_CA` is not literally named `ca.crt` — including
+    // under the README's own documented `TLS_CA=os`, where it yields the empty
+    // string. Column B then *is* column A, the negative control disappears, and
+    // the matrix reads clean. Refusing loudly is the only honest answer: a
+    // harness whose control silently vanishes is worse than no harness.
+    let wrong_ca = match std::env::var("TLS_WRONG_CA") {
+        Ok(_) => ca_setting("TLS_WRONG_CA", ""),
+        Err(_) if ca.contains("ca.crt") => ca.replace("ca.crt", "otherca.crt"),
+        Err(_) => {
+            eprintln!(
+                "TLS_WRONG_CA has no default here: it is derived by rewriting `ca.crt` in                  TLS_CA ({}), which does not contain it. Set TLS_WRONG_CA to a CA that did                  NOT sign this server (or to `os`) — without it column B is column A and the                  matrix proves nothing.",
+                ca_label(&ca)
+            );
+            std::process::exit(2);
+        }
+    };
+    if wrong_ca == ca {
+        eprintln!(
+            "TLS_WRONG_CA and TLS_CA are the same setting ({}), so column B is column A and              the negative control is gone.",
+            ca_label(&ca)
+        );
+        std::process::exit(2);
+    }
+
+    // The mutual-TLS arm. Unset by default, because most servers do not ask for
+    // a client certificate — but with no way to set it at all, the matrix's
+    // mutual-TLS row, `scripts/tls-testbed`'s `schemaic_x509` account and
+    // `--pg-clientcert` were exercised by nothing. That is why `read_certs`
+    // passing a DER file went unnoticed.
+    let client_cert = env("TLS_CLIENT_CERT", "");
+    let client_key = env("TLS_CLIENT_KEY", "");
+    if client_cert.is_empty() != client_key.is_empty() {
+        eprintln!("TLS_CLIENT_CERT and TLS_CLIENT_KEY are set together or not at all.");
+        std::process::exit(2);
+    }
+    if !client_cert.is_empty() {
+        println!("client certificate = {client_cert}");
+    }
 
     let database = std::env::var("TLS_DATABASE").ok().filter(|d| !d.is_empty());
 
@@ -145,6 +240,8 @@ async fn main() {
                 let tls = Tls {
                     mode,
                     ca_path: ca_path.clone(),
+                    client_cert_path: client_cert.clone(),
+                    client_key_path: client_key.clone(),
                     ..Tls::default()
                 };
                 // `TLS_DATABASE` reaches this through the connection's own
@@ -152,7 +249,7 @@ async fn main() {
                 // the app does rather than a shortcut around it.
                 let db = Db::connect(&connection(engine, &host, port, tls), None);
                 cells.push(match db.ping(Duration::from_secs(5)).await {
-                    Ok(()) => "connected".to_string(),
+                    Ok(()) => transport(&db, engine).await,
                     Err(e) => format!("refused ({e})"),
                 });
             }
