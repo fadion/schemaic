@@ -31,6 +31,8 @@ mod endpoint;
 mod runtime;
 mod scratch;
 mod suite;
+mod triggers;
+mod views;
 mod writeback;
 
 /// Expand each named [`suite`] function into one test per server.
@@ -109,6 +111,19 @@ live_suite!(
         a_manual_transaction_is_invisible_until_it_commits,
         a_rolled_back_manual_transaction_leaves_nothing,
         a_cancelled_query_stops_at_the_server,
+    ],
+    views: [
+        an_introspected_view_diffs_to_nothing_against_its_own_draft,
+        an_edited_view_body_lands_and_settles,
+        a_renamed_view_lands_under_the_new_name,
+        a_view_is_introspected_as_a_view,
+        a_view_is_never_writable_through_a_key_that_does_not_identify_a_row,
+    ],
+    triggers: [
+        an_introspected_trigger_diffs_to_nothing_against_its_own_draft,
+        an_added_trigger_lands_and_fires,
+        a_dropped_trigger_stops_firing,
+        a_renamed_trigger_still_fires,
     ],
     writeback: [
         a_staged_update_writes_exactly_the_row_it_names,
