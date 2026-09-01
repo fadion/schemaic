@@ -646,16 +646,25 @@ fn field_view(
 /// then the list of things you could have typed. It was the one clickable
 /// control in either modal Tab couldn't reach, which left the curated type list
 /// needing a pointer.
-// `use<>`: the view captures only the two `Copy` overlay signals, not the `&Ui`
-// it read them off, so it can outlive the borrow and be returned from a form
-// builder that took `ui` by reference.
-pub(crate) fn suggest_chevron(
+///
+/// **`options` is a closure, read when the chevron is *pressed*.** Two of the
+/// three callers hand over a constant list and could have passed a `Vec`; the
+/// third — the database editor's Owner field — offers the server's roles, which
+/// arrive from a fetch *after* the form is built. Reading the list at press time
+/// is what lets that land with no rebuild: rebuilding the row when the reply
+/// came would tear down the field the user may be typing in, which is the hazard
+/// `object_editor`'s module comment states.
+// `use<F>`: the view captures the options closure and nothing else — in
+// particular not the `&Ui` it read the two `Copy` overlay signals off, so it can
+// outlive that borrow and be returned from a form builder that took `ui` by
+// reference. `F` has to be named for that list to be writable at all.
+pub(crate) fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
     ui: &Ui,
     sig: RwSignal<String>,
-    options: Vec<String>,
+    options: F,
     ring: FocusRing,
     tabindex: u32,
-) -> impl IntoView + use<> {
+) -> impl IntoView + use<F> {
     let popup = ui.overlay.popup_menu;
     let anchor = ui.overlay.popup_anchor;
     // **The chevron's own id, so the menu can open under the chevron.** The
@@ -696,14 +705,23 @@ pub(crate) fn suggest_chevron(
             popup.set(None);
             return;
         }
+        // **Nothing to suggest, nothing to open.** `popup_menu_overlay` builds a
+        // panel for any `Some`, and an empty entry list is still a panel: its
+        // height sums to the padding and border alone and its measured width is
+        // zero, so it clamps to the 170px `popup_width` floor and draws an empty
+        // bordered box at the chevron that then eats the click meant to dismiss
+        // it. Unreachable while every caller passed a constant list; the Owner
+        // field's roles arrive from a fetch, and are empty until it lands and
+        // for good if it fails.
+        let entries = options();
+        if entries.is_empty() {
+            return;
+        }
         anchor.set(here);
         popup.set(Some(
-            options
-                .iter()
-                .map(|o| {
-                    let o = o.clone();
-                    MenuEntry::action(o.clone(), move || sig.set(o.clone()))
-                })
+            entries
+                .into_iter()
+                .map(|o| MenuEntry::action(o.clone(), move || sig.set(o.clone())))
                 .collect(),
         ));
     });
@@ -753,7 +771,7 @@ fn bound_field_with_menu(
     let sig = bound_signal(ui, initial, apply);
     h_stack((
         field_view(sig, width, placeholder, mono, ring.clone(), tabindex),
-        suggest_chevron(ui, sig, options, ring, tabindex + 1),
+        suggest_chevron(ui, sig, move || options.clone(), ring, tabindex + 1),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
     .into_any()

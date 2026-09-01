@@ -90,6 +90,31 @@ fn find_top() -> f64 {
     theme::scaled(80.0)
 }
 
+/// The question a container's **Drop** confirm asks, built from the change's own
+/// [`schemaic_core::ddl::Change::risks`] so the confirm and the DDL preview's
+/// warning block cannot drift into saying different things about the same act.
+///
+/// **The fallback is the point of the function.** `risks()` returning empty —
+/// an arm emptied by a later edit — would otherwise render a confirm titled
+/// `Drop database` with a *blank body*: an irreversible action asked with no
+/// question, and the exact shape of the bug
+/// `dropping_an_event_is_destructive_and_says_why` was written to catch one
+/// level down. The unit tests pin `risks()` in isolation; this is the seam
+/// between it and the modal, which is where CLAUDE.md says these bugs live.
+pub(crate) fn container_drop_prompt(
+    change: &schemaic_core::ddl::Change,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> String {
+    let risks = change.risks(dialect);
+    if risks.is_empty() {
+        // Never reached while the arms are populated, and never a blank modal
+        // if they aren't. It names the change so the question is still about
+        // something even in the degenerate case.
+        return format!("{}. This cannot be undone.", change.summary());
+    }
+    risks.join(" ")
+}
+
 /// Is the active connection read-only? Every schema-editing menu entry asks,
 /// because a write it can't perform is shown dimmed rather than hidden — a
 /// missing item reads as "not supported", a dimmed one as "not here".
@@ -145,6 +170,18 @@ fn create_submenu(
                 CreateKind::Object(kind) => {
                     crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
                 }
+                // A database is made *beside* this node, so it takes no database
+                // — see `DatabaseTarget::database`. A namespace is made inside
+                // the one the menu was raised on, and never inside `ns`: a
+                // namespace does not nest.
+                CreateKind::Database => {
+                    crate::database_editor::open_for_new(&ui, crate::ContainerKind::Database, None)
+                }
+                CreateKind::Schema => crate::database_editor::open_for_new(
+                    &ui,
+                    crate::ContainerKind::Schema,
+                    Some(&db),
+                ),
             })
             .disabled(e.disabled)
         })
@@ -322,6 +359,17 @@ pub(crate) enum CreateKind {
     Table,
     View,
     Object(schemaic_core::ddl::ObjectKind),
+    /// A whole database. **The one entry here that does not make a child of the
+    /// node the menu was raised on** — it makes a sibling of the database, or on
+    /// a namespace node something two levels up. It is offered anyway, from both
+    /// nodes and identically, because the alternative is a per-node rule about
+    /// which containers a given row may make, and the label already says exactly
+    /// what it makes. The SCHEMA gear carries the same entry for the case where
+    /// the tree has no row worth right-clicking.
+    Database,
+    /// A namespace inside the database the menu was raised on — PostgreSQL's
+    /// alone (`ddl::supports_namespace_editing`).
+    Schema,
 }
 
 /// One Create entry as data: its label, what it opens, and whether it is inert.
@@ -404,6 +452,28 @@ pub(crate) fn create_children(
         out.push(CreateEntry {
             label: "Event",
             kind: CreateKind::Object(ObjectKind::Event),
+            disabled: read_only,
+        });
+    }
+    // **The containers, last.** Everything above makes something *inside* the
+    // node the menu was raised on; these two make the node's own kind or the one
+    // above it, so they sit at the end rather than interleaved with the objects.
+    //
+    // Two capabilities, not one, and this is the pair that makes the distinction
+    // visible: on MySQL `Database` is offered and `Schema` is not, because there
+    // `CREATE SCHEMA` is a synonym for `CREATE DATABASE` and an entry named for
+    // the smaller thing would quietly make the larger one.
+    if schemaic_core::ddl::supports_database_editing(dialect) {
+        out.push(CreateEntry {
+            label: "Database",
+            kind: CreateKind::Database,
+            disabled: read_only,
+        });
+    }
+    if schemaic_core::ddl::supports_namespace_editing(dialect) {
+        out.push(CreateEntry {
+            label: "Schema",
+            kind: CreateKind::Schema,
             disabled: read_only,
         });
     }
@@ -966,6 +1036,50 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             // persisted, so a MySQL connection comes back to whatever it was left at.
             let mut items: Vec<floem::AnyView> =
                 vec![refresh_item.into_any(), collapse_item.into_any()];
+
+            // **`Create database` lives here because the tree has no reliable
+            // blank space to right-click.** Every other create hangs off the row
+            // it makes a child of; this one makes a *sibling* of every row, and
+            // on a connection with more than a screenful of databases there is
+            // no empty tree left to raise a menu on — which is exactly the
+            // connection where a new database is worth making. This menu is
+            // already the one that acts on the whole tree (Refresh, Collapse
+            // all), so it is where an action about the connection belongs. The
+            // schema tree's `Create ▸` submenu carries the same entry for
+            // whoever looks there first.
+            //
+            // Absent where the engine has no such statement, and **dimmed** on a
+            // read-only connection — the two different answers the rest of the
+            // app gives, for the two different reasons it gives them.
+            if schemaic_core::ddl::supports_database_editing(
+                crate::table_designer::edit_ctx(&ui).dialect,
+            ) {
+                let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn);
+                let create_ui = ui.clone();
+                items.push(
+                    container(text("Create database").style(move |s| {
+                        s.color(if read_only {
+                            theme::text_faint()
+                        } else {
+                            theme::text()
+                        })
+                    }))
+                    .on_click_stop(move |_| {
+                        open.set(false);
+                        // The read-only refusal is inside `open_for_new`, so
+                        // every home of this action is guarded by construction —
+                        // see it for why the guard moved off the four call sites.
+                        crate::database_editor::open_for_new(
+                            &create_ui,
+                            crate::ContainerKind::Database,
+                            None,
+                        );
+                    })
+                    .style(menu_item_style)
+                    .style(|s| s.padding_vert(theme::scaled(8.0)))
+                    .into_any(),
+                );
+            }
             if schemaic_core::stats::supports_table_stats(
                 crate::table_designer::edit_ctx(&ui).dialect,
             ) {
@@ -1247,6 +1361,53 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             conn_read_only(&connections, active_conn),
                         ));
                     }
+                    // **Last, like every other Drop** — the row a right-click
+                    // must not land the cursor on. This is the largest one in
+                    // the app: everything the other five can drop, at once.
+                    //
+                    // Absent rather than dimmed where the engine has no such
+                    // statement (SQLite, where a database is a file), the same
+                    // call the Create entries above make.
+                    if schemaic_core::ddl::supports_database_editing(
+                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                    ) {
+                        let ui = import_ui.clone();
+                        let confirm = ui.overlay.confirm;
+                        let db = menu.name.clone();
+                        entries.push(
+                            MenuEntry::action_colored("Drop", theme::error, move || {
+                                let (ui, db) = (ui.clone(), db.clone());
+                                confirm.set(Some(crate::Confirm {
+                                    title: "Drop database".to_string(),
+                                    // The plain-language cost is the change's
+                                    // own (`Change::risks`), so this question
+                                    // and the preview's warning cannot drift
+                                    // into saying different things about the
+                                    // same act — and the preview still stands
+                                    // between the answer and the server.
+                                    message: container_drop_prompt(
+                                        &schemaic_core::ddl::Change::DropDatabase {
+                                            name: db.clone(),
+                                        },
+                                        crate::table_designer::edit_ctx(&ui).dialect,
+                                    ),
+                                    resolve: Rc::new(move |yes| {
+                                        if yes {
+                                            crate::ddl_preview::preview_container(
+                                                &ui,
+                                                &db,
+                                                &db,
+                                                schemaic_core::ddl::Change::DropDatabase {
+                                                    name: db.clone(),
+                                                },
+                                            );
+                                        }
+                                    }),
+                                }));
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
+                    }
                 }
                 // One of PostgreSQL's standalone objects. Deliberately the same
                 // shape as the table menu — copy, DDL, refresh, then the writing
@@ -1443,6 +1604,45 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         Some(&menu.name),
                         conn_read_only(&connections, active_conn),
                     ));
+                    // Last, like every other Drop. Unlike the database node's,
+                    // this one cannot silently destroy: Schemaic never sends
+                    // `CASCADE`, so a namespace that still holds anything is
+                    // refused by the server — which is what the risk sentence
+                    // this confirm borrows actually says.
+                    if schemaic_core::ddl::supports_namespace_editing(
+                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                    ) {
+                        let ui = import_ui.clone();
+                        let confirm = ui.overlay.confirm;
+                        let (db, ns) = (database.clone(), menu.name.clone());
+                        entries.push(
+                            MenuEntry::action_colored("Drop", theme::error, move || {
+                                let (ui, db, ns) = (ui.clone(), db.clone(), ns.clone());
+                                confirm.set(Some(crate::Confirm {
+                                    title: "Drop schema".to_string(),
+                                    message: container_drop_prompt(
+                                        &schemaic_core::ddl::Change::DropSchema {
+                                            name: ns.clone(),
+                                        },
+                                        crate::table_designer::edit_ctx(&ui).dialect,
+                                    ),
+                                    resolve: Rc::new(move |yes| {
+                                        if yes {
+                                            crate::ddl_preview::preview_container(
+                                                &ui,
+                                                &db,
+                                                &ns,
+                                                schemaic_core::ddl::Change::DropSchema {
+                                                    name: ns.clone(),
+                                                },
+                                            );
+                                        }
+                                    }),
+                                }));
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
+                    }
                 }
                 // A `Types`/`Domains`/`Sequences` folder. The menu is about the
                 // set, not the row: a folder has no name worth copying and
@@ -5090,7 +5290,7 @@ mod object_menu_tests {
 
 #[cfg(test)]
 mod create_menu_tests {
-    use super::{CreateKind, create_children};
+    use super::{CreateKind, container_drop_prompt, create_children};
     use schemaic_core::ddl::ObjectKind;
     use schemaic_core::intel::SqlDialect;
 
@@ -5110,7 +5310,19 @@ mod create_menu_tests {
     fn mysql_offers_only_what_it_has() {
         assert_eq!(
             labels(SqlDialect::MySql),
-            vec!["Table", "View", "Function", "Procedure", "Event"]
+            vec![
+                "Table",
+                "View",
+                "Function",
+                "Procedure",
+                "Event",
+                // **And no `Schema`.** MySQL's `CREATE SCHEMA` is a synonym for
+                // `CREATE DATABASE`, so an entry named for the smaller thing
+                // would quietly make the larger one — which is the whole reason
+                // `supports_namespace_editing` is a second predicate rather than
+                // part of the first.
+                "Database",
+            ]
         );
     }
 
@@ -5147,7 +5359,11 @@ mod create_menu_tests {
                 "Domain",
                 "Sequence",
                 "Function",
-                "Procedure"
+                "Procedure",
+                // The containers last — everything above makes something inside
+                // the node the menu was raised on, and these two do not.
+                "Database",
+                "Schema",
             ]
         );
         let kinds: Vec<CreateKind> = create_children(SqlDialect::Postgres, false)
@@ -5164,8 +5380,71 @@ mod create_menu_tests {
                 CreateKind::Object(ObjectKind::Sequence),
                 CreateKind::Object(ObjectKind::Function),
                 CreateKind::Object(ObjectKind::Procedure),
+                CreateKind::Database,
+                CreateKind::Schema,
             ]
         );
+    }
+
+    /// **PostgreSQL is the only engine offered both**, and the pair is what the
+    /// two capabilities are for: on MySQL a `Schema` entry would make a
+    /// database, and on SQLite neither exists at all — a database there is a
+    /// file, which is the connection form's business and not a DDL preview's.
+    #[test]
+    fn only_postgres_is_offered_a_namespace() {
+        assert!(labels(SqlDialect::Postgres).contains(&"Schema"));
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            assert!(!labels(d).contains(&"Schema"), "{d:?}");
+        }
+        assert!(labels(SqlDialect::MySql).contains(&"Database"));
+        assert!(!labels(SqlDialect::Sqlite).contains(&"Database"));
+    }
+
+    /// **The seam, not the pure function.** `dropping_a_database_is_destructive_
+    /// and_names_it` over in `core::ddl` pins `risks()` in isolation and would
+    /// pass just as happily if the modal never showed it. This is what the
+    /// confirm actually renders: for both container drops it must name the
+    /// object and must not be blank, whatever `risks()` does.
+    #[test]
+    fn a_container_drop_confirm_is_never_a_blank_question() {
+        use schemaic_core::ddl::Change;
+        for (change, name) in [
+            (
+                Change::DropDatabase {
+                    name: "shop".into(),
+                },
+                "shop",
+            ),
+            (
+                Change::DropSchema {
+                    name: "sales".into(),
+                },
+                "sales",
+            ),
+        ] {
+            for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+                let msg = container_drop_prompt(&change, d);
+                assert!(!msg.trim().is_empty(), "{change:?} on {d:?} asked nothing");
+                assert!(msg.contains(name), "{msg} does not name {name}");
+            }
+        }
+    }
+
+    /// And the fallback really is a sentence, so an emptied `risks()` arm
+    /// degrades to a question rather than to a modal with no body. Probed
+    /// through a change that has no risks of its own — the same code path a
+    /// future emptied arm would take.
+    #[test]
+    fn a_riskless_change_still_asks_something() {
+        let msg = container_drop_prompt(
+            &schemaic_core::ddl::Change::CreateSchema {
+                name: "sales".into(),
+                owner: None,
+            },
+            SqlDialect::Postgres,
+        );
+        assert!(msg.contains("sales"), "{msg}");
+        assert!(msg.contains("cannot be undone"), "{msg}");
     }
 
     /// The gate that matters if it drifts: every one of these opens an editor
@@ -6068,11 +6347,15 @@ mod menu_order_gate {
                 drops.last().expect("a drop").line
             );
         }
-        // The three read-only menus have nothing to drop; every menu that writes
-        // ends on its Drop.
+        // **Only the folder has nothing to drop.** A `Types`/`Sequences` folder
+        // is structural — it stands for a *set*, not for an object the server
+        // holds — so there is nothing there to drop that dropping each member
+        // would not do. The database and namespace rows used to be in this list
+        // beside it for a quite different reason (the statement had no emitter),
+        // and both now end on their own Drop like every other writing menu.
         assert_eq!(
             dropless,
-            vec!["Database", "Schema", "ObjectGroup"],
+            vec!["ObjectGroup"],
             "which menus carry a Drop has changed"
         );
 
@@ -6138,7 +6421,7 @@ mod menu_order_gate {
             .collect();
         assert_eq!(
             marked.len(),
-            6,
+            8,
             "has the builder or the `theme::error` marking changed? {marked:?}"
         );
         assert!(

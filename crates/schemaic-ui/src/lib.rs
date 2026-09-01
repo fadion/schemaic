@@ -15,6 +15,7 @@ mod connection_form;
 mod connection_import;
 mod consts;
 pub mod contrast;
+mod database_editor;
 mod ddl_preview;
 mod dividers;
 mod dump_view;
@@ -655,6 +656,50 @@ impl ObjectTarget {
     }
 }
 
+/// Which container the database editor is making — a database, or one of
+/// PostgreSQL's namespaces inside one.
+///
+/// Two kinds in one modal because the form is the same form: a name, and an
+/// owner where the engine has owners. They stay distinguishable rather than
+/// being folded into "a container" because the two are **not the same statement
+/// at the same level** — a database is server-level and a namespace is not (see
+/// [`DdlScope`]), and on MySQL the first exists and the second does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContainerKind {
+    Database,
+    Schema,
+}
+
+impl ContainerKind {
+    /// The word the modal title, the confirm and the preview subject all use, so
+    /// one edit changes them together.
+    pub fn label(self) -> &'static str {
+        match self {
+            ContainerKind::Database => "database",
+            ContainerKind::Schema => "schema",
+        }
+    }
+}
+
+/// The database editor's target; doubles as its open flag.
+///
+/// There is no `current`, unlike every other target here: this modal only ever
+/// creates. A container is dropped from its own row's menu and altered from
+/// nowhere — neither engine offers a rename that is safe to perform (see
+/// `ddl::DatabaseDraft`) — so an "edit" state would be a form with nothing to
+/// put in it.
+#[derive(Clone, Debug)]
+pub struct DatabaseTarget {
+    pub conn_id: u64,
+    pub kind: ContainerKind,
+    /// The database a new **namespace** goes in, and what the plan then runs
+    /// against. `None` for [`ContainerKind::Database`], which is server-level
+    /// and has no database to run in — see [`DdlScope::Server`].
+    pub database: Option<String>,
+    pub dialect: SqlDialect,
+    pub read_only: bool,
+}
+
 /// One lazy trigger-function fetch — see `schemaic_db::Db::trigger_functions`.
 ///
 /// A plain code span, not an intra-doc link: this crate doesn't depend on
@@ -674,6 +719,18 @@ pub type TriggerFnDoneFn = Rc<dyn Fn(Vec<schemaic_core::schema::RoutineInfo>)>;
 /// Lazy, not part of the schema fetch: a function body is only needed for the
 /// one being bound or edited — the same call [`ViewAlgoFn`] makes.
 pub type TriggerFnFn = Rc<dyn Fn(TriggerFnRequest, TriggerFnDoneFn)>;
+
+/// Hands the fetched role names back on the UI thread.
+pub type RolesDoneFn = Rc<dyn Fn(Vec<String>)>;
+
+/// Fetches the server's roles off the UI thread — the database editor's Owner
+/// shortcut. Takes only a `conn_id`: roles are cluster-wide, and the caller may
+/// be about to create a database that does not exist yet.
+///
+/// Lazy for the reason [`TriggerFnFn`] is, and **failure is silent by design**:
+/// this feeds a menu beside a field that stays free text, so an empty list
+/// costs a shortcut and never a value.
+pub type RolesFn = Rc<dyn Fn(u64, RolesDoneFn)>;
 
 /// Which section of the designer is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -712,6 +769,10 @@ impl DesignerTab {
 pub struct DdlPreview {
     pub conn_id: u64,
     pub database: String,
+    /// Where this plan runs — see [`DdlScope`]. Carried on the preview so
+    /// `ddl_preview::apply` passes it straight through to the request, rather
+    /// than the app re-deriving it from statements it can only see as strings.
+    pub scope: DdlScope,
     /// What the plan is about, for the title ("orders", or a new table's name).
     pub subject: String,
     /// One plain-language line per change.
@@ -732,10 +793,36 @@ pub struct DdlPreview {
     pub read_only: bool,
 }
 
+/// Where a DDL plan runs, and therefore what has to be re-read afterwards.
+///
+/// **Not a detail of the statements — a property of the plan**, decided by
+/// `schemaic_core::ddl::is_server_level` where the `Change` is still a `Change`.
+/// By the time a plan reaches the app it is a `Vec<String>`, and asking "is this
+/// a `CREATE DATABASE`?" of a string is the hand-rolled scanner the architecture
+/// keeps out of this codebase.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DdlScope {
+    /// Runs **inside** [`DdlRunRequest::database`], in a transaction where the
+    /// engine has one, and that database is re-introspected afterwards. Every
+    /// plan the designer and the object editors build.
+    #[default]
+    Database,
+    /// Runs at the **server** level: `CREATE DATABASE` / `DROP DATABASE`, which
+    /// cannot run on a connection to the database they are about and which
+    /// PostgreSQL refuses inside a transaction. Takes `Db::run_server_ddl`, and
+    /// afterwards the connection's database *list* is what changed — so the
+    /// refresh re-lists rather than re-introspecting a database that may be gone.
+    Server,
+}
+
 /// Run a generated DDL plan against a database.
 pub struct DdlRunRequest {
     pub conn_id: u64,
+    /// The database the plan is about. Under [`DdlScope::Server`] this is the
+    /// database being created or dropped — the one the run must *not* connect
+    /// to — rather than the one it runs on.
     pub database: String,
+    pub scope: DdlScope,
     pub statements: Vec<String>,
 }
 
@@ -893,6 +980,19 @@ pub struct DdlUi {
     /// already moved — the third outcome of the same reply
     /// ([`schemaic_core::ddl::SourceOutcome`]). See `routine_body_stale`.
     pub event_body_stale: RwSignal<bool>,
+    /// The database editor's target; doubles as its open flag. See
+    /// [`DatabaseTarget`] for why it has no "edit" state.
+    pub database: RwSignal<Option<DatabaseTarget>>,
+    /// The database or namespace being created. Same rule as `draft`: one value,
+    /// because the plan is built from exactly it.
+    pub database_draft: RwSignal<schemaic_core::ddl::DatabaseDraft>,
+    /// The server's roles, fetched when a PostgreSQL database editor opens —
+    /// what its Owner chevron offers. Empty on MySQL, and empty until the fetch
+    /// lands, which costs a shortcut and never a value: the field is free text,
+    /// and `suggest_chevron` reads this **when pressed** rather than when the
+    /// form is built, so a late reply needs no rebuild and takes no caret with
+    /// it.
+    pub roles: RwSignal<Vec<String>>,
     /// The object editor's target; doubles as its open flag.
     pub object: RwSignal<Option<ObjectTarget>>,
     /// The enum / domain / sequence being edited. Same rule as `draft`: one
@@ -2964,6 +3064,8 @@ pub struct SchemaActions {
     /// Read a MySQL view's `ALGORITHM`, which no bulk query reports.
     pub view_algorithm: ViewAlgoFn,
     pub trigger_functions: TriggerFnFn,
+    /// Read the server's roles, for the database editor's Owner shortcut.
+    pub roles: RolesFn,
     /// Read a MySQL trigger's body as written, which `information_schema`
     /// cannot report faithfully.
     pub trigger_source: TriggerSrcFn,

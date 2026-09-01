@@ -26,8 +26,8 @@ use crate::settings::{
     ai_settings_overlay, help_overlay, term_settings_overlay, theme_settings_overlay,
 };
 use crate::{
-    DdlUi, Ui, ddl_preview, event_editor, import_view, object_editor, properties, routine_editor,
-    table_designer, theme, trigger_editor, view_editor,
+    DdlUi, Ui, database_editor, ddl_preview, event_editor, import_view, object_editor, properties,
+    routine_editor, table_designer, theme, trigger_editor, view_editor,
 };
 
 /// **Every modal, in one layer that starts below the title bar.**
@@ -99,6 +99,8 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let trigger_open = ui.ddl.trigger;
             let routine_open = ui.ddl.routine;
             let event_open = ui.ddl.event;
+            let object_open = ui.ddl.object;
+            let database_open = ui.ddl.database;
             let dump_open = ui.dump.target;
             let script_open = ui.script.target;
             stack((
@@ -154,7 +156,25 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                         s
                     }
                 }),
-                object_editor::object_editor_overlay(ui.clone()),
+                // The object and database editors share one tuple element — this
+                // stack is at Floem's 16-arity `ViewTuple` limit — and only one
+                // of the two is ever painted, since every `open` here clears the
+                // other's target. The wrapper must fill the layer while either
+                // is up, or the member's own `inset(0)` resolves against a
+                // zero-by-zero box and the modal renders nothing at all: the
+                // failure the event editor shipped with, stated at
+                // `ddl_editors_up`.
+                stack((
+                    object_editor::object_editor_overlay(ui.clone()),
+                    database_editor::database_editor_overlay(ui.clone()),
+                ))
+                .style(move |s| {
+                    if object_open.get().is_some() || database_open.get().is_some() {
+                        s.absolute().inset(0.0)
+                    } else {
+                        s
+                    }
+                }),
                 ddl_preview::ddl_preview_overlay(ui.clone()),
                 // **Last in this group, because the DDL preview raises it.**
                 // `run_ddl` asks about every open transaction on the connection
@@ -310,6 +330,7 @@ pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
             || d.routine.get().is_some()
             || d.object.get().is_some()
             || d.event.get().is_some()
+            || d.database.get().is_some()
             || d.preview.get().is_some()
     }
 }
@@ -408,6 +429,10 @@ mod modal_backdrop_gate {
         // A loose child of the layer, directly above `connection_form.rs`'s
         // modal, which is what raises it.
         "connection_import.rs",
+        // In the layer's DDL group, sharing `object_editor.rs`'s tuple element
+        // (the stack is at floem's 16-arity limit and the two never open
+        // together), raised by `ddl_editors_up`'s `d.database` arm.
+        "database_editor.rs",
         "ddl_preview.rs",
         // In the layer's DDL group, raised by `ddl_modals_up`'s
         // `dump_open.get().is_some()` arm.

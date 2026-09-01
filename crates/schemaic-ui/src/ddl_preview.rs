@@ -90,6 +90,7 @@ pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
     d.routine.set(None);
     d.object.set(None);
     d.event.set(None);
+    d.database.set(None);
 }
 
 /// Open the preview on a change set. `from_designer` decides where Cancel goes.
@@ -119,6 +120,16 @@ pub(crate) fn preview_of(
     DdlPreview {
         conn_id,
         database: database.to_string(),
+        // **Read off the changes, not off the caller.** Every path into this
+        // function would otherwise have to remember to say, and the one that
+        // forgot would send a `DROP DATABASE` down the in-database route — where
+        // PostgreSQL refuses it and MySQL runs it on a connection pointed at the
+        // database it just removed.
+        scope: if cs.changes.iter().any(schemaic_core::ddl::is_server_level) {
+            crate::DdlScope::Server
+        } else {
+            crate::DdlScope::Database
+        },
         subject: subject.into(),
         changes: cs.changes.iter().map(|c| c.summary()).collect(),
         destructive: cs.destructive(),
@@ -127,6 +138,30 @@ pub(crate) fn preview_of(
         script: cs.editor_script(),
         read_only,
     }
+}
+
+/// Send a **container** change — a database or a namespace — to the preview.
+///
+/// The counterpart of [`preview_change`] for the four changes that have no
+/// table: `ddl::server_level` builds the set, and [`preview_of`] reads the scope
+/// back off it, so a caller here cannot get the run path wrong by forgetting to
+/// say which one it wanted.
+///
+/// `database` is what the plan is *about*, which under [`crate::DdlScope::Server`]
+/// is deliberately not the database the statements run on — see
+/// [`crate::DdlRunRequest::database`].
+pub(crate) fn preview_container(
+    ui: &Ui,
+    database: &str,
+    subject: &str,
+    change: schemaic_core::ddl::Change,
+) {
+    let ctx = crate::table_designer::edit_ctx(ui);
+    let cs = schemaic_core::ddl::server_level(subject, ctx.dialect, change);
+    open_preview(
+        ui,
+        preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
+    );
 }
 
 /// Send **one** change straight to the preview, skipping the designer — how
@@ -357,6 +392,7 @@ fn apply(ui: Ui) {
         DdlRunRequest {
             conn_id: p.conn_id,
             database: p.database.clone(),
+            scope: p.scope,
             statements: p.statements.clone(),
         },
         Rc::new(move |res| {
@@ -427,12 +463,25 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             // Read before `ui` is moved into the footer's closures.
-            let title = format!(
-                "Apply changes to {} · {}.{}",
-                connection_label(&ui, p.conn_id),
-                p.database,
-                p.subject
-            );
+            //
+            // **A server-level plan has no database to qualify against**, and
+            // the subject *is* the database — so the usual `db.subject` would
+            // read `.schemaic_probe`, a qualifier with nothing on its left.
+            // `DdlScope` is the question rather than an emptiness test on the
+            // string, so the two can't disagree about which plan this is.
+            let title = match p.scope {
+                crate::DdlScope::Server => format!(
+                    "Apply changes to {} · {}",
+                    connection_label(&ui, p.conn_id),
+                    p.subject
+                ),
+                crate::DdlScope::Database => format!(
+                    "Apply changes to {} · {}.{}",
+                    connection_label(&ui, p.conn_id),
+                    p.database,
+                    p.subject
+                ),
+            };
 
             // The script box, then the footer. The box is read-only, but it is
             // the thing this modal exists to be *read*, and Tab is how a keyboard
@@ -534,7 +583,23 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     // The database the plan would have been applied to — the tab
                     // has to be the one this script belongs in, or "Open in
                     // editor" hands you an `ALTER` aimed somewhere else.
-                    let open_db = p.database.clone();
+                    //
+                    // **A server-level plan binds the tab to no database at
+                    // all**, and the question is the scope rather than whether
+                    // the name happens to be blank. A `CREATE DATABASE` has no
+                    // database and so reads as empty either way; a `DROP
+                    // DATABASE` carries its *target* here — the one database the
+                    // statement must not be run from — so keying on emptiness
+                    // handed the user a tab bound to the database the script
+                    // drops, where PostgreSQL answers `cannot drop the currently
+                    // open database`. The escape hatch has to open somewhere the
+                    // script can actually run.
+                    let open_db = match p.scope {
+                        crate::DdlScope::Server => None,
+                        crate::DdlScope::Database => {
+                            Some(p.database.clone()).filter(|d| !d.is_empty())
+                        }
+                    };
                     let open_query = ui_side.tab_actions.open_query.clone();
                     h_stack((
                         action_button_icon(
@@ -558,7 +623,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             ring.clone(),
                             ACTION_TAB + 10,
                             move || {
-                                (open_query)(open_sql.clone(), Some(open_db.clone()));
+                                (open_query)(open_sql.clone(), open_db.clone());
                                 d.preview.set(None);
                                 close_editors(d);
                             },
@@ -698,7 +763,7 @@ mod tests {
     use schemaic_core::intel::SqlDialect;
 
     /// Every editor signal, so the test fails to compile rather than silently
-    /// pass if a sixth one is added.
+    /// pass if a seventh one is added.
     fn ddl_ui(scope: Scope) -> crate::DdlUi {
         crate::DdlUi {
             designer: scope.create_rw_signal(None),
@@ -722,6 +787,9 @@ mod tests {
             event_source_pending: scope.create_rw_signal(false),
             event_body_stale: scope.create_rw_signal(false),
             functions: scope.create_rw_signal(Vec::new()),
+            database: scope.create_rw_signal(None),
+            database_draft: scope.create_rw_signal(Default::default()),
+            roles: scope.create_rw_signal(Vec::new()),
             object: scope.create_rw_signal(None),
             object_draft: scope.create_rw_signal(Default::default()),
             object_errors: scope.create_rw_signal(Vec::new()),
@@ -795,6 +863,13 @@ mod tests {
             current: None,
             read_only: false,
         }));
+        d.database.set(Some(crate::DatabaseTarget {
+            conn_id: 1,
+            kind: crate::ContainerKind::Database,
+            database: None,
+            dialect: SqlDialect::MySql,
+            read_only: false,
+        }));
 
         close_editors(d);
 
@@ -803,6 +878,7 @@ mod tests {
         assert!(d.trigger.get_untracked().is_none(), "trigger");
         assert!(d.object.get_untracked().is_none(), "object");
         assert!(d.event.get_untracked().is_none(), "event");
+        assert!(d.database.get_untracked().is_none(), "database");
 
         scope.dispose();
     }
@@ -869,7 +945,7 @@ mod tests {
         // none of these captures anything, and the array is the list of editors
         // the test is about.
         type Raise = (&'static str, fn(crate::DdlUi));
-        let raise: [Raise; 6] = [
+        let raise: [Raise; 7] = [
             ("designer", |d| {
                 d.designer.set(Some(crate::DesignerTarget {
                     conn_id: 1,
@@ -930,6 +1006,15 @@ mod tests {
                     database: "db".into(),
                     dialect: SqlDialect::MySql,
                     current: None,
+                    read_only: false,
+                }))
+            }),
+            ("database", |d| {
+                d.database.set(Some(crate::DatabaseTarget {
+                    conn_id: 1,
+                    kind: crate::ContainerKind::Database,
+                    database: None,
+                    dialect: SqlDialect::MySql,
                     read_only: false,
                 }))
             }),

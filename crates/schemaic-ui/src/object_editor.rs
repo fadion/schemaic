@@ -692,10 +692,12 @@ fn domain_form(
                 suggest_chevron(
                     ui,
                     sig,
-                    ddl::common_types(dialect)
-                        .iter()
-                        .map(|t| t.to_string())
-                        .collect(),
+                    move || {
+                        ddl::common_types(dialect)
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect()
+                    },
                     ring.clone(),
                     21,
                 ),
