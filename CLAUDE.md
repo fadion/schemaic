@@ -158,6 +158,13 @@ start with a failing test, then the code that makes it pass.
   the hand checks down instead, in the shape `review/user-verify-fix.md` uses: setup, the exact
   action, what should happen, and what would mean the fix is wrong.
 
+## Writing the UI's words
+
+- **No ellipsis on a menu label.** `Create database`, never `Create database…` (or `...`). The
+  convention that an entry opening a dialog trails three dots is a Windows-menu habit this app does
+  not follow, and every label in it is written without one — a new entry that carries one is the
+  odd one out, which is why it keeps having to be corrected after the fact.
+
 ## Never bulk-rewrite source with a script
 
 **Do not use `sed -i`/`awk`/`perl -i` (or any generated script) to edit `.rs` files in place.** Use
