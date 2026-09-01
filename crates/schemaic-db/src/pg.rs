@@ -122,11 +122,26 @@ async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool
 /// Is this failure about the *database* we asked for, rather than the server,
 /// the transport or the user?
 ///
-/// Two codes qualify and no others. `3D000` is the database not existing.
+/// Five codes qualify and no others. `3D000` is the database not existing.
 /// `28000` is `pg_hba.conf` refusing the connection — which reads like an
 /// authentication failure but is matched **per database**, so it is exactly the
 /// case another candidate can fix, and exactly what a hosted provider answers
 /// for a database it does not publish.
+///
+/// **The three that were missing are strictly per-database refusals too**, and
+/// classifying them as server-level failed the whole connection where the
+/// pre-`82a83cd` loop recovered — the opposite of `maintenance_candidates`' own
+/// "degrade rather than lock the user out" promise:
+///
+/// - `55000` — `datallowconn = false`. `template0` ships this way, so a server
+///   whose first candidate is a template was unbrowsable.
+/// - `53300` — too many connections *for that database*, and **transient**: a
+///   momentarily-full `postgres` made the whole server fail rather than the
+///   next candidate be tried a moment later.
+/// - `42501` — `CONNECT` revoked on that database, which is how a hosted
+///   provider fences its own catalogues off.
+///
+/// All five measured on PG 16.15.
 ///
 /// A wrong password (`28P01`) deliberately does not qualify: it is the same
 /// wrong password for every database, and retrying it three more times is three
@@ -136,6 +151,9 @@ fn another_database_might_work(code: Option<&SqlState>) -> bool {
         code,
         Some(&SqlState::INVALID_CATALOG_NAME)
             | Some(&SqlState::INVALID_AUTHORIZATION_SPECIFICATION)
+            | Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)
+            | Some(&SqlState::TOO_MANY_CONNECTIONS)
+            | Some(&SqlState::INSUFFICIENT_PRIVILEGE)
     )
 }
 
@@ -1693,7 +1711,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         client,
         &format!(
             "SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, true), \
-                    c.relkind, array_to_string(c.reloptions, ',') \
+                    c.relkind, array_to_string(c.reloptions, ','), \
+                    c.relispopulated \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('v', 'm') AND {}",
             user_schema_filter("n.nspname")
@@ -1839,7 +1858,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         .map(|r| {
             (
                 (cell(r, 0), cell(r, 1)),
-                pg_view_options(&cell(r, 3), &cell(r, 4)),
+                pg_view_options(&cell(r, 3), &cell(r, 4), &cell(r, 5)),
             )
         })
         .collect();
@@ -2536,9 +2555,18 @@ fn pg_trigger_args(def: &str) -> Vec<String> {
 /// `check_option` is lifted out because both engines spell that one the same way
 /// in DDL (`WITH CASCADED CHECK OPTION`); everything else stays verbatim, since
 /// it's restated inside the `WITH (…)` it came from. Pure + tested.
-pub(crate) fn pg_view_options(relkind: &str, reloptions: &str) -> ViewOptions {
+pub(crate) fn pg_view_options(
+    relkind: &str,
+    reloptions: &str,
+    relispopulated: &str,
+) -> ViewOptions {
     let mut out = ViewOptions {
         materialized: relkind == "m",
+        // A bool column, so `cell` renders it `t` / `f`. Anything else — an
+        // older server, a column that stopped being selected — reads as
+        // populated, which is the answer that leaves the concurrent refresh on
+        // offer rather than silently withdrawing it from every view.
+        populated: !relispopulated.eq_ignore_ascii_case("f"),
         ..Default::default()
     };
     for opt in reloptions
@@ -3321,6 +3349,21 @@ mod tests {
         assert!(another_database_might_work(Some(
             &SqlState::INVALID_AUTHORIZATION_SPECIFICATION
         )));
+        // **The three this used to classify as server-level.** Each refuses one
+        // database and says nothing about the server, so failing the whole
+        // connection on them locked the user out where the pre-`82a83cd` loop
+        // recovered. `template0` ships with `datallowconn = false`; `53300` is
+        // transient, so a momentarily-full `postgres` made the server
+        // unbrowsable; `42501` is how a hosted provider fences its catalogues.
+        assert!(another_database_might_work(Some(
+            &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+        )));
+        assert!(another_database_might_work(Some(
+            &SqlState::TOO_MANY_CONNECTIONS
+        )));
+        assert!(another_database_might_work(Some(
+            &SqlState::INSUFFICIENT_PRIVILEGE
+        )));
 
         // The same wrong password for every database, and three more failed
         // logins against whatever is counting them.
@@ -3761,16 +3804,34 @@ mod tests {
 
     #[test]
     fn pg_view_options_splits_check_option_from_the_storage_parameters() {
-        let o = pg_view_options("v", "security_barrier=true,check_option=cascaded");
+        let o = pg_view_options("v", "security_barrier=true,check_option=cascaded", "t");
         assert_eq!(o.check_option.as_deref(), Some("CASCADED"));
         assert_eq!(o.storage, vec!["security_barrier=true".to_string()]);
         assert!(!o.materialized);
 
         // A plain view with no options at all.
-        assert_eq!(pg_view_options("v", ""), ViewOptions::default());
+        assert_eq!(pg_view_options("v", "", "t"), ViewOptions::default());
 
         // `relkind = 'm'` is the one thing that makes a view uneditable here.
-        assert!(pg_view_options("m", "").materialized);
+        assert!(pg_view_options("m", "", "t").materialized);
+    }
+
+    /// `relispopulated` is what tells a `WITH NO DATA` materialized view apart,
+    /// and PostgreSQL refuses a concurrent refresh on one — so reading it wrong
+    /// makes *Refresh view* inoperable for that view.
+    ///
+    /// Only a literal `f` means unpopulated. An older server, or a column that
+    /// stopped being selected, reads as populated: that is the answer which
+    /// leaves the non-blocking form on offer rather than silently withdrawing
+    /// it from every materialized view there is.
+    #[test]
+    fn only_a_false_relispopulated_marks_a_view_unpopulated() {
+        assert!(!pg_view_options("m", "", "f").populated);
+        assert!(!pg_view_options("m", "", "F").populated);
+        assert!(pg_view_options("m", "", "t").populated);
+        assert!(pg_view_options("m", "", "").populated);
+        // And a plain view, which has no such notion, is never "unpopulated".
+        assert!(pg_view_options("v", "", "t").populated);
     }
 
     #[test]

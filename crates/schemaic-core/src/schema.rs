@@ -1050,7 +1050,7 @@ impl CheckInfo {
 /// the definer and the security type, PostgreSQL the storage parameters and
 /// materialization, SQLite the explicit column list. `check_option` is the one
 /// two of them spell the same way — SQLite has no form of it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewOptions {
     /// `WITH {CASCADED|LOCAL} CHECK OPTION`, upper-cased. `None` for a view
     /// without one (MySQL reports that as `NONE`).
@@ -1073,6 +1073,21 @@ pub struct ViewOptions {
     /// `CREATE OR REPLACE` and no check option, so Schemaic shows it rather than
     /// editing it.
     pub materialized: bool,
+    /// **PostgreSQL `pg_class.relispopulated`.** False for a materialized view
+    /// created `WITH NO DATA` and never refreshed since.
+    ///
+    /// Here because the server refuses `REFRESH MATERIALIZED VIEW
+    /// CONCURRENTLY` on an unpopulated view, and
+    /// [`crate::ddl::supports_concurrent_refresh`] had no way to see it: a view
+    /// created `WITH NO DATA` that happens to carry a unique index got the
+    /// concurrent form, PG refused it, and the single menu entry offered no
+    /// plain fallback — so *Refresh view* was inoperable for that view, every
+    /// time.
+    ///
+    /// **Defaults to `true`**, which is the right answer for every object that
+    /// is not a PostgreSQL materialized view and keeps a `ViewOptions` built
+    /// anywhere else behaving as it did.
+    pub populated: bool,
     /// **SQLite.** The explicit column list of `CREATE VIEW v (x, y) AS …`,
     /// verbatim and without its parentheses — `None` for the usual view, which
     /// takes its column names from the body.
@@ -1088,6 +1103,26 @@ pub struct ViewOptions {
     /// re-quoting a parsed list is a way to change it. The other two engines
     /// bake the names into the body they report, so this stays `None` there.
     pub column_list: Option<String>,
+}
+
+/// **Hand-written for one field.** Every other default here is "absent", which
+/// `derive` gets right; `populated` defaults to *true*, because "we do not know
+/// whether this view holds rows" must not read as "it holds none" — that is the
+/// answer that withdraws the concurrent refresh from every view on the two
+/// engines that have no such flag at all.
+impl Default for ViewOptions {
+    fn default() -> Self {
+        Self {
+            check_option: None,
+            definer: None,
+            security: None,
+            algorithm: None,
+            storage: Vec::new(),
+            materialized: false,
+            populated: true,
+            column_list: None,
+        }
+    }
 }
 
 /// A MySQL `DEFINER` clause from the catalogue's `user@host` form.
