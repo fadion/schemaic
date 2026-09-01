@@ -9037,7 +9037,8 @@ pub fn single(table: &str, schema: Option<&str>, dialect: SqlDialect, change: Ch
 }
 
 /// A one-change set for a **container** — a database or a namespace, the four
-/// changes [`ChangeSet::database_statements`] writes.
+/// changes [`ChangeSet::container_creates`] and [`ChangeSet::container_drops`]
+/// write.
 ///
 /// Its own constructor rather than a [`single`] call at each site, because
 /// `single`'s first argument is a *table* and these changes have none. `subject`
