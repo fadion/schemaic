@@ -35,7 +35,7 @@ use schemaic_core::model::{GridWrite, RefetchRow, RefetchTemplate, ResultSet, Va
 use schemaic_core::tx::{self, StmtOutcome};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 
 use crate::{Db, DbError, Engine, TxScope, collect_rows, pg, refetch_on, write_on};
@@ -542,8 +542,9 @@ impl Session {
                 let token = client.cancel_token();
                 tokio::select! {
                     r = pg::write_on(client, write, TxScope::Savepoint) => r,
+                    // Over this session's own transport. See `pg::cancel_query`.
                     _ = cancel.cancelled() => {
-                        let _ = token.cancel_query(NoTls).await;
+                        pg::cancel_query(&self.db, &token).await;
                         Err(DbError::Cancelled)
                     }
                 }
@@ -579,8 +580,9 @@ impl Session {
                 let token = client.cancel_token();
                 tokio::select! {
                     r = pg::refetch_on(client, template, rows) => r,
+                    // Over this session's own transport. See `pg::cancel_query`.
                     _ = cancel.cancelled() => {
-                        let _ = token.cancel_query(NoTls).await;
+                        pg::cancel_query(&self.db, &token).await;
                         Err(DbError::Cancelled)
                     }
                 }
@@ -609,6 +611,68 @@ pub fn tx_engine_of(engine: Engine) -> tx::TxEngine {
     match engine {
         Engine::Postgres => tx::TxEngine::Postgres,
         Engine::MySql | Engine::Sqlite => tx::TxEngine::MySql,
+    }
+}
+
+/// **A gate over the call *sites*, because the defect was never in the
+/// function.**
+///
+/// `pg::cancel_query` has been correct since it was written: it dials the
+/// cancel connection over the same transport the query used, because
+/// PostgreSQL cancellation opens a *second* connection and a TLS-only server
+/// refuses a plaintext one. What shipped was two `tokio::select!` arms that
+/// never called it — converted eight of ten sites and missed two, ~170 lines
+/// below a converted one in the same file. A unit test of `cancel_query` would
+/// have passed the whole time.
+///
+/// The result of a cancel is deliberately discarded everywhere (it is
+/// best-effort), so the failure is *silent*: against a TLS-only server the
+/// write completes inside the still-open savepoint while the UI reports
+/// "cancelled", and the user's next Commit ships it.
+///
+/// Scanning the source is the only way to assert a property of a set of call
+/// sites; the crate's live paths cannot be driven from a unit test. `pg.rs` is
+/// exempt because it *defines* the helper.
+#[cfg(test)]
+mod pg_cancel_gate {
+    use std::path::{Path, PathBuf};
+
+    fn crate_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    #[test]
+    fn every_postgres_cancel_goes_through_the_helper_that_knows_the_transport() {
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(crate_src()).expect("the crate's src") {
+            let path = entry.expect("a dir entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().expect("a file name").to_string_lossy();
+            // The definition itself, and the only place `NoTls` is a correct
+            // answer — when the plan says the connection is plaintext.
+            if name == "pg.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a source file");
+            // Spelled in two pieces so the scanner does not find *itself* —
+            // this module lives in the file it reads.
+            let needle = format!(".cancel{}(", "_query");
+            for (i, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains(&needle) {
+                    offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "cancel the query through `pg::cancel_query`, which dials over the connection's own \
+             transport — a plaintext cancel is refused by exactly the servers TLS was set for, \
+             and the refusal is discarded:\n{}",
+            offenders.join("\n")
+        );
     }
 }
 
