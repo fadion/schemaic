@@ -164,6 +164,20 @@ pub(crate) struct EditCtx {
     pub conn_id: u64,
     pub dialect: SqlDialect,
     pub read_only: bool,
+    /// **Is there a saved connection behind `conn_id` at all?**
+    ///
+    /// On a fresh install with none, `active_conn` still answers a number
+    /// (`Connection::startup_active_id`) and the two fields above fall back to
+    /// `SqlDialect::default()` — MySQL — and `read_only: false`. Both *Create
+    /// database* homes then opened a working-looking form and previewed real
+    /// ``CREATE DATABASE `foo`;`` against a connection that names nothing, with
+    /// Apply failing on an internal string. It is the very first thing a new
+    /// user can click.
+    ///
+    /// **Not the same question as "did it connect".** An entry must not
+    /// disappear on a connection that merely failed to reach its server — the
+    /// user's fix for that is to try again, not to lose the menu.
+    pub exists: bool,
 }
 
 pub(crate) fn edit_ctx(ui: &Ui) -> EditCtx {
@@ -178,7 +192,8 @@ pub(crate) fn edit_ctx(ui: &Ui) -> EditCtx {
             .as_ref()
             .map(|c| SqlDialect::from_db_type(&c.db_type))
             .unwrap_or_default(),
-        read_only: conn.is_some_and(|c| c.read_only),
+        read_only: conn.as_ref().is_some_and(|c| c.read_only),
+        exists: conn.is_some(),
     }
 }
 

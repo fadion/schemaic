@@ -578,6 +578,21 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     // provider share the whole host but the leading id, and
                     // differ in the port.
                     let endpoint = schemaic_core::connection::elide_endpoint(&c.endpoint(), 22);
+                    // **The full name and endpoint, on hover**, when either was
+                    // cut. Two connections sharing a 15-character prefix are
+                    // otherwise indistinguishable here and in the header — the
+                    // two places a connection is chosen — and this is the row
+                    // that chooses one. Empty when nothing was elided, so an
+                    // ordinary row raises no tooltip.
+                    let tip = match (name != c.name, endpoint != c.endpoint()) {
+                        (false, false) => String::new(),
+                        _ => format!(
+                            "{}
+{}",
+                            c.name,
+                            c.endpoint()
+                        ),
+                    };
                     h_stack((
                         dot,
                         // Name in the connection-list text colour; the dot carries status.
@@ -586,6 +601,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                         text(endpoint)
                             .style(|s| s.color(theme::text_faint()).font_size(theme::font_label())),
                     ))
+                    .tooltip(move || text(tip.clone()).style(crate::widgets::tooltip_style))
                     .on_click_stop(move |_| {
                         (switch)(id);
                         open.set(false);
@@ -1077,9 +1093,17 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             // Absent where the engine has no such statement, and **dimmed** on a
             // read-only connection — the two different answers the rest of the
             // app gives, for the two different reasons it gives them.
-            if schemaic_core::ddl::supports_database_editing(
-                crate::table_designer::edit_ctx(&ui).dialect,
-            ) {
+            //
+            // **And absent with no saved connection at all**, which is not the
+            // same question as "did it connect". `edit_ctx` falls back to
+            // `SqlDialect::default()` and `read_only: false` when there is none,
+            // so on a fresh install this offered the entry, opened the form and
+            // previewed real SQL against a connection id that names nothing —
+            // the first thing a new user can click. See
+            // `table_designer::EditCtx::exists`, and `schema_tree`'s
+            // blank-space menu, which is the same gate on the other home.
+            let ctx = crate::table_designer::edit_ctx(&ui);
+            if ctx.exists && schemaic_core::ddl::supports_database_editing(ctx.dialect) {
                 let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn);
                 let create_ui = ui.clone();
                 items.push(

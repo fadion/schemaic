@@ -5555,6 +5555,66 @@ mod tests {
         assert_eq!(tunneled.parts(), ("127.0.0.1", 55001, "u", "p", ""));
     }
 
+    /// **The name a tunnelled connection verifies against is still the far
+    /// end's**, and this test exists because the one above could not see it:
+    /// it builds `tls: Default::default()`, which is `Disable`, so `tls_plan()`
+    /// is `None` and the mapping branch is never entered. Deleting
+    /// `hostname_override` left the whole suite green while `verify-full`
+    /// through a tunnel compared a perfectly good certificate against
+    /// `127.0.0.1` and rejected it — the mode that most wants to work through a
+    /// bastion being the one that cannot.
+    ///
+    /// Asserted for **every mode that handshakes**, because the override rides
+    /// on the plan and a mode-specific answer here would be a mode-specific
+    /// failure at a customer's bastion.
+    #[test]
+    fn a_tunnel_moves_the_address_and_keeps_the_name_to_verify() {
+        use schemaic_core::connection::{SslMode, Tls};
+        for mode in SslMode::ALL {
+            let conn = schemaic_core::connection::Connection {
+                id: 1,
+                name: "c".to_string(),
+                db_type: "PostgreSQL".to_string(),
+                host: "remote.example".to_string(),
+                port: 5432,
+                user: "u".to_string(),
+                password: "p".to_string(),
+                file: String::new(),
+                database: String::new(),
+                ssh: Default::default(),
+                tls: Tls {
+                    mode,
+                    ..Tls::default()
+                },
+                color: None,
+                prominent_color: false,
+                read_only: false,
+                environment: Default::default(),
+                ai_data: None,
+            };
+
+            let direct = Db::connect(&conn, None);
+            assert!(
+                direct
+                    .tls_plan()
+                    .is_none_or(|p| p.hostname_override.is_none()),
+                "{mode:?}: an untunnelled connection dials the name it verifies"
+            );
+
+            let tunneled = Db::connect(&conn, Some(55001));
+            assert_eq!(tunneled.parts().0, "127.0.0.1", "{mode:?}");
+            match tunneled.tls_plan() {
+                // `Disable` never handshakes, so there is nothing to verify.
+                None => assert_eq!(mode, SslMode::Disable, "{mode:?} should have a plan"),
+                Some(plan) => assert_eq!(
+                    plan.hostname_override.as_deref(),
+                    Some("remote.example"),
+                    "{mode:?}: the address moved and the name did not come with it"
+                ),
+            }
+        }
+    }
+
     /// A SQLite connection's target is its file, and **a tunnel port must not
     /// repoint it**. Nothing should open a tunnel for one in the first place
     /// (`Engine::is_networked`), but a rewrite to `127.0.0.1:<port>` there would
