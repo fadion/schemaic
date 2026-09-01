@@ -52,7 +52,10 @@ pub fn decode_text_file(bytes: &[u8]) -> String {
 /// A trailing odd byte is dropped: the file is truncated, and losing half a
 /// character is a better answer than losing all of it.
 fn decode_utf16(bytes: &[u8], word: fn([u8; 2]) -> u16) -> String {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| word([c[0], c[1]])).collect();
+    // `as_chunks::<2>` rather than `chunks_exact(2)`: the pairs arrive as
+    // `[u8; 2]` already, which is what `word` takes, so the indexing goes too.
+    // `.1` is the trailing odd byte, deliberately dropped — see above.
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|&c| word(c)).collect();
     String::from_utf16_lossy(&units)
 }
 
