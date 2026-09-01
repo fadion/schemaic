@@ -315,15 +315,26 @@ pub fn statement_kind(sql: &str, dialect: SqlDialect) -> Option<String> {
     )
 }
 
-/// Statements that destroy something outright, for the plain-language warning
-/// the app gives before anything irreversible runs.
+/// Statements that destroy or delete data, for the plain-language warning the
+/// app gives before a script runs.
 ///
-/// `DELETE` is **not** here: `dump.rs` never writes one, and a `DELETE` with a
-/// `WHERE` is ordinary. What the run guard says about a missing `WHERE` is a
-/// separate question asked by `sql::first_unsafe`, and duplicating it here would
-/// be a second, differently-worded answer to it.
+/// **This line is the confirmation**, which is what sets its width. The modal
+/// has no "are you sure" step: a script is chosen from a dialog and run from a
+/// panel that first says what the file will do, and *this sentence* is the part
+/// of that saying the irreversible part. So the net is drawn wide enough that a
+/// file it stays silent about is genuinely one worth running.
+///
+/// `DELETE` is therefore counted, though it is not destructive in the
+/// `DROP`/`TRUNCATE` sense and `dump.rs` never writes one. A hand-written
+/// script does, and a warning that said nothing about four hundred `DELETE`s
+/// would be worse than no warning: it would have been read, and found
+/// reassuring.
+///
+/// It stays a *count*, not a verdict. Whether a `DELETE` is missing a `WHERE` is
+/// `sql::first_unsafe`'s question, and answering it a second time here in
+/// different words is exactly the drift that predicate exists to prevent.
 fn is_destructive(kind: &str) -> bool {
-    kind.starts_with("DROP") || kind == "TRUNCATE"
+    kind.starts_with("DROP") || kind == "TRUNCATE" || kind == "DELETE"
 }
 
 /// How much of a script the probe reads before answering.
@@ -862,11 +873,36 @@ mod tests {
         assert_eq!(p.destructive, 0);
     }
 
-    /// What the app says out loud before running anything irreversible.
+    /// What the app says out loud before running anything irreversible — and
+    /// **this line is the confirmation**, so its net is deliberately wide.
+    ///
+    /// `DELETE` is counted. It is not "destructive" in the `DROP`/`TRUNCATE`
+    /// sense and a dump never writes one, but a hand-written script very much
+    /// does, and a sentence that stayed silent about four hundred `DELETE`s
+    /// would be worse than no sentence at all — it would have been *read* and
+    /// found reassuring.
     #[test]
     fn the_probe_counts_what_the_script_destroys() {
         let p = probed("DROP TABLE a; TRUNCATE TABLE b; DROP VIEW v; INSERT INTO c VALUES (1);");
         assert_eq!(p.destructive, 3, "{:?}", p.kinds);
+    }
+
+    /// The wide half of that net.
+    #[test]
+    fn a_delete_counts_as_something_the_script_destroys() {
+        let p = probed("DELETE FROM a WHERE id = 1; DELETE FROM b; SELECT 1;");
+        assert_eq!(p.destructive, 2, "{:?}", p.kinds);
+    }
+
+    /// And nothing else is swept in with it: a script of reads and inserts
+    /// raises no warning, or the warning stops meaning anything.
+    #[test]
+    fn an_ordinary_load_destroys_nothing() {
+        let p = probed(
+            "CREATE TABLE a (x int); INSERT INTO a VALUES (1); \
+             UPDATE a SET x = 2; SELECT * FROM a;",
+        );
+        assert_eq!(p.destructive, 0, "{:?}", p.kinds);
     }
 
     /// Both spellings our own dump writes — `dump::transaction_sql` emits

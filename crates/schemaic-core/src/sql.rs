@@ -1366,6 +1366,13 @@ pub fn rerunnable_for_export(sql: &str, dialect: SqlDialect) -> bool {
 /// - **It never returns [`RunVerdict::Allow`]**, whatever `confirm_writes` says.
 ///   That setting is about a statement the user typed and can see; a file they
 ///   picked from a dialog is the case it was written for, not an exception to it.
+///
+/// **Who satisfies the `Confirm`.** Not a bar on screen: `script_view`'s panel
+/// is the confirmation, and it is a better one than this message — it names the
+/// statement counts and, in red, how many of them destroy or delete data, all
+/// before a button marked Run. The caller matches this verdict exhaustively so
+/// that is a decision written down rather than a fall-through; the `Confirm`
+/// arm remains so that no caller can ever read this as "go ahead".
 /// - **No database refuses outright**, rather than only when some statement
 ///   `needs_database` — see [`GuardPolicy::no_database`] for what an unscoped
 ///   `CREATE TABLE` does to a PostgreSQL server.
@@ -2353,20 +2360,31 @@ mod tests {
         ));
     }
 
-    /// The confirmation names the file, because at this point it is the only
-    /// thing the user can recognise — they have read no statements either.
+    /// An ordinary policy yields `Confirm` — never `Allow`.
+    ///
+    /// **What this does *not* claim is that a bar appears on screen.** The
+    /// script modal treats its own panel as the confirmation: the user picked
+    /// the file, and the panel names the statement counts and, in red, how many
+    /// of them destroy or delete data, above a button marked Run. So the arm is
+    /// satisfied there rather than rendered, and `script_view::run_script`
+    /// matches it out exhaustively so that is a decision on the page instead of
+    /// a fall-through.
+    ///
+    /// This test used to assert the *wording* of a message nothing displays —
+    /// which read as coverage of a confirmation flow that did not exist. What
+    /// is worth pinning is the arm.
     #[test]
-    fn the_confirmation_names_the_file() {
+    fn an_ordinary_policy_asks_rather_than_allowing() {
         let policy = super::GuardPolicy {
             read_only: false,
             confirm_writes: false,
             no_database: false,
             dialect: SqlDialect::MySql,
         };
-        match super::script_verdict(policy, "sakila-dump.sql") {
-            super::RunVerdict::Confirm(m) => assert!(m.contains("sakila-dump.sql"), "{m}"),
-            other => panic!("expected a confirmation, got {other:?}"),
-        }
+        assert!(matches!(
+            super::script_verdict(policy, "sakila-dump.sql"),
+            super::RunVerdict::Confirm(_)
+        ));
     }
 
     /// The one place the two scans deliberately disagree, stated so a later
