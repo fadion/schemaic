@@ -7248,10 +7248,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // was found. Applied *after* `scan` rather than by handing it
                 // both files: `scan` would offer `.pgpass`'s own servers as rows
                 // too, and the user asked to import one file.
+                //
+                // **`PickedFile`, because these two halves have different
+                // authors.** The rows came out of a file the user was handed;
+                // the passwords are the user's own. A wildcard `.pgpass` line
+                // may therefore only complete a row for a server that file
+                // already names outright, and a row it does complete says so
+                // and arrives unticked.
                 for pw in conn_sources::password_sources() {
                     conn_import::fill_missing_passwords(
                         &mut scan.found,
                         &conn_import::pgpass_entries(&pw.text),
+                        conn_import::PgpassScope::PickedFile,
                     );
                 }
                 import_ui.paste_error.set(None);

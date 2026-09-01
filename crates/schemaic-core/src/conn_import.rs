@@ -105,6 +105,14 @@ pub enum ImportNote {
     /// The path still contains a macro the source tool expands for itself
     /// (`$PROJECT_DIR$`, `$USER_HOME$`). It will not resolve here as written.
     UnexpandedPath,
+    /// The row arrived without a password and one of **this machine's** own
+    /// `.pgpass` lines completed it.
+    ///
+    /// Only ever set where that crossed a trust boundary — a file the user was
+    /// merely given, completed from a credential of their own. See
+    /// [`PgpassScope`]. It also un-ticks the row, because a credential leaving
+    /// the machine is not a thing to do by not noticing.
+    PasswordFromPgpass,
 }
 
 impl ImportNote {
@@ -114,6 +122,7 @@ impl ImportNote {
             ImportNote::NoPassword => "No password in the source",
             ImportNote::AlreadySaved => "Already saved",
             ImportNote::UnexpandedPath => "Path contains an unexpanded macro",
+            ImportNote::PasswordFromPgpass => "Password taken from your own .pgpass",
         }
     }
 }
@@ -141,12 +150,14 @@ impl Imported {
 
     /// Should the review list tick this row by default?
     ///
-    /// Everything except a duplicate of something already saved. A missing
-    /// password is not a reason to skip a row — the user is about to type it —
-    /// but re-adding a server they already have is the one outcome nobody wants
-    /// by accident.
+    /// Everything except a duplicate of something already saved, and except a
+    /// row a `.pgpass` of the user's own completed across a trust boundary. A
+    /// missing password is not a reason to skip a row — the user is about to
+    /// type it — but re-adding a server they already have, or sending one of
+    /// their credentials to a server named by a file somebody sent them, are
+    /// the two outcomes nobody wants by accident.
     pub fn preselected(&self) -> bool {
-        !self.has(ImportNote::AlreadySaved)
+        !self.has(ImportNote::AlreadySaved) && !self.has(ImportNote::PasswordFromPgpass)
     }
 
     fn note(&mut self, note: ImportNote) {
@@ -267,7 +278,11 @@ pub fn scan(files: &[SourceFile], existing: &[Connection]) -> ImportScan {
         out.merge(one);
     }
 
-    fill_missing_passwords(&mut out.found, &pgpass);
+    // `OwnClients`: the only `.pgpass` entries here are ones that came in
+    // `files` alongside the rows they complete, so both halves have the same
+    // author. A hand-picked file is completed by the *caller*, from this
+    // machine's `~/.pgpass`, and that call passes `PickedFile`.
+    fill_missing_passwords(&mut out.found, &pgpass, PgpassScope::OwnClients);
     out.found = dedupe(out.found);
     mark_existing(&mut out.found, existing);
     for imp in &mut out.found {
@@ -1280,15 +1295,29 @@ impl PgpassEntry {
     /// password so the pair stays consistent.
     pub fn matches(&self, c: &Connection) -> bool {
         is_postgres(&c.db_type)
-            && wild(&self.host, &c.host)
+            && wild_host(&self.host, &c.host)
             && (self.port == "*" || self.port == c.port.to_string())
-            && wild(&self.database, &c.database)
+            && wild_field(&self.database, &c.database)
             && (self.user == "*" || c.user.trim().is_empty() || self.user == c.user)
     }
 }
 
-fn wild(pattern: &str, value: &str) -> bool {
+/// `*`, or a host name — compared without case, which is the one field where
+/// that is right: DNS names are case-insensitive and the two spellings name one
+/// machine.
+fn wild_host(pattern: &str, value: &str) -> bool {
     pattern == "*" || pattern.eq_ignore_ascii_case(value)
+}
+
+/// `*`, or an exact value.
+///
+/// **Byte-exact, because libpq is.** `wild` compared the *database* without case
+/// too, and `app` and `App` are two different PostgreSQL databases — so the
+/// `app` line's password was handed to the `App` connection, ticked and with no
+/// note. The user field was already compared exactly, so the three fields
+/// disagreed with each other about what a match is.
+fn wild_field(pattern: &str, value: &str) -> bool {
+    pattern == "*" || pattern == value
 }
 
 /// Parse a `~/.pgpass` into its lines.
@@ -1384,7 +1413,17 @@ pub fn parse_pgpass(text: &str) -> ImportScan {
 /// gets its passwords afterwards) would otherwise show "No password in the
 /// source" on a row that has one. The function that supplies the password is the
 /// one that knows the claim is no longer true.
-pub fn fill_missing_passwords(found: &mut [Imported], entries: &[PgpassEntry]) {
+///
+/// **`scope` is not a preference; it is who wrote the rows.** See
+/// [`PgpassScope`].
+pub fn fill_missing_passwords(found: &mut [Imported], entries: &[PgpassEntry], scope: PgpassScope) {
+    // Every host the file names outright. A `*` line may complete a row only if
+    // the row's server is one of these — see `PgpassScope::PickedFile`.
+    let known: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.host != "*")
+        .map(|e| e.host.as_str())
+        .collect();
     for imp in found.iter_mut() {
         if !imp.connection.password.is_empty() {
             continue;
@@ -1392,12 +1431,52 @@ pub fn fill_missing_passwords(found: &mut [Imported], entries: &[PgpassEntry]) {
         let Some(e) = entries.iter().find(|e| e.matches(&imp.connection)) else {
             continue;
         };
+        if scope == PgpassScope::PickedFile
+            && e.host == "*"
+            && !known
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&imp.connection.host))
+        {
+            continue;
+        }
         imp.connection.password = e.password.clone();
         if imp.connection.user.trim().is_empty() && e.user != "*" {
             imp.connection.user = e.user.clone();
         }
         imp.notes.retain(|n| *n != ImportNote::NoPassword);
+        if scope == PgpassScope::PickedFile {
+            imp.note(ImportNote::PasswordFromPgpass);
+        }
     }
+}
+
+/// Who wrote the rows a `.pgpass` is being asked to complete.
+///
+/// **The rows and the password file need not come from the same place, and that
+/// is the whole problem.** *Scan installed clients* reads both off this machine:
+/// every row is a server the user already had configured, so completing one
+/// from their own file moves a credential nowhere. *Choose a file…* takes a
+/// file the user was **sent** — a `dataSources.xml` from a colleague, a
+/// `.env`-shaped list — and completing *those* rows from `~/.pgpass` sends the
+/// user's real password to whatever server the file named.
+///
+/// The concrete attack: a line `postgres://db.mallory.example:5432/analytics`
+/// names no user, so [`PgpassEntry::matches`]' third disjunct
+/// (`c.user.trim().is_empty()`) accepts any user line, and a wildcard
+/// `*:*:*:bob:hunter2` — the shape `.pgpass` files most often have — supplied
+/// both the password **and** the login. The row rendered as `bob@…` with no
+/// note and arrived ticked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PgpassScope {
+    /// Rows and `.pgpass` both came off this machine. A wildcard line may
+    /// complete any row, and nothing is noted: no credential crossed anything.
+    OwnClients,
+    /// The rows came out of a file the user merely pointed at. A wildcard line
+    /// completes a row only when the row's host is **named outright** on some
+    /// line of the same `.pgpass` — i.e. it is a server the user already has a
+    /// password for — and any row it does complete is flagged
+    /// [`ImportNote::PasswordFromPgpass`] and left unticked.
+    PickedFile,
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,7 +2386,11 @@ mod tests {
             },
             ImportSource::DataGrip,
         )];
-        fill_missing_passwords(&mut found, &pgpass_entries("*:*:*:schemaic:secret\n"));
+        fill_missing_passwords(
+            &mut found,
+            &pgpass_entries("*:*:*:schemaic:secret\n"),
+            PgpassScope::OwnClients,
+        );
         assert_eq!(found[0].connection.password, "secret");
     }
 
@@ -2325,6 +2408,7 @@ mod tests {
         fill_missing_passwords(
             &mut found,
             &pgpass_entries("pg.example:5432:world:owner:pw\n"),
+            PgpassScope::OwnClients,
         );
         assert_eq!(found[0].connection.user, "owner");
         assert_eq!(found[0].connection.password, "pw");
@@ -2341,7 +2425,11 @@ mod tests {
             },
             ImportSource::DataGrip,
         )];
-        fill_missing_passwords(&mut found, &pgpass_entries("*:*:*:*:secret\n"));
+        fill_missing_passwords(
+            &mut found,
+            &pgpass_entries("*:*:*:*:secret\n"),
+            PgpassScope::OwnClients,
+        );
         assert!(found[0].connection.password.is_empty());
     }
 
@@ -2360,7 +2448,11 @@ mod tests {
         );
         row.note(ImportNote::NoPassword);
         let mut found = vec![row];
-        fill_missing_passwords(&mut found, &pgpass_entries("*:*:*:schemaic:secret\n"));
+        fill_missing_passwords(
+            &mut found,
+            &pgpass_entries("*:*:*:schemaic:secret\n"),
+            PgpassScope::OwnClients,
+        );
         assert_eq!(found[0].connection.password, "secret");
         assert!(
             !found[0].has(ImportNote::NoPassword),
@@ -2381,7 +2473,11 @@ mod tests {
         );
         row.note(ImportNote::NoPassword);
         let mut found = vec![row];
-        fill_missing_passwords(&mut found, &pgpass_entries("other.example:5432:d:u:pw\n"));
+        fill_missing_passwords(
+            &mut found,
+            &pgpass_entries("other.example:5432:d:u:pw\n"),
+            PgpassScope::OwnClients,
+        );
         assert!(found[0].connection.password.is_empty());
         assert!(found[0].has(ImportNote::NoPassword));
     }
@@ -2398,8 +2494,129 @@ mod tests {
             },
             ImportSource::Url,
         )];
-        fill_missing_passwords(&mut found, &pgpass_entries("*:*:*:*:frompgpass\n"));
+        fill_missing_passwords(
+            &mut found,
+            &pgpass_entries("*:*:*:*:frompgpass\n"),
+            PgpassScope::OwnClients,
+        );
         assert_eq!(found[0].connection.password, "fromurl");
+    }
+
+    /// **The credential leak this feature shipped with.** A file the user was
+    /// merely *sent* names a server nobody here has ever heard of and no user
+    /// at all. `matches`' third disjunct accepts any user line for a row with
+    /// no user, so a wildcard `.pgpass` line — the shape those files most often
+    /// have — handed over the user's real production password **and** their
+    /// login, rendered the row as `bob@db.mallory.example` with no note, and
+    /// ticked it. The first connect sends the credential to that host.
+    #[test]
+    fn a_picked_file_gets_no_password_for_a_server_the_pgpass_never_names() {
+        let mut found = vec![imported(
+            {
+                let mut c = blank(POSTGRES);
+                c.host = "db.mallory.example".into();
+                c.port = 5432;
+                c.database = "analytics".into();
+                c
+            },
+            ImportSource::Url,
+        )];
+        let entries = pgpass_entries("*:*:*:bob:hunter2\nreal.example:5432:shop:bob:hunter2\n");
+        fill_missing_passwords(&mut found, &entries, PgpassScope::PickedFile);
+        assert!(
+            found[0].connection.password.is_empty(),
+            "a wildcard line must not complete a host this machine never listed"
+        );
+        assert!(found[0].connection.user.is_empty(), "nor lend it a login");
+    }
+
+    /// The same wildcard line *is* allowed to complete a row for a server the
+    /// file names outright — that is a server the user already has a password
+    /// for, so nothing moved. It is still marked and left unticked, because a
+    /// credential going into a row from a file somebody sent is worth seeing.
+    #[test]
+    fn a_picked_file_may_be_completed_for_a_server_the_pgpass_does_name() {
+        let mut found = vec![imported(
+            {
+                let mut c = blank(POSTGRES);
+                c.host = "real.example".into();
+                c.port = 5432;
+                c.database = "shop".into();
+                c
+            },
+            ImportSource::DataGrip,
+        )];
+        let entries = pgpass_entries("*:*:*:bob:hunter2\nreal.example:5432:other:bob:pw\n");
+        fill_missing_passwords(&mut found, &entries, PgpassScope::PickedFile);
+        assert_eq!(found[0].connection.password, "hunter2");
+        assert!(found[0].has(ImportNote::PasswordFromPgpass));
+        assert!(
+            !found[0].preselected(),
+            "the user should have to tick this one themselves"
+        );
+    }
+
+    /// And *Scan installed clients* is unchanged: rows and `.pgpass` came off
+    /// the same machine, so a wildcard completes anything and nothing is
+    /// flagged. Narrowing that too would have made the feature's headline path
+    /// worse for a threat that is not present.
+    #[test]
+    fn a_scan_of_this_machines_own_clients_is_not_narrowed() {
+        let mut found = vec![imported(
+            {
+                let mut c = blank(POSTGRES);
+                c.host = "pg.example".into();
+                c.port = 5432;
+                c.database = "world".into();
+                c
+            },
+            ImportSource::DBeaver,
+        )];
+        fill_missing_passwords(
+            &mut found,
+            &pgpass_entries("*:*:*:bob:hunter2\n"),
+            PgpassScope::OwnClients,
+        );
+        assert_eq!(found[0].connection.password, "hunter2");
+        assert_eq!(found[0].connection.user, "bob");
+        assert!(!found[0].has(ImportNote::PasswordFromPgpass));
+        assert!(found[0].preselected());
+    }
+
+    /// libpq matches a `.pgpass` database field byte-exactly, and `app` and
+    /// `App` are two different PostgreSQL databases — so the `app` line's
+    /// password was landing on the `App` connection, ticked and unnoted. The
+    /// *host* stays case-insensitive, because DNS is.
+    #[test]
+    fn a_pgpass_database_matches_exactly_while_a_host_ignores_case() {
+        let row = |db: &str, host: &str| {
+            imported(
+                {
+                    let mut c = blank(POSTGRES);
+                    c.host = host.into();
+                    c.port = 5432;
+                    c.database = db.into();
+                    c.user = "u".into();
+                    c
+                },
+                ImportSource::Url,
+            )
+        };
+        let entries = pgpass_entries("pg.example:5432:app:u:secret\n");
+
+        let mut found = vec![row("App", "pg.example")];
+        fill_missing_passwords(&mut found, &entries, PgpassScope::OwnClients);
+        assert!(
+            found[0].connection.password.is_empty(),
+            "`App` is not the `app` the line names"
+        );
+
+        let mut found = vec![row("app", "PG.Example")];
+        fill_missing_passwords(&mut found, &entries, PgpassScope::OwnClients);
+        assert_eq!(
+            found[0].connection.password, "secret",
+            "one host, two cases"
+        );
     }
 
     #[test]
