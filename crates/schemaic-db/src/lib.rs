@@ -4291,6 +4291,16 @@ impl Db {
 /// also the backpressure — reading a 2 GB file as fast as the disk allows, into
 /// a queue the server drains one statement at a time, is how a load comes to
 /// hold the whole file in memory after all.
+///
+/// **It bounds statements, not bytes, and the real ceiling is the product.**
+/// Sixty-four `mysqldump` extended `INSERT`s is a few tens of megabytes, which
+/// is the case this was sized for; sixty-four statements from a dump written at
+/// a 16 MB `max_allowed_packet` is a gigabyte, and the reader's own
+/// `MAX_PENDING_BYTES` (256 MB) bounds one *unfinished* statement rather than
+/// the queue behind it. So "cannot pile up in memory" is true of the files this
+/// meets and not a guarantee. Bounding the queue in bytes instead is the honest
+/// fix and needs a real large-packet dump to size; until then this says what it
+/// actually promises.
 pub const SCRIPT_QUEUE: usize = 64;
 
 impl Db {

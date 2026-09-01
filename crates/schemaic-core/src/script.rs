@@ -42,8 +42,21 @@ pub struct Statement {
     pub sql: String,
     /// 1-based line the statement starts on, for naming a failure.
     pub line: u64,
-    /// Byte offset of the statement's first byte in the file, for a progress
-    /// bar that can be honest about a file whose statement count is unknown.
+    /// Byte offset of the statement's first byte in the **decoded text**, for a
+    /// progress bar that can be honest about a file whose statement count is
+    /// unknown.
+    ///
+    /// **Not the file offset, on a file that did not decode cleanly.** Decoding
+    /// is not length-preserving: an invalid byte becomes a three-byte `U+FFFD`,
+    /// so on a Latin-1 file this runs ahead of the real position by two per
+    /// mis-encoded byte (measured 17 where the file says 13). A leading BOM goes
+    /// the other way and is accounted for.
+    ///
+    /// It said "in the file", which is a trap for the first caller rather than a
+    /// wrong number today — nothing reads this yet. The honest file position is
+    /// [`Splitter::consumed`], which counts what was handed in; use that for a
+    /// progress bar, and this only where a decoded-text offset is what is
+    /// wanted.
     pub offset: u64,
 }
 
@@ -322,6 +335,16 @@ const OBJECT_KINDS: &[&str] = &[
 /// [`sql::leading_words`] for why eight is the floor.
 const KIND_WORDS: usize = 12;
 
+/// What a statement [`statement_kind`] cannot name is called in the histogram.
+///
+/// **A word, not a silent omission.** These were dropped from
+/// [`Probe::kinds`] while still counted in [`Probe::statements`], so the summary
+/// and the list beneath it disagreed — a `mysqldump` preamble that opens with
+/// `/*!40101 SET …*/` conditional comments reads "3 statements" over a histogram
+/// of one, and nothing on screen said which of the two was wrong. Not a verb, so
+/// it cannot be mistaken for one the engine has.
+pub const UNCLASSIFIED: &str = "Other";
+
 /// What this statement *does*, in the words the modal reads out: `INSERT`,
 /// `CREATE TABLE`, `DROP VIEW`.
 ///
@@ -517,6 +540,13 @@ pub struct Probe {
     pub statements: usize,
     /// Kinds and their counts, commonest first, ties by name so the readout is
     /// stable between two probes of the same file.
+    ///
+    /// **Sums to [`Self::statements`]**, including the statements
+    /// [`statement_kind`] could not name — those are counted under
+    /// [`UNCLASSIFIED`] rather than dropped. They used to be dropped, so a
+    /// `mysqldump` preamble read "3 statements" over a histogram of one, and the
+    /// summary and the list beneath it disagreed with no way to tell which was
+    /// wrong.
     pub kinds: Vec<(String, usize)>,
     /// The probe stopped before the end of the file, so **every count here is a
     /// floor**. The modal says `400+`, not `400`.
@@ -579,9 +609,13 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
     let mut own_transaction = false;
     let mut destructive = 0usize;
     for s in &stmts {
-        let Some(kind) = statement_kind(&s.sql, dialect) else {
-            continue;
-        };
+        // **Counted, not dropped.** A statement `statement_kind` cannot name is
+        // still a statement the run will send, and dropping it from the
+        // histogram made the summary and the list beneath it disagree — a
+        // `mysqldump` preamble read "3 statements" over a histogram of one, with
+        // nothing saying which number was wrong. It is also asked whether it
+        // destroys anything, which the old shape never did.
+        let kind = statement_kind(&s.sql, dialect).unwrap_or_else(|| UNCLASSIFIED.to_string());
         // Both spellings our own dump writes — `START TRANSACTION` on MySQL,
         // `BEGIN` on PostgreSQL and SQLite (`dump::transaction_sql`).
         if kind == "BEGIN" || kind == "START" {
@@ -1112,6 +1146,41 @@ mod tests {
             .own_transaction
         );
         assert!(!probed("INSERT INTO t VALUES (1);").own_transaction);
+    }
+
+    /// **The histogram sums to the summary.** A statement `statement_kind`
+    /// cannot name was counted in `statements` and dropped from `kinds`, so a
+    /// `mysqldump` preamble read "3 statements" over a histogram of one, with
+    /// nothing on screen saying which of the two numbers was wrong.
+    #[test]
+    fn a_statement_with_no_recognisable_kind_is_still_in_the_histogram() {
+        // A `mysqldump` preamble: two conditional-comment `SET`s that classify,
+        // and a bare `/*!…*/` block that does not.
+        let p = probed(
+            "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n\
+             /*!40103 SET TIME_ZONE='+00:00' */;\n\
+             CREATE TABLE t (a int);\n",
+        );
+        assert_eq!(
+            p.kinds.iter().map(|(_, n)| n).sum::<usize>(),
+            p.statements,
+            "the histogram and the summary disagree: {:?}",
+            p.kinds
+        );
+
+        // And a genuinely unnameable one is named rather than vanishing.
+        let p = probed("(SELECT 1) UNION (SELECT 2);\n((1));\n");
+        assert_eq!(
+            p.kinds.iter().map(|(_, n)| n).sum::<usize>(),
+            p.statements,
+            "{:?}",
+            p.kinds
+        );
+        assert!(
+            p.kinds.iter().any(|(k, _)| k == UNCLASSIFIED),
+            "{:?}",
+            p.kinds
+        );
     }
 
     /// **The composition, not the strip.** A splitter round-trip over a BOM'd
