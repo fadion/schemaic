@@ -1663,7 +1663,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     never happened: a batch stops at its first failure and reports the rest `Cancelled` without
     dispatching them, so a 60-statement script failing at statement 2 evicted the connection's 50
     real entries in favour of 48 that never ran. Deliberately **not** applied to a single run —
-    one the user cancels *was* dispatched and may have written something. `RunResult::loaded`/
+    one the user cancels *was* dispatched and may have written something. `remove` is the row
+    menu's single-entry delete, and its key is **`(conn_id, sql)` because that is the identity
+    `push` maintains**: `push` drops any earlier entry with the same pair before inserting, so at
+    most one can be in the log at a time, and `remove` is that predicate read backwards. The
+    coupling is real and neither function states it alone, which is why the test that holds the
+    seam is `remove_undoes_a_push_and_a_push_undoes_a_remove` rather than a pin on either side of
+    it. `run_id` looks like the better key and is not — it is `0` on everything written before it
+    existed, so it names a *run* and not an entry, and deleting by it would take every legacy row
+    at once; `ts` is no better, since re-running a statement bubbles its entry to the top with a
+    fresh one and a menu built before that bump would miss its target. It `retain`s rather than
+    dropping the first match (`push` cannot make a duplicate, a hand-edited `history.json` can, and
+    leaving a copy behind reads as the delete having failed) and returns whether anything went, for
+    `push`'s reason: the app rewrites the whole file on every mutation, so a right-click on a row
+    that is already gone should not spend that write. `RunResult::loaded`/
     `failed` own the rows-vs-`affected` choice and the `rows_capped` rule, and `outcome_line` the
     facts line's composition, so both are in core rather than in a view builder: a wrong
     `rows_capped` writes a number into a log read long after the grid it came from. `preview`
@@ -3742,6 +3755,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     memo is tracked in the row `dyn_container`'s trigger tuple alongside `visible` and `search` —
     two connections that both have no history yield the same empty `visible`, and without it the
     rows would stay built with the previous engine's lexer.
+    **A row's right-click menu takes the snippet library's route exactly** —
+    `menus.close_except(Some(MenuId::Popup))`, `popup_anchor` cleared so the panel opens at the
+    pointer, `popup_width` from `menu_panel_width(&entries)`, then the fill — and the width is
+    *measured* rather than a constant for the reason recorded there: `popup_width` is the panel's
+    `min_width`, so a number picked by eye becomes a floor the rows cannot pull back in. `row_menu`
+    offers **Open in new tab** (what the single click already does) and **Delete**, with a
+    `MenuEntry::Separator` before the destructive one, the same convention the library's row menu
+    follows. **Delete is deliberately not behind the shared confirm the trash button uses**: that
+    one clears a whole connection's log at once and names the count in the modal, while this
+    destroys the one row under the pointer and re-running the statement records it again — a modal
+    would cost more than the mistake it prevents. The opener is built **once in `history_panel`**
+    as an `Rc<dyn Fn(HistoryEntry)>` that `history_row` takes as a single parameter, rather than
+    assembled per row: `overlay` and `menus` are panel-wide `Copy` bundles, threading them through
+    every row would say otherwise, and the row goes on taking only what it draws with.
   - `snippet_edit.rs` — the snippet editor modal: **the one place a saved query's body can be
     changed**, with its name and abbrev alongside. The panel's inline fields cover the two
     one-word edits because those are the same act as renaming a tab; a body is SQL, multi-line, and

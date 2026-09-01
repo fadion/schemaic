@@ -3538,6 +3538,12 @@ pub struct HistoryActions {
     /// Reopen a history entry in a new tab: seeds the SQL, the database it ran
     /// against, and the originating tab's custom name (does NOT run it).
     pub open: Rc<dyn Fn(HistoryEntry)>,
+    /// Delete one entry (the row menu), persisting. Takes the whole entry
+    /// because `(conn_id, sql)` is what identifies it — see
+    /// [`schemaic_core::history::remove`]. Unlike [`Self::clear`] this is not
+    /// behind a confirm: it destroys one row that the user right-clicked, and
+    /// re-running the statement records it again.
+    pub remove: Rc<dyn Fn(HistoryEntry)>,
 }
 
 /// What the Server Activity panel currently has to show.
