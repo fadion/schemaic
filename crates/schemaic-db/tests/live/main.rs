@@ -25,10 +25,12 @@
 //! the one thing its name does not say.
 
 mod cases;
+mod ddl;
 mod editable;
 mod endpoint;
 mod scratch;
 mod suite;
+mod writeback;
 
 /// Expand each named [`suite`] function into one test per server.
 ///
@@ -86,6 +88,26 @@ live_suite!(
         the_same_column_twice_refuses_the_whole_table,
         a_binary_column_is_read_only_inside_an_editable_row,
         one_table_offers_itself_as_the_insert_target,
+    ],
+    ddl: [
+        an_introspected_table_diffs_to_nothing_against_its_own_draft,
+        an_added_column_lands_and_reads_back_as_drafted,
+        a_dropped_column_goes_and_the_rest_stays,
+        a_renamed_column_keeps_its_data,
+        a_retyped_column_reads_back_as_the_new_type,
+        a_refused_plan_says_where_it_stopped,
+    ],
+    writeback: [
+        a_staged_update_writes_exactly_the_row_it_names,
+        an_update_to_an_unchanged_value_still_counts_as_one_row,
+        a_staged_insert_lands_with_defaults_for_what_it_omits,
+        a_staged_delete_removes_exactly_its_row,
+        a_staged_null_is_written_as_a_null,
+        deletes_run_before_inserts_so_a_unique_key_can_be_reused,
+        a_key_that_matches_no_row_fails_the_batch_and_undoes_the_rest,
+        a_key_that_matches_two_rows_fails_the_batch_and_undoes_the_rest,
+        a_failed_batch_says_what_the_rollback_actually_undid,
+        an_empty_batch_writes_nothing,
     ],
 );
 

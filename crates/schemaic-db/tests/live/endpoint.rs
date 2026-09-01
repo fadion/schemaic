@@ -51,6 +51,22 @@ pub struct Target {
     /// the same reason `namespace` is: what differs between servers belongs in
     /// the table describing them, not in an `if` inside a test.
     pub binary_type: &'static str,
+    /// The table clause that makes a table **non-transactional**, where this
+    /// server has one — MySQL's `MyISAM`, which accepts `BEGIN`/`ROLLBACK` and
+    /// ignores them. `None` on PostgreSQL, which has no such table.
+    ///
+    /// It is here so `a_failed_batch_says_what_the_rollback_actually_undid` can
+    /// assert both halves of [`schemaic_core::model::Rollback`] where both
+    /// exist, and the honest half where only one does — rather than skipping.
+    pub non_transactional: Option<&'static str>,
+    /// Does a **DDL** plan roll back as a whole on this server?
+    ///
+    /// PostgreSQL's `run_ddl` wraps the plan in `BEGIN`/`ROLLBACK` and its DDL
+    /// honours it, so a refused plan applies *nothing*. MySQL and MariaDB commit
+    /// each `ALTER` as it runs, so the statements before the failure are on the
+    /// table for good — which is why `DdlError::applied` exists and why the
+    /// preview's failure message counts it.
+    pub transactional_ddl: bool,
     /// The types this server is asked to round-trip, and the ones only it has.
     /// Two slices rather than one so MySQL and MariaDB can share the twenty they
     /// agree on and still each own the one they do not — see [`cases`].
@@ -66,6 +82,8 @@ pub static MARIADB: Target = Target {
     default_user: "schemaic",
     namespace: None,
     binary_type: "VARBINARY(4)",
+    non_transactional: Some("ENGINE=MyISAM"),
+    transactional_ddl: false,
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
 };
@@ -78,6 +96,8 @@ pub static MYSQL: Target = Target {
     default_user: "schemaic",
     namespace: None,
     binary_type: "VARBINARY(4)",
+    non_transactional: Some("ENGINE=MyISAM"),
+    transactional_ddl: false,
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
 };
@@ -90,6 +110,8 @@ pub static POSTGRES: Target = Target {
     default_user: "schemaic",
     namespace: Some("public"),
     binary_type: "bytea",
+    non_transactional: None,
+    transactional_ddl: true,
     types: cases::POSTGRES,
     extra_types: &[],
 };
