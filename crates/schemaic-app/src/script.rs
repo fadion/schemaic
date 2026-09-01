@@ -40,6 +40,23 @@ const BLOCK: usize = 256 * 1024;
 /// from turning into one 256 MB allocation at the ceiling.
 const MAX_BLOCK: usize = 32 * 1024 * 1024;
 
+/// How much to read next, given what the splitter is still holding.
+///
+/// **The whole of the linearity fix, and it was one expression inside the
+/// loop.** `Splitter::split` re-scans its buffer from the start on every block,
+/// so a statement spanning *m* blocks costs O(m²·block): a file with no
+/// terminator in it at all — a CSV renamed `.sql`, a dump truncated inside a
+/// string literal — grows the buffer to `MAX_PENDING_BYTES` and would re-scan a
+/// quarter of a gigabyte a thousand times before being refused, which is
+/// minutes of a pinned thread before the message saying the file is not a
+/// script. Doubling the read makes the number of re-scans logarithmic.
+///
+/// Extracted so that property can be asserted: written inline, `let want =
+/// BLOCK;` restored the quadratic cost and left the workspace green.
+fn next_read(pending: usize) -> usize {
+    BLOCK.max(pending / 2).min(MAX_BLOCK)
+}
+
 /// Run a script to completion, reporting progress as the file is consumed.
 ///
 /// Returns the outcome rather than reporting it, so the caller owns the single
@@ -106,7 +123,7 @@ fn read(
         // thousand times before being refused: minutes of a pinned thread before
         // the message saying the file is not a script. Doubling the read makes
         // the number of re-scans logarithmic instead.
-        let want = BLOCK.max(splitter.pending() / 2).min(MAX_BLOCK);
+        let want = next_read(splitter.pending());
         if block.len() < want {
             block.resize(want, 0);
         }
@@ -150,6 +167,44 @@ fn read(
 mod tests {
     use super::*;
     use schemaic_core::script::ExecEnd;
+
+    /// **The linearity fix, which was one expression with no test.** Writing
+    /// `let want = BLOCK;` where it lived left the whole workspace green while a
+    /// file with no terminator in it re-scanned a quarter of a gigabyte a
+    /// thousand times — minutes of a pinned thread before the message saying the
+    /// file is not a script.
+    ///
+    /// The property is that the read *grows with what is held*, so the number of
+    /// re-scans over a buffer growing to `MAX_PENDING_BYTES` is logarithmic
+    /// rather than linear. Asserted as the count of reads it takes to get there,
+    /// which is the thing that actually hurt.
+    #[test]
+    fn the_read_grows_with_what_is_still_unfinished() {
+        // Small files read a whole block; the growth only starts once more than
+        // two blocks are held.
+        assert_eq!(next_read(0), BLOCK);
+        assert_eq!(next_read(BLOCK), BLOCK);
+        assert_eq!(next_read(4 * BLOCK), 2 * BLOCK);
+        // And it never becomes one enormous allocation.
+        assert_eq!(next_read(usize::MAX), MAX_BLOCK);
+
+        // The count that matters: filling the pending ceiling costs tens of
+        // reads, not thousands. A fixed `BLOCK` needs
+        // `MAX_PENDING_BYTES / BLOCK` = 1024 of them.
+        let ceiling = schemaic_core::script::MAX_PENDING_BYTES;
+        let mut held = 0usize;
+        let mut reads = 0u32;
+        while held < ceiling {
+            held += next_read(held);
+            reads += 1;
+            assert!(reads < 10_000, "the read is not growing at all");
+        }
+        assert!(
+            reads < 64,
+            "{reads} reads to reach the ceiling — the growth is gone              (a fixed block takes {})",
+            ceiling / BLOCK
+        );
+    }
 
     /// The reader's contract, driven over a real file: every statement handed
     /// over in order, and `Eof` at the end.
