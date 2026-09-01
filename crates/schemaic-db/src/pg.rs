@@ -206,8 +206,23 @@ pub(crate) async fn cancel_query(db: &Db, token: &tokio_postgres::CancelToken) {
 /// health checks) — PostgreSQL has no server-level connection. Tries the usual
 /// always-present candidates in turn so it works whether or not `postgres` exists.
 pub(crate) async fn connect_maintenance(db: &Db) -> Result<Client, DbError> {
+    connect_maintenance_avoiding(db, None).await
+}
+
+/// [`connect_maintenance`], but never landing on `avoid`.
+///
+/// **`DROP DATABASE` cannot run on a connection to the database it drops** —
+/// *"cannot drop the currently open database"* — and the configured database is
+/// the *first* maintenance candidate, so dropping the one a connection names
+/// would otherwise pick precisely the connection that cannot perform it. The
+/// exclusion is passed to [`maintenance_candidates`] rather than filtered here,
+/// so the decision stays in the pure function that already has tests on it.
+pub(crate) async fn connect_maintenance_avoiding(
+    db: &Db,
+    avoid: Option<&str>,
+) -> Result<Client, DbError> {
     let mut last: Option<DbError> = None;
-    for cand in maintenance_candidates(db.database(), &db.user) {
+    for cand in maintenance_candidates(db.database(), &db.user, avoid) {
         match connect_probe(db, cand).await {
             Ok(c) => return Ok(c),
             // The server answered about *this database*; another may work.
@@ -238,13 +253,25 @@ pub(crate) async fn connect_maintenance(db: &Db) -> Result<Client, DbError> {
 ///
 /// Split out from the connect loop so the order is a decision with a test on it
 /// rather than a literal in the middle of an I/O function.
-fn maintenance_candidates<'a>(configured: Option<&'a str>, user: &'a str) -> Vec<&'a str> {
+///
+/// `avoid` drops one name from the list wherever it appears — the database a
+/// `DROP DATABASE` is about, which cannot be the one the statement runs on. It
+/// is dropped rather than moved to the back: a connection to it is not a worse
+/// candidate for that plan, it is an impossible one.
+fn maintenance_candidates<'a>(
+    configured: Option<&'a str>,
+    user: &'a str,
+    avoid: Option<&str>,
+) -> Vec<&'a str> {
     let mut out = Vec::with_capacity(4);
     out.extend(configured);
     for fallback in ["postgres", user, "template1"] {
         if !fallback.is_empty() && !out.contains(&fallback) {
             out.push(fallback);
         }
+    }
+    if let Some(avoid) = avoid {
+        out.retain(|c| *c != avoid);
     }
     out
 }
@@ -560,6 +587,55 @@ pub(crate) async fn run_ddl(
     if let Err(e) = client.batch_execute("COMMIT").await {
         let _ = client.batch_execute("ROLLBACK").await;
         return Err(fail(stmts.len().saturating_sub(1), e.to_string()));
+    }
+    Ok(())
+}
+
+/// PostgreSQL's arm of [`crate::Db::run_server_ddl`] — `CREATE DATABASE` and
+/// `DROP DATABASE`.
+///
+/// Two things separate it from [`run_ddl`] above, and neither is a matter of
+/// taste:
+///
+/// - **No transaction.** PostgreSQL refuses both statements inside one —
+///   *"CREATE DATABASE cannot run inside a transaction block"* — so the `BEGIN`
+///   that makes every other plan here all-or-nothing is exactly what would make
+///   this one fail. There is nothing to give up by leaving it out: a
+///   server-level plan is a single statement, so atomicity across statements is
+///   not a property it could have had.
+/// - **A connection that is not to the target.** `run_ddl` connects to the
+///   database it is changing; here that database is the thing being created (so
+///   it cannot be connected to) or dropped (so it must not be). The maintenance
+///   connection is picked with the target excluded — see
+///   [`connect_maintenance_avoiding`].
+///
+/// `applied` is therefore the count of statements that really did land, with no
+/// rollback to qualify it.
+pub(crate) async fn run_server_ddl(
+    db: &Db,
+    avoid: Option<&str>,
+    stmts: &[String],
+    cancel: CancellationToken,
+) -> Result<(), crate::DdlError> {
+    let client = connect_maintenance_avoiding(db, avoid)
+        .await
+        .map_err(|e| crate::DdlError {
+            message: e.to_string(),
+            at: 0,
+            applied: 0,
+        })?;
+    for (i, sql) in stmts.iter().enumerate() {
+        let step = tokio::select! {
+            r = client.batch_execute(sql) => r.map_err(|e| e.to_string()),
+            _ = cancel.cancelled() => Err("cancelled".to_string()),
+        };
+        if let Err(e) = step {
+            return Err(crate::DdlError {
+                message: e,
+                at: i,
+                applied: i,
+            });
+        }
     }
     Ok(())
 }
@@ -2187,6 +2263,43 @@ pub(crate) async fn trigger_functions(
     routines_where(&client, &trigger_function_filter()).await
 }
 
+/// The roles a database or schema could be **owned by**, in name order.
+///
+/// A *shortcut* for the Owner field, which stays free text — so this list only
+/// has to be useful, not exhaustive, and a role created since the modal opened
+/// can still be typed. The `pg_` prefixed roles are excluded because they are
+/// the server's own bookkeeping (`pg_read_all_data`, `pg_monitor` and their
+/// kin): they are not who anything is owned by, and they would be most of a
+/// short list on a fresh cluster.
+///
+/// **Both login roles and groups**, deliberately — `OWNER` takes either, and
+/// filtering on `rolcanlogin` would hide precisely the group roles a database is
+/// most often deliberately owned by.
+///
+/// Server-level, on the maintenance connection: `pg_roles` is a cluster-wide
+/// catalogue, and the caller may be asking in order to create a database that
+/// does not exist yet.
+pub(crate) async fn roles(db: &Db) -> Result<Vec<String>, DbError> {
+    let client = connect_maintenance(db).await?;
+    // **`left(…, 3)`, not `NOT LIKE 'pg\_%'`.** That pattern needs the backslash
+    // to survive the string literal and reach `LIKE` as its escape, which is
+    // true only while `standard_conforming_strings` is on. With it off — legacy,
+    // and still settable per database or per role — the literal consumes the
+    // backslash, `LIKE` sees `pg_%` with `_` as a single-character wildcard, and
+    // roles named `pgadmin` or `pgbouncer` vanish from the menu on the very
+    // server most likely to have them. A prefix comparison has no escaping to
+    // depend on.
+    let rows = query_all(
+        &client,
+        "SELECT rolname FROM pg_roles WHERE left(rolname, 3) <> 'pg_' ORDER BY rolname",
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect())
+}
+
 /// The browse list against a client the caller already has — what `fetch_schema`
 /// uses, so a schema refresh doesn't open a second connection for it.
 pub(crate) async fn routines_on(client: &Client) -> Result<Vec<RoutineInfo>, DbError> {
@@ -3227,7 +3340,7 @@ mod tests {
     #[test]
     fn a_configured_database_is_tried_before_the_guesses() {
         assert_eq!(
-            maintenance_candidates(Some("defaultdb"), "avnadmin"),
+            maintenance_candidates(Some("defaultdb"), "avnadmin", None),
             ["defaultdb", "postgres", "avnadmin", "template1"]
         );
     }
@@ -3236,7 +3349,7 @@ mod tests {
     #[test]
     fn no_configured_database_leaves_the_old_order_alone() {
         assert_eq!(
-            maintenance_candidates(None, "app"),
+            maintenance_candidates(None, "app", None),
             ["postgres", "app", "template1"]
         );
     }
@@ -3247,7 +3360,7 @@ mod tests {
     #[test]
     fn a_candidate_is_never_tried_twice() {
         assert_eq!(
-            maintenance_candidates(Some("postgres"), "postgres"),
+            maintenance_candidates(Some("postgres"), "postgres", None),
             ["postgres", "template1"]
         );
     }
@@ -3256,7 +3369,36 @@ mod tests {
     /// before, which spends a round trip to be told so.
     #[test]
     fn an_empty_username_is_not_a_candidate() {
-        assert_eq!(maintenance_candidates(None, ""), ["postgres", "template1"]);
+        assert_eq!(
+            maintenance_candidates(None, "", None),
+            ["postgres", "template1"]
+        );
+    }
+
+    /// **`DROP DATABASE` cannot run on a connection to its own target**, and the
+    /// configured database is tried *first* — so dropping the database a
+    /// connection names would pick, before any other candidate, the one
+    /// connection that cannot perform the statement. The exclusion covers every
+    /// slot rather than the first: `app` reaches this list as the username
+    /// guess too, so filtering only the configured entry would still land on it
+    /// for a user whose role and database share a name, which is the default
+    /// PostgreSQL setup.
+    #[test]
+    fn the_database_being_dropped_is_never_the_one_it_runs_on() {
+        assert_eq!(
+            maintenance_candidates(Some("shop"), "app", Some("shop")),
+            ["postgres", "app", "template1"]
+        );
+        assert_eq!(
+            maintenance_candidates(Some("app"), "app", Some("app")),
+            ["postgres", "template1"]
+        );
+        // And nothing is filtered when the plan is a create, which has no target
+        // to avoid — the same list the old signature produced.
+        assert_eq!(
+            maintenance_candidates(Some("shop"), "app", None),
+            ["shop", "postgres", "app", "template1"]
+        );
     }
 
     /// The reason a TLS handshake failed lives only in `source()`, so a message
