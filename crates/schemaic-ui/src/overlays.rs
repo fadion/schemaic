@@ -1200,16 +1200,25 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let iui = import_ui.clone();
                         let db = menu.name.clone();
-                        entries.push(MenuEntry::action("Import", move || {
-                            let ctx = crate::table_designer::edit_ctx(&iui);
-                            crate::script_view::open_script(
-                                iui.clone(),
-                                ctx.conn_id,
-                                db.clone(),
-                                None,
-                                ctx.dialect,
-                            );
-                        }));
+                        // Dimmed on a read-only connection, like the `Create ▸`
+                        // two rows below. The run is refused either way
+                        // (`sql::script_verdict` blocks before the file is
+                        // opened), but without this the refusal arrives after a
+                        // modal, a file dialog and an 8 MB probe — an answer the
+                        // menu could have given for free.
+                        entries.push(
+                            MenuEntry::action("Import", move || {
+                                let ctx = crate::table_designer::edit_ctx(&iui);
+                                crate::script_view::open_script(
+                                    iui.clone(),
+                                    ctx.conn_id,
+                                    db.clone(),
+                                    None,
+                                    ctx.dialect,
+                                );
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
                     }
                     {
                         let dui = import_ui.clone();
@@ -1394,16 +1403,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let iui = import_ui.clone();
                         let db = database.clone();
                         let ns = menu.name.clone();
-                        entries.push(MenuEntry::action("Import", move || {
-                            let ctx = crate::table_designer::edit_ctx(&iui);
-                            crate::script_view::open_script(
-                                iui.clone(),
-                                ctx.conn_id,
-                                db.clone(),
-                                Some(ns.clone()),
-                                ctx.dialect,
-                            );
-                        }));
+                        // Dimmed on a read-only connection, as on the database
+                        // node above and for the same reason.
+                        entries.push(
+                            MenuEntry::action("Import", move || {
+                                let ctx = crate::table_designer::edit_ctx(&iui);
+                                crate::script_view::open_script(
+                                    iui.clone(),
+                                    ctx.conn_id,
+                                    db.clone(),
+                                    Some(ns.clone()),
+                                    ctx.dialect,
+                                );
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
                     }
                     // This one *is* confined: the picker is filtered to the
                     // namespace, so a `sales` export carries no `public` table.

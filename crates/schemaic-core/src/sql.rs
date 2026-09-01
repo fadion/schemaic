@@ -2332,6 +2332,13 @@ mod tests {
 
     /// Blocked, not confirmed: an unscoped script on PostgreSQL builds into a
     /// maintenance database the schema tree can never show again.
+    ///
+    /// **No caller can produce this policy today** — `script_view::policy`
+    /// hard-codes `no_database: false`, because the modal is only reachable from
+    /// a database node. The arm is kept, and tested, because the property that
+    /// matters is the *relation*: this gate must be no weaker than `run_verdict`
+    /// for **every** policy, including the ones a second caller might one day
+    /// hand it. Deleting it would leave that relation true only by accident.
     #[test]
     fn a_script_with_no_database_is_blocked_outright() {
         let policy = super::GuardPolicy {

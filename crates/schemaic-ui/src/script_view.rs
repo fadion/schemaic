@@ -58,6 +58,13 @@ pub(crate) fn open_script(
     dialect: SqlDialect,
 ) {
     let s = ui.script;
+    // **Clear the sibling this one shares a tuple element with.** The two are
+    // painted in one nested `stack` and each fills the modal layer when open, so
+    // both being set would stack two full-screen overlays. "Only ever one at a
+    // time" was true by reachability alone; the trigger/routine/event group next
+    // to it states the same rule and enforces it the same way, and relying on
+    // reachability is how that group's members once ended up on screen together.
+    ui.dump.target.set(None);
     s.path.set(None);
     s.probe.set(None);
     s.probing.set(false);

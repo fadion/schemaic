@@ -3779,8 +3779,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     running. The second step is `core::script::probe`'s readout — the kind histogram, what the file
     destroys, and whether it opens its own transaction — with every count printed through
     `count_label`, so a bounded probe says `400+` rather than a total it did not earn.
-    **Run is `ActionKind::Danger`, not `Primary`.** Every other modal's confirming button is the safe
-    one; this runs a file the user has read a *summary* of, against a database, with no undo.
+    **Run is `ActionKind::Primary`** — the same button the table import's own *Import* is. It was
+    `Danger` for one build, on the argument that this runs someone else's DDL with no undo; what
+    that actually produced was one modal reachable from two menu entries wearing two different
+    confirming colours, which reads as two features rather than as a warning. What the file will do
+    is said in words, in the panel, where it can be specific about *this* file. `open_script` clears
+    `ui.dump.target` and `open_dump` clears `ui.script.target`: the two share one tuple element in
+    the modal layer and each fills it when open, so both being set would stack two full-screen
+    overlays — a rule the trigger/routine/event group next to them also states, and one that relying
+    on reachability alone has already broken once.
     The guard is `sql::script_verdict`, asked in the same synchronous step that launches
     (`widgets::accept_launch`) — see the write-guard invariant for why it is stricter than
     `run_verdict` rather than a second, laxer gate.
