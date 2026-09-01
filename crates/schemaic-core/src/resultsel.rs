@@ -122,6 +122,51 @@ pub fn active_after_removal(panels: &[PanelRef], removed: &[u64], active: u64) -
     }
 }
 
+/// How much a pinned strip is holding, and whether that is worth saying out
+/// loud.
+///
+/// **Pinning removed the row cap as *the* memory bound and put nothing in its
+/// place.** A result is capped at 200k rows, which used to be the ceiling on
+/// what one tab could hold; a pinned panel survives every later run, so ten of
+/// them at 200k x 50 measured **2.00 GB** live, and four tabs of ten is about 8
+/// GB. Nothing capped, evicted, warned or even totalled — `retained_bytes` had
+/// exactly one consumer, a per-chip tooltip.
+///
+/// **This warns; it does not refuse.** Pinning is a deliberate act with a
+/// deliberate cost, and an app that silently declines to keep the result a user
+/// asked it to keep is worse than one that says what keeping it costs. What was
+/// missing was the *saying*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinVerdict {
+    /// Ordinary. Say nothing; a byte figure on every pin is noise.
+    Fine,
+    /// Past [`PIN_NOTICE_BYTES`] — carry the total, in bytes, so the strip can
+    /// print it.
+    Heavy(u64),
+}
+
+/// When a kept strip starts being worth a sentence.
+///
+/// A quarter of a gigabyte is roughly one 200k x 50 result, so a user reaches it
+/// by pinning one large thing rather than by working normally — which is exactly
+/// when the number is news rather than noise.
+pub const PIN_NOTICE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What the strip would be holding after pinning one more result, and whether to
+/// say so. See [`PinVerdict`].
+///
+/// Takes the total *and* the addition rather than the sum, so the caller cannot
+/// accidentally ask about the strip as it already is — the question is what the
+/// pin the user is about to make will cost.
+pub fn pin_verdict(kept_bytes: u64, adding: u64) -> PinVerdict {
+    let total = kept_bytes.saturating_add(adding);
+    if total >= PIN_NOTICE_BYTES {
+        PinVerdict::Heavy(total)
+    } else {
+        PinVerdict::Fine
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +331,40 @@ mod tests {
     #[test]
     fn a_stale_active_id_falls_back_to_the_first_survivor() {
         assert_eq!(active_after_removal(&strip(), &[2], 99), Some(1));
+    }
+
+    /// **The bound pinning removed, put back as a sentence.** A capped result
+    /// used to be the ceiling on what one tab held; a pin survives every later
+    /// run, and ten 200k x 50 results measured 2.00 GB with nothing capping,
+    /// evicting, warning or even totalling.
+    ///
+    /// It warns and does not refuse: an app that silently declines to keep what
+    /// the user asked it to keep is worse than one that says what keeping it
+    /// costs.
+    #[test]
+    fn a_strip_says_what_it_is_holding_only_once_that_is_news() {
+        let mb = |n: u64| n * 1024 * 1024;
+        // Ordinary work: a handful of small results, nothing to say.
+        assert_eq!(pin_verdict(mb(4), mb(2)), PinVerdict::Fine);
+        assert_eq!(pin_verdict(0, 0), PinVerdict::Fine);
+
+        // One large result is enough to cross it — which is the point: the user
+        // gets there by pinning something big, not by working normally.
+        assert_eq!(
+            pin_verdict(0, PIN_NOTICE_BYTES),
+            PinVerdict::Heavy(PIN_NOTICE_BYTES)
+        );
+        // Just under stays quiet, so the boundary is a boundary and not a mood.
+        assert_eq!(pin_verdict(0, PIN_NOTICE_BYTES - 1), PinVerdict::Fine);
+
+        // And it is the *total*, not the addition: nine quiet pins that add up
+        // are what the missing policy actually let through.
+        assert_eq!(
+            pin_verdict(PIN_NOTICE_BYTES, mb(1)),
+            PinVerdict::Heavy(PIN_NOTICE_BYTES + mb(1))
+        );
+
+        // Absurd totals do not wrap.
+        assert_eq!(pin_verdict(u64::MAX, mb(1)), PinVerdict::Heavy(u64::MAX));
     }
 }

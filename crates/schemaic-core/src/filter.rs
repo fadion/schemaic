@@ -186,6 +186,29 @@ pub fn rerun_statement(base: &str, gq: &GridQuery, dialect: SqlDialect) -> Optio
     crate::sql::rerunnable_for_export(&sql, dialect).then_some(sql)
 }
 
+/// [`rerun_statement`] for a result that may be **kept** — the whole decision
+/// the grid asks, in one place.
+///
+/// **The frozen half was a `return None` in a method and nothing tested it.** A
+/// pinned result is a snapshot, and every re-run in the grid lands in the panel
+/// it was launched from — so offering one on a pinned panel offers to overwrite
+/// the very thing that was pinned. Deleting that term left the workspace green
+/// while a pin regained "read all rows" and the "All rows" export, both of which
+/// destroy it. The memo that *computes* `kept` had a test; its consumer did not.
+///
+/// `base` is `None` before a result has a statement behind it at all.
+pub fn rerun_of(
+    kept: bool,
+    base: Option<&str>,
+    gq: &GridQuery,
+    dialect: SqlDialect,
+) -> Option<String> {
+    if kept {
+        return None;
+    }
+    rerun_statement(base?, gq, dialect)
+}
+
 /// Build a `WHERE`-fragment for the cell right-click "Filter by / Exclude value"
 /// actions, ready to append (with ` AND `) into the filter field. `value` is the
 /// cell's raw text, or `None` for a NULL cell.
@@ -610,6 +633,50 @@ mod tests {
         for d in EVERY_DIALECT {
             assert_eq!(rerun("", "", &[], d), None, "{d:?}");
             assert_eq!(rerun("   \n\t ", "", &[], d), None, "{d:?}");
+        }
+    }
+
+    /// **A pinned result has no statement to re-run**, and this is the term
+    /// nothing could reach: it was a `return None` inside a `GridState` method,
+    /// so deleting it left the workspace green while a pin regained "read all
+    /// rows" and the "All rows" export — both of which re-run *into* the panel
+    /// and destroy the very thing that was pinned. The memo that computes
+    /// `kept` had a test; its consumer did not.
+    #[test]
+    fn a_kept_result_has_nothing_to_rerun_whatever_is_behind_it() {
+        let gq = GridQuery::default();
+        for d in EVERY_DIALECT {
+            // The same input that is perfectly re-runnable when it is live.
+            assert_eq!(
+                rerun_of(false, Some("SELECT * FROM rental"), &gq, d).as_deref(),
+                Some("SELECT * FROM rental"),
+                "{d:?}"
+            );
+            assert_eq!(
+                rerun_of(true, Some("SELECT * FROM rental"), &gq, d),
+                None,
+                "a pin must not be offered a re-run: {d:?}"
+            );
+            // And a filtered one, where the statement is rebuilt rather than
+            // taken verbatim — the frozen term has to come first either way.
+            let filtered = GridQuery {
+                filter: "id > 1".to_string(),
+                sort: Vec::new(),
+            };
+            assert!(rerun_of(false, Some("SELECT * FROM rental"), &filtered, d).is_some());
+            assert_eq!(
+                rerun_of(true, Some("SELECT * FROM rental"), &filtered, d),
+                None
+            );
+            // No base at all: before a result has a statement behind it.
+            assert_eq!(rerun_of(false, None, &gq, d), None, "{d:?}");
+            // And the write guard still applies to a live result — the frozen
+            // term is added to it, never in place of it.
+            assert_eq!(
+                rerun_of(false, Some("DELETE FROM rental RETURNING *"), &gq, d),
+                None,
+                "{d:?}"
+            );
         }
     }
 

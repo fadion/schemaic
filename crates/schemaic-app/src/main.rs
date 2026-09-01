@@ -2405,16 +2405,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let fail_batch = {
                 let panels = panels.clone();
                 move |msg: String| {
-                    for (i, id) in panels.iter().enumerate() {
-                        tab.set_panel_state(
+                    // One `update`, as above: sixty chips must not cost sixty
+                    // rebuilds of the strip.
+                    tab.set_panel_states(panels.iter().enumerate().map(|(i, id)| {
+                        (
                             *id,
                             if i == 0 {
                                 QueryState::Failed(msg.clone())
                             } else {
                                 QueryState::Cancelled
                             },
-                        );
-                    }
+                        )
+                    }));
                 }
             };
             let db = match db_for(tab.conn_id.get_untracked()) {
@@ -2503,9 +2505,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // pinned, reordered or partly closed while the batch ran, and
                     // a positional write would then land a statement's result on
                     // somebody else's panel.
-                    for (pid, st) in panels.iter().zip(states) {
-                        tab.set_panel_state(*pid, st);
-                    }
+                    //
+                    // **In one `update`.** Writing them one at a time notified
+                    // the strip, the body's key memo, every chip and the error
+                    // bar once per statement — 0.67 ms to 263 ms at 400
+                    // statements, measured. See `Tab::set_panel_states`, and the
+                    // note there about `reactive::batch` making it worse.
+                    tab.set_panel_states(panels.iter().copied().zip(states));
                 },
             );
             let cap = row_limit.get_untracked();

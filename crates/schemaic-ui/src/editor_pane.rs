@@ -3874,11 +3874,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         QueryState::Failed(m) => Some(m),
         _ => None,
     });
+    // **Whether the shown failure is a frozen one**, which decides whether the
+    // two AI actions are offered at all — see `ShownResult::frozen`. A separate
+    // memo rather than a term in the one above, so a pin does not rebuild the
+    // bar's text and a message change does not re-ask about the pin.
+    let error_kept = create_memo(move |_| results.frozen());
     let error_bar = {
         let ai_fix = ai_fix.clone();
         dyn_container(
-            move || error_msg.get(),
-            move |state| {
+            move || (error_msg.get(), error_kept.get()),
+            move |(state, kept)| {
                 let Some(msg) = state else {
                     return empty().into_any();
                 };
@@ -3928,32 +3933,50 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // hold all three with the message still readable. It is the
                     // one of the three that has a second home — the *View* modal
                     // offers the same explanation — so it is the one that can go.
-                    dyn_container(move || error_bar_fits_explain(error_bar_w.get()), {
-                        let explain_error = explain_error.clone();
-                        move |fits: bool| {
-                            if !fits {
+                    // **Withheld on a kept result**, along with *AI fix* below:
+                    // both resolve the bar's message against the *current*
+                    // buffer, and a pin's message is a snapshot of a statement
+                    // that may no longer be in it. *View* stays — it shows the
+                    // message itself, which is still true.
+                    dyn_container(
+                        move || !kept && error_bar_fits_explain(error_bar_w.get()),
+                        {
+                            let explain_error = explain_error.clone();
+                            move |fits: bool| {
+                                if !fits {
+                                    return empty().into_any();
+                                }
+                                let explain_error = explain_error.clone();
+                                crate::widgets::sparkle_action(
+                                    "Explain",
+                                    theme::err_fix_btn,
+                                    theme::err_fix_btn_hover,
+                                    move || (explain_error)(),
+                                )
+                                // The gap to *AI fix* belongs to the button, not
+                                // to the slot: on the container it would leave
+                                // 20px of nothing behind when Explain is dropped.
+                                .style(|s| s.margin_right(theme::scaled(20.0)))
+                                .into_any()
+                            }
+                        },
+                    ),
+                    dyn_container(move || kept, {
+                        let ai_fix = ai_fix.clone();
+                        move |kept: bool| {
+                            if kept {
                                 return empty().into_any();
                             }
-                            let explain_error = explain_error.clone();
+                            let ai_fix = ai_fix.clone();
                             crate::widgets::sparkle_action(
-                                "Explain",
+                                "AI fix",
                                 theme::err_fix_btn,
                                 theme::err_fix_btn_hover,
-                                move || (explain_error)(),
+                                move || (ai_fix)(),
                             )
-                            // The gap to *AI fix* belongs to the button, not
-                            // to the slot: on the container it would leave
-                            // 20px of nothing behind when Explain is dropped.
-                            .style(|s| s.margin_right(theme::scaled(20.0)))
                             .into_any()
                         }
                     }),
-                    crate::widgets::sparkle_action(
-                        "AI fix",
-                        theme::err_fix_btn,
-                        theme::err_fix_btn_hover,
-                        move || (ai_fix)(),
-                    ),
                 ))
                 .on_resize(move |r| {
                     if (error_bar_w.get_untracked() - r.width()).abs() > 0.5 {
