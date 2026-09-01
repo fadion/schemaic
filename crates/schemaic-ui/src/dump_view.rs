@@ -63,6 +63,9 @@ pub(crate) fn open_dump(
     dialect: SqlDialect,
 ) {
     let d = ui.dump;
+    // The other half of `script_view::open_script`'s rule — the two share one
+    // tuple element in the modal layer, and each fills it when open.
+    ui.script.target.set(None);
     d.tables.set(Vec::new());
     d.chosen.set(Vec::new());
     d.progress.set(None);
