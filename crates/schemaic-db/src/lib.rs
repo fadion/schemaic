@@ -471,8 +471,16 @@ impl Db {
         found_rows: bool,
     ) -> Result<Conn, DbError> {
         // Before the driver gets a chance to report a mistyped path as an
-        // anonymous I/O error. Skipped when the plan may fall back anyway, since
-        // `prefer` names no files.
+        // anonymous I/O error.
+        //
+        // **It runs for every mode, `prefer` included, and that is the
+        // decision.** The comment here used to say it was skipped when the plan
+        // may fall back; it never was. Leaving it running means a `prefer`
+        // connection whose client-certificate path is stale fails outright
+        // rather than quietly connecting in plaintext — a refusal naming the
+        // file, which the user can fix, instead of a silent downgrade of
+        // something they deliberately configured. `prefer`'s promise is about
+        // what the *server* offers, not about tolerating a broken local setup.
         if let Some(plan) = self.tls.as_ref() {
             tls::preflight(plan)?;
         }
@@ -480,7 +488,11 @@ impl Db {
         match first {
             Ok(conn) => Ok(conn),
             Err(e) => {
-                if !self.tls.as_ref().is_some_and(|p| p.fallback_to_plaintext) {
+                if !self
+                    .tls
+                    .as_ref()
+                    .is_some_and(|p| should_retry_plaintext(p, &e))
+                {
                     return Err(DbError::Connect(e.to_string()));
                 }
                 // The plaintext error is the one worth reporting: having chosen
@@ -499,6 +511,35 @@ impl Db {
             let _ = killer.disconnect().await;
         }
     }
+}
+
+/// Should a failed MySQL connect be retried in plaintext?
+///
+/// **Only when the server said it has no TLS.** The retry's condition used to be
+/// `plan.fallback_to_plaintext` alone — the error was never looked at — so a
+/// `prefer` connection retried after *any* failure: a wrong password produced
+/// twelve connect attempts for ten pings, which doubles failed logins against
+/// `max_connect_errors` and fail2ban on a path that runs once per operation.
+/// The downgrade half is worse: one injected RST or malformed TLS record during
+/// the handshake and the whole operation continues in cleartext, which is an
+/// attacker-forceable downgrade rather than a server capability.
+///
+/// `DriverError::NoClientSslFlagFromServer` is the exact variant `prefer` exists
+/// for: the server did not advertise `CLIENT_SSL`. PostgreSQL's side already
+/// falls back only on the server's `N`, so this is also what stops the two
+/// engines meaning different things by one word in the picker.
+///
+/// Free rather than a method so it can be asserted without a live server — the
+/// whole decision is `(plan, error) -> bool`.
+pub(crate) fn should_retry_plaintext(
+    plan: &schemaic_core::connection::TlsPlan,
+    e: &mysql_async::Error,
+) -> bool {
+    plan.fallback_to_plaintext
+        && matches!(
+            e,
+            mysql_async::Error::Driver(mysql_async::DriverError::NoClientSslFlagFromServer)
+        )
 }
 
 impl Db {
@@ -4890,6 +4931,66 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The plaintext retry ───────────────────────────────────────────────
+
+    fn plan(mode: schemaic_core::connection::SslMode) -> schemaic_core::connection::TlsPlan {
+        schemaic_core::connection::Tls {
+            mode,
+            ..Default::default()
+        }
+        .plan()
+        .expect("every mode above Disable handshakes")
+    }
+
+    /// **The retry is for a server with no TLS, not for any failure at all.**
+    /// Its only condition was `plan.fallback_to_plaintext`, so `prefer` retried
+    /// after a wrong password (twelve connect attempts for ten pings, measured)
+    /// and after anything an attacker can provoke mid-handshake — one injected
+    /// RST and the whole operation continues in cleartext.
+    #[test]
+    fn prefer_falls_back_only_when_the_server_says_it_has_no_tls() {
+        use mysql_async::{DriverError, Error};
+        let prefer = plan(schemaic_core::connection::SslMode::Prefer);
+
+        assert!(should_retry_plaintext(
+            &prefer,
+            &Error::Driver(DriverError::NoClientSslFlagFromServer)
+        ));
+
+        // Everything else is a real failure to report, not a reason to
+        // downgrade. `ConnectionClosed` stands in for the whole class an
+        // attacker can force by cutting the handshake.
+        assert!(!should_retry_plaintext(
+            &prefer,
+            &Error::Driver(DriverError::ConnectionClosed)
+        ));
+        assert!(!should_retry_plaintext(
+            &prefer,
+            &Error::Io(mysql_async::IoError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset"
+            )))
+        ));
+    }
+
+    /// And no mode above `prefer` retries at all, whatever the error — offering
+    /// the second attempt to `require` would turn the strongest half of the
+    /// setting into the weakest while still reporting success.
+    #[test]
+    fn no_verifying_mode_ever_retries_in_plaintext() {
+        use mysql_async::{DriverError, Error};
+        use schemaic_core::connection::SslMode;
+        for mode in [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull] {
+            assert!(
+                !should_retry_plaintext(
+                    &plan(mode),
+                    &Error::Driver(DriverError::NoClientSslFlagFromServer)
+                ),
+                "{mode:?}"
+            );
+        }
+    }
 
     // ── The MySQL statistics half ─────────────────────────────────────────
     //
