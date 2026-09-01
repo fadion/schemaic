@@ -36,6 +36,10 @@ CA_DIR="$CERT_DIR/ca"
 OTHER_DIR="$CERT_DIR/otherca"
 TEST_HOST="${SCHEMAIC_TLS_HOST:-schemaic-tls.test}"
 TEST_PASSWORD="${SCHEMAIC_TLS_PASSWORD:-schemaic}"
+# The one database the test accounts may reach. They exist to prove a handshake
+# happened, so `SELECT 1` inside a sandbox is the whole requirement — and the
+# password above is printed in this directory's README.
+TEST_DB="${SCHEMAIC_TLS_DB:-schemaic_tls_test}"
 
 PG_CLIENTCERT=0
 FORCE=0
@@ -117,6 +121,26 @@ if [ "$TEARDOWN" = 1 ]; then
   if [ "$HAVE_MY" = 1 ]; then
     rm -f "$MY_CONFD/99-schemaic-tls.cnf"
     rm -rf "$MY_SSL_DIR"
+    # Put back whatever was in that directory before setup ran — it was
+    # `rm -rf`d here with nothing said, while `pg_hba.conf` beside it was
+    # carefully backed up and restored.
+    if [ -d "$MY_SSL_DIR.pre-schemaic-tls" ]; then
+      cp -a "$MY_SSL_DIR.pre-schemaic-tls" "$MY_SSL_DIR"
+      rm -rf "$MY_SSL_DIR.pre-schemaic-tls"
+      echo "  $MY_SSL_DIR restored from its backup"
+    fi
+    # The two accounts and their sandbox database. Leaving accounts behind is
+    # not a tidiness question: they authenticate with a password this
+    # directory's README prints.
+    if [ -n "${MY_CLIENT:-}" ]; then
+      "$MY_CLIENT" <<EOF || true
+DROP USER IF EXISTS 'schemaic_ssl'@'localhost', 'schemaic_ssl'@'127.0.0.1', 'schemaic_ssl'@'%';
+DROP USER IF EXISTS 'schemaic_x509'@'localhost', 'schemaic_x509'@'127.0.0.1', 'schemaic_x509'@'%';
+DROP DATABASE IF EXISTS \`$TEST_DB\`;
+FLUSH PRIVILEGES;
+EOF
+      echo "  dropped the schemaic_ssl / schemaic_x509 accounts and $TEST_DB"
+    fi
     systemctl restart "$MY_SERVICE" && echo "  $MY_SERVICE back to plaintext"
   fi
 
@@ -131,11 +155,24 @@ if [ "$TEARDOWN" = 1 ]; then
     systemctl restart postgresql && echo "  postgresql back to its packaged certificate"
   fi
 
-  sed -i "/[[:space:]]$TEST_HOST\$/d" /etc/hosts
+  # `$TEST_HOST` is interpolated into a regex, so a name carrying a `.` (every
+  # name here does) matches more lines than it should — and a name carrying a
+  # `/` would end the expression. Escaped, and anchored to the exact word.
+  sed -i "/[[:space:]]$(printf '%s' "$TEST_HOST" | sed 's/[.[\*^$\/]/\\&/g')\$/d" /etc/hosts
   rm -rf "$CERT_DIR"
   echo "  removed $CERT_DIR and the /etc/hosts entry"
+
+  # The Windows-profile copies, which include `client.key`. Setup writes them
+  # and teardown used to leave them: a private key sitting in a user's home
+  # directory long after the test-bed is gone.
+  WIN_DIR="$(detect_win_dir || true)"
+  if [ -n "$WIN_DIR" ] && [ -d "$WIN_DIR" ]; then
+    rm -f "$WIN_DIR/ca.crt" "$WIN_DIR/otherca.crt" "$WIN_DIR/client.crt" "$WIN_DIR/client.key"
+    rmdir "$WIN_DIR" 2>/dev/null || true
+    echo "  removed the client copies in $WIN_DIR"
+  fi
   echo
-  echo "The test users and roles are left in place; drop them by hand if you want them gone."
+  echo "PostgreSQL's test roles are left in place; drop them by hand if you want them gone."
   exit 0
 fi
 
@@ -251,7 +288,10 @@ issue "$CA_DIR"    client           "schemaic_client" ""                  client
 cp -f "$CA_DIR/ca.crt"    "$CERT_DIR/ca.crt"
 cp -f "$OTHER_DIR/ca.crt" "$CERT_DIR/otherca.crt"
 chmod 644 "$CERT_DIR"/*.crt
-chmod 644 "$CERT_DIR/client.key"
+# The client key stays 0600, like every other key here. It authenticates as
+# schemaic_x509 and, with --pg-clientcert, as a PostgreSQL LOGIN role: a
+# world-readable copy hands that to every local account. The Windows copies
+# below are chowned to the invoking user for the same reason.
 
 if [ "$CERTS_ONLY" = 1 ]; then
   say "Certificates only — servers untouched"
@@ -272,6 +312,15 @@ fi
 say "Configuring MariaDB/MySQL (TLS on, plaintext still allowed)"
 if [ "$HAVE_MY" = 1 ]; then
   mkdir -p "$MY_SSL_DIR"
+  # **Back up whatever was there first**, the way `pg_hba.conf` already is.
+  # `install` below writes over `$MY_SSL_DIR/{ca,server}.{crt,key}` and teardown
+  # `rm -rf`s the whole directory, so a machine that already had a certificate
+  # there lost it with nothing said. One snapshot, kept next to the directory
+  # and never overwritten by a second run.
+  if [ ! -d "$MY_SSL_DIR.pre-schemaic-tls" ] && [ -n "$(ls -A "$MY_SSL_DIR" 2>/dev/null)" ]; then
+    cp -a "$MY_SSL_DIR" "$MY_SSL_DIR.pre-schemaic-tls"
+    echo "  backed up $MY_SSL_DIR to $MY_SSL_DIR.pre-schemaic-tls"
+  fi
   install -o mysql -g mysql -m 644 "$CERT_DIR/ca.crt"          "$MY_SSL_DIR/ca.crt"
   install -o mysql -g mysql -m 644 "$CERT_DIR/server-good.crt" "$MY_SSL_DIR/server.crt"
   install -o mysql -g mysql -m 600 "$CERT_DIR/server-good.key" "$MY_SSL_DIR/server.key"
@@ -293,13 +342,28 @@ EOF
   systemctl restart "$MY_SERVICE"
   echo "  have_ssl is now: $("$MY_CLIENT" -Ns -e "SHOW VARIABLES LIKE 'have_ssl'" | awk '{print $2}')"
 
+  # **Scoped, and local.** These two accounts exist to prove a handshake
+  # happened: they need to log in and run `SELECT 1`, and nothing more. They
+  # used to be created at host `%` with GRANT ALL PRIVILEGES ON *.*, on a server
+  # whose bind_address is 0.0.0.0, with a password this directory's README
+  # prints — which reached every database on the machine, the real fixtures
+  # included, from anywhere on the network.
+  #
+  # `localhost` is the socket and `127.0.0.1` is what the app dials; $TEST_HOST
+  # resolves to the second.
   "$MY_CLIENT" <<EOF
-CREATE USER IF NOT EXISTS 'schemaic_ssl'@'%'  IDENTIFIED BY '$TEST_PASSWORD' REQUIRE SSL;
-CREATE USER IF NOT EXISTS 'schemaic_x509'@'%' IDENTIFIED BY '$TEST_PASSWORD' REQUIRE X509;
-GRANT ALL PRIVILEGES ON *.* TO 'schemaic_ssl'@'%';
-GRANT ALL PRIVILEGES ON *.* TO 'schemaic_x509'@'%';
+CREATE DATABASE IF NOT EXISTS \`$TEST_DB\`;
+CREATE USER IF NOT EXISTS 'schemaic_ssl'@'localhost'  IDENTIFIED BY '$TEST_PASSWORD' REQUIRE SSL;
+CREATE USER IF NOT EXISTS 'schemaic_ssl'@'127.0.0.1'  IDENTIFIED BY '$TEST_PASSWORD' REQUIRE SSL;
+CREATE USER IF NOT EXISTS 'schemaic_x509'@'localhost' IDENTIFIED BY '$TEST_PASSWORD' REQUIRE X509;
+CREATE USER IF NOT EXISTS 'schemaic_x509'@'127.0.0.1' IDENTIFIED BY '$TEST_PASSWORD' REQUIRE X509;
+GRANT ALL PRIVILEGES ON \`$TEST_DB\`.* TO 'schemaic_ssl'@'localhost';
+GRANT ALL PRIVILEGES ON \`$TEST_DB\`.* TO 'schemaic_ssl'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON \`$TEST_DB\`.* TO 'schemaic_x509'@'localhost';
+GRANT ALL PRIVILEGES ON \`$TEST_DB\`.* TO 'schemaic_x509'@'127.0.0.1';
 FLUSH PRIVILEGES;
 EOF
+  echo "  database $TEST_DB — the only one these accounts can reach"
   echo "  user schemaic_ssl  (REQUIRE SSL)  — rejects a plaintext login"
   echo "  user schemaic_x509 (REQUIRE X509) — needs the client certificate"
 else
