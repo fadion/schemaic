@@ -1179,8 +1179,18 @@ pub struct Tab {
     pub next_panel: RwSignal<u64>,
     /// The saved connection id this tab's query runs against.
     pub conn_id: RwSignal<u64>,
-    /// The database `USE`d for this tab's queries (`None` before the connection's
-    /// database list has loaded — queries then run at the server level).
+    /// The database `USE`d for this tab's queries.
+    ///
+    /// `None` before the connection's database list has loaded. **That is not
+    /// "the server level"**, which is what this said and what it meant until
+    /// the connection gained a configured **Database**: an unbound tab now runs
+    /// in that database on both engines (`Db::open`'s fallback), unqualified
+    /// `DROP TABLE` included, with nothing on screen naming it. MySQL used to
+    /// answer `ERROR 1046 No database selected`, which was a hard stop.
+    ///
+    /// The window is usually short — a schema load binds every unbound tab of
+    /// the connection — but it is not always: an empty or unreadable listing
+    /// leaves tabs `None` for the session.
     pub database: RwSignal<Option<String>>,
     /// The table this tab was opened from, if any — used to highlight the source
     /// table in the schema sidebar and to make the grid editable.
