@@ -539,6 +539,20 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     // reset never fires on a disposed signal.
     let save_flash = RwSignal::new(false);
     let test_flash = RwSignal::new(false);
+    // **Closing the modal withdraws the confirmation**, rather than leaving it
+    // to the timer that set it. Save's `save_gen` guard lives in the *form*,
+    // which the open/close `dyn_container` disposes, so a modal closed inside
+    // `SAVE_FLASH` left the pending `exec_after` reading `None` from a dead
+    // generation — it declined to clear, and the check was still sitting on the
+    // button the next time the modal opened. Clearing on close rather than
+    // hoisting `save_gen` out beside this signal, because the timer firing late
+    // is only half of it: a check reporting a save from a previous visit is
+    // wrong even while its two seconds are still running.
+    floem::reactive::create_effect(move |_| {
+        if !open.get() && save_flash.get_untracked() {
+            save_flash.set(false);
+        }
+    });
     // Which row raised the open menu, painted as the rule the schema tree's rows
     // already wear (`widgets::row_menu_mark`). The list's menu names no
     // connection — Duplicate and Delete carry the id themselves, and the *click*
