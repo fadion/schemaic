@@ -817,6 +817,37 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     sequence that explicit inserts leave where it was — while MySQL's `AUTO_INCREMENT` and SQLite's
     `rowid` both advance from the data already in the table, so there is nothing to resync;
     `dump::sequence_resync_sql` is the one caller, and this replaced the `!= Postgres` it shipped as.
+    `supports_database_editing` and `supports_namespace_editing` are the newest pair, for the
+    **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL and
+    PostgreSQL, and PostgreSQL's `CREATE`/`DROP SCHEMA`. They are two predicates rather than one
+    because MySQL answers them *differently* — its `CREATE SCHEMA` is a synonym for
+    `CREATE DATABASE`, one level up from what the change means, so a single "supports containers"
+    answer would have offered `Create schema` there and quietly made a database. SQLite answers no
+    to both: a database there is a file, so a create is the connection form's business and a drop
+    would be deleting the user's file off disk — absent rather than dimmed, since there is nothing
+    another connection could enable. **The namespace one is deliberately not called
+    `supports_schema_editing`**: that name belonged to the predicate deleted two paragraphs up,
+    which meant the whole of this module rather than one statement in it, and the same name for
+    two opposite scopes is worse than a longer one. The menu entry is still labelled `Schema`,
+    because that is what PostgreSQL calls it.
+    The four changes they gate (`CreateDatabase`, `DropDatabase`, `CreateSchema`, `DropSchema`)
+    are the only ones in the module that **do not address `ChangeSet::table`** — each carries its
+    own name, `ddl::server_level` is the constructor that builds such a set, and
+    `container_creates`/`container_drops` are the one emitter pair that reads neither `table` nor
+    `qname()` (`a_container_change_ignores_the_change_sets_subject` is the pin, since an emitter
+    reaching for `qname()` like every sibling would address the wrong object while the change
+    list still read right). **They are two functions emitted at opposite ends of the plan, and
+    the asymmetry is the point**: a container has to exist *before* anything inside it is created
+    and survive *until* everything inside it is done with, so a `DROP SCHEMA` at the front would
+    take the namespace away from every later statement naming `sales.orders`. Written as one
+    front-loaded loop first, with a comment claiming the position was universally safe — which is
+    the kind of claim a later edit builds a real bug on;
+    `a_container_is_created_first_and_dropped_last` hand-builds the mixed set nothing produces
+    yet. `is_server_level` splits them again along a different seam — the database pair
+    runs on a connection that names no database and outside any transaction, the namespace pair on
+    the ordinary in-database path — which is what `DdlScope` and `Db::run_server_ddl` are for.
+    `DROP SCHEMA` is never `CASCADE`, the same call `DropObject` makes: cascading drops every
+    table in the namespace, so the server is left to refuse and name what is still in there.
     What actually varies for views moved down a level, into
     two narrower facts that are false on SQLite and only there. `supports_or_replace_view` — SQLite has no
     `CREATE OR REPLACE VIEW` in any form, so a redefinition there is a `DROP` plus a `CREATE`, the
@@ -2928,6 +2959,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   arm no longer refuses every plan: the gate moved upstream to `ddl::supports_change`, which can
   see the `Change` where `run_ddl` has only strings, and refusing wholesale here would have taken
   away the drops SQLite genuinely has.
+  **`run_server_ddl` is the second apply path, and it exists because two statements can take
+  neither of `run_ddl`'s commitments.** `CREATE DATABASE` and `DROP DATABASE` — the pair
+  `ddl::is_server_level` marks — cannot run on a connection to the database they are about (one
+  does not exist yet, the other is what PostgreSQL means by *"cannot drop the currently open
+  database"*), and PostgreSQL refuses both **inside a transaction block**, which is precisely
+  what `pg::run_ddl` wraps every plan in. So this path connects without naming the target and
+  runs untransacted, and nothing is given up by either: a server-level plan is one statement, so
+  there is no second one for a rollback to protect and no scaffolding for `applied` to discount.
+  The PostgreSQL arm takes the target through `connect_maintenance_avoiding`, since the
+  *configured* database is the first maintenance candidate and dropping it would otherwise pick,
+  before anything else, the one connection that cannot perform the statement
+  (`the_database_being_dropped_is_never_the_one_it_runs_on`, which covers the username guess too
+  — role and database sharing a name is the default PostgreSQL setup). SQLite's arm is an error
+  with a sentence in it rather than a statement: a database there is a file, so creating one is
+  the connection form's business and dropping one would be deleting the user's file off disk.
+  Which path a plan takes is **decided where the `Change` still is a `Change`** — `preview_of`
+  stamps `DdlScope` onto the preview from `ddl::is_server_level`, `ddl_preview::apply` passes it
+  through on the `DdlRunRequest`, and `app/main.rs` branches on it. Asking "is this a `CREATE
+  DATABASE`?" of a `Vec<String>` would be the hand-rolled scanner this codebase keeps out.
+  **The refresh branches with it**, and that is not bookkeeping: what a server-level plan changed
+  is the connection's *list* of databases, so it calls `refresh_schema` (re-list) where an
+  ordinary plan calls `refresh_db(database)`. Left on the latter, a drop re-introspected a name
+  that no longer exists and a create re-introspected one the tree had never heard of — both find
+  no node and return, leaving the tree showing a database that is gone.
   **It also suspends foreign keys for the duration and checks them before the commit** — `PRAGMA
   foreign_keys = OFF` outside the transaction, since SQLite ignores the pragma inside one. It used
   to turn them *on*, and enforcing during a plan is not the safe reading it looks like: with them
@@ -4181,6 +4236,57 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     nothing back on a failed parse would silently swallow what somebody typed.
     `is_editable_object` is the entry point's gate: an identity column's counter is listed
     and alterable but not editable-as-an-object, the call a materialized view gets.
+  - `database_editor.rs` — the **container** form: a database, or one of PostgreSQL's
+    namespaces inside one, over `core::ddl`'s `DatabaseDraft`. The smallest of the schema
+    editors and the only one that **only ever creates** — there is no `current`, no diff and
+    no change count, because a container is dropped from its own row's menu and neither engine
+    offers a rename that is safe to perform (MySQL withdrew `RENAME DATABASE` in 5.1.23;
+    PostgreSQL's needs every session off the database). The footer therefore says what will be
+    made rather than counting changes, and the panel takes its height from its content, since
+    it is two to four rows tall depending on the engine.
+    **Three homes.** The schema tree's **Create ▸ Database / Schema**, the SCHEMA gear's
+    **Create database**, and a right-click on the tree's **empty space** — which is the one
+    people reach for first, since every file manager trains it. The gear is not a duplicate of
+    that third: a connection whose tree already fills the panel has no blank space left to
+    right-click, which is exactly the connection on which a new database is worth making.
+    `create_children` and `schema_tree::blank_space_entries` are the two places that decide
+    which entries exist, each with its own test. **The read-only refusal is inside
+    `open_for_new` itself**, not at the four launch sites: the invariant is that a launch guards
+    itself in the same step that launches it, and written per site that is four copies of one
+    `if` — of which `create_submenu`'s arm had already been left out, relying on
+    `MenuEntry::disabled` alone. One refusal at the door is the only version that survives a
+    fifth home. The entries stay dimmed, because that is what *says* the action is unavailable.
+    The option fields are per-engine and **absent** rather than dimmed where the engine has
+    none — asked as `ddl::supports_owners` / `supports_database_charset` rather than as
+    `dialect ==` tests, which is what both were written as first. MySQL gets `Character set` /
+    `Collation`, PostgreSQL gets `Owner`, and PostgreSQL's `ENCODING` is deliberately not
+    offered at all: the server refuses it unless the locale clauses and `TEMPLATE template0`
+    agree, so a field for it would mostly produce *"new encoding is incompatible with the
+    encoding of the template database"*.
+    All three are **free text with a `suggest_chevron` beside them**, the designer's
+    column-type pattern, because every value they take is per-server and per-version — a
+    collation only MariaDB has, a role created five minutes ago. The MySQL lists are the
+    constants `ddl::MYSQL_CHARSETS`/`MYSQL_COLLATIONS`; the collations are deliberately **not**
+    filtered by the chosen character set, since filtering would make it a picker that has to be
+    *right*. Owner's list is `Db::roles` (`left(rolname, 3) <> 'pg_'`, **not** a `NOT LIKE
+    'pg\_%'` whose escape only survives while `standard_conforming_strings` is on), fetched on
+    open like the trigger editor's functions — which is why `suggest_chevron` takes its options
+    as a **closure read at press time**: the reply lands after the form is built, and rebuilding
+    the row to deliver it would tear down a field the user may be typing in. That closure is also
+    why the chevron now **refuses to open on an empty list**: `popup_menu_overlay` builds a panel
+    for any `Some`, and an empty entry vec still draws — height collapsing to the padding and
+    border, width clamping to the 170px floor — so a press before the fetch landed painted an
+    empty bordered box that then ate the click meant to dismiss it. Unreachable while every
+    caller passed a constant.
+    **The footer says nothing while the form is valid**, unlike every peer modal. Theirs show a
+    change count, which is a diff the reader cannot otherwise see; here there is no diff, so
+    the only sentence available restated the title and the name field — and a status line that
+    only ever agrees with the screen teaches the eye to skip the place errors appear.
+    `change_of` is the pure mapping from kind to `Change`, and it is unit-tested because a
+    swapped arm is invisible in a rendered form: the two kinds are different statements at
+    **different levels** — `CreateDatabase` is server-level and `CreateSchema` is not.
+    `ddl_preview::preview_container` is the one exit, and it reads that level off the change
+    (`ddl::is_server_level`) rather than taking a caller's word for it.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
     question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while Claude's turn has
@@ -4224,7 +4330,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     offset frozen between two growing boxes is not an offset but a drift, and at 160% a 154px panel
     tucked by a literal 30 landed its right edge ~18px inside the icon instead of flush past it.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
-    nav). The standalone objects hang off the same levels the tables do, in
+    nav).
+    **A right-click on the tree's empty space raises its own menu** — `Create database` and
+    `Refresh`, both about the *panel* rather than about anything in it, because nothing in it was
+    clicked. It hangs off the tree's own box with no hit test of its own: every row raises its
+    menu with `on_secondary_click_stop`, so what reaches this handler is exactly a click that
+    landed on no row, and a hit test here would be a second answer to a question floem's
+    propagation already answers. It uses the **generic** `popup_menu` channel rather than
+    `context_menu`, which carries a `CtxKind` describing the row that was clicked — and this
+    menu exists precisely because there wasn't one. `blank_space_entries` is the decision, split
+    out to be asserted like `overlays::create_children`: it returns **nothing at all** on SQLite
+    rather than a menu holding only `Refresh`, since a one-row menu on blank space reads as a
+    misfire and the gear still carries Refresh for anyone looking for it.
+    The standalone objects hang off the same levels the tables do, in
     `Types`/`Domains`/`Sequences`/`Functions`/`Procedures` folders after them
     (`object_groups`/`object_group_node`/
     `object_row`, over `schema::ObjectItem`, keyed by `ddl::ObjectKind::ALL` — one list, because
@@ -6339,7 +6457,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
 - **Generated DDL is never run silently, and never emitted from a second differ.** Every
   schema edit goes `TableDraft`/`ViewDraft` → `ddl::diff`/`diff_view` → `ChangeSet::emit` →
-  the preview modal → `Db::run_ddl`. Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
+  the preview modal → `Db::run_ddl`. **`Db::run_server_ddl` is on the same rule, not beside it**:
+  `CREATE`/`DROP DATABASE` reach it through the same preview, from `ddl::server_level` →
+  `ChangeSet::emit` → `ddl_preview::preview_container`, and it is a second *runner* rather than a
+  second emitter — the two statements can take neither of `run_ddl`'s commitments (see it above).
+  Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
   don't add one that applies a plan without the preview — the preview is where the destructive
   consequence is stated in plain language and where "Open in editor" hands the script over.
   **A dump is on the written side of this rule rather than an exception to it.** `core::dump::plan`

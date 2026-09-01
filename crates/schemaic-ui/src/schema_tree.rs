@@ -701,6 +701,100 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 }
 
 // ── Schema sidebar: databases → tables → columns/indexes ─────────────────────
+/// The menu a right-click on the schema tree's **empty space** raises — the area
+/// below the last database, and the whole panel on a connection with nothing in
+/// it.
+///
+/// **Two entries, and both are about the panel rather than about anything in
+/// it**, because nothing in it was clicked. `Create database` is the third home
+/// of that action (the SCHEMA gear and the tree's `Create ▸` submenu are the
+/// other two) and the one people reach for first, since right-clicking empty
+/// space is what every file manager trains; `Refresh` is the same whole-tree
+/// refresh the gear offers, and it is here because a connection showing nothing
+/// is exactly when you want it and has no row to right-click.
+///
+/// Empty on SQLite, where there is no database to create — and then the handler
+/// raises nothing at all, rather than a menu whose only entry would be
+/// `Refresh`. A one-item menu on a blank area reads as a misfire.
+///
+/// `Create database` is **dimmed** on a read-only connection rather than absent,
+/// the distinction the rest of the app draws: absent means "not on this engine",
+/// dimmed means "not here".
+fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
+    let ctx = crate::table_designer::edit_ctx(ui);
+    blank_space_entries(ctx.dialect, ctx.read_only)
+        .into_iter()
+        .map(|e| {
+            let ui = ui.clone();
+            let refresh = ui.schema_actions.refresh_schema.clone();
+            widgets::MenuEntry::action(e.label, move || match e.kind {
+                // The read-only refusal lives in `open_for_new` itself, so every
+                // one of this action's four homes is guarded by construction
+                // rather than by each remembering to ask.
+                BlankKind::CreateDatabase => {
+                    crate::database_editor::open_for_new(&ui, crate::ContainerKind::Database, None)
+                }
+                BlankKind::Refresh => (refresh)(),
+            })
+            .disabled(e.disabled)
+        })
+        .collect()
+}
+
+/// What a blank-space entry does.
+///
+/// **A discriminant, not the label string.** Routing on `e.label` with a
+/// catch-all arm meant a third entry would fall into whichever branch was
+/// written last and render as an enabled row that does nothing — the failure
+/// [`crate::overlays::CreateKind`] exists next door to prevent, and one no test
+/// asserting labels and disabled flags could ever catch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BlankKind {
+    CreateDatabase,
+    Refresh,
+}
+
+/// One blank-space entry as data: its label, what it does, and whether it is
+/// inert.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct BlankEntry {
+    pub label: &'static str,
+    pub kind: BlankKind,
+    pub disabled: bool,
+}
+
+/// Which entries the blank-space menu has, and which are inert — the same
+/// split-out-so-it-can-be-asserted shape [`crate::overlays::create_children`]
+/// has, and for the same reason: `Create database` opens an editor that ends at
+/// a live `run_ddl`, so both gates on it are worth a test rather than a comment.
+///
+/// **Empty means no menu at all**, not a menu with one row: on SQLite there is
+/// no database to create, and a lone `Refresh` popping up on blank space reads
+/// as a misfire rather than an offer. The gear menu still carries Refresh, which
+/// is where someone looking for it goes.
+pub(crate) fn blank_space_entries(
+    dialect: schemaic_core::intel::SqlDialect,
+    read_only: bool,
+) -> Vec<BlankEntry> {
+    if !schemaic_core::ddl::supports_database_editing(dialect) {
+        return Vec::new();
+    }
+    vec![
+        BlankEntry {
+            label: "Create database",
+            kind: BlankKind::CreateDatabase,
+            disabled: read_only,
+        },
+        // Never dimmed: re-reading the schema is a read, and a read-only
+        // connection is the one most worth re-reading.
+        BlankEntry {
+            label: "Refresh",
+            kind: BlankKind::Refresh,
+            disabled: false,
+        },
+    ]
+}
+
 pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let db_nodes = ui.schema.db_nodes;
     let expanded = ui.schema.expanded;
@@ -760,6 +854,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // row builders need it for the matching double-click.
     let nav_ui = ui.clone();
     let tree_ui = ui.clone();
+    let blank_menu_ui = ui.clone();
 
     // Not `width_full`: the tree sizes to its widest row so the horizontal
     // scrollbar appears when a deep/long row overflows the panel. Hidden
@@ -832,6 +927,30 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // the search box holds focus, key events go there instead, so its own arrow
     // handling (caret movement) wins and tree nav is naturally disabled.
     let tree = autohide(shift_hscroll(tree))
+        // **The blank-space menu**, on the tree's own box rather than on any row.
+        //
+        // Every row raises its menu with `on_secondary_click_stop`, so what
+        // reaches this handler is exactly a right-click that landed on *no* row —
+        // the empty area below the last database, and the whole panel on a
+        // connection with nothing in it. That is the one thing making it correct:
+        // there is no hit test here, and adding one would be a second answer to a
+        // question floem's propagation already answers.
+        //
+        // It uses the **generic** popup channel, not `context_menu`: that one
+        // carries a `CtxKind` describing the row that was clicked, and this menu
+        // exists precisely because none was. Anchor cleared, so it opens at the
+        // cursor.
+        .on_secondary_click_stop({
+            let ui = blank_menu_ui.clone();
+            move |_| {
+                let entries = blank_space_menu(&ui);
+                if entries.is_empty() {
+                    return;
+                }
+                ui.overlay.popup_anchor.set(None);
+                ui.overlay.popup_menu.set(Some(entries));
+            }
+        })
         .keyboard_navigable()
         .on_event(EventListener::FocusGained, move |_| {
             nav.focused.set(true);
@@ -3386,5 +3505,65 @@ mod tests {
         );
         // Nothing open, nothing to seed from.
         assert_eq!(resume_cursor(None, None, |_| true), None);
+    }
+
+    // ── The blank-space menu ────────────────────────────────────────────────
+
+    use schemaic_core::intel::SqlDialect;
+
+    fn blank_labels(d: SqlDialect, read_only: bool) -> Vec<&'static str> {
+        blank_space_entries(d, read_only)
+            .into_iter()
+            .map(|e| e.label)
+            .collect()
+    }
+
+    /// Two entries, and both about the panel rather than about anything in it —
+    /// nothing in it was clicked.
+    ///
+    /// **The kinds are asserted beside the labels**, because the menu builder
+    /// routes on the kind: an entry whose label and discriminant disagree would
+    /// render one thing and do another, and a labels-only assertion is exactly
+    /// what would not notice.
+    #[test]
+    fn blank_space_offers_create_and_refresh() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert_eq!(
+                blank_labels(d, false),
+                ["Create database", "Refresh"],
+                "{d:?}"
+            );
+            let kinds: Vec<BlankKind> = blank_space_entries(d, false)
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+            assert_eq!(
+                kinds,
+                [BlankKind::CreateDatabase, BlankKind::Refresh],
+                "{d:?}"
+            );
+        }
+    }
+
+    /// **No menu at all on SQLite, rather than a menu holding only Refresh.**
+    /// There is no database to create there — a database is a file — and a
+    /// one-row menu popping up on blank space reads as a misfire. The gear still
+    /// carries Refresh, which is where someone looking for it goes.
+    #[test]
+    fn blank_space_raises_nothing_where_there_is_no_database_to_create() {
+        assert!(blank_space_entries(SqlDialect::Sqlite, false).is_empty());
+        assert!(blank_space_entries(SqlDialect::Sqlite, true).is_empty());
+    }
+
+    /// The live gate: `Create database` opens an editor that ends at a real
+    /// `run_ddl`, so a read-only connection must not reach it. **Refresh is not
+    /// dimmed with it** — re-reading a schema is a read, and this is the one
+    /// entry a read-only connection has every right to.
+    #[test]
+    fn a_read_only_connection_can_refresh_but_not_create() {
+        let entries = blank_space_entries(SqlDialect::MySql, true);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].disabled, "Create database must be dimmed");
+        assert!(!entries[1].disabled, "Refresh is a read");
     }
 }

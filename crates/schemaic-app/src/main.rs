@@ -6808,10 +6808,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         )
     };
 
+    // The server's roles, for the database editor's Owner shortcut. The same
+    // shape `trigger_functions` has, minus the database: `pg_roles` is a
+    // cluster-wide catalogue, and the caller may be about to create a database
+    // that does not exist yet.
+    let roles: schemaic_ui::RolesFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(move |conn_id: u64, done: schemaic_ui::RolesDoneFn| {
+            let Ok(db) = db_for(conn_id) else {
+                // Nothing to report: the Owner field is free text and keeps
+                // whatever is typed in it.
+                return;
+            };
+            let report = create_ext_action(cx, move |roles| (done)(roles));
+            handle.spawn(async move {
+                // A failure here costs a menu, never a value — see `RolesFn`.
+                report(db.roles().await.unwrap_or_default());
+            });
+        })
+    };
+
     let run_ddl: schemaic_ui::DdlFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
         let refresh_db = refresh_db.clone();
+        let refresh_schema = refresh_schema.clone();
         let guard_tx = guard_tx.clone();
         Rc::new(
             move |req: schemaic_ui::DdlRunRequest, done: schemaic_ui::DdlDoneFn| {
@@ -6829,13 +6851,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let start: Rc<dyn Fn()> = {
                     let handle = handle.clone();
                     let refresh_db = refresh_db.clone();
+                    let refresh_schema = refresh_schema.clone();
                     let done = done.clone();
                     Rc::new(move || {
                         let db = db.clone();
                         let req = req.clone();
                         let done = done.clone();
                         let refresh_db = refresh_db.clone();
+                        let refresh_schema = refresh_schema.clone();
                         let database = req.database.clone();
+                        let scope = req.scope;
                         let report = create_ext_action(
                             cx,
                             move |(changed, res): (bool, Result<(), String>)| {
@@ -6845,7 +6870,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 // that failed halfway still moved the schema out
                                 // from under us.
                                 if changed {
-                                    (refresh_db)(database.clone());
+                                    match scope {
+                                        // **A different refresh, not a different
+                                        // argument to the same one.** What
+                                        // changed here is the connection's
+                                        // *list* of databases, and
+                                        // `refresh_db` re-introspects one by
+                                        // name — which after a drop is a name
+                                        // that no longer exists, and after a
+                                        // create is one the tree has never
+                                        // heard of. Either way it finds no node
+                                        // and returns, leaving the tree showing
+                                        // a database that is gone.
+                                        schemaic_ui::DdlScope::Server => (refresh_schema)(),
+                                        schemaic_ui::DdlScope::Database => {
+                                            (refresh_db)(database.clone())
+                                        }
+                                    }
                                 }
                                 (done)(match res {
                                     Ok(()) => DdlOutcome::Applied,
@@ -6857,9 +6898,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // and the `Rc` holding it can't.
                         let (database, statements) = (req.database.clone(), req.statements.clone());
                         handle.spawn(async move {
-                            let out = db
-                                .run_ddl(&database, &statements, CancellationToken::new())
-                                .await;
+                            let out = match scope {
+                                // The database named here is what the run must
+                                // **avoid** connecting to, not what it runs on —
+                                // see `Db::run_server_ddl`. Empty for a create,
+                                // which has nothing to avoid yet.
+                                schemaic_ui::DdlScope::Server => {
+                                    let avoid = Some(database.as_str()).filter(|d| !d.is_empty());
+                                    db.run_server_ddl(avoid, &statements, CancellationToken::new())
+                                        .await
+                                }
+                                schemaic_ui::DdlScope::Database => {
+                                    db.run_ddl(&database, &statements, CancellationToken::new())
+                                        .await
+                                }
+                            };
                             let changed = schemaic_db::ddl_changed_schema(&out);
                             report((changed, out.map_err(|e| e.to_string())));
                         });
@@ -8971,6 +9024,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             run_ddl,
             view_algorithm,
             trigger_functions,
+            roles,
             trigger_source,
             routine_source,
             event_source,
@@ -9061,6 +9115,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             event_source_pending: RwSignal::new(false),
             event_body_stale: RwSignal::new(false),
             functions: RwSignal::new(Vec::new()),
+            database: RwSignal::new(None),
+            database_draft: RwSignal::new(schemaic_core::ddl::DatabaseDraft::default()),
+            roles: RwSignal::new(Vec::new()),
             object: RwSignal::new(None),
             object_draft: RwSignal::new(schemaic_core::ddl::ObjectDraft::default()),
             object_errors: RwSignal::new(Vec::new()),
