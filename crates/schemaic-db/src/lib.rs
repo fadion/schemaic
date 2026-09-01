@@ -295,6 +295,22 @@ pub struct Db {
     pub(crate) tls: Option<schemaic_core::connection::TlsPlan>,
 }
 
+/// What database a MySQL/MariaDB connection opens in.
+///
+/// **The two readings of `open(None)`, given separate spellings.** Since a
+/// connection gained a configured database, `None` has meant *"the caller named
+/// none, so use the connection's"* — and eleven call sites were written when it
+/// meant *"this operation needs no database scope"*. Most are harmless because
+/// their SQL is fully qualified anyway; `run_server_ddl` is not, and it is the
+/// one that emits `DROP DATABASE`.
+#[derive(Clone, Copy, Debug)]
+enum Scope<'a> {
+    /// The named database, or the connection's own when none is named.
+    Database(Option<&'a str>),
+    /// **No database at all**, and the connection's own must not fill it in.
+    Server,
+}
+
 impl Db {
     /// Resolve a saved connection into a `Db`. For an SSH connection, pass the
     /// established tunnel's local port and the target is rewritten to
@@ -428,8 +444,8 @@ impl Db {
     /// database (`USE`d on connect so unqualified names resolve) and
     /// `CLIENT_FOUND_ROWS` (so `affected_rows()` counts *matched* rows, not
     /// *changed* ones — the commit path's exactly-one-row guard relies on it).
-    fn opts(&self, database: Option<&str>, found_rows: bool) -> OptsBuilder {
-        self.opts_with_tls(database, found_rows, self.tls.as_ref())
+    fn opts(&self, scope: Scope<'_>, found_rows: bool) -> OptsBuilder {
+        self.opts_with_tls(scope, found_rows, self.tls.as_ref())
     }
 
     /// [`Self::opts`] with the TLS plan named explicitly, so the `prefer`
@@ -437,7 +453,7 @@ impl Db {
     /// second, subtly different set.
     fn opts_with_tls(
         &self,
-        database: Option<&str>,
+        scope: Scope<'_>,
         found_rows: bool,
         tls: Option<&schemaic_core::connection::TlsPlan>,
     ) -> OptsBuilder {
@@ -452,7 +468,9 @@ impl Db {
         // operation that named one is working in it, and quietly redirecting
         // that to the connection default would run a statement somewhere the
         // caller did not ask for.
-        if let Some(db) = database.or_else(|| self.database()) {
+        if let Scope::Database(named) = scope
+            && let Some(db) = named.or_else(|| self.database())
+        {
             b = b.db_name(Some(db));
         }
         b
@@ -470,6 +488,54 @@ impl Db {
         database: Option<&str>,
         found_rows: bool,
     ) -> Result<Conn, DbError> {
+        self.open_scoped(Scope::Database(database), found_rows)
+            .await
+    }
+
+    /// Open a connection that names **no database at all**.
+    ///
+    /// **`open(None)` is not this**, and the two readings were spelled
+    /// identically until now. Since the connection gained a configured
+    /// database, `open(None)` means *"no database was named, so use the
+    /// connection's"* — which is right for a `SHOW DATABASES` and wrong for the
+    /// one operation that must not be attached to a database: `DROP DATABASE`
+    /// ran on a session pointed at its own target, so the statement failed or
+    /// left the connection answering `ERROR 1049` to everything afterwards.
+    ///
+    /// `KILL QUERY` takes this door too. It names no object, and a connection
+    /// whose configured database will not open should still be able to cancel
+    /// its own query.
+    pub(crate) async fn open_serverless(&self, found_rows: bool) -> Result<Conn, DbError> {
+        self.open_scoped(Scope::Server, found_rows).await
+    }
+
+    async fn open_scoped(&self, scope: Scope<'_>, found_rows: bool) -> Result<Conn, DbError> {
+        let out = self.dial(scope, found_rows).await;
+        // **The configured database must not be able to break the listing that
+        // would let the user fix it.**
+        //
+        // On MySQL/MariaDB the database is part of the *handshake*, so a
+        // **Database** field naming something the server will not open fails
+        // every `Db` method with `ERROR 1049` — `ping`, `fetch_databases`,
+        // `fetch_schema`, `commit_writes`, `run_server_ddl`, all of them. One
+        // typo and the tree cannot list the databases, so there is nothing on
+        // screen to correct it from. PostgreSQL degrades deliberately here
+        // (`maintenance_candidates`); MySQL had no retry anywhere.
+        //
+        // Narrow on purpose: only where the caller named **no** database and
+        // the fallback supplied one. An operation that asked for `shop` by name
+        // still fails, because silently running it somewhere else is worse than
+        // failing.
+        if let Scope::Database(None) = scope
+            && self.database().is_some()
+            && out.as_ref().err().is_some_and(unknown_database)
+        {
+            return self.dial(Scope::Server, found_rows).await;
+        }
+        out
+    }
+
+    async fn dial(&self, scope: Scope<'_>, found_rows: bool) -> Result<Conn, DbError> {
         // Before the driver gets a chance to report a mistyped path as an
         // anonymous I/O error.
         //
@@ -484,7 +550,7 @@ impl Db {
         if let Some(plan) = self.tls.as_ref() {
             tls::preflight(plan)?;
         }
-        let first = Conn::new(self.opts(database, found_rows)).await;
+        let first = Conn::new(self.opts(scope, found_rows)).await;
         match first {
             Ok(conn) => Ok(conn),
             Err(e) => {
@@ -497,7 +563,7 @@ impl Db {
                 }
                 // The plaintext error is the one worth reporting: having chosen
                 // to fall back, the user's problem is whatever plaintext hit.
-                Conn::new(self.opts_with_tls(database, found_rows, None))
+                Conn::new(self.opts_with_tls(scope, found_rows, None))
                     .await
                     .map_err(|e| DbError::Connect(e.to_string()))
             }
@@ -506,11 +572,28 @@ impl Db {
 
     /// Best-effort server-side cancel: connect afresh and `KILL QUERY <id>`.
     pub(crate) async fn kill_query(&self, conn_id: u32) {
-        if let Ok(mut killer) = self.open(None, false).await {
+        if let Ok(mut killer) = self.open_serverless(false).await {
             let _ = killer.query_drop(format!("KILL QUERY {conn_id}")).await;
             let _ = killer.disconnect().await;
         }
     }
+}
+
+/// Did this connect fail because the *database* could not be opened, rather
+/// than because the server, the network or the credentials were wrong?
+///
+/// Read off the message because that is all a `DbError::Connect` carries. Both
+/// spellings are checked: MySQL and MariaDB print the code, and the driver's
+/// own `Display` for a server error puts the text beside it.
+///
+/// Free and pure so the classification can be asserted without a live server —
+/// the sole thing that decides whether an unopenable configured database is a
+/// recoverable mistake or a dead connection.
+pub(crate) fn unknown_database(e: &DbError) -> bool {
+    let DbError::Connect(msg) = e else {
+        return false;
+    };
+    msg.contains("1049") || msg.to_ascii_lowercase().contains("unknown database")
 }
 
 /// Should a failed MySQL connect be retried in plaintext?
@@ -4136,9 +4219,18 @@ impl Db {
             }
             Engine::MySql => {}
         }
-        // `None`: the server-level connection, which is what makes `DROP
-        // DATABASE` on the connection's own default database work at all.
-        let mut conn = self.open(None, false).await.map_err(|e| fail(0, 0, e))?;
+        // **Serverless, not `open(None)`.** `avoid` names the database this
+        // plan is about to drop or create, and `open(None)` fills an unnamed
+        // database in from the connection's own — so `DROP DATABASE shop` on a
+        // connection configured for `shop` ran on a session pointed at its
+        // target. The comment here used to claim the opposite, and was true
+        // until the connection gained a configured database. (PostgreSQL still
+        // reads `avoid` in its own arm above: it must connect to *some*
+        // database, so it picks one that is not the target. MySQL needs none.)
+        let mut conn = self
+            .open_serverless(false)
+            .await
+            .map_err(|e| fail(0, 0, e))?;
         let conn_id = conn.id();
         let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
         let mut out = Ok(());
@@ -4931,6 +5023,71 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The connection's own database ─────────────────────────────────────
+
+    /// **`open(None)` and "no database at all" must not be the same
+    /// spelling.** A `DROP DATABASE shop` on a connection configured for `shop`
+    /// went out on a session pointed at its own target; every later operation
+    /// then answered `ERROR 1049`.
+    ///
+    /// Asserted through the options builder, which is where the two readings
+    /// diverge — the connect itself needs a server.
+    #[test]
+    fn a_server_level_connection_names_no_database_even_when_one_is_configured() {
+        let db = Db::from_parts(
+            Engine::MySql,
+            "h".into(),
+            3306,
+            "u".into(),
+            "p".into(),
+            String::new(),
+        )
+        .with_database(Some("shop"));
+
+        let named = mysql_async::Opts::from(db.opts(Scope::Database(None), false));
+        assert_eq!(
+            named.db_name(),
+            Some("shop"),
+            "an unnamed database still falls back to the connection's"
+        );
+
+        let server = mysql_async::Opts::from(db.opts(Scope::Server, false));
+        assert_eq!(
+            server.db_name(),
+            None,
+            "a server-level connection must not be filled in from the connection"
+        );
+
+        // And a caller that named one is never redirected.
+        let explicit = mysql_async::Opts::from(db.opts(Scope::Database(Some("other")), false));
+        assert_eq!(explicit.db_name(), Some("other"));
+    }
+
+    /// The other end of the same conflation: an unopenable configured database
+    /// must not take out the listing that would let the user fix it. This is
+    /// the classification the retry hangs on — narrow enough that a real
+    /// credential or network failure is still reported.
+    #[test]
+    fn only_an_unopenable_database_is_worth_a_second_connect() {
+        assert!(unknown_database(&DbError::Connect(
+            "Server error: `ERROR 1049 (42000): Unknown database 'wolrd''".into()
+        )));
+        assert!(unknown_database(&DbError::Connect(
+            "Unknown database 'wolrd'".into()
+        )));
+
+        assert!(!unknown_database(&DbError::Connect(
+            "Access denied for user 'app'@'localhost' (using password: YES)".into()
+        )));
+        assert!(!unknown_database(&DbError::Connect(
+            "Connection refused (os error 111)".into()
+        )));
+        // Only a *connect* failure; a query that mentions the words is not one.
+        assert!(!unknown_database(&DbError::Query(
+            "Unknown database 'x'".into()
+        )));
+    }
 
     // ── The plaintext retry ───────────────────────────────────────────────
 
