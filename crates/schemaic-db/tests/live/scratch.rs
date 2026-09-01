@@ -24,6 +24,7 @@
 //! namespaces of a *concurrent* run, which is the one failure a fixture must not
 //! introduce.
 
+use schemaic_core::edit::{EditModel, analyze_edit};
 use schemaic_core::export::ident_sql;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::ResultSet;
@@ -122,6 +123,35 @@ impl Scratch {
     /// The dialect this server's literals and identifiers are written in.
     pub fn dialect(&self) -> SqlDialect {
         self.dialect
+    }
+
+    /// The result of `sql`, and the edit model the app would build from it.
+    ///
+    /// **The composition is the point.** `edit::analyze_edit` has unit tests, and
+    /// every one of them hands it a `ColumnOrigin` written out by hand — so what
+    /// they prove is that the ladder works on the metadata a test *imagined*.
+    /// Whether a real driver reports `org_table` for an alias, a `table_oid` for
+    /// a joined column or a primary-key flag at all is decided on the wire, and
+    /// the two halves have never met outside the running app.
+    ///
+    /// The schema is fetched per call rather than cached, because that is also
+    /// what the app does: `analyze_edit`'s `schema_for` reads whatever the tree
+    /// last loaded.
+    pub async fn edit_model(&self, sql: &str) -> (ResultSet, EditModel) {
+        let rs = self.exec(sql).await;
+        let schema = self
+            .db
+            .fetch_schema(&self.database, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("live tier could not introspect {}: {e}", self.database));
+        let model = analyze_edit(&rs, |_db, ns, table| {
+            schema
+                .tables
+                .iter()
+                .find(|t| t.name == table && t.schema.as_deref() == ns)
+                .cloned()
+        });
+        (rs, model)
     }
 
     /// `table`, quoted and qualified so a statement cannot land outside the

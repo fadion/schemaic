@@ -17,12 +17,15 @@
 //! [`endpoint`] for how servers are named, and [`scratch`] for the namespace
 //! guard that keeps the tier away from any database it did not create.
 //!
-//! **One suite, run per server.** [`suite`] holds the assertions, and the
-//! `live_suite!` macro below expands them into a module per leg, so a failure
-//! reads `mysql::introspection_finds_the_seeded_table` rather than a loop that
-//! stopped at the first server and never reached the other two.
+//! **One suite, run per server.** [`suite`] and [`editable`] hold the
+//! assertions, and the `live_suite!` macro below expands them into a module per
+//! leg, so a failure reads `mysql::introspection_finds_the_seeded_table` rather
+//! than a loop that stopped at the first server and never reached the other two.
+//! The macro takes them grouped by module because the group a test belongs to is
+//! the one thing its name does not say.
 
 mod cases;
+mod editable;
 mod endpoint;
 mod scratch;
 mod suite;
@@ -34,14 +37,14 @@ mod suite;
 /// missing server is a failure, because a suite that quietly passes when it
 /// could not connect is worth less than no suite at all.
 macro_rules! live_suite {
-    ($($test:ident),+ $(,)?) => {
-        live_suite!(@leg mariadb, MARIADB, $($test),+);
-        live_suite!(@leg mysql, MYSQL, $($test),+);
-        live_suite!(@leg pg, POSTGRES, $($test),+);
+    ($($module:ident: [$($test:ident),+ $(,)?]),+ $(,)?) => {
+        live_suite!(@leg mariadb, MARIADB, $($module: [$($test),+]),+);
+        live_suite!(@leg mysql, MYSQL, $($module: [$($test),+]),+);
+        live_suite!(@leg pg, POSTGRES, $($module: [$($test),+]),+);
     };
-    (@leg $leg:ident, $target:ident, $($test:ident),+) => {
+    (@leg $leg:ident, $target:ident, $($module:ident: [$($test:ident),+]),+) => {
         mod $leg {
-            $(
+            $($(
                 // Multi-threaded: the drivers spawn their connection tasks onto
                 // the runtime, and the teardown guard blocks a thread of its own.
                 #[tokio::test(flavor = "multi_thread")]
@@ -54,20 +57,36 @@ macro_rules! live_suite {
                         );
                         return;
                     }
-                    crate::suite::$test(target).await;
+                    crate::$module::$test(target).await;
                 }
-            )+
+            )+)+
         }
     };
 }
 
 live_suite!(
-    a_ping_reaches_the_server,
-    a_seeded_table_round_trips_through_a_query,
-    introspection_finds_the_seeded_table,
-    a_scratch_database_is_gone_once_torn_down,
-    every_type_renders_as_the_grid_shows_it,
-    the_text_the_grid_shows_writes_back_unchanged,
+    suite: [
+        a_ping_reaches_the_server,
+        a_seeded_table_round_trips_through_a_query,
+        introspection_finds_the_seeded_table,
+        a_scratch_database_is_gone_once_torn_down,
+        every_type_renders_as_the_grid_shows_it,
+        the_text_the_grid_shows_writes_back_unchanged,
+    ],
+    editable: [
+        a_select_star_carries_each_columns_provenance,
+        an_alias_does_not_hide_the_real_column,
+        an_expression_column_has_no_provenance,
+        a_join_attributes_each_column_to_its_own_table,
+        a_primary_key_becomes_the_write_key,
+        a_not_null_unique_index_is_the_fallback_key,
+        a_nullable_unique_index_is_no_key_at_all,
+        a_table_with_no_key_is_read_only,
+        a_key_left_out_of_the_select_makes_the_result_read_only,
+        the_same_column_twice_refuses_the_whole_table,
+        a_binary_column_is_read_only_inside_an_editable_row,
+        one_table_offers_itself_as_the_insert_target,
+    ],
 );
 
 /// The name guard needs no server, and is here rather than in `schemaic-core`

@@ -47,6 +47,10 @@ pub struct Target {
     /// the suite is written once, so what differs between servers belongs in the
     /// table describing them, the same way production code asks a capability.
     pub namespace: Option<&'static str>,
+    /// How this server spells a short raw-bytes column. Data on the target for
+    /// the same reason `namespace` is: what differs between servers belongs in
+    /// the table describing them, not in an `if` inside a test.
+    pub binary_type: &'static str,
     /// The types this server is asked to round-trip, and the ones only it has.
     /// Two slices rather than one so MySQL and MariaDB can share the twenty they
     /// agree on and still each own the one they do not — see [`cases`].
@@ -61,6 +65,7 @@ pub static MARIADB: Target = Target {
     default_port: 3306,
     default_user: "schemaic",
     namespace: None,
+    binary_type: "VARBINARY(4)",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
 };
@@ -72,6 +77,7 @@ pub static MYSQL: Target = Target {
     default_port: 3307,
     default_user: "schemaic",
     namespace: None,
+    binary_type: "VARBINARY(4)",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
 };
@@ -83,6 +89,7 @@ pub static POSTGRES: Target = Target {
     default_port: 5432,
     default_user: "schemaic",
     namespace: Some("public"),
+    binary_type: "bytea",
     types: cases::POSTGRES,
     extra_types: &[],
 };
