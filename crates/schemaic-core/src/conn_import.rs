@@ -615,7 +615,26 @@ fn truthy(v: &str) -> bool {
 /// know is not evidence that TLS is off.
 fn sslmode_from_str(v: &str) -> Option<SslMode> {
     match normalize_key(v).as_str() {
-        "disable" | "disabled" | "allow" | "off" | "false" => Some(SslMode::Disable),
+        "disable" | "disabled" | "off" | "false" => Some(SslMode::Disable),
+        // **`allow` is not a synonym for `disable`.** libpq's `allow` tries a
+        // non-SSL connection *first* and an SSL one second, so a service file
+        // `psql` reaches over TLS could not connect at all once imported.
+        // `Prefer` is the faithful end of the ladder: it is the one mode
+        // `Tls::plan` gives `fallback_to_plaintext`, which is the same
+        // "either transport is acceptable" promise with the order reversed.
+        // Reading it as `Disable` was also the one value that defeated
+        // `dbeaver_handlers`' `unwrap_or(Require)` guard, since that guard only
+        // protects values the table does *not* recognise.
+        "allow" => Some(SslMode::Prefer),
+        // **`allow` is not a synonym for `disable`.** libpq's `allow` tries a
+        // non-SSL connection *first* and an SSL one second, so a service file
+        // `psql` reaches over TLS could not connect at all once imported.
+        // `Prefer` is the faithful end of the ladder: it is the one mode
+        // `Tls::plan` gives `fallback_to_plaintext`, which is the same
+        // "either transport is acceptable" promise with the order reversed.
+        // Reading it as `Disable` was also the one value that defeated
+        // `dbeaver_handlers`' `unwrap_or(Require)` guard, since that guard only
+        // protects values the table does *not* recognise.
         "prefer" | "preferred" => Some(SslMode::Prefer),
         "require" | "required" => Some(SslMode::Require),
         "verifyca" => Some(SslMode::VerifyCa),
@@ -797,7 +816,18 @@ fn dbeaver_handlers(c: &mut Connection, cfg: &serde_json::Value) {
         } else if k.contains("ssl") {
             // An enabled SSL handler with no mode of its own means "encrypt" and
             // nothing about verification, which is exactly `Require`.
-            c.tls.mode = sslmode_from_str(&prop("ssl.mode")).unwrap_or(SslMode::Require);
+            //
+            // **Raise, never lower**, which is the rule `apply_params`' own
+            // `ssl`/`useSSL` arm already documents. This runs *after* the URL
+            // has been parsed and overlaid, and DBeaver's MySQL SSL handler
+            // carries no `ssl.mode` property at all — so assigning
+            // unconditionally clamped a URL's `verify-full` down to `require`,
+            // and *disabling* DBeaver's SSL imported more securely than
+            // enabling it. The cost of the rule, stated: an explicit handler
+            // mode weaker than the URL's is ignored rather than honoured. A
+            // silent downgrade is the worse of the two.
+            let want = sslmode_from_str(&prop("ssl.mode")).unwrap_or(SslMode::Require);
+            c.tls.mode = c.tls.mode.stronger_of(want);
             set_if_empty(&mut c.tls.ca_path, &prop("ssl.ca.cert"));
             set_if_empty(&mut c.tls.ca_path, &prop("ssl.root.cert"));
             set_if_empty(&mut c.tls.client_cert_path, &prop("ssl.client.cert"));
@@ -1764,6 +1794,28 @@ mod tests {
         );
     }
 
+    /// **The arm this test used to skip.** It reached five of the seven and
+    /// missed exactly the defective one.
+    ///
+    /// libpq's `allow` tries a non-SSL connection *first* and an SSL one
+    /// second, so it is not a synonym for `disable` — a service file `psql`
+    /// reaches over TLS could not connect at all once imported. `Prefer` is the
+    /// faithful end: the same "either transport is acceptable" promise with the
+    /// order reversed, and the one mode `Tls::plan` gives a plaintext fallback.
+    #[test]
+    fn allow_and_prefer_are_both_the_falling_back_rung_not_plaintext() {
+        assert_eq!(
+            url("postgres://h/d?sslmode=allow").tls.mode,
+            SslMode::Prefer
+        );
+        assert_eq!(
+            url("postgres://h/d?sslmode=prefer").tls.mode,
+            SslMode::Prefer
+        );
+        let scan = parse_pg_service("[svc]\nhost=h\nsslmode=allow\n");
+        assert_eq!(scan.found[0].connection.tls.mode, SslMode::Prefer);
+    }
+
     #[test]
     fn certificate_paths_come_across_from_the_query() {
         let c = url(
@@ -1909,6 +1961,56 @@ mod tests {
         let tls = &row(&scan, "Analytics").tls;
         assert_eq!(tls.mode, SslMode::VerifyCa);
         assert_eq!(tls.ca_path, "/ca.pem");
+    }
+
+    /// **The fixture above has an `ssl.mode`, and the bug was in the branch
+    /// where it does not.** DBeaver's MySQL SSL handler carries no such
+    /// property, so the `unwrap_or(Require)` default fired and — assigned
+    /// unconditionally, after the URL had already been parsed and overlaid —
+    /// clamped a URL's `verify-full` down to `require`. Disabling DBeaver's SSL
+    /// imported *more* securely than enabling it.
+    #[test]
+    fn an_ssl_handler_with_no_mode_of_its_own_does_not_lower_the_url() {
+        let json = r#"{"connections":{"1":{
+            "name":"Prod","provider":"mysql","driver":"mysql8",
+            "configuration":{
+              "url":"jdbc:mysql://db.example:3306/shop?sslMode=VERIFY_IDENTITY",
+              "handlers":{"mysql_ssl":{"enabled":true,"properties":{}}}
+            }}}}"#;
+        let scan = parse_dbeaver(json);
+        assert_eq!(scan.found.len(), 1, "{:?}", scan.skipped);
+        assert_eq!(scan.found[0].connection.tls.mode, SslMode::VerifyFull);
+    }
+
+    /// The other direction still works: a handler that asks for *more* than the
+    /// URL raises it. This is the case the "raise, never lower" rule exists to
+    /// keep — an enabled SSL block on a URL that says nothing at all.
+    #[test]
+    fn an_enabled_ssl_handler_still_raises_a_url_that_asked_for_nothing() {
+        let json = r#"{"connections":{"1":{
+            "name":"Prod","provider":"mysql","driver":"mysql8",
+            "configuration":{
+              "url":"jdbc:mysql://db.example:3306/shop",
+              "handlers":{"mysql_ssl":{"enabled":true,"properties":{}}}
+            }}}}"#;
+        let scan = parse_dbeaver(json);
+        assert_eq!(scan.found[0].connection.tls.mode, SslMode::Require);
+    }
+
+    /// And the value that used to slip past the `unwrap_or(Require)` guard
+    /// entirely, because that guard only protects modes the table does not
+    /// recognise: an enabled handler saying `allow` yielded plaintext.
+    #[test]
+    fn an_enabled_ssl_handler_never_yields_plaintext() {
+        let json = r#"{"connections":{"1":{
+            "name":"Prod","provider":"postgresql","driver":"postgres-jdbc",
+            "configuration":{
+              "url":"jdbc:postgresql://db.example:5432/shop",
+              "handlers":{"pg_ssl":{"enabled":true,"properties":{"ssl.mode":"allow"}}}
+            }}}}"#;
+        let scan = parse_dbeaver(json);
+        let mode = scan.found[0].connection.tls.mode;
+        assert!(mode.negotiates_tls(), "{mode:?} on an enabled SSL handler");
     }
 
     #[test]
