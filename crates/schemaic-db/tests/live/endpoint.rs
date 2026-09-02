@@ -67,6 +67,17 @@ pub struct Target {
     /// table for good — which is why `DdlError::applied` exists and why the
     /// preview's failure message counts it.
     pub transactional_ddl: bool,
+    /// Does a grant list from this server cover **one database only**?
+    ///
+    /// PostgreSQL keeps schema, table and sequence privileges in the catalogue
+    /// of the database holding the object, so one connection answers for one
+    /// database and `Grants::note` says which. MySQL's grant tables are
+    /// server-wide and `SHOW GRANTS` answers for every database at once, so
+    /// there is nothing to qualify and the note is absent.
+    ///
+    /// Data on the target rather than an `if engine == Postgres` in a test body,
+    /// for the reason at the top of [`crate::suite`].
+    pub grants_are_database_scoped: bool,
     /// How a trigger on this server says "uppercase the name being inserted".
     ///
     /// **The two engines model a trigger differently, not just spell it
@@ -98,6 +109,7 @@ pub static MARIADB: Target = Target {
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
     transactional_ddl: false,
+    grants_are_database_scoped: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
@@ -116,6 +128,7 @@ pub static MYSQL: Target = Target {
     binary_type: "VARBINARY(4)",
     non_transactional: Some("ENGINE=MyISAM"),
     transactional_ddl: false,
+    grants_are_database_scoped: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
@@ -134,6 +147,7 @@ pub static POSTGRES: Target = Target {
     binary_type: "bytea",
     non_transactional: None,
     transactional_ddl: true,
+    grants_are_database_scoped: true,
     trigger_body: None,
     trigger_function_ddl: Some(
         "CREATE FUNCTION upper_name() RETURNS trigger AS $$          BEGIN NEW.name := UPPER(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql",
@@ -161,6 +175,12 @@ impl Target {
             self.var("PASSWORD", "schemaic"),
             String::new(),
         )
+    }
+
+    /// The account the suite connects as — which is also the one account every
+    /// leg is guaranteed to have, and so the one a read-only test can name.
+    pub fn user(&self) -> String {
+        self.var("USER", self.default_user)
     }
 
     /// Every type case this server answers for.
