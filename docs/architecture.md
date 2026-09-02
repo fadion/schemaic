@@ -5247,8 +5247,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is the original point: a one-row menu on blank space reads as a misfire, and the gear still
     carries Refresh for anyone looking for it. Left asking only the first question, that lone
     `Refresh` would have appeared the moment a second entry arrived.
-    `Users and privileges` is skeleton group 2 and sits **before** `Refresh`, which the skeleton
-    says closes that group. It is dimmed on a **down** connection and **not** on a read-only one —
+    `Users and privileges` is skeleton group 2 and sits **after** `Refresh` rather than before it,
+    where the skeleton's wording says that group closes with `Refresh`. That is a deviation of the
+    same kind as the two recorded at `group` for the context menus, and tolerated for the same
+    reason — it stays *inside* the group, so the cross-group rule is untouched and the read entry is
+    still above the write one. What moves is only which of the two reads is under the cursor, and
+    `Refresh` is both what this menu is opened for most often and the only entry in it that costs
+    nothing. It is dimmed on a **down** connection and **not** on a read-only one —
     browsing accounts writes nothing, and the write actions inside the browser gate themselves —
     where `Create database` is dimmed on either. `blank_space_is_a_subsequence_of_the_skeleton` is
     this menu's own half of `overlays::menu_order_gate`, which cannot see a menu built in this file;
