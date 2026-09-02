@@ -48,12 +48,26 @@ unmaintained = "workspace"
 # exception — a specific advisory we've assessed as not reachable / not fixable.
 ignore = [
     # quick-xml < 0.41 quadratic-time attribute parsing (DoS). Only exploitable
-    # via UNTRUSTED XML input, and the *vulnerable* copy never sees any: 0.39
-    # is reached through usvg/resvg, which parses only Schemaic's own bundled
-    # SVG icons (a fixed, trusted set), and through wayland-scanner, a
-    # build-time proc macro over its own protocol files. The fix (quick-xml >=
-    # 0.41) is gated behind usvg/resvg ← floem 0.2.0, so there's no upgrade
-    # path for that copy yet. Revisit when floem bumps its SVG rendering stack.
+    # via UNTRUSTED XML input, and the *vulnerable* copy never sees any — nor,
+    # on Windows, is it built at all. `cargo tree -i quick-xml@0.39.4 -e
+    # normal,build --target all` has exactly one consumer:
+    #
+    #   quick-xml 0.39.4 <- wayland-scanner (proc-macro) <- smithay-client-toolkit
+    #                    <- floem-winit <- floem
+    #
+    # a build-time proc macro over Wayland's own protocol XML, on Linux only.
+    # Its input is vendored, it runs at compile time, and nothing it produces
+    # parses anything at runtime.
+    #
+    # (An earlier version of this entry said 0.39 was reached "through
+    # usvg/resvg". It is not: usvg parses SVG with roxmltree, and is not a
+    # consumer of either quick-xml version. Following that sentence would have
+    # meant watching floem's SVG stack for an upgrade that can never come from
+    # there, while the crate that *does* pull 0.39 went unwatched.)
+    #
+    # Revisit when the winit/wayland stack moves — wayland-scanner <-
+    # smithay-client-toolkit <- floem-winit is the upgrade path, not the
+    # renderer.
     #
     # Schemaic *does* now parse untrusted XML — an imported `.xlsx` is a ZIP of
     # it, and the file comes from wherever the user got it. That path goes
