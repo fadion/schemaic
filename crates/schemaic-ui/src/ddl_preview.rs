@@ -92,6 +92,8 @@ pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
     d.object.set(None);
     d.event.set(None);
     d.database.set(None);
+    d.account.set(None);
+    d.grant.set(None);
 }
 
 /// Open the preview on a change set. `from_designer` decides where Cancel goes.
@@ -163,6 +165,33 @@ pub(crate) fn preview_container(
 ) {
     let ctx = crate::table_designer::edit_ctx(ui);
     let cs = schemaic_core::ddl::server_level(subject, ctx.dialect, change);
+    open_preview(
+        ui,
+        preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
+    );
+}
+
+/// Send an **account** change — a create, a drop, a grant or a revoke — to the
+/// preview.
+///
+/// The counterpart of [`preview_container`] for the six changes that have no
+/// table *and* are not server-level: `ddl::account` builds the set, and
+/// [`preview_of`] reads the scope back off it, which for these is
+/// [`crate::DdlScope::Database`]. That is not an accident of the default — see
+/// `ddl::is_account_change` for why a PostgreSQL grant has to run in the
+/// database whose catalogue holds the object it names.
+///
+/// `database` is therefore load-bearing here in a way it is not for a container:
+/// it is the database the statements actually run on, and it is the one the
+/// browser was already showing privileges for.
+pub(crate) fn preview_account(
+    ui: &Ui,
+    database: &str,
+    subject: &str,
+    change: schemaic_core::ddl::Change,
+) {
+    let ctx = crate::table_designer::edit_ctx(ui);
+    let cs = schemaic_core::ddl::account(subject, ctx.dialect, change);
     open_preview(
         ui,
         preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
@@ -863,6 +892,10 @@ mod tests {
             functions: scope.create_rw_signal(Vec::new()),
             database: scope.create_rw_signal(None),
             database_draft: scope.create_rw_signal(Default::default()),
+            account: scope.create_rw_signal(None),
+            account_draft: scope.create_rw_signal(Default::default()),
+            grant: scope.create_rw_signal(None),
+            grant_draft: scope.create_rw_signal(Default::default()),
             roles: scope.create_rw_signal(Vec::new()),
             object: scope.create_rw_signal(None),
             object_draft: scope.create_rw_signal(Default::default()),

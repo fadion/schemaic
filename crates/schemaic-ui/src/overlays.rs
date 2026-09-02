@@ -90,7 +90,7 @@ fn find_top() -> f64 {
     theme::scaled(80.0)
 }
 
-/// The question a container's **Drop** confirm asks, built from the change's own
+/// The question a destructive confirm asks, built from the change's own
 /// [`schemaic_core::ddl::Change::risks`] so the confirm and the DDL preview's
 /// warning block cannot drift into saying different things about the same act.
 ///
@@ -101,7 +101,7 @@ fn find_top() -> f64 {
 /// `dropping_an_event_is_destructive_and_says_why` was written to catch one
 /// level down. The unit tests pin `risks()` in isolation; this is the seam
 /// between it and the modal, which is where CLAUDE.md says these bugs live.
-pub(crate) fn container_drop_prompt(
+pub(crate) fn risk_prompt(
     change: &schemaic_core::ddl::Change,
     dialect: schemaic_core::intel::SqlDialect,
 ) -> String {
@@ -1099,6 +1099,54 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             let mut items: Vec<floem::AnyView> =
                 vec![refresh_item.into_any(), collapse_item.into_any()];
 
+            // Read once for both of the entries below, which ask the same two
+            // questions of it.
+            let ctx = crate::table_designer::edit_ctx(&ui);
+
+            // **Users and privileges lives here for the reason `Create database`
+            // does**: it is about the *server*, not about any row in the tree,
+            // and this menu is already the one that acts on the connection as a
+            // whole. Absent where the engine has no accounts at all
+            // (`users::supports_users` — SQLite), and absent with no saved
+            // connection, the same `ctx.exists` gate the entry above states.
+            //
+            // **Dimmed on a down connection, but not on a read-only one.**
+            // Browsing accounts writes nothing, so the read-only refusal that
+            // guards `Create database` would be answering a question this action
+            // does not ask; a connection that cannot be reached is a different
+            // matter, and the browser would open on a fetch that fails.
+            if ctx.exists && schemaic_core::users::supports_users(ctx.dialect) {
+                let down = ui.conn.conn_status.get_untracked().is_down();
+                let users_ui = ui.clone();
+                items.push(
+                    container(text("Users and privileges").style(move |s| {
+                        s.color(if down {
+                            theme::text_faint()
+                        } else {
+                            theme::text()
+                        })
+                    }))
+                    .on_click_stop(move |_| {
+                        open.set(false);
+                        if down {
+                            return;
+                        }
+                        // The database is the active tab's, because that is the
+                        // one PostgreSQL's schema and table privileges can be
+                        // read from — see `users_view::open_for_server`.
+                        let database = users_ui.tabs_ui.active_db.get_untracked();
+                        crate::users_view::open_for_server(
+                            &users_ui,
+                            users_ui.conn.active_conn.get_untracked(),
+                            database.as_deref(),
+                        );
+                    })
+                    .style(menu_item_style)
+                    .style(|s| s.padding_vert(theme::scaled(8.0)))
+                    .into_any(),
+                );
+            }
+
             // **`Create database` lives here because the tree has no reliable
             // blank space to right-click.** Every other create hangs off the row
             // it makes a child of; this one makes a *sibling* of every row, and
@@ -1122,7 +1170,6 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             // the first thing a new user can click. See
             // `table_designer::EditCtx::exists`, and `schema_tree`'s
             // blank-space menu, which is the same gate on the other home.
-            let ctx = crate::table_designer::edit_ctx(&ui);
             if ctx.exists && schemaic_core::ddl::supports_database_editing(ctx.dialect) {
                 // Dimmed on a **down** connection as well as a read-only one —
                 // the same answer the tree's blank-space menu gives, and for the
@@ -1464,7 +1511,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     // into saying different things about the
                                     // same act — and the preview still stands
                                     // between the answer and the server.
-                                    message: container_drop_prompt(
+                                    message: risk_prompt(
                                         &schemaic_core::ddl::Change::DropDatabase {
                                             name: db.clone(),
                                         },
@@ -1699,7 +1746,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 let (ui, db, ns) = (ui.clone(), db.clone(), ns.clone());
                                 confirm.set(Some(crate::Confirm {
                                     title: format!("Drop {}", crate::ContainerKind::Schema.label()),
-                                    message: container_drop_prompt(
+                                    message: risk_prompt(
                                         &schemaic_core::ddl::Change::DropSchema {
                                             name: ns.clone(),
                                         },
@@ -5436,7 +5483,7 @@ mod object_menu_tests {
 
 #[cfg(test)]
 mod create_menu_tests {
-    use super::{CreateKind, container_drop_prompt, create_children};
+    use super::{CreateKind, create_children, risk_prompt};
     use schemaic_core::ddl::ObjectKind;
     use schemaic_core::intel::SqlDialect;
 
@@ -5569,7 +5616,7 @@ mod create_menu_tests {
             ),
         ] {
             for d in [SqlDialect::MySql, SqlDialect::Postgres] {
-                let msg = container_drop_prompt(&change, d);
+                let msg = risk_prompt(&change, d);
                 assert!(!msg.trim().is_empty(), "{change:?} on {d:?} asked nothing");
                 assert!(msg.contains(name), "{msg} does not name {name}");
             }
@@ -5582,7 +5629,7 @@ mod create_menu_tests {
     /// future emptied arm would take.
     #[test]
     fn a_riskless_change_still_asks_something() {
-        let msg = container_drop_prompt(
+        let msg = risk_prompt(
             &schemaic_core::ddl::Change::CreateSchema {
                 name: "sales".into(),
                 owner: None,
@@ -6360,6 +6407,12 @@ mod menu_order_gate {
             // entry rather than spending a hover on a lone child.
             | "Generate"
             | "Generate DDL"
+            // Not a context-menu row today — it is raised from the SCHEMA gear
+            // and from the tree's blank space, and `schema_tree`'s own half of
+            // this gate mirrors the number from here. It is in the table because
+            // that is what the table is for: a label with no group fails, so a
+            // second menu cannot place an entry this one has never heard of.
+            | "Users and privileges"
             | "Refresh"
             | "Collapse all" => 2,
             // 3. Tree state — the row, not the object.

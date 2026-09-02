@@ -1470,6 +1470,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         RwSignal::new(schemaic_ui::PropertiesState::Loading);
     let properties_counting: RwSignal<bool> = RwSignal::new(false);
     let properties_count_err: RwSignal<Option<String>> = RwSignal::new(None);
+    // Users and privileges browser. `users` is both the open flag and the server
+    // being described, so a stale fetch can check it before writing — the same
+    // shape `properties` has, and for the same reason.
+    let users: RwSignal<Option<schemaic_ui::UsersTarget>> = RwSignal::new(None);
+    let users_state: RwSignal<schemaic_ui::UsersState> =
+        RwSignal::new(schemaic_ui::UsersState::Loading);
+    let users_filter: RwSignal<String> = RwSignal::new(String::new());
+    let users_selected: RwSignal<Option<schemaic_core::users::Principal>> = RwSignal::new(None);
+    let users_grants: RwSignal<schemaic_ui::GrantsState> =
+        RwSignal::new(schemaic_ui::GrantsState::Idle);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
     // Bumped whenever a refresh puts some node's statistics back to `Idle`, and
@@ -6764,6 +6774,95 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
+    // The Users and privileges browser's list.
+    let principals: Rc<dyn Fn(schemaic_ui::UsersTarget)> = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(move |target: schemaic_ui::UsersTarget| {
+            let db = match db_for(target.conn_id) {
+                Ok(db) => db,
+                Err(e) => {
+                    users_state.set(schemaic_ui::UsersState::Failed(e));
+                    return;
+                }
+            };
+            // Asked before the round trip, for the reason `table_stats` asks
+            // `supports_table_stats` before its own: an engine that has no
+            // accounts has a different thing to say than one whose fetch failed,
+            // and no query can tell the two apart.
+            if !schemaic_core::users::supports_users(db.engine().dialect()) {
+                users_state.set(schemaic_ui::UsersState::Unsupported);
+                return;
+            }
+            let want = target.clone();
+            let report = create_ext_action(
+                cx,
+                move |res: Result<Vec<schemaic_core::users::Principal>, String>| {
+                    // The browser has since closed, or reopened on another
+                    // server: this answer is about neither.
+                    if users.with_untracked(|t| t.as_ref() != Some(&want)) {
+                        return;
+                    }
+                    users_state.set(match res {
+                        Ok(list) => schemaic_ui::UsersState::Loaded(list),
+                        Err(e) => schemaic_ui::UsersState::Failed(e),
+                    });
+                },
+            );
+            handle.spawn(async move {
+                let res = db.fetch_principals().await.map_err(|e| e.to_string());
+                report(res);
+            });
+        })
+    };
+
+    // One account's privileges, per selection. Separate from `principals` for the
+    // reason `count_rows` is separate from `table_stats`: it is a second round
+    // trip the user asked for by picking a row, and a failure to read one
+    // account's grants must not replace the list of accounts with an error.
+    let grants: Rc<dyn Fn(schemaic_ui::UsersTarget, schemaic_core::users::Principal)> = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |target: schemaic_ui::UsersTarget, principal: schemaic_core::users::Principal| {
+                let db = match db_for(target.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        users_grants.set(schemaic_ui::GrantsState::Failed(e));
+                        return;
+                    }
+                };
+                let want = principal.clone();
+                let want_target = target.clone();
+                let report = create_ext_action(
+                    cx,
+                    move |res: Result<schemaic_core::users::Grants, String>| {
+                        // Both halves have to still be true: the browser may have
+                        // closed, and the user may have clicked a second account
+                        // while this one was in flight — in which case this
+                        // answer belongs to a row that is no longer selected.
+                        if users.with_untracked(|t| t.as_ref() != Some(&want_target))
+                            || users_selected.with_untracked(|p| p.as_ref() != Some(&want))
+                        {
+                            return;
+                        }
+                        users_grants.set(match res {
+                            Ok(g) => schemaic_ui::GrantsState::Loaded(g),
+                            Err(e) => schemaic_ui::GrantsState::Failed(e),
+                        });
+                    },
+                );
+                handle.spawn(async move {
+                    let res = db
+                        .fetch_grants(target.database.as_deref(), &principal)
+                        .await
+                        .map_err(|e| e.to_string());
+                    report(res);
+                });
+            },
+        )
+    };
+
     let toggle_table_sizes: Rc<dyn Fn()> = Rc::new(move || table_sizes.update(|on| *on = !*on));
 
     // Fetch one database's table statistics into its node's slot, once.
@@ -6943,6 +7042,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let refresh_schema = refresh_schema.clone();
         let guard_tx = guard_tx.clone();
         let ddl_token = ddl_token.clone();
+        // The account list has its own refresh — see the `users` arm inside.
+        let principals_for_ddl = principals.clone();
         Rc::new(
             move |req: schemaic_ui::DdlRunRequest, done: schemaic_ui::DdlDoneFn| {
                 let db = match db_for(req.conn_id) {
@@ -6962,12 +7063,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let refresh_schema = refresh_schema.clone();
                     let done = done.clone();
                     let ddl_token = ddl_token.clone();
+                    let principals_refresh = principals_for_ddl.clone();
                     Rc::new(move || {
                         let db = db.clone();
                         let req = req.clone();
                         let done = done.clone();
                         let refresh_db = refresh_db.clone();
                         let refresh_schema = refresh_schema.clone();
+                        let principals_refresh = principals_refresh.clone();
                         let database = req.database.clone();
                         let scope = req.scope;
                         let token = CancellationToken::new();
@@ -6997,6 +7100,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         schemaic_ui::DdlScope::Database => {
                                             (refresh_db)(database.clone())
                                         }
+                                    }
+                                    // **And the accounts, if the browser is
+                                    // looking at them.** An account plan takes
+                                    // the `Database` route above, whose refresh
+                                    // re-introspects a *schema* — it knows
+                                    // nothing about `mysql.user`, so a created
+                                    // account never appeared and a dropped one
+                                    // stayed on the list until the modal was
+                                    // closed and reopened. The selection goes
+                                    // back to nothing rather than being kept: the
+                                    // account it named may be the one that was
+                                    // just dropped.
+                                    if let Some(t) = users.get_untracked() {
+                                        users_selected.set(None);
+                                        users_grants.set(schemaic_ui::GrantsState::Idle);
+                                        users_state.set(schemaic_ui::UsersState::Loading);
+                                        (principals_refresh)(t);
                                     }
                                 }
                                 (done)(match res {
@@ -9132,6 +9252,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             properties_state,
             properties_counting,
             properties_count_err,
+            users,
+            users_state,
+            users_filter,
+            users_selected,
+            users_grants,
             run_guard,
             snippet_edit: snippet_edit_open,
         },
@@ -9181,6 +9306,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             table_stats,
             count_rows,
             count_cancel,
+            principals,
+            grants,
             toggle_table_sizes,
             db_stats,
         }),
@@ -9269,6 +9396,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             functions: RwSignal::new(Vec::new()),
             database: RwSignal::new(None),
             database_draft: RwSignal::new(schemaic_core::ddl::DatabaseDraft::default()),
+            account: RwSignal::new(None),
+            account_draft: RwSignal::new(schemaic_core::users::AccountDraft::default()),
+            grant: RwSignal::new(None),
+            grant_draft: RwSignal::new(schemaic_core::users::GrantDraft::default()),
             roles: RwSignal::new(Vec::new()),
             object: RwSignal::new(None),
             object_draft: RwSignal::new(schemaic_core::ddl::ObjectDraft::default()),

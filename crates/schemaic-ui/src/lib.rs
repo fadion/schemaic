@@ -6,6 +6,7 @@
 //! fn indexes into a shared `Arc<ResultSet>` (no per-row cloning). Layout
 //! follows FEATURES §1.
 
+mod account_editor;
 mod activity_panel;
 mod ai_panel;
 pub use ai_panel::mark_messages_seen;
@@ -56,6 +57,7 @@ mod tabs;
 pub mod theme;
 pub mod themes;
 mod trigger_editor;
+mod users_view;
 mod view_editor;
 mod widgets;
 mod window_chrome;
@@ -775,6 +777,36 @@ pub struct DatabaseTarget {
     pub read_only: bool,
 }
 
+/// The account editor's target; doubles as its open flag.
+///
+/// Like [`DatabaseTarget`] it has no "edit" state: an account is created here
+/// and dropped from its row in the browser, and neither engine offers a rename.
+/// Changing what an account *may do* is the other form ([`GrantTarget`]), which
+/// is a different question with a different answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountTarget {
+    pub conn_id: u64,
+    /// The database the plan runs in. Unlike a container's this is **not**
+    /// optional and not a "what to avoid": an account change takes the ordinary
+    /// in-database route (see `ddl::is_account_change`), so there has to be one.
+    pub database: String,
+    pub dialect: SqlDialect,
+    pub read_only: bool,
+}
+
+/// The grant editor's target; doubles as its open flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantTarget {
+    pub conn_id: u64,
+    pub database: String,
+    /// The account the statement is about. Carried whole rather than by name
+    /// because `users::account_sql` needs the host too, and a MySQL account
+    /// *is* the pair.
+    pub account: schemaic_core::users::Principal,
+    pub dialect: SqlDialect,
+    pub read_only: bool,
+}
+
 /// One lazy trigger-function fetch — see `schemaic_db::Db::trigger_functions`.
 ///
 /// A plain code span, not an intra-doc link: this crate doesn't depend on
@@ -1063,6 +1095,21 @@ pub struct DdlUi {
     /// already moved — the third outcome of the same reply
     /// ([`schemaic_core::ddl::SourceOutcome`]). See `routine_body_stale`.
     pub event_body_stale: RwSignal<bool>,
+    /// The account editor's target; doubles as its open flag.
+    pub account: RwSignal<Option<AccountTarget>>,
+    /// The account being created. Same rule as `draft`: one value, because the
+    /// plan is built from exactly it.
+    ///
+    /// **It holds a password while the form is open**, and nothing else in the
+    /// app does. It is cleared on every open and on Cancel, it is never
+    /// persisted and never logged, and the one place its value becomes visible
+    /// is the preview's SQL — which is the app's one gate between a plan and a
+    /// server, and so the one place a statement may not be shown with a field
+    /// blanked out. See `users::account_draft_sql`.
+    pub account_draft: RwSignal<schemaic_core::users::AccountDraft>,
+    /// The grant editor's target; doubles as its open flag.
+    pub grant: RwSignal<Option<GrantTarget>>,
+    pub grant_draft: RwSignal<schemaic_core::users::GrantDraft>,
     /// The database editor's target; doubles as its open flag. See
     /// [`DatabaseTarget`] for why it has no "edit" state.
     pub database: RwSignal<Option<DatabaseTarget>>,
@@ -3285,6 +3332,15 @@ pub struct SchemaActions {
     /// it whenever the modal's target changes, which covers Escape, the ✕, the
     /// backdrop and reopening on another table.
     pub count_cancel: Rc<dyn Fn()>,
+    /// Fetch the server's accounts for the Users and privileges browser, into
+    /// `overlay.users_state`.
+    pub principals: Rc<dyn Fn(UsersTarget)>,
+    /// Fetch one account's privileges, into `overlay.users_grants`. Separate
+    /// from [`SchemaActions::principals`] for the reason
+    /// [`SchemaActions::count_rows`] is separate from `table_stats`: it is a
+    /// second round trip, per selection, and a failure to read one account's
+    /// grants must not take the list of accounts down with it.
+    pub grants: Rc<dyn Fn(UsersTarget, schemaic_core::users::Principal)>,
     /// Toggle the schema tree's size column, persisting the choice. Switching it
     /// on is what makes the app fetch statistics for the expanded databases.
     pub toggle_table_sizes: Rc<dyn Fn()>,
@@ -3372,6 +3428,61 @@ pub enum PropertiesState {
     /// offers the exact count, which every engine can answer.
     Unsupported,
     /// The fetch failed (message shown in the modal body).
+    Failed(String),
+}
+
+/// What the **Users and privileges** browser is open on.
+///
+/// Server-level, so there is no object here — an account belongs to the server,
+/// not to a database. `database` is carried anyway because PostgreSQL's schema,
+/// table and sequence privileges live in the catalogue of the database holding
+/// the object, so the grant list is only ever as wide as one database and has to
+/// say which (see `users::pg_scope_note`). `None` is a connection with nothing
+/// selected: the cluster-wide half still answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsersTarget {
+    /// Read rather than taken from the active connection at fetch time, for the
+    /// reason [`PropertiesTarget`] carries one: the browser describes the server
+    /// it was opened on, even if the switcher has since moved.
+    pub conn_id: u64,
+    pub database: Option<String>,
+    /// Captured at open beside `conn_id`, and for the same reason: everything
+    /// the browser renders — the statements' highlighting, which write actions
+    /// it offers — is about the server it was opened on, and reading the
+    /// *active* connection's dialect instead would be the coupling `conn_id`
+    /// exists to avoid. Its two sibling targets ([`AccountTarget`],
+    /// [`GrantTarget`]) carry one for the same reason.
+    pub dialect: SqlDialect,
+}
+
+/// The account list's four states.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UsersState {
+    /// The fetch is in flight (the state the browser opens in).
+    #[default]
+    Loading,
+    Loaded(Vec<schemaic_core::users::Principal>),
+    /// This engine has no accounts at all
+    /// ([`schemaic_core::users::supports_users`]) — SQLite. Distinct from an
+    /// empty `Loaded`, which would read as "a server with no users".
+    Unsupported,
+    /// The fetch failed (message shown in the browser's list pane). The likely
+    /// cause is the connection lacking `SELECT` on `mysql` and on nothing else
+    /// either, which is a sentence worth showing rather than an empty list.
+    Failed(String),
+}
+
+/// One account's privileges, per selection.
+///
+/// `Idle` is its own state rather than an empty `Loaded`: before a row is
+/// picked, the pane invites a selection instead of claiming the account with no
+/// name has no privileges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum GrantsState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded(schemaic_core::users::Grants),
     Failed(String),
 }
 
@@ -3933,6 +4044,19 @@ pub struct OverlayUi {
     pub properties_state: RwSignal<PropertiesState>,
     pub properties_counting: RwSignal<bool>,
     pub properties_count_err: RwSignal<Option<String>>,
+    /// Users and privileges browser: `Some(target)` opens it for that server.
+    ///
+    /// The selection and the grant fetch it drives are tracked apart from
+    /// `users_state`, for the reason the properties modal's exact count is: they
+    /// are a second request per row, and folding them together would let one
+    /// account's unreadable grants replace a list of accounts that loaded fine.
+    pub users: RwSignal<Option<UsersTarget>>,
+    pub users_state: RwSignal<UsersState>,
+    /// The filter box's text. Not persisted — a filter is about the question
+    /// being asked right now, and a stale one on reopening reads as a short list.
+    pub users_filter: RwSignal<String>,
+    pub users_selected: RwSignal<Option<schemaic_core::users::Principal>>,
+    pub users_grants: RwSignal<GrantsState>,
     /// The snippet whose body is being edited, or `None`. One at a time, like
     /// every other editor here.
     pub snippet_edit: RwSignal<Option<u64>>,

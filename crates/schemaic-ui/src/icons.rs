@@ -210,6 +210,14 @@ pub const TRASH_2: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" 
 /// other icons.
 pub const AI_LOGO: &str = r#"<svg viewBox="0 0 16 10" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M9.23453 9.772V8.582H11.5305V1.19H9.23453V0H15.3945V1.19H13.0985V8.582H15.3945V9.772H9.23453Z" fill="currentColor"/><path d="M6.188 9.772L5.446 7.168H2.338L1.596 9.772H0L2.856 0H4.998L7.854 9.772H6.188ZM3.948 1.582H3.836L2.632 5.866H5.152L3.948 1.582Z" fill="currentColor"/></svg>"#;
 
+/// Lucide `user` (one account, in the Users and privileges browser and the gear
+/// entry that opens it).
+pub const USER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"#;
+
+/// Lucide `users` (a **role** — a bag of privileges granted to accounts rather
+/// than logged into, which is why it is the plural of [`USER`]).
+pub const USERS: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
+
 /// Lucide `table-properties` (the results toolbar's Properties entry — a table
 /// with a facts column down one side, which is what the panel behind it is).
 pub const TABLE_PROPERTIES: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M21 9H3"/><path d="M21 15H3"/></svg>"#;
