@@ -705,17 +705,20 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 /// below the last database, and the whole panel on a connection with nothing in
 /// it.
 ///
-/// **Two entries, and both are about the panel rather than about anything in
-/// it**, because nothing in it was clicked. `Create database` is the third home
-/// of that action (the SCHEMA gear and the tree's `Create ▸` submenu are the
-/// other two) and the one people reach for first, since right-clicking empty
-/// space is what every file manager trains; `Refresh` is the same whole-tree
-/// refresh the gear offers, and it is here because a connection showing nothing
-/// is exactly when you want it and has no row to right-click.
+/// **Three entries, and every one of them is about the panel rather than about
+/// anything in it**, because nothing in it was clicked. `Create database` is the
+/// third home of that action (the SCHEMA gear and the tree's `Create ▸` submenu
+/// are the other two) and the one people reach for first, since right-clicking
+/// empty space is what every file manager trains; `Users and privileges` is here
+/// for the same reason and is the gear's neighbour there too; `Refresh` is the
+/// same whole-tree refresh the gear offers, and it is here because a connection
+/// showing nothing is exactly when you want it and has no row to right-click.
 ///
-/// Empty on SQLite, where there is no database to create — and then the handler
-/// raises nothing at all, rather than a menu whose only entry would be
-/// `Refresh`. A one-item menu on a blank area reads as a misfire.
+/// Empty on SQLite, which has neither a database to create nor an account to
+/// browse — and then the handler raises nothing at all, rather than a menu whose
+/// only entry would be `Refresh`. A one-item menu on a blank area reads as a
+/// misfire, which is why the test is whether this engine has *anything* here
+/// beyond `Refresh` rather than whether it has databases.
 ///
 /// `Create database` is **dimmed** on a read-only connection rather than absent,
 /// the distinction the rest of the app draws: absent means "not on this engine",
@@ -740,6 +743,14 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
                 crate::database_editor::open_for_new(&ui, crate::ContainerKind::Database, None)
             }
             BlankKind::Refresh => (refresh)(),
+            // The database is the active tab's, because that is the one
+            // PostgreSQL's schema and table privileges can be read from — the
+            // same argument the gear's entry makes.
+            BlankKind::Users => crate::users_view::open_for_server(
+                &ui,
+                ui.conn.active_conn.get_untracked(),
+                ui.tabs_ui.active_db.get_untracked().as_deref(),
+            ),
         })
         .disabled(e.disabled)
     })
@@ -757,6 +768,7 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
 pub(crate) enum BlankKind {
     CreateDatabase,
     Refresh,
+    Users,
 }
 
 /// One blank-space entry as data: its label, what it does, and whether it is
@@ -804,7 +816,14 @@ pub(crate) fn blank_space_entries(
     connection_exists: bool,
     down: bool,
 ) -> Vec<BlankEntry> {
-    if !connection_exists || !schemaic_core::ddl::supports_database_editing(dialect) {
+    let databases = schemaic_core::ddl::supports_database_editing(dialect);
+    let users = schemaic_core::users::supports_users(dialect);
+    // **Empty means no menu at all**, and the test is now whether this engine has
+    // *anything* here beyond Refresh — not whether it has databases. SQLite has
+    // neither a database to create nor an account to browse, so it still raises
+    // nothing; asking only the first question would have left a lone Refresh the
+    // moment a second entry arrived.
+    if !connection_exists || (!databases && !users) {
         return Vec::new();
     }
     // **Skeleton order: read (group 2) before write (group 4).** This shipped
@@ -815,20 +834,33 @@ pub(crate) fn blank_space_entries(
     // menu has learned them all; a blank-space menu that inverts the pair is the
     // drift `8a85fa1` was written about. `blank_space_is_a_subsequence_of_the_
     // skeleton` below is this menu's half of that gate.
-    vec![
-        // Never dimmed: re-reading the schema is a read, and a read-only
-        // connection is the one most worth re-reading.
-        BlankEntry {
-            label: "Refresh",
-            kind: BlankKind::Refresh,
-            disabled: false,
-        },
-        BlankEntry {
+    let mut out = Vec::new();
+    if users {
+        // Group 2, and **before** Refresh, which the skeleton says closes the
+        // group. Dimmed on a down connection like every other entry here, but
+        // **not** on a read-only one: browsing accounts writes nothing, and the
+        // write actions inside the browser gate themselves.
+        out.push(BlankEntry {
+            label: "Users and privileges",
+            kind: BlankKind::Users,
+            disabled: down,
+        });
+    }
+    // Never dimmed: re-reading the schema is a read, and a read-only
+    // connection is the one most worth re-reading.
+    out.push(BlankEntry {
+        label: "Refresh",
+        kind: BlankKind::Refresh,
+        disabled: false,
+    });
+    if databases {
+        out.push(BlankEntry {
             label: "Create database",
             kind: BlankKind::CreateDatabase,
             disabled: read_only || down,
-        },
-    ]
+        });
+    }
+    out
 }
 
 pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
@@ -3568,19 +3600,19 @@ mod tests {
             .collect()
     }
 
-    /// Two entries, and both about the panel rather than about anything in it —
-    /// nothing in it was clicked.
+    /// Three entries, and all three about the panel rather than about anything
+    /// in it — nothing in it was clicked.
     ///
     /// **The kinds are asserted beside the labels**, because the menu builder
     /// routes on the kind: an entry whose label and discriminant disagree would
     /// render one thing and do another, and a labels-only assertion is exactly
     /// what would not notice.
     #[test]
-    fn blank_space_offers_create_and_refresh() {
+    fn blank_space_offers_accounts_refresh_and_create() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(
                 blank_labels(d, false),
-                ["Refresh", "Create database"],
+                ["Users and privileges", "Refresh", "Create database"],
                 "{d:?}"
             );
             let kinds: Vec<BlankKind> = blank_space_entries(d, false, true, false)
@@ -3589,7 +3621,11 @@ mod tests {
                 .collect();
             assert_eq!(
                 kinds,
-                [BlankKind::Refresh, BlankKind::CreateDatabase],
+                [
+                    BlankKind::Users,
+                    BlankKind::Refresh,
+                    BlankKind::CreateDatabase
+                ],
                 "{d:?}"
             );
         }
@@ -3627,8 +3663,8 @@ mod tests {
         // And the moment there is one, the menu is back — including on a
         // connection that is down, which this cannot see and must not punish.
         assert_eq!(
-            blank_space_entries(SqlDialect::MySql, false, true, false).len(),
-            2
+            labels(&blank_space_entries(SqlDialect::MySql, false, true, false)),
+            vec!["Users and privileges", "Refresh", "Create database"]
         );
     }
 
@@ -3639,9 +3675,16 @@ mod tests {
     #[test]
     fn a_read_only_connection_can_refresh_but_not_create() {
         let entries = blank_space_entries(SqlDialect::MySql, true, true, false);
-        assert_eq!(entries.len(), 2);
-        assert!(!entries[0].disabled, "Refresh is a read");
-        assert!(entries[1].disabled, "Create database must be dimmed");
+        assert!(!disabled(&entries, "Refresh"), "Refresh is a read");
+        assert!(
+            disabled(&entries, "Create database"),
+            "Create database must be dimmed"
+        );
+        // And browsing accounts is a read too, so it stays live.
+        assert!(
+            !disabled(&entries, "Users and privileges"),
+            "browsing accounts writes nothing"
+        );
     }
 
     /// **A connection that is down gets the same answer as a read-only one.**
@@ -3657,13 +3700,44 @@ mod tests {
     #[test]
     fn a_connection_that_is_down_cannot_create_but_can_still_refresh() {
         let entries = blank_space_entries(SqlDialect::MySql, false, true, true);
-        assert_eq!(entries.len(), 2, "the menu must not disappear");
-        assert!(!entries[0].disabled, "Refresh is how you come back");
-        assert!(entries[1].disabled, "Create database must be dimmed");
+        assert!(!entries.is_empty(), "the menu must not disappear");
+        assert!(
+            !disabled(&entries, "Refresh"),
+            "Refresh is how you come back"
+        );
+        assert!(
+            disabled(&entries, "Create database"),
+            "Create database must be dimmed"
+        );
+        // The browser would open on a fetch that cannot reach the server, which
+        // is the same four-steps-to-learn-what-the-header-says the create entry
+        // is dimmed to avoid.
+        assert!(
+            disabled(&entries, "Users and privileges"),
+            "a down connection has no accounts to read"
+        );
 
         // Down *and* read-only is still one dimmed entry, not a contradiction.
         let both = blank_space_entries(SqlDialect::MySql, true, true, true);
-        assert!(both[1].disabled);
+        assert!(disabled(&both, "Create database"));
+    }
+
+    /// The labels an entry list carries, in order — asserted on rather than
+    /// indices, so a third entry cannot silently shift what the older tests
+    /// below were checking.
+    fn labels(entries: &[BlankEntry]) -> Vec<&'static str> {
+        entries.iter().map(|e| e.label).collect()
+    }
+
+    /// Is the entry with this label dimmed? **Panics when it is absent**, which
+    /// is the point: an assertion about a row that is not there would otherwise
+    /// pass by finding nothing.
+    fn disabled(entries: &[BlankEntry], label: &str) -> bool {
+        entries
+            .iter()
+            .find(|e| e.label == label)
+            .unwrap_or_else(|| panic!("no `{label}` entry in {:?}", labels(entries)))
+            .disabled
     }
 
     /// **This menu's half of `overlays::menu_order_gate`.**
@@ -3682,7 +3756,7 @@ mod tests {
         // The skeleton groups these two labels sit in — the numbers in
         // `overlays::menu_order_gate::group`, which this must not disagree with.
         let group = |label: &str| match label {
-            "Refresh" => 2,
+            "Refresh" | "Users and privileges" => 2,
             "Create database" => 4,
             other => panic!(
                 "`{other}` has no place in the menu skeleton — put it in a group in                  `overlays::menu_order_gate::group` first, and mirror the number here"

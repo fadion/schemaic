@@ -26,8 +26,9 @@ use crate::settings::{
     ai_settings_overlay, help_overlay, term_settings_overlay, theme_settings_overlay,
 };
 use crate::{
-    DdlUi, Ui, database_editor, ddl_preview, event_editor, import_view, object_editor, properties,
-    routine_editor, table_designer, theme, trigger_editor, view_editor,
+    DdlUi, Ui, account_editor, database_editor, ddl_preview, event_editor, import_view,
+    object_editor, properties, routine_editor, table_designer, theme, trigger_editor, users_view,
+    view_editor,
 };
 
 /// **Every modal, in one layer that starts below the title bar.**
@@ -101,6 +102,8 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let event_open = ui.ddl.event;
             let object_open = ui.ddl.object;
             let database_open = ui.ddl.database;
+            let account_open = ui.ddl.account;
+            let grant_open = ui.ddl.grant;
             let dump_open = ui.dump.target;
             let script_open = ui.script.target;
             stack((
@@ -167,9 +170,15 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 stack((
                     object_editor::object_editor_overlay(ui.clone()),
                     database_editor::database_editor_overlay(ui.clone()),
+                    account_editor::account_editor_overlay(ui.clone()),
+                    account_editor::grant_editor_overlay(ui.clone()),
                 ))
                 .style(move |s| {
-                    if object_open.get().is_some() || database_open.get().is_some() {
+                    if object_open.get().is_some()
+                        || database_open.get().is_some()
+                        || account_open.get().is_some()
+                        || grant_open.get().is_some()
+                    {
                         s.absolute().inset(0.0)
                     } else {
                         s
@@ -205,6 +214,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             monitor_overlay(ui.clone()),
             erd_overlay(ui.clone()),
             properties::properties_overlay(ui.clone()),
+            users_view::users_overlay(ui.clone()),
         ))
         .style(move |s| {
             if workspace_modals_up() {
@@ -331,16 +341,41 @@ pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
             || d.object.get().is_some()
             || d.event.get().is_some()
             || d.database.get().is_some()
+            // Both account forms are painted in this group, so both have to be
+            // in this list — the failure `ddl_editors_up` states, and the shape
+            // most likely to be forgotten is the *second* signal of a shared
+            // tuple element, which the grant editor is.
+            || d.account.get().is_some()
+            || d.grant.get().is_some()
             || d.preview.get().is_some()
     }
 }
 
-/// The workspace group's modals — Live Monitor, the ER diagram, Properties.
+/// The workspace group's modals — Live Monitor, the ER diagram, Properties, and
+/// the Users and privileges browser, which is the one that is not simply open or
+/// closed. See the note in the body.
 fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let mon_open = ui.overlay.monitor_open;
     let erd_open = ui.overlay.erd;
     let props_open = ui.overlay.properties;
-    move || mon_open.get() || erd_open.get().is_some() || props_open.get().is_some()
+    let users_open = ui.overlay.users;
+    // **The browser counts only while it is the thing on screen.** It renders
+    // nothing while one of the account forms or the DDL preview is up — those
+    // are raised from it and painted in an earlier group — and a wrapper that
+    // still filled the layer would be a transparent full-window box sitting on
+    // top of the form, swallowing every click meant for it.
+    let account_open = ui.ddl.account;
+    let grant_open = ui.ddl.grant;
+    let preview_open = ui.ddl.preview;
+    move || {
+        mon_open.get()
+            || erd_open.get().is_some()
+            || props_open.get().is_some()
+            || (users_open.get().is_some()
+                && account_open.get().is_none()
+                && grant_open.get().is_none()
+                && preview_open.get().is_none())
+    }
 }
 
 /// The settings/help group's modals.
@@ -454,8 +489,15 @@ mod modal_backdrop_gate {
         // In the layer's DDL group, raised by `ddl_modals_up`'s
         // `snippet_edit.get().is_some()` arm.
         "snippet_edit.rs",
+        // In the layer's DDL group, sharing `object_editor.rs`'s tuple element,
+        // raised by `ddl_editors_up`'s `d.account` and `d.grant` arms — one file,
+        // two overlays.
+        "account_editor.rs",
         "table_designer.rs",
         "trigger_editor.rs",
+        // In the layer's workspace group, raised by `workspace_modals_up`'s
+        // `users_open.get().is_some()` arm.
+        "users_view.rs",
         "view_editor.rs",
         // **The one deliberate exception**, and the reason the list is data rather
         // than a rule. `WindowChrome::over_backdrop` paints the same scrim across
