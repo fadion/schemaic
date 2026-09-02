@@ -1781,9 +1781,14 @@ pub(crate) struct QueryPaneParams {
     /// completion + diagnostics parsing. Reactive — follows the tab's `conn_id`.
     pub dialect: Memo<SqlDialect>,
     /// How much of the active tab's connection the assistant may see. The **tab's**
-    /// connection, not the active one, for `grid::ai_data_of`'s reason. Gates the
-    /// engine's error text out of the AI fix and Explain prompts on any level
-    /// below `Full` — see [`schemaic_core::prompt::result_shape`].
+    /// connection, not the active one, for `grid::ai_data_of`'s reason. Below
+    /// `Full` it does not withhold the engine's error from the AI fix and Explain
+    /// prompts — it *redacts* it: the values come out and the constraint, column
+    /// and error class still go, via
+    /// [`schemaic_core::prompt::redact_engine_error`]. A message shaped like no
+    /// template it knows is passed through, so a new call site handing it an
+    /// error is not thereby covered — see that function's own note on the
+    /// residual risk.
     pub ai_data: Memo<schemaic_core::connection::AiData>,
     pub active_db_menu_open: RwSignal<bool>,
     pub active_db_anchor: RwSignal<Point>,

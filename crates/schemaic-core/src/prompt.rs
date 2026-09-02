@@ -131,6 +131,105 @@ pub fn pipe_table(columns: &[String], rows: &[Vec<String>], cell_chars: usize) -
     out
 }
 
+/// What replaces a value the engine quoted back into its own error message.
+pub const REDACTED: &str = "<redacted>";
+
+/// What the model is told when it is reading a redacted message, so it does not
+/// reason about [`REDACTED`] as though it were the stored value.
+const REDACTION_NOTE: &str = "Values the engine quoted back have been replaced with <redacted>, \
+     because this connection's AI data access does not send stored values. Everything else is the \
+     engine's own text. Never write <redacted> into SQL or into any answer as though it were the \
+     value — it is a marker for something you were not shown. Ask the user to paste the original \
+     line if you need what was removed.";
+
+/// Which end of the run to close on when a value's delimiter could also appear
+/// *inside* the value.
+enum Edge {
+    First,
+    Last,
+}
+
+/// An engine error with the **values** taken out and everything else kept.
+///
+/// The alternative this replaces was withholding the whole message below
+/// `AiData::Full`, on the reasoning that
+/// `Duplicate entry 'alice@corp.com' for key 'users.email'` is a stored cell
+/// quoted back by the server. That reasoning is right about the value and wrong
+/// about the message: `users.email` is schema, which every level already sends,
+/// and it is the half that makes the error actionable. So the value goes and the
+/// message stays.
+///
+/// **Per-template, not a blunt quote-stripper.** Engines quote identifiers in the
+/// same syntax as values — `for key 'users.email'`, `constraint "users_email_key"`
+/// — so blanking every quoted run would destroy exactly the half worth keeping.
+/// Each rule below is anchored on the phrase that identifies the *value's*
+/// position in one engine's message.
+///
+/// **Not a SQL scan**, so it is not built on `sql::skip_noncode` and is not an
+/// exception to that invariant: the input is an engine's prose, and the quoting
+/// rules here are the message's, not the dialect's. For the same reason it takes
+/// no dialect — every engine's patterns are tried, and one engine's anchor does
+/// not occur in another's message. A wrong dialect can't be passed to it.
+///
+/// **The residual risk is named rather than papered over:** a message shaped like
+/// nothing here is passed through, so a value in an unrecognised template still
+/// reaches the model. What the levels below `Full` promise is that *rows* do not
+/// leave, and the rules cover the messages that carry them — the uniqueness,
+/// not-null, type-coercion and failing-row reports. A syntax error quoting the
+/// user's own SQL back is deliberately left whole: that is what the user typed,
+/// not what the table stores, and it is the most useful error there is.
+pub fn redact_engine_error(msg: &str) -> String {
+    msg.lines().map(redact_line).collect::<Vec<_>>().join("\n")
+}
+
+/// One line of [`redact_engine_error`]. Line-scoped so an anchor cannot reach
+/// across into the next line's text.
+fn redact_line(line: &str) -> String {
+    let mut out = line.to_string();
+    // MySQL/MariaDB 1062: `Duplicate entry 'VALUE' for key 'KEY'`. Closed on the
+    // trailing phrase rather than the next quote, so a value containing `'`
+    // still redacts whole.
+    out = redact_between(&out, "Duplicate entry '", "' for key ", &Edge::First);
+    // MySQL 1366 and kin: `Incorrect integer value: 'VALUE' for column 'COL'`.
+    if out.contains("Incorrect ") {
+        out = redact_between(&out, " value: '", "'", &Edge::First);
+    }
+    // PostgreSQL DETAIL: `Failing row contains (v1, v2, …).` — a whole row.
+    out = redact_between(&out, "Failing row contains (", ")", &Edge::Last);
+    // PostgreSQL DETAIL: `Key (col)=(VALUE) already exists.` The first
+    // parenthetical is column names and is kept; only the second is data.
+    out = redact_between(&out, ")=(", ")", &Edge::Last);
+    // PostgreSQL 22P02: `invalid input syntax for type integer: "VALUE"`.
+    if out.contains("invalid input syntax") {
+        out = redact_between(&out, ": \"", "\"", &Edge::First);
+    }
+    out
+}
+
+/// Replace the run between `start` and `end` with [`REDACTED`], or return `line`
+/// unchanged when either anchor is missing — a truncated or unfamiliar message
+/// must survive this without losing the text it does have.
+///
+/// `Edge::Last` closes on the *final* `end` in the rest of the line, for the
+/// paren-delimited PostgreSQL details whose values can themselves contain `)`.
+/// It can over-redact a line that ends in an unrelated parenthetical, which is
+/// the safe direction to be wrong in.
+fn redact_between(line: &str, start: &str, end: &str, edge: &Edge) -> String {
+    let Some(i) = line.find(start) else {
+        return line.to_string();
+    };
+    let from = i + start.len();
+    let rest = &line[from..];
+    let found = match edge {
+        Edge::First => rest.find(end),
+        Edge::Last => rest.rfind(end),
+    };
+    let Some(j) = found else {
+        return line.to_string();
+    };
+    format!("{}{REDACTED}{}", &line[..from], &rest[j..])
+}
+
 /// What the result panel is holding, for the AI turn context — **shape only**.
 ///
 /// Column names and types, the row count, the cap, the elapsed time, the
@@ -152,8 +251,17 @@ pub fn pipe_table(columns: &[String], rows: &[Vec<String>], cell_chars: usize) -
 /// the user did not hand over. It was `may_attach`, which let the text out on
 /// **Only what I attach**, the default, whose consent line reads *"Rows you
 /// attach from a result leave this machine with that question."* Nobody
-/// attached that one. The failure is still reported at every level; only the
-/// text is withheld, and the arm tells the model to ask for it.
+/// attached that one.
+///
+/// **What the gate now decides is verbatim-or-redacted, not sent-or-withheld.**
+/// Below `Full` the message goes through [`redact_engine_error`], which takes out
+/// the values and keeps the constraint, the column and the error class. The
+/// whole message used to be dropped, and that was more caution than the reason
+/// called for: the stored value is what `SchemaOnly`'s *"No row ever leaves this
+/// machine"* promises about, and `users.email` is schema, which every level
+/// already sends. A model told only *"the last run FAILED, the message is
+/// withheld"* cannot help, so the level was paying for its caution in
+/// usefulness rather than in exposure.
 pub fn result_shape(
     state: &crate::model::QueryState,
     data: crate::connection::AiData,
@@ -167,10 +275,10 @@ pub fn result_shape(
             "The last run FAILED. The engine's error, verbatim:\n{}",
             fenced(e)
         ),
-        QueryState::Failed(_) => "The last run FAILED. This connection sends rows only when \
-             the user attaches them, so the engine's message is withheld — it can quote a \
-             stored value. Ask the user to paste it if you need it."
-            .to_string(),
+        QueryState::Failed(e) => format!(
+            "The last run FAILED. {REDACTION_NOTE}\nThe engine's error:\n{}",
+            fenced(&redact_engine_error(e))
+        ),
         QueryState::Loaded(rs) => match rs.affected {
             // A write/DDL: no grid to describe, just what the server reported.
             Some(n) => format!("The last statement returned no result set: {n} rows affected."),
@@ -282,11 +390,17 @@ pub struct FixPrompt {
 /// [`result_shape`]'s reason: an engine's error is not shape, and
 /// `Duplicate entry 'alice@corp.com' for key 'users.email'` is a stored cell
 /// quoted back by the server. Below [`crate::connection::AiData::may_query`] —
-/// `Full` — the model is
-/// told a run failed and that the text is withheld, and the SQL still goes with
-/// it, which is enough for a syntax fix and honest about the rest. Without this,
-/// one click on a connection whose consent line reads *"No row ever leaves this
-/// machine"* sent that cell to the model.
+/// `Full` — the message goes through [`redact_engine_error`]: the value is
+/// replaced and the constraint, column and error class still go, along with the
+/// SQL. Without the gate, one click on a connection whose consent line reads
+/// *"No row ever leaves this machine"* sent that cell to the model.
+///
+/// **The problems are redacted before anything is built from them**, so the
+/// [`FixPrompt::input`] *label* carries the redacted text too and not only the
+/// intent: the Ctrl+K box shows that label, and a retry sends the box's
+/// contents — the path `editor_pane.rs`'s `CmdK::intent` doc comment warns
+/// about. Redacting only the intent would have left the value one keystroke
+/// from the model.
 ///
 /// `FixOrigin::Editor` is gated too. Most of what the editor reports is our own
 /// offline analysis over the user's own SQL, but live validation puts the
@@ -297,27 +411,23 @@ pub fn ai_fix_prompt(
     origin: FixOrigin,
     data: crate::connection::AiData,
 ) -> Option<FixPrompt> {
-    let problems: Vec<&str> = problems
+    // Redacted *before* anything is built from them, so neither the intent nor
+    // the label can carry a value the level does not send. The label matters as
+    // much as the intent here: it is what the Ctrl+K box shows, and a retry
+    // sends the box's contents.
+    let problems: Vec<String> = problems
         .iter()
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
+        .map(|p| {
+            if data.may_query() {
+                p.to_string()
+            } else {
+                redact_engine_error(p)
+            }
+        })
         .collect();
-    let first = *problems.first()?;
-    if !data.may_query() {
-        let noun = match origin {
-            FixOrigin::Run => "run failed",
-            FixOrigin::Editor => "editor reports a problem",
-        };
-        return Some(FixPrompt {
-            input: format!("Fix the {noun} (message withheld)"),
-            intent: format!(
-                "The {noun}. This connection sends rows only when the user attaches \
-                 them, so the message is withheld — it can quote a stored value. Fix \
-                 what you can see in the SQL; if you need the message, return the SQL \
-                 unchanged and the user will paste it.\n\nReturn the corrected SQL only."
-            ),
-        });
-    }
+    let first = problems.first()?.as_str();
     // Singular reads as what it is; plural drops the message, which wouldn't fit
     // the box anyway — the list is in the intent.
     let input = if problems.len() == 1 {
@@ -346,8 +456,13 @@ pub fn ai_fix_prompt(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let note = if data.may_query() {
+        String::new()
+    } else {
+        format!("\n{REDACTION_NOTE}")
+    };
     let intent = format!(
-        "{header}\n{}\n{UNTRUSTED_NOTE}\n\nReturn the corrected SQL only.",
+        "{header}\n{}\n{UNTRUSTED_NOTE}{note}\n\nReturn the corrected SQL only.",
         fenced(&body)
     );
     Some(FixPrompt { input, intent })
@@ -377,9 +492,9 @@ pub fn ai_fix_prompt(
 ///
 /// **`data` gates the message**, by [`result_shape`]'s rule and for its reason —
 /// see [`ai_fix_prompt`], which takes the same argument for the same text. Below
-/// `Full` the ask still goes, with the statement and without the message, and
-/// says so; a model can usually explain a failure from the SQL alone, and when it
-/// cannot the user is told to paste the line.
+/// `Full` the ask carries the message [`redact_engine_error`] returns rather
+/// than the engine's own, under a note saying so; the statement is the user's
+/// own text and goes in full at every level.
 pub fn explain_error_prompt(
     statement: Option<&str>,
     message: &str,
@@ -389,30 +504,23 @@ pub fn explain_error_prompt(
     if message.is_empty() {
         return None;
     }
-    if !data.may_query() {
-        let mut out = String::from(
-            "A database error came back, but this connection sends rows only when the \
-             user attaches them, so the engine's message is withheld — it can quote a \
-             stored value. Explain what is likely to have gone wrong from the statement \
-             alone, and say plainly that you have not seen the message. Don't rewrite \
-             the query — the editor has its own action for that.",
-        );
-        if let Some(sql) = statement.map(str::trim).filter(|s| !s.is_empty()) {
-            out.push_str("\n\n");
-            out.push_str(UNTRUSTED_NOTE);
-            out.push_str("\n\nThe statement it came from:\n");
-            out.push_str(&fenced_as("sql", sql));
-        }
-        return Some(out);
-    }
+    let shown = if data.may_query() {
+        message.to_string()
+    } else {
+        redact_engine_error(message)
+    };
     let mut out = String::from(
         "A database error came back. Explain what it means and what causes it, in a \
          sentence or two. Don't rewrite the query — the editor has its own action for \
          that.\n\n",
     );
     out.push_str(UNTRUSTED_NOTE);
+    if !data.may_query() {
+        out.push('\n');
+        out.push_str(REDACTION_NOTE);
+    }
     out.push_str("\n\nThe error:\n");
-    out.push_str(&fenced(message));
+    out.push_str(&fenced(&shown));
     if let Some(sql) = statement.map(str::trim).filter(|s| !s.is_empty()) {
         out.push_str("\n\nThe statement it came from:\n");
         out.push_str(&fenced_as("sql", sql));
@@ -552,9 +660,11 @@ mod tests {
     /// read-only queries and read sample rows by itself"*. `OnRequest`'s says
     /// rows leave when the user attaches them, and nobody attached this one.
     ///
-    /// So the gate is [`AiData::may_query`], not `may_attach`. The failure is
-    /// still reported at every level; only the text is withheld, and the arm
-    /// tells the model to ask.
+    /// So the gate is [`AiData::may_query`], not `may_attach` — but what it
+    /// decides is *verbatim or redacted*, not sent or withheld. The value is
+    /// what the consent line is about; `users.email` is schema, which every
+    /// level already sends, and dropping it too bought no privacy and cost the
+    /// model the only actionable half of the message.
     #[test]
     fn the_engines_error_leaves_only_where_the_consent_line_covers_it() {
         let failed = QueryState::Failed(
@@ -565,14 +675,20 @@ mod tests {
         for level in AiData::ALL {
             let out = result_shape(&failed, level).unwrap();
             assert!(out.contains("FAILED"), "{level:?}: {out}");
+            // The stored value goes only where the consent line covers it.
             assert_eq!(
                 out.contains("alice@corp.com"),
                 level.may_query(),
                 "{level:?}: {out}"
             );
-            if !level.may_query() {
-                assert!(out.contains("withheld"), "{level:?}: {out}");
-            }
+            // The rest of the message goes at *every* level, marked as redacted
+            // where a value was taken out.
+            assert!(out.contains("users.email"), "{level:?}: {out}");
+            assert_eq!(
+                out.contains(REDACTED),
+                !level.may_query(),
+                "{level:?}: {out}"
+            );
         }
     }
 
@@ -841,18 +957,182 @@ mod tests {
         assert!(explain_error_prompt(None, "  \n ", AiData::Full).is_none());
     }
 
+    // ── redacting the engine's own message ───────────────────────────────────
+
+    #[test]
+    fn the_note_names_the_marker_the_model_will_actually_see() {
+        assert!(REDACTION_NOTE.contains(REDACTED), "{REDACTION_NOTE}");
+    }
+
+    #[test]
+    fn redaction_drops_a_duplicate_value_and_keeps_the_key_it_collided_on() {
+        let out = redact_engine_error("Duplicate entry 'alice@corp.com' for key 'users.email'");
+        assert!(!out.contains("alice@corp.com"), "{out}");
+        assert!(out.contains("users.email"), "{out}");
+        assert!(out.contains(REDACTED), "{out}");
+    }
+
+    #[test]
+    fn redaction_drops_a_postgres_key_value_and_keeps_the_column() {
+        let out = redact_engine_error("DETAIL:  Key (email)=(alice@corp.com) already exists.");
+        assert!(!out.contains("alice@corp.com"), "{out}");
+        assert!(out.contains("(email)"), "{out}");
+    }
+
+    #[test]
+    fn redaction_drops_a_whole_failing_row() {
+        let out =
+            redact_engine_error("DETAIL:  Failing row contains (7, alice@corp.com, 2024-01-01).");
+        for v in ["alice@corp.com", "2024-01-01"] {
+            assert!(!out.contains(v), "{v} survived: {out}");
+        }
+        assert!(out.contains("Failing row contains"), "{out}");
+    }
+
+    #[test]
+    fn redaction_drops_a_rejected_literal_and_keeps_the_type_and_column() {
+        let pg = redact_engine_error("invalid input syntax for type integer: \"abc\"");
+        assert!(!pg.contains("abc"), "{pg}");
+        assert!(pg.contains("integer"), "{pg}");
+        let my = redact_engine_error("Incorrect integer value: 'abc' for column 'age' at row 1");
+        assert!(!my.contains("abc"), "{my}");
+        assert!(my.contains("age"), "{my}");
+    }
+
+    /// A value containing the delimiter that ends its own run — the case a
+    /// first-match close would leak a fragment of.
+    #[test]
+    fn redaction_survives_a_value_holding_its_own_delimiter() {
+        let out = redact_engine_error("Duplicate entry 'O'Brien' for key 'people.name'");
+        assert!(!out.contains("Brien"), "{out}");
+        assert!(out.contains("people.name"), "{out}");
+        let pg = redact_engine_error("DETAIL:  Key (org)=(Acme (UK)) already exists.");
+        assert!(!pg.contains("Acme"), "{pg}");
+    }
+
+    /// The messages that name no value at all must come through untouched —
+    /// SQLite's constraint reports are the whole of its uniqueness story.
+    #[test]
+    fn redaction_leaves_a_message_that_names_no_value_alone() {
+        for msg in [
+            "UNIQUE constraint failed: users.email",
+            "NOT NULL constraint failed: users.name",
+            "Unknown column 'emial' in 'where clause'",
+            "null value in column \"name\" of relation \"users\" violates not-null constraint",
+            "duplicate key value violates unique constraint \"users_email_key\"",
+        ] {
+            assert_eq!(redact_engine_error(msg), msg, "{msg}");
+        }
+    }
+
+    /// The user's own SQL, quoted back by the parser, is not a stored value —
+    /// and a syntax error is the one message that is *all* useful.
+    #[test]
+    fn redaction_keeps_the_users_own_sql_that_a_syntax_error_quotes() {
+        let msg = "You have an error in your SQL syntax near 'SELCT 1 FROM users' at line 1";
+        assert_eq!(redact_engine_error(msg), msg);
+    }
+
+    #[test]
+    fn redaction_spans_the_lines_of_one_message_and_repeats_itself_exactly() {
+        let msg = "ERROR: duplicate key value violates unique constraint \"users_email_key\"\n\
+                   DETAIL:  Key (email)=(alice@corp.com) already exists.";
+        let once = redact_engine_error(msg);
+        assert!(once.contains("users_email_key"), "{once}");
+        assert!(!once.contains("alice@corp.com"), "{once}");
+        // Idempotent: a redacted message redacts to itself, so a value can never
+        // reappear and the marker is never nested.
+        assert_eq!(redact_engine_error(&once), once);
+    }
+
+    /// **Captured from the engines, not remembered.** Every string here was read
+    /// off a live MariaDB 10.11 and PostgreSQL 16 rather than written from
+    /// memory of the format, because the rules are anchored on exact phrasing and
+    /// a plausible-looking template that no engine emits protects nothing. Two
+    /// details only the live capture showed: MariaDB spells the column in
+    /// **backticks** in 1366 (so the `'` that closes the value is unambiguous),
+    /// and PostgreSQL appends a `LINE n:` echo of the statement.
+    #[test]
+    fn redaction_answers_the_messages_the_engines_actually_emit() {
+        let maria_dup = "Duplicate entry 'alice@corp.com' for key 'email'";
+        let out = redact_engine_error(maria_dup);
+        assert!(!out.contains("alice@corp.com"), "{out}");
+        assert!(out.contains("for key 'email'"), "{out}");
+
+        let maria_int =
+            "Incorrect integer value: 'notanumber' for column `redact_t`.`u`.`age` at row 1";
+        let out = redact_engine_error(maria_int);
+        assert!(!out.contains("notanumber"), "{out}");
+        assert!(out.contains("`redact_t`.`u`.`age`"), "{out}");
+
+        let pg_dup = "ERROR:  duplicate key value violates unique constraint \"redact_u_email_key\"\n\
+                      DETAIL:  Key (email)=(alice@corp.com) already exists.";
+        let out = redact_engine_error(pg_dup);
+        assert!(!out.contains("alice@corp.com"), "{out}");
+        assert!(out.contains("redact_u_email_key"), "{out}");
+
+        // The whole row, and the reason this rule exists at all.
+        let pg_row = "ERROR:  null value in column \"age\" of relation \"redact_u\" violates not-null constraint\n\
+                      DETAIL:  Failing row contains (3, b@c.d, null).";
+        let out = redact_engine_error(pg_row);
+        assert!(!out.contains("b@c.d"), "{out}");
+        assert!(out.contains("not-null constraint"), "{out}");
+        assert!(out.contains("\"age\""), "{out}");
+    }
+
+    /// PostgreSQL's `LINE n:` echo is the **user's own statement**, values and
+    /// all, and it is deliberately kept: it is what they typed, not what the
+    /// table stores, and it is how the caret line below it means anything. The
+    /// same rule that keeps a syntax error's quoted SQL whole.
+    #[test]
+    fn redaction_keeps_the_postgres_line_echo_of_the_users_own_statement() {
+        let msg = "ERROR:  invalid input syntax for type integer: \"abc\"\n\
+                   LINE 1: INSERT INTO redact_u VALUES (4,'d@e.f','abc');\n\
+                                                                  ^";
+        let out = redact_engine_error(msg);
+        // The engine's own quoted-back literal goes …
+        assert!(
+            out.lines().next().is_some_and(|l| !l.contains("abc")),
+            "{out}"
+        );
+        // … but the statement the user wrote, and the caret under it, stay.
+        assert!(out.contains("LINE 1: INSERT INTO redact_u"), "{out}");
+        assert!(out.contains('^'), "{out}");
+    }
+
+    #[test]
+    fn a_truncated_message_keeps_what_it_has_instead_of_panicking() {
+        for msg in [
+            "Duplicate entry '",
+            "DETAIL:  Key (email)=(",
+            "Failing row contains (",
+            "",
+            "Incorrect ",
+        ] {
+            let out = redact_engine_error(msg);
+            assert!(out.starts_with(msg.lines().next().unwrap_or("")), "{out}");
+        }
+    }
+
     // ── the level gate on both of them ───────────────────────────────────────
 
     /// The failure this exists for: a `Duplicate entry` quotes a stored cell, and
     /// both new buttons sent it on a connection whose consent line reads "No row
     /// ever leaves this machine" — and on the default level, with no attach
-    /// gesture. `result_shape` had already withheld this exact string.
+    /// gesture.
+    ///
+    /// **Both halves are asserted, and the second is the point.** Withholding the
+    /// whole message also keeps the value out, so a test that only checks the
+    /// value's absence passes just as well against the behaviour this replaced —
+    /// it would not notice a regression to sending nothing. Pinning
+    /// `users.email` is what makes this a test of *redaction*.
     #[test]
-    fn neither_prompt_carries_the_engines_message_below_full() {
+    fn both_prompts_carry_the_message_redacted_below_full() {
         let msg = "Duplicate entry 'alice@corp.com' for key 'users.email'";
         for data in [AiData::SchemaOnly, AiData::OnRequest] {
             let p = ai_fix_prompt(&[msg.to_string()], FixOrigin::Run, data)
                 .expect("the action still works, it just says less");
+            // The label too: the Ctrl+K box shows it, and a retry sends the box.
             assert!(!p.input.contains("alice@corp.com"), "{data:?}: {}", p.input);
             assert!(
                 !p.intent.contains("alice@corp.com"),
@@ -860,16 +1140,23 @@ mod tests {
                 p.intent
             );
             assert!(
+                p.intent.contains("users.email"),
+                "the key it collided on is schema and must survive — {data:?}: {}",
+                p.intent
+            );
+            assert!(p.intent.contains(REDACTED), "{data:?}: {}", p.intent);
+            assert!(
                 p.intent.contains("Return the corrected SQL only"),
                 "{data:?}: {}",
                 p.intent
             );
 
             let e = explain_error_prompt(Some("SELECT 1"), msg, data)
-                .expect("an explanation from the statement alone is still worth asking for");
+                .expect("an explanation is still worth asking for");
             assert!(!e.contains("alice@corp.com"), "{data:?}: {e}");
-            // The statement is the user's own SQL and goes at every level; it is
-            // the *engine's* text that is withheld.
+            assert!(e.contains("users.email"), "{data:?}: {e}");
+            assert!(e.contains(REDACTED), "{data:?}: {e}");
+            // The statement is the user's own SQL and goes at every level.
             assert!(e.contains("SELECT 1"), "{data:?}: {e}");
         }
     }
@@ -903,6 +1190,19 @@ mod tests {
                 .contains("alice@corp.com");
             assert_eq!((shape, fix), (shape, shape), "{data:?} fix");
             assert_eq!((shape, explain), (shape, shape), "{data:?} explain");
+
+            // They must agree on what they *keep*, too — otherwise one could
+            // drift back to withholding the whole message while the other
+            // redacts, and the value-only check above would not see it.
+            for kept in [
+                result_shape(&QueryState::Failed(msg.to_string()), data).unwrap_or_default(),
+                ai_fix_prompt(&[msg.to_string()], FixOrigin::Run, data)
+                    .unwrap()
+                    .intent,
+                explain_error_prompt(None, msg, data).unwrap(),
+            ] {
+                assert!(kept.contains("users.email"), "{data:?}: {kept}");
+            }
         }
     }
 }
