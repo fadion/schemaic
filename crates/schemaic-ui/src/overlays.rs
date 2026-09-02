@@ -1038,6 +1038,99 @@ pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
+/// What a SCHEMA-gear entry does.
+///
+/// A discriminant rather than the label, for [`crate::schema_tree::BlankKind`]'s
+/// reason: routing on the string with a catch-all arm makes a sixth entry render
+/// as a row that does nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GearKind {
+    Refresh,
+    CollapseAll,
+    Users,
+    CreateDatabase,
+    ShowTableSizes,
+}
+
+/// One SCHEMA-gear entry as data: its label, what it does, and whether it is
+/// inert.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct GearEntry {
+    pub label: &'static str,
+    pub kind: GearKind,
+    pub disabled: bool,
+}
+
+/// Which entries the SCHEMA gear's menu has, and which are inert.
+///
+/// **Split out for the reason its sibling was.** The gear and the tree's
+/// blank space are two homes for the same three actions, and
+/// `schema_tree::blank_space_entries` got this treatment after an ordering
+/// inversion that no test could see — while this menu, which has *more* gates
+/// (two of the five are conditional and two of those are conditionally dimmed),
+/// stayed a 130-line inline builder in a file whose test module could not reach
+/// it. The gates are the part worth asserting: `Create database` ends at a live
+/// `run_ddl`, and `Users and privileges` opens a browser on a connection that
+/// may be down.
+///
+/// **The two menus deliberately do not agree entry for entry** — the gear also
+/// carries `Collapse all` and the size toggle, which are about the panel rather
+/// than the server — so this is a second list rather than a call to the first.
+/// What they must agree on is the *gating*, which is why both ask the same
+/// capabilities: `users::supports_users` and `ddl::supports_database_editing`.
+pub(crate) fn gear_entries(
+    dialect: schemaic_core::intel::SqlDialect,
+    connection_exists: bool,
+    read_only: bool,
+    down: bool,
+) -> Vec<GearEntry> {
+    let mut out = vec![
+        // Never dimmed: a down connection is the one most worth re-reading, and
+        // collapsing the tree needs no server at all.
+        GearEntry {
+            label: "Refresh",
+            kind: GearKind::Refresh,
+            disabled: false,
+        },
+        GearEntry {
+            label: "Collapse all",
+            kind: GearKind::CollapseAll,
+            disabled: false,
+        },
+    ];
+    // Absent where the engine has no accounts (SQLite) and with no saved
+    // connection. **Dimmed on a down connection but not on a read-only one**:
+    // browsing accounts writes nothing, so the read-only refusal that guards
+    // `Create database` would answer a question this action does not ask.
+    if connection_exists && schemaic_core::users::supports_users(dialect) {
+        out.push(GearEntry {
+            label: "Users and privileges",
+            kind: GearKind::Users,
+            disabled: down,
+        });
+    }
+    // Dimmed on read-only *and* on down, for the reason
+    // `schema_tree::blank_space_entries` states: the form would open, preview
+    // real SQL and fail at Apply with a connect error the header already showed.
+    if connection_exists && schemaic_core::ddl::supports_database_editing(dialect) {
+        out.push(GearEntry {
+            label: "Create database",
+            kind: GearKind::CreateDatabase,
+            disabled: read_only || down,
+        });
+    }
+    // Absent where the engine has no sizes to show — a row that visibly toggles
+    // while nothing changes is worse than no row.
+    if schemaic_core::stats::supports_table_stats(dialect) {
+        out.push(GearEntry {
+            label: "Show table sizes",
+            kind: GearKind::ShowTableSizes,
+            disabled: false,
+        });
+    }
+    out
+}
+
 // The SCHEMA settings dropdown (opened by the gear): Refresh, Collapse all, and
 // the size-column toggle. Same style as the other dropdowns, dropped 3px below
 // the gear.
@@ -1062,165 +1155,89 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             let ui = menu_ui.clone();
             let refresh = refresh.clone();
             let collapse_all = collapse_all.clone();
-            let refresh_item = container(text("Refresh").style(|s| s.color(theme::text())))
-                .on_click_stop(move |_| {
-                    (refresh)();
-                    open.set(false);
-                })
-                .style(menu_item_style)
-                .style(|s| s.padding_vert(theme::scaled(8.0)));
-            let collapse_item = container(text("Collapse all").style(|s| s.color(theme::text())))
-                .on_click_stop(move |_| {
-                    (collapse_all)();
-                    open.set(false);
-                })
-                .style(menu_item_style)
-                .style(|s| s.padding_vert(theme::scaled(8.0)));
-
-            // **The label carries the state, the way the eye menu's rows do** —
-            // `db_toggle_on` when the column is showing. No check glyph: it would
-            // need a reserved 13px gutter that reads as an empty box on every
-            // other row of this menu, and on the off state as a missing tick.
-            //
-            // Off is plain `text()`, not the eye menu's faded `db_toggle_off`.
-            // There, dim means *this database is hidden* — a state with a
-            // consequence. Here off is just the resting state of a view mode, and
-            // dimming it would make an ordinary menu row look disabled.
-            //
-            // **And it is offered only where the engine has sizes to show**
-            // (`stats::supports_table_stats`, the capability the fetch itself is
-            // guarded by). SQLite has none — no per-table row estimate outside an
-            // `ANALYZE` sample, and per-table bytes need the `dbstat` module this
-            // build omits — so the column stays empty whichever way the row is set,
-            // and a row that visibly toggles while nothing changes is worse than no
-            // row. Absent rather than disabled: there is nothing here for another
-            // connection to enable. The *setting* is untouched — it is global and
-            // persisted, so a MySQL connection comes back to whatever it was left at.
-            let mut items: Vec<floem::AnyView> =
-                vec![refresh_item.into_any(), collapse_item.into_any()];
-
-            // Read once for both of the entries below, which ask the same two
-            // questions of it.
+            let toggle_sizes = toggle_sizes.clone();
+            // Read once for every gate below, which ask the same questions of it.
             let ctx = crate::table_designer::edit_ctx(&ui);
-
-            // **Users and privileges lives here for the reason `Create database`
-            // does**: it is about the *server*, not about any row in the tree,
-            // and this menu is already the one that acts on the connection as a
-            // whole. Absent where the engine has no accounts at all
-            // (`users::supports_users` — SQLite), and absent with no saved
-            // connection, the same `ctx.exists` gate the entry above states.
-            //
-            // **Dimmed on a down connection, but not on a read-only one.**
-            // Browsing accounts writes nothing, so the read-only refusal that
-            // guards `Create database` would be answering a question this action
-            // does not ask; a connection that cannot be reached is a different
-            // matter, and the browser would open on a fetch that fails.
-            if ctx.exists && schemaic_core::users::supports_users(ctx.dialect) {
-                let down = ui.conn.conn_status.get_untracked().is_down();
-                let users_ui = ui.clone();
-                items.push(
-                    container(text("Users and privileges").style(move |s| {
-                        s.color(if down {
-                            theme::text_faint()
+            let down = ui.conn.conn_status.get_untracked().is_down();
+            let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn);
+            // **Which rows, in which order, and which are inert is data** — see
+            // `gear_entries`. This builder turns each entry into a row and
+            // nothing else, so the gates are asserted in a test rather than
+            // read off a 130-line view.
+            let items: Vec<floem::AnyView> = gear_entries(ctx.dialect, ctx.exists, read_only, down)
+                .into_iter()
+                .map(|e| {
+                    let ui = ui.clone();
+                    let refresh = refresh.clone();
+                    let collapse_all = collapse_all.clone();
+                    let toggle_sizes = toggle_sizes.clone();
+                    let kind = e.kind;
+                    let disabled = e.disabled;
+                    container(text(e.label).style(move |s| {
+                        // **The size toggle's label carries its state, the
+                        // way the eye menu's rows do** — `db_toggle_on` when
+                        // the column is showing. No check glyph: it would
+                        // need a reserved 13px gutter that reads as an empty
+                        // box on every other row of this menu.
+                        //
+                        // Off is plain `text()`, not the eye menu's faded
+                        // `db_toggle_off`: there, dim means *this database
+                        // is hidden*, a state with a consequence; here off
+                        // is the resting state of a view mode, and dimming
+                        // it would make an ordinary row look disabled.
+                        if disabled || (kind == GearKind::ShowTableSizes && !sizes_on.get()) {
+                            if disabled {
+                                return s.color(theme::text_faint());
+                            }
+                            return s.color(theme::text());
+                        }
+                        if kind == GearKind::ShowTableSizes {
+                            s.color(theme::db_toggle_on())
                         } else {
-                            theme::text()
-                        })
+                            s.color(theme::text())
+                        }
                     }))
                     .on_click_stop(move |_| {
-                        open.set(false);
-                        if down {
+                        // The toggle is the one entry that leaves the menu
+                        // up — it is a view mode the user may flick twice.
+                        if kind != GearKind::ShowTableSizes {
+                            open.set(false);
+                        }
+                        if disabled {
                             return;
                         }
-                        // The database is the active tab's, because that is the
-                        // one PostgreSQL's schema and table privileges can be
-                        // read from — see `users_view::open_for_server`.
-                        let database = users_ui.tabs_ui.active_db.get_untracked();
-                        crate::users_view::open_for_server(
-                            &users_ui,
-                            users_ui.conn.active_conn.get_untracked(),
-                            database.as_deref(),
-                        );
+                        match kind {
+                            GearKind::Refresh => (refresh)(),
+                            GearKind::CollapseAll => (collapse_all)(),
+                            GearKind::ShowTableSizes => (toggle_sizes)(),
+                            // The database is the active tab's, because that
+                            // is the one PostgreSQL's schema and table
+                            // privileges can be read from — see
+                            // `users_view::open_for_server`.
+                            GearKind::Users => {
+                                let database = ui.tabs_ui.active_db.get_untracked();
+                                crate::users_view::open_for_server(
+                                    &ui,
+                                    ui.conn.active_conn.get_untracked(),
+                                    database.as_deref(),
+                                );
+                            }
+                            // The read-only refusal is inside `open_for_new`,
+                            // so every home of this action is guarded by
+                            // construction — see it for why the guard moved
+                            // off the four call sites.
+                            GearKind::CreateDatabase => crate::database_editor::open_for_new(
+                                &ui,
+                                crate::ContainerKind::Database,
+                                None,
+                            ),
+                        }
                     })
                     .style(menu_item_style)
                     .style(|s| s.padding_vert(theme::scaled(8.0)))
-                    .into_any(),
-                );
-            }
-
-            // **`Create database` lives here because the tree has no reliable
-            // blank space to right-click.** Every other create hangs off the row
-            // it makes a child of; this one makes a *sibling* of every row, and
-            // on a connection with more than a screenful of databases there is
-            // no empty tree left to raise a menu on — which is exactly the
-            // connection where a new database is worth making. This menu is
-            // already the one that acts on the whole tree (Refresh, Collapse
-            // all), so it is where an action about the connection belongs. The
-            // schema tree's `Create ▸` submenu carries the same entry for
-            // whoever looks there first.
-            //
-            // Absent where the engine has no such statement, and **dimmed** on a
-            // read-only connection — the two different answers the rest of the
-            // app gives, for the two different reasons it gives them.
-            //
-            // **And absent with no saved connection at all**, which is not the
-            // same question as "did it connect". `edit_ctx` falls back to
-            // `SqlDialect::default()` and `read_only: false` when there is none,
-            // so on a fresh install this offered the entry, opened the form and
-            // previewed real SQL against a connection id that names nothing —
-            // the first thing a new user can click. See
-            // `table_designer::EditCtx::exists`, and `schema_tree`'s
-            // blank-space menu, which is the same gate on the other home.
-            if ctx.exists && schemaic_core::ddl::supports_database_editing(ctx.dialect) {
-                // Dimmed on a **down** connection as well as a read-only one —
-                // the same answer the tree's blank-space menu gives, and for the
-                // reason `schema_tree::blank_space_entries` states: the form
-                // would open, preview real SQL and fail at Apply with a connect
-                // error the header already showed.
-                let read_only = conn_read_only(&ui.conn.connections, ui.conn.active_conn)
-                    || ui.conn.conn_status.get_untracked().is_down();
-                let create_ui = ui.clone();
-                items.push(
-                    container(text("Create database").style(move |s| {
-                        s.color(if read_only {
-                            theme::text_faint()
-                        } else {
-                            theme::text()
-                        })
-                    }))
-                    .on_click_stop(move |_| {
-                        open.set(false);
-                        // The read-only refusal is inside `open_for_new`, so
-                        // every home of this action is guarded by construction —
-                        // see it for why the guard moved off the four call sites.
-                        crate::database_editor::open_for_new(
-                            &create_ui,
-                            crate::ContainerKind::Database,
-                            None,
-                        );
-                    })
-                    .style(menu_item_style)
-                    .style(|s| s.padding_vert(theme::scaled(8.0)))
-                    .into_any(),
-                );
-            }
-            if schemaic_core::stats::supports_table_stats(
-                crate::table_designer::edit_ctx(&ui).dialect,
-            ) {
-                let toggle_sizes = toggle_sizes.clone();
-                items.push(
-                    container(text("Show table sizes").style(move |s| {
-                        s.color(if sizes_on.get() {
-                            theme::db_toggle_on()
-                        } else {
-                            theme::text()
-                        })
-                    }))
-                    .on_click_stop(move |_| (toggle_sizes)())
-                    .style(menu_item_style)
-                    .style(|s| s.padding_vert(theme::scaled(8.0)))
-                    .into_any(),
-                );
-            }
+                    .into_any()
+                })
+                .collect();
 
             focus_root(v_stack_from_iter(items))
                 .on_key_down(
@@ -6025,7 +6042,112 @@ mod find_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::ghost_suffix;
+    use super::{GearKind, gear_entries, ghost_suffix};
+    use schemaic_core::intel::SqlDialect;
+
+    fn gear_kinds(d: SqlDialect, exists: bool, read_only: bool, down: bool) -> Vec<GearKind> {
+        gear_entries(d, exists, read_only, down)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    /// **The gear's entries, in order, with the kinds beside them** — the menu
+    /// routes on the kind, so an entry whose label and discriminant disagree
+    /// would render one thing and do another.
+    ///
+    /// The gear and the tree's blank space are two homes for the same three
+    /// server actions; the sibling got this treatment after an ordering
+    /// inversion no test could see, and this menu — which has more gates —
+    /// stayed inline.
+    #[test]
+    fn the_gear_offers_the_panel_actions_then_the_server_ones() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let labels: Vec<&str> = gear_entries(d, true, false, false)
+                .into_iter()
+                .map(|e| e.label)
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    "Refresh",
+                    "Collapse all",
+                    "Users and privileges",
+                    "Create database",
+                    "Show table sizes",
+                ],
+                "{d:?}"
+            );
+            assert_eq!(
+                gear_kinds(d, true, false, false),
+                [
+                    GearKind::Refresh,
+                    GearKind::CollapseAll,
+                    GearKind::Users,
+                    GearKind::CreateDatabase,
+                    GearKind::ShowTableSizes,
+                ],
+                "{d:?}"
+            );
+        }
+    }
+
+    /// **Absent means "not on this engine"; dimmed means "not here".** SQLite
+    /// has no accounts, no `CREATE DATABASE` and no per-table sizes, so the gear
+    /// keeps exactly the two entries that need no server at all — rather than
+    /// showing three dead rows a user would hunt for the setting to enable.
+    #[test]
+    fn the_gear_omits_what_the_engine_has_not_got() {
+        assert_eq!(
+            gear_kinds(SqlDialect::Sqlite, true, false, false),
+            [GearKind::Refresh, GearKind::CollapseAll]
+        );
+        // And with no saved connection: `edit_ctx` falls back to MySQL, so
+        // without this gate a fresh install offered `Create database`, opened
+        // the form and previewed real SQL against a connection id naming
+        // nothing. Same gate, same reason, as the blank-space menu's.
+        assert_eq!(
+            gear_kinds(SqlDialect::MySql, false, false, false),
+            [
+                GearKind::Refresh,
+                GearKind::CollapseAll,
+                GearKind::ShowTableSizes
+            ]
+        );
+    }
+
+    /// The two dimming rules, which are **different questions**: browsing
+    /// accounts writes nothing, so read-only does not touch it; a connection
+    /// that cannot be reached dims both, because either would open on a fetch
+    /// or an Apply that fails with what the header already says.
+    #[test]
+    fn the_gear_dims_a_write_on_read_only_and_both_on_a_down_connection() {
+        let disabled = |read_only, down| -> Vec<(GearKind, bool)> {
+            gear_entries(SqlDialect::MySql, true, read_only, down)
+                .into_iter()
+                .map(|e| (e.kind, e.disabled))
+                .collect()
+        };
+        let of = |v: &[(GearKind, bool)], k: GearKind| {
+            v.iter().find(|(x, _)| *x == k).expect("present").1
+        };
+
+        let ro = disabled(true, false);
+        assert!(!of(&ro, GearKind::Users), "read-only must not dim a read");
+        assert!(of(&ro, GearKind::CreateDatabase));
+
+        let down = disabled(false, true);
+        assert!(of(&down, GearKind::Users));
+        assert!(of(&down, GearKind::CreateDatabase));
+
+        // Refresh is never dimmed — a down connection is the one most worth
+        // re-reading — and neither is anything that needs no server.
+        for v in [disabled(true, true), ro, down] {
+            assert!(!of(&v, GearKind::Refresh));
+            assert!(!of(&v, GearKind::CollapseAll));
+            assert!(!of(&v, GearKind::ShowTableSizes));
+        }
+    }
 
     /// The panic this function exists to prevent: a Turkish schema with a table
     /// named `İzmir`, and the user types one `i`. Reproduced in
