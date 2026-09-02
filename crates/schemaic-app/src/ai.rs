@@ -31,10 +31,16 @@ use schemaic_ui::{AiEffort, AiModel, ConnNode, InlineAiRequest, SchemaScope, Tab
 use crate::claude_cli::{claude_bin, claude_seal};
 
 // ===== moved from main.rs (AI session + context) =====
-// The `claude` CLI runs non-interactively, so a tool that isn't named here has
-// no one to approve it: the call is denied outright. Both lists must therefore
-// name every tool `mcp::tools_list` offers at that level, which
+// The `claude` CLI runs non-interactively, so an **MCP** tool that isn't named
+// here has no one to approve it: the call is denied outright. Both lists must
+// therefore name every tool `mcp::tools_list` offers at that level, which
 // `every_offered_tool_is_allow_listed_at_its_level` holds them to.
+//
+// **Only the MCP surface**, and not by convention: `build_session_args` emits
+// `--allowedTools` solely alongside `--mcp-config` and solely from these names,
+// so it cannot name a built-in even in principle. Nothing here ever governed the
+// CLI's own tools — that is why nineteen of them were reachable, and why the
+// guard on them is `--tools ""` rather than this list.
 const AI_TOOLS_WITH_QUERY: &[&str] = &[
     "mcp__schemaic__run_query",
     "mcp__schemaic__list_schema",
