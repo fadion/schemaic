@@ -2149,8 +2149,15 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
                     // the target only on success), and the rows that did arrive are
                     // in that sibling. Deleting it is still not ours to do — it is
                     // the one thing the user may still want.
+                    //
+                    // **Unless the format buffers**, in which case the sibling
+                    // holds nothing and the sentence would point at an empty
+                    // file — see `ExportFormat::writes_incrementally`.
                     crate::ExportOutcome::Cancelled => {
-                        let msg = schemaic_core::export::export_cancel_note(&name);
+                        let msg = schemaic_core::export::export_cancel_note(
+                            &name,
+                            format.writes_incrementally(),
+                        );
                         gs.commit_note.try_update(|v| *v = Some(msg));
                     }
                     // The same two facts the Cancel arm above states, for the

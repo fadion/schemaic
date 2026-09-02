@@ -2859,20 +2859,36 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
                     // Pass 2 — load. The row iterator parses between statements;
                     // 500 records is microseconds against a round-trip.
-                    let f = match open(&req.path) {
-                        Ok(f) => f,
-                        Err(e) => return report(schemaic_ui::ImportOutcome::Failed(e)),
+                    //
+                    // **Building it is off the runtime, like pass 1 above.**
+                    // Constructing the iterator opens the file, and for an
+                    // `.xlsx` that means reading the whole archive before the
+                    // first row exists — blocking work that was running on a
+                    // tokio worker while the validate pass thirty lines up took
+                    // `spawn_blocking` for exactly the same read.
+                    let built = {
+                        let (path, format, cfg, table, mapping) = (
+                            req.path.clone(),
+                            req.format,
+                            req.cfg.clone(),
+                            req.target.table.clone(),
+                            req.mapping.clone(),
+                        );
+                        tokio::task::spawn_blocking(move || {
+                            let f = open(&path)?;
+                            schemaic_core::import::row_iter(
+                                f, format, &cfg, &table, &mapping, dialect,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
                     };
-                    let mut rows = match schemaic_core::import::row_iter(
-                        f,
-                        req.format,
-                        &req.cfg,
-                        &req.target.table,
-                        &req.mapping,
-                        dialect,
-                    ) {
-                        Ok(it) => it,
-                        Err(e) => return report(schemaic_ui::ImportOutcome::Failed(e.to_string())),
+                    let mut rows = match built {
+                        Ok(Ok(it)) => it,
+                        Ok(Err(e)) => return report(schemaic_ui::ImportOutcome::Failed(e)),
+                        Err(e) => {
+                            return report(schemaic_ui::ImportOutcome::Failed(e.to_string()));
+                        }
                     };
                     let columns: Vec<String> =
                         schemaic_core::import::insert_columns(&req.mapping, &req.target.table)
@@ -3085,6 +3101,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // the disk takes the last.
                         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
                         let part = part_of(&path);
+                        // A copy for the failure arms, which run in the other
+                        // task: a buffered format leaves an empty sibling and
+                        // nothing else would remove it.
+                        let sweep_part = part.clone();
                         // The writer needs the token as well as the reader: a
                         // cancelled read closes the channel, which the writer sees
                         // as an ordinary end of stream — so without this it would
@@ -3093,10 +3113,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let w_token = token.clone();
                         let writer = handle.spawn_blocking(move || {
                             use std::io::Write as _;
+                            // One for the pull closure below, one for the check
+                            // after the write — both ask the same question at
+                            // two different moments.
+                            let src_token = w_token.clone();
                             let mut w = create(&part).map_err(|e| e.to_string())?;
                             let mut src = schemaic_core::export::PullChunks::new(move || match rx
                                 .blocking_recv()
                             {
+                                // **A cancelled read is an error, not an end of
+                                // stream.** It closes the channel, which reads
+                                // as "the table ended" — and for a buffered
+                                // format that means the whole discarded workbook
+                                // is still assembled and compressed before
+                                // anyone notices: measured 12.3 s at 800k x 50,
+                                // with the bar still saying "Exporting…" and a
+                                // Cancel that has already been pressed. Raising
+                                // it here returns `stream_to` at the next chunk
+                                // instead, which is where the five incremental
+                                // formats already stop.
+                                None if src_token.is_cancelled() => {
+                                    Err(std::io::Error::other("export cancelled"))
+                                }
                                 None => Ok(None),
                                 Some(Ok(rs)) => Ok(Some(rs)),
                                 // The reason the reader put on the channel.
@@ -3161,14 +3199,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // `stream_query` puts its reason on the channel and
                             // the writer returns that very message.
                             // Every failure arm here is *after* the writer task
-                            // opened the `.part` sibling, so that sibling holds
-                            // whatever arrived — and the destination is untouched,
-                            // because the rename only runs when the write
-                            // completed. `partial` is what says the sibling exists;
-                            // `export_failure_note` states both halves.
-                            let failed = |message: String| ExportOutcome::Failed {
-                                message,
-                                partial: true,
+                            // opened the `.part` sibling, and the destination is
+                            // untouched because the rename only runs when the
+                            // write completed. `partial` is what says the sibling
+                            // holds something; `export_failure_note` states both
+                            // halves.
+                            //
+                            // **It is the format's answer, not `true`.** Excel is
+                            // a ZIP and nothing reaches the sink until
+                            // `save_to_writer`, so every pre-save failure left a
+                            // *zero-byte* sibling the message pointed the user
+                            // at. `writes_incrementally` is the capability; the
+                            // empty file is swept rather than left as litter.
+                            let incremental = format.writes_incrementally();
+                            let failed = move |message: String| {
+                                if !incremental {
+                                    let _ = std::fs::remove_file(&sweep_part);
+                                }
+                                ExportOutcome::Failed {
+                                    message,
+                                    partial: incremental,
+                                }
                             };
                             report(match (read, written) {
                                 (Err(schemaic_db::DbError::Cancelled), _) => {

@@ -90,6 +90,25 @@ impl ExportFormat {
         !matches!(self, ExportFormat::Xlsx)
     }
 
+    /// Does this format reach the sink **as it goes**, or only at the end?
+    ///
+    /// **A capability, beside [`Self::is_text`], and the answer to a question
+    /// the export plumbing was written before anything could answer `false`
+    /// to.** The five text formats write each row as they see it, so a failure
+    /// halfway leaves a `.part` sibling holding the rows that arrived and
+    /// `export_failure_note` can honestly point at it. `Xlsx` is a ZIP: nothing
+    /// reaches the sink until `save_to_writer`, so *every* pre-save failure —
+    /// both ceilings, a dropped connection, a query error mid-stream — left a
+    /// **zero-byte** file the user was directed to, and a failure during the
+    /// save leaves a truncated archive, which is worse than empty because it
+    /// looks like a workbook and will not open.
+    ///
+    /// Computed from the variant rather than stored, so a seventh format has to
+    /// answer it.
+    pub fn writes_incrementally(self) -> bool {
+        !matches!(self, ExportFormat::Xlsx)
+    }
+
     /// The formats a **Copy** menu may offer, in menu order — [`Self::ALL`]
     /// filtered by [`Self::is_text`].
     ///
@@ -1621,11 +1640,19 @@ pub fn export_failure_note(message: &str, partial: Option<&str>) -> String {
 /// always used: stopping was the user's own doing, so this is a note rather than an
 /// error. It said `— {name} is incomplete`, which was true when the destination was
 /// truncated at `t = 0` and is now the opposite of true.
-pub fn export_cancel_note(name: &str) -> String {
-    format!(
-        "Export cancelled — {name} was not changed; the rows that were written are in {}",
-        part_path(name)
-    )
+///
+/// `partial` is [`ExportFormat::writes_incrementally`]'s answer, for the same
+/// reason [`export_failure_note`] takes one: a buffered format's sibling holds
+/// nothing, so pointing at it is directing the user to an empty file.
+pub fn export_cancel_note(name: &str, partial: bool) -> String {
+    if partial {
+        format!(
+            "Export cancelled — {name} was not changed; the rows that were written are in {}",
+            part_path(name)
+        )
+    } else {
+        format!("Export cancelled — {name} was not changed.")
+    }
 }
 
 /// The `All rows` menu entry's label: the scope's size, and every way the file
@@ -3118,7 +3145,7 @@ mod tests {
     /// stopping was the user's own doing, so it is a note and not an error.
     #[test]
     fn a_cancelled_export_says_the_same_two_things() {
-        let msg = export_cancel_note("orders.csv");
+        let msg = export_cancel_note("orders.csv", true);
         assert_eq!(
             msg,
             "Export cancelled — orders.csv was not changed; \
@@ -3226,6 +3253,80 @@ mod tests {
         // And the reason: a `String` rendering of it is empty, which is exactly
         // what would reach the clipboard if the menu didn't filter.
         assert_eq!(ExportFormat::Xlsx.render(&rs(), &[0, 1], None, MySql), "");
+    }
+
+    /// **A failed xlsx export must not point at a file that holds nothing.**
+    /// Nothing reaches the sink until `save_to_writer`, so every pre-save
+    /// failure left a zero-byte `.part` sibling that the message named as
+    /// holding "the rows that were written".
+    ///
+    /// Both halves are asserted, and both matter: the capability, and that the
+    /// sink really is untouched when the writer returns `Err` — the second is
+    /// what makes the first true rather than a claim about it.
+    #[test]
+    fn a_buffered_format_leaves_nothing_behind_when_it_fails() {
+        let buffered: Vec<_> = ExportFormat::ALL
+            .into_iter()
+            .filter(|f| !f.writes_incrementally())
+            .collect();
+        assert_eq!(buffered, [ExportFormat::Xlsx]);
+
+        // Driven at the row ceiling, which is the failure a user actually hits.
+        const CHUNK: usize = 4096;
+        let cols = vec![col("id")];
+        let block: Vec<Vec<Value>> = (0..CHUNK).map(|i| vec![Value::Int(i as i64)]).collect();
+        let full = ResultSet::from_rows(cols, block);
+        let mut sent = 0usize;
+        let target = XLSX_MAX_ROWS as usize;
+        let mut src = PullChunks::new(move || {
+            sent += CHUNK;
+            Ok(if sent <= target + CHUNK {
+                Some(full.clone())
+            } else {
+                None
+            })
+        });
+        let mut buf = Vec::new();
+        ExportFormat::Xlsx
+            .stream_to(&mut buf, &mut src, None, MySql)
+            .expect_err("past the ceiling");
+        assert!(buf.is_empty(), "{} bytes reached the sink", buf.len());
+
+        // …and a text format's sink is not empty at the same point, which is
+        // why the sentence was written unconditionally in the first place.
+        let rs = rs();
+        let mut src = PullChunks::new({
+            let rs = rs.clone();
+            let mut once = false;
+            move || {
+                if once {
+                    return Err(std::io::Error::other("the connection dropped"));
+                }
+                once = true;
+                Ok(Some(rs.clone()))
+            }
+        });
+        let mut buf = Vec::new();
+        ExportFormat::Csv
+            .stream_to(&mut buf, &mut src, None, MySql)
+            .expect_err("the read failed");
+        assert!(!buf.is_empty(), "an incremental format wrote nothing");
+    }
+
+    /// The two notes agree with the capability, and neither names a file that
+    /// holds nothing.
+    #[test]
+    fn neither_note_points_at_an_empty_sibling() {
+        for f in ExportFormat::ALL {
+            let partial = f.writes_incrementally();
+            let fail = export_failure_note("Export failed: x", partial.then_some("orders.xlsx"));
+            let cancel = export_cancel_note("orders.xlsx", partial);
+            assert_eq!(fail.contains(".part"), partial, "{f:?}: {fail}");
+            assert_eq!(cancel.contains(".part"), partial, "{f:?}: {cancel}");
+            // Both still say the destination survived, which is the reassurance
+            // half and is true either way.
+            assert!(cancel.contains("was not changed"), "{f:?}: {cancel}");
+        }
     }
 
     /// **The list the menu is built from, not just the predicate under it.**
