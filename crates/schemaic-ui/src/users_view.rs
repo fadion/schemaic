@@ -35,7 +35,7 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::text::plural;
-use schemaic_core::users::{Grants, Principal, PrincipalKind};
+use schemaic_core::users::{Grants, Principal, PrincipalKind, WriteGate};
 
 use schemaic_core::intel::SqlDialect;
 
@@ -169,7 +169,7 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
             // `+ New account` live while `Privileges`/`Drop` are dimmed, with
             // nothing to say which is right — and it re-walks the connection
             // list for an answer that cannot differ between them.
-            let gate = WriteGate::of(&ui, &t);
+            let gate = write_gate(&ui, &t);
             let right = v_stack((
                 detail_pane(&ui, &t, gate),
                 footer(state, filter, grants, close.clone(), ring.clone()),
@@ -582,42 +582,19 @@ fn statement_row(sql: &str, dialect: SqlDialect) -> AnyView {
 /// otherwise be invisible — an account change takes the ordinary in-database
 /// route (`ddl::is_account_change`), so with nothing selected there is nowhere
 /// to send it.
-#[derive(Clone, Copy)]
-enum WriteGate {
-    Allowed,
-    NoEngineSupport,
-    ReadOnly,
-    NoDatabase,
-}
-
-impl WriteGate {
-    fn of(ui: &Ui, target: &UsersTarget) -> WriteGate {
-        // The dialect is the target's, the read-only flag the live connection's:
-        // one is what the browser is *about* and cannot change while it is open,
-        // the other is a setting that can.
-        if !schemaic_core::users::supports_user_admin(target.dialect) {
-            return WriteGate::NoEngineSupport;
-        }
-        if crate::table_designer::edit_ctx(ui).read_only {
-            return WriteGate::ReadOnly;
-        }
-        if target.database.is_none() {
-            return WriteGate::NoDatabase;
-        }
-        WriteGate::Allowed
-    }
-
-    /// Is the action **offered at all**? Absent where the engine has nothing to
-    /// offer, present-but-dimmed where this connection or this moment does — the
-    /// two different answers the rest of the app gives for the two different
-    /// reasons it gives them.
-    fn offered(&self) -> bool {
-        !matches!(self, WriteGate::NoEngineSupport)
-    }
-
-    fn enabled(&self) -> bool {
-        matches!(self, WriteGate::Allowed)
-    }
+///
+/// [`schemaic_core::users::WriteGate`], asked of this browser's target and of
+/// the live connection.
+///
+/// The decision itself is in `core` — it is an ordering of four answers, which
+/// is exactly the kind of thing an 860-line view is the wrong place to keep and
+/// the reason it had no test.
+fn write_gate(ui: &Ui, target: &UsersTarget) -> WriteGate {
+    WriteGate::of(
+        target.dialect,
+        crate::table_designer::edit_ctx(ui).read_only,
+        target.database.is_some(),
+    )
 }
 
 /// **`+ New account`, at the foot of the list column** — the shape Manage
@@ -720,6 +697,13 @@ fn actions_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, p: &Principal) ->
     let drop_target = target.clone();
     let drop_who = p.clone();
     let risk_dialect = target.dialect;
+    // The connection the browser was opened on, like the dialect beside it —
+    // the preview must be built for the server this account lives on, not for
+    // whichever the switcher points at by the time the confirm is answered.
+    // `read_only` is `false` because this button is only reachable through
+    // `WriteGate::Allowed`, and the preview re-asks the live connection by
+    // `conn_id` before it applies anything.
+    let plan_conn_id = target.conn_id;
     let confirm = ui.overlay.confirm;
     let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 2, move || {
         let ui = drop_ui.clone();
@@ -741,7 +725,12 @@ fn actions_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, p: &Principal) ->
                 if yes {
                     crate::ddl_preview::preview_account(
                         &ui,
-                        &database,
+                        crate::ddl_preview::AccountPlanTarget {
+                            conn_id: plan_conn_id,
+                            database: database.clone(),
+                            dialect: risk_dialect,
+                            read_only: false,
+                        },
                         &who.display(),
                         schemaic_core::ddl::Change::DropAccount(Box::new(who.clone())),
                     );
