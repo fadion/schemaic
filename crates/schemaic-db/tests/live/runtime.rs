@@ -470,10 +470,10 @@ pub const SLEEP_SECS: u64 = 5;
 /// **The feeding is a task of its own**, and that is not tidiness: the channel
 /// holds 16, and filling it inline meant the seventeenth `send` awaited a
 /// receiver nothing was polling yet — `run_script` is called on the line below.
-/// A 17-statement script test would have hung forever rather than failed, and
-/// the CI live job has no `timeout-minutes`. This is the shape the app itself
-/// uses (`script::feed` alongside `Db::run_script`), so the test now drives the
-/// same arrangement it is testing.
+/// A 17-statement script test would have hung until the CI job's
+/// `timeout-minutes` cut it off, reported as "still running" rather than as
+/// itself. This is the shape the app itself uses (`script::feed` alongside
+/// `Db::run_script`), so the test now drives the same arrangement it is testing.
 async fn run_script(scratch: &Scratch, stmts: &[String]) -> (ExecEnd, usize) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let owned: Vec<String> = stmts.to_vec();

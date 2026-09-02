@@ -1574,12 +1574,15 @@ pub const XLSX_MEMORY_FACTOR: u64 = 4;
 
 /// Past this file size, [`xlsx_memory_warning`] speaks up.
 ///
-/// Higher than it was (40 MB), because the thing it was warning about is gone:
-/// at 25× a 40 MB workbook was estimated at 1 GB and measured 1,085 MB, and it
-/// now costs 64 MB. Set where [`JSON_WARN_BYTES`] is set — the point at which
-/// the estimate stops being something a machine absorbs without noticing — and
-/// with the same factor, so the two warnings again fire at the same estimated
-/// footprint.
+/// Higher than it was (40 MiB), because the thing it was warning about is gone:
+/// at 25× a 40 MiB workbook was estimated at 1 GiB and measured 1,085 MB, and it
+/// now costs 64 MB. Set at [`JSON_WARN_BYTES`] — the point at which the estimate
+/// stops being something a machine absorbs without noticing.
+///
+/// The two factors are near enough that the same threshold means the same thing
+/// for both (4× here against JSON's 5×, so ~800 MiB against ~1 GiB), which is
+/// why this is the same number rather than one derived from the ratio the way
+/// the old 40 MiB was.
 pub const XLSX_WARN_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Roughly the peak memory an Excel import of `file_bytes` will need.
