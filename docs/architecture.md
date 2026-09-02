@@ -4028,9 +4028,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   unanswered, `Skill`, `ToolSearch` and `Monitor` all executed inside the turn and **no
   `can_use_tool` control request was emitted at all**, in two separate trials. So the exposure is not
   that these tools ask and go unheard; it is that they do not ask. Whether an un-allow-listed tool
-  can *also* stall a turn is a separate question this measurement does not answer, and the only
-  evidence on it is the older `propose_table_change` observation recorded under `mcp.rs` — that such
-  a call is simply denied, invisibly. The TODO item that reported a turn stalling with no message is
+  can *also* stall a turn is a separate question this measurement does not answer. The only evidence
+  on it is the older `propose_table_change` observation recorded under `mcp.rs`, and that is about a
+  different class of tool: an **MCP** tool absent from `--allowedTools`, denied invisibly. These
+  nineteen are **built-ins**, which that allow-list never named and `DISALLOWED_TOOLS` did not
+  cover — which is precisely why they were reachable, and why nothing governed them until
+  `--tools ""` emptied the set. So the denial rule does not carry across to them, and neither does
+  its opposite: the measurement shows these three ran, not what the CLI would do with a built-in it
+  had decided to gate. The TODO item that reported a turn stalling with no message is
   therefore **not** explained by these nineteen, and its cause is still unidentified; emptying the
   built-in set was justified by what the tools can do, not by that symptom.
   `DISALLOWED_TOOLS` is kept as a **backstop** in case a future CLI stops
@@ -6841,8 +6846,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   the session's *entire* tool set rather than an addition to it (on a CLI whose `--help` does not
   advertise the flag it is an addition again, with the twenty-nine-name backstop behind it — see
   `schemaic-ai`): it runs
-  non-interactively, so a tool missing from its level's list has nobody to approve it
-  and the call is simply denied. Two lists in two files drift —
+  non-interactively, so an **MCP** tool missing from its level's list has nobody to approve it
+  and the call is simply denied. That rule is about the MCP surface and nothing else —
+  `--allowedTools` is emitted only alongside `--mcp-config` and names only `mcp__schemaic__…`, so it
+  never governed the CLI's *own* built-in tools, which is why three of those were measured executing
+  un-allow-listed and why the guard on them had to be `--tools ""` rather than this list (that
+  measurement is under `schemaic-ai`). What a built-in would do if the CLI *did* decide it needed
+  approval is not known: none was ever observed asking, so nothing here says built-ins are never
+  gated — only that those three were not. Two lists in two files drift —
   `propose_table_change` was offered by the server from the day it landed and named by neither
   list, so the assistant's check of a proposed change against the live table was denied every time,
   invisibly, since the model then writes the fenced block from the schema it already has and the
