@@ -1,8 +1,14 @@
 //! Locating the `claude` CLI binary: auto-detection, a minimal `PATH`/`PATHEXT`
-//! `which`, and resolving a user-provided override to a real executable. Pure
-//! (std-only) — no app state. Shared by the AI-session spawn (`ai::start_ai_session`)
-//! and the AI panel's reachability check. (The Windows-`PATHEXT` handling is the
-//! H12 subtlety: `Command::new` alone won't append `.cmd`/`.exe`.)
+//! `which`, and resolving a user-provided override to a real executable. Shared
+//! by the AI-session spawn (`ai::start_ai_session`) and the AI panel's
+//! reachability check. (The Windows-`PATHEXT` handling is the H12 subtlety:
+//! `Command::new` alone won't append `.cmd`/`.exe`.)
+//!
+//! Std-only and free of app state, with **one exception that is not pure**:
+//! [`claude_seal`] spawns `<bin> --help` and memoises what it reads in a
+//! process-wide cache. It lives here because it answers a question about the
+//! binary this module's whole job is to find, and the decision it feeds —
+//! which flags are safe to pass — is pure and unit-tested in `schemaic-ai`.
 
 // ===== moved from main.rs (claude CLI discovery) =====
 /// Auto-detect the `claude` binary: `$SCHEMAIC_CLAUDE_BIN`, then `~/.local/bin`,
