@@ -456,9 +456,18 @@ pub struct ImportProbeResult {
     pub sample: schemaic_core::import::Sample,
     /// The file's size on disk. Stat'd here rather than in the view because the
     /// probe is already the thread that touches the filesystem; the modal only
-    /// needs it to warn about a large JSON load
-    /// ([`schemaic_core::import::json_memory_warning`]).
+    /// needs it to warn about a load held in memory
+    /// ([`schemaic_core::import::memory_warning`]).
     pub file_bytes: u64,
+    /// The workbook's sheet names, for Excel; empty otherwise.
+    ///
+    /// Carried back with the sample because they come off the **same parse** of
+    /// the workbook ([`schemaic_core::import::read_workbook_sample`]). A second
+    /// call to fetch them would open and inflate the whole file again — on
+    /// every settings change, since each one re-probes — and a picker populated
+    /// by its own read could list sheets from a *different* file than the
+    /// preview beside it.
+    pub sheets: Vec<String>,
 }
 
 pub type ImportProbeDoneFn = Rc<dyn Fn(Result<ImportProbeResult, String>)>;
@@ -2110,6 +2119,14 @@ pub struct ImportUi {
     /// so each control binds to one.
     pub delimiter: RwSignal<String>,
     pub has_header: RwSignal<bool>,
+    /// Every sheet in the chosen workbook, in workbook order — the sheet
+    /// picker's options. Empty for every format but Excel, and empty until a
+    /// probe has read the file.
+    pub sheets: RwSignal<Vec<String>>,
+    /// The worksheet to import. `None` is the first one, which is both the
+    /// default and what a single-sheet workbook wants — see
+    /// [`schemaic_core::import::ReadConfig::sheet`].
+    pub sheet: RwSignal<Option<String>>,
     /// Whether an empty CSV field means NULL. Its own control rather than a
     /// token in the list below, because "the empty string" can't be written in a
     /// comma-separated list — an empty box would be indistinguishable from "no

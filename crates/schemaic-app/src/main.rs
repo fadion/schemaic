@@ -2674,6 +2674,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // head of the file.
                         let cfg = match req.cfg {
                             Some(c) => c,
+                            // A workbook has nothing to sniff — no delimiter and
+                            // no quote — and its head is deflated ZIP bytes, so
+                            // running the sniffer over it would let a compressed
+                            // stream's byte frequencies decide `has_header`.
+                            // The defaults (header on, first sheet) are the
+                            // right opening answer, and the user can change both.
+                            None if req.format == schemaic_core::import::ImportFormat::Xlsx => {
+                                schemaic_core::import::ReadConfig::default()
+                            }
                             None => {
                                 let mut head = vec![0u8; SNIFF_BYTES];
                                 let mut f =
@@ -2688,21 +2697,48 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 }
                             }
                         };
-                        let f = std::fs::File::open(&req.path).map_err(|e| e.to_string())?;
-                        let sample = schemaic_core::import::read_sample(
-                            std::io::BufReader::new(f),
-                            req.format,
-                            &cfg,
-                            SAMPLE_ROWS,
-                        )
-                        .map_err(|e| e.to_string())?;
                         // Best-effort: a size we can't read just means no
                         // large-file warning, never a failed probe.
                         let file_bytes = std::fs::metadata(&req.path).map(|m| m.len()).unwrap_or(0);
+                        // **Before the read, not after it.** A workbook has to
+                        // be read whole before its first row can be shown (a
+                        // ZIP's directory is at the end), so unlike CSV and
+                        // JSON — both bounded at `SAMPLE_MAX_BYTES` — there is
+                        // no cheap look at a big one. Asking the file's *size*
+                        // costs nothing and is the only way the refusal can
+                        // come before the thing it refuses.
+                        if let Some(too_big) =
+                            schemaic_core::import::xlsx_size_refusal(req.format, file_bytes)
+                        {
+                            return Err(too_big);
+                        }
+                        let f = std::fs::File::open(&req.path).map_err(|e| e.to_string())?;
+                        // One parse of the workbook for both the preview and the
+                        // sheet list: they come off the same open, so a probe
+                        // does not pay for the file twice.
+                        let (sample, sheets) =
+                            if req.format == schemaic_core::import::ImportFormat::Xlsx {
+                                schemaic_core::import::read_workbook_sample(
+                                    std::io::BufReader::new(f),
+                                    &cfg,
+                                    SAMPLE_ROWS,
+                                )
+                                .map_err(|e| e.to_string())?
+                            } else {
+                                let sample = schemaic_core::import::read_sample(
+                                    std::io::BufReader::new(f),
+                                    req.format,
+                                    &cfg,
+                                    SAMPLE_ROWS,
+                                )
+                                .map_err(|e| e.to_string())?;
+                                (sample, Vec::new())
+                            };
                         Ok(schemaic_ui::ImportProbeResult {
                             cfg,
                             sample,
                             file_bytes,
+                            sheets,
                         })
                     };
                     report(probe());
@@ -9157,6 +9193,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             format: RwSignal::new(schemaic_core::import::ImportFormat::Csv),
             delimiter: RwSignal::new(",".to_string()),
             has_header: RwSignal::new(true),
+            sheets: RwSignal::new(Vec::new()),
+            sheet: RwSignal::new(None),
             empty_is_null: RwSignal::new(true),
             null_tokens: RwSignal::new(String::new()),
             trim: RwSignal::new(false),

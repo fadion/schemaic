@@ -31,6 +31,10 @@ pub enum ImportFormat {
     /// Objects keyed by column name — either one array of them, or one per line
     /// (JSON Lines). Both read the same way; see [`ArrayUnwrap`].
     Json,
+    /// An Excel workbook. One **sheet** of it — which one is
+    /// [`ReadConfig::sheet`], because a workbook is a file with several tables in
+    /// it and no other import format has to choose.
+    Xlsx,
 }
 
 impl ImportFormat {
@@ -38,11 +42,25 @@ impl ImportFormat {
         match self {
             ImportFormat::Csv => "CSV / TSV",
             ImportFormat::Json => "JSON",
+            ImportFormat::Xlsx => "Excel",
         }
     }
 
+    /// Does this format carry its own nulls?
+    ///
+    /// **A capability, because two unrelated decisions turn on it.** CSV cannot
+    /// tell an empty field from a missing value, which is the entire reason
+    /// [`NullRule`] exists; JSON has a real `null` and Excel has a genuinely
+    /// empty cell, so applying the NULL-token rule to either would turn every
+    /// empty *string* they hold into a NULL. `validate` and `row_iter` each ask
+    /// this, and they must not answer it differently — the preview would then
+    /// show one thing and the import do another.
+    pub fn has_own_nulls(self) -> bool {
+        !matches!(self, ImportFormat::Csv)
+    }
+
     /// Every format, for the override dropdown.
-    pub const ALL: [ImportFormat; 2] = [ImportFormat::Csv, ImportFormat::Json];
+    pub const ALL: [ImportFormat; 3] = [ImportFormat::Csv, ImportFormat::Json, ImportFormat::Xlsx];
 }
 
 /// Guess the format from a file name's extension. `None` when the extension says
@@ -53,6 +71,12 @@ pub fn infer_format(file_name: &str) -> Option<ImportFormat> {
     match ext.as_str() {
         "csv" | "tsv" | "tab" | "txt" => Some(ImportFormat::Csv),
         "json" => Some(ImportFormat::Json),
+        // `.xlsm` is the same OOXML container with macros in it, which the
+        // reader neither runs nor looks at. `.xls` and `.xlsb` are different
+        // formats and are deliberately absent — guessing `Xlsx` for one would
+        // fail at open time with a confusing error instead of leaving the
+        // dropdown alone.
+        "xlsx" | "xlsm" => Some(ImportFormat::Xlsx),
         _ => None,
     }
 }
@@ -649,6 +673,20 @@ pub struct ReadConfig {
     /// That's the `csv` reader's behaviour, not a choice made here, and it's the
     /// sharpest reason to leave this off unless a file actually needs it.
     pub trim: bool,
+    /// Which worksheet to read, for [`ImportFormat::Xlsx`]. `None` means the
+    /// **first** one, which is what a single-sheet workbook wants and what the
+    /// probe fills in for every other.
+    ///
+    /// It lives on the shared config for the same reason everything else here
+    /// does: the preview, the validation pass and the load must read the same
+    /// bytes. A sheet chosen only at load time would import a table the user
+    /// never saw.
+    ///
+    /// A name that no longer matches any sheet is an error rather than a
+    /// silent fall back to the first — see [`xlsx_records`]. Importing a
+    /// different table than the one on screen is the failure worth being loud
+    /// about.
+    pub sheet: Option<String>,
 }
 
 /// Why a file couldn't be read or planned at all — as opposed to an [`Issue`],
@@ -741,10 +779,19 @@ pub fn read_sample<R: std::io::Read>(
     cfg: &ReadConfig,
     limit: usize,
 ) -> Result<Sample, ImportError> {
+    // **Not** byte-bounded for Excel: an `.xlsx` is a ZIP whose directory is at
+    // the end of the file, so a truncated prefix does not open at all — the cap
+    // would turn "preview a 9 MB workbook" into "this file is corrupt". See
+    // [`open_xlsx`]; the disclosure for reading it whole is
+    // [`xlsx_memory_warning`].
+    if format == ImportFormat::Xlsx {
+        return read_xlsx_sample(r, cfg, limit);
+    }
     let r = r.take(SAMPLE_MAX_BYTES);
     match format {
         ImportFormat::Csv => read_csv_sample(r, cfg, limit),
         ImportFormat::Json => read_json_sample(r, limit),
+        ImportFormat::Xlsx => unreachable!("returned above"),
     }
 }
 
@@ -781,6 +828,10 @@ fn for_each_record<R: std::io::Read>(
         ImportFormat::Json => {
             let mut keys: Vec<String> = Vec::new();
             json_records(r, &mut keys, usize::MAX, on_record)?;
+        }
+        ImportFormat::Xlsx => {
+            let mut names: Vec<String> = Vec::new();
+            xlsx_records(r, cfg, &mut names, usize::MAX, on_record)?;
         }
     }
     Ok(())
@@ -1016,6 +1067,298 @@ fn json_records<R: std::io::Read>(
     Ok(more)
 }
 
+/// The largest `.xlsx` the importer will open.
+///
+/// **A refusal, because this format cannot be previewed cheaply.** CSV and JSON
+/// bound their preview at [`SAMPLE_MAX_BYTES`] and read no further, so a huge
+/// file of either costs 8 MiB to look at and the memory warning arrives before
+/// anything expensive happens. A ZIP has its directory at the end, so a workbook
+/// must be read whole before its first row can be seen — which put the
+/// unbounded read *before* the warning meant to precede it, and left the app
+/// able to die at preview time on a file the user only meant to glance at.
+///
+/// Generous enough that no workbook a person would import is affected: Excel
+/// itself is unhappy well below this.
+pub const XLSX_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Why this file cannot be opened at all, or `None` — asked from the file's
+/// *size on disk*, before a byte of it is read.
+pub fn xlsx_size_refusal(format: ImportFormat, file_bytes: u64) -> Option<String> {
+    if format != ImportFormat::Xlsx || file_bytes <= XLSX_MAX_BYTES {
+        return None;
+    }
+    Some(format!(
+        "This workbook is {}, and an Excel file has to be read whole before any \
+         of it can be shown — {} is the most this can open. Export the sheet as \
+         CSV and import that instead; a CSV loads in constant memory.",
+        crate::format::human_bytes(file_bytes as i64),
+        crate::format::human_bytes(XLSX_MAX_BYTES as i64)
+    ))
+}
+
+/// The Excel preview **and** the workbook's sheet names, from one read of the
+/// file.
+///
+/// The two together because they come from the same parse: the probe used to
+/// call a separate `xlsx_sheet_names`, which opened and inflated the whole
+/// workbook a second time to populate a dropdown — doubling the cost of a probe
+/// that fires on every settings change.
+pub fn read_workbook_sample<R: std::io::Read>(
+    r: R,
+    cfg: &ReadConfig,
+    limit: usize,
+) -> Result<(Sample, Vec<String>), ImportError> {
+    use calamine::Reader;
+    let mut wb = open_xlsx(r)?;
+    let sheets = wb.sheet_names().to_vec();
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Field>> = Vec::new();
+    let more = xlsx_rows(&mut wb, &sheets, cfg, &mut columns, limit, |fields, _| {
+        rows.push(fields);
+        true
+    })?;
+    Ok((
+        Sample {
+            columns,
+            rows,
+            more,
+        },
+        sheets,
+    ))
+}
+
+/// Read the whole reader and open it as a workbook.
+///
+/// **The whole file, deliberately.** An `.xlsx` is a ZIP, so it cannot be read
+/// as a prefix at all — its central directory is at the *end*, and a truncated
+/// one does not open. That rules out [`SAMPLE_MAX_BYTES`]'s approach for this
+/// format (see [`read_sample`]) and makes an Excel import memory-bound like
+/// JSON's rather than streamed like CSV's; [`xlsx_memory_warning`] is the
+/// disclosure of that.
+fn open_xlsx<R: std::io::Read>(
+    r: R,
+) -> Result<calamine::Xlsx<std::io::Cursor<Vec<u8>>>, ImportError> {
+    use calamine::Reader;
+    let mut bytes = Vec::new();
+    let mut r = r;
+    std::io::Read::read_to_end(&mut r, &mut bytes).map_err(|e| ImportError::Read(e.to_string()))?;
+    calamine::Xlsx::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Read(e.to_string()))
+}
+
+/// Walk one worksheet's rows as [`Field`]s, the way [`json_records`] walks a
+/// JSON document — the single reader the preview, the validation pass and the
+/// load all go through.
+///
+/// `columns` is filled with the header names (or `Column N` placeholders when
+/// the sheet has no header row). Returns whether rows exist beyond `limit`.
+///
+/// The row number handed to `on_record` is the **worksheet row**, 1-based and
+/// counted from the top of the *sheet* — the number in Excel's own margin, and
+/// the equivalent of a CSV's line number.
+///
+/// **It is not the offset within the used range**, which is what it would be if
+/// the range were simply enumerated. `worksheet_range` returns the *used* range,
+/// whose origin is the first cell that holds anything: a sheet with a title
+/// block above its header starts at row 5, and enumerating from zero would send
+/// the user to look at row 2, which is blank. `range.start()` is the correction.
+///
+/// **A row with nothing in any cell is not a record.** The used range is a
+/// rectangle, so a blank spacer row between two blocks of data — routine in a
+/// hand-made spreadsheet — arrives as a row of empty cells, and emitting it
+/// would insert a row of NULLs nobody typed (or fail the whole import on the
+/// first NOT NULL column). CSV has no equivalent: its reader yields no record
+/// for a blank line. Only a *wholly* empty row is skipped; one blank cell among
+/// values is a real NULL and is kept.
+fn xlsx_records<R: std::io::Read>(
+    r: R,
+    cfg: &ReadConfig,
+    columns: &mut Vec<String>,
+    limit: usize,
+    on_record: impl FnMut(Vec<Field>, u64) -> bool,
+) -> Result<bool, ImportError> {
+    use calamine::Reader;
+    let mut wb = open_xlsx(r)?;
+    let names = wb.sheet_names().to_vec();
+    xlsx_rows(&mut wb, &names, cfg, columns, limit, on_record)
+}
+
+/// [`xlsx_records`] over an already-opened workbook, so the preview can take
+/// the sheet names and the rows from one parse ([`read_workbook_sample`]).
+fn xlsx_rows(
+    wb: &mut calamine::Xlsx<std::io::Cursor<Vec<u8>>>,
+    names: &[String],
+    cfg: &ReadConfig,
+    columns: &mut Vec<String>,
+    limit: usize,
+    mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
+) -> Result<bool, ImportError> {
+    use calamine::Reader;
+    let name = match &cfg.sheet {
+        // Not a fall back to the first sheet: a workbook the user edited between
+        // the preview and the load would then import a different table than the
+        // one they mapped, silently.
+        Some(s) => {
+            if !names.iter().any(|n| n == s) {
+                return Err(ImportError::Read(format!(
+                    "this workbook has no sheet called \"{s}\" — it has {}",
+                    names.join(", ")
+                )));
+            }
+            s.clone()
+        }
+        None => names
+            .first()
+            .cloned()
+            .ok_or_else(|| ImportError::Read("this workbook has no sheets".into()))?,
+    };
+    let range = wb
+        .worksheet_range(&name)
+        .map_err(|e| ImportError::Read(e.to_string()))?;
+
+    let width = range.width();
+    // The used range's own origin, so every row below carries the number Excel
+    // shows rather than its offset within the range. `(0, 0)` for an empty
+    // sheet, which has no rows to number anyway.
+    let (top, _) = range.start().unwrap_or((0, 0));
+    let mut rows = range
+        .rows()
+        .enumerate()
+        .map(|(n, row)| (u64::from(top) + n as u64 + 1, row));
+    // `width` is the used range's, so every row is already this wide — a header
+    // shorter than the data still yields a name per column, which is what keeps
+    // the field count uniform and makes a real count mismatch meaningful.
+    if cfg.dialect.has_header {
+        match rows.next() {
+            Some((_, head)) => {
+                for (i, c) in head.iter().enumerate() {
+                    let name = cell_text(c).unwrap_or_default();
+                    let name = if cfg.trim { name.trim() } else { &name[..] };
+                    columns.push(if name.is_empty() {
+                        format!("Column {}", i + 1)
+                    } else {
+                        name.to_string()
+                    });
+                }
+            }
+            // An empty sheet: no header to take, and no rows to emit.
+            None => return Ok(false),
+        }
+    } else {
+        columns.extend((1..=width).map(|i| format!("Column {i}")));
+    }
+
+    // Records emitted so far. Not the row's index: a skipped blank row advances
+    // one and not the other, which is the whole reason the two are separate.
+    let mut seen = 0usize;
+    for (line, row) in rows {
+        if row.iter().all(|c| matches!(c, calamine::Data::Empty)) {
+            continue;
+        }
+        // Asked *after* the blank check, so a sheet padded with empty rows past
+        // its data does not report there is more to read.
+        if seen >= limit {
+            return Ok(true);
+        }
+        seen += 1;
+        let fields = row
+            .iter()
+            .map(|c| {
+                let t = cell_text(c)?;
+                Some(if cfg.trim { t.trim().to_string() } else { t })
+            })
+            .collect();
+        if !on_record(fields, line) {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+/// An Excel duration — `days` as the fraction of a day it stores — as
+/// `[-]H:MM:SS`, the form a `TIME` column reads.
+///
+/// **Not a decimal number of hours**, which is what a duration's underlying
+/// serial looks like and what this used to emit. MySQL parses a bare decimal in
+/// a `TIME` context as *seconds*, so a timesheet's 8h30m went in as `8.500000`
+/// and was stored as eight and a half **seconds** — wrong by a factor of 3600,
+/// and silent, because the value coerces perfectly well. PostgreSQL's `INTERVAL`
+/// rejects the bare number instead, so the same file failed on one engine and
+/// corrupted on the other.
+///
+/// Hours are **not** wrapped at 24: an elapsed time of 36 hours is `36:00:00`,
+/// which is what Excel's own `[h]:mm:ss` format means and what MySQL `TIME`
+/// accepts (its range is ±838:59:59).
+fn duration_hms(days: f64) -> String {
+    let sign = if days < 0.0 { "-" } else { "" };
+    // Rounded to the second before splitting, so 0.9999999 of a day is 24:00:00
+    // rather than 23:59:59 with a discarded remainder.
+    let total = (days.abs() * 86_400.0).round() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    format!("{sign}{h}:{m:02}:{s:02}")
+}
+
+/// One worksheet cell as the text an import coerces, or `None` for a cell that
+/// holds nothing.
+///
+/// **An empty cell is a real null**, like JSON's — not the empty string, and not
+/// subject to [`NullRule`]. That is what [`ImportFormat::has_own_nulls`] says
+/// about this format.
+///
+/// The conversions are chosen so a value that came *out* of a database and back
+/// in again survives the trip:
+///
+/// - A **number** is written with `f64`'s own shortest round-trip form, so a
+///   whole number is `7` rather than `7.0` — an integer column would reject the
+///   latter, and Excel has no separate integer type to distinguish them.
+/// - A **date or time** becomes ISO 8601, which every engine's date parser
+///   accepts. Excel stores these as a serial number with a display format, so
+///   the alternative is importing `45292` into a `DATE` column.
+/// - A **duration** becomes `H:MM:SS` — see [`duration_hms`], which is where
+///   the 3600× trap lives.
+/// - A **formula error** becomes Excel's own spelling of it (`#REF!`,
+///   `#DIV/0!`) rather than a null: it is a cell the sheet itself could not
+///   evaluate, and passing it on surfaces as a coercion [`Issue`] naming the
+///   row, where a silent null would not.
+fn cell_text(c: &calamine::Data) -> Field {
+    use calamine::Data;
+    match c {
+        Data::Empty => None,
+        Data::String(s) => Some(s.clone()),
+        Data::Int(i) => Some(i.to_string()),
+        Data::Float(f) => Some(f.to_string()),
+        // The spellings `coerce`'s boolean family already accepts.
+        Data::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
+        Data::DateTimeIso(s) | Data::DurationIso(s) => Some(s.clone()),
+        // A duration is an elapsed time and not a clock time, so it is the one
+        // kind `to_ymd_hms_milli` says nothing useful about — hence the split
+        // before that call rather than after it.
+        Data::DateTime(d) if d.is_duration() => Some(duration_hms(d.as_f64())),
+        Data::DateTime(d) => {
+            let (y, mo, da, h, mi, s, ms) = d.to_ymd_hms_milli();
+            Some(match (h, mi, s, ms) {
+                // A pure date: no clock part to write, and a `DATE` column takes
+                // the short form directly.
+                (0, 0, 0, 0) => format!("{y:04}-{mo:02}-{da:02}"),
+                (_, _, _, 0) => format!("{y:04}-{mo:02}-{da:02} {h:02}:{mi:02}:{s:02}"),
+                _ => format!("{y:04}-{mo:02}-{da:02} {h:02}:{mi:02}:{s:02}.{ms:03}"),
+            })
+        }
+        // `Display`, not `Debug`: calamine's `Display` is Excel's own spelling
+        // (`#DIV/0!`), and `Debug` is the Rust variant name (`Div0`) — a token
+        // that appears nowhere in Excel, so a user could not connect the issue
+        // to the cell it names.
+        Data::Error(e) => Some(e.to_string()),
+    }
+}
+
+fn read_xlsx_sample<R: std::io::Read>(
+    r: R,
+    cfg: &ReadConfig,
+    limit: usize,
+) -> Result<Sample, ImportError> {
+    read_workbook_sample(r, cfg, limit).map(|(s, _)| s)
+}
+
 fn read_json_sample<R: std::io::Read>(r: R, limit: usize) -> Result<Sample, ImportError> {
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Field>> = Vec::new();
@@ -1070,6 +1413,59 @@ pub fn json_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<Stri
         crate::format::human_bytes(file_bytes as i64),
         crate::format::human_bytes(est as i64)
     ))
+}
+
+/// How much memory an Excel load needs, as a multiple of the file's size.
+///
+/// **Larger than JSON's, and the multiplier is against the *compressed* size.**
+/// An `.xlsx` is a ZIP of XML: the sheet's markup is several times the data it
+/// carries and then deflates well, so a 50 MB workbook is a far bigger table
+/// than a 50 MB CSV. This is a deliberately conservative estimate rather than a
+/// measured one — unlike [`JSON_MEMORY_FACTOR`], which came off a counting
+/// allocator — because the ratio depends on how repetitive the sheet's strings
+/// are, and a warning that under-states is worth nothing.
+pub const XLSX_MEMORY_FACTOR: u64 = 25;
+
+/// Past this file size, [`xlsx_memory_warning`] speaks up. Lower than
+/// [`JSON_WARN_BYTES`] in the same proportion the factor is higher, so both
+/// warnings fire at roughly the same *estimated* footprint.
+pub const XLSX_WARN_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Roughly the peak memory an Excel import of `file_bytes` will need.
+pub fn xlsx_load_estimate(file_bytes: u64) -> u64 {
+    file_bytes.saturating_mul(XLSX_MEMORY_FACTOR)
+}
+
+/// What to tell the user before a large Excel load starts, or `None`.
+///
+/// The same honesty [`json_memory_warning`] exists for, for a sharper version of
+/// the same constraint: a ZIP's directory is at the end of the file, so an
+/// `.xlsx` cannot be read as a stream even in principle — where JSON's buffering
+/// is a consequence of its key union, this one is the container format. Saying
+/// the number before the load is the only alternative to discovering it by the
+/// app dying.
+pub fn xlsx_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<String> {
+    if format != ImportFormat::Xlsx || file_bytes <= XLSX_WARN_BYTES {
+        return None;
+    }
+    let est = xlsx_load_estimate(file_bytes);
+    Some(format!(
+        "This workbook is {}, and an Excel import is held in memory while it \
+         loads — expect it to need roughly {}, since the file is compressed. \
+         A CSV of the same sheet loads in constant memory.",
+        crate::format::human_bytes(file_bytes as i64),
+        crate::format::human_bytes(est as i64)
+    ))
+}
+
+/// The pre-load memory warning for whichever format, or `None`.
+///
+/// **One call site, so a format that needs a warning cannot be given one nobody
+/// asks for.** The JSON warning was reached directly by the modal; adding a
+/// second direct call is how the two drift, and the third format would then have
+/// to be remembered in a third place.
+pub fn memory_warning(format: ImportFormat, file_bytes: u64) -> Option<String> {
+    json_memory_warning(format, file_bytes).or_else(|| xlsx_memory_warning(format, file_bytes))
 }
 
 /// The table columns an import writes, as indices in **table order**.
@@ -1223,12 +1619,15 @@ pub fn validate<R: std::io::Read>(
     if insert_columns(mapping, table).is_empty() {
         return Err(ImportError::NoColumnsMapped);
     }
-    // JSON carries its own nulls, so the NULL-token rule (which exists because
-    // CSV can't tell an empty string from a missing value) must not also apply —
-    // it would turn every empty JSON string into a NULL.
-    let nulls = match format {
-        ImportFormat::Csv => cfg.nulls.clone(),
-        ImportFormat::Json => NullRule::none(),
+    // JSON and Excel carry their own nulls, so the NULL-token rule (which exists
+    // because CSV can't tell an empty field from a missing value) must not also
+    // apply — it would turn every empty JSON string, and every empty Excel
+    // string cell, into a NULL. Asked as a capability so this and `row_iter`
+    // cannot answer it differently; see [`ImportFormat::has_own_nulls`].
+    let nulls = if format.has_own_nulls() {
+        NullRule::none()
+    } else {
+        cfg.nulls.clone()
     };
 
     let mut out = Validation {
@@ -1268,7 +1667,11 @@ pub fn validate<R: std::io::Read>(
 fn trim_to_mapping(fields: &[Field], format: ImportFormat, mapping: &Mapping) -> usize {
     match format {
         ImportFormat::Json => fields.len().min(mapping.targets.len()),
-        ImportFormat::Csv => fields.len(),
+        // Excel sides with CSV, not JSON: a worksheet's columns are fixed by its
+        // used range, so every row is already the same width and a count
+        // mismatch is a real one worth reporting — there is no key union here
+        // that could widen a later row.
+        ImportFormat::Csv | ImportFormat::Xlsx => fields.len(),
     }
 }
 
@@ -1328,7 +1731,11 @@ pub struct RowIter<R: std::io::Read> {
 
 enum RowSourceIter<R: std::io::Read> {
     Csv(csv::StringRecordsIntoIter<R>),
-    Json(std::vec::IntoIter<(Vec<Field>, u64)>),
+    /// Buffered, for the same reason in both cases and a different cause: JSON
+    /// cannot know its columns before EOF, and an `.xlsx` cannot be read as a
+    /// prefix at all. Either way the rows exist before the first one is handed
+    /// out, so one variant carries both.
+    Buffered(std::vec::IntoIter<(Vec<Field>, u64)>),
 }
 
 /// Build the row stream for an import. `mapping` must have at least one target,
@@ -1347,10 +1754,11 @@ pub fn row_iter<R: std::io::Read>(
     let ctx = RowCtx {
         table: table.clone(),
         mapping: mapping.clone(),
-        // JSON carries its own nulls — see `validate`.
-        nulls: match format {
-            ImportFormat::Csv => cfg.nulls.clone(),
-            ImportFormat::Json => NullRule::none(),
+        // JSON and Excel carry their own nulls — see `validate`.
+        nulls: if format.has_own_nulls() {
+            NullRule::none()
+        } else {
+            cfg.nulls.clone()
         },
         dialect,
         format,
@@ -1370,7 +1778,16 @@ pub fn row_iter<R: std::io::Read>(
                 rows.push((fields, n));
                 true
             })?;
-            RowSourceIter::Json(rows.into_iter())
+            RowSourceIter::Buffered(rows.into_iter())
+        }
+        ImportFormat::Xlsx => {
+            let mut names = Vec::new();
+            let mut rows = Vec::new();
+            xlsx_records(r, cfg, &mut names, usize::MAX, |fields, n| {
+                rows.push((fields, n));
+                true
+            })?;
+            RowSourceIter::Buffered(rows.into_iter())
         }
     };
     Ok(RowIter { ctx, source })
@@ -1392,7 +1809,7 @@ impl<R: std::io::Read> Iterator for RowIter<R> {
                     Err(e) => Err(e.to_string()),
                 })
             }
-            RowSourceIter::Json(rows) => {
+            RowSourceIter::Buffered(rows) => {
                 let (fields, line) = rows.next()?;
                 Some(self.ctx.row(&fields, line))
             }
@@ -1599,8 +2016,14 @@ mod tests {
         assert_eq!(infer_format("rows.csv"), Some(ImportFormat::Csv));
         assert_eq!(infer_format("rows.TSV"), Some(ImportFormat::Csv));
         assert_eq!(infer_format("export.json"), Some(ImportFormat::Json));
-        // An extension that says nothing shouldn't be guessed at.
-        assert_eq!(infer_format("data.xlsx"), None);
+        assert_eq!(infer_format("data.xlsx"), Some(ImportFormat::Xlsx));
+        assert_eq!(infer_format("book.XLSM"), Some(ImportFormat::Xlsx));
+        // An extension that says nothing shouldn't be guessed at — and the two
+        // *other* Excel formats say something this reader can't act on, so they
+        // are as good as nothing. Guessing `Xlsx` for a `.xls` would trade a
+        // dropdown left alone for an "is not a zip archive" at open time.
+        assert_eq!(infer_format("old.xls"), None);
+        assert_eq!(infer_format("binary.xlsb"), None);
         assert_eq!(infer_format("noextension"), None);
     }
 
@@ -2089,7 +2512,687 @@ mod tests {
             },
             nulls: NullRule::default(),
             trim: false,
+            sheet: None,
         }
+    }
+
+    // ── Excel ───────────────────────────────────────────────────────────────
+
+    /// What a test writes into a worksheet cell. Deliberately not [`Field`]: the
+    /// point of these tests is that Excel's *types* survive the trip, so a
+    /// fixture has to be able to say "the number 7" as distinct from "the text
+    /// 7".
+    enum Cell {
+        Blank,
+        Text(&'static str),
+        Num(f64),
+        Bool(bool),
+        Date(u16, u8, u8),
+        DateTime(u16, u8, u8, u16, u8, u8),
+        /// An elapsed time, as a fraction of a day — a number under an
+        /// `[h]:mm:ss` format, which is what makes calamine read it back as a
+        /// duration rather than a clock time.
+        Duration(f64),
+    }
+
+    /// Build a real `.xlsx` in memory from `sheets`.
+    ///
+    /// **The export half writes the fixtures the import half reads**, which is
+    /// what makes these tests worth more than a golden file: they fail if either
+    /// side of the feature drifts, and neither side can be "corrected" into
+    /// agreement with a stale blob.
+    fn workbook(sheets: &[(&str, &[&[Cell]])]) -> Vec<u8> {
+        workbook_at(0, 0, sheets)
+    }
+
+    /// [`workbook`] with the data written at `(top, left)` instead of `A1`.
+    ///
+    /// A separate entry point because the origin is the *point* of two tests and
+    /// noise in every other: a used range that does not start at `A1` is what a
+    /// title block above a header produces, and it is the arrangement in which
+    /// enumerating the range and numbering the worksheet stop agreeing.
+    fn workbook_at(top: u32, left: u16, sheets: &[(&str, &[&[Cell]])]) -> Vec<u8> {
+        use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+        let mut wb = Workbook::new();
+        // calamine reads a cell as a date because of its *number format*, not
+        // its value — a date is a serial number underneath — so the fixture has
+        // to carry one, exactly as a real workbook does.
+        let date = Format::new().set_num_format("yyyy\\-mm\\-dd");
+        let stamp = Format::new().set_num_format("yyyy\\-mm\\-dd\\ hh:mm:ss");
+        // The bracketed hour is what makes this an *elapsed* time rather than a
+        // clock time — it is the format that tells calamine to hand back a
+        // `TimeDelta`, so the fixture cannot express a duration without it.
+        let elapsed = Format::new().set_num_format("[h]:mm:ss");
+        for (name, rows) in sheets {
+            let sheet = wb.add_worksheet();
+            sheet.set_name(*name).unwrap();
+            for (r, row) in rows.iter().enumerate() {
+                for (c, cell) in row.iter().enumerate() {
+                    let (r, c) = (top + r as u32, left + c as u16);
+                    match cell {
+                        Cell::Blank => continue,
+                        Cell::Duration(d) => {
+                            sheet.write_number_with_format(r, c, *d, &elapsed).unwrap()
+                        }
+                        Cell::Text(s) => sheet.write_string(r, c, *s).unwrap(),
+                        Cell::Num(n) => sheet.write_number(r, c, *n).unwrap(),
+                        Cell::Bool(b) => sheet.write_boolean(r, c, *b).unwrap(),
+                        Cell::Date(y, m, d) => sheet
+                            .write_datetime_with_format(
+                                r,
+                                c,
+                                ExcelDateTime::from_ymd(*y, *m, *d).unwrap(),
+                                &date,
+                            )
+                            .unwrap(),
+                        Cell::DateTime(y, mo, d, h, mi, s) => sheet
+                            .write_datetime_with_format(
+                                r,
+                                c,
+                                ExcelDateTime::from_ymd(*y, *mo, *d)
+                                    .unwrap()
+                                    .and_hms(*h, *mi, *s as f64)
+                                    .unwrap(),
+                                &stamp,
+                            )
+                            .unwrap(),
+                    };
+                }
+            }
+        }
+        let mut buf = Vec::new();
+        wb.save_to_writer(&mut buf).unwrap();
+        buf
+    }
+
+    fn xlsx_cfg(has_header: bool, sheet: Option<&str>) -> ReadConfig {
+        ReadConfig {
+            sheet: sheet.map(str::to_string),
+            ..cfg(has_header)
+        }
+    }
+
+    #[test]
+    fn an_xlsx_sample_takes_its_header_and_rows_from_the_first_sheet() {
+        let bytes = workbook(&[(
+            "People",
+            &[
+                &[Cell::Text("id"), Cell::Text("name")],
+                &[Cell::Num(1.0), Cell::Text("Ada")],
+                &[Cell::Num(2.0), Cell::Text("Grace")],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10)
+            .expect("a workbook we just wrote");
+        assert_eq!(s.columns, ["id", "name"]);
+        assert_eq!(s.rows.len(), 2);
+        assert!(!s.more);
+        assert_eq!(s.rows[0], f(&["1", "Ada"]));
+        assert_eq!(s.rows[1], f(&["2", "Grace"]));
+    }
+
+    /// **A whole number must not arrive as `1.0`.** Excel has one numeric type
+    /// and stores every number as a float, so this is the very first thing an
+    /// import of a real spreadsheet hits: an `INT` column rejects `1.0`, and it
+    /// would reject it on every row.
+    #[test]
+    fn an_excel_number_comes_across_without_a_decimal_point_it_never_had() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("n"), Cell::Text("f")],
+                &[Cell::Num(42.0), Cell::Num(1.5)],
+                &[Cell::Num(-7.0), Cell::Num(0.1)],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(s.rows[0], f(&["42", "1.5"]));
+        assert_eq!(s.rows[1], f(&["-7", "0.1"]));
+    }
+
+    /// **An empty cell is a null, and an empty string is not.** A worksheet is
+    /// the one import format that can tell them apart, so the NULL-token rule
+    /// CSV needs must not be applied to it — that rule would turn the empty
+    /// string into a null too and lose the distinction the format carries.
+    #[test]
+    fn an_empty_excel_cell_is_a_null_and_an_empty_string_is_not() {
+        assert!(ImportFormat::Xlsx.has_own_nulls());
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("a"), Cell::Text("b")],
+                &[Cell::Blank, Cell::Text("kept")],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(s.rows[0][0], None, "a blank cell is a real null");
+        assert_eq!(s.rows[0][1].as_deref(), Some("kept"));
+
+        // The other half of the distinction is asserted on the cell reader
+        // directly, because the fixture writer **cannot express it**:
+        // `rust_xlsxwriter` emits nothing at all for an empty string, so it
+        // round-trips as a blank cell. Files from other tools do carry a real
+        // empty-string cell, and this is the code that meets one — so the case
+        // is tested where it can be, rather than left to a fixture that would
+        // quietly assert the wrong thing.
+        assert_eq!(
+            cell_text(&calamine::Data::String(String::new())),
+            Some(String::new()),
+            "an empty string cell is a value, not a null"
+        );
+        assert_eq!(cell_text(&calamine::Data::Empty), None);
+        // And neither is subject to the NULL-token rule, which is what
+        // `has_own_nulls` buys: with CSV's default rule an empty string would
+        // become a NULL.
+        assert!(NullRule::default().matches(""));
+        assert!(!NullRule::none().matches(""));
+    }
+
+    /// Excel stores a date as a serial number with a display format. Handing the
+    /// serial to a `DATE` column would import `45292`; ISO 8601 is what every
+    /// engine's date parser takes.
+    #[test]
+    fn an_excel_date_comes_across_as_iso_8601_rather_than_its_serial_number() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("d"), Cell::Text("t")],
+                &[
+                    Cell::Date(2024, 1, 1),
+                    Cell::DateTime(2024, 3, 9, 14, 30, 5),
+                ],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        // A pure date keeps the short form a `DATE` column wants — no midnight
+        // clock part invented for it.
+        assert_eq!(s.rows[0][0].as_deref(), Some("2024-01-01"));
+        assert_eq!(s.rows[0][1].as_deref(), Some("2024-03-09 14:30:05"));
+    }
+
+    /// Booleans arrive as the spellings `coerce`'s boolean family already
+    /// accepts — the seam between this reader and the coercion is exactly where
+    /// a `TRUE` that no column would take could hide.
+    #[test]
+    fn an_excel_boolean_arrives_in_a_spelling_coerce_accepts() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("flag")],
+                &[Cell::Bool(true)],
+                &[Cell::Bool(false)],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        for (row, want) in s.rows.iter().zip([Value::Int(1), Value::Int(0)]) {
+            let text = row[0].clone().expect("a value");
+            assert_eq!(
+                coerce(&text, ColKind::Bool, false, &NullRule::none(), MySql),
+                Ok(want)
+            );
+        }
+    }
+
+    /// A workbook is a file with several tables in it — the only import format
+    /// that has to choose. A name that no longer matches is an error rather than
+    /// a quiet fall back to the first sheet, because importing a *different*
+    /// table than the one previewed is the failure worth being loud about.
+    #[test]
+    fn the_named_sheet_is_read_and_a_missing_one_is_refused() {
+        let bytes = workbook(&[
+            ("First", &[&[Cell::Text("a")], &[Cell::Text("from first")]]),
+            (
+                "Second",
+                &[&[Cell::Text("a")], &[Cell::Text("from second")]],
+            ),
+        ]);
+        // The names come off the *same* read as the preview — one parse of the
+        // workbook, not one for the rows and another for the dropdown.
+        let (sample, sheets) = read_workbook_sample(&bytes[..], &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(sheets, ["First".to_string(), "Second".to_string()]);
+        assert_eq!(sample.rows[0][0].as_deref(), Some("from first"));
+        // No sheet named: the first, which is what a one-sheet workbook wants.
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(s.rows[0][0].as_deref(), Some("from first"));
+
+        let s = read_sample(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &xlsx_cfg(true, Some("Second")),
+            10,
+        )
+        .unwrap();
+        assert_eq!(s.rows[0][0].as_deref(), Some("from second"));
+
+        let err = read_sample(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &xlsx_cfg(true, Some("Gone")),
+            10,
+        )
+        .expect_err("a sheet that isn't there");
+        let msg = err.to_string();
+        assert!(msg.contains("no sheet called \"Gone\""), "{msg}");
+        // …and it names what the workbook does have, so the message is actionable.
+        assert!(msg.contains("First, Second"), "{msg}");
+    }
+
+    /// Without a header row every row is data, and the columns get the same
+    /// `Column N` placeholders CSV uses — so `auto_map`'s positional path works
+    /// identically for both.
+    #[test]
+    fn a_sheet_read_without_a_header_row_names_its_columns_positionally() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("a"), Cell::Text("b")],
+                &[Cell::Num(1.0), Cell::Num(2.0)],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(false, None), 10).unwrap();
+        assert_eq!(s.columns, ["Column 1", "Column 2"]);
+        assert_eq!(s.rows.len(), 2, "the first row is data, not a header");
+        assert_eq!(s.rows[0], f(&["a", "b"]));
+
+        // A header row with a blank cell in it still names every column — the
+        // width comes from the used range, so a nameless column would otherwise
+        // shift every mapping after it.
+        let gappy = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("a"), Cell::Blank, Cell::Text("c")],
+                &[Cell::Num(1.0), Cell::Num(2.0), Cell::Num(3.0)],
+            ],
+        )]);
+        let s = read_sample(&gappy[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(s.columns, ["a", "Column 2", "c"]);
+    }
+
+    /// The sample bound applies to Excel too — `more` is what the modal shows,
+    /// and a preview that claimed to be the whole sheet would be a lie about a
+    /// file the user is about to import.
+    #[test]
+    fn an_xlsx_sample_stops_at_the_limit_and_says_there_is_more() {
+        let rows: Vec<&[Cell]> = vec![
+            &[Cell::Text("a")],
+            &[Cell::Num(1.0)],
+            &[Cell::Num(2.0)],
+            &[Cell::Num(3.0)],
+        ];
+        let bytes = workbook(&[("S", &rows)]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 2).unwrap();
+        assert_eq!(s.rows.len(), 2);
+        assert!(s.more);
+    }
+
+    /// **The seam the two-pass import turns on.** `validate` and `row_iter` are
+    /// separate walks of the same file, and the whole contract is that the
+    /// second inserts exactly what the first approved — so a format wired into
+    /// one and not the other, or given a different NULL rule by each, produces
+    /// a clean validation followed by a failed transaction. Both passes are
+    /// driven here over one workbook.
+    #[test]
+    fn an_xlsx_import_validates_and_then_streams_the_same_rows() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("id"), Cell::Text("name"), Cell::Text("when")],
+                &[Cell::Num(1.0), Cell::Text("Ada"), Cell::Date(2024, 1, 1)],
+                &[Cell::Num(2.0), Cell::Blank, Cell::Date(2024, 6, 30)],
+            ],
+        )]);
+        let table = tbl(&[
+            ("id", "int", false),
+            ("name", "varchar", true),
+            ("when", "date", true),
+        ]);
+        let cfg = xlsx_cfg(true, None);
+        let mapping = auto_map(&["id".into(), "name".into(), "when".into()], &table, true);
+
+        let v = validate(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+            100,
+        )
+        .expect("a workbook we just wrote");
+        assert_eq!(v.rows, 2);
+        assert!(v.issues.is_empty(), "{:?}", v.issues);
+
+        let rows: Vec<_> = row_iter(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+        )
+        .expect("the same file the validation approved")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("every row the validation approved");
+        assert_eq!(rows.len(), 2);
+        // The number reached an `int` column as an integer, not `1.0`, and the
+        // date as text a `DATE` column parses.
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Int(1),
+                Value::Str("Ada".into()),
+                Value::Str("2024-01-01".into())
+            ]
+        );
+        // The blank cell became a real NULL in a nullable column.
+        assert_eq!(rows[1][1], Value::Null);
+    }
+
+    /// **`has_own_nulls` asked through its callers, not on its own.** Testing
+    /// the predicate beside `NullRule`'s semantics would pass with the two
+    /// wired together wrongly — the bug would sit in the composition, which is
+    /// where these have historically hidden. So this drives a real NULL token
+    /// through both passes: a workbook cell reading `N/A`, with `N/A`
+    /// configured as a CSV null token.
+    ///
+    /// Excel carries its own nulls, so the token must **not** apply and the
+    /// cell must arrive as the string it is. The same file read as CSV is the
+    /// control: there the token does apply.
+    #[test]
+    fn a_csv_null_token_does_not_reach_an_excel_cell_that_merely_says_it() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("id"), Cell::Text("name")],
+                &[Cell::Num(1.0), Cell::Text("N/A")],
+            ],
+        )]);
+        let table = tbl(&[("id", "int", false), ("name", "varchar", false)]);
+        let mapping = auto_map(&["id".into(), "name".into()], &table, true);
+        let cfg = ReadConfig {
+            nulls: NullRule {
+                tokens: vec!["N/A".into()],
+            },
+            ..xlsx_cfg(true, None)
+        };
+
+        let v = validate(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert!(
+            v.issues.is_empty(),
+            "the token must not turn an Excel cell into a NULL: {:?}",
+            v.issues
+        );
+        let rows: Vec<_> = row_iter(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(rows[0][1], Value::Str("N/A".into()));
+
+        // The control: the same token, the same rule, a format that needs it.
+        // `name` is NOT NULL, so applying the token is visible as an issue.
+        let csv = "id,name\n1,N/A\n";
+        let v = validate(
+            csv.as_bytes(),
+            ImportFormat::Csv,
+            &cfg,
+            &table,
+            &mapping,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.issues.len(), 1, "CSV's token still applies");
+        assert_eq!(v.issues[0].kind, IssueKind::NullInNotNull);
+    }
+
+    /// A blank cell in a `NOT NULL` column is a real problem, and the row it is
+    /// on is the actionable part — the row number has to be the worksheet's own,
+    /// so the user can go and look at it.
+    #[test]
+    fn a_blank_cell_in_a_not_null_column_is_reported_against_its_worksheet_row() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("id"), Cell::Text("name")],
+                &[Cell::Num(1.0), Cell::Text("Ada")],
+                &[Cell::Num(2.0), Cell::Blank],
+            ],
+        )]);
+        let table = tbl(&[("id", "int", false), ("name", "varchar", false)]);
+        let mapping = auto_map(&["id".into(), "name".into()], &table, true);
+        let v = validate(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &xlsx_cfg(true, None),
+            &table,
+            &mapping,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.issues.len(), 1, "{:?}", v.issues);
+        assert_eq!(v.issues[0].kind, IssueKind::NullInNotNull);
+        // Row 3 of the worksheet: the header is row 1, so the second data row is
+        // the third — the number Excel puts in its own margin.
+        assert_eq!(v.issues[0].line, 3);
+    }
+
+    /// **A duration is an elapsed time, and a decimal is not one.** A `[h]:mm:ss`
+    /// cell's underlying value is a fraction of a day; emitting it as decimal
+    /// hours put a timesheet's 8h30m into a MySQL `TIME` column as `8.500000`,
+    /// which MySQL reads as eight and a half *seconds* — wrong by 3600×, and
+    /// silent, because the value coerces perfectly well.
+    #[test]
+    fn an_excel_duration_arrives_as_a_clock_span_not_a_decimal() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("worked")],
+                // 8h30m, the shape a timesheet holds.
+                &[Cell::Duration(8.5 / 24.0)],
+                // Past 24h, which is the whole point of the `[h]` bracket and
+                // which MySQL `TIME` accepts (its range is ±838:59:59).
+                &[Cell::Duration(36.0 / 24.0)],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(s.rows[0][0].as_deref(), Some("8:30:00"));
+        assert_eq!(
+            s.rows[1][0].as_deref(),
+            Some("36:00:00"),
+            "an elapsed time is not wrapped at 24 hours"
+        );
+
+        // The unit itself, over the cases a workbook cannot easily produce.
+        assert_eq!(duration_hms(0.0), "0:00:00");
+        assert_eq!(duration_hms(-1.5 / 24.0), "-1:30:00");
+        // Rounded to the second rather than truncated, so a hair under a whole
+        // day is a whole day.
+        assert_eq!(duration_hms(1.0 - f64::EPSILON), "24:00:00");
+    }
+
+    /// A formula error carries **Excel's** spelling. `Debug` would give `Div0`,
+    /// a token that appears nowhere in Excel, so a user could not connect the
+    /// issue to the cell it names.
+    #[test]
+    fn a_formula_error_keeps_the_spelling_excel_shows() {
+        use calamine::{CellErrorType, Data};
+        assert_eq!(
+            cell_text(&Data::Error(CellErrorType::Div0)).as_deref(),
+            Some("#DIV/0!")
+        );
+        assert_eq!(
+            cell_text(&Data::Error(CellErrorType::Ref)).as_deref(),
+            Some("#REF!")
+        );
+        // Not a null: a cell the sheet could not evaluate has to surface as an
+        // issue naming its row, which a silent NULL would not do.
+        assert!(cell_text(&Data::Error(CellErrorType::NA)).is_some());
+    }
+
+    /// **The row number has to be the one in Excel's own margin.** A sheet whose
+    /// data sits below a title block starts its used range partway down, and
+    /// enumerating that range numbers the first data row `2` while the user is
+    /// looking at row `6` — an issue list pointing at a blank row.
+    #[test]
+    fn an_offset_sheet_reports_the_row_number_excel_shows() {
+        // Four blank rows and two blank columns above and left of the data, the
+        // shape a title block leaves behind.
+        let bytes = workbook_at(
+            4,
+            2,
+            &[(
+                "S",
+                &[
+                    &[Cell::Text("id"), Cell::Text("name")],
+                    &[Cell::Num(1.0), Cell::Text("Ada")],
+                    &[Cell::Num(2.0), Cell::Blank],
+                ],
+            )],
+        );
+        // The columns are unaffected — they come off the used range's width, so
+        // only the *numbering* depends on the origin.
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(s.columns, ["id", "name"]);
+        assert_eq!(s.rows.len(), 2);
+
+        let table = tbl(&[("id", "int", false), ("name", "varchar", false)]);
+        let mapping = auto_map(&["id".into(), "name".into()], &table, true);
+        let v = validate(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &xlsx_cfg(true, None),
+            &table,
+            &mapping,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.issues.len(), 1, "{:?}", v.issues);
+        // The header is worksheet row 5, so the blank cell is on row 7 — not the
+        // row 3 an offset-blind count would report.
+        assert_eq!(v.issues[0].line, 7);
+    }
+
+    /// **A blank row is not a record.** The used range is a rectangle, so a
+    /// spacer row between two blocks of data arrives as a row of empty cells;
+    /// emitting it inserts a row of NULLs nobody typed, or fails the import on
+    /// the first NOT NULL column.
+    #[test]
+    fn a_wholly_blank_row_is_skipped_and_does_not_shift_the_numbering() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("id"), Cell::Text("name")],
+                &[Cell::Num(1.0), Cell::Text("Ada")],
+                &[Cell::Blank, Cell::Blank],
+                &[Cell::Num(3.0), Cell::Text("Grace")],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(
+            s.rows.len(),
+            2,
+            "the spacer row is not a record: {:?}",
+            s.rows
+        );
+        assert_eq!(s.rows[0], f(&["1", "Ada"]));
+        assert_eq!(s.rows[1], f(&["3", "Grace"]));
+
+        // …and the row that follows it keeps its real number, so skipping does
+        // not quietly renumber what comes after.
+        let mut lines = Vec::new();
+        let mut names = Vec::new();
+        xlsx_records(
+            &bytes[..],
+            &xlsx_cfg(true, None),
+            &mut names,
+            usize::MAX,
+            |_, line| {
+                lines.push(line);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(lines, [2, 4], "worksheet rows, with row 3 skipped");
+
+        // A blank cell *among* values is still a real NULL — only a wholly empty
+        // row is dropped, so the skip cannot swallow data.
+        let partial = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("id"), Cell::Text("name")],
+                &[Cell::Num(1.0), Cell::Blank],
+            ],
+        )]);
+        let s = read_sample(&partial[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(s.rows[0][1], None);
+    }
+
+    /// **The size refusal is asked of the file's stat, before it is read.** CSV
+    /// and JSON bound their preview at `SAMPLE_MAX_BYTES` and stop there, so a
+    /// huge file of either is cheap to look at; a workbook has to be read whole
+    /// before its first row can be shown, which put the unbounded read *before*
+    /// the memory warning that was supposed to precede it.
+    #[test]
+    fn an_oversized_workbook_is_refused_before_a_byte_is_read() {
+        assert_eq!(xlsx_size_refusal(ImportFormat::Xlsx, 1024), None);
+        assert_eq!(xlsx_size_refusal(ImportFormat::Xlsx, XLSX_MAX_BYTES), None);
+        // The other two formats are never refused on size — they are bounded by
+        // `SAMPLE_MAX_BYTES` instead, so there is nothing to protect them from.
+        assert_eq!(
+            xlsx_size_refusal(ImportFormat::Csv, XLSX_MAX_BYTES * 4),
+            None
+        );
+        assert_eq!(
+            xlsx_size_refusal(ImportFormat::Json, XLSX_MAX_BYTES * 4),
+            None
+        );
+        let msg =
+            xlsx_size_refusal(ImportFormat::Xlsx, XLSX_MAX_BYTES + 1).expect("past the ceiling");
+        // The way out is named, as it is in every other message here.
+        assert!(msg.contains("CSV"), "{msg}");
+
+        // The refusal sits *above* the warning, so a file that is merely large
+        // is warned about and still opens.
+        assert!(memory_warning(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1).is_some());
+        assert!(xlsx_size_refusal(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1).is_none());
+    }
+
+    /// The memory disclosure fires for a big workbook and for nothing else. The
+    /// shared entry point is the point: a format that needs a warning must not
+    /// be able to have one nobody asks for.
+    #[test]
+    fn the_memory_warning_speaks_up_for_a_large_workbook_only() {
+        assert_eq!(memory_warning(ImportFormat::Xlsx, 1024), None);
+        assert_eq!(
+            memory_warning(ImportFormat::Csv, XLSX_WARN_BYTES * 10),
+            None
+        );
+        let msg = memory_warning(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1)
+            .expect("a workbook past the threshold");
+        assert!(msg.contains("held in memory"), "{msg}");
+        assert!(msg.contains("CSV"), "{msg}");
+        // The JSON warning still reaches the same entry point — the whole reason
+        // it exists is that a second direct caller is how the two drift.
+        assert!(memory_warning(ImportFormat::Json, JSON_WARN_BYTES + 1).is_some());
     }
 
     /// Fields as CSV produces them — text, never a format-level null.
