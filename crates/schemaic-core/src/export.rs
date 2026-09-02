@@ -90,6 +90,22 @@ impl ExportFormat {
         !matches!(self, ExportFormat::Xlsx)
     }
 
+    /// The formats a **Copy** menu may offer, in menu order — [`Self::ALL`]
+    /// filtered by [`Self::is_text`].
+    ///
+    /// A function rather than the filter written inline at the call site,
+    /// because the predicate and its application are two different things and
+    /// only one of them was pinned: `is_text` had a test and the menu's
+    /// `.filter(|f| f.is_text())` did not, so deleting the filter left the whole
+    /// suite green and shipped an Excel entry that clears the clipboard. The
+    /// composition is the part that can regress, so the composition is what has
+    /// a name and a test.
+    ///
+    /// Download menus keep offering [`Self::ALL`] — a file can hold bytes.
+    pub fn clipboard_formats() -> impl Iterator<Item = ExportFormat> {
+        Self::ALL.into_iter().filter(|f| f.is_text())
+    }
+
     /// The file extension, without the leading dot.
     pub fn extension(self) -> &'static str {
         self.extensions()[0]
@@ -918,6 +934,12 @@ pub fn export_xlsx_chunks<W: Write + Send>(
 
     let mut wb = Workbook::new();
     let header = Format::new().set_bold();
+    // The format that makes a blank cell *exist*. Excel — and this writer,
+    // matching it — drops an unformatted blank, so `Format::default()` here
+    // writes nothing and a row of nothing but NULLs would still vanish. Cell
+    // protection is the one property that changes nothing a reader can see on a
+    // sheet that is never protected, which this one is not.
+    let blank = Format::new().set_unlocked();
     let mut tally = ExportTally::default();
     {
         let sheet = wb.add_worksheet_with_constant_memory();
@@ -931,10 +953,15 @@ pub fn export_xlsx_chunks<W: Write + Send>(
         // header to take.
         let mut row: u32 = 0;
         while let Some(c) = src.next_chunk()? {
+            // Asked of **every** chunk, not just the first. `RowChunk` documents
+            // same-columns-per-chunk as a precondition, but a first-chunk-only
+            // check means a source that breaks it reaches the writer and fails
+            // with a message naming neither the count nor the way out — and the
+            // `ci as u16` casts below have no other bound.
+            if c.rs.columns.len() > XLSX_MAX_COLS as usize {
+                return Err(too_wide(c.rs.columns.len()));
+            }
             if first {
-                if c.rs.columns.len() > XLSX_MAX_COLS as usize {
-                    return Err(too_wide(c.rs.columns.len()));
-                }
                 for (ci, col) in c.rs.columns.iter().enumerate() {
                     sheet
                         .write_string_with_format(0, ci as u16, &col.name, &header)
@@ -960,6 +987,7 @@ pub fn export_xlsx_chunks<W: Write + Send>(
                 if row >= XLSX_MAX_ROWS {
                     return Err(too_many_rows());
                 }
+                let mut wrote_a_cell = false;
                 for ci in 0..c.rs.columns.len() {
                     let Some(cell) = c.rs.cell(di, ci) else {
                         continue;
@@ -976,7 +1004,23 @@ pub fn export_xlsx_chunks<W: Write + Send>(
                     if cell.is_null() || withheld_binary(&mask, ci, &cell) {
                         continue;
                     }
-                    write_xlsx_cell(sheet, row, ci as u16, &cell, c.rs, &mut tally)?;
+                    wrote_a_cell |=
+                        write_xlsx_cell(sheet, row, ci as u16, &cell, c.rs, &mut tally)?;
+                }
+                // **A row that wrote no cell would be no row at all.** The
+                // writer emits a `<row>` only for a row that received one, and
+                // the sheet's dimension comes from the cells actually written —
+                // so an all-NULL (or all-empty-string, or all-withheld) row at
+                // the *end* of a result disappeared from the file while
+                // `tally.rows` below still counted it, and the two disagreed
+                // with nothing on screen saying so. An interior one survived
+                // only by accident, stretched into existence by a later row.
+                // A blank cell is the worksheet's way of saying "this row is
+                // here and empty", which is what CSV's unconditional `\n` says.
+                if !wrote_a_cell {
+                    sheet
+                        .write_blank(row, 0, &blank)
+                        .map_err(io::Error::other)?;
                 }
                 row += 1;
                 tally.rows += 1;
@@ -990,6 +1034,11 @@ pub fn export_xlsx_chunks<W: Write + Send>(
 /// One cell, typed. Split out of [`export_xlsx_chunks`]'s loop so the tag →
 /// worksheet-type decision is one testable thing rather than six arms nested
 /// three loops deep.
+///
+/// Answers **whether a cell actually reached the sheet**, which is not the same
+/// as "was called": an empty string writes nothing, because this writer drops an
+/// unformatted blank exactly as Excel does. The caller needs that answer to know
+/// whether the row exists at all — see its `wrote_a_cell`.
 fn write_xlsx_cell(
     sheet: &mut rust_xlsxwriter::Worksheet,
     row: u32,
@@ -997,7 +1046,7 @@ fn write_xlsx_cell(
     cell: &crate::model::CellRef<'_>,
     rs: &ResultSet,
     tally: &mut ExportTally,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use crate::model::CellTag;
     let text = cell.text();
     let number = match cell.tag {
@@ -1016,17 +1065,30 @@ fn write_xlsx_cell(
         // NaN and the infinities have no worksheet representation; their text
         // does.
         CellTag::Float => text.parse::<f64>().ok().filter(|f| f.is_finite()),
-        // `Str` covers DECIMAL/NUMERIC, dates and every exotic type, all of which
+        // `Str` covers dates, `SET-1`, JSON and every exotic type, all of which
         // arrive over the text protocol precisely so they round-trip losslessly.
-        // Handing them to an `f64` here is the one way to undo that.
+        // Handing those to an `f64` here is the one way to undo that.
+        //
+        // **The exception is the fixed-point family**, which is `Str`-tagged for
+        // the same exactness reason and is the commonest numeric column there
+        // is. Sending a `DECIMAL(10,2)` money column out as text is the CSV
+        // behaviour this format exists to replace: `=SUM(B:B)` reads 0 and the
+        // column sorts as words. So a decimal column's value becomes a number
+        // when — and only when — an `f64` holds it exactly ([`exact_decimal`]).
+        // The *column's type* is what licenses it, never the shape of the text:
+        // a `VARCHAR` zip code that looks like a number is not one.
         //
         // `Null` is here only to keep the match exhaustive — the caller writes
         // no cell at all for one, so a null never reaches this function. Don't
         // read this arm as null handling; that lives in `export_xlsx_chunks`.
+        CellTag::Str if is_fixed_point(&rs.columns[col as usize].type_name) => exact_decimal(text),
         CellTag::Str | CellTag::Null => None,
     };
-    match number {
-        Some(n) => sheet.write_number(row, col, n).map_err(io::Error::other)?,
+    let wrote = match number {
+        Some(n) => {
+            sheet.write_number(row, col, n).map_err(io::Error::other)?;
+            true
+        }
         None => {
             let fitted = fit_cell(text);
             if fitted.len() < text.len() {
@@ -1034,10 +1096,67 @@ fn write_xlsx_cell(
             }
             sheet
                 .write_string(row, col, fitted)
-                .map_err(io::Error::other)?
+                .map_err(io::Error::other)?;
+            !fitted.is_empty()
         }
     };
-    Ok(())
+    Ok(wrote)
+}
+
+/// Is this column an engine's **exact fixed-point** type — the family that
+/// arrives as text so it stays exact, and that a spreadsheet user expects to be
+/// able to sum?
+///
+/// Matched on the leading token, so `DECIMAL(10,2)` and `numeric` both answer.
+/// Deliberately narrow: `FLOAT`/`DOUBLE` already arrive tagged `Float`, and
+/// everything outside this list keeps the conservative text rendering.
+fn is_fixed_point(type_name: &str) -> bool {
+    let head = type_name
+        .trim()
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    matches!(
+        head.to_ascii_uppercase().as_str(),
+        "DECIMAL" | "DEC" | "NUMERIC" | "FIXED" | "MONEY" | "SMALLMONEY"
+    )
+}
+
+/// `text` as an `f64` **only if the `f64` is that decimal exactly**.
+///
+/// The comparison is against the shortest representation that round-trips
+/// (`f64`'s own `Display`), with the text first normalised the way that
+/// representation is — a leading `+`, redundant leading zeros and trailing
+/// fractional zeros are notation, not value, and `1234.50` is the everyday shape
+/// of a `DECIMAL(10,2)`. Anything the `f64` cannot carry digit for digit —
+/// `0.1234567890123456789`, `12345678901234567890.5` — fails the comparison and
+/// stays text.
+fn exact_decimal(text: &str) -> Option<f64> {
+    let n: f64 = text.parse().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
+    (normalise_decimal(text) == format!("{n}")).then_some(n)
+}
+
+/// `text` written the way `f64`'s `Display` would write the same value: no
+/// leading `+`, no redundant leading zeros, no trailing fractional zeros.
+fn normalise_decimal(text: &str) -> String {
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (int, frac) = match digits.split_once('.') {
+        Some((i, f)) => (i, f.trim_end_matches('0')),
+        None => (digits, ""),
+    };
+    let int = int.trim_start_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    if frac.is_empty() {
+        format!("{sign}{int}")
+    } else {
+        format!("{sign}{int}.{frac}")
+    }
 }
 
 /// `s` cut to what one worksheet cell holds, on a **character** boundary.
@@ -1047,23 +1166,33 @@ fn write_xlsx_cell(
 /// case) is returned untouched without walking it twice.
 fn fit_cell(s: &str) -> &str {
     if s.len() <= XLSX_MAX_CELL_CHARS {
-        // A char is at least one byte, so a string this short in *bytes* cannot
-        // be too long in characters.
+        // A char is at least one byte and at most two UTF-16 units, and a UTF-16
+        // unit costs at least one byte in UTF-8 — so a string this short in
+        // *bytes* cannot be too long in units either.
         return s;
     }
-    match s.char_indices().nth(XLSX_MAX_CELL_CHARS) {
-        Some((end, _)) => &s[..end],
-        None => s,
+    let mut units = 0usize;
+    for (i, c) in s.char_indices() {
+        let next = units + c.len_utf16();
+        if next > XLSX_MAX_CELL_CHARS {
+            return &s[..i];
+        }
+        units = next;
     }
+    s
 }
 
 /// The worksheet name for an export of `source`: the table's own name, cut and
 /// scrubbed to what Excel accepts, or `Result` when the result isn't a table.
 ///
 /// Excel's rules are its own and it rejects a workbook that breaks them rather
-/// than repairing it: at most 31 characters, none of `[ ] : * ? / \`, and no
-/// leading or trailing apostrophe. A table name is server-controlled, so every
-/// one of those is reachable — `db."my/table"` is legal in PostgreSQL.
+/// than repairing it: at most 31 characters, none of `[ ] : * ? / \`, no leading
+/// or trailing apostrophe, and not the reserved name `History` (in any case),
+/// which belongs to a shared workbook's change log. A table name is
+/// server-controlled, so every one of those is reachable — `db."my/table"` is
+/// legal in PostgreSQL, and `history` is an ordinary table name everywhere.
+/// `rust_xlsxwriter` enforces the first three for us and documents the fourth
+/// without checking it, so that one is ours.
 fn sheet_name(source: Option<(&str, Option<&str>, &str)>) -> String {
     let base = source.map(|(_, _, t)| t).unwrap_or("");
     let cleaned: String = base
@@ -1075,7 +1204,7 @@ fn sheet_name(source: Option<(&str, Option<&str>, &str)>) -> String {
         .take(31)
         .collect();
     let trimmed = cleaned.trim_matches('\'').trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("history") {
         "Result".to_string()
     } else {
         trimmed.to_string()
@@ -1738,6 +1867,13 @@ mod tests {
     /// Rows with something for every renderer to trip over: a NULL, an embedded
     /// quote, a pipe and a newline (Markdown), an angle bracket (HTML), a
     /// backslash (the dialect-sensitive SQL literal), and a non-ASCII glyph.
+    /// **NULLs in the same row, not just in the same fixture.** This had a NULL
+    /// in each column but never both at once, and no `Float`, no `UInt` and no
+    /// over-long `Str` — so the chunk-seam gate crossed a boundary with three of
+    /// the four typed arms untouched, and the all-NULL row that produced no
+    /// worksheet row at all could not appear on either side of the comparison.
+    /// The row *before* the last one is all-NULL deliberately: an interior one
+    /// survives by accident, because a later row stretches the used range.
     fn awkward_rows() -> (Vec<Column>, Vec<Vec<Value>>) {
         let cols = vec![col("id"), col("a`b")];
         let rows = vec![
@@ -1747,6 +1883,9 @@ mod tests {
             vec![Value::Int(4), Value::Str("<b>&\"quoted\"".to_string())],
             vec![Value::Int(5), Value::Str("back\\slash".to_string())],
             vec![Value::Int(6), Value::Str("José".to_string())],
+            vec![Value::Float(-0.5), Value::Str("x".repeat(300))],
+            vec![Value::UInt(u64::MAX), Value::Str(String::new())],
+            vec![Value::Null, Value::Null],
             vec![Value::Int(7), Value::Null],
         ];
         (cols, rows)
@@ -3089,6 +3228,33 @@ mod tests {
         assert_eq!(ExportFormat::Xlsx.render(&rs(), &[0, 1], None, MySql), "");
     }
 
+    /// **The list the menu is built from, not just the predicate under it.**
+    /// The filter used to live inline in `grid_toolbar`, in a file with no test
+    /// module — so deleting it left the suite green and shipped an "Excel" entry
+    /// that sets the clipboard to `""`. Every format the list offers renders to
+    /// something, and the one it withholds is the one that cannot.
+    #[test]
+    fn the_clipboard_list_is_every_format_that_renders_to_text() {
+        let offered: Vec<_> = ExportFormat::clipboard_formats().collect();
+        assert!(!offered.contains(&ExportFormat::Xlsx));
+        // In menu order, and nothing else dropped.
+        assert_eq!(
+            offered,
+            ExportFormat::ALL
+                .into_iter()
+                .filter(|f| *f != ExportFormat::Xlsx)
+                .collect::<Vec<_>>()
+        );
+        // Driven, not asserted about: every entry the menu would build puts
+        // something on the clipboard.
+        for f in ExportFormat::clipboard_formats() {
+            assert!(
+                !f.render(&rs(), &[0, 1], None, MySql).is_empty(),
+                "{f:?} would empty the clipboard"
+            );
+        }
+    }
+
     /// **The point of the format.** A CSV opened in Excel is text the
     /// application then guesses at; a workbook states each cell's type, so
     /// there is nothing to guess.
@@ -3212,6 +3378,31 @@ mod tests {
         assert_eq!(fit_cell(&fits), fits);
     }
 
+    /// **Excel counts UTF-16 units, not Rust `char`s.** Its documented ceiling —
+    /// 32,767 characters in a cell — is counted in the units it stores strings
+    /// as, so an astral char costs two. Cutting by `char` sent an emoji-heavy
+    /// cell out at 65,534 units, twice the limit, which Excel repairs rather
+    /// than opens. The test above pins only the BMP case (`日` is 3 bytes and
+    /// one unit), where the two counts coincide.
+    #[test]
+    fn a_cell_of_astral_characters_is_cut_by_what_excel_counts() {
+        let emoji = "😀".repeat(40_000);
+        let cut = fit_cell(&emoji);
+        assert!(
+            cut.encode_utf16().count() <= XLSX_MAX_CELL_CHARS,
+            "{} units",
+            cut.encode_utf16().count()
+        );
+        // Cut on a character boundary, and a prefix of what came in.
+        assert!(emoji.starts_with(cut));
+        // Not over-cut either: one more character would cross the ceiling.
+        assert_eq!(cut.chars().count(), XLSX_MAX_CELL_CHARS / 2);
+        // A BMP string is unaffected — one char, one unit — so the stricter
+        // count must not shorten what already fitted.
+        let bmp = "日".repeat(XLSX_MAX_CELL_CHARS);
+        assert_eq!(fit_cell(&bmp), bmp);
+    }
+
     /// The chunk seam, asked of Excel the only way it can be: by reading both
     /// workbooks back. `a_chunked_export_matches_the_same_rows_in_one_go` is
     /// this test for the text formats, and it is the same hazard — a header
@@ -3222,7 +3413,11 @@ mod tests {
         let whole = ResultSet::from_rows(cols.clone(), rows.clone());
         let order: Vec<usize> = (0..rows.len()).collect();
         let src_name = Some(("shop", None, "orders"));
-        let one_go = read_back(&to_xlsx(&whole, &order, src_name));
+        let mut one_go_buf = Vec::new();
+        let whole_tally = ExportFormat::Xlsx
+            .render_to(&mut one_go_buf, &whole, &order, src_name, MySql)
+            .expect("writing to a Vec cannot fail");
+        let one_go = read_back(&one_go_buf);
         assert_eq!(one_go.1.len(), rows.len());
         for size in 1..=rows.len() {
             let mut src = chunked(&cols, &rows, size);
@@ -3230,9 +3425,101 @@ mod tests {
             let tally = ExportFormat::Xlsx
                 .stream_to(&mut buf, &mut src, src_name, MySql)
                 .expect("writing to a Vec cannot fail");
-            assert_eq!(tally.rows as usize, rows.len(), "chunks of {size}");
+            // The whole tally, not just its row count: a seam that lost a
+            // truncation note or a dropped column is the same class of bug and
+            // `rows` alone cannot see it.
+            assert_eq!(tally, whole_tally, "chunks of {size}");
             assert_eq!(read_back(&buf), one_go, "chunks of {size}");
         }
+    }
+
+    /// **A row that writes no cell writes no row.** `rust_xlsxwriter` emits a
+    /// `<row>` only for a row that received a cell, and the sheet's dimension is
+    /// computed from the cells actually written — so an all-NULL row at the
+    /// *end* of a result vanished from the file while `tally.rows` still counted
+    /// it, and `SELECT max(total) … WHERE 1=0` exported a header, no data row,
+    /// and a bar reading "Exported 1 row". An interior one survived only because
+    /// a later row stretched the range.
+    ///
+    /// Every way a row can write nothing is asked: all NULL, all empty string
+    /// (which this writer cannot distinguish from NULL — see the loop's own
+    /// note), and a mixture.
+    ///
+    /// **Asserted on the sheet's declared dimension, not on `read_back`.** That
+    /// is what a spreadsheet application reads to decide how far the sheet goes,
+    /// and it is the only reader that can see the difference: calamine's
+    /// `worksheet_range` drops every `Empty` cell before computing its own
+    /// range, so a trailing blank row is invisible to it whether it is in the
+    /// file or not — which is precisely why the review's own fix sketch, an
+    /// assertion on `read_back(...).1.len()`, would have passed a broken fix.
+    /// (`Format::default()` in that sketch writes nothing either: this writer,
+    /// like Excel, drops an *unformatted* blank cell.)
+    #[test]
+    fn a_row_that_writes_no_cell_still_occupies_a_worksheet_row() {
+        let cols = vec![col("a"), col("b")];
+        for rows in [
+            vec![
+                vec![Value::Str("x".into()), Value::Int(1)],
+                vec![Value::Null, Value::Null],
+            ],
+            vec![
+                vec![Value::Str("x".into()), Value::Int(1)],
+                vec![Value::Null, Value::Null],
+                vec![Value::Null, Value::Null],
+            ],
+            vec![
+                vec![Value::Null, Value::Null],
+                vec![Value::Null, Value::Null],
+            ],
+            vec![
+                vec![Value::Str("x".into()), Value::Int(1)],
+                vec![Value::Str(String::new()), Value::Str(String::new())],
+            ],
+            vec![
+                vec![Value::Str("x".into()), Value::Int(1)],
+                vec![Value::Null, Value::Str(String::new())],
+            ],
+        ] {
+            let rs = ResultSet::from_rows(cols.clone(), rows.clone());
+            let order: Vec<usize> = (0..rows.len()).collect();
+            let mut buf = Vec::new();
+            let tally = ExportFormat::Xlsx
+                .render_to(&mut buf, &rs, &order, None, MySql)
+                .expect("writing to a Vec cannot fail");
+            assert_eq!(tally.rows as usize, rows.len(), "{rows:?}");
+            // Row 0 is the header, so the last data row is at `rows.len()`.
+            assert_eq!(
+                sheet_dimension(&buf).end.0 as usize,
+                rows.len(),
+                "the sheet must reach every row the tally counts: {rows:?}"
+            );
+            // And the forced cell holds nothing: every value that did get
+            // written still reads back exactly as before.
+            let (_, back) = read_back(&buf);
+            for (i, row) in back.iter().enumerate() {
+                for (ci, cell) in row.iter().enumerate() {
+                    if matches!(rows[i][ci], Value::Null)
+                        || rows[i][ci] == Value::Str(String::new())
+                    {
+                        assert_eq!(cell.as_deref(), None, "{rows:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The row/column extent the sheet **declares** — `<dimension ref="A1:B3"/>`
+    /// — which is what a spreadsheet application reads and what `read_back`
+    /// cannot show, since calamine recomputes its own range from non-empty
+    /// cells only.
+    fn sheet_dimension(bytes: &[u8]) -> calamine::Dimensions {
+        use calamine::{Reader, Xlsx};
+        let mut wb: Xlsx<_> =
+            Xlsx::new(std::io::Cursor::new(bytes.to_vec())).expect("a workbook we just wrote");
+        let name = wb.sheet_names()[0].clone();
+        wb.worksheet_cells_reader(&name)
+            .expect("the first sheet")
+            .dimensions()
     }
 
     /// **A refusal, not a truncation.** Stopping at row 1,048,576 of a bigger
@@ -3273,6 +3560,115 @@ mod tests {
         );
         // The advice is the actionable half: CSV and JSON have no such ceiling.
         assert!(err.to_string().contains("CSV"), "{err}");
+    }
+
+    /// The width ceiling, driven the same way its taller sibling is — and for
+    /// the same reason. It had **no test at all**: deleting the whole refusal
+    /// left the suite green, and the `ci as u16` casts whose only bound is that
+    /// check then wrap silently at 65,536 columns.
+    ///
+    /// The last case is the second half of the same guard: the check used to run
+    /// on the *first* chunk only, so a later, wider one reached the writer and
+    /// failed with a message naming neither the column count nor the way out.
+    #[test]
+    fn a_result_wider_than_a_worksheet_is_refused_rather_than_cut() {
+        let wide = |n: usize| {
+            let cols: Vec<Column> = (0..n).map(|i| col(&format!("c{i}"))).collect();
+            let row = vec![Value::Int(1); n];
+            ResultSet::from_rows(cols, vec![row])
+        };
+        // Exactly on the ceiling it exports, header and all.
+        let ok = wide(XLSX_MAX_COLS as usize);
+        let (header, _) = read_back(&to_xlsx(&ok, &[0], None));
+        assert_eq!(header.len(), XLSX_MAX_COLS as usize);
+
+        // One past it is a refusal that names the count and the way out.
+        let too_wide = wide(XLSX_MAX_COLS as usize + 1);
+        let mut buf = Vec::new();
+        let err = ExportFormat::Xlsx
+            .render_to(&mut buf, &too_wide, &[0], None, MySql)
+            .expect_err("a result this wide does not fit a worksheet");
+        assert!(err.to_string().contains("columns"), "{err}");
+        assert!(err.to_string().contains("CSV"), "{err}");
+
+        // …including when the width arrives on a later chunk.
+        let narrow = ResultSet::from_rows(vec![col("id")], vec![vec![Value::Int(1)]]);
+        let mut sent = 0u8;
+        let mut src = PullChunks::new(move || {
+            sent += 1;
+            Ok(match sent {
+                1 => Some(narrow.clone()),
+                2 => Some(too_wide.clone()),
+                _ => None,
+            })
+        });
+        let mut buf = Vec::new();
+        let err = ExportFormat::Xlsx
+            .stream_to(&mut buf, &mut src, None, MySql)
+            .expect_err("the width check must not be a first-chunk-only step");
+        assert!(err.to_string().contains("columns"), "{err}");
+    }
+
+    /// **The format's headline promise, on the commonest numeric column.**
+    /// `DECIMAL`/`NUMERIC` arrives over the text protocol precisely so it is
+    /// exact, and `CellTag::Str` sent all of it to a text cell — so `=SUM(B:B)`
+    /// was `0`, the column sorted lexicographically (`"100.00" < "9.00"`), and
+    /// Excel flagged every cell as a number stored as text. Exactly the CSV
+    /// behaviour the format exists to replace.
+    ///
+    /// The two values a worksheet cannot hold are pinned in the same test, so
+    /// the guard cannot be widened by accident.
+    #[test]
+    fn an_exact_decimal_goes_out_as_a_number_and_an_inexact_one_stays_text() {
+        let dec = |name: &str| Column {
+            name: name.to_string(),
+            type_name: "DECIMAL(30,10)".to_string(),
+            origin: None,
+        };
+        for (text, want_number) in [
+            ("1234.50", true),
+            ("100.00", true),
+            ("-0.10", true),
+            ("9.00", true),
+            ("0", true),
+            // Past what an `f64` holds: 19 significant digits, and a magnitude
+            // beyond 2^53. Both must stay text, digit for digit.
+            ("0.1234567890123456789", false),
+            ("12345678901234567890.5", false),
+            // Not a number at all — a DECIMAL column can still carry this on the
+            // way through, and it must not be guessed at.
+            ("NaN", false),
+        ] {
+            let rs =
+                ResultSet::from_rows(vec![dec("total")], vec![vec![Value::Str(text.to_string())]]);
+            let (_, rows) = read_back(&to_xlsx(&rs, &[0], None));
+            let got = rows[0][0].as_deref();
+            if want_number {
+                let n: f64 = got.unwrap_or("").parse().unwrap_or(f64::NAN);
+                assert_eq!(n, text.parse::<f64>().unwrap(), "{text} -> {got:?}");
+            } else {
+                assert_eq!(got, Some(text), "{text} must stay text");
+            }
+        }
+        // An empty cell in a decimal column is still an empty cell — the
+        // conversion must not turn absence into a zero.
+        let rs = ResultSet::from_rows(
+            vec![dec("total"), dec("t2")],
+            vec![vec![Value::Str(String::new()), Value::Str("1.5".into())]],
+        );
+        let (_, rows) = read_back(&to_xlsx(&rs, &[0], None));
+        assert_eq!(rows[0][0].as_deref(), None);
+        assert_eq!(rows[0][1].as_deref(), Some("1.5"));
+
+        // **The type is what licenses the conversion, not the shape of the
+        // text.** A `VARCHAR` holding a phone number or a zip code is not a
+        // number and must not become one — that guess is the CSV behaviour.
+        let rs = ResultSet::from_rows(
+            vec![col("code")],
+            vec![vec![Value::Str("1234567890".to_string())]],
+        );
+        let (_, rows) = read_back(&to_xlsx(&rs, &[0], None));
+        assert_eq!(rows[0][0].as_deref(), Some("1234567890"));
     }
 
     /// A display order can name a row a later splice removed. Every other
@@ -3358,6 +3754,17 @@ mod tests {
         assert_eq!(sheet_name(Some(("db", None, "///"))), "___");
         assert_eq!(sheet_name(Some(("db", None, "  "))), "Result");
         assert_eq!(sheet_name(Some(("db", None, "'quoted'"))), "quoted");
+        // Excel's fifth rule, and the only one `rust_xlsxwriter` does not
+        // enforce for us: `History` is reserved for a shared workbook's change
+        // log, case-insensitively, and a workbook using it as an ordinary sheet
+        // name is repaired rather than opened. A table can be called that.
+        for reserved in ["history", "History", "HISTORY", " history "] {
+            assert_eq!(
+                sheet_name(Some(("db", None, reserved))),
+                "Result",
+                "{reserved}"
+            );
+        }
         // Every character Excel forbids, replaced rather than dropped, so two
         // different tables cannot collapse to one name.
         assert_eq!(
