@@ -132,6 +132,13 @@ jobs:
   live:
     name: Live engines (MySQL + MariaDB + PostgreSQL)
     runs-on: ubuntu-latest
+    # **The one job here that talks to something that can stop answering.** Every
+    # other job either compiles or does not; this one waits on three servers, a
+    # channel and a `DROP DATABASE` that a held transaction can block. Without a
+    # ceiling a wedged test holds a runner for the full six-hour default, and the
+    # failure reads as "still running" rather than as itself. Generous against a
+    # cold service container — the whole tier runs in ~10 s locally.
+    timeout-minutes: 15
     services:
       # MariaDB is a leg of its own rather than a MySQL stand-in: the two
       # diverge in exactly what the DB layer reads — `information_schema`,
