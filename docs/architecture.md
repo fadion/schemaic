@@ -558,27 +558,54 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Excel is the sixth format and the only binary one.** `export_xlsx_chunks` writes one worksheet
     — named by `sheet_name` after the source table, because Excel *rejects* a workbook whose sheet
     name breaks its rules rather than repairing it (at most 31 characters, none of `[ ] : * ? / \`,
-    no leading or trailing apostrophe, and `Result` when the result is not a table's) — with a frozen
+    no leading or trailing apostrophe, **not the reserved `History`** in any case, and `Result` when
+    the result is not a table's). `rust_xlsxwriter` enforces the first three and documents the
+    reserved name without checking it, so that one is ours — and `history` is an ordinary table name
+    on every engine, which makes it reachable rather than theoretical. The sheet has a frozen
     bold header row and **typed cells**: `CellTag::Int`/`UInt`/`Float` become worksheet numbers and
     everything else a string, so the application has nothing left to guess at, which is the whole
     point of the format over a CSV that Excel then guesses at — the guess that turns `SET-1` into a
     date and drops the leading zeros off a postcode. The exception is a number a worksheet could not
     hold *exactly* — an `i64`/`u64` past 2^53, a non-finite float — which goes out as **text**,
     because a worksheet number is an `f64` and a `BIGINT` key that comes back off by one is a silent
-    corruption. `rust_xlsxwriter`'s `constant_memory` feature is
+    corruption. **The exception's exception is the fixed-point family**, which is `Str`-tagged for
+    that same exactness reason and is the commonest numeric column there is: sending a
+    `DECIMAL(10,2)` money column out as text is the CSV behaviour this format exists to replace —
+    `=SUM(B:B)` reads 0 and the column sorts as words. So `is_fixed_point` (`DECIMAL`/`DEC`/
+    `NUMERIC`/`FIXED`/`MONEY`/`SMALLMONEY`, matched on the leading token) plus `exact_decimal`
+    (the text, normalised the way `f64`'s own `Display` writes it, comparing equal to the parsed
+    value) makes it a number when — and only when — an `f64` holds it digit for digit. **The
+    column's type is what licenses it, never the shape of the text**: a `VARCHAR` postcode that
+    looks like a number is not one, which is the whole guess this format exists to stop.
+    `write_xlsx_cell` is that decision split out of the loop, and it answers **whether a cell
+    actually reached the sheet** — not the same as "was called", since an empty string writes
+    nothing. The caller needs that answer because **a row that wrote no cell would be no row at
+    all**: the writer emits a `<row>` only for a row that received one and the sheet's dimension
+    comes from the cells actually written, so an all-NULL (or all-withheld) row at the *end* of a
+    result vanished from the file while the tally still counted it, and an interior one survived
+    only by accident, stretched into existence by a later row. Such a row now gets one **formatted**
+    blank — `Format::new().set_unlocked()`, because this writer drops an *unformatted* blank exactly
+    as Excel does, and cell protection is the one property that changes nothing a reader can see on
+    a sheet that is never protected. A blank cell is the worksheet's way of saying "this row is here
+    and empty", which is what CSV's unconditional `\n` says. `rust_xlsxwriter`'s `constant_memory` feature is
     load-bearing: it spills each finished row's XML to a library-managed temp file, which is what
     holds an export to a bounded buffer at any row count — the bound `RowChunks` exists to give, and
     the one an in-memory workbook would throw away at exactly the size where it matters. That makes
     `export_xlsx_chunks` **the one function in `schemaic-core` whose tests touch the filesystem**
     (see the pure-logic invariant). Excel's own ceilings are `XLSX_MAX_ROWS` (1,048,576),
-    `XLSX_MAX_COLS` (16,384) and `XLSX_MAX_CELL_CHARS` (32,767): a cell past the last is cut on a
-    *character* boundary and reported through `ExportTally::cut`, while a result taller than a
+    `XLSX_MAX_COLS` (16,384) and `XLSX_MAX_CELL_CHARS` (32,767): a cell past the last is cut by
+    `fit_cell` and reported through `ExportTally::cut`, while a result taller than a
     worksheet is **refused** — with an error naming CSV and JSON as the way out — rather than
     truncated, stopping at row 1,048,576 of a 3M-row table being the one loss the file would carry no
-    trace of at all, and the `.part` dance means the refusal leaves the destination alone. A result
+    trace of at all, and the `.part` dance means the refusal leaves the destination alone. **The cut
+    is counted in UTF-16 units**, which is what Excel counts, taken on a `char` boundary because
+    slicing a `&str` mid-codepoint panics; an all-ASCII value short enough in *bytes* cannot be too
+    long in units either, so the common case returns untouched without being walked twice. A result
     wider than a worksheet is refused the same way: unreachable in practice, since no engine returns
     16,384 columns, but stated rather than assumed because silently dropping the columns past it
-    would be the worse failure. **The
+    would be the worse failure — and it is asked of **every chunk, not just the first**, since
+    `RowChunk` documents same-columns-per-chunk as a precondition rather than enforcing one, and the
+    `ci as u16` casts in the cell loop have no other bound. **The
     known fidelity gap**: an empty *string* writes no cell, since `rust_xlsxwriter` emits nothing for
     one, so it reads back as NULL — the same ambiguity CSV has, deliberately not fixed here.
     And because the rendering is bytes rather than text, `ExportFormat::is_text` exists: the grid's
@@ -587,7 +614,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the clipboard and report success. That menu filters on the capability while the Download menu
     still offers every format (*Data grid*) — the split `erd_export::ErdExportFormat::is_text`
     already makes for PNG — and the capability is computed from the variant rather than stored, so a
-    seventh format has to answer it. `stream_to`/`render_to` carry a `W: Send` bound for this
+    seventh format has to answer it. **The filter is `clipboard_formats()`, not `.filter(|f|
+    f.is_text())` written at the call site**: the predicate had a test and its application did not,
+    so deleting the filter left the whole suite green and shipped an Excel entry that clears the
+    clipboard. The composition is the part that can regress, so the composition is what has a name
+    and a test. **`writes_incrementally()` is the second capability**, and the answer to a question
+    the export plumbing was written before anything could answer `false` to: the five text formats
+    reach the sink as they go, so a failure halfway leaves a `.part` sibling holding the rows that
+    arrived, while `Xlsx` is a ZIP and nothing reaches the sink until `save_to_writer` — so every
+    pre-save failure left a **zero-byte** file the message pointed the user at. `export_cancel_note`
+    and `export_failure_note` therefore take that answer rather than `true`, and the app sweeps the
+    empty sibling instead of leaving it as litter (*Data grid*). `stream_to`/`render_to` carry a `W: Send` bound for this
     renderer alone: `rust_xlsxwriter` hands the writer to the thread that assembles the workbook's
     ZIP, and every sink an export already writes to (`BufWriter<File>`, `Vec<u8>`) satisfies it.
     **The formats anything reads
@@ -663,8 +700,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the sentence is not "your file is a fragment" but `— <name> was not changed; the rows that were
     written are in <name>.part` — the reassurance and where the partial went, in one line — while a
     `partial` of `None`, an export refused before the write started, still says nothing extra.
-    `export_cancel_note(name)` is the same two facts in the cancel arm's voice, a note rather than
-    an error because stopping was the user's own doing. And
+    `export_cancel_note(name, partial)` is the same two facts in the cancel arm's voice, a note
+    rather than an error because stopping was the user's own doing — and it takes a `bool` for the
+    reason `export_failure_note` takes an `Option`: a buffered format's sibling holds nothing, so
+    pointing at it directs the user to an empty file. Both are pinned across every format by
+    `neither_note_points_at_an_empty_sibling`, which asserts the `.part` sentence appears exactly
+    where `writes_incrementally` says and that the *destination survived* half is said either way.
+    And
     `all_rows_label(size, sorted, manual_tx)` is the Download menu's `All rows` entry, three
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
   - `import.rs` — the inverse of `export.rs`: CSV/TSV, JSON (array *or* NDJSON) and Excel
@@ -705,27 +747,61 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     reader the preview, the validation pass and the load all walk, as `json_records` is for JSON;
     `read_workbook_sample` is the probe's entry point, returning the preview **and** the sheet names
     from one parse, because a second call to list the sheets meant opening and inflating the whole
-    workbook again on every settings change. Two properties of that walk are load-bearing and neither
-    is visible in an `A1`-anchored fixture: rows are numbered from `range.start()`, since
-    `worksheet_range` returns the *used* range and a sheet with a title block above its header starts
-    partway down (enumerating it sent the user to look at a blank row), and a **wholly empty row is
-    not a record**, since the used range is a rectangle and a blank spacer row would otherwise insert
-    a row of NULLs nobody typed. `xlsx_size_refusal` is asked of the file's *stat* before any of it
-    is read: CSV and JSON bound their preview at `SAMPLE_MAX_BYTES` and stop, but a ZIP's directory
-    is at the end, so a workbook must be read whole before its first row can be shown — which put the
-    unbounded read ahead of the memory warning meant to precede it. `cell_text` is one cell → `Field`, and its conversions are chosen
+    workbook again on every settings change.
+    **`xlsx_rows` streams the sheet and never materialises it.** It walks
+    `worksheet_cells_reader` and assembles one row at a time — cells arrive in sheet order and an
+    empty cell is not emitted at all, so a row is complete when a cell for a later row shows up.
+    What it replaced was `worksheet_range`, which builds the **dense** bounding rectangle of every
+    cell present: a legal 5,461-byte workbook holding two cells at opposite corners cost 262 MB —
+    48,099× the file — and the worst legal sheet 550 GB, which is not an error but
+    `handle_alloc_error`, i.e. the process. Measured on this project's own 200k × 50 target, the
+    preview went from **1,085 MB / 2.8 s to 64 MB / 21 ms**. Two properties of that walk are
+    load-bearing and neither is visible in an `A1`-anchored fixture: rows carry the **worksheet**
+    row number, the one in Excel's own margin, since a sheet with a title block above its header
+    starts partway down (enumerating from zero sent the user to look at a blank row), and a
+    **wholly empty row is not a record**, since a blank spacer row would otherwise insert a row of
+    NULLs nobody typed — which the streaming walk gets for free rather than by a filter, an empty
+    row producing no cell to end the previous one. **The row's width comes from the sheet's
+    *declared* extent** (`sheet_width` over `Dimensions`), capped at `XLSX_MAX_COLS` (16,384) and
+    refused above it: the rows are streamed, so a sheet's height costs nothing to skip past, and the
+    row buffer is the one allocation whose size the file controls. A cell is placed relative to the
+    used range's **left edge** — the same correction `range.start()` used to make — and one outside
+    the declared range is dropped rather than widening or shifting the row, since every record has
+    to carry the same field count or the mismatch report becomes noise on every row after the widest.
+    `xlsx_size_refusal` is still asked of the file's *stat* before any of it
+    is read, because it can say so before the file is touched and it names the size — but the
+    ceiling is now **enforced in `open_xlsx`**, which reads through a `std::io::Read::take` at
+    `XLSX_MAX_BYTES` (512 MiB) so all three readers inherit it. A guard the *launcher* has to
+    remember is a guard the two load-path opens did not have; they went straight to `read_to_end`.
+    `oversize_workbook` is the one sentence both raise, naming the size where the caller knows it.
+    `cell_text` is one cell → `Field`, and its conversions are chosen
     so a value that came *out* of a database survives the trip back in: an empty cell → null; a
     number in `f64`'s shortest round-trip form, so `7.0` is `7` (an `INT` column rejects the latter,
     and Excel has no integer type to tell them apart); a date or time as ISO 8601 rather than the
     serial number Excel actually stores, since a `DATE` column otherwise receives `45292`; a bool as
-    `true`/`false`, spellings `coerce` already accepts; a **duration** through `duration_hms` as
+    **`1`/`0`, not `true`/`false`** — both spellings are in `ColKind::Bool`'s accepted list, so this
+    is not a trade between engines but the one that also works where the column is *not* classified
+    `Bool`: MySQL and MariaDB report a `BOOLEAN` as `tinyint(1)`, so `classify` gives `ColKind::Int`
+    and `coerce("true", Int)` is `NotAnInteger`, and every row of an ordinary spreadsheet's
+    TRUE/FALSE column was refused while the same workbook imported fine on PostgreSQL and SQLite;
+    a **duration** through `duration_hms` as
     `H:MM:SS` with hours deliberately unwrapped past 24, since a `[h]:mm:ss` cell holds a fraction of
     a day and emitting it as decimal hours put a timesheet's 8h30m into a MySQL `TIME` column as
     `8.500000` — eight and a half *seconds*, wrong by 3600× and silent, because the value coerces
     perfectly well; and a formula error in **Excel's own spelling** (`#REF!`, `#DIV/0!`, from
     calamine's `Display` rather than its `Debug`, which gives a `Div0` that appears nowhere in the
     application the user is looking at) as its own text rather than a null, so a cell the sheet
-    itself could not evaluate surfaces as an `Issue` naming the row. **`ImportFormat::has_own_nulls` is the capability the null rules ask** — true for JSON
+    itself could not evaluate surfaces as an `Issue` naming the row. **That `Issue` is
+    `IssueKind::CellError`, raised ahead of the type dispatch and not by it**: a cell the sheet
+    could not evaluate is wrong for *every* column type, and `ColKind::Other` — text, date, JSON,
+    blob, enum — has no dispatch to catch it with, so a `#N/A` went into a `VARCHAR` column as the
+    literal text. `is_worksheet_error` matches the closed set the format defines, case-sensitively
+    and whole-field, so a `VARCHAR` holding "check the #REF! column" is text, which it is. It is
+    **gated on `ImportFormat::Xlsx`**, which is why `coerce_record` gained a `format` parameter — a
+    `#N/A` typed into a CSV is a string somebody wrote. The worksheet header goes through
+    `text::strip_bom` for the same reason the CSV path does: a BOM that survived a round trip
+    through a BOM'd CSV lands *inside* the first header name and silently breaks name-matching on
+    the very first column. **`ImportFormat::has_own_nulls` is the capability the null rules ask** — true for JSON
     and Excel, false for CSV — because a worksheet's empty cell is a real null and `NullRule`'s token
     list must not apply to it; it replaced two separate `match format` expressions, in `validate` and
     in `row_iter`, that had to agree with each other. `RowSourceIter::Json` is now
@@ -735,10 +811,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     width. **`read_sample` bypasses `SAMPLE_MAX_BYTES` for a workbook** for that same prefix reason:
     a ZIP's central directory is at the end of the file, so a truncated read does not open at all and
     the bound would turn "preview a 9 MB workbook" into "this file is corrupt". What is left to
-    disclose is the memory that costs: `xlsx_load_estimate` is `XLSX_MEMORY_FACTOR` (25) × the file
-    size, a deliberately conservative figure and **not a measured one** — unlike `JSON_MEMORY_FACTOR`
-    — because the ratio depends on how repetitive the sheet's strings are, and `XLSX_WARN_BYTES` is
-    40 MiB. The modal asks **`memory_warning(format, bytes)`** and never `json_memory_warning`
+    disclose is the memory that costs: `xlsx_load_estimate` is `XLSX_MEMORY_FACTOR` × the file size,
+    and that factor is now **4 and measured**, on the same counting allocator `JSON_MEMORY_FACTOR`
+    came off — 2.0× on the 200k × 50 target and 1.5× on 120k × 50 of distinct 60-char strings, with
+    4 as headroom for a workbook shaped unlike either. It was a **guess of 25**, on the reasoning
+    that an `.xlsx` is a ZIP of XML that deflates well: right about the file and wrong about what
+    was actually held, which was the dense `Range` the old reader built rather than the file. With
+    that gone, `XLSX_WARN_BYTES` moves from 40 MiB to `JSON_WARN_BYTES`'s **200 MiB** — a 40 MB
+    workbook was estimated at 1 GB, measured 1,085 MB, and now costs 64 MB — so the two warnings
+    again fire at roughly the same estimated footprint (4× against JSON's 5×), which is where an
+    estimate stops being something a machine absorbs without noticing.
+    The modal asks **`memory_warning(format, bytes)`** and never `json_memory_warning`
     directly: one call site, so a format that needs a warning cannot be given one nothing asks for.
     **The reader is `calamine`, and an imported `.xlsx` is the first untrusted XML this app has ever
     parsed** — a ZIP of it, from wherever the user got the file. `calamine` depends on quick-xml
@@ -965,8 +1048,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     browser is showing privileges for, which is correct on both engines: MySQL's grant tables are
     server-wide and answer the same from any connection, and PostgreSQL's are exactly the ones the
     browser was already scoped to (`an_account_change_takes_the_ordinary_in_database_route`).
-    `supports_change` answers for them in an early arm returning `users::supports_user_admin`, so it
-    and the browser that offers the action cannot drift about which engines have accounts at all.
+    `supports_change` answers for them in an early arm asking `users::supports_user_admin`, so it
+    and the browser that offers the action cannot drift about which engines have accounts at all —
+    **and then asks `users::levels_for` for the two changes that carry a level.** That arm used to
+    answer for all six variants on "does this engine have accounts", which made `unsupported()`
+    blind to the one thing an account change can ask an engine for and not get: `GRANT … ON *.*` has
+    no PostgreSQL grammar and `ON SCHEMA` has no MySQL one. Blind meant no INCOMPLETE header, a
+    silent `apply` guard, and Apply enabled over a statement the server will refuse. Every other
+    narrow arm in that function is shape-aware; this is the capability that already knew the answer,
+    consulted until now only by the form's own picker.
     `ChangeSet::account_statements` emits them at the **end** of the plan, called from `emit_mysql`
     and `emit_postgres` beside `container_drops` and filtered on `supports_change` like its
     neighbours — a privilege is stated *on* something, so it comes after whatever the plan creates.
@@ -981,9 +1071,39 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     "1 Change", listed it, and showed an empty SQL box under a dimmed Apply: a change described with
     nothing behind it. The form's Apply asks `GrantDraft::is_ready` first, so this is reachable only
     by a caller that builds the change directly. `risks` speaks for `DropAccount`,
-    `RevokePrivileges` and `RevokeRole`, and the account drop's sentence says what is actually
-    lost — **its privileges, not its data**, with no record of them left anywhere to put back —
-    plus the surprise that anything still connected as it keeps running until it disconnects.
+    `RevokePrivileges`, `RevokeRole` and **`CreateAccount`**, and the account drop's sentence says
+    what is actually lost — **its privileges, not its data**, with no record of them left anywhere
+    to put back — plus the surprise that anything still connected as it keeps running until it
+    disconnects. **Creating an account destroys nothing and is still the highest-consequence thing
+    this module emits**, which is the call `DropCheck`'s "rows the constraint refused are accepted
+    from now on" already makes: a blank password on MySQL is an account anyone who can reach the
+    server can log in as, with no `IDENTIFIED BY` for `validate_password` to fire on, and a blank
+    host means `%` — every machine on the network. The form discloses the host default and that the
+    password shows in the preview; nothing said what leaving it *blank* produces. So the risk block
+    can no longer head itself "This can't be undone": `ChangeSet::risk_heading` reads **"Before you
+    apply"** when every change in the set is `risk_is_reversible` — the two revokes and the create,
+    a deliberately narrow list so a fourth change inherits the strong heading rather than losing it
+    by omission. A revoke's own sentence says it destroys no data and is undone by granting it back,
+    and it appeared under the strong heading two entries away from `DROP USER`, which is the one
+    modal where that heading has to keep its meaning. It is here rather than in the view because it
+    is a claim about the changes.
+    **What leaves the preview is `ChangeSet::export_script`, and it carries no password.** A
+    `CREATE USER … IDENTIFIED BY 'hunter2'` is the one plan this app emits that holds a plaintext
+    credential, and both exits from the modal put it somewhere durable: *Open in editor* makes a
+    query tab whose text the next session save writes into `tabs.json` in the clear and restores on
+    every launch, and *Copy* puts it on the OS clipboard, which on Windows persists in Clipboard
+    History and cloud-syncs. Three doc sites asserted the opposite ("never persisted, never
+    logged"). One function, so a third exit inherits the rule instead of remembering it — the shape
+    the write guard's own invariant exists to enforce. The substitution happens **before** the
+    emitter runs, not by scanning its output: `without_secrets` clones the set with
+    `PASSWORD_PLACEHOLDER` in place of each secret and re-emits, so there is no scanning to get
+    wrong and no second emitter, and the placeholder is shaped so the statement still parses and
+    fails at the server rather than quietly creating an account whose password is that string. A
+    header on the script says the password is missing and what to replace. `without_secrets` is
+    separate so the *decision* — which changes carry a secret — is a pure function with a test
+    (`every_account_change_that_carries_a_password_is_scrubbed`), which a seventh such change has to
+    extend. The preview itself still renders `statements`, which is the statement that runs: a
+    modal showing a blanked-out plan would not be showing the plan.
     `grant_change(draft, account)` is the last piece: the mapping from the grant form's Action and
     Subject dropdowns (two toggles when the test was named) to those four statements, out of the
     view because a mapping invisible in a rendered form is the
@@ -1813,8 +1933,35 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     from being confused with `account_sql`'s unconditional quoting for SQL that runs.
     `Grants { statements, note }` is the honesty half, and `pg_scope_note` writes the note:
     PostgreSQL keeps schema, table and sequence privileges in the catalogue of the database holding
-    the object, so one connection answers for one database and the note names which. A privilege
+    the object, so one connection answers for one database and the note names which
+    (`pg_no_database_note` is the same sentence for a connection with none selected, where those
+    queries are not run at all). A privilege
     screen that is quietly partial is the one way this feature can mislead.
+    **`Principals { list, note }` is that same shape for the account list, and it exists because a
+    `Vec<Principal>` had no channel for "the wide reads were refused, this is one account out of
+    eight".** An ordinary application account — no `SELECT` on `mysql` — browsed a list of exactly
+    itself, rendered as a complete list under a footer reading "1 account".
+    `my_own_account_only_note` is what the MySQL ladder's last rung sets, and `Principals::complete`
+    is the constructor for every rung above it, so the absence is carried out rather than inferred
+    from a count. **MySQL's grant list carries a note too** — `my_scope_note`: `SHOW GRANTS` is
+    documented on both servers as **direct grants only**, so a privilege held through a granted role
+    does not appear and no `USING` form is issued here that would expand one. The list shipped with
+    `note: None`, so a role-based setup — the normal way a modern MySQL 8 or MariaDB installation is
+    provisioned — showed an account with almost nothing on it and said nothing about why.
+    **`pg_implicit_note` is what an ACL query cannot see, and it is stated rather than emitted as a
+    `GRANT`.** `aclexplode` reads only *explicit* entries, and three of the commonest ways a role
+    holds power leave none: a superuser bypasses every check, an owner holds every privilege on what
+    it owns, and a `pg_*` predefined role's powers are wired into the server. Clicking
+    `pg_read_all_data` therefore printed the pane's own **"This account holds no privileges."**, and
+    an owner of fourteen tables got one statement about a database they were not looking at under a
+    note that enumerated its omissions and did not include these. A line shaped like a `GRANT` would
+    be a lie in the other direction — there is no statement that would produce these and none that
+    would revoke them — so it is prose, passed as the `extra` argument both scope notes now take and
+    placed **first**, because "this role is a superuser" changes how the rest of the screen should
+    be read. The superuser sentence subsumes the other two and returns alone; `is_pg_predefined` is
+    the same `pg_` prefix test `pg::roles` uses to keep those roles out of a *grantable* list, and
+    they are kept in the browser deliberately, which is exactly why their powers have to be
+    accounted for. Both notes now also admit ownership and superuser among their omissions.
     **`redact_secrets` is why nothing here can put a credential on screen.** MariaDB's `SHOW GRANTS`
     carries the account's stored hash inline (`IDENTIFIED BY PASSWORD '*01E8…'`), and for
     `mysql_native_password` that hash *is* the credential — the client proves knowledge of it, so
@@ -1876,7 +2023,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Object names in these statements go through `export::ident_sql`** and its unconditional
     quoting, because this is SQL that is *executed* — the opposite call to the browser's read-only
     `GRANT` list and its `ident_if_needed` (`pg_ident`), which is the same distinction one paragraph
-    up. Accounts themselves still go through `account_sql`.
+    up. Accounts themselves still go through `account_sql`. `GrantLevel::object_sql` — everything
+    after `ON`, keyword included — is **the file's only dialect match and it names every arm**,
+    with no `_ =>`: a catch-all there answers for an engine nobody has looked at, so a fourth engine
+    would silently take PostgreSQL's spelling rather than failing to compile. SQLite reaches it only
+    through a caller that skipped `supports_user_admin`, which is what the arms are for.
+    **Two decisions the browser used to hold live here now.** `WriteGate::of(dialect, read_only,
+    has_database)` answers whether a write is offered and, if not, why — `NoEngineSupport`,
+    `ReadOnly`, `NoDatabase`, `Allowed` — and the *ordering* of those four answers is the whole
+    content of it: engine first, because an engine with no accounts must **omit** the action rather
+    than dim it (`offered()`), and read-only before no-database, because a read-only connection is
+    the more specific reason and the one the user can act on. It lived inline in an 860-line view
+    with no `#[cfg(test)]` at all, so that ordering had nowhere to be pinned. `filter_indices`
+    returns the *indices* matching the search box in list order, computed once: the view asked
+    `matches` twice per keystroke — once to build the rows and once for the footer's count — each
+    call re-`format!`ing every account's `display()`, which at the ~1,000 accounts a shared server
+    has was measured at ≥13 ms of a 16.7 ms frame, behind a query with no `LIMIT`.
   - `diff.rs` — the line-level diff behind the inline-AI (Ctrl+K) preview. `line_diff` is the LCS
     pass, one tagged row per displayed line (context / removed / added); `inline_plan` re-addresses
     those rows as **document line numbers**, which is what lets the UI draw the suggestion in the
@@ -2570,13 +2732,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       error actionable — so dropping it bought no privacy and left a model told only *"the last run
       FAILED, the message is withheld"*, the level paying for its caution in usefulness rather than
       in exposure.
-      **`redact_engine_error` is per-template, not a blunt quote-stripper**, because engines quote
-      identifiers in the same syntax as values (`for key 'users.email'`, `constraint
-      "users_email_key"`) and blanking every quoted run would destroy exactly the half worth
-      keeping. Each rule is anchored on the phrase that locates the *value* in one engine's message
-      — MySQL/MariaDB's `Duplicate entry 'V' for key` and `Incorrect <type> value: 'V' for column`,
-      PostgreSQL's `Key (cols)=(V)`, `Failing row contains (V…)` and
-      `invalid input syntax for type T: "V"`; SQLite's constraint reports name no value and pass
+      **`redact_engine_error` is per-*family*, not a blunt quote-stripper and no longer
+      per-template**, because engines quote identifiers in the same syntax as values (`for key
+      'users.email'`, `constraint "users_email_key"`) and blanking every quoted run would destroy
+      exactly the half worth keeping. Anchoring each rule on one message's prose failed the other
+      way round: `contains("Incorrect ")` missed MySQL 1292's lower-case `Truncated incorrect <T>
+      value: '…'` and `contains("invalid input syntax")` named one of PostgreSQL's five
+      value-quoting messages, so six live-captured templates reached the model whole. **The two
+      rules with a family behind them therefore match on the *shape* the family shares and are
+      default-deny** — MySQL's ` value: '…'` (the column form closing on `' for column `, the bare
+      form on the line's last quote) and PostgreSQL's trailing `: "…"`, which takes any line whose
+      *final* quoted run is introduced by `: `. What keeps the identifiers is that PostgreSQL never
+      introduces one that way — `constraint "x"`, `relation "x"`, `column "x"`, `at or near "x"` all
+      quote mid-sentence, which `redaction_keeps_the_identifiers_postgres_quotes_the_same_way`
+      holds — plus `is_statement_echo`, which exempts the user's own statement outright. Two prose
+      anchors remain because they name one message each with no family behind it:
+      MySQL/MariaDB's `Duplicate entry 'V' for key` and PostgreSQL's `Failing row contains (V…)`.
+      `Key (cols)=(V)` is anchored on **`Key (`** rather than on `)=(`, because `)=(` is also
+      ordinary SQL — a row comparison, or any `f(x)=(…)` — and unanchored the rule deleted the very
+      clause a syntax error was about (`redaction_leaves_a_row_comparison_in_the_users_own_sql_alone`).
+      SQLite's constraint reports name no value and pass
       through untouched. It takes **no dialect** — every engine's patterns are tried, and one
       engine's anchor does not occur in another's message, so a wrong dialect cannot be passed to
       it. It is **not a SQL scan**, so it is not built on `sql::skip_noncode` and is not an
@@ -2584,12 +2759,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       message's rather than the dialect's. Two things are kept whole on purpose, because they are
       the user's own text rather than stored data — a syntax error's quoted-back SQL, and
       PostgreSQL's `LINE n:` echo of the statement with the caret line under it
-      (`redaction_keeps_the_postgres_line_echo_of_the_users_own_statement`). **The rules are applied
-      line by line**, so an anchor cannot reach across into the next line's text: the
-      paren-delimited PostgreSQL details close on the *last* delimiter in the line, because a value
-      can contain one itself, and over a whole message that reach would take the statement echo with
-      it. Within a line it can over-redact an unrelated trailing parenthetical, which is the safe
-      direction to be wrong in. **The residual risk is
+      (`redaction_keeps_the_postgres_line_echo_of_the_users_own_statement`). That echo and its caret
+      line are now exempted **as whole lines, before any rule can bite them**, by
+      `is_statement_echo`, and that exemption is precisely what makes the default-deny above safe: a
+      statement can end in anything, including `: "…"`. **The rules are applied
+      line by line**, so an anchor cannot reach across into the next line's text — and **every
+      trailing-phrase rule closes on the *last* anchor in the line, never the first**, in the shared
+      `try_redact` (whose `None` for a missing anchor is what lets one rule fall back to a narrower
+      one, which `redact_between` could not express). A stored value is attacker-controlled and can
+      contain its own closing phrase: `Duplicate entry 'bob' for key 'x' for key 'users.email'`
+      closed on the first `' for key ` and shipped `x` to the model
+      (`redaction_survives_a_value_holding_the_phrase_that_closes_it`). Closing last can over-redact
+      a message that repeats the phrase innocently, or one ending in an unrelated trailing
+      parenthetical, which is the safe direction to be wrong in. `redact_trailing_quoted_value` and
+      `redact_to_end_of_line` are the two rules with a different shape — a final quoted run, and a
+      value that runs to the end of the line (PostgreSQL's `CONTEXT:  JSON data, line 1: {…`).
+      **The residual risk is
       named rather than papered over:** a message shaped like nothing in the table passes through,
       so a value in an unrecognised template still reaches the model. What the levels below `Full`
       promise is that *rows* do not leave, and the rules cover the messages that carry them.
@@ -3158,28 +3343,49 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   than answering empty (`core::activity::supports_activity`); the app is gated not to ask.
   **`Db::fetch_principals`/`Db::fetch_grants`** are the Users and privileges browser's backend, and
   they gate on `users::supports_users` before the engine `match` for the same reason those two do,
-  with `NO_USERS_MSG` as the one sentence both raise. The MySQL half is `collect_my_users`: **four
+  with `NO_USERS_MSG` as the one sentence both raise. The MySQL half is `collect_my_users`: **five
   queries, of which exactly one runs to completion** — MariaDB's `mysql.user` column set, then MySQL
-  8's, then the bare `(User, Host)` pair, then `information_schema.USER_PRIVILEGES`. **The fallbacks
+  8's, then `MY_USERS_ROLE_SQL`, then the bare `(User, Host)` pair, then
+  `information_schema.USER_PRIVILEGES`. **The fallbacks
   fire on an *error*, not on an empty result**, the rule the lock-wait pair above had to learn:
   `mysql.user` is never legitimately empty, so an empty answer would mean the read was denied and
-  only the error says so. The last query is the one whose failure the caller sees, and it is the one
+  only the error says so. The middle rung asks for **`is_role` alone**, for a MariaDB with roles but
+  no `password_expired` — every 10.1, 10.2 and 10.3, a window still in service. Without it such a
+  server fell through to the pair below, where `is_role` is `None` on every row, so
+  `from_mysql_rows` folded each role into a `User` and kept the `''` host MariaDB stores: a role
+  `readers` listed as `readers@`, and three of the four actions built from it are the errors
+  `core::users` already documents (1141, 1133, and a `DROP ROLE` grammar with no `@host` in it).
+  Role-ness is the one column whose absence changes what a statement *is*, which is why it gets a
+  rung rather than sharing the pair's. The last query is the one whose failure the caller sees, and it is the one
   an *application* account can actually read — `mysql.user` needs `SELECT` on the `mysql` database,
   which a properly-provisioned account has not got, while `USER_PRIVILEGES` shows it its own row: one
   account is a poor list, but it is a true one and it is the account the person opening this is most
-  likely asking about. `my_user_rows` only slots the fifth column into `is_role` or `account_locked`
-  by which query answered; everything else is `users::from_mysql_rows`. `fetch_grants` runs
+  likely asking about — **and reaching it is news, so that rung is the one that sets
+  `Principals::note`** (`users::my_own_account_only_note`). The three `if let Ok` rungs above it
+  discard their errors deliberately, a denied read being the expected case, which is exactly why the
+  absence has to be carried out rather than inferred from a count of one. `my_user_rows` only slots
+  the fifth column into `is_role` or `account_locked`
+  by which query answered (`my_role_rows` is the third rung's three); everything else is
+  `users::from_mysql_rows`. `fetch_grants` runs
   `SHOW GRANTS FOR <account_sql>` and pipes **every row through `users::redact_secrets` at the
   boundary**, not in the view, so a second caller — the grant/revoke step beside it, a copy
   button — cannot forget to. `pg::fetch_principals` reads `pg_roles` on the **maintenance**
   connection (the catalogue is cluster-wide and the browser may be open with no database selected)
   and, unlike `pg::roles` behind the Owner dropdown, **keeps** the `pg_` predefined roles, since they
-  hold real privileges and `users::from_pg_rows` sorts them last. `pg::fetch_grants` is **four
+  hold real privileges and `users::from_pg_rows` sorts them last. `pg::fetch_grants` is **five
   queries, because PostgreSQL has no `SHOW GRANTS`**: `pg_auth_members`, then `aclexplode` over
   `pg_database.datacl`, `pg_namespace.nspacl` and `pg_class.relacl` (relkinds `r p v m f S`, filtered
   rather than left open so an index or a composite type can't reach the statement builder, and `S`
-  the only one taking the `SEQUENCE` keyword). Three of the four see **one database only**, which is
-  what `users::pg_scope_note` says on screen. Every one of them compares against the role's own oid,
+  the only one taking the `SEQUENCE` keyword). Three of those see **one database only**, which is
+  what `users::pg_scope_note` says on screen — and the two per-database ones are **not run at all**
+  with no database selected, since the client then stands on PostgreSQL's *maintenance* database and
+  would answer for a database the user did not choose; `pg_no_database_note` says that instead. The
+  three ACL queries `ORDER BY … is_grantable, privilege_type`, which is what makes
+  `pg_grant_statements`' one-pass grouping — comparing each row against the group before it — see
+  each `(object, grantable)` group whole. The fifth query is not an ACL read at all: it asks for
+  `rolsuper` and a count of the objects this role owns (`pg_database.datdba` +
+  `pg_namespace.nspowner` + `pg_class.relowner`), which feeds `users::pg_implicit_note` and rides
+  into whichever scope note applies as its `extra`. Every one of them compares against the role's own oid,
   so a role dropped since the list was fetched yields an empty answer rather than an error. `pg_bool`
   is the small reader `simple_query`'s text protocol needs, which spells a boolean `t`/`f`.
   Populates each result column's
@@ -3430,6 +3636,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   stamps `DdlScope` onto the preview from `ddl::is_server_level`, `ddl_preview::apply` passes it
   through on the `DdlRunRequest`, and `app/main.rs` branches on it. Asking "is this a `CREATE
   DATABASE`?" of a `Vec<String>` would be the hand-rolled scanner this codebase keeps out.
+  `DdlPreview::qualified` is read off the same set and is **not** the same question: it says whether
+  the plan is *in* a database, and an account change answers `Database` to the first and `false` to
+  the second — server-wide, but on the in-database runner.
   **The refresh branches with it**, and that is not bookkeeping: what a server-level plan changed
   is the connection's *list* of databases, so it calls `refresh_schema` (re-list) where an
   ordinary plan calls `refresh_db(database)`. Left on the latter, a drop re-introspected a name
@@ -3869,8 +4078,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   rendering matrix green — `"170"` and `170` are the same cell — and fails the write back on both
   MySQL legs with `ERROR 1406: Data too long`, which is exactly how that bug reached a release. A
   case with no expected text (`timestamptz`, whose rendering follows the server's `TimeZone`) still
-  asserts the NULL row and the write back; both matrix tests assert a **floor** on how many cases
-  ran, since a matrix that walked nothing at all is otherwise a pair of passes.
+  asserts the NULL row and the write back; both matrix tests assert how many cases ran, since a
+  matrix that walked nothing at all is otherwise a pair of passes. **That is now an equality against
+  the leg's own count, not a floor.** It was one `TYPE_CASE_FLOOR = 20` across legs of 21 and 25, so
+  PostgreSQL could lose its entire numeric family and both matrix tests would still pass — the exact
+  failure the floor was added to catch, one size down. The expected count is derived from the leg's
+  own slices (`Target::type_cases`), so it needs no maintenance and there is nothing to be gained by
+  weakening it back.
   **`editable.rs` is the other half nothing else reaches.** Every `edit::analyze_edit` unit test
   hands the ladder a `ColumnOrigin` written out by hand, so what they prove is that it works on
   metadata a test *imagined*; whether a real driver reports `org_table` for an aliased column, a
@@ -3882,6 +4096,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   loudly, it writes to a row nobody asked for, with only the 1-row net behind it. Removing the
   `NOT NULL` guard from the unique-index rung fails `a_nullable_unique_index_is_no_key_at_all` on all
   three legs and nothing else — checked, not assumed.
+  **`a_write_built_from_the_resolved_key_lands_on_that_row` is the composition the rungs' own tests
+  cannot reach.** It walks every writable type case, keys a table on that type where the server
+  allows one — asked by *trying* it and falling back, not by a hand-kept exception list, since
+  PostgreSQL has no btree operator class for `json` and MySQL refuses a `TEXT` key without a
+  length — resolves the key through `analyze_edit`, writes through `GridWrite` and reads the row
+  back. It asserts every writable case was reached **and** that at least one really went through a
+  resolved key, so a leg where nothing could be one does not pass by exercising nothing.
   **`writeback.rs` asserts the number the 1-row net reads, where `model.rs` asserts the verdict
   given one.** Two of its claims exist only at this seam. `CLIENT_FOUND_ROWS`: MySQL counts
   *changed* rows by default, so an edit setting a cell to the value it already holds affects 0, the
@@ -3893,8 +4114,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   second. **`ddl.rs`** carries the designer's round trip — introspect → draft → diff → emit → run →
   introspect — whose real subject is the *asymmetric* failure: an emitter writing something the
   introspector reads back differently leaves a table that is correct on the server and permanently
-  dirty in the designer, and neither half's own tests can see it. Breaking `ddl::defaults_equal`
-  fails all fifteen of them with `AlterColumn { from: X, to: X }`, which is that symptom exactly.
+  dirty in the designer, and neither half's own tests can see it. Inverting `ddl::defaults_equal`
+  fails **seventeen** of them with `AlterColumn { from: X, to: X }`, which is that symptom exactly —
+  measured, and the *inversion* is the point: a break that stays reflexive (`a == b`) fails nothing
+  at all, because an identity gate compares a value with itself and any reflexive comparator
+  satisfies it.
+  Its `SHAPES` are **deliberately awkward rather than representative**, and the sixth is
+  `checks_and_fks`: no shape carried a `CHECK` or a foreign key, so `CheckDraft` and
+  `ForeignKeyDraft` went through the identity gate on nothing at all and
+  `ddl::alter_column_disturbs_checks` — the capability deciding whether a column change has to route
+  around a constraint — had zero live coverage. A `CHECK` clause is also where MySQL 8 and MariaDB
+  disagree about escaping, the divergence that file's own module doc names. It needs a `PARENT`
+  table created before every shape, a `REFERENCES` to a table that is not there being refused
+  outright. `a_reordered_column_lands_where_it_was_put` is the other addition, gated on
+  `ddl::supports_column_reorder` the way the view rename is gated on its capability: on MySQL a
+  reorder is an `ALTER … MODIFY … AFTER`, which restates the column's **whole definition**, so
+  getting it wrong silently drops a default or a `NOT NULL` along with moving it — and it asserts
+  the column's **data** arrived with it, since a reorder implemented as a drop-and-add would pass a
+  test that checked only the order. PostgreSQL returns early with a comment, having no column order
+  to change, rather than quietly asserting nothing.
   **Three capability differences are recorded as leg data rather than discovered per test**, since a
   test asserting one answer would be wrong on two servers out of three: `Target::non_transactional`
   (MySQL's `MyISAM`, which accepts `BEGIN` and ignores it), `Target::transactional_ddl`
@@ -3908,12 +4146,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   That `run_script` holds **one** connection for a whole file is asserted by making a temporary
   table in one statement and reading it in the next: under a connection per statement the second
   fails, and so would a dump's opening `SET FOREIGN_KEY_CHECKS = 0`. That a `Session`'s transaction
-  is real is asserted from a *second* connection, which must not see the uncommitted row. The
+  is real is asserted from a *second* connection, which must not see the uncommitted row. Feeding a
+  script is **a task of its own**, not tidiness: the test channel holds 16, so filling it inline
+  meant the seventeenth `send` awaited a receiver nothing was polling yet — `run_script` is called
+  on the next line — and a 17-statement script test would have hung forever rather than failed. It
+  is also the arrangement the app itself uses (`script::feed` alongside `Db::run_script`), so the
+  test now drives the shape it is testing.
+  The
   cancellation test asserts `DbError::Cancelled` **specifically** and that the call returned well
   before the five-second sleep would have ended: asking only "did it fail, and quickly?" is
   satisfied by a sleep statement the server does not understand, which is how that test passed on
   all three legs while cancelling nothing — pointing `Target::sleep_sql` at an undefined function
-  now fails it, and did not before.
+  now fails it, and did not before. **And it now asks the *server* whether the statement is still
+  running**, through `Target::running_sleeps`. Measuring how long the *client* took to return
+  `Cancelled` is a question `tokio::select!` answers on its own: deleting `kill_query` and
+  `cancel_query` from both arms left all six legs passing in ~250 ms while three servers slept on.
+  The probe counts `sleep_sql` statements in the server's own session view, and its marker is split
+  across a concatenation (`'…Cancel' + 'Marker…'`) so the probe does not count itself — its text is
+  in the very view it reads. `sleep_template` is a template and `sleep_sql()` the one place it meets
+  `SLEEP_SECS`: it was `"SELECT SLEEP(5)"` in three places beside a constant documented as linked to
+  them and held together by nothing, so changing the constant left three servers sleeping for the
+  old duration and the assertion measuring against the new one.
   **`views.rs` and `triggers.rs`** carry the same round trip for the two objects the engines model
   differently. A view's body is never the text that went in — MySQL fully qualifies and back-quotes
   it, PostgreSQL re-prints it from the parse tree — so the identity diff is doing real work there;
@@ -3928,10 +4181,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   still stands, because a driver may reasonably start attributing a view's columns to the table
   underneath, and the key the resolver then picks has to identify exactly one row — which the test
   checks by counting what it matches.
+  **Two arms in these two files had never met a server.**
+  `a_view_that_drops_a_column_takes_the_destructive_arm_where_it_must` narrows a view's `SELECT`,
+  which is the redefinition `pg_replaceable` answers `Some(false)` to — so the change set carries
+  `recreate: true` and the plan has a `DROP` in it. No live case satisfied that predicate, and the
+  assertion is per leg because the answer genuinely differs, which is what `supports_or_replace_view`
+  and `pg_replaceable` exist to say. `one_of_two_triggers_can_be_dropped_without_the_other` is the
+  first fixture here with **two** triggers on one table, so `diff_triggers`' set semantics are asked
+  something at last: with zero or one, "the set changed" and "this trigger changed" are the same
+  statement, and a diff that re-emitted the whole set would pass. The second trigger differs by
+  **event** rather than timing, since MySQL refuses `SET NEW.x` in an `AFTER` trigger (ERROR 1362),
+  which makes timing the wrong axis to vary.
   **`streaming.rs` and `namespaces.rs`** close the last two. The export's assertions are about
   completeness and about how a failure reaches the *writer*: a channel that simply closes reads as
   "the table ended", so a half-written file would be reported as finished — both failure tests check
-  the channel, not just the return value. `namespaces.rs` needs two namespaces to exist at all,
+  the channel, not just the return value. `a_cancelled_export_tells_the_writer_it_stopped` is the
+  case that was missing: every other test there fails the *statement* and none of them cancels, so
+  the file's own opening claim had no case for the one path where the channel closes with nothing
+  wrong. `namespaces.rs` needs two namespaces to exist at all,
   which is what `Scratch::alt_namespace` is for: a schema on PostgreSQL, a second scratch database
   on MySQL, so one test means the same thing on both. What it guards is silent — the statement
   succeeds, one row is affected, the net is satisfied, and the wrong table changed — so it asserts
@@ -3946,9 +4213,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   databases and it is checked by the same `assert_scratch_name`, called on the way **in and again on
   the way out**, so the rule that nothing here touches what it did not create holds for accounts too
   — and it has to carry more weight here, since an account is not namespaced by anything the server
-  enforces. A `ScratchAccount` dropped without `teardown` — a test that panicked — prints the name on
-  stderr rather than pretending: `Drop` cannot `await`, and the prefix is what makes the leftover
-  self-identifying. What this covers is the half nothing else reaches: three servers, four
+  enforces. A `ScratchAccount` dropped without `teardown` — a test that panicked — **really drops
+  the account**, on its own thread with its own runtime, and prints the name only when that fails;
+  it used to print and nothing else, so exactly the case the guard exists for left a real login on a
+  real server, named but present. What this covers is the half nothing else reaches: three servers, four
   catalogues, and a `mysql.user` column set that differs between MySQL 8 and MariaDB 10 in both
   directions, where a query naming a column the server hasn't got fails outright and only a live
   server says so. Four read tests — the connected account is in the list and carries a host part on
@@ -4001,8 +4269,32 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `schemaic_it_` prefix, the process id and the leg, and both the create and the drop path assert
   the prefix — the drop guard runs during unwinding, where nothing else is checking anything, and
   it deliberately does not panic while panicking (a second panic would abort and take the real
-  failure's message with it). CI runs the tier as a blocking `live` job with three service
-  containers; the lint job compiles it via `--features schemaic-db/live-tests`, since otherwise it
+  failure's message with it).
+  **The name's uniqueness is now *enforced* rather than stated.** The label is hand-written at 65
+  call sites and the suite runs threaded, so two tests picking the same one share a database and
+  each drops the other's tables, with failures that read as anything but a name collision — and
+  nothing checked it, since a duplicate only reaches `CREATE DATABASE` as an error if the two happen
+  to overlap, which is exactly the race that does not reproduce. `claim_name`/`release_name` hold a
+  process-wide set of the whole name (so the same label on two legs is fine, the leg being part of
+  it) and release it on teardown, so create → tear down → create again is not refused. Teardown is
+  **bounded at `TEARDOWN_TIMEOUT` (30 s)**: a `DROP DATABASE` blocks behind an open transaction —
+  measured on MariaDB, and the manual-transaction tests are what supply one — and an unbounded
+  `block_on` inside a `Drop` hangs the whole binary with no output at all, where a timeout turns
+  that into the named leftover the message is for. (The `timeout` is constructed *inside*
+  `block_on`, since building a `Sleep` before the runtime is entered panics.) And `Scratch` marks
+  itself `torn` **only once it is**, which is the whole point of the flag: set at the top, a panic
+  from the extra-databases loop left `torn = true` with the primary database still there and `Drop`
+  returning immediately — the one path where the tier silently did not clean up after itself.
+  `ScratchAccount::drop` closes the matching hole on the account side: it **used to only print**, so
+  a panicking test left a real login on a real server, named but present. It now drops the account
+  on its own thread with its own runtime, on `Scratch::drop`'s terms — a drop is synchronous and
+  blocking on the current runtime from inside one deadlocks — and prints rather than panicking while
+  panicking. CI runs the tier as a blocking `live` job with three service
+  containers, **under `timeout-minutes: 15`**: the tier has both a channel that can wait forever and
+  a `DROP DATABASE` a held transaction can block, and without a ceiling a wedged test holds a runner
+  for the six-hour default while the failure reads as "still running" rather than as itself
+  (generous against a cold service container — the whole tier runs in ~10 s locally). The lint job
+  compiles it via `--features schemaic-db/live-tests`, since otherwise it
   would be the one code in the repository no push compiles.
 - `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
   **The spawned session is sealed to what Schemaic hands it, and that is `build_session_args`'s
@@ -4022,11 +4314,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   drop it and the next flag's name is read as a tool). `--strict-mcp-config` loads only the server
   passed via `--mcp-config`, so the user's own global servers do not join Schemaic's SQL assistant.
   `--setting-sources user` keeps the user's own `~/.claude/settings.json` — their own choice — and
-  drops the two directory-relative sources, because the session child is spawned in
-  `std::env::temp_dir` (world-writable on most systems, so anything that drops a
-  `.claude/settings.json` there was granting permissions in Schemaic's AI panel); the one-shot paths
-  below inherit the app's own working directory instead, and the flag covers them for the same
-  reason. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
+  drops the two directory-relative sources, because the CLI resolves them against the child's
+  working directory; the one-shot paths below inherit the app's own working directory instead, and
+  the flag covers them for the same reason.
+  **And the session child no longer runs in the temp dir.** `ai::session_cwd` is
+  `persist::private_dir("ai-session")` — a directory under the app's own config dir, created
+  owner-only (`create_private_dir`, `0o700` where the platform has modes; on Windows the profile's
+  ACL already scopes it). `std::env::temp_dir` on Unix is world-writable, and `/tmp`'s sticky bit
+  stops another local account deleting your files, not taking a path nobody has: a
+  `.claude/settings.json` pre-created there has its `hooks` run as this user the next time the AI
+  panel opens. `--setting-sources user` closes that on a current CLI, but it is exactly the flag
+  `CliSeal` may have to drop, and unlike `--tools` — backstopped by `DISALLOWED_TOOLS` — nothing
+  stood in for it. Owning the directory makes the flag defence in depth instead of the only line.
+  The temp dir stays as the fallback for a machine with no config directory at all, which is where
+  `private_dir` answers `None`; `private_dir_in` is the pure half, separate so the *choice* is the
+  part that can be pinned. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
   otherwise swallow a later flag's name as a tool name, and both
   `the_session_loads_no_mcp_server_and_no_config_dir_of_its_own_finding` and the test above pin that
   order. **They did not prompt — they ran.** Driving the old flag set with
@@ -4059,8 +4361,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   than of a version number.** Schemaic spawns whatever `claude` the user has and pins no version,
   and a flag an older CLI does not know does not degrade the session, it kills it — the child exits
   with `error: unknown option '--tools'` before the first turn and the AI panel is gone until the
-  user upgrades. So `claude_cli::claude_seal` runs `<bin> --help` and `seal_from_help` reads a
-  `CliSeal` out of it, one `bool` per flag; `build_session_args` and `inline_args` both take one and
+  user upgrades. So `claude_cli::claude_seal` runs `<bin> --help` and hands the **whole probe** —
+  the exit status and both streams — to `schemaic_ai::seal_from_probe`, which reads a
+  `CliSeal` out of it, one `bool` per flag. The status is half the answer and the caller must not
+  decide it alone: a `--help` that fails loudly still prints something, and that something is a
+  diagnostic rather than a help text, so reading the output on its own treated a failed probe as a
+  CLI lacking every sealing flag. A non-zero exit yields `CliSeal::ALL`; stderr is folded in beside
+  stdout only as a fallback for a CLI that prints its usage there.
+  `build_session_args` and `inline_args` both take one and
   turn it into argv through the single private `seal_args`, so the session and the one-shot paths
   cannot come to seal themselves differently — the one-shot paths being the ones with no surface
   that would show it if they did. A version number would only stand in for the answer `--help`
@@ -4072,7 +4380,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   unsealed. Guessing "absent" on no evidence would silently reopen the hole this whole change
   exists to close, with nothing on screen to say so
   (`an_unreadable_probe_seals_rather_than_opens`). Only a help text that was actually read, and
-  that actually lacks the flag, drops it. On a CLI too old for `--tools`, `DISALLOWED_TOOLS` is what
+  that actually lacks the flag, drops it — and **"read" is now a positive test rather than
+  `!is_empty()`**. Emptiness was the only unreadable case the check knew, so a probe that caught a
+  diagnostic instead of help — an npm shim whose `node` is missing, a one-line usage from a wrapper,
+  an auth wall — was non-empty, mentioned none of the three flags, and was read as their absence.
+  `looks_like_help` requires the text to document at least one flag every build of the CLI has
+  always had (`--help`, `--print`, `--model`, `--version`), and **deliberately not one of the three
+  sealing flags**: their absence is the answer the gate is qualifying, so testing for them would
+  make it circular and it could never seal. On a CLI too old for `--tools`, `DISALLOWED_TOOLS` is what
   still stands between the assistant and a shell — that is the case the backstop exists for, and
   `an_old_cli_gets_no_sealing_flags_but_keeps_the_backstop` pins it.
   **The `HELP` fixture is captured from the real `claude --help`, not written from memory** — the
@@ -4099,9 +4414,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   flag's description reads as advertising it — an imprecision kept because it errs towards sealing,
   which is the direction every other choice here errs in too. The
   probe costs **~140 ms measured**, so `claude_seal` caches the answer per resolved binary path and
-  `main.rs` calls `warm_seal_cache` once at startup on a background thread; without it that wait
-  sits on the UI thread ahead of every AI action. The warm runs against the *auto-detected* path,
-  so a user with a `cli_path` override pays the probe once on their first AI action instead.
+  `main.rs` calls `warm_seal_cache` on a background thread; without it that wait
+  sits on the UI thread ahead of every AI action. **What it warms must be what the spawn will
+  resolve** — `claude_bin(&ai_cli_path)`, not `detect_claude_bin()`: the cache is keyed by the
+  resolved path, and an AI CLI override makes those two different keys, so warming the auto-detected
+  one warmed an entry nothing ever read and left all four AI entry points paying a blocking `--help`
+  on the UI thread. It is therefore called from an **effect on `claude_bin(&ai_cli_path)`** rather
+  than once at startup, so changing the override re-warms the key that will actually be used.
   **`inline_args` is sealed the same way, and its case is sharper.** Ctrl+K, AI Fill and AI Seed
   each want one string back that a parser then reads, and none of them has a surface that could
   render a tool call — so where the chat panel merely stalls on a tool it cannot prompt for, those
@@ -4624,6 +4943,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     identical three signals, because a wrapper that still filled the layer would be a transparent
     full-window box sitting on top of the form and swallowing every click meant for it. Cancel over
     there returns here with the list intact.
+    **The fetch effect therefore lives *above* that container and keys on the target alone.**
+    `hidden` moves whenever a form or the preview opens *or closes*, so an effect created inside the
+    child re-ran on every one of those transitions: a full `fetch_principals` — a fresh connection,
+    through the SSH tunnel if there is one, plus an unbounded `SELECT … FROM mysql.user` — for
+    pressing Cancel, and two for an Apply. The comment that stood there said the effect "runs once
+    per opening: the closure reads no signal", which was true of the closure and not of the scope it
+    was created in. It compares against its own previous value as well, since `create_effect` has no
+    equality check and the target signal is written with the value it already held.
+    **And the answer is guarded by `overlay.users_generation`**, `DdlUi::generation`'s pattern for
+    the same failure one modal up. Two `fetch_principals` are routinely in flight on an *identical*
+    target — creating an account is one, closing the preview afterwards is another — and target
+    identity was the reporter's only guard, so the later request was not guaranteed to be the last
+    writer and the list could settle on the **pre-mutation** snapshot: an account just created
+    missing, or one just dropped listed again with a live Drop beside it.
     **Opened from the SCHEMA gear and from a right-click on the tree's blank space, for the reason
     `Create database` sits in both**: an account belongs to the *server*, not to any row in the tree,
     so the modal has no object and takes none, and the gear is not a duplicate of the blank-space
@@ -4640,8 +4973,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     every signal it reads on the way in rather than on close, so a second opening cannot flash the
     previous server's accounts while the new list is in flight; the database it is given is the
     active tab's, because that is the one PostgreSQL's schema and table privileges can be read from.
-    Two panes: a filtered account list (`users::matches`, one field over the whole `app@host` display
-    name) on the left, and the selected account's attributes and `GRANT` statements on the right.
+    Two panes: a filtered account list (`users::filter_indices` over `matches`, one field over the
+    whole `app@host` display name, asked **once** and read by both the rows and the footer's count)
+    on the left, and the selected account's attributes and `GRANT` statements on the right. A
+    `Principals::note` — the MySQL ladder reaching its last rung — is rendered as a faint row
+    **under** the list, the way the privileges pane renders `Grants::note`, because the footer's
+    "1 account" is exactly as confident about a denied read as about a server with one account.
     **The list column runs the full height of the body and the footer belongs to the right column**,
     which is Manage Connections' shape and was adopted from it: a footer spanning both put a rule
     through the list just above its last row, and the count under a list the count is not about. The
@@ -4685,10 +5022,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `Drop` pair under the selected account's name. That pair is an `Option<AnyView>` the detail pane
     **extends its section list with**, never an `empty()` placeholder: the stack has a 16px gap and
     floem gaps an empty child like any other, so an absent actions row left a hole between the
-    account's name and its attributes — the trap `properties::stats_body` states. The footer's
+    account's name and its attributes — the trap `properties::stats_body` states. That pair sits in
+    **the modal's own `FocusRing`, at 12 and 13**: they built a `FocusRing::new()` of their own with
+    no focus root stepping it, so clicking one focused it and Tab then cycled the pair forever with
+    Escape the only way out. 1 and 2 would put them *before* the search field, so they take the two
+    stops after the list's last fixed one (11) and before the footer's `ACTION_TAB`. The footer's
     actions are about the *modal* —
-    copy what is shown, close it — and a Drop down there would sit one Tab from Close, which is the
-    wrong pair of neighbours for an irreversible action. `WriteGate::of` is asked **once, in
+    re-read the server, copy what is shown, close it — and a Drop down there would sit one Tab from
+    Close, which is the wrong pair of neighbours for an irreversible action. **Refresh is the way
+    back to the truth**: everything else here re-reads the server only as a side effect of opening
+    something, so a list gone stale — a `DROP USER` applied from another client, a fetch whose answer
+    lost a race — could otherwise only be corrected by closing the browser and reopening it.
+    `WriteGate::of` is asked **once, in
     `users_overlay`**, and the answer is passed into both panes: the two rows asked it independently
     to begin with, which is two places for one answer to drift — one of them leaving `+ New account`
     live while `Privileges`/`Drop` were dimmed, with nothing on screen to say which was right — and
@@ -4948,7 +5293,33 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     panels being painted at once, which is precisely what a partial list does. Six flags maintained
     by hand in five places is where one list becomes the only version that stays true. The single
     exception is the caller's, not the list's: `keep_trigger` is what leaves a half-filled trigger
-    form standing under the routine editor it opened.
+    form standing under the routine editor it opened. **The drafts go with the targets**:
+    `account_draft` and `grant_draft` are app-lifetime signals, so clearing `ddl.account` alone left
+    the plaintext password sitting in a signal for the rest of the process — after Cancel and after
+    Apply alike, reachable by anything holding the bundle. Both forms re-seed from their target on
+    open, so there is nothing to keep. `close_preview` is the same one-door idea for the preview
+    itself, because `ddl.sql` is app-lifetime too and held the last plan's script for the life of
+    the process; there were two `set(None)` sites and a third would have had to remember. It is
+    defence in depth rather than the only line, `ddl.sql` being `export_script`'s output rather than
+    the real statement, which is why it is a one-line helper.
+    **`DdlPreview::qualified` is a *different* question to `scope`, and both are read off the change
+    set.** `scope` says which runner a plan takes; `qualified` says whether the plan is *in* a
+    database and so whether the title bar writes `db.subject`. An account change is the case where
+    they differ: it deliberately takes the ordinary in-database runner (`ddl::is_account_change`),
+    and it inherited the qualifier as a side effect, so `CREATE USER 'app'@'%'` — server-wide on
+    both engines — was titled `shop.app@%`, which reads as scoped and is not. `preview_title` is a
+    free function so that sentence has a test; it was a `match` inside a `dyn_container` child.
+    `risk_heading` rides on the preview beside it, from `ChangeSet::risk_heading` — a heading that
+    contradicts the sentence beneath it costs the sentence its weight.
+    **`preview_account` takes an `AccountPlanTarget` captured where the plan was raised**, not the
+    live `edit_ctx`. `conn_id`, `dialect` and `read_only` come off the `AccountTarget`/`GrantTarget`
+    the form was opened with — which is what those fields are *for*, and they were carried and never
+    read while this re-derived all three from whichever connection the switcher pointed at now: a
+    form opened on MySQL and previewed after a switch to PostgreSQL was emitted at the wrong
+    dialect, and the wrong connection's read-only flag decided whether Apply was offered. It is a
+    struct rather than three more parameters because all three come from one place and have to stay
+    together — taking them individually is how one call site comes to pass the live connection's
+    `read_only` beside the target's `conn_id`.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
     tree's column and key right-clicks (`Edit column`, and `Edit index` / `Edit foreign key` /
@@ -5204,8 +5575,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     people reach for first, since every file manager trains it. The gear is not a duplicate of
     that third: a connection whose tree already fills the panel has no blank space left to
     right-click, which is exactly the connection on which a new database is worth making.
-    `create_children` and `schema_tree::blank_space_entries` are the two places that decide
-    which entries exist, each with its own test. **The read-only refusal is inside
+    `create_children`, `schema_tree::blank_space_entries` and `overlays::gear_entries` are the
+    three places that decide which entries exist, each with its own test. The gear's list got
+    that treatment last and had most to gain from it: two of its five entries are conditional and
+    two of those are conditionally dimmed, and it stayed a 130-line inline builder in a file whose
+    test module could not reach it, while its sibling had already been split out after an ordering
+    inversion no test could see. `GearEntry` carries a `GearKind` discriminant rather than a bare
+    label, for `BlankKind`'s reason: routing on the string with a catch-all arm makes a sixth entry
+    render as a row that does nothing. The two menus deliberately **do not agree entry for entry**
+    — the gear also carries `Collapse all` and the size toggle, which are about the panel rather
+    than the server — so it is a second list and not a call to the first; what they must agree on is
+    the *gating*, which is why both ask `users::supports_users` and `ddl::supports_database_editing`. **The read-only refusal is inside
     `open_for_new` itself**, not at the four launch sites: the invariant is that a launch guards
     itself in the same step that launches it, and written per site that is four copies of one
     `if` — of which `create_submenu`'s arm had already been left out, relying on
@@ -5258,10 +5638,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     rather than sitting there inert**, and Host is absent on PostgreSQL, which has no such thing at
     all. **The form holds a password, and nothing else in this crate does.** It is blanked on every
     open — a form that reopened holding the last one would put a credential on screen nobody typed
-    this time — cleared on Cancel, never persisted and never logged, and it becomes visible in
+    this time — cleared on Cancel (`ddl_preview::close_peers` empties `account_draft` with the
+    target, since the draft is app-lifetime and the target is not), never persisted and never
+    logged, and it becomes visible in
     exactly one place: the preview's SQL. That is deliberate. The preview is the app's one gate
     between a plan and a server, and a statement shown there with a field blanked out would not be
-    the statement it ran.
+    the statement it ran — but nothing *leaves* the preview carrying it, which is
+    `ChangeSet::export_script`'s job. **The field itself is
+    `connection_form::masked_edit_field`**, the same one the four saved-connection secrets wear:
+    this was the app's only *unmasked* secret field, so its real characters were on screen and a
+    Ctrl+A/Ctrl+C from the clipboard. That helper is `pub(crate)` precisely so there is one of them
+    — a second masking widget is how the two come to disagree about `reconstruct_real`'s deletion
+    rule, which is the part that is easy to get subtly wrong.
     **Every fixed-list choice in both forms is the app's `<select>`** — `settings::focusable_dropdown`,
     the control the settings modals wear, so the popup, the keyboard, the tinted current value and
     the chevron box are one implementation. Four rows moved onto it: the account form's **Kind**, and
@@ -5311,7 +5699,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the shape of. Wrapped, the whole set is one block, which is the question the row is actually
     asking — *which of these*. `privilege_tag` (once `privilege_row`) still reads the draft inside
     its own style, so clicking one tag does not rebuild the cloud of eighteen, and it is the one
-    control here still wearing `picked_outline`.
+    control here still wearing `picked_outline`. **The cloud gets a reserved Tab span rather than
+    the distance to whatever was written next** — `PRIVILEGE_TAB` (50) plus `PRIVILEGE_TAB_SPAN`
+    (200), the toggle after it claiming the end of that span, with
+    `PRIVILEGE_TAB + PRIVILEGE_TAB_SPAN < widgets::FIXED_TAB_END` asserted at compile time. Today's
+    longest list is eighteen, so nothing collides — but `users::privileges_for`'s own doc calls that
+    list "curated, not exhaustive" and names the dozens left out, and adding 23 of them would put a
+    tag at exactly the toggle's index, where `FocusRing::register` inserts *after* an equal index
+    and `focus_at` resolves to whichever was built first. The block cannot move above the toggle
+    (the toggle comes after it on screen), so the span is what makes the collision impossible;
+    `every_privilege_list_fits_its_tab_span` asserts every dialect × level fits it. Both overlays
+    wear one `modal_shell` — title bar, body, footer, backdrop and the Escape handler — taking a
+    `ShellParts`/`ShellSize` pair rather than eight positionals, because three same-typed `AnyView`s
+    in a row transpose silently.
     The database the browser is scoped to is *suggested* beside the qualifier
     field rather than filled in, since a prefilled name on a form that grants privileges is a value
     nobody read.
@@ -7504,6 +7904,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic.log` in cleartext, in the folder Settings offers an **Open folder** button for. A
   dependency that logs a secret gets a line in `CREDENTIAL_TARGETS`, appended last so the floor
   outranks an equal key; never a `debug!` we hope nobody enables.
+  **And it includes a script the user asked for a copy of.** The DDL preview's *Copy* and *Open in
+  editor* both put their text somewhere durable — the OS clipboard, which on Windows persists in
+  Clipboard History and cloud-syncs, and a query tab whose text the next session save writes into
+  `tabs.json` in the clear — so the one plan that carries a plaintext credential,
+  `CREATE USER … IDENTIFIED BY '…'`, was leaving through both while three doc sites said it was
+  "never persisted, never logged". What goes out is `ChangeSet::export_script`, which re-emits from
+  a set cloned with `ddl::PASSWORD_PLACEHOLDER` in each secret's place; the modal still *renders*
+  the real statement, because a preview showing a blanked-out plan is not showing the plan.
 - **Connection secrets persist to the OS keyring, not `connections.json`.** DB/SSH passwords and the
   SSH key passphrase go through `schemaic_core::secrets` (`SecretStore` seam) + `schemaic-app`'s
   keyring-backed store; the JSON on disk is blanked and hydrated on load. All connection saves route
@@ -7595,7 +8003,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   A second emitter would be the regression here, not the missing preview.
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
-  disabled button. Which gate to ask depends on the question: `supports_change` for a single change
+  disabled button. **`supports_change` has to be as narrow as the change is**, or `unsupported()`
+  is blind: its account arm answered for all six variants on "does this engine have accounts",
+  which is true of `GRANT … ON *.*` on PostgreSQL and of `ON SCHEMA` on MySQL, neither of which has
+  a grammar there — so there was no INCOMPLETE header and Apply was enabled over a statement the
+  server would refuse. It now asks `users::levels_for` for the two changes that carry a level.
+  Which gate to ask depends on the question: `supports_change` for a single change
   with no draft behind it, and for an editor the capability for *that object* —
   `supports_view_editing`, `supports_trigger_editing` or `supports_table_design`. All three answer
   true for every engine today (SQLite reaches a table edit by rebuilding, `Change::RebuildTable`),
@@ -10210,6 +10623,17 @@ for keyboard nav.
   truncated at `t = 0` and now the opposite of true. `Failed` carries `partial`, and `None` is not a
   formality: an export refused *before* the write starts (no connection, one already running) must
   not mention a file at all.
+  **`partial` is read off `ExportFormat::writes_incrementally`, never written as `true`.** Excel is
+  a ZIP and nothing reaches the sink until `save_to_writer`, so for it every pre-save failure left a
+  **zero-byte** sibling that the sentence then pointed the user at; the failure arm now sweeps that
+  empty file (`std::fs::remove_file`) and says nothing about it, and the cancel arm in `grid.rs`
+  asks the same capability. **And a cancelled read now reaches the writer as a channel *error***,
+  not as an end of stream. The two look the same to `PullChunks` — a cancelled read closes the
+  channel — and for a buffered format that meant the whole discarded workbook was still assembled
+  and compressed before anyone noticed: **measured at 12.3 s on 800k × 50**, with the bar still
+  saying `Exporting…` and a Cancel that had already been pressed. Raising it at the pull returns
+  `stream_to` at the next chunk instead, which is where the five incremental formats already stop;
+  `a_cancelled_export_tells_the_writer_it_stopped` is the live-tier pin.
 - **The results strip shrinks its prose, never its controls.** It is one flex row — stats, the
   read-more offer, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
   flex row squeezes its children before it overflows, so whichever child refuses to shrink is the

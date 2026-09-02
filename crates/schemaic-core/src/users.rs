@@ -148,13 +148,17 @@ pub fn matches(p: &Principal, needle: &str) -> bool {
 
 /// The indices of `list` that [`matches()`] `needle`, in list order.
 ///
-/// **Indices, and computed once.** The browser's list is virtualised, so the
-/// filter has to be a value the scroll can index rather than a predicate each
-/// row re-asks — and the view was answering it twice per keystroke, once to
-/// build the rows and once for the footer's count, each call re-`format!`ing
-/// every account's `display()`. At the ~1,000 accounts a shared server has that
-/// was measured at ≥13 ms of identified work per keystroke on a 16.7 ms frame,
-/// and the query behind it has no `LIMIT`.
+/// **Indices, and computed once.** The view was answering the filter twice per
+/// keystroke — once to build the rows and once for the footer's count — each
+/// call re-`format!`ing every account's `display()`. At the ~1,000 accounts a
+/// shared server has, that second pass was measured at ≥13 ms of identified work
+/// per keystroke on a 16.7 ms frame, and the query behind it has no `LIMIT`.
+///
+/// Indices rather than a filtered `Vec<Principal>` so nothing is cloned, and so
+/// a caller that *does* index — a virtualised list, if this one ever becomes one
+/// — needs no second shape. It is **not** virtualised today: `users_view.rs`
+/// builds a `v_stack_from_iter` inside a `scroll`, so the whole list is still
+/// constructed per keystroke; this halved that work rather than bounding it.
 pub fn filter_indices(list: &[Principal], needle: &str) -> Vec<usize> {
     let needle = needle.trim();
     if needle.is_empty() {
