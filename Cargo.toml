@@ -159,6 +159,26 @@ serde_json = { version = "1", features = ["raw_value"] }
 # and newlines, escapes, BOMs — is not, and a hand-rolled parser here would lose
 # data quietly.
 csv = "1"
+# Excel `.xlsx`, the sixth export format and the third import one. Two crates,
+# because reading and writing OOXML are not the same problem and no crate does
+# both well.
+#
+# `rust_xlsxwriter` writes. **`constant_memory` is the reason for the feature
+# list**: without it a workbook lives entirely in RAM until it is zipped, which
+# on this app's own target result (200k x 50) is a gigabyte of cell structs to
+# emit a file the user asked to *stream*. In that mode each row's XML is spilled
+# to a library-managed temp file as soon as the next row starts, so the export
+# costs a buffer at any row count — the same bound `RowChunks` exists to give
+# every other format. It is the one place in `schemaic-core` whose tests touch
+# the filesystem; `export::export_xlsx_chunks` states why.
+#
+# `calamine` reads. Note the quick-xml it pulls is **0.41**, the version that
+# fixes RUSTSEC-2026-0194/0195 — which matters here and nowhere else in the
+# tree: an imported `.xlsx` is the first untrusted XML this app has ever parsed
+# (see `deny.toml`, where those two advisories are ignored for the *trusted*
+# bundled-SVG parser floem reaches through usvg).
+rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
+calamine = "0.36"
 
 # Profiling build: release-grade optimization (so we measure real perf, not a slow
 # debug build) but with full debug symbols so a sampling profiler (samply, etc.) can
