@@ -48,10 +48,21 @@ unmaintained = "workspace"
 # exception — a specific advisory we've assessed as not reachable / not fixable.
 ignore = [
     # quick-xml < 0.41 quadratic-time attribute parsing (DoS). Only exploitable
-    # via UNTRUSTED XML input; Schemaic parses only its own bundled SVG icons
-    # (a fixed, trusted set) through usvg/resvg. The fix (quick-xml >= 0.41) is
-    # gated behind usvg/resvg ← floem 0.2.0, so there's no upgrade path yet.
-    # Revisit when floem bumps its SVG rendering stack.
+    # via UNTRUSTED XML input, and the *vulnerable* copy never sees any: 0.39
+    # is reached through usvg/resvg, which parses only Schemaic's own bundled
+    # SVG icons (a fixed, trusted set), and through wayland-scanner, a
+    # build-time proc macro over its own protocol files. The fix (quick-xml >=
+    # 0.41) is gated behind usvg/resvg ← floem 0.2.0, so there's no upgrade
+    # path for that copy yet. Revisit when floem bumps its SVG rendering stack.
+    #
+    # Schemaic *does* now parse untrusted XML — an imported `.xlsx` is a ZIP of
+    # it, and the file comes from wherever the user got it. That path goes
+    # through calamine, which depends on quick-xml **0.41**: the patched
+    # version, and the reason the tree carries two. So the duplicate that
+    # `[bans] multiple-versions = "warn"` reports here is load-bearing rather
+    # than untidy — deduplicating it *downwards* would put the untrusted parser
+    # on the vulnerable code. If a future change makes these resolve to one
+    # version, check it is >= 0.41 before removing these ignores.
     "RUSTSEC-2026-0194",
     # quick-xml < 0.41 unbounded namespace-declaration allocation (memory-exhaustion
     # DoS). Same reachability + upgrade situation as RUSTSEC-2026-0194 above.
