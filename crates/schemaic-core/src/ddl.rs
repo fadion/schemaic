@@ -2900,10 +2900,23 @@ impl Change {
             // The account lines name the account for the same reason the
             // database ones name the database: the preview's subject was typed
             // into a form or picked out of a list, not right-clicked.
-            Change::CreateAccount(d) => match d.kind {
-                crate::users::PrincipalKind::User => format!("Create user {}", d.name),
-                crate::users::PrincipalKind::Role => format!("Create role {}", d.name),
-            },
+            // **The host is part of which account this is**, and the line said
+            // only the name — so `app@10.0.0.5` and an unqualified `app` (which
+            // MySQL turns into `app@%`, every machine on the network) both read
+            // "Create user app". `summary` takes no dialect, so the host is
+            // written when the draft carries one and left off when it does not,
+            // which is exactly the distinction that was missing; the risk block
+            // below is what says what a blank one means.
+            Change::CreateAccount(d) => {
+                let who = match d.host.trim() {
+                    "" => d.name.clone(),
+                    h => format!("{}@{h}", d.name),
+                };
+                match d.kind {
+                    crate::users::PrincipalKind::User => format!("Create user {who}"),
+                    crate::users::PrincipalKind::Role => format!("Create role {}", d.name),
+                }
+            }
             Change::DropAccount(p) => {
                 format!("Drop {} {}", p.kind.label().to_lowercase(), p.display())
             }
@@ -3338,6 +3351,37 @@ impl Change {
                 c.role.display(),
                 c.member.display()
             )],
+            // **Creating an account destroys nothing and is still the highest-
+            // consequence thing this module emits.** `risks` is where the
+            // preview says what the plan will *do for you* — `DropCheck`'s
+            // "rows the constraint refused are accepted from now on" destroys
+            // nothing either — and a blank password on MySQL means an account
+            // any host that can reach the server can log in as, with no
+            // `IDENTIFIED BY` for `validate_password` to fire on. The form
+            // discloses the host default and that the password shows in the
+            // preview; nothing said what leaving it blank produces.
+            Change::CreateAccount(d) if d.kind == crate::users::PrincipalKind::User => {
+                let mut out = Vec::new();
+                if d.password.is_empty() {
+                    out.push(format!(
+                        "{} will have no password: anyone who can reach the server can log \
+                         in as it. Set one here, or with ALTER USER afterwards.",
+                        d.principal(dialect).display()
+                    ));
+                }
+                // The host is MySQL's alone, and blank means `%` — the form's
+                // own placeholder says so, but only next to the empty box.
+                if dialect == SqlDialect::MySql
+                    && matches!(d.host.trim(), "" | "%")
+                    && d.password.is_empty()
+                {
+                    out.push(
+                        "Its host is % — every machine on the network, not just this one."
+                            .to_string(),
+                    );
+                }
+                out
+            }
             _ => Vec::new(),
         }
     }
@@ -8012,7 +8056,24 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     // engines have accounts at all — and so a fourth engine answers once, in
     // `users::supports_user_admin`, rather than here as well.
     if is_account_change(change) {
-        return crate::users::supports_user_admin(dialect);
+        if !crate::users::supports_user_admin(dialect) {
+            return false;
+        }
+        // **And the level, for the two changes that carry one.** This arm used
+        // to answer for all six variants on "does this engine have accounts",
+        // which made `unsupported()` blind to the one thing accounts can ask an
+        // engine for and not get: `GRANT … ON *.* ` has no PostgreSQL grammar
+        // and `ON SCHEMA` has no MySQL one. Blind meant no INCOMPLETE header,
+        // `apply`'s withheld guard silent, and Apply enabled over a statement
+        // the server will refuse. Every other narrow arm in this function is
+        // shape-aware; this is the capability that knows the answer
+        // (`users::levels_for`), and it was consulted only by the form's picker.
+        return match change {
+            Change::GrantPrivileges(c) | Change::RevokePrivileges(c) => {
+                crate::users::levels_for(dialect).contains(&c.level.kind())
+            }
+            _ => true,
+        };
     }
     // **A database is a file on SQLite, and a file is not DDL.** Creating one
     // means writing a path the connection form owns, and dropping one means
@@ -18941,6 +19002,92 @@ mod database_tests {
         assert!(!is_account_change(&Change::DropTable));
     }
 
+    /// **The list cannot quietly shrink.** `every_account_change()` is
+    /// hand-written so a new variant has to be added on purpose — but nothing
+    /// held it to the variants that exist, so a seventh could join `Change` and
+    /// three tests would keep passing over six. Counted against the discriminant
+    /// rather than a literal, so adding one fails here with a name.
+    #[test]
+    fn every_account_change_is_in_the_list_the_account_tests_walk() {
+        use std::collections::HashSet;
+        let listed: HashSet<std::mem::Discriminant<Change>> = every_account_change()
+            .iter()
+            .map(std::mem::discriminant)
+            .collect();
+        assert_eq!(
+            listed.len(),
+            every_account_change().len(),
+            "the list repeats a variant, so one is untested behind another"
+        );
+        // The six the module has. A new one lands in `is_account_change` (or it
+        // is not an account change at all), which is what makes this the right
+        // side to count from.
+        assert_eq!(listed.len(), 6);
+    }
+
+    /// **`unsupported()` has to be able to withhold a level the engine has not
+    /// got.** The account arm answered "does this engine have accounts" for all
+    /// six variants, so a `GRANT … ON *.* ` on a PostgreSQL set passed, no
+    /// INCOMPLETE header was written, `apply`'s withheld guard stayed silent and
+    /// Apply was enabled over a statement PostgreSQL has no grammar for.
+    #[test]
+    fn a_grant_at_a_level_the_engine_has_not_got_is_withheld() {
+        let at = |level: crate::users::GrantLevel| {
+            Box::new(crate::users::PrivilegeChange {
+                account: an_account(),
+                level,
+                privileges: vec!["SELECT".into()],
+                with_grant_option: false,
+            })
+        };
+        // PostgreSQL has no `*.*`; MySQL has no schema and no sequence.
+        for (d, level) in [
+            (Postgres, crate::users::GrantLevel::Global),
+            (MySql, crate::users::GrantLevel::Schema("sales".into())),
+            (
+                MySql,
+                crate::users::GrantLevel::Sequence {
+                    qualifier: "sales".into(),
+                    name: "s".into(),
+                },
+            ),
+        ] {
+            for c in [
+                Change::GrantPrivileges(at(level.clone())),
+                Change::RevokePrivileges(at(level.clone())),
+            ] {
+                let cs = account("app@%", d, c);
+                assert!(cs.emit().is_empty(), "{d:?} {level:?}: {:?}", cs.emit());
+                assert_eq!(cs.unsupported().len(), 1, "{d:?} {level:?}");
+            }
+        }
+        // …and every level the engine *does* have still emits.
+        for d in [MySql, Postgres] {
+            for kind in crate::users::levels_for(d) {
+                let level = match kind {
+                    crate::users::GrantLevelKind::Global => crate::users::GrantLevel::Global,
+                    crate::users::GrantLevelKind::Database => {
+                        crate::users::GrantLevel::Database("shop".into())
+                    }
+                    crate::users::GrantLevelKind::Schema => {
+                        crate::users::GrantLevel::Schema("sales".into())
+                    }
+                    crate::users::GrantLevelKind::Table => crate::users::GrantLevel::Table {
+                        qualifier: "shop".into(),
+                        name: "orders".into(),
+                    },
+                    crate::users::GrantLevelKind::Sequence => crate::users::GrantLevel::Sequence {
+                        qualifier: "sales".into(),
+                        name: "s".into(),
+                    },
+                };
+                let cs = account("app@%", d, Change::GrantPrivileges(at(level)));
+                assert_eq!(cs.emit().len(), 1, "{d:?} {kind:?}");
+                assert!(cs.unsupported().is_empty(), "{d:?} {kind:?}");
+            }
+        }
+    }
+
     /// The list is written out rather than derived, so a new account change has
     /// to be added here on purpose — the same bargain
     /// `every_container_change_the_engine_accepts_emits_a_statement` makes.
@@ -19054,15 +19201,97 @@ mod database_tests {
         assert!(destructive(Change::DropAccount(Box::new(an_account()))).len() == 1);
         assert!(destructive(Change::RevokePrivileges(a_privilege_change(&["SELECT"]))).len() == 1);
         assert!(destructive(Change::GrantPrivileges(a_privilege_change(&["SELECT"]))).is_empty());
+        // Creating an account with a password destroys nothing and says nothing
+        // — but see the test below: the *passwordless* case is not the same
+        // claim, and this test used to make the blanket one for both.
         assert!(
             destructive(Change::CreateAccount(Box::new(
                 crate::users::AccountDraft {
                     name: "app".into(),
+                    password: "hunter2".into(),
                     ..Default::default()
                 }
             )))
             .is_empty()
         );
+    }
+
+    /// **A blank password is the highest-consequence thing this module emits,
+    /// and it had no arm.** `CREATE USER 'app'@'%';` fell through to
+    /// `_ => Vec::new()`, so the preview's risk block hid itself and Apply came
+    /// up blue — over an account any host on the network can log in as with no
+    /// password, and one MySQL's `validate_password` does not fire on because
+    /// there is no `IDENTIFIED BY` to check.
+    /// Two accounts, two lines. `Create user app` named neither the host it was
+    /// given nor the one MySQL would fill in.
+    #[test]
+    fn a_new_accounts_summary_names_the_host_it_was_given() {
+        let s = |host: &str| {
+            Change::CreateAccount(Box::new(crate::users::AccountDraft {
+                name: "app".into(),
+                host: host.into(),
+                ..Default::default()
+            }))
+            .summary()
+        };
+        assert_eq!(s("10.0.0.5"), "Create user app@10.0.0.5");
+        assert_eq!(s("%"), "Create user app@%");
+        assert_ne!(s("10.0.0.5"), s(""));
+        // No host given is no host written — the risk block is what says what
+        // MySQL will fill in.
+        assert_eq!(s(""), "Create user app");
+        // A role has no host on either engine.
+        assert_eq!(
+            Change::CreateAccount(Box::new(crate::users::AccountDraft {
+                name: "readers".into(),
+                host: "ignored".into(),
+                kind: crate::users::PrincipalKind::Role,
+                ..Default::default()
+            }))
+            .summary(),
+            "Create role readers"
+        );
+    }
+
+    #[test]
+    fn a_passwordless_account_says_so_before_it_is_created() {
+        let draft = |password: &str, host: &str| {
+            Change::CreateAccount(Box::new(crate::users::AccountDraft {
+                name: "app".into(),
+                host: host.into(),
+                password: password.into(),
+                ..Default::default()
+            }))
+        };
+        let risks = |d, c| account("app@%", d, c).destructive();
+
+        // Both halves, on the engine that has hosts.
+        let blank = risks(MySql, draft("", ""));
+        assert_eq!(blank.len(), 2, "{blank:?}");
+        assert!(blank[0].contains("no password"), "{blank:?}");
+        assert!(blank[1].contains('%'), "{blank:?}");
+        // An explicit `%` is the same account written out.
+        assert_eq!(risks(MySql, draft("", "%")).len(), 2);
+        // A named host is one sentence, not two: it is the password that is the
+        // problem, and the reach that makes it worse.
+        let localhost = risks(MySql, draft("", "localhost"));
+        assert_eq!(localhost.len(), 1, "{localhost:?}");
+
+        // PostgreSQL has no host at all, so it never gets the second sentence.
+        assert_eq!(risks(Postgres, draft("", "")).len(), 1);
+
+        // And a password silences both, on either engine.
+        for d in [MySql, Postgres] {
+            assert!(risks(d, draft("hunter2", "")).is_empty(), "{d:?}");
+        }
+
+        // A *role* has no login at all, so neither sentence applies to one.
+        let role = Change::CreateAccount(Box::new(crate::users::AccountDraft {
+            name: "readers".into(),
+            kind: crate::users::PrincipalKind::Role,
+            ..Default::default()
+        }));
+        assert!(risks(MySql, role).is_empty());
     }
 
     /// **The mapping the two toggles make**, which is the one thing about this

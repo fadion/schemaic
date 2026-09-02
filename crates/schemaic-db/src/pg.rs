@@ -2487,7 +2487,8 @@ pub(crate) async fn fetch_grants(
         &format!(
             "SELECT d.datname, a.privilege_type, a.is_grantable \
              FROM pg_catalog.pg_database d, aclexplode(d.datacl) a \
-             WHERE a.grantee = {oid} ORDER BY d.datname, a.privilege_type"
+             WHERE a.grantee = {oid} \
+             ORDER BY d.datname, a.is_grantable, a.privilege_type"
         ),
     )
     .await?;
@@ -2510,7 +2511,8 @@ pub(crate) async fn fetch_grants(
             &format!(
                 "SELECT n.nspname, a.privilege_type, a.is_grantable \
              FROM pg_catalog.pg_namespace n, aclexplode(n.nspacl) a \
-             WHERE a.grantee = {oid} ORDER BY n.nspname, a.privilege_type"
+             WHERE a.grantee = {oid} \
+             ORDER BY n.nspname, a.is_grantable, a.privilege_type"
             ),
         )
         .await?;
@@ -2534,7 +2536,7 @@ pub(crate) async fn fetch_grants(
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              CROSS JOIN LATERAL aclexplode(c.relacl) a \
              WHERE a.grantee = {oid} AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') \
-             ORDER BY n.nspname, c.relname, a.privilege_type"
+             ORDER BY n.nspname, c.relname, a.is_grantable, a.privilege_type"
             ),
         )
         .await?;

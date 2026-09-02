@@ -547,6 +547,13 @@ pub fn pg_grant_statements(grantee: &str, rows: &[PgAclRow]) -> Vec<String> {
     // the same object, and the object is named identically in both statements —
     // so the ordering is an optimisation the caller supplies rather than a
     // contract the caller can break.
+    //
+    // **`grantable` is part of the key, so it has to be part of the sort**, and
+    // it was the one component the paragraph above did not name while the three
+    // queries did not order by it. A table holding `INSERT`, `UPDATE` plainly
+    // and `SELECT` `WITH GRANT OPTION` arrived interleaved by privilege name,
+    // broke the run twice, and printed three statements where the administrator
+    // wrote two — losing the `ALL PRIVILEGES` collapse in both fragments.
     let mut groups: Vec<(GrantKey, Vec<String>)> = Vec::new();
     for r in rows {
         let continues = groups
@@ -642,6 +649,56 @@ pub struct Grants {
     /// so a connection sees exactly one database's worth of them and nothing at
     /// all about the others.
     pub note: Option<String>,
+}
+
+/// Whether the account browser offers a write, and if not, why.
+///
+/// **In `core` because it is a decision, not a rendering.** It lived inline in
+/// an 860-line view with no `#[cfg(test)]` at all, so the ordering of its four
+/// answers — which is the whole content of it — had nowhere to be pinned. The
+/// order is load-bearing: *engine* first, because an engine with no accounts
+/// must not merely dim the action but omit it, and *read-only* before
+/// *database*, because a read-only connection is the more specific reason and
+/// the one the user can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteGate {
+    Allowed,
+    /// SQLite — no accounts at all, so the action is not offered.
+    NoEngineSupport,
+    /// The connection is read-only. Offered and dimmed, not hidden.
+    ReadOnly,
+    /// No database selected, and an account plan runs in one.
+    NoDatabase,
+}
+
+impl WriteGate {
+    /// `read_only` is the **live** connection's and `dialect` the browser's
+    /// target: one is a setting that can change while the browser is open, the
+    /// other is what the browser is about and cannot.
+    pub fn of(dialect: SqlDialect, read_only: bool, has_database: bool) -> WriteGate {
+        if !supports_user_admin(dialect) {
+            return WriteGate::NoEngineSupport;
+        }
+        if read_only {
+            return WriteGate::ReadOnly;
+        }
+        if !has_database {
+            return WriteGate::NoDatabase;
+        }
+        WriteGate::Allowed
+    }
+
+    /// Is the action **offered at all**? Absent where the engine has nothing to
+    /// offer, present-but-dimmed where this connection or this moment does — the
+    /// two different answers the rest of the app gives for the two different
+    /// reasons it gives them.
+    pub fn offered(self) -> bool {
+        !matches!(self, WriteGate::NoEngineSupport)
+    }
+
+    pub fn enabled(self) -> bool {
+        matches!(self, WriteGate::Allowed)
+    }
 }
 
 /// The account list, and what it does **not** cover.
@@ -947,14 +1004,24 @@ impl GrantLevel {
         let q = |n: &str| crate::export::ident_sql(n, dialect);
         match self {
             GrantLevel::Global => "*.*".to_string(),
+            // **Every dialect named**, not `_ =>`. This is the file's only
+            // dialect match, and a catch-all here answers for an engine nobody
+            // has looked at: SQLite reaches this today only through a caller
+            // that skipped `supports_user_admin`, and a fourth engine would take
+            // PostgreSQL's spelling silently rather than failing to compile.
+            // `levels_for` already gives SQLite an empty list for the same
+            // reason, so the arms below are what a wrong call site gets rather
+            // than what a user sees.
             GrantLevel::Database(d) => match dialect {
                 SqlDialect::MySql => format!("{}.*", q(d)),
-                _ => format!("DATABASE {}", q(d)),
+                SqlDialect::Postgres | SqlDialect::Sqlite => format!("DATABASE {}", q(d)),
             },
             GrantLevel::Schema(s) => format!("SCHEMA {}", q(s)),
             GrantLevel::Table { qualifier, name } => match dialect {
                 SqlDialect::MySql => format!("{}.{}", q(qualifier), q(name)),
-                _ => format!("TABLE {}.{}", q(qualifier), q(name)),
+                SqlDialect::Postgres | SqlDialect::Sqlite => {
+                    format!("TABLE {}.{}", q(qualifier), q(name))
+                }
             },
             GrantLevel::Sequence { qualifier, name } => {
                 format!("SEQUENCE {}.{}", q(qualifier), q(name))
@@ -1750,6 +1817,51 @@ mod tests {
         );
     }
 
+    /// **The order the fetch actually delivers**, for the key component the
+    /// grouper's own comment does not mention. `grantable` is the fourth part of
+    /// the group key, and the three ACL queries order by
+    /// `nspname, relname, privilege_type` with no `is_grantable` term — so a
+    /// table holding `INSERT`, `UPDATE` plainly and `SELECT` with grant option
+    /// arrived interleaved and printed **three** statements where the
+    /// administrator wrote two.
+    ///
+    /// **Both orders, so the requirement is visible rather than assumed.** The
+    /// fix itself is three `ORDER BY` clauses in `pg::fetch_grants`, which no
+    /// unit test here can reach — so this pins the property that makes them
+    /// necessary: the same three rows produce two statements in one order and
+    /// three in the other, and it is the *fetch* that decides which arrives.
+    #[test]
+    fn a_mixed_grant_option_object_is_split_only_when_the_rows_interleave() {
+        let grantable = |mut r: PgAclRow| {
+            r.grantable = true;
+            r
+        };
+        // What `ORDER BY privilege_type` alone delivered: INSERT(f), SELECT(t),
+        // UPDATE(f) — three statements for one table, and no `ALL PRIVILEGES`
+        // collapse available in either fragment.
+        let interleaved = [
+            acl(PgObjectKind::Table, Some("public"), "users", "INSERT"),
+            grantable(acl(PgObjectKind::Table, Some("public"), "users", "SELECT")),
+            acl(PgObjectKind::Table, Some("public"), "users", "UPDATE"),
+        ];
+        assert_eq!(pg_grant_statements("app", &interleaved).len(), 3);
+
+        // What `ORDER BY is_grantable, privilege_type` delivers: the two the
+        // administrator actually wrote.
+        let grouped = [
+            acl(PgObjectKind::Table, Some("public"), "users", "INSERT"),
+            acl(PgObjectKind::Table, Some("public"), "users", "UPDATE"),
+            grantable(acl(PgObjectKind::Table, Some("public"), "users", "SELECT")),
+        ];
+        assert_eq!(
+            pg_grant_statements("app", &grouped),
+            vec![
+                "GRANT INSERT, UPDATE ON TABLE public.users TO app",
+                "GRANT SELECT ON TABLE public.users TO app WITH GRANT OPTION",
+            ]
+        );
+    }
+
     /// And the ordinary case — the one the queries actually deliver — is one
     /// statement per object.
     #[test]
@@ -1862,6 +1974,21 @@ mod tests {
         assert_eq!(
             redact_secrets(stmt, SqlDialect::MySql),
             "GRANT USAGE ON *.* TO `a`@`%` IDENTIFIED VIA mysql_native_password USING <hidden>"
+        );
+    }
+
+    /// **The `VIA` half of the exemption, on an input that actually reaches
+    /// it.** The test above feeds a *bare-word* plugin, which never gets as far
+    /// as the literal branch — so deleting `&& !prev_word…("VIA")` changed
+    /// nothing any test supplied and the whole suite stayed green. MariaDB
+    /// quotes the plugin here whenever it is not an identifier, which `ed25519`
+    /// is not on every build.
+    #[test]
+    fn a_quoted_plugin_name_after_via_survives_and_the_hash_after_it_does_not() {
+        let stmt = "GRANT USAGE ON *.* TO `a`@`%` IDENTIFIED VIA 'ed25519' USING 'HASH'";
+        assert_eq!(
+            redact_secrets(stmt, SqlDialect::MySql),
+            "GRANT USAGE ON *.* TO `a`@`%` IDENTIFIED VIA 'ed25519' USING <hidden>"
         );
     }
 
@@ -1988,6 +2115,38 @@ mod tests {
         let n = my_scope_note();
         assert!(n.contains("role"), "{n}");
         assert!(n.contains("directly"), "{n}");
+    }
+
+    /// **The order of the four answers is the whole content of this gate**, and
+    /// it had no test at all — it lived inline in a view with no test module.
+    #[test]
+    fn the_write_gate_answers_the_most_specific_reason_first() {
+        use SqlDialect::{MySql, Postgres, Sqlite};
+        // An engine with no accounts omits the action rather than dimming it,
+        // whatever else is true — a dimmed button invites a hunt for the setting
+        // that would enable it, and there isn't one.
+        for read_only in [true, false] {
+            for has_db in [true, false] {
+                let g = WriteGate::of(Sqlite, read_only, has_db);
+                assert_eq!(g, WriteGate::NoEngineSupport);
+                assert!(!g.offered(), "{g:?}");
+                assert!(!g.enabled(), "{g:?}");
+            }
+        }
+        for d in [MySql, Postgres] {
+            // Read-only wins over no-database: it is the reason the user can act
+            // on, and it is true regardless of which database is selected.
+            assert_eq!(WriteGate::of(d, true, true), WriteGate::ReadOnly);
+            assert_eq!(WriteGate::of(d, true, false), WriteGate::ReadOnly);
+            assert_eq!(WriteGate::of(d, false, false), WriteGate::NoDatabase);
+            assert_eq!(WriteGate::of(d, false, true), WriteGate::Allowed);
+            // Every refusal is offered-and-dimmed, and only one is enabled.
+            for g in [WriteGate::of(d, true, true), WriteGate::of(d, false, false)] {
+                assert!(g.offered(), "{g:?}");
+                assert!(!g.enabled(), "{g:?}");
+            }
+            assert!(WriteGate::of(d, false, true).enabled());
+        }
     }
 
     /// The account list's own note, for the rung where every wider read was
@@ -2179,6 +2338,106 @@ mod tests {
             role_sql(&c, SqlDialect::Postgres, true),
             "REVOKE \"readers\" FROM \"app\""
         );
+    }
+
+    /// **The one statement where both quoting rules meet.** On MySQL and
+    /// MariaDB a role has no host, so it is an *identifier*; the member is the
+    /// `(user, host)` pair, so it is two *literals* — one statement, two rules,
+    /// which is the entire reason `account_sql` branches on `host` rather than
+    /// on dialect. The test above is PostgreSQL on both sides, where the two
+    /// rules coincide and the composition proves nothing.
+    #[test]
+    fn a_mysql_role_grant_names_the_role_as_an_identifier_and_the_member_as_a_pair() {
+        let c = RoleChange {
+            role: from_mysql_rows(&[MyUserRow {
+                user: "readers".into(),
+                host: String::new(),
+                is_role: Some("Y".into()),
+                ..Default::default()
+            }])
+            .remove(0),
+            member: my_account(),
+            with_admin_option: true,
+        };
+        assert_eq!(
+            role_sql(&c, SqlDialect::MySql, false),
+            "GRANT `readers` TO 'app'@'%' WITH ADMIN OPTION"
+        );
+        assert_eq!(
+            role_sql(&c, SqlDialect::MySql, true),
+            "REVOKE `readers` FROM 'app'@'%'"
+        );
+    }
+
+    /// **The revoke direction, at every level and on both engines.** It was
+    /// pinned at exactly one shape — MySQL at `Global` — so four of `object_sql`'s
+    /// five arms had never been asked to spell a `REVOKE … FROM` at all, and
+    /// PostgreSQL never revoked anything in the default suite.
+    #[test]
+    fn a_revoke_names_the_same_object_the_grant_did_at_every_level() {
+        let cases: Vec<(SqlDialect, Principal, GrantLevel, &str)> = vec![
+            (SqlDialect::MySql, my_account(), GrantLevel::Global, "*.*"),
+            (
+                SqlDialect::MySql,
+                my_account(),
+                GrantLevel::Database("shop".into()),
+                "`shop`.*",
+            ),
+            (
+                SqlDialect::MySql,
+                my_account(),
+                GrantLevel::Table {
+                    qualifier: "shop".into(),
+                    name: "orders".into(),
+                },
+                "`shop`.`orders`",
+            ),
+            (
+                SqlDialect::Postgres,
+                pg_account(),
+                GrantLevel::Database("shop".into()),
+                "DATABASE \"shop\"",
+            ),
+            (
+                SqlDialect::Postgres,
+                pg_account(),
+                GrantLevel::Schema("sales".into()),
+                "SCHEMA \"sales\"",
+            ),
+            (
+                SqlDialect::Postgres,
+                pg_account(),
+                GrantLevel::Table {
+                    qualifier: "sales".into(),
+                    name: "orders".into(),
+                },
+                "TABLE \"sales\".\"orders\"",
+            ),
+            (
+                SqlDialect::Postgres,
+                pg_account(),
+                GrantLevel::Sequence {
+                    qualifier: "sales".into(),
+                    name: "orders_id_seq".into(),
+                },
+                "SEQUENCE \"sales\".\"orders_id_seq\"",
+            ),
+        ];
+        for (dialect, account, level, object) in cases {
+            let c = change(account, level.clone(), &["SELECT"]);
+            let grant = privilege_sql(&c, dialect, false).expect("a grant");
+            let revoke = privilege_sql(&c, dialect, true).expect("a revoke");
+            // The same object, named identically both ways — the arm is shared,
+            // and this is what says the revoke reaches it.
+            assert!(grant.contains(object), "{level:?}: {grant}");
+            assert!(revoke.contains(object), "{level:?}: {revoke}");
+            // …and the keyword and the preposition are the ones that undo it.
+            assert!(grant.starts_with("GRANT "), "{grant}");
+            assert!(revoke.starts_with("REVOKE "), "{revoke}");
+            assert!(grant.contains(" TO "), "{grant}");
+            assert!(revoke.contains(" FROM "), "{revoke}");
+            assert!(!revoke.contains(" TO "), "{revoke}");
+        }
     }
 
     // ── the grant form's draft ───────────────────────────────────────────────

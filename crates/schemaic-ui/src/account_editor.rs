@@ -536,7 +536,7 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
                                 let subject = draft.principal(target.dialect).display();
                                 ddl_preview::preview_account(
                                     &ui,
-                                    &target.database,
+                                    (&target).into(),
                                     &subject,
                                     account_change(&draft),
                                 );
@@ -934,7 +934,7 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
                                 if let Some(change) = ddl::grant_change(&draft, &target.account) {
                                     ddl_preview::preview_account(
                                         &ui,
-                                        &target.database,
+                                        (&target).into(),
                                         &target.account.display(),
                                         change,
                                     );

@@ -214,18 +214,60 @@ pub(crate) fn preview_container(
 /// `database` is therefore load-bearing here in a way it is not for a container:
 /// it is the database the statements actually run on, and it is the one the
 /// browser was already showing privileges for.
+/// **Built against the connection the plan was raised on**, not against
+/// whichever the switcher points at now. `conn_id`, `dialect` and `read_only`
+/// come from the captured `AccountTarget`/`GrantTarget`/`UsersTarget` — which is
+/// what those fields are *for*, and they were carried and never read while this
+/// re-derived all three from the live `edit_ctx`. A form opened on MySQL and
+/// previewed after a switch to PostgreSQL was emitted at the wrong dialect, and
+/// the wrong connection's read-only flag decided whether Apply was offered.
 pub(crate) fn preview_account(
     ui: &Ui,
-    database: &str,
+    on: AccountPlanTarget,
     subject: &str,
     change: schemaic_core::ddl::Change,
 ) {
-    let ctx = crate::table_designer::edit_ctx(ui);
-    let cs = schemaic_core::ddl::account(subject, ctx.dialect, change);
+    let cs = schemaic_core::ddl::account(subject, on.dialect, change);
     open_preview(
         ui,
-        preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
+        preview_of(on.conn_id, &on.database, subject, &cs, on.read_only),
     );
+}
+
+/// Which server an account plan is for — captured where the plan is raised.
+///
+/// A struct rather than three more parameters because all three come from one
+/// place and have to stay together: taking them individually is how one call
+/// site comes to pass the live connection's `read_only` beside the target's
+/// `conn_id`.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountPlanTarget {
+    pub conn_id: u64,
+    pub database: String,
+    pub dialect: SqlDialect,
+    pub read_only: bool,
+}
+
+impl From<&crate::AccountTarget> for AccountPlanTarget {
+    fn from(t: &crate::AccountTarget) -> Self {
+        Self {
+            conn_id: t.conn_id,
+            database: t.database.clone(),
+            dialect: t.dialect,
+            read_only: t.read_only,
+        }
+    }
+}
+
+impl From<&crate::GrantTarget> for AccountPlanTarget {
+    fn from(t: &crate::GrantTarget) -> Self {
+        Self {
+            conn_id: t.conn_id,
+            database: t.database.clone(),
+            dialect: t.dialect,
+            read_only: t.read_only,
+        }
+    }
 }
 
 /// Send **one** change straight to the preview, skipping the designer — how
