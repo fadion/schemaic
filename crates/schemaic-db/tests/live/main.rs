@@ -34,6 +34,7 @@ mod scratch;
 mod streaming;
 mod suite;
 mod triggers;
+mod users;
 mod views;
 mod writeback;
 
@@ -148,6 +149,18 @@ live_suite!(
         a_key_that_matches_two_rows_fails_the_batch_and_undoes_the_rest,
         a_failed_batch_says_what_the_rollback_actually_undid,
         an_empty_batch_writes_nothing,
+    ],
+    users: [
+        the_account_we_connected_as_is_in_the_list,
+        an_accounts_grants_come_back_as_grant_statements,
+        a_grant_list_says_which_database_it_covers_when_it_covers_only_one,
+        a_grant_list_with_no_database_says_it_is_covering_none,
+        no_password_material_survives_the_fetch,
+        a_created_account_is_one_the_server_then_lists,
+        a_created_role_is_one_the_server_accepts,
+        a_granted_privilege_comes_back_and_a_revoke_takes_it_off,
+        a_granted_role_comes_back_and_a_revoke_takes_it_off,
+        a_dropped_account_is_gone_from_the_list,
     ],
 );
 
