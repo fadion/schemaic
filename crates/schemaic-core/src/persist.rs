@@ -486,6 +486,54 @@ fn connections_path() -> Option<PathBuf> {
     Some(config_dir()?.join("connections.json"))
 }
 
+/// Where a child process whose settings resolve **relative to its working
+/// directory** should be spawned, given a config directory.
+///
+/// Pure, and separate from [`private_dir`], because the *choice* is the part
+/// worth pinning and the failure it exists for is silent. The AI session's
+/// `claude` used to run in `std::env::temp_dir()`, which on Unix is
+/// world-writable: another local account can pre-create `.claude/settings.json`
+/// there — `/tmp`'s sticky bit stops them deleting your files, not taking a path
+/// nobody has — and that file's `hooks` then run as this user the next time the
+/// AI panel opens. A CLI new enough for `--setting-sources user` ignores it, but
+/// nothing stood in for that flag on one too old, unlike `DISALLOWED_TOOLS`
+/// standing in for `--tools`.
+pub fn private_dir_in(config: &Path, name: &str) -> PathBuf {
+    config.join(name)
+}
+
+/// [`private_dir_in`] under our own [`config_dir`], created owner-only.
+///
+/// `None` when there is no config directory or it cannot be created — the caller
+/// decides what to do, and for the AI session that means falling back to the
+/// temp dir with the exposure above. A last resort on a machine with no config
+/// directory at all, not the default.
+pub fn private_dir(name: &str) -> Option<PathBuf> {
+    let dir = private_dir_in(&config_dir()?, name);
+    create_private_dir(&dir).ok()?;
+    Some(dir)
+}
+
+/// `mkdir -p` at `0o700` where the platform has modes. On Windows the directory
+/// inherits the user profile's ACL and is not exposed to other accounts, so
+/// there is nothing to narrow — the same split [`write_private`] makes.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        // `mode` applies only to directories this call creates, so an existing
+        // one — a 0755 from a build before this — keeps its mode otherwise.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
 /// Write `bytes` to `path`, **owner-only** where the platform supports it,
 /// truncating an existing file.
 ///
@@ -961,12 +1009,29 @@ pub fn clear_connections_backup() {
 mod tests {
     use super::{
         ConnectionsFile, FileStore, Load, RECOVERIES, RightPanelState, UiState, classify,
-        legacy_ai_run_queries_in, read_bytes, recover, recovery_notice, sibling, statement_timeout,
-        statement_timeout_label, take_recoveries, write_bytes,
+        legacy_ai_run_queries_in, private_dir_in, read_bytes, recover, recovery_notice, sibling,
+        statement_timeout, statement_timeout_label, take_recoveries, write_bytes,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+
+    /// The one thing that matters about a spawn directory for a child that
+    /// reads directory-relative settings: it is **ours**, not the shared temp
+    /// dir. Asserted as a property rather than a string, so it keeps holding if
+    /// the sub-directory is renamed.
+    #[test]
+    fn a_private_child_directory_is_under_our_config_dir_and_never_the_temp_dir() {
+        let config = PathBuf::from("/home/u/.config/schemaic");
+        let dir = private_dir_in(&config, "ai-session");
+        assert!(dir.starts_with(&config), "{dir:?}");
+        assert_ne!(
+            dir, config,
+            "a sub-directory of its own, not the config dir"
+        );
+        assert_ne!(dir, std::env::temp_dir(), "{dir:?}");
+        assert!(!dir.starts_with(std::env::temp_dir()), "{dir:?}");
+    }
 
     // ── Statement timeout ─────────────────────────────────────────────────
 

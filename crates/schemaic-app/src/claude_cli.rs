@@ -151,19 +151,21 @@ pub(crate) fn claude_seal(bin: &str) -> schemaic_ai::CliSeal {
     {
         return *seal;
     }
-    let help = std::process::Command::new(bin)
+    // The whole probe — status included — is handed to `schemaic-ai`, which owns
+    // the decision and tests it. Reading the output alone treated a `--help`
+    // that failed loudly as a CLI that lacks every sealing flag.
+    let seal = std::process::Command::new(bin)
         .arg("--help")
         .output()
         .ok()
         .map(|o| {
-            // `--help` goes to stdout; keep stderr as a fallback for a CLI that
-            // prints usage there, so a readable answer isn't mistaken for none.
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
-            s
+            schemaic_ai::seal_from_probe(
+                o.status.success(),
+                &String::from_utf8_lossy(&o.stdout),
+                &String::from_utf8_lossy(&o.stderr),
+            )
         })
-        .unwrap_or_default();
-    let seal = schemaic_ai::seal_from_help(&help);
+        .unwrap_or(schemaic_ai::CliSeal::ALL);
     if let Ok(mut c) = cache.lock() {
         c.insert(bin.to_string(), seal);
     }
@@ -172,8 +174,14 @@ pub(crate) fn claude_seal(bin: &str) -> schemaic_ai::CliSeal {
 
 /// Fill [`claude_seal`]'s cache for `bin` on a background thread.
 ///
-/// Called once at startup with the auto-detected path. Nothing waits on it: a
-/// miss simply pays the probe where it would have anyway.
+/// Nothing waits on it: a miss simply pays the probe where it would have anyway.
+///
+/// **`bin` must be what the spawn will resolve** — `claude_bin(&ai_cli_path)`,
+/// not `detect_claude_bin()`. The cache is keyed by the binary's resolved path,
+/// and an AI CLI override makes those two different keys, so warming the
+/// auto-detected one warmed an entry nothing ever read and left all four AI
+/// entry points paying a blocking `--help` on the UI thread. Its caller re-warms
+/// from an effect on the setting for the same reason.
 pub(crate) fn warm_seal_cache(bin: String) {
     std::thread::spawn(move || {
         let _ = claude_seal(&bin);

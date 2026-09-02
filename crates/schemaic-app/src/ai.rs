@@ -295,6 +295,22 @@ fn write_mcp_config(endpoint: &str) -> Option<PathBuf> {
     None
 }
 
+/// Where the session child runs.
+///
+/// **Not the temp dir.** The CLI resolves `.claude/settings.json` relative to
+/// its working directory, and on Unix `/tmp` is world-writable — another local
+/// account can pre-create that path and have its `hooks` run as this user the
+/// next time the AI panel opens. `--setting-sources user` closes it on a current
+/// CLI, but that flag is exactly the one `CliSeal` may have to drop, and unlike
+/// `--tools` (backstopped by `DISALLOWED_TOOLS`) nothing stood in for it. Owning
+/// the directory makes the flag defence in depth instead of the only line.
+///
+/// The temp dir remains the fallback for a machine with no config directory at
+/// all, where there is nowhere better to go.
+fn session_cwd() -> PathBuf {
+    schemaic_core::persist::private_dir("ai-session").unwrap_or_else(std::env::temp_dir)
+}
+
 /// A random hex tag for a temp file name. `RandomState` is seeded by the OS, and
 /// the counter plus the clock keep two calls in one process apart.
 fn random_tag() -> String {
@@ -456,7 +472,7 @@ pub(crate) fn start_ai_session(
     handle.spawn(async move {
         let mut child = match Command::new(claude_bin(&cli_path))
             .args(&args)
-            .current_dir(std::env::temp_dir())
+            .current_dir(session_cwd())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Capture stderr (was discarded): a failing `claude` — e.g. an expired

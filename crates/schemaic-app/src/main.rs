@@ -1396,9 +1396,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ai_detected_path = detect_claude_bin();
     // Probe what sealing flags this CLI takes now, off-thread, so the first AI
     // action doesn't pay for it — see `claude_cli::claude_seal`.
-    if let Some(bin) = ai_detected_path.clone() {
-        claude_cli::warm_seal_cache(bin);
-    }
+    //
+    // **Warmed on the path the spawn will actually use**, which is
+    // `claude_bin(&ai_cli_path)` — the same expression every AI action resolves.
+    // Warming the *auto-detected* path instead keyed the cache differently from
+    // every reader whenever the user set an AI CLI override, so each of the four
+    // AI entry points paid a blocking, timeout-free `--help` on the UI thread.
+    // The effect re-warms when the setting changes, for the same reason.
+    create_effect(move |_| {
+        claude_cli::warm_seal_cache(claude_bin(&ai_cli_path.get()));
+    });
     let db_menu_open = RwSignal::new(false);
     let schema_menu_open = RwSignal::new(false);
     let context_menu: RwSignal<Option<CtxMenu>> = RwSignal::new(None);
