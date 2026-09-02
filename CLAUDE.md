@@ -146,7 +146,14 @@ start with a failing test, then the code that makes it pass.
   deterministic, which is why `db::sqlite` is the one backend whose DB layer is tested directly.
   Use SQLite's shared-cache memory URI (`file:name?mode=memory&cache=shared`, unique name per test)
   where several connections must reach one database, as the write paths do — a plain `:memory:` is
-  private to one connection, and a temp file would break the rule for real. Don't commit with failing
+  private to one connection, and a temp file would break the rule for real. **One function does break
+  it**, deliberately and with the user's say-so: `export::export_xlsx_chunks` drives
+  `rust_xlsxwriter` in `constant_memory` mode, which spills each finished row to a library-managed
+  temp file so an Excel export costs a bounded buffer at any row count — the alternative holds 10M
+  cell structs in memory at 200k × 50, which is exactly the size the streaming path exists for. The
+  file is created and removed inside the call, so the test stays deterministic and needs no server.
+  Read it as *the* one case, not as licence for a second: anything else wanting a real file still
+  models it at the boundary. Don't commit with failing
   or `#[ignore]`d tests unless the user asks. The single exception is
   `core/tests/doc_coverage.rs`, which asserts every `src/*.rs` module is named somewhere in
   `docs/architecture.md` — the thing under test *is* a file. A new module fails it until it's on the
