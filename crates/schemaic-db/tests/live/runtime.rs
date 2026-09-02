@@ -217,16 +217,26 @@ pub async fn a_reader_error_rolls_the_whole_import_back(target: &'static Target)
 }
 
 /// A value the server refuses rolls the whole import back.
+///
+/// **It has to cross a batch to see a rollback at all.** This sent 100 rows
+/// against an `INSERT_BATCH_ROWS` of 500 — one statement, one batch — so the
+/// only thing it could observe was a single refused `INSERT` leaving nothing
+/// behind, which is true of a server with no transaction as much as of one with
+/// it. The row that collides now lands in the *second* batch, so passing means
+/// the first batch's rows were really undone.
 pub async fn a_refused_row_rolls_the_whole_import_back(target: &'static Target) {
     let scratch = Scratch::create(target, "import_refused").await;
     seed_import_table(&scratch).await;
 
-    let mut rows = (1..=100)
+    let total = schemaic_core::import::INSERT_BATCH_ROWS as i64 + 50;
+    let collide_at = schemaic_core::import::INSERT_BATCH_ROWS as i64 + 10;
+    let mut rows = (1..=total)
         .map(|i| {
             Ok(vec![
-                // Two rows claiming the same primary key: the server refuses the
-                // batch carrying the second.
-                Value::Int(if i == 60 { 1 } else { i }),
+                // Two rows claiming the same primary key, a batch apart: the
+                // server refuses the batch carrying the second, and the first
+                // has already been sent.
+                Value::Int(if i == collide_at { 1 } else { i }),
                 Value::Str(format!("row {i}")),
             ])
         })
@@ -256,9 +266,11 @@ pub async fn a_manual_transaction_is_invisible_until_it_commits(target: &'static
     let scratch = Scratch::create(target, "manual_commit").await;
     seed_import_table(&scratch).await;
 
-    let session = Session::open(&scratch.db, Some(&scratch.database))
-        .await
-        .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name));
+    let session = OpenSession(Some(
+        Session::open(&scratch.db, Some(&scratch.database))
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name)),
+    ));
     session
         .ensure_tx()
         .await
@@ -292,7 +304,8 @@ pub async fn a_manual_transaction_is_invisible_until_it_commits(target: &'static
         "{}: the row did not survive the commit",
         target.name
     );
-    session.close().await;
+    // `OpenSession` closes it on every other path too — see its own note.
+    drop(session);
 
     scratch.teardown().await;
 }
@@ -302,9 +315,11 @@ pub async fn a_rolled_back_manual_transaction_leaves_nothing(target: &'static Ta
     let scratch = Scratch::create(target, "manual_rollback").await;
     seed_import_table(&scratch).await;
 
-    let session = Session::open(&scratch.db, Some(&scratch.database))
-        .await
-        .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name));
+    let session = OpenSession(Some(
+        Session::open(&scratch.db, Some(&scratch.database))
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name)),
+    ));
     session
         .ensure_tx()
         .await
@@ -330,7 +345,8 @@ pub async fn a_rolled_back_manual_transaction_leaves_nothing(target: &'static Ta
         "{}: a rolled-back row is still there",
         target.name
     );
-    session.close().await;
+    // `OpenSession` closes it on every other path too — see its own note.
+    drop(session);
 
     scratch.teardown().await;
 }
@@ -355,7 +371,7 @@ pub async fn a_cancelled_query_stops_at_the_server(target: &'static Target) {
     let started = Instant::now();
     let outcome = scratch
         .db
-        .fetch_query(Some(&scratch.database), target.sleep_sql, 10, cancel)
+        .fetch_query(Some(&scratch.database), &target.sleep_sql(), 10, cancel)
         .await;
     let elapsed = started.elapsed();
 
@@ -372,13 +388,77 @@ pub async fn a_cancelled_query_stops_at_the_server(target: &'static Target) {
     // The statement sleeps for SLEEP_SECS; anything close to that means the
     // cancel waited for it rather than stopping it.
     assert!(
-        elapsed < Duration::from_secs(SLEEP_SECS - 2),
+        elapsed < Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN,
         "{}: the cancel took {elapsed:?}, so the statement ran to completion",
+        target.name
+    );
+
+    // **And the server agrees.** Everything above is about the *client*:
+    // `tokio::select!` returns `Cancelled` fast whether or not anything was sent
+    // to the server, so deleting `kill_query`/`cancel_query` from both arms left
+    // all six legs passing in ~250 ms while three servers slept on. This is the
+    // half that asks. Polled rather than read once, because a `KILL QUERY` is
+    // asynchronous — the row leaves the view shortly after the client returns —
+    // and the wait is bounded well inside the sleep so a statement that really
+    // ran on cannot pass by outlasting it.
+    let deadline = Instant::now() + (Duration::from_secs(SLEEP_SECS) - CANCEL_MARGIN);
+    let mut still = target.running_sleeps(&scratch.db).await;
+    while still > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        still = target.running_sleeps(&scratch.db).await;
+    }
+    assert_eq!(
+        still, 0,
+        "{}: the client returned Cancelled but the server is still running the statement",
         target.name
     );
 
     scratch.teardown().await;
 }
+
+/// A pinned [`Session`] that is closed **on every path out**, including a panic.
+///
+/// The manual-transaction tests reach `session.close()` on their last line, so
+/// every `unwrap_or_else(panic)` above it skipped the close and left an open
+/// transaction on the server. `DROP DATABASE` then waits on it — measured on
+/// MariaDB — so a failing assertion here took the scratch teardown with it, and
+/// the first failure was reported as a teardown that hung rather than as itself.
+struct OpenSession(Option<std::sync::Arc<Session>>);
+
+impl std::ops::Deref for OpenSession {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        self.0.as_ref().expect("held until drop")
+    }
+}
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        let Some(session) = self.0.take() else {
+            return;
+        };
+        // On its own thread with its own runtime, for `Scratch::drop`'s reason:
+        // a drop is synchronous and blocking on the current runtime from inside
+        // one deadlocks.
+        let _ = std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(session.close());
+            }
+        })
+        .join();
+    }
+}
+
+/// How far inside [`SLEEP_SECS`] the two cancellation assertions have to land.
+///
+/// Subtracted rather than written as a second literal, and as a `Duration` so
+/// the arithmetic cannot underflow: `SLEEP_SECS - 2` on a `u64` wraps for any
+/// sleep under two seconds, which is exactly what someone shortening this
+/// constant would try.
+const CANCEL_MARGIN: Duration = Duration::from_secs(2);
 
 /// How long the cancellation test's statement would run for if nothing stopped
 /// it. Long enough that finishing it is unmistakable, short enough that a leg
@@ -386,23 +466,42 @@ pub async fn a_cancelled_query_stops_at_the_server(target: &'static Target) {
 pub const SLEEP_SECS: u64 = 5;
 
 /// Feed `stmts` through the channel `run_script` reads, and report how it ended.
+///
+/// **The feeding is a task of its own**, and that is not tidiness: the channel
+/// holds 16, and filling it inline meant the seventeenth `send` awaited a
+/// receiver nothing was polling yet — `run_script` is called on the line below.
+/// A 17-statement script test would have hung forever rather than failed, and
+/// the CI live job has no `timeout-minutes`. This is the shape the app itself
+/// uses (`script::feed` alongside `Db::run_script`), so the test now drives the
+/// same arrangement it is testing.
 async fn run_script(scratch: &Scratch, stmts: &[String]) -> (ExecEnd, usize) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    for (i, sql) in stmts.iter().enumerate() {
-        tx.send(Statement {
-            sql: sql.clone(),
-            // One statement per line, so a reported line is its index.
-            line: i as u64 + 1,
-            offset: 0,
-        })
-        .await
-        .expect("the runner holds the receiver");
-    }
-    drop(tx);
-    scratch
+    let owned: Vec<String> = stmts.to_vec();
+    let feed = tokio::spawn(async move {
+        for (i, sql) in owned.into_iter().enumerate() {
+            // A send that fails means the runner stopped early — a refused
+            // statement, which is the case several of these tests are about — so
+            // it ends the feed rather than failing the test.
+            if tx
+                .send(Statement {
+                    sql,
+                    // One statement per line, so a reported line is its index.
+                    line: i as u64 + 1,
+                    offset: 0,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    let out = scratch
         .db
         .run_script(&scratch.database, rx, CancellationToken::new())
-        .await
+        .await;
+    feed.await.expect("the feeding task must not panic");
+    out
 }
 
 async fn seed_import_table(scratch: &Scratch) {

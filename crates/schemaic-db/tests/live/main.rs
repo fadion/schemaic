@@ -13,7 +13,9 @@
 //!
 //! `cargo test --workspace` does not build this target at all (the manifest
 //! declares the feature `required-features`), so the pure tier stays pure by
-//! construction rather than by a runtime check that could be got wrong. See
+//! construction rather than by a runtime check that could be got wrong —
+//! **for that spelling**. `--all-features` supplies the feature and runs the
+//! whole tier; see the manifest's note on why that is left as it is. See
 //! [`endpoint`] for how servers are named, and [`scratch`] for the namespace
 //! guard that keeps the tier away from any database it did not create.
 //!

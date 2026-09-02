@@ -9,6 +9,16 @@ license.workspace = true
 # below declares it `required-features`, so `cargo test --workspace` does not
 # build the target at all and the pure suite stays pure by construction.
 #
+# **`--all-features` defeats that, and it is a routine habit.**
+# `cargo test --workspace --all-features` supplies this feature, builds the
+# target and runs all 207 leg tests — which on a machine without MySQL, MariaDB
+# and PostgreSQL is 207 failures reading "could not reach mariadb at
+# 127.0.0.1:3306", because the tier is deliberately built so a missing server is
+# a hard failure and never a skip. That is the honest outcome rather than a
+# hidden one, but it is not what "pure by construction" promises, so the promise
+# is stated for the spelling it actually holds for. No CI job here passes
+# `--all-features`.
+#
 # **Nothing in this tier skips.** With the feature on, a server that cannot be
 # reached is a failure, never a quiet pass — a harness that returns early when
 # an endpoint is missing reads green having asserted nothing, which is the

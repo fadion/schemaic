@@ -77,12 +77,53 @@ pub struct Scratch {
     torn: bool,
 }
 
+/// Every scratch name currently held, so the uniqueness contract is **enforced**
+/// rather than stated.
+///
+/// `test` is hand-written at 65 call sites and the suite runs threaded, so two
+/// tests that pick the same label share one database — each dropping the other's
+/// tables, with failures that read as anything but a name collision. Nothing
+/// checked it: a duplicate reaches `CREATE DATABASE` as an error only if the two
+/// happen to overlap, which is precisely the race that does not reproduce.
+///
+/// Keyed on the *whole* name, so the same label on two legs is fine (the leg is
+/// part of it), and released on teardown so a test that creates, tears down and
+/// creates again is not refused.
+/// How long a scratch teardown may take before it is reported as a leftover.
+///
+/// Generous against a slow server and far short of hanging the binary: a
+/// `DROP DATABASE` waits on an open transaction, which is a state this tier
+/// deliberately creates.
+const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn live_names() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(Default::default)
+}
+
+fn claim_name(name: &str) {
+    let mut held = live_names().lock().expect("the name set is not poisoned");
+    assert!(
+        held.insert(name.to_string()),
+        "two live tests are using the scratch name {name:?} at once — \
+         `Scratch::create`'s label must be unique within the binary"
+    );
+}
+
+fn release_name(name: &str) {
+    if let Ok(mut held) = live_names().lock() {
+        held.remove(name);
+    }
+}
+
 impl Scratch {
     /// Create a scratch database for `test`, and hand back a handle scoped to it.
     ///
     /// `test` names the test and must be unique within the binary — the same
     /// contract `sqlite::tests::shared_memory` has, and for the same reason: the
-    /// suite runs threaded and the name is the whole identity.
+    /// suite runs threaded and the name is the whole identity. Enforced by
+    /// [`claim_name`], not left to 65 call sites.
     pub async fn create(target: &'static Target, test: &str) -> Scratch {
         // The leg is part of the name as well as the process id: the suite is
         // one binary running every server at once, so two legs pointed at the
@@ -90,6 +131,7 @@ impl Scratch {
         // race for one namespace. It also makes a leftover self-identifying.
         let name = format!("{PREFIX}{}_{}_{test}", std::process::id(), target.name);
         assert_scratch_name(&name);
+        claim_name(&name);
         // 64 bytes on MySQL, 63 on PostgreSQL. Caught here rather than as a
         // truncated name that two tests then share.
         assert!(
@@ -296,7 +338,6 @@ statement: {sql}"
     /// calling it explicitly is what lets a test then assert the database is
     /// really gone.
     pub async fn teardown(mut self) {
-        self.torn = true;
         // Before the database this handle is attached to, so a failure to drop an
         // extra is still reported rather than orphaned by an early return.
         for name in std::mem::take(&mut self.extra_databases) {
@@ -312,6 +353,14 @@ statement: {sql}"
             .fetch_query(None, &sql, 1, CancellationToken::new())
             .await
             .unwrap_or_else(|e| panic!("live tier could not drop {}: {e}", self.database));
+        release_name(&self.database);
+        // **Marked torn only once it is**, which is the whole point of the flag:
+        // it is what tells `Drop` there is nothing left to do. Set at the top, a
+        // panic from the extras loop above — the `unwrap_or_else` two lines up —
+        // left `torn = true` with the *primary* database still there, and `Drop`
+        // returned immediately. The tier's own rule is that it cleans up after
+        // itself, and that is the one path where it silently did not.
+        self.torn = true;
     }
 
     fn drop_sql(&self) -> String {
@@ -338,6 +387,7 @@ impl Drop for Scratch {
     /// failure is printed in that case and raised only when the test was
     /// otherwise passing.
     fn drop(&mut self) {
+        release_name(&self.database);
         if self.torn {
             return;
         }
@@ -355,14 +405,20 @@ impl Drop for Scratch {
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
-            rt.block_on(async {
+            // **Bounded.** A `DROP DATABASE` blocks behind an open transaction —
+            // measured on MariaDB, and the manual-transaction tests are what
+            // supply one — and an unbounded `block_on` inside a `Drop` hangs the
+            // whole binary with no output at all. A timeout turns that into the
+            // named leftover the message below is for.
+            rt.block_on(tokio::time::timeout(TEARDOWN_TIMEOUT, async {
                 for sql in &plan {
                     base.fetch_query(None, sql, 1, CancellationToken::new())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
                 Ok(())
-            })
+            }))
+            .unwrap_or_else(|_| Err(format!("teardown timed out after {TEARDOWN_TIMEOUT:?}")))
         })
         .join();
 
