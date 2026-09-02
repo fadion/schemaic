@@ -33,7 +33,7 @@ use ai::{
     active_tab_database, ai_context, apply_turn_delta, extract_sql, inline_system_prompt,
     mcp_endpoint_from_env, needs_respawn, render_recap, start_ai_session, turn_context,
 };
-use claude_cli::{claude_bin, claude_reachable, detect_claude_bin};
+use claude_cli::{claude_bin, claude_reachable, claude_seal, detect_claude_bin};
 use schemaic_core::tabsel::scoped_database;
 
 use std::cell::{Cell, RefCell};
@@ -1394,6 +1394,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     create_effect(move |_| schemaic_ui::theme::set_editor_soft_tabs(soft_tabs.get()));
     create_effect(move |_| schemaic_ui::theme::set_editor_word_wrap(word_wrap.get()));
     let ai_detected_path = detect_claude_bin();
+    // Probe what sealing flags this CLI takes now, off-thread, so the first AI
+    // action doesn't pay for it — see `claude_cli::claude_seal`.
+    if let Some(bin) = ai_detected_path.clone() {
+        claude_cli::warm_seal_cache(bin);
+    }
     let db_menu_open = RwSignal::new(false);
     let schema_menu_open = RwSignal::new(false);
     let context_menu: RwSignal<Option<CtxMenu>> = RwSignal::new(None);
@@ -8430,7 +8435,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // oversize prompt surfaced as `os error 206`, which names the one
             // cause that isn't the problem — and Ctrl+K on a large catalogue was
             // simply broken with nothing on screen to say why.
-            let args = schemaic_ai::inline_args(&intent, &system, &model);
+            let args = schemaic_ai::inline_args(&intent, &system, &model, claude_seal(&bin));
             if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
                 inline_ai.set(InlineAiState::Failed(why));
                 return;
@@ -8546,8 +8551,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     );
                     let system = "You output only the requested raw value — no quotes, \
                                   no markdown, no prose.";
+                    // Before the move into `Command::new`, and normally a cache
+                    // hit — `warm_seal_cache` ran at startup.
+                    let seal = claude_seal(&bin);
                     let out = Command::new(bin)
-                        .args(schemaic_ai::inline_args(&prompt, system, &model))
+                        .args(schemaic_ai::inline_args(&prompt, system, &model, seal))
                         // Close stdin so `claude -p` doesn't stall ~3s waiting for
                         // piped input ("no stdin data received") before responding.
                         .stdin(std::process::Stdio::null())
@@ -8625,8 +8633,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     );
                     let system = "You output only a JSON array of row objects — no \
                                   markdown, no prose.";
+                    // Before the move into `Command::new`, and normally a cache
+                    // hit — `warm_seal_cache` ran at startup.
+                    let seal = claude_seal(&bin);
                     let out = Command::new(bin)
-                        .args(schemaic_ai::inline_args(&prompt, system, &model))
+                        .args(schemaic_ai::inline_args(&prompt, system, &model, seal))
                         // Close stdin so `claude -p` doesn't stall ~3s waiting for
                         // piped input ("no stdin data received") before responding.
                         .stdin(std::process::Stdio::null())

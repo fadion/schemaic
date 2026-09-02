@@ -28,7 +28,7 @@ use schemaic_core::transcript::{ChatMessage, Role};
 use schemaic_db::Db;
 use schemaic_ui::{AiEffort, AiModel, ConnNode, InlineAiRequest, SchemaScope, Tab};
 
-use crate::claude_cli::claude_bin;
+use crate::claude_cli::{claude_bin, claude_seal};
 
 // ===== moved from main.rs (AI session + context) =====
 // The `claude` CLI runs non-interactively, so a tool that isn't named here has
@@ -430,6 +430,7 @@ pub(crate) fn start_ai_session(
         Some(&effort),
         mcp_cfg_arg.as_deref(),
         tools,
+        claude_seal(&claude_bin(&cli_path)),
     );
 
     // Before the spawn, because afterwards it is unrecognisable: the OS returns
@@ -2868,7 +2869,12 @@ mod tests {
         assert!(out.contains("too large for one prompt"), "{out}");
         // And what it produces is small enough to actually spawn, on the
         // tightest platform.
-        let args = schemaic_ai::inline_args("count rows", &out, "claude-opus-5");
+        let args = schemaic_ai::inline_args(
+            "count rows",
+            &out,
+            "claude-opus-5",
+            schemaic_ai::CliSeal::ALL,
+        );
         assert_eq!(schemaic_ai::oversize_reason(&args, 30_000), None);
     }
 }
