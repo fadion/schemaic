@@ -90,6 +90,7 @@ fn read_config(ui: ImportUi) -> ReadConfig {
         },
         nulls: NullRule { tokens },
         trim: ui.trim.get_untracked(),
+        sheet: ui.sheet.get_untracked(),
     }
 }
 
@@ -108,6 +109,12 @@ pub(crate) fn open_import(ui: &Ui, target: ImportTargetInfo) {
     i.format.set(ImportFormat::Csv);
     i.delimiter.set(",".to_string());
     i.has_header.set(true);
+    // The workbook is per-file, so both belong to the previous open. A sheet
+    // list left standing would offer sheets from a file this import isn't
+    // reading, and a sheet *name* left standing would be applied to the next
+    // workbook the moment one is picked.
+    i.sheets.set(Vec::new());
+    i.sheet.set(None);
     i.empty_is_null.set(true);
     i.null_tokens.set(String::new());
     i.trim.set(false);
@@ -161,8 +168,26 @@ fn probe(ui: Ui, sniff: bool) {
                     i.error.set(Some(e));
                     i.file_bytes.set(0);
                     i.sample.set(None);
+                    // Nothing is known about this file, so nothing is claimed
+                    // about its sheets. Leaving them would describe the
+                    // *previous* workbook beside an error about this one — and
+                    // clearing the chosen sheet is also what unwedges the one
+                    // failure this can cause on its own: a name carried over
+                    // from another file that this one has no sheet for. The
+                    // next read then takes the first sheet and succeeds.
+                    //
+                    // Under `applying`, so resetting the choice is not mistaken
+                    // by the settings effect for the user changing it.
+                    i.applying.set(true);
+                    i.sheets.set(Vec::new());
+                    i.sheet.set(None);
+                    i.applying.set(false);
                 }
                 Ok(p) => {
+                    // The picker's options, whatever else the probe found. Set
+                    // before the settings below so a `sheet` written here is
+                    // always one the list can show.
+                    let sheets = p.sheets.clone();
                     if sniff {
                         // The settings effect watches these; writing them here is
                         // the app answering itself, so it must not bounce back
@@ -182,8 +207,14 @@ fn probe(ui: Ui, sniff: bool) {
                                 .collect::<Vec<_>>()
                                 .join(","),
                         );
+                        // A new file is a new workbook: a sheet name carried
+                        // over from the last one would either not exist (a hard
+                        // read error the user never asked for) or, worse, exist
+                        // and silently be a different table.
+                        i.sheet.set(None);
                         i.applying.set(false);
                     }
+                    i.sheets.set(sheets);
                     // Re-propose the mapping whenever the columns change: after a
                     // delimiter fix the old mapping refers to columns that no
                     // longer exist.
@@ -281,6 +312,138 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         },
     );
 
+    // Excel-only settings: which sheet, and whether its first row names the
+    // columns. Built and torn down the same way `csv_settings` is, and for the
+    // same reason — a `hide()`n control is still in the modal's Tab order.
+    //
+    // The header toggle is repeated here rather than lifted out of
+    // `csv_settings` and shared: it is the only setting the two formats have in
+    // common, and hoisting it would put it above the format-specific block for
+    // CSV too, moving a control users already know the position of.
+    // **The sheet list is *not* in this container's key.** It is written on
+    // every probe, and a probe fires whenever a reading setting changes — so
+    // keying on it rebuilt this whole block, header toggle included, the moment
+    // the user pressed Space on that toggle, dropping keyboard focus. floem's
+    // `dyn_container` has no `PartialEq` bound and `create_updater` does not
+    // dedup, so an equal value rebuilds just as readily as a changed one. Only
+    // the picker below depends on the list, so only the picker is keyed on it.
+    let ring_xlsx = ring.clone();
+    let xlsx_settings = dyn_container(
+        move || i.format.get() == ImportFormat::Xlsx,
+        move |is_xlsx| {
+            if !is_xlsx {
+                return empty().into_any();
+            }
+            let ring = ring_xlsx.clone();
+            // Only worth a control when there is a choice to make: a
+            // single-sheet workbook is the common case and a dropdown with one
+            // entry is furniture. The list is empty until the probe returns,
+            // which is also when there is nothing to choose from yet.
+            //
+            // `nothing()` and not `empty()`: a zero-sized child still *is* a
+            // flex child, so taffy gives it a `form_gap` on each side and the
+            // header toggle sits two gaps below "Reading" instead of one —
+            // visibly further than Delimiter sits from it on the CSV side. A
+            // `display:none` child is skipped entirely. Same trap the
+            // `csv_settings` container below is written around.
+            let ring_pick = ring.clone();
+            let picker = dyn_container(
+                move || i.sheets.get(),
+                move |sheets| {
+                    let ring = ring_pick.clone();
+                    if sheets.len() < 2 {
+                        crate::widgets::nothing()
+                    } else {
+                        let names = sheets.clone();
+                        let current = {
+                            let names = names.clone();
+                            move || {
+                                i.sheet
+                                    .get()
+                                    .unwrap_or_else(|| names.first().cloned().unwrap_or_default())
+                            }
+                        };
+                        let entries = {
+                            let names = names.clone();
+                            move || {
+                                let chosen = i.sheet.get_untracked();
+                                names
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(n, name)| {
+                                        let name = name.clone();
+                                        let pick = {
+                                            let name = name.clone();
+                                            move || i.sheet.set(Some(name.clone()))
+                                        };
+                                        // The same tint-means-current vocabulary
+                                        // `focusable_dropdown` uses. `None` is the first
+                                        // sheet, so it tints that one.
+                                        let holding = match &chosen {
+                                            Some(c) => *c == name,
+                                            None => n == 0,
+                                        };
+                                        match holding {
+                                            true => {
+                                                MenuEntry::action_colored(name, theme::accent, pick)
+                                            }
+                                            false => MenuEntry::action(name, pick),
+                                        }
+                                    })
+                                    .collect()
+                            }
+                        };
+                        form_setting(
+                            "Sheet",
+                            container(crate::settings::in_ring_picker(
+                                crate::settings::picker_box_content(current),
+                                entries,
+                                ring.clone(),
+                                15,
+                            ))
+                            .style(|s| s.width(field_w())),
+                        )
+                        .into_any()
+                    }
+                },
+            )
+            // The container is the flex child, so an absent picker has to step
+            // aside rather than sit there at zero height: taffy charges a
+            // `form_gap` on each side of a zero-sized child and skips a
+            // `display:none` one, which is the difference between the header
+            // toggle sitting one gap under "Reading" and two.
+            .style(move |s| {
+                let s = s.width_full();
+                if i.sheets.get().len() < 2 {
+                    s.hide()
+                } else {
+                    s
+                }
+            });
+            v_stack((
+                form_section("Reading"),
+                picker,
+                focusable_toggle_row(
+                    "First row is a header",
+                    "Use the first row as column names instead of data.",
+                    i.has_header,
+                    ring,
+                    30,
+                ),
+            ))
+            .style(|s| s.flex_col().gap(form_gap()).width_full())
+            .into_any()
+        },
+    )
+    .style(move |s| {
+        let s = s.width_full();
+        if i.format.get() == ImportFormat::Xlsx {
+            s
+        } else {
+            s.hide()
+        }
+    });
+
     // CSV-only settings — a JSON file has no delimiter, and its nulls are its own.
     //
     // Built only for CSV rather than built-and-hidden: a `hide()`n view is still
@@ -375,6 +538,7 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             ))
             .style(|s| s.width(theme::scaled(150.0))),
         ),
+        xlsx_settings,
         csv_settings,
     ))
     .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -748,13 +912,18 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         },
     );
 
-    // A JSON load can't stream — the columns are the union of every object's
-    // keys — so it is held in memory at roughly five times the file's size,
-    // measured. Said here, before the load, because the alternative was the user
-    // discovering it when the app died; CSV of the same data is constant-memory,
-    // which the message names as the way out.
-    let json_size_note = dyn_container(
-        move || import::json_memory_warning(i.format.get(), i.file_bytes.get()),
+    // Two formats can't stream, for two reasons: a JSON file's columns are the
+    // union of every object's keys, so nothing can be emitted before EOF, and an
+    // `.xlsx` is a ZIP whose directory is at the end of the file, so it cannot
+    // be read as a prefix even in principle. Both are therefore held in memory
+    // at some multiple of the file's size. Said here, before the load, because
+    // the alternative was the user discovering it when the app died; a CSV of
+    // the same data is constant-memory, which both messages name as the way out.
+    //
+    // `memory_warning` rather than either format's own: one call site, so a
+    // format that needs a warning cannot be given one nothing asks for.
+    let size_note = dyn_container(
+        move || import::memory_warning(i.format.get(), i.file_bytes.get()),
         move |warning| {
             let Some(warning) = warning else {
                 return crate::widgets::nothing();
@@ -807,7 +976,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         form_section("Columns"),
         autohide(scroll(rows)).style(|s| s.max_height(mapping_list_h()).width_full()),
         missing,
-        json_size_note,
+        size_note,
         engine_note,
         form_separator(GAP),
         form_section("Preview"),
@@ -930,23 +1099,31 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     // over a hand-edited one.
     {
         let ui = ui.clone();
-        create_effect(move |prev: Option<(String, bool, bool, ImportFormat)>| {
-            let cur = (
-                i.delimiter.get(),
-                i.has_header.get(),
-                i.trim.get(),
-                i.format.get(),
-            );
-            let changed = prev.is_some_and(|p| p != cur);
-            if changed
-                && !i.applying.get_untracked()
-                && i.target.get_untracked().is_some()
-                && i.path.get_untracked().is_some()
-            {
-                probe(ui.clone(), false);
-            }
-            cur
-        });
+        create_effect(
+            move |prev: Option<(String, bool, bool, ImportFormat, Option<String>)>| {
+                // The sheet belongs here for exactly the reason the delimiter does:
+                // it changes which bytes the reader sees, so the preview and the
+                // mapping both have to be rebuilt from the new one. It is the *one*
+                // Excel setting that does — the NULL rules stay absent for the
+                // reason above.
+                let cur = (
+                    i.delimiter.get(),
+                    i.has_header.get(),
+                    i.trim.get(),
+                    i.format.get(),
+                    i.sheet.get(),
+                );
+                let changed = prev.is_some_and(|p| p != cur);
+                if changed
+                    && !i.applying.get_untracked()
+                    && i.target.get_untracked().is_some()
+                    && i.path.get_untracked().is_some()
+                {
+                    probe(ui.clone(), false);
+                }
+                cur
+            },
+        );
     }
 
     // A refreshed schema shouldn't leave the modal editing a table that's gone —
