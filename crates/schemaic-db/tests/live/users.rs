@@ -328,18 +328,54 @@ impl ScratchAccount {
 }
 
 impl Drop for ScratchAccount {
+    /// Drop the account even when the test panicked — which is exactly when it
+    /// matters, since a failing assertion skips every line after it.
+    ///
+    /// **It used to only print.** A panicking test therefore left a real login
+    /// on a real server, named but present, and the tier's rule is that it
+    /// cleans up after itself — its `Scratch` sibling does. On its own thread
+    /// with its own runtime, because a drop is synchronous and blocking on the
+    /// current runtime from inside one deadlocks; and it **does not panic while
+    /// panicking**, so a teardown failure is printed rather than aborting the
+    /// process and taking the real failure's message with it.
     fn drop(&mut self) {
-        // A test that panicked before `teardown` leaves an account behind, and
-        // the tier's rule is that it cleans up after itself. It cannot `await`
-        // here, so it says so loudly rather than pretending — the name is the one
-        // thing needed to remove it by hand, and the prefix makes it
-        // self-identifying.
-        if !self.dropped {
-            eprintln!(
-                "live: account {} was not dropped — remove it by hand",
-                self.principal.display()
-            );
+        if self.dropped {
+            return;
         }
+        let db = self.db.clone();
+        let database = self.database.clone();
+        let who = self.principal.clone();
+        let display = who.display();
+        assert_scratch_name(&who.name);
+        let stmts = ddl::account(
+            &display,
+            self.dialect,
+            ddl::Change::DropAccount(Box::new(who)),
+        )
+        .emit();
+        let outcome = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                db.run_ddl(&database, &stmts, CancellationToken::new())
+                    .await
+                    .map_err(|e| e.message)
+            })
+        })
+        .join();
+
+        let failure = match outcome {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e,
+            Err(_) => "the teardown thread panicked".to_string(),
+        };
+        eprintln!("live tier left account {display} behind: {failure}");
+        assert!(
+            std::thread::panicking(),
+            "live tier could not drop {display}: {failure}"
+        );
     }
 }
 

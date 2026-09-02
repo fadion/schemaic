@@ -88,10 +88,30 @@ pub struct Target {
     pub trigger_body: Option<&'static str>,
     pub trigger_function_ddl: Option<&'static str>,
     pub trigger_function_name: Option<&'static str>,
-    /// A statement that does nothing for `runtime::SLEEP_SECS` seconds, in this
-    /// server's spelling — what the cancellation test interrupts. There is no
-    /// portable way to ask a server to wait.
-    pub sleep_sql: &'static str,
+    /// A statement that does nothing for a given number of seconds, in this
+    /// server's spelling, with `{}` where the count goes — what the cancellation
+    /// test interrupts. There is no portable way to ask a server to wait.
+    ///
+    /// **A template, not the finished statement.** It used to be
+    /// `"SELECT SLEEP(5)"` in three places beside a `SLEEP_SECS = 5` the test
+    /// compared against, documented as linked and held together by nothing:
+    /// changing the constant left three servers sleeping for the old duration
+    /// and the assertion measuring against the new one. [`Target::sleep_sql`]
+    /// is the one place the two meet.
+    sleep_template: &'static str,
+    /// How to ask this server whether a [`Target::sleep_sql`] is **still
+    /// running** — one row, one column, the count.
+    ///
+    /// The other half of the cancellation test, and the half it did not have: it
+    /// measured how long the *client* took to return `Cancelled`, which
+    /// `tokio::select!` answers on its own. Deleting `kill_query` and
+    /// `cancel_query` from both arms left all six legs passing in ~250 ms while
+    /// three servers slept on.
+    ///
+    /// The marker is split in the middle of this pattern (`'…Cancel'` +
+    /// `'Marker…'`) so the probe does not count *itself*: its own text is in the
+    /// same view it reads.
+    running_sleeps_sql: &'static str,
     /// The types this server is asked to round-trip, and the ones only it has.
     /// Two slices rather than one so MySQL and MariaDB can share the twenty they
     /// agree on and still each own the one they do not — see [`cases`].
@@ -113,7 +133,8 @@ pub static MARIADB: Target = Target {
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
-    sleep_sql: "SELECT SLEEP(5)",
+    sleep_template: "SELECT SLEEP({}) /* schemaicItCancelMarker */",
+    running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
 };
@@ -132,7 +153,8 @@ pub static MYSQL: Target = Target {
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
     trigger_function_name: None,
-    sleep_sql: "SELECT SLEEP(5)",
+    sleep_template: "SELECT SLEEP({}) /* schemaicItCancelMarker */",
+    running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
 };
@@ -153,7 +175,8 @@ pub static POSTGRES: Target = Target {
         "CREATE FUNCTION upper_name() RETURNS trigger AS $$          BEGIN NEW.name := UPPER(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql",
     ),
     trigger_function_name: Some("upper_name"),
-    sleep_sql: "SELECT pg_sleep(5)",
+    sleep_template: "SELECT pg_sleep({}) /* schemaicItCancelMarker */",
+    running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%schemaicItCancel' || 'Marker%'",
     types: cases::POSTGRES,
     extra_types: &[],
 };
@@ -186,6 +209,28 @@ impl Target {
     /// Every type case this server answers for.
     pub fn type_cases(&self) -> impl Iterator<Item = &'static TypeCase> {
         self.types.iter().chain(self.extra_types)
+    }
+
+    /// The statement that makes this server wait for
+    /// [`crate::runtime::SLEEP_SECS`] seconds.
+    ///
+    /// The one place the template and the constant meet — see
+    /// [`Target::sleep_template`].
+    pub fn sleep_sql(&self) -> String {
+        self.sleep_template
+            .replace("{}", &crate::runtime::SLEEP_SECS.to_string())
+    }
+
+    /// How many [`Target::sleep_sql`] statements this server is running right
+    /// now — the question the cancellation test asks the *server*.
+    pub async fn running_sleeps(&self, db: &Db) -> u64 {
+        let rs = db
+            .fetch_query(None, self.running_sleeps_sql, 10, Default::default())
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not read the sleep probe: {e}", self.endpoint()));
+        rs.cell(0, 0)
+            .and_then(|c| c.text().parse().ok())
+            .unwrap_or_else(|| panic!("{}: the sleep probe returned no count", self.endpoint()))
     }
 
     /// How this leg is spelled in an error, so a failure names the endpoint a
