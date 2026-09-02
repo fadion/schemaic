@@ -1492,6 +1492,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let users_selected: RwSignal<Option<schemaic_core::users::Principal>> = RwSignal::new(None);
     let users_grants: RwSignal<schemaic_ui::GrantsState> =
         RwSignal::new(schemaic_ui::GrantsState::Idle);
+    let users_generation: RwSignal<u64> = RwSignal::new(0);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
     // Bumped whenever a refresh puts some node's statistics back to `Idle`, and
@@ -6858,12 +6859,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             let want = target.clone();
+            // **Claimed before the round trip, compared when it lands.** Target
+            // identity alone was not enough: two fetches on an *identical*
+            // target are routine — creating an account is one, and closing the
+            // preview afterwards is another — so the later request was not
+            // guaranteed to be the last writer, and the list could settle on the
+            // pre-mutation snapshot. `DdlUi::generation` is the same guard for
+            // the same failure one modal up.
+            let generation = users_generation.get_untracked() + 1;
+            users_generation.set(generation);
             let report = create_ext_action(
                 cx,
                 move |res: Result<schemaic_core::users::Principals, String>| {
                     // The browser has since closed, or reopened on another
                     // server: this answer is about neither.
                     if users.with_untracked(|t| t.as_ref() != Some(&want)) {
+                        return;
+                    }
+                    // …or a later fetch has since been issued, and this one's
+                    // answer is older than the screen.
+                    if users_generation.get_untracked() != generation {
                         return;
                     }
                     users_state.set(match res {
@@ -9326,6 +9341,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             users_filter,
             users_selected,
             users_grants,
+            users_generation,
             run_guard,
             snippet_edit: snippet_edit_open,
         },

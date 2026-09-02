@@ -136,6 +136,31 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
         account_open.get().is_some() || grant_open.get().is_some() || preview_open.get().is_some()
     };
 
+    // **The fetch keys on the target alone**, and lives above the container
+    // rather than inside it. The container's key is `(target, hidden)`, and
+    // `hidden` moves whenever a form or the preview opens *or closes* — so an
+    // effect created in the child ran again on every one of those transitions:
+    // a full `fetch_principals` (a fresh connection, through the SSH tunnel if
+    // there is one, plus an unbounded `SELECT … FROM mysql.user`) for pressing
+    // Cancel, and two for an Apply. The comment that stood here said "runs once
+    // per opening: the closure reads no signal", which was true of the closure
+    // and not of the scope it was created in.
+    {
+        let fetch = ui.schema_actions.principals.clone();
+        create_effect(move |prev: Option<Option<UsersTarget>>| {
+            let t = target.get();
+            // `create_effect` has no equality check of its own, so the compare
+            // is here: this must not re-fetch when the signal is written with
+            // the value it already held.
+            if prev.as_ref() != Some(&t)
+                && let Some(t) = t.clone()
+            {
+                (fetch)(t);
+            }
+            t
+        });
+    }
+
     dyn_container(
         move || (target.get(), hidden()),
         move |(open, hidden)| {
@@ -152,14 +177,6 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
             });
             let ring = FocusRing::new();
 
-            // Ask for the accounts. Runs once per opening: the closure reads no
-            // signal, and a fresh target rebuilds this whole branch.
-            {
-                let fetch = ui.schema_actions.principals.clone();
-                let t = t.clone();
-                create_effect(move |_| (fetch)(t.clone()));
-            }
-
             // **The footer belongs to the right column, not to the modal.** The
             // list column runs the full height of the body — the shape Manage
             // Connections has — so a footer spanning both would cut across it
@@ -172,7 +189,7 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
             let gate = write_gate(&ui, &t);
             let right = v_stack((
                 detail_pane(&ui, &t, gate),
-                footer(state, filter, grants, close.clone(), ring.clone()),
+                footer(&ui, &t, state, filter, grants, close.clone(), ring.clone()),
             ))
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0).height_full().flex_col());
             let body = h_stack((list_pane(&ui, &t, gate, ring.clone()), right)).style(|s| {
@@ -263,20 +280,25 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
             ),
             UsersState::Failed(e) => list_note(icons::TRIANGLE_ALERT, theme::error, e),
             UsersState::Loaded(list) => {
-                let mut rows: Vec<AnyView> = list
-                    .list
-                    .iter()
-                    .filter(|p| schemaic_core::users::matches(p, &needle))
-                    .map(|p| {
-                        account_row(
-                            p.clone(),
-                            selected,
-                            grants,
-                            fetch.clone(),
-                            row_target.clone(),
-                        )
-                    })
-                    .collect();
+                // **Filtered once**, through `users::filter_indices`, rather
+                // than by re-asking the predicate per row here and again in the
+                // footer — each of which re-`format!`ed every account's
+                // `display()`. At the ~1,000 accounts a shared server has, that
+                // second pass alone was measured in the review at several
+                // milliseconds of a 16.7 ms frame, per keystroke.
+                let mut rows: Vec<AnyView> =
+                    schemaic_core::users::filter_indices(&list.list, &needle)
+                        .into_iter()
+                        .map(|i| {
+                            account_row(
+                                list.list[i].clone(),
+                                selected,
+                                grants,
+                                fetch.clone(),
+                                row_target.clone(),
+                            )
+                        })
+                        .collect();
                 if rows.is_empty() {
                     return list_note(
                         icons::CIRCLE_QUESTION,
@@ -791,22 +813,32 @@ fn note(icon: &'static str, color: fn() -> floem::peniko::Color, message: String
     crate::widgets::fact_note(icon, color, message)
 }
 
-/// The count on the left; Copy and Close on the right.
+/// The count on the left; Refresh, Copy and Close on the right.
 fn footer(
+    ui: &Ui,
+    target: &UsersTarget,
     state: RwSignal<UsersState>,
     filter: RwSignal<String>,
     grants: RwSignal<GrantsState>,
     close: Rc<dyn Fn()>,
     ring: FocusRing,
 ) -> AnyView {
+    // **The way back to the truth.** Everything else here re-reads the server
+    // only as a side effect of opening something, so a list that has gone stale
+    // — a `DROP USER` applied from another client, or a fetch whose answer lost
+    // a race — could only be corrected by closing the browser and reopening it.
+    let refresh = {
+        let fetch = ui.schema_actions.principals.clone();
+        let t = target.clone();
+        move || {
+            state.set(UsersState::Loading);
+            (fetch)(t.clone());
+        }
+    };
     let status = label(move || match state.get() {
         UsersState::Loaded(list) => {
             let needle = filter.get();
-            let shown = list
-                .list
-                .iter()
-                .filter(|p| schemaic_core::users::matches(p, &needle))
-                .count();
+            let shown = schemaic_core::users::filter_indices(&list.list, &needle).len();
             let total = list.list.len();
             // "3 of 40 accounts" only while a filter is narrowing them — an
             // unfiltered list saying "40 of 40" invites a hunt for the missing
@@ -837,11 +869,19 @@ fn footer(
         status,
         h_stack((
             action_button(
-                "Copy privileges",
+                "Refresh",
                 ActionKind::Quiet,
                 true,
                 ring.clone(),
                 ACTION_TAB,
+                refresh,
+            ),
+            action_button(
+                "Copy privileges",
+                ActionKind::Quiet,
+                true,
+                ring.clone(),
+                ACTION_TAB + 1,
                 copy,
             ),
             action_button(
@@ -849,7 +889,7 @@ fn footer(
                 ActionKind::Neutral,
                 true,
                 ring,
-                ACTION_TAB + 1,
+                ACTION_TAB + 2,
                 move || close(),
             ),
         ))

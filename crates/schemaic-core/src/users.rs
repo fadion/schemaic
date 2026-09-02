@@ -146,6 +146,27 @@ pub fn matches(p: &Principal, needle: &str) -> bool {
     needle.is_empty() || contains_ignore_ascii_case(&p.display(), needle)
 }
 
+/// The indices of `list` that [`matches`] `needle`, in list order.
+///
+/// **Indices, and computed once.** The browser's list is virtualised, so the
+/// filter has to be a value the scroll can index rather than a predicate each
+/// row re-asks — and the view was answering it twice per keystroke, once to
+/// build the rows and once for the footer's count, each call re-`format!`ing
+/// every account's `display()`. At the ~1,000 accounts a shared server has that
+/// was measured at ≥13 ms of identified work per keystroke on a 16.7 ms frame,
+/// and the query behind it has no `LIMIT`.
+pub fn filter_indices(list: &[Principal], needle: &str) -> Vec<usize> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return (0..list.len()).collect();
+    }
+    list.iter()
+        .enumerate()
+        .filter(|(_, p)| contains_ignore_ascii_case(&p.display(), needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// The account as SQL names it, for the statement that asks about it.
 ///
 /// MySQL spells an account as **two string literals** — `'app'@'%'` — not as an
@@ -2115,6 +2136,40 @@ mod tests {
         let n = my_scope_note();
         assert!(n.contains("role"), "{n}");
         assert!(n.contains("directly"), "{n}");
+    }
+
+    /// The filter, as the virtualised list consumes it: positions, in order,
+    /// agreeing with `matches` on every element.
+    #[test]
+    fn the_filter_answers_positions_and_agrees_with_the_predicate() {
+        // `from_mysql_rows` sorts, so positions are read back by name rather
+        // than assumed — which is also the property under test: the indices are
+        // into the list as it stands, because that is what the row builder
+        // indexes.
+        let list = from_mysql_rows(&[my("app", "%"), my("admin", "localhost"), my("bob", "%")]);
+        let at = |name: &str| list.iter().position(|p| p.name == name).expect(name);
+        // An empty needle is every index — not an empty list, which would read
+        // as "no account matches" on an unfiltered browser.
+        assert_eq!(filter_indices(&list, ""), vec![0, 1, 2]);
+        assert_eq!(filter_indices(&list, "   "), vec![0, 1, 2]);
+        // Both halves of a MySQL account are searchable.
+        assert_eq!(filter_indices(&list, "localhost"), vec![at("admin")]);
+        assert_eq!(filter_indices(&list, "app@"), vec![at("app")]);
+        let mut any_host = vec![at("app"), at("bob")];
+        any_host.sort_unstable();
+        assert_eq!(filter_indices(&list, "%"), any_host);
+        assert!(filter_indices(&list, "nobody").is_empty());
+        // And it cannot disagree with the predicate the footer's count and the
+        // row's own highlighting still use.
+        for needle in ["", "a", "localhost", "%", "APP"] {
+            let by_predicate: Vec<usize> = list
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches(p, needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(filter_indices(&list, needle), by_predicate, "{needle:?}");
+        }
     }
 
     /// **The order of the four answers is the whole content of this gate**, and

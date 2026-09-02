@@ -4067,6 +4067,18 @@ pub struct OverlayUi {
     pub users_filter: RwSignal<String>,
     pub users_selected: RwSignal<Option<schemaic_core::users::Principal>>,
     pub users_grants: RwSignal<GrantsState>,
+    /// Bumped by every account fetch, and compared when its answer lands —
+    /// `DdlUi::generation`'s pattern, for the same reason and after the same
+    /// failure.
+    ///
+    /// Two `fetch_principals` are routinely in flight on an *identical*
+    /// `UsersTarget` (a create is a fetch, and so is closing the preview after
+    /// it), and the reporter's only guard was target identity — so the later
+    /// request was not guaranteed to be the last writer. The list could settle
+    /// on the **pre-mutation** snapshot: an account just created missing, or,
+    /// worse, one just dropped listed again with a live Drop beside it. The
+    /// browser has no other way back to the truth than closing and reopening.
+    pub users_generation: RwSignal<u64>,
     /// The snippet whose body is being edited, or `None`. One at a time, like
     /// every other editor here.
     pub snippet_edit: RwSignal<Option<u64>>,
