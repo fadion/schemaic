@@ -894,8 +894,13 @@ pub struct DdlPreview {
     pub withheld: Vec<String>,
     pub statements: Vec<String>,
     /// The same plan as one script a **client** can run — see
-    /// [`schemaic_core::ddl::ChangeSet::editor_script`]. What "Copy" and "Open in
+    /// [`schemaic_core::ddl::ChangeSet::export_script`]. What "Copy" and "Open in
     /// editor" hand over; `statements` is what goes on the wire.
+    ///
+    /// **Not the same text as `statements`, when the plan carries a password.**
+    /// Both exits put this somewhere durable and neither is private, so
+    /// `export_script` replaces an account password with a placeholder and says
+    /// so at the top. The modal renders `statements`, which is the real thing.
     pub script: String,
     pub read_only: bool,
     /// The engine this plan is for.

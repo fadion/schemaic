@@ -376,19 +376,26 @@ fn account_form(
     }
 
     if kind == PrincipalKind::User {
+        // **Masked, like the app's four other secret fields.** This was the one
+        // that was not: the real characters were in the editor's own document,
+        // so they were on screen and a select-all away from the clipboard.
+        // `masked_edit_field` keeps only `*`s in the document and diffs each
+        // edit back onto the value, which is why there is one of it rather than
+        // a second copy here.
+        let pw = floem::reactive::create_rw_signal(seed.password.clone());
+        create_effect(move |prev: Option<String>| {
+            let v = pw.get();
+            if prev.is_some_and(|p| p != v) {
+                draft.update(|d| d.password = v.clone());
+            }
+            v
+        });
         rows.push(
             form_setting(
                 "Password",
-                bound_field(
-                    draft,
-                    seed.password.clone(),
-                    FieldCfg {
-                        placeholder: "none",
-                        focus: Some((ring, 30)),
-                        ..Default::default()
-                    },
-                    |d, v| d.password = v.to_string(),
-                ),
+                crate::connection_form::masked_edit_field(pw, ring, 30)
+                    .style(|s| s.width(field_w()))
+                    .into_any(),
             )
             .into_any(),
         );
@@ -429,7 +436,15 @@ fn picked_outline(s: floem::style::Style, picked: bool) -> floem::style::Style {
 
 pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
-    let close = move || d.account.set(None);
+    // **The draft goes with the form.** `account_draft` is app-lifetime, so
+    // clearing only the target left the plaintext password in a signal for the
+    // rest of the process — after Cancel as much as after Apply. The form
+    // re-seeds itself from its target on open, so nothing is lost. Same rule and
+    // same reason as `ddl_preview::close_peers`, which is the other door.
+    let close = move || {
+        d.account.set(None);
+        d.account_draft.set(Default::default());
+    };
 
     dyn_container(
         // The preview stacks on top and this stays open behind it (Cancel there
@@ -811,7 +826,13 @@ fn privilege_tag(
 
 pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
-    let close = move || d.grant.set(None);
+    // The grant draft carries no secret, but it takes the same rule for the same
+    // reason its sibling above does: one closing behaviour, so the pair cannot
+    // drift into two.
+    let close = move || {
+        d.grant.set(None);
+        d.grant_draft.set(Default::default());
+    };
 
     dyn_container(
         move || (d.grant.get().is_some(), d.preview.get().is_some()),

@@ -94,6 +94,28 @@ pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
     d.database.set(None);
     d.account.set(None);
     d.grant.set(None);
+    // **The drafts go with the targets.** `account_draft` is app-lifetime, so
+    // clearing only `d.account` left the plaintext password sitting in a signal
+    // for the rest of the process — after Cancel and after Apply alike, and
+    // reachable by anything that reads the bundle. The form re-seeds itself from
+    // its target on open, so there is nothing to keep.
+    d.account_draft.set(Default::default());
+    d.grant_draft.set(Default::default());
+}
+
+/// Close the preview and drop the script with it.
+///
+/// The one door, because there are two `set(None)` sites and a third would
+/// otherwise have to remember: `d.sql` is app-lifetime and held the last plan's
+/// script for the life of the process. It is [`ChangeSet::export_script`]'s
+/// output rather than the real statement, so this is defence in depth rather
+/// than the only line — which is the reason it is a one-line helper and not a
+/// larger piece of machinery.
+///
+/// [`ChangeSet::export_script`]: schemaic_core::ddl::ChangeSet::export_script
+pub(crate) fn close_preview(d: crate::DdlUi) {
+    d.preview.set(None);
+    d.sql.set(String::new());
 }
 
 /// Open the preview on a change set. `from_designer` decides where Cancel goes.
@@ -138,7 +160,15 @@ pub(crate) fn preview_of(
         destructive: cs.destructive(),
         withheld: cs.unsupported(),
         statements: cs.emit(),
-        script: cs.editor_script(),
+        // **`export_script`, not `editor_script`.** This field is what Copy and
+        // Open in editor hand over, and both put it somewhere durable — the
+        // clipboard, and a query tab the session file writes to `tabs.json` in
+        // the clear. A `CREATE USER … IDENTIFIED BY 'hunter2'` has no business
+        // in either. The *preview* renders `statements`, which is unchanged and
+        // is the statement that runs. Read off the change set, like `scope`
+        // below, so a third exit from this modal inherits the rule instead of
+        // having to remember it.
+        script: cs.export_script(),
         read_only,
         // Off the change set, like `scope` above and for the same reason: a
         // caller that had to remember to say is a caller that will one day
@@ -511,7 +541,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     let exit: Rc<dyn Fn()> = Rc::new(move || {
         let cancellable = schemaic_core::ddl::ddl_rolls_back_as_a_whole(exit_dialect());
         match exit_action(d.applying.get_untracked(), cancellable) {
-            ExitAction::Close => d.preview.set(None),
+            ExitAction::Close => close_preview(d),
             ExitAction::Cancel => (cancel_apply.ddl_cancel)(),
             ExitAction::Ignore => {}
         }
@@ -701,7 +731,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 (open_query)(open_sql.clone(), open_db.clone());
-                                d.preview.set(None);
+                                close_preview(d);
                                 close_editors(d);
                             },
                         ),
@@ -977,6 +1007,31 @@ mod tests {
             dialect: SqlDialect::MySql,
             read_only: false,
         }));
+        d.account.set(Some(crate::AccountTarget {
+            conn_id: 1,
+            database: "db".into(),
+            dialect: SqlDialect::MySql,
+            read_only: false,
+        }));
+        d.grant.set(Some(crate::GrantTarget {
+            conn_id: 1,
+            database: "db".into(),
+            account: an_account(),
+            dialect: SqlDialect::MySql,
+            read_only: false,
+        }));
+        // The drafts too: `account_draft` is app-lifetime and holds the
+        // plaintext password, so leaving it set is the secret outliving the form
+        // by the rest of the process.
+        d.account_draft.set(schemaic_core::users::AccountDraft {
+            name: "app".into(),
+            password: "hunter2".into(),
+            ..Default::default()
+        });
+        d.grant_draft.set(schemaic_core::users::GrantDraft {
+            role: "r".into(),
+            ..Default::default()
+        });
 
         close_editors(d);
 
@@ -986,8 +1041,26 @@ mod tests {
         assert!(d.object.get_untracked().is_none(), "object");
         assert!(d.event.get_untracked().is_none(), "event");
         assert!(d.database.get_untracked().is_none(), "database");
+        assert!(d.account.get_untracked().is_none(), "account");
+        assert!(d.grant.get_untracked().is_none(), "grant");
+        assert_eq!(
+            d.account_draft.get_untracked(),
+            Default::default(),
+            "the password outlived the form it was typed into"
+        );
+        assert_eq!(d.grant_draft.get_untracked(), Default::default(), "grant");
 
         scope.dispose();
+    }
+
+    /// The account fixture the two lists above share.
+    fn an_account() -> schemaic_core::users::Principal {
+        schemaic_core::users::from_mysql_rows(&[schemaic_core::users::MyUserRow {
+            user: "app".into(),
+            host: "%".into(),
+            ..Default::default()
+        }])
+        .remove(0)
     }
 
     /// **The one editor a close must leave standing.** A PostgreSQL trigger has
@@ -1052,7 +1125,24 @@ mod tests {
         // none of these captures anything, and the array is the list of editors
         // the test is about.
         type Raise = (&'static str, fn(crate::DdlUi));
-        let raise: [Raise; 7] = [
+        let raise: [Raise; 9] = [
+            ("account", |d| {
+                d.account.set(Some(crate::AccountTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    dialect: SqlDialect::MySql,
+                    read_only: false,
+                }))
+            }),
+            ("grant", |d| {
+                d.grant.set(Some(crate::GrantTarget {
+                    conn_id: 1,
+                    database: "db".into(),
+                    account: an_account(),
+                    dialect: SqlDialect::MySql,
+                    read_only: false,
+                }))
+            }),
             ("designer", |d| {
                 d.designer.set(Some(crate::DesignerTarget {
                     conn_id: 1,
