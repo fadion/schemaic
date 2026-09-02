@@ -188,7 +188,7 @@ pub(crate) fn users_overlay(ui: Ui) -> impl IntoView {
             // list for an answer that cannot differ between them.
             let gate = write_gate(&ui, &t);
             let right = v_stack((
-                detail_pane(&ui, &t, gate),
+                detail_pane(&ui, &t, gate, ring.clone()),
                 footer(&ui, &t, state, filter, grants, close.clone(), ring.clone()),
             ))
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0).height_full().flex_col());
@@ -444,7 +444,7 @@ fn account_row(
 
 // ── the detail pane ──────────────────────────────────────────────────────────
 
-fn detail_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate) -> AnyView {
+fn detail_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) -> AnyView {
     let selected = ui.overlay.users_selected;
     let grants = ui.overlay.users_grants;
     // The target's, not the active connection's — see [`UsersTarget::dialect`].
@@ -466,7 +466,7 @@ fn detail_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate) -> AnyView {
                 // other, so an absent actions row left a hole between the name
                 // and the attributes — the trap `properties::stats_body` states.
                 let mut sections: Vec<AnyView> = vec![heading(&p)];
-                sections.extend(actions_row(&ui, &target, gate, &p));
+                sections.extend(actions_row(&ui, &target, gate, &p, ring.clone()));
                 if !p.attributes.is_empty() {
                     sections.push(section(
                         "Attributes",
@@ -680,7 +680,13 @@ fn new_account_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRi
 /// actions are about the *modal* (Copy what is shown, Close it) and these are
 /// about one account. A Drop in the footer would also sit one Tab away from
 /// Close, which is the wrong pair of neighbours for an irreversible action.
-fn actions_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, p: &Principal) -> Option<AnyView> {
+fn actions_row(
+    ui: &Ui,
+    target: &UsersTarget,
+    gate: WriteGate,
+    p: &Principal,
+    ring: FocusRing,
+) -> Option<AnyView> {
     if !gate.offered() {
         return None;
     }
@@ -695,7 +701,6 @@ fn actions_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, p: &Principal) ->
         ));
     }
     let enabled = gate.enabled();
-    let ring = FocusRing::new();
 
     let grant_ui = ui.clone();
     let grant_target = target.clone();
@@ -705,7 +710,14 @@ fn actions_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, p: &Principal) ->
         ActionKind::Quiet,
         enabled,
         ring.clone(),
-        1,
+        // **The modal's own ring, in the fixed band above `+ New account`.**
+        // These two used to make a `FocusRing::new()` of their own, with no
+        // focus root stepping it — so clicking one focused it and Tab then
+        // cycled the pair forever, with Escape the only way out. Reusing the
+        // modal's ring at 1 and 2 would put them *before* the search field, so
+        // they sit after the list's last fixed stop (11) and before the
+        // footer's `ACTION_TAB`.
+        12,
         move || {
             crate::account_editor::open_for_grant(
                 &grant_ui,
@@ -727,7 +739,7 @@ fn actions_row(ui: &Ui, target: &UsersTarget, gate: WriteGate, p: &Principal) ->
     // `conn_id` before it applies anything.
     let plan_conn_id = target.conn_id;
     let confirm = ui.overlay.confirm;
-    let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 2, move || {
+    let drop = action_button("Drop", ActionKind::Danger, enabled, ring, 13, move || {
         let ui = drop_ui.clone();
         let database = drop_target.database.clone().unwrap_or_default();
         let who = drop_who.clone();
