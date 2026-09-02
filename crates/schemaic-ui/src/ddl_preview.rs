@@ -156,8 +156,14 @@ pub(crate) fn preview_of(
             crate::DdlScope::Database
         },
         subject: subject.into(),
+        // Off the change set, like `scope` above — but a *different* question:
+        // see `DdlPreview::qualified`. An account is server-wide and takes the
+        // in-database runner, so the two answers differ for exactly this case.
+        qualified: !cs.changes.iter().any(schemaic_core::ddl::is_server_level)
+            && !cs.changes.iter().all(schemaic_core::ddl::is_account_change),
         changes: cs.changes.iter().map(|c| c.summary()).collect(),
         destructive: cs.destructive(),
+        risk_heading: cs.risk_heading(),
         withheld: cs.unsupported(),
         statements: cs.emit(),
         // **`export_script`, not `editor_script`.** This field is what Copy and
@@ -384,13 +390,17 @@ fn change_line(label: String) -> impl IntoView {
 
 /// The destructive block. Present ⇒ this plan takes something away, and the
 /// wording says what rather than "are you sure".
-fn risk_block(risks: Vec<String>) -> impl IntoView {
+fn risk_block(heading: &'static str, risks: Vec<String>) -> impl IntoView {
     let empty_block = risks.is_empty();
     v_stack((
         h_stack((
             icons::icon(icons::TRIANGLE_ALERT, 15.0)
                 .style(|s| s.color(theme::error()).flex_shrink(0.0_f32)),
-            text("This can't be undone").style(|s| {
+            // **The change set's, not a literal here.** See
+            // `ChangeSet::risk_heading`: a revoke's own sentence says it is
+            // undone by granting it back, and it appeared under "This can't be
+            // undone" two entries away from `DROP USER`.
+            text(heading).style(|s| {
                 s.color(theme::error())
                     .font_size(theme::font_body())
                     .font_bold()
@@ -553,6 +563,34 @@ fn connection_label(ui: &Ui, conn_id: u64) -> String {
     })
 }
 
+/// The preview modal's title bar.
+///
+/// **A server-level plan has no database to qualify against**, and the subject
+/// *is* the database — so the usual `db.subject` would read `.schemaic_probe`, a
+/// qualifier with nothing on its left.
+///
+/// **And an account is not in a database either.** `DdlScope` answers which
+/// *runner* a plan takes, and an account change deliberately takes the ordinary
+/// in-database one (`ddl::is_account_change` — a PostgreSQL grant has to run in
+/// the database whose catalogue holds the object). It inherited the qualifier as
+/// a side effect, so `CREATE USER 'app'@'%'` — server-wide on both engines —
+/// was titled `shop.app@%`, which reads as scoped and is not. `qualified` is the
+/// separate question: what the plan is *about*, read off the change set by
+/// `preview_of`, not off which connection carries it.
+///
+/// A free function so the sentence has a test; it was a `match` inside a
+/// `dyn_container` child.
+pub(crate) fn preview_title(connection: &str, p: &DdlPreview) -> String {
+    if p.qualified {
+        format!(
+            "Apply changes to {connection} · {}.{}",
+            p.database, p.subject
+        )
+    } else {
+        format!("Apply changes to {connection} · {}", p.subject)
+    }
+}
+
 pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
     // Closing returns to the designer when it's still open behind — the draft is
@@ -601,25 +639,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             // Read before `ui` is moved into the footer's closures.
-            //
-            // **A server-level plan has no database to qualify against**, and
-            // the subject *is* the database — so the usual `db.subject` would
-            // read `.schemaic_probe`, a qualifier with nothing on its left.
-            // `DdlScope` is the question rather than an emptiness test on the
-            // string, so the two can't disagree about which plan this is.
-            let title = match p.scope {
-                crate::DdlScope::Server => format!(
-                    "Apply changes to {} · {}",
-                    connection_label(&ui, p.conn_id),
-                    p.subject
-                ),
-                crate::DdlScope::Database => format!(
-                    "Apply changes to {} · {}.{}",
-                    connection_label(&ui, p.conn_id),
-                    p.database,
-                    p.subject
-                ),
-            };
+            let title = preview_title(&connection_label(&ui, p.conn_id), &p);
 
             // The script box, then the footer. The box is read-only, but it is
             // the thing this modal exists to be *read*, and Tab is how a keyboard
@@ -660,7 +680,8 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     form_section_owned(format!("{n} {}", plural(n, "Change", "Changes"))),
                     v_stack_from_iter(p.changes.iter().cloned().map(change_line))
                         .style(|s| s.flex_col().width_full()),
-                    risk_block(p.destructive.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
+                    risk_block(p.risk_heading, p.destructive.clone())
+                        .style(|s| s.margin_top(theme::scaled(14.0))),
                     withheld_block(p.withheld.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
                     form_section("SQL").style(|s| s.margin_top(theme::scaled(18.0))),
                     // Read-only, but a real editor field: the script is meant to
@@ -1311,6 +1332,62 @@ mod tests {
         let p = preview_of(1, "shop", "orders", &table, false);
         assert_eq!(p.scope, crate::DdlScope::Database);
         assert_eq!(p.dialect, SqlDialect::MySql);
+    }
+
+    /// **Which runner a plan takes and what it is *about* are two questions**,
+    /// and the title asked the first. An account change takes the in-database
+    /// runner deliberately — a PostgreSQL grant has to run in the database whose
+    /// catalogue holds the object — and is nonetheless server-wide, so
+    /// `CREATE USER 'app'@'%'` was titled `shop.app@%`, which reads as scoped
+    /// and is not.
+    #[test]
+    fn only_a_plan_that_lives_in_a_database_is_qualified_by_one() {
+        use schemaic_core::ddl::{Change, DatabaseDraft};
+
+        // A table: in the database, and qualified by it.
+        let table =
+            schemaic_core::ddl::single("orders", None, SqlDialect::MySql, Change::TruncateTable);
+        let p = preview_of(1, "shop", "orders", &table, false);
+        assert!(p.qualified);
+        assert_eq!(
+            preview_title("My MariaDB", &p),
+            "Apply changes to My MariaDB · shop.orders"
+        );
+
+        // An account: the in-database *runner*, and no database to be in.
+        let account = schemaic_core::ddl::account(
+            "app@%",
+            SqlDialect::MySql,
+            Change::CreateAccount(Box::new(schemaic_core::users::AccountDraft {
+                name: "app".into(),
+                ..Default::default()
+            })),
+        );
+        let p = preview_of(1, "shop", "app@%", &account, false);
+        assert_eq!(
+            p.scope,
+            crate::DdlScope::Database,
+            "the runner is unchanged"
+        );
+        assert!(!p.qualified);
+        assert_eq!(
+            preview_title("My MariaDB", &p),
+            "Apply changes to My MariaDB · app@%"
+        );
+
+        // A container: neither, and the arm that already existed — the subject
+        // *is* the database, so a qualifier would have nothing on its left.
+        let create = schemaic_core::ddl::server_level(
+            "shop",
+            SqlDialect::MySql,
+            Change::CreateDatabase(Box::new(DatabaseDraft::blank("shop"))),
+        );
+        let p = preview_of(1, "", "shop", &create, false);
+        assert!(!p.qualified);
+        assert_eq!(
+            preview_title("My MariaDB", &p),
+            "Apply changes to My MariaDB · shop"
+        );
     }
 
     /// **Whether the preview's exits may stop an apply is the engine's

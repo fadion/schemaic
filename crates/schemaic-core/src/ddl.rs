@@ -3390,6 +3390,24 @@ impl Change {
     pub fn is_destructive(&self, dialect: SqlDialect) -> bool {
         !self.risks(dialect).is_empty()
     }
+
+    /// Is what this change takes away put back by doing the opposite?
+    ///
+    /// **The preview's risk block heads itself "This can't be undone"**, which
+    /// is true of everything that drops or rewrites data and false of the three
+    /// arms below. A revoke's own sentence says so — "destroys no data and is
+    /// undone by granting it back" — and it appeared under that heading two
+    /// entries away from `DROP USER`, which is the one modal where the heading
+    /// has to keep its meaning. Creating an account destroys nothing at all.
+    ///
+    /// The *reversible* list is the narrow one, so a fourth change inherits the
+    /// strong heading rather than losing it by omission.
+    fn risk_is_reversible(&self) -> bool {
+        matches!(
+            self,
+            Change::RevokePrivileges(_) | Change::RevokeRole(_) | Change::CreateAccount(_)
+        )
+    }
 }
 
 /// The sentence behind a rename-create-recast-drop rebuild.
@@ -3760,6 +3778,21 @@ impl ChangeSet {
             self.withheld_header(),
             client_script(&self.emit(), self.dialect)
         )
+    }
+
+    /// What the preview's risk block calls itself.
+    ///
+    /// The heading was a literal in the view — "This can't be undone" — over a
+    /// list that now includes consequences which *are* undone, and which sit two
+    /// entries away from `DROP USER` in the same modal. It is here rather than
+    /// there because it is a claim about the changes, and because a heading that
+    /// contradicts the sentence beneath it costs the sentence its weight.
+    pub fn risk_heading(&self) -> &'static str {
+        if self.changes.iter().all(Change::risk_is_reversible) {
+            "Before you apply"
+        } else {
+            "This can't be undone"
+        }
     }
 
     /// The script as it may **leave** the preview — for the clipboard, and for
@@ -19222,6 +19255,61 @@ mod database_tests {
     /// up blue — over an account any host on the network can log in as with no
     /// password, and one MySQL's `validate_password` does not fire on because
     /// there is no `IDENTIFIED BY` to check.
+    /// **The heading has to agree with the sentence under it.** A revoke's own
+    /// risk says it "destroys no data and is undone by granting it back", and it
+    /// appeared under "This can't be undone" — in the one modal where that
+    /// heading must keep its meaning, two entries away from `DROP USER`.
+    #[test]
+    fn the_risk_heading_does_not_contradict_the_risk_it_heads() {
+        let heading = |c: Change| account("app@%", MySql, c).risk_heading();
+        // Undone by doing the opposite…
+        assert_eq!(
+            heading(Change::RevokePrivileges(a_privilege_change(&["SELECT"]))),
+            "Before you apply"
+        );
+        assert_eq!(
+            heading(Change::RevokeRole(Box::new(crate::users::RoleChange {
+                role: an_account(),
+                member: an_account(),
+                with_admin_option: false,
+            }))),
+            "Before you apply"
+        );
+        // …and creating an account destroys nothing at all, though a blank
+        // password is worth a sentence.
+        assert_eq!(
+            heading(Change::CreateAccount(Box::new(
+                crate::users::AccountDraft {
+                    name: "app".into(),
+                    ..Default::default()
+                }
+            ))),
+            "Before you apply"
+        );
+
+        // Everything else keeps the strong heading, including the drop that
+        // stands beside them.
+        assert_eq!(
+            heading(Change::DropAccount(Box::new(an_account()))),
+            "This can't be undone"
+        );
+        let table = single("orders", None, MySql, Change::TruncateTable);
+        assert_eq!(table.risk_heading(), "This can't be undone");
+        assert_eq!(
+            single("orders", None, MySql, Change::DropTable).risk_heading(),
+            "This can't be undone"
+        );
+
+        // A *mixed* plan takes the strong one: one irreversible change is
+        // enough, and the weaker heading over it would be the wrong way to be
+        // wrong.
+        let mut mixed = account("app@%", MySql, Change::DropAccount(Box::new(an_account())));
+        mixed
+            .changes
+            .push(Change::RevokePrivileges(a_privilege_change(&["SELECT"])));
+        assert_eq!(mixed.risk_heading(), "This can't be undone");
+    }
+
     /// Two accounts, two lines. `Create user app` named neither the host it was
     /// given nor the one MySQL would fill in.
     #[test]

@@ -882,11 +882,26 @@ pub struct DdlPreview {
     pub scope: DdlScope,
     /// What the plan is about, for the title ("orders", or a new table's name).
     pub subject: String,
+    /// Does `subject` live **in** `database`, so the title may write
+    /// `database.subject`?
+    ///
+    /// Not the same question as [`DdlScope`], which decides which *runner* the
+    /// plan takes. An account change takes the in-database runner (a PostgreSQL
+    /// grant has to run in the database whose catalogue holds the object) and is
+    /// nonetheless server-wide, so it inherited a qualifier that reads as a
+    /// scope it does not have: `CREATE USER 'app'@'%'` titled `shop.app@%`.
+    /// Read off the change set by `ddl_preview::preview_of`, like `scope`.
+    pub qualified: bool,
     /// One plain-language line per change.
     pub changes: Vec<String>,
     /// What the plan destroys, in plain language. Non-empty ⇒ the modal says so
     /// before the Apply button, in the error colour.
     pub destructive: Vec<String>,
+    /// What that block calls itself — see
+    /// [`schemaic_core::ddl::ChangeSet::risk_heading`]. Off the change set, so a
+    /// consequence that *is* undone does not appear under "This can't be undone"
+    /// two entries away from `DROP USER`.
+    pub risk_heading: &'static str,
     /// What the plan asks for that this engine **can't express** — see
     /// [`schemaic_core::ddl::ChangeSet::unsupported`]. Non-empty ⇒ the modal
     /// names each one and Apply refuses, because `statements` is then less than
