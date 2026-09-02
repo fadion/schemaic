@@ -65,6 +65,40 @@ const ACCOUNT_PANEL_H: f64 = 380.0;
 /// windows, which is what the scroll is for.
 const GRANT_PANEL_H: f64 = 560.0;
 
+/// Where the privilege tag cloud's Tab stops begin.
+///
+/// **A growing block inside the fixed band, which is the shape `VALUE_TAB`'s
+/// doc names as unsafe** — so it is given a *reserved span* rather than left to
+/// run into its neighbour. `With grant option` used to sit at a fixed `90`
+/// fifteen lines below a block claiming `50 + i`: today's widest list is MySQL's
+/// eighteen, so the ceiling is 67 and nothing collides, but
+/// `users::privileges_for`'s own doc calls that list "curated, not exhaustive"
+/// and names the dozens left out. Adding 23 of them would put a tag at exactly
+/// 90, and `FocusRing::register` inserts *after* an equal index — so Tab would
+/// visit the last tag and the toggle in build order, and `focus_at(90)` would
+/// resolve to whichever happened to be first.
+///
+/// The block cannot be moved above the toggle (`VALUE_TAB`'s home) because the
+/// toggle comes after it on screen, so the span is what makes the collision
+/// impossible instead: `every_privilege_list_fits_its_tab_span` asserts every
+/// dialect × level fits, and the compile-time chain below keeps the whole thing
+/// inside the fixed band.
+const PRIVILEGE_TAB: u32 = 50;
+
+/// How many Tab stops [`PRIVILEGE_TAB`] reserves before the next fixed control.
+///
+/// Enough for every privilege either engine has ever documented, several times
+/// over — the point is that the number is stated and checked rather than being
+/// the distance to whatever was written next.
+const PRIVILEGE_TAB_SPAN: u32 = 200;
+
+const _: () = {
+    assert!(
+        PRIVILEGE_TAB + PRIVILEGE_TAB_SPAN < crate::widgets::FIXED_TAB_END,
+        "the privilege block and the control after it must stay in the fixed band"
+    );
+};
+
 fn field_w() -> f64 {
     theme::scaled(260.0)
 }
@@ -551,13 +585,17 @@ pub(crate) fn account_editor_overlay(ui: Ui) -> impl IntoView {
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             modal_shell(
                 "Create account".to_string(),
-                body.into_any(),
-                status.into_any(),
-                actions.into_any(),
+                ShellParts {
+                    body: body.into_any(),
+                    status: status.into_any(),
+                    actions: actions.into_any(),
+                },
                 close_x,
                 root_ring,
-                panel_w(),
-                ACCOUNT_PANEL_H,
+                ShellSize {
+                    width: panel_w(),
+                    height: ACCOUNT_PANEL_H,
+                },
             )
         },
     )
@@ -765,11 +803,9 @@ fn grant_form(
                 // actually asking: *which of these*.
                 let all = users::privileges_for(dialect, kind);
                 rows.push(
-                    h_stack_from_iter(
-                        all.iter().enumerate().map(|(i, &p)| {
-                            privilege_tag(draft, p, all, ring.clone(), 50 + i as u32)
-                        }),
-                    )
+                    h_stack_from_iter(all.iter().enumerate().map(|(i, &p)| {
+                        privilege_tag(draft, p, all, ring.clone(), PRIVILEGE_TAB + i as u32)
+                    }))
                     .style(|s| {
                         s.flex_row()
                             .flex_wrap(floem::style::FlexWrap::Wrap)
@@ -782,9 +818,13 @@ fn grant_form(
                     rows.push(
                         form_setting(
                             "With grant option",
-                            bound_toggle(draft, seed.with_grant_option, ring, 90, |d, v| {
-                                d.with_grant_option = v
-                            }),
+                            bound_toggle(
+                                draft,
+                                seed.with_grant_option,
+                                ring,
+                                PRIVILEGE_TAB + PRIVILEGE_TAB_SPAN,
+                                |d, v| d.with_grant_option = v,
+                            ),
                         )
                         .into_any(),
                     );
@@ -950,13 +990,17 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             modal_shell(
                 format!("Privileges — {}", who.display()),
-                body.into_any(),
-                status.into_any(),
-                actions.into_any(),
+                ShellParts {
+                    body: body.into_any(),
+                    status: status.into_any(),
+                    actions: actions.into_any(),
+                },
                 close_x,
                 root_ring,
-                grant_panel_w(),
-                GRANT_PANEL_H,
+                ShellSize {
+                    width: grant_panel_w(),
+                    height: GRANT_PANEL_H,
+                },
             )
         },
     )
@@ -971,20 +1015,41 @@ pub(crate) fn grant_editor_overlay(ui: Ui) -> impl IntoView {
 
 // ── the shell both forms wear ────────────────────────────────────────────────
 
-/// Title bar, body, footer, backdrop and the Escape handler — the parts both
-/// forms have identically, written once so they cannot drift into two modals
-/// that dismiss differently.
-#[allow(clippy::too_many_arguments)]
-fn modal_shell(
-    title: String,
+/// The three views [`modal_shell`] lays out.
+///
+/// **Named fields, because they are all `AnyView`.** Three same-typed
+/// positionals in a row transpose silently — a status line where the actions go
+/// compiles and renders a footer with the buttons on the wrong side — and this
+/// is the shell both forms wear, so the mistake would be invisible in one of
+/// them until someone opened it.
+struct ShellParts {
     body: AnyView,
     status: AnyView,
     actions: AnyView,
-    close: Rc<dyn Fn()>,
-    ring: FocusRing,
+}
+
+/// The panel's size. Same reason: two `f64`s in a row.
+struct ShellSize {
     width: f64,
     height: f64,
+}
+
+/// Title bar, body, footer, backdrop and the Escape handler — the parts both
+/// forms have identically, written once so they cannot drift into two modals
+/// that dismiss differently.
+fn modal_shell(
+    title: String,
+    parts: ShellParts,
+    close: Rc<dyn Fn()>,
+    ring: FocusRing,
+    size: ShellSize,
 ) -> AnyView {
+    let ShellParts {
+        body,
+        status,
+        actions,
+    } = parts;
+    let ShellSize { width, height } = size;
     let panel = v_stack((
         modal_title_owned(title, close.clone(), ring.clone()),
         body,
@@ -1156,6 +1221,25 @@ mod form_shape_tests {
             },
         ] {
             assert_ne!(grant_form_shape(&picked), shape, "{picked:?}");
+        }
+    }
+
+    /// **The reserved span is only worth having if something checks it.** Every
+    /// list either engine offers, at every level it offers one, has to fit
+    /// between `PRIVILEGE_TAB` and the fixed control after it — otherwise a tag
+    /// and that control share an index, `FocusRing::register` orders them by
+    /// build order, and `focus_at` resolves to whichever is first.
+    #[test]
+    fn every_privilege_list_fits_its_tab_span() {
+        use schemaic_core::users::{levels_for, privileges_for};
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for kind in levels_for(d) {
+                let n = privileges_for(d, *kind).len() as u32;
+                assert!(
+                    n < PRIVILEGE_TAB_SPAN,
+                    "{d:?}/{kind:?} has {n} privileges, past the {PRIVILEGE_TAB_SPAN} reserved"
+                );
+            }
         }
     }
 }
