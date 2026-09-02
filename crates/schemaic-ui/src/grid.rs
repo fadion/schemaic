@@ -7153,17 +7153,17 @@ fn grid_toolbar(
         gs.popup_anchor
             .set(Some(anchor_below(copy_origin.get_untracked())));
         gs.popup.set(Some(
-            // **Text formats only.** `render_export` produces a `String`, and a
-            // binary format's rendering is not one — `export::to_string` turns
-            // it into the *empty* string, so an Excel entry here would silently
-            // clear the clipboard and report success. The Download menu below
-            // offers every format, because a file can hold bytes. Same split the
-            // ER diagram's two menus already make for PNG
-            // (`erd_export::ErdExportFormat::is_text`).
-            ExportFormat::ALL
-                .iter()
-                .filter(|f| f.is_text())
-                .map(|&f| {
+            // **Text formats only**, and the list is `clipboard_formats()`
+            // rather than a filter written here: `render_export` produces a
+            // `String`, and a binary format's rendering is not one —
+            // `export::to_string` turns it into the *empty* string, so an Excel
+            // entry would silently clear the clipboard and report success. The
+            // filter used to be inline, in a file with no test module, so
+            // deleting it left the suite green; the composition now has a name
+            // and a test. The Download menu below still offers every format,
+            // because a file can hold bytes.
+            ExportFormat::clipboard_formats()
+                .map(|f| {
                     MenuEntry::action(f.label(), move || {
                         let _ = floem::Clipboard::set_contents(render_export(gs, f));
                     })
