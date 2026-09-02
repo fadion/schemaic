@@ -1956,8 +1956,8 @@ fn export_column_csv(gs: GridState, ci: usize) -> String {
 ///
 /// **The scope step appears only when the two scopes differ.** An uncapped result
 /// *is* every row, so offering to fetch them again would be a choice between a
-/// thing and itself, and the flat five-item menu the user already knows is the
-/// right menu for it. It also needs a statement to re-run
+/// thing and itself, and the flat one-entry-per-format menu the user already
+/// knows is the right menu for it. It also needs a statement to re-run
 /// (`current_statement`) — a result spliced together by a refetch, or one with no
 /// captured `base_sql`, has none, and the cap is then the only honest scope on
 /// offer.
@@ -7153,8 +7153,16 @@ fn grid_toolbar(
         gs.popup_anchor
             .set(Some(anchor_below(copy_origin.get_untracked())));
         gs.popup.set(Some(
+            // **Text formats only.** `render_export` produces a `String`, and a
+            // binary format's rendering is not one — `export::to_string` turns
+            // it into the *empty* string, so an Excel entry here would silently
+            // clear the clipboard and report success. The Download menu below
+            // offers every format, because a file can hold bytes. Same split the
+            // ER diagram's two menus already make for PNG
+            // (`erd_export::ErdExportFormat::is_text`).
             ExportFormat::ALL
                 .iter()
+                .filter(|f| f.is_text())
                 .map(|&f| {
                     MenuEntry::action(f.label(), move || {
                         let _ = floem::Clipboard::set_contents(render_export(gs, f));

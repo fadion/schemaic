@@ -371,11 +371,12 @@ fn unnamed_column(i: usize) -> String {
 /// has no such table. Its rows are not rows of the watched table — they are
 /// observations *about* it, a third of them deletions — so every statement that
 /// export produced would be a plausible-looking lie about where the data goes.
-pub const LOG_FORMATS: [crate::export::ExportFormat; 4] = [
+pub const LOG_FORMATS: [crate::export::ExportFormat; 5] = [
     crate::export::ExportFormat::Json,
     crate::export::ExportFormat::Csv,
     crate::export::ExportFormat::Markdown,
     crate::export::ExportFormat::Html,
+    crate::export::ExportFormat::Xlsx,
 ];
 
 /// Project a change log into a [`ResultSet`] so it exports through the ordinary
@@ -1179,8 +1180,11 @@ mod tests {
     /// formats, indistinguishable from a column whose value is the string
     /// "NULL".
     ///
-    /// Table-driven over [`LOG_FORMATS`] so a fifth format has to state its
-    /// answer rather than inherit CSV's by omission.
+    /// Table-driven over [`LOG_FORMATS`] so a sixth format has to state its
+    /// answer rather than inherit CSV's by omission — which is exactly what
+    /// Excel had to do when it arrived: its spelling of absent is an *empty
+    /// cell*, and a worksheet is the one place where that is genuinely not the
+    /// same value as an empty string.
     #[test]
     fn every_log_format_renders_a_null_its_own_way() {
         use crate::export::ExportFormat;
@@ -1204,12 +1208,49 @@ mod tests {
         let order: Vec<usize> = (0..rs.row_count()).collect();
         let render = |f: ExportFormat| f.render(&rs, &order, None, crate::intel::SqlDialect::MySql);
 
-        for f in LOG_FORMATS {
+        for f in LOG_FORMATS.into_iter().filter(|f| f.is_text()) {
             let out = render(f);
             // The transition is text in every format, and says NULL on its right.
             assert!(
                 out.contains(&format!("hi{TRANSITION}NULL")),
                 "{f:?}: the transition lost its wording\n{out}"
+            );
+        }
+
+        // Excel is the one format whose output isn't a string, so it is read
+        // back as cells. Same two properties: the transition keeps its wording,
+        // and the standalone NULL is an *empty cell* — not the text "NULL",
+        // which would be indistinguishable from a value that really is "NULL".
+        {
+            use calamine::{Data, Reader, Xlsx};
+            let mut buf = Vec::new();
+            ExportFormat::Xlsx
+                .render_to(&mut buf, &rs, &order, None, crate::intel::SqlDialect::MySql)
+                .expect("writing to a Vec cannot fail");
+            let mut wb: Xlsx<_> = Xlsx::new(std::io::Cursor::new(buf)).expect("a valid workbook");
+            let name = wb.sheet_names()[0].clone();
+            let range = wb.worksheet_range(&name).expect("the first sheet");
+            let header: Vec<String> = range
+                .rows()
+                .next()
+                .unwrap()
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
+            let row = range.rows().nth(1).expect("one logged change");
+            let note = header
+                .iter()
+                .position(|h| h == "note")
+                .expect("a note column");
+            let extra = header
+                .iter()
+                .position(|h| h == "extra")
+                .expect("an extra column");
+            assert_eq!(row[note].to_string(), format!("hi{TRANSITION}NULL"));
+            assert_eq!(
+                row[extra],
+                Data::Empty,
+                "Excel: an empty cell, not the text NULL"
             );
         }
         // …and the standalone NULL is each format's own spelling of absent.
