@@ -82,7 +82,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     bytes. SQLite's was the honest answer and is now everyone's.
     **What the wire carries is not what a type is, and `BIT` is the case that proves it**: MySQL
     hands a bit-field over as bytes, which put it on `type_is_binary`'s list, and a `BIT(8)` holding
-    10 then rendered as `<1 bytes>`, was *withheld* from the CSV and JSON exports — the two formats
+    10 then rendered as `<1 bytes>`, was *withheld* from the CSV and JSON exports — the formats
     this app reads back — and was read-only into the bargain. A bit-field has a lossless text form:
     its number, which is also what MySQL accepts back. So it is off that list, `type_is_bit` names
     it, and `bit_display` reads the bytes big-endian the way the server wrote them (`convert_row`
@@ -526,7 +526,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     straddles the frozen column is visually discontiguous, so copy→paste of such a selection no
     longer round-trips. The ambiguity is in the selection model, not in either surface, and both now
     agree with what is drawn rather than with each other.
-  - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
+  - `export.rs` — CSV/JSON/SQL/Markdown/HTML/Excel export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping). **Rows arrive through a pull source,
     not as a `&ResultSet`**: `RowChunks::next_chunk` hands over one `RowChunk { rs, order }` at a
     time and `ExportFormat::stream_to` renders from it, returning an `ExportTally`. Every entry
@@ -540,7 +540,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `OneChunk` is a source of exactly one chunk (what the grid's own export uses) and `PullChunks`
     adapts a `FnMut() -> io::Result<Option<ResultSet>>` — the app's `rx.blocking_recv()` —
     materialising natural order into a **reused** `Vec<usize>`, one allocation for the whole
-    export against five renderers that would each have needed a second code path. `OneChunk`
+    export against six renderers that would each have needed a second code path. `OneChunk`
     yields **even for an empty result**, which is load-bearing rather than an edge case: CSV,
     Markdown and HTML take their header from the first chunk, so a source that yielded nothing for
     a zero-row result would write an empty file where the old code wrote a header. One empty chunk
@@ -555,6 +555,41 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `streaming_render_matches_the_string_render_in_every_format` for the byte-for-byte agreement
     per format, and `a_chunked_export_matches_the_same_rows_in_one_go` for the same rows split
     into blocks rendering identically; add a new format by writing the `*_chunks` and wrapping it.
+    **Excel is the sixth format and the only binary one.** `export_xlsx_chunks` writes one worksheet
+    — named by `sheet_name` after the source table, because Excel *rejects* a workbook whose sheet
+    name breaks its rules rather than repairing it (at most 31 characters, none of `[ ] : * ? / \`,
+    no leading or trailing apostrophe, and `Result` when the result is not a table's) — with a frozen
+    bold header row and **typed cells**: `CellTag::Int`/`UInt`/`Float` become worksheet numbers and
+    everything else a string, so the application has nothing left to guess at, which is the whole
+    point of the format over a CSV that Excel then guesses at — the guess that turns `SET-1` into a
+    date and drops the leading zeros off a postcode. The exception is a number a worksheet could not
+    hold *exactly* — an `i64`/`u64` past 2^53, a non-finite float — which goes out as **text**,
+    because a worksheet number is an `f64` and a `BIGINT` key that comes back off by one is a silent
+    corruption. `rust_xlsxwriter`'s `constant_memory` feature is
+    load-bearing: it spills each finished row's XML to a library-managed temp file, which is what
+    holds an export to a bounded buffer at any row count — the bound `RowChunks` exists to give, and
+    the one an in-memory workbook would throw away at exactly the size where it matters. That makes
+    `export_xlsx_chunks` **the one function in `schemaic-core` whose tests touch the filesystem**
+    (see the pure-logic invariant). Excel's own ceilings are `XLSX_MAX_ROWS` (1,048,576),
+    `XLSX_MAX_COLS` (16,384) and `XLSX_MAX_CELL_CHARS` (32,767): a cell past the last is cut on a
+    *character* boundary and reported through `ExportTally::cut`, while a result taller than a
+    worksheet is **refused** — with an error naming CSV and JSON as the way out — rather than
+    truncated, stopping at row 1,048,576 of a 3M-row table being the one loss the file would carry no
+    trace of at all, and the `.part` dance means the refusal leaves the destination alone. A result
+    wider than a worksheet is refused the same way: unreachable in practice, since no engine returns
+    16,384 columns, but stated rather than assumed because silently dropping the columns past it
+    would be the worse failure. **The
+    known fidelity gap**: an empty *string* writes no cell, since `rust_xlsxwriter` emits nothing for
+    one, so it reads back as NULL — the same ambiguity CSV has, deliberately not fixed here.
+    And because the rendering is bytes rather than text, `ExportFormat::is_text` exists: the grid's
+    **Copy** menu renders through `render()` → `String`, where `to_string`'s `unwrap_or_default`
+    turns a binary rendering into the *empty* string, so an Excel entry there would silently clear
+    the clipboard and report success. That menu filters on the capability while the Download menu
+    still offers every format (*Data grid*) — the split `erd_export::ErdExportFormat::is_text`
+    already makes for PNG — and the capability is computed from the variant rather than stored, so a
+    seventh format has to answer it. `stream_to`/`render_to` carry a `W: Send` bound for this
+    renderer alone: `rust_xlsxwriter` hands the writer to the thread that assembles the workbook's
+    ZIP, and every sink an export already writes to (`BufWriter<File>`, `Vec<u8>`) satisfies it.
     **The formats anything reads
     back must not pass a raw-bytes cell straight through.** Such a cell is
     `model::binary_display`'s `<n bytes>` (a `Value` has no bytes variant to hold the real thing),
@@ -574,10 +609,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     The consequence to know: in a column that has handed over raw bytes, a cell whose text reads
     exactly `<n bytes>` is now withheld — the same answer a declared `BLOB` column always gave.
     **Which emitters withhold is decided by whether anything reads the format back**, and that is
-    three of the five: the SQL export (`NULL`, plus a `-- NOTE:` heading the script — a comment
+    four of the six: the SQL export (`NULL`, plus a `-- NOTE:` heading the script — a comment
     rather than a refusal, since the script still runs and the one thing it may not do is pretend
-    the placeholder was the data) and **CSV and JSON**, which are exactly `import::ImportFormat`,
-    including their single-column "copy this column" forms. Markdown and HTML keep it, deliberately:
+    the placeholder was the data) and **CSV, JSON and Excel**, which are exactly
+    `import::ImportFormat`, including the single-column "copy this column" forms the first two have
+    (a worksheet has none). Markdown and HTML keep it, deliberately:
     nothing reads those back, and there the placeholder is the *useful* rendering — blanking it
     would make a 4 MB blob indistinguishable from an empty cell and from NULL, which is less than
     what the grid itself shows. This was the SQL export alone at first, and the commit that made it
@@ -596,11 +632,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     that collapses to exactly the old behaviour, one note before the first `INSERT` naming every
     withheld column (`the_binary_note_finds_a_column_that_only_drops_later`).
     **`ExportTally` is what a renderer returns, because a row count was never the whole result.**
-    `rows`, plus `withheld` (those binary columns, named — empty for Markdown and HTML) and `blanked`
-    (`ResultSet::capped_columns`, the cells past a column's 512 MiB arena, which read back as the
-    empty string). Nothing had ever read that second flag, so a streamed chunk that overran the arena
-    wrote a file with holes in it and reported a full row count: the grid surfaces the arena cap with
-    a note of its own, but a streamed chunk is never mounted in a grid. `ExportTally::note` folds one
+    `rows`, plus three losses the file itself shows no trace of: `withheld` (those binary columns,
+    named — empty for Markdown and HTML), `blanked` (`ResultSet::capped_columns`, the cells past a
+    column's 512 MiB arena, which read back as the empty string) and `cut` (columns cut to
+    `XLSX_MAX_CELL_CHARS`, which only the Excel renderer can produce). Nothing had ever read that
+    second flag, so a streamed chunk that overran the arena wrote a file with holes in it and
+    reported a full row count: the grid surfaces the arena cap with a note of its own, but a streamed
+    chunk is never mounted in a grid. **`cut` is a third category rather than an arm of
+    `blanked`** because the two say different things to someone deciding how much of the file to
+    trust: a blanked cell is empty and looks like a NULL, a cut one *looks complete* — and it
+    is the only one of the three the user can act on, by exporting that column as CSV or JSON, which
+    have no cell ceiling. It is spelled `cut` and not `truncated`, the word it wanted, because
+    `ResultSet::truncated` already means the *row cap* was hit and both are read in the same export
+    and grid paths — `grid.rs` asks `rs.truncated` for the export-scope split a few lines from where
+    it receives this tally, and two fields of one name meaning different losses is how a caveat ends
+    up reporting the wrong one. `export_note` says it, `absorb` folds it and `has_caveat` counts it, on the
+    rules the other two already follow. `ExportTally::note` folds one
     chunk's losses in without repeating a name, since a streamed export meets the same column in
     every chunk and a caveat that named `body` two hundred times would say less than one that names
     it once. `ExportTally::absorb` is that same question one level up — folding **another table's**
@@ -608,7 +655,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     many tables into one file and reports one sentence about it. It lives here rather than in the
     dump's writer loop for the reason `dump_verdict` does: written out at the call site it is a fold
     nothing can test, the caller needing a `Db`, a runtime handle and two channels to reach.
-    Neither loss is an error — the file is written and the rows in it are real — so the one
+    None of the three is an error — the file is written and the rows in it are real — so the one
     thing that must not happen is the caveat going unsaid, which is `export_note(tally, name,
     streaming)`'s job: silent for a clean non-streamed save, and never silent when there is a caveat.
     `export_failure_note(message, partial)` is the same rule on the other side, and what it has to
@@ -620,7 +667,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     an error because stopping was the user's own doing. And
     `all_rows_label(size, sorted, manual_tx)` is the Download menu's `All rows` entry, three
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
-  - `import.rs` — the inverse of `export.rs`: CSV/TSV + JSON (array *or* NDJSON) → table. Format
+  - `import.rs` — the inverse of `export.rs`: CSV/TSV, JSON (array *or* NDJSON) and Excel
+    `.xlsx` → table. Format
     inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
     a header, positional without), per-column `coerce` (only the families a wrong answer would
     definitely break — int/uint/float/exact/bool; everything else passes through, the **server stays
@@ -639,13 +687,68 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     field-count check, where a mismatch means a stray delimiter). An array and JSON Lines read
     through one path: `ArrayUnwrap` blanks the wrapping brackets + top-level commas as bytes
     stream past, so a sample really stops at its limit instead of deserializing the file first
-    (a whole-file walk still buffers, for the key union). NULL tokens match the *trimmed* field,
-    except the empty one, which is exact — a blank field is data, and `trim` is the setting that
-    says otherwise. `read_sample` is bounded at `SAMPLE_MAX_BYTES`, because a **record count is not
-    a byte bound**: the CSV reader sets no field-size limit, so one stray `"` makes the whole
+    (a whole-file walk still buffers, for the key union). CSV's NULL tokens match the *trimmed*
+    field, except the empty one, which is exact — a blank field is data, and `trim` is the setting
+    that says otherwise. `read_sample` is bounded at `SAMPLE_MAX_BYTES` for the two streamable
+    formats, because a **record count is not a byte bound**: the CSV reader sets no field-size
+    limit, so one stray `"` makes the whole
     remainder of a file a single unterminated field and a sample "of 200 records" reads to EOF —
-    from a file the user only meant to look at. `target_verdict` over `DbNodeView` is the modal's
-    other half: whether a schema change means the table it is open on has *gone*. `has_table` is an
+    from a file the user only meant to look at.
+    **Excel is the third format, and a workbook is a file with several tables in it.**
+    `infer_format` takes `xlsx`/`xlsm` and deliberately **not** `.xls`/`.xlsb` — different formats
+    this reader cannot open, where guessing would trade a clear "unsupported file" for a parse error
+    on a file that was never going to work. `ReadConfig::sheet` picks the worksheet (`None` = the
+    first, which is what a one-sheet workbook wants), and a name that no longer matches any sheet is
+    an **error rather than a fall back to the first**: a workbook edited between the preview and the
+    load would otherwise import a different table than the one the user reviewed, which is the
+    failure worth being loud about. `open_xlsx` opens the file and `xlsx_records` is the single
+    reader the preview, the validation pass and the load all walk, as `json_records` is for JSON;
+    `read_workbook_sample` is the probe's entry point, returning the preview **and** the sheet names
+    from one parse, because a second call to list the sheets meant opening and inflating the whole
+    workbook again on every settings change. Two properties of that walk are load-bearing and neither
+    is visible in an `A1`-anchored fixture: rows are numbered from `range.start()`, since
+    `worksheet_range` returns the *used* range and a sheet with a title block above its header starts
+    partway down (enumerating it sent the user to look at a blank row), and a **wholly empty row is
+    not a record**, since the used range is a rectangle and a blank spacer row would otherwise insert
+    a row of NULLs nobody typed. `xlsx_size_refusal` is asked of the file's *stat* before any of it
+    is read: CSV and JSON bound their preview at `SAMPLE_MAX_BYTES` and stop, but a ZIP's directory
+    is at the end, so a workbook must be read whole before its first row can be shown — which put the
+    unbounded read ahead of the memory warning meant to precede it. `cell_text` is one cell → `Field`, and its conversions are chosen
+    so a value that came *out* of a database survives the trip back in: an empty cell → null; a
+    number in `f64`'s shortest round-trip form, so `7.0` is `7` (an `INT` column rejects the latter,
+    and Excel has no integer type to tell them apart); a date or time as ISO 8601 rather than the
+    serial number Excel actually stores, since a `DATE` column otherwise receives `45292`; a bool as
+    `true`/`false`, spellings `coerce` already accepts; a **duration** through `duration_hms` as
+    `H:MM:SS` with hours deliberately unwrapped past 24, since a `[h]:mm:ss` cell holds a fraction of
+    a day and emitting it as decimal hours put a timesheet's 8h30m into a MySQL `TIME` column as
+    `8.500000` — eight and a half *seconds*, wrong by 3600× and silent, because the value coerces
+    perfectly well; and a formula error in **Excel's own spelling** (`#REF!`, `#DIV/0!`, from
+    calamine's `Display` rather than its `Debug`, which gives a `Div0` that appears nowhere in the
+    application the user is looking at) as its own text rather than a null, so a cell the sheet
+    itself could not evaluate surfaces as an `Issue` naming the row. **`ImportFormat::has_own_nulls` is the capability the null rules ask** — true for JSON
+    and Excel, false for CSV — because a worksheet's empty cell is a real null and `NullRule`'s token
+    list must not apply to it; it replaced two separate `match format` expressions, in `validate` and
+    in `row_iter`, that had to agree with each other. `RowSourceIter::Json` is now
+    `RowSourceIter::Buffered` and carries both: the same buffering for two different causes, JSON not
+    knowing its columns before EOF and an `.xlsx` not being readable as a prefix at all.
+    `trim_to_mapping` puts Excel on **CSV's** side rather than JSON's, the used range fixing the
+    width. **`read_sample` bypasses `SAMPLE_MAX_BYTES` for a workbook** for that same prefix reason:
+    a ZIP's central directory is at the end of the file, so a truncated read does not open at all and
+    the bound would turn "preview a 9 MB workbook" into "this file is corrupt". What is left to
+    disclose is the memory that costs: `xlsx_load_estimate` is `XLSX_MEMORY_FACTOR` (25) × the file
+    size, a deliberately conservative figure and **not a measured one** — unlike `JSON_MEMORY_FACTOR`
+    — because the ratio depends on how repetitive the sheet's strings are, and `XLSX_WARN_BYTES` is
+    40 MiB. The modal asks **`memory_warning(format, bytes)`** and never `json_memory_warning`
+    directly: one call site, so a format that needs a warning cannot be given one nothing asks for.
+    **The reader is `calamine`, and an imported `.xlsx` is the first untrusted XML this app has ever
+    parsed** — a ZIP of it, from wherever the user got the file. `calamine` depends on quick-xml
+    **0.41**, the patched version; the 0.39 in the tree is reached only through usvg/resvg for the
+    bundled SVG icons and through wayland-scanner at build time. So the duplicate `deny.toml`'s
+    `[bans]` reports is load-bearing rather than untidy — deduplicating it *downwards* would put the
+    untrusted parser on the vulnerable code, which is why `RUSTSEC-2026-0194`/`0195` are ignored
+    there with that reachability argument written out beside them.
+    `target_verdict` over `DbNodeView` is the modal's other half: whether a schema change means the
+    table it is open on has *gone*. `has_table` is an
     `Option<bool>` because "I looked and it wasn't there" and "I haven't looked" are the same
     `false` to a bool and a refresh empties what there is to look at, and the caller passes
     `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
@@ -2426,7 +2529,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `dump.rs`: that module decides what a replayable file holds and hands the app a plan to write
     it, this one takes such a file apart a block at a time, so a dump far larger than memory can be
     replayed. Until it existed the round trip did not close — Schemaic wrote `.sql` files only
-    another tool could read, because the import path takes CSV/JSON and `sqlfile::open_verdict`
+    another tool could read, because the import path takes CSV, JSON and Excel and
+    `sqlfile::open_verdict`
     refuses a `.sql` past 64 MB.
     **What a statement is and what a server may be *sent* are two different strings**, and
     conflating them shipped a bug: a range carries its terminator — right for the editor, which
@@ -4065,7 +4169,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     table is gone, since `load_schema` empties `db_nodes` before it fetches, and a running load is
     *cancelled* rather than abandoned. The effect that re-probes on a settings change tracks only settings
     that change how the file *parses* — the NULL rules apply at coercion time, so tracking them
-    would re-read the file per keystroke and stamp over a hand-edited mapping. While a load runs,
+    would re-read the file per keystroke and stamp over a hand-edited mapping.
+    **Excel adds an `xlsx_settings` block beside `csv_settings`**, built and torn down rather than
+    hidden, for that section's Tab-order reason: a Sheet picker and the "First row is a header"
+    toggle, which is all a workbook has to be asked (there is no delimiter and no quote). The header
+    toggle is repeated rather than lifted out of `csv_settings` and shared, since hoisting the one
+    setting the two formats have in common would move a control CSV users already know the position
+    of. The picker is `settings::in_ring_picker` **directly** and not `focusable_dropdown`, because
+    that wrapper needs `T: Copy` and a sheet name is a `String`, and it is built only when the
+    workbook has two sheets or more — a dropdown with one entry is furniture. **The picker sits in
+    its own `dyn_container`, keyed on `sheets`, inside the block's** — which is keyed only on
+    whether the format is Excel. The list is rewritten on *every* probe, and floem's `dyn_container`
+    takes no `PartialEq` (`create_updater` does not dedup), so keying the outer block on it rebuilt
+    the header toggle the instant the user pressed Space on it, dropping keyboard focus. `ImportUi`
+    carries the two signals behind it, `sheets` and `sheet`, cleared in `open_import`, again when a
+    probe reports a *different* file, and again when a probe **fails**: a sheet list left standing
+    would describe the previous workbook beside an error about this one, and clearing the chosen
+    sheet is also what unwedges a name carried over from a file that had it. `sheet` joins the
+    settings effect above, because which sheet is read is a fact about how the file parses exactly as
+    the delimiter is. The probe itself fills `ImportProbeResult::sheets` from the same parse as the
+    sample and **skips the CSV sniffer for a workbook**: an `.xlsx`'s head is deflated ZIP bytes, so
+    running the sniffer over it would let a compressed stream's byte frequencies decide `has_header`.
+    While a load runs,
     the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does
     for query runs) instead of closing — the transaction rolls back, so a cancelled import writes
     nothing.
@@ -4076,9 +4201,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     back, which is the hole this closes. **Import leads and the order is not alphabetical**: it is
     the entry that changes the database, so it takes the slot furthest from where the pointer rests
     after a right-click — the reasoning that keeps `Drop` last everywhere else in these menus.
-    **One word, two scopes.** *Import* on a **table** is `import_view`'s CSV/JSON loader; *Import* on
-    a **database** is this. A script has no table to load into because its statements name their own,
-    so the scope of the node picks the loader — and the namespace a namespace-node open carries is
+    **One word, two scopes.** *Import* on a **table** is `import_view`'s CSV/JSON/Excel loader;
+    *Import* on a **database** is this. A script has no table to load into because its statements
+    name their own, so the scope of the node picks the loader — and the namespace a namespace-node open carries is
     for the **title only**, since nothing can confine someone else's `CREATE TABLE` to `sales`.
     **Its own `ScriptUi` bundle rather than an arm of `ImportUi`**, though the user reaches both
     through one word: a CSV import is twenty-odd signals about delimiters, headers, null tokens and a
@@ -6726,6 +6851,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   literal cannot tell the two apart.
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
   export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
+  **One function in the crate breaks the no-filesystem rule its tests otherwise keep, and it is a
+  deliberate trade**: `export::export_xlsx_chunks` drives `rust_xlsxwriter` in `constant_memory`
+  mode, which spills each finished row's XML to a library-managed temp file so an export costs a
+  bounded buffer at any row count. The alternative holds the whole workbook in memory — 10M cell
+  structs at 200k × 50, before a byte is compressed — which is exactly the size the streaming path
+  exists for, so the bound is worth more than the purity. The file is created and removed inside the
+  call, so a test of it is still deterministic and still needs no server; it is the same pragmatic
+  exception in-memory SQLite already is in `schemaic-db`. Read it as the one case, not as licence
+  for a second: anything else wanting a file still models it at the boundary.
 - **Generated DDL is never run silently, and never emitted from a second differ.** Every
   schema edit goes `TableDraft`/`ViewDraft` → `ddl::diff`/`diff_view` → `ChangeSet::emit` →
   the preview modal → `Db::run_ddl`. **`Db::run_server_ddl` is on the same rule, not beside it**:
@@ -7882,9 +8016,10 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **A `.hide()`n control is still in the Tab order** — `hide()` is `display: none`, so the view is
   still in the tree and still registered in the ring, and Tab moves focus onto something nobody can
   see. Every engine-conditional block that was built-and-hidden is therefore now **built
-  conditionally**: import's CSV settings, the designer's MySQL-only engine/collation and `ON UPDATE`
-  and PostgreSQL-only index method/predicate, the view editor's MySQL options, PG recreate toggle
-  and SQLite-only column list, the trigger form's `Fires`/`When` and SQLite-only `Of columns`.
+  conditionally**: import's CSV and Excel settings, the designer's MySQL-only engine/collation and
+  `ON UPDATE` and PostgreSQL-only index method/predicate, the view editor's MySQL options, PG
+  recreate toggle and SQLite-only column list, the trigger form's `Fires`/`When` and SQLite-only
+  `Of columns`.
   Nothing is lost by rebuilding — each of those binds
   straight to a draft or a persisted signal — and a control an engine can't express shouldn't be
   reachable at all, which is the same call `trigger_editor`'s per-engine form already made.
@@ -9185,8 +9320,11 @@ for keyboard nav.
   `truncated` and the total and prints what comes back. The cap itself is unchanged and is still a
   **client-side stream cutoff**, not a `LIMIT`; this only says how much of the table went past it.
 - **The Download menu names the scope, and only when there is a choice to make.** `export_menu`
-  normally opens the flat five formats; when the result is `truncated` **and**
-  `GridState::current_statement` yields something to re-run, it puts a scope step in front of them —
+  normally opens the flat six formats — all of them, unlike the **Copy** menu beside it, which
+  filters on `export::ExportFormat::is_text` and so has no Excel entry: a file can hold bytes and a
+  clipboard render cannot (the empty-string trap is in `core::export`'s entry). When the result is
+  `truncated` **and** `GridState::current_statement` yields something to re-run, it puts a scope
+  step in front of them —
   `Fetched rows (N)` and `All rows (~N)`, both through `text::human_count`, the `~` for the same
   reason the stats line carries one (the figure is the catalogue's estimate, and a menu promising an
   exact count the export then missed would be worse than one that never claimed it). **The step
