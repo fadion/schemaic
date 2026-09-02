@@ -142,13 +142,6 @@ const REDACTION_NOTE: &str = "Values the engine quoted back have been replaced w
      value — it is a marker for something you were not shown. Ask the user to paste the original \
      line if you need what was removed.";
 
-/// Which end of the run to close on when a value's delimiter could also appear
-/// *inside* the value.
-enum Edge {
-    First,
-    Last,
-}
-
 /// An engine error with the **values** taken out and everything else kept.
 ///
 /// The alternative this replaces was withholding the whole message below
@@ -159,11 +152,19 @@ enum Edge {
 /// and it is the half that makes the error actionable. So the value goes and the
 /// message stays.
 ///
-/// **Per-template, not a blunt quote-stripper.** Engines quote identifiers in the
-/// same syntax as values — `for key 'users.email'`, `constraint "users_email_key"`
-/// — so blanking every quoted run would destroy exactly the half worth keeping.
-/// Each rule below is anchored on the phrase that identifies the *value's*
-/// position in one engine's message.
+/// **Per-family, not a blunt quote-stripper and no longer per-template.**
+/// Engines quote identifiers in the same syntax as values —
+/// `for key 'users.email'`, `constraint "users_email_key"` — so blanking every
+/// quoted run would destroy exactly the half worth keeping. But anchoring each
+/// rule on one message's prose failed the other way: `contains("Incorrect ")`
+/// missed MySQL 1292's lower-case `Truncated incorrect <T> value: '…'`, and
+/// `contains("invalid input syntax")` named one of PostgreSQL's five
+/// value-quoting messages — six live-captured templates reached the model whole.
+/// So the two rules with a family behind them now match on the **shape** the
+/// family shares and are default-deny (MySQL's ` value: '…'`, PostgreSQL's
+/// trailing `: "…"`), and what keeps the identifiers is that PostgreSQL never
+/// introduces one with `: ` — plus [`is_statement_echo`], which exempts the
+/// user's own statement outright.
 ///
 /// **Not a SQL scan**, so it is not built on `sql::skip_noncode` and is not an
 /// exception to that invariant: the input is an engine's prose, and the quoting
@@ -184,50 +185,134 @@ pub fn redact_engine_error(msg: &str) -> String {
 
 /// One line of [`redact_engine_error`]. Line-scoped so an anchor cannot reach
 /// across into the next line's text.
+///
+/// **Two of these rules are anchored on prose and three are not, and the split
+/// is deliberate.** An anchor names one template, and every engine's
+/// value-quoting messages are a *family*: keying on `Incorrect ` missed error
+/// 1292's lower-case `Truncated incorrect …`, and keying on
+/// `invalid input syntax` named one of PostgreSQL's five. So the shapes that a
+/// family shares — MySQL's ` value: '…'` and PostgreSQL's trailing `: "…"` —
+/// are matched on the *shape*, default-deny, and the identifier quoting that
+/// looks the same is kept by [`is_statement_echo`] and by requiring the `: `
+/// introducer. The two remaining prose anchors (`Duplicate entry`,
+/// `Failing row contains`) each identify one message with no family behind it.
 fn redact_line(line: &str) -> String {
+    // The user's own statement, echoed back. Values and all, deliberately: it is
+    // what they typed, not what the table stores, and it is the most useful
+    // error there is. Exempt as a whole line, before any rule can bite it.
+    if is_statement_echo(line) {
+        return line.to_string();
+    }
     let mut out = line.to_string();
     // MySQL/MariaDB 1062: `Duplicate entry 'VALUE' for key 'KEY'`. Closed on the
     // trailing phrase rather than the next quote, so a value containing `'`
-    // still redacts whole.
-    out = redact_between(&out, "Duplicate entry '", "' for key ", &Edge::First);
-    // MySQL 1366 and kin: `Incorrect integer value: 'VALUE' for column 'COL'`.
-    if out.contains("Incorrect ") {
-        out = redact_between(&out, " value: '", "'", &Edge::First);
-    }
+    // still redacts whole — and on the *last* one, so a value containing the
+    // phrase itself does too.
+    out = redact_between(&out, "Duplicate entry '", "' for key ");
+    // MySQL/MariaDB's value-quoting family, matched on the shape rather than on
+    // any one message's prose: 1366 `Incorrect <T> value: 'V' for column 'C'`,
+    // 1292 `Truncated incorrect <T> value: 'V'` (no column clause, the value
+    // ends the line), and their kin. The column form closes on the trailing
+    // phrase; the bare form closes on the line's final quote.
+    out = try_redact(&out, " value: '", "' for column ")
+        .or_else(|| try_redact(&out, " value: '", "'"))
+        .unwrap_or(out);
     // PostgreSQL DETAIL: `Failing row contains (v1, v2, …).` — a whole row.
-    out = redact_between(&out, "Failing row contains (", ")", &Edge::Last);
+    out = redact_between(&out, "Failing row contains (", ")");
     // PostgreSQL DETAIL: `Key (col)=(VALUE) already exists.` The first
     // parenthetical is column names and is kept; only the second is data.
-    out = redact_between(&out, ")=(", ")", &Edge::Last);
-    // PostgreSQL 22P02: `invalid input syntax for type integer: "VALUE"`.
-    if out.contains("invalid input syntax") {
-        out = redact_between(&out, ": \"", "\"", &Edge::First);
+    // Anchored on `Key (`, because `)=(` is also ordinary SQL — a row
+    // comparison, or any `f(x)=(…)` — and unanchored this rule deleted the
+    // clause a syntax error was about.
+    if out.contains("Key (") {
+        out = redact_between(&out, ")=(", ")");
     }
-    out
+    // PostgreSQL's json report, which arrives on the paths that keep the
+    // driver's full `Display`: the offending token, then an echo of the data.
+    out = redact_between(&out, "Token \"", "\" is invalid");
+    out = redact_to_end_of_line(&out, "JSON data, line ", ": ");
+    // PostgreSQL's quoted-literal family — the one **default-deny** rule.
+    redact_trailing_quoted_value(&out).unwrap_or(out)
+}
+
+/// A line that is the user's own statement quoted back — PostgreSQL's `LINE n:`
+/// echo and the caret line under it.
+///
+/// Exempt from every rule, which is the only reason the default-deny in
+/// [`redact_trailing_quoted_value`] is safe: a statement can end in anything,
+/// including `: "…"`.
+fn is_statement_echo(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some(rest) = t.strip_prefix("LINE ") else {
+        return t.chars().all(|c| c == '^' || c.is_whitespace()) && t.contains('^');
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    !digits.is_empty() && rest[digits.len()..].starts_with(':')
+}
+
+/// PostgreSQL quotes a rejected **value** in double quotes at the end of the
+/// primary message, and there is no phrase the family shares:
+/// `malformed array literal: "…"`, `invalid input value for enum mood: "…"`,
+/// `date/time field value out of range: "…"`, `invalid input syntax for type
+/// integer: "…"`. So this rule is inverted — any line whose *final* quoted run
+/// is introduced by `: ` loses that run.
+///
+/// What makes the inversion safe is that PostgreSQL never introduces an
+/// **identifier** that way: `constraint "x"`, `relation "x"`, `column "x"`,
+/// `at or near "x"` all quote mid-sentence, and `LINE n:` is exempted outright
+/// by [`is_statement_echo`]. `redaction_keeps_the_identifiers_postgres_quotes_the_same_way`
+/// is the test that holds that claim.
+fn redact_trailing_quoted_value(line: &str) -> Option<String> {
+    let i = line.rfind(": \"")?;
+    let from = i + ": \"".len();
+    let rest = &line[from..];
+    let j = rest.rfind('"')?;
+    // The closing quote has to end the line, allowing the sentence's own
+    // punctuation after it — otherwise the quoted run is mid-sentence and is an
+    // identifier, not the value the message is rejecting.
+    let tail = rest[j + 1..].trim_matches(|c: char| c.is_whitespace() || ".,;".contains(c));
+    tail.is_empty()
+        .then(|| format!("{}{REDACTED}{}", &line[..from], &rest[j..]))
+}
+
+/// Replace everything after the first `sep` that follows `start` with
+/// [`REDACTED`] — for a message whose value runs to the end of the line, such
+/// as PostgreSQL's `CONTEXT:  JSON data, line 1: {…`.
+fn redact_to_end_of_line(line: &str, start: &str, sep: &str) -> String {
+    let Some(i) = line.find(start) else {
+        return line.to_string();
+    };
+    let after = i + start.len();
+    let Some(j) = line[after..].find(sep) else {
+        return line.to_string();
+    };
+    format!("{}{REDACTED}", &line[..after + j + sep.len()])
 }
 
 /// Replace the run between `start` and `end` with [`REDACTED`], or return `line`
 /// unchanged when either anchor is missing — a truncated or unfamiliar message
 /// must survive this without losing the text it does have.
+fn redact_between(line: &str, start: &str, end: &str) -> String {
+    try_redact(line, start, end).unwrap_or_else(|| line.to_string())
+}
+
+/// [`redact_between`]'s answer, or `None` when either anchor is missing — so a
+/// caller with a *fallback* rule can tell "did not match" from "matched and
+/// changed nothing", which `redact_between` cannot.
 ///
-/// `Edge::Last` closes on the *final* `end` in the rest of the line, for the
-/// paren-delimited PostgreSQL details whose values can themselves contain `)`.
-/// It can over-redact a line that ends in an unrelated parenthetical, which is
-/// the safe direction to be wrong in.
-fn redact_between(line: &str, start: &str, end: &str, edge: &Edge) -> String {
-    let Some(i) = line.find(start) else {
-        return line.to_string();
-    };
+/// **The run always closes on the final `end` in the rest of the line**, never
+/// the first. A stored value is attacker-controlled and can contain its own
+/// closing phrase, so a first-match close ships its tail:
+/// `Duplicate entry 'bob' for key 'x' for key 'users.email'` closes on the first
+/// `' for key ` and `x` reaches the model. Closing last over-redacts a message
+/// that repeats the phrase innocently, or one ending in an unrelated
+/// parenthetical, which is the safe direction to be wrong in.
+fn try_redact(line: &str, start: &str, end: &str) -> Option<String> {
+    let i = line.find(start)?;
     let from = i + start.len();
     let rest = &line[from..];
-    let found = match edge {
-        Edge::First => rest.find(end),
-        Edge::Last => rest.rfind(end),
-    };
-    let Some(j) = found else {
-        return line.to_string();
-    };
-    format!("{}{REDACTED}{}", &line[..from], &rest[j..])
+    let j = rest.rfind(end)?;
+    Some(format!("{}{REDACTED}{}", &line[..from], &rest[j..]))
 }
 
 /// What the result panel is holding, for the AI turn context — **shape only**.
@@ -1008,6 +1093,118 @@ mod tests {
         assert!(out.contains("people.name"), "{out}");
         let pg = redact_engine_error("DETAIL:  Key (org)=(Acme (UK)) already exists.");
         assert!(!pg.contains("Acme"), "{pg}");
+        // The 1366 sibling of the same shape: the value's own quote must not
+        // close the run early.
+        let my = redact_engine_error(
+            "Incorrect integer value: 'O'Brien' for column `t`.`u`.`age` at row 1",
+        );
+        assert!(!my.contains("Brien"), "{my}");
+        assert!(my.contains("`t`.`u`.`age`"), "{my}");
+    }
+
+    /// A stored value holding the *whole* phrase that closes its run, which a
+    /// first-match close leaks the tail of. Both value-quoting families are
+    /// pinned: a rule that closes on a trailing phrase has to close on the
+    /// **last** one.
+    #[test]
+    fn redaction_survives_a_value_holding_the_phrase_that_closes_it() {
+        let dup = redact_engine_error("Duplicate entry 'bob' for key 'x' for key 'users.email'");
+        assert!(!dup.contains("bob"), "{dup}");
+        assert!(!dup.contains("'x'"), "{dup}");
+        assert!(dup.contains("users.email"), "{dup}");
+
+        let val = redact_engine_error(
+            "Incorrect integer value: 'a' for column 'b' for column `t`.`u`.`age` at row 1",
+        );
+        assert!(!val.contains("'a'"), "{val}");
+        assert!(!val.contains("'b'"), "{val}");
+        assert!(val.contains("`t`.`u`.`age`"), "{val}");
+    }
+
+    /// **The families, not one member each.** Every string here was captured off
+    /// a live server during the `v0.21.0` release review — MySQL 8.4.11 on 3307,
+    /// MariaDB 10.11.14 on 3306, PostgreSQL 16.15 on 5432 — and every one of
+    /// them passed through the previous rule set **whole**, because each rule
+    /// was anchored on the prose of one template: `contains("Incorrect ")`
+    /// missed error 1292's lower-case `incorrect`, and
+    /// `contains("invalid input syntax")` named one of PostgreSQL's five
+    /// value-quoting messages.
+    #[test]
+    fn redaction_answers_the_value_quoting_families_not_one_member_each() {
+        // MySQL/MariaDB 1292 — no `for column` clause; the value ends the line.
+        for (msg, keep) in [
+            (
+                "Truncated incorrect DOUBLE value: 'alice@corp.com'",
+                "DOUBLE",
+            ),
+            (
+                "Truncated incorrect DECIMAL value: 'alice@corp.com'",
+                "DECIMAL",
+            ),
+        ] {
+            let out = redact_engine_error(msg);
+            assert!(!out.contains("alice@corp.com"), "{out}");
+            assert!(out.contains(keep), "{out}");
+            assert!(out.contains(REDACTED), "{out}");
+        }
+
+        // PostgreSQL's value-quoting family: four primary messages, only one of
+        // which carries the phrase the old rule was anchored on.
+        for (msg, keep, value) in [
+            (
+                "ERROR:  malformed array literal: \"secret-array-value\"",
+                "malformed array literal",
+                "secret-array-value",
+            ),
+            (
+                "ERROR:  invalid input value for enum s6_mood: \"secret-mood\"",
+                "s6_mood",
+                "secret-mood",
+            ),
+            (
+                "ERROR:  date/time field value out of range: \"2024-13-45\"",
+                "out of range",
+                "2024-13-45",
+            ),
+            (
+                "ERROR:  invalid input syntax for type integer: \"abc\"",
+                "integer",
+                "\"abc\"",
+            ),
+        ] {
+            let out = redact_engine_error(msg);
+            assert!(!out.contains(value), "{value} survived: {out}");
+            assert!(out.contains(keep), "{out}");
+            assert!(out.contains(REDACTED), "{out}");
+        }
+
+        // The json pair, which arrives on the paths that keep the driver's full
+        // `Display`: the offending token, and the echo of the data itself.
+        let json = redact_engine_error(
+            "DETAIL:  Token \"alice\" is invalid.\n\
+             CONTEXT:  JSON data, line 1: {alice...",
+        );
+        assert!(!json.contains("alice"), "{json}");
+        assert!(json.contains("is invalid"), "{json}");
+        assert!(json.contains("JSON data, line 1"), "{json}");
+    }
+
+    /// The inversion's other half: PostgreSQL quotes **identifiers** in the same
+    /// syntax as values, and those are the half worth keeping. None of them is
+    /// introduced by `: `, which is what makes the default-deny safe — this test
+    /// is what says so.
+    #[test]
+    fn redaction_keeps_the_identifiers_postgres_quotes_the_same_way() {
+        for msg in [
+            "ERROR:  duplicate key value violates unique constraint \"users_email_key\"",
+            "ERROR:  syntax error at or near \"SELCT\"",
+            "ERROR:  relation \"users\" does not exist",
+            "ERROR:  column \"emial\" of relation \"users\" does not exist",
+            "HINT:  Perhaps you meant to reference the column \"u.email\".",
+            "ERROR:  new row for relation \"users\" violates check constraint \"users_age_check\"",
+        ] {
+            assert_eq!(redact_engine_error(msg), msg, "{msg}");
+        }
     }
 
     /// The messages that name no value at all must come through untouched —
@@ -1031,6 +1228,24 @@ mod tests {
     fn redaction_keeps_the_users_own_sql_that_a_syntax_error_quotes() {
         let msg = "You have an error in your SQL syntax near 'SELCT 1 FROM users' at line 1";
         assert_eq!(redact_engine_error(msg), msg);
+    }
+
+    /// `)=(` is PostgreSQL's `DETAIL: Key (cols)=(vals)`, and it is also
+    /// ordinary SQL — a row comparison, or any `f(x)=(…)`. Unanchored, the rule
+    /// ate the clause the syntax error was *about*, and the model was then asked
+    /// to fix a statement it had been shown a corrupted copy of.
+    #[test]
+    fn redaction_leaves_a_row_comparison_in_the_users_own_sql_alone() {
+        for msg in [
+            "You have an error in your SQL syntax near 'WHERE (a,b)=(1,2) AND (c,d)=(3,4) ORDR BY a' at line 1",
+            "LINE 1: SELECT * FROM t WHERE (a,b)=(1,2) AND (c,d)=(3,4) ORDR BY a;",
+            "You have an error in your SQL syntax near 'WHERE upper(name)=('BOB') ORDR BY a' at line 1",
+        ] {
+            assert_eq!(redact_engine_error(msg), msg, "{msg}");
+        }
+        // … while the shape it was written for still redacts.
+        let key = redact_engine_error("DETAIL:  Key (email)=(alice@corp.com) already exists.");
+        assert!(!key.contains("alice@corp.com"), "{key}");
     }
 
     #[test]
