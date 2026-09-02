@@ -52,10 +52,17 @@ pub async fn a_staged_update_writes_exactly_the_row_it_names(target: &'static Ta
     .unwrap_or_else(|e| panic!("{}: the commit failed: {e}", target.name));
 
     assert_eq!(written, 1, "{}: rows written", target.name);
+    // **Both columns, not just the staged one.** `note` was never staged, so it
+    // has to be exactly what it was — an update whose `SET` list carried more
+    // than the dirty cells would show up here and nowhere else.
     assert_eq!(
-        names(&scratch, "w").await,
-        ["one", "changed", "three"],
-        "{}: only row 2 should have moved",
+        rows(&scratch, "w").await,
+        [
+            ("one".to_string(), "n1".to_string()),
+            ("changed".to_string(), "n2".to_string()),
+            ("three".to_string(), "n3".to_string()),
+        ],
+        "{}: only row 2's name should have moved",
         target.name
     );
 
@@ -479,9 +486,14 @@ async fn seed_rows(scratch: &Scratch, table: &str, ddl: &str) {
     scratch
         .exec(&format!("CREATE TABLE {} {ddl}", scratch.qualified(table)))
         .await;
+    // `note` is seeded, not left NULL, so it is a value a write could *change*.
+    // `WRITABLE`'s comment calls it "a column to leave alone" and nothing ever
+    // read it back, so an update that put every staged column in its `SET` list
+    // — or one that reset the unstaged ones — would have passed.
     scratch
         .exec(&format!(
-            "INSERT INTO {} (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+            "INSERT INTO {} (id, name, note) VALUES \
+             (1, 'one', 'n1'), (2, 'two', 'n2'), (3, 'three', 'n3')",
             scratch.qualified(table)
         ))
         .await;
@@ -530,6 +542,28 @@ async fn names(scratch: &Scratch, table: &str) -> Vec<String> {
                 .expect("a selected cell")
                 .display()
                 .to_string()
+        })
+        .collect()
+}
+
+/// The `(name, note)` pair of every row, in key order — [`names`] plus the
+/// column a write must leave alone.
+async fn rows(scratch: &Scratch, table: &str) -> Vec<(String, String)> {
+    let rs = scratch
+        .exec(&format!(
+            "SELECT name, note FROM {} ORDER BY id",
+            scratch.qualified(table)
+        ))
+        .await;
+    (0..rs.row_count())
+        .map(|r| {
+            let cell = |c| {
+                rs.cell(r, c)
+                    .expect("a selected cell")
+                    .display()
+                    .to_string()
+            };
+            (cell(0), cell(1))
         })
         .collect()
 }

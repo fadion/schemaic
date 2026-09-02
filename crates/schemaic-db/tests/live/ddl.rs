@@ -53,7 +53,24 @@ const SHAPES: &[(&str, &str)] = &[
         "composite_key",
         "(a INTEGER NOT NULL, b INTEGER NOT NULL, v VARCHAR(8), PRIMARY KEY (a, b))",
     ),
+    // **A CHECK and a foreign key**, which no shape here had — so `CheckDraft`
+    // and `ForeignKeyDraft` went through the identity gate on nothing at all,
+    // and `alter_column_disturbs_checks` (the capability that decides whether a
+    // column change has to route around a constraint) had zero live coverage.
+    // A CHECK clause is also where MySQL 8 and MariaDB disagree about escaping,
+    // which is the divergence this file's own module doc names.
+    (
+        "checks_and_fks",
+        "(id INTEGER NOT NULL PRIMARY KEY, n INTEGER NOT NULL, \
+         parent INTEGER, \
+         CONSTRAINT n_positive CHECK (n > 0), \
+         CONSTRAINT parent_fk FOREIGN KEY (parent) REFERENCES ddl_parent(id))",
+    ),
 ];
+
+/// The table `checks_and_fks` points at. Created before every shape, because a
+/// `REFERENCES` to a table that is not there is refused outright.
+const PARENT: &str = "(id INTEGER NOT NULL PRIMARY KEY)";
 
 /// A table read off the server and drafted straight back proposes no change.
 ///
@@ -64,7 +81,19 @@ pub async fn an_introspected_table_diffs_to_nothing_against_its_own_draft(target
     let scratch = Scratch::create(target, "ddl_identity").await;
     let mut failures = Vec::new();
 
+    // The foreign key's target, first — a `REFERENCES` to a table that is not
+    // there is refused outright.
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} {PARENT}",
+            scratch.qualified("ddl_parent")
+        ))
+        .await;
+
     for (name, ddl_sql) in SHAPES {
+        // The shape's `REFERENCES ddl_parent(id)` is unqualified, which resolves
+        // in the scratch database on MySQL and in the scratch schema on
+        // PostgreSQL — the same place `qualified` puts the table.
         scratch
             .exec(&format!(
                 "CREATE TABLE {} {ddl_sql}",
@@ -107,18 +136,143 @@ pub async fn an_added_column_lands_and_reads_back_as_drafted(target: &'static Ta
 
     let current = table_of(&scratch, "t").await;
     let mut draft = TableDraft::from_table(&current);
+    // **Every attribute non-default**, which is what makes this a test of "as
+    // drafted". It asked for `INTEGER`, nullable, no default — the engine's own
+    // answer to every question — so `AddColumn` could have emitted the name
+    // alone and the assertion below, which only looked for the name, would not
+    // have noticed.
     draft.columns.push(ColumnDraft::new(ColumnInfo {
         name: "added".to_string(),
         type_name: "INTEGER".to_string(),
-        nullable: true,
+        nullable: false,
+        default: Some("7".to_string()),
         ..Default::default()
     }));
 
     apply(&scratch, &current, &draft, target).await;
     assert_settled(&scratch, "t", target, "adding a column").await;
+    let after = table_of(&scratch, "t").await;
+    let col = after
+        .columns
+        .iter()
+        .find(|c| c.name == "added")
+        .unwrap_or_else(|| panic!("{}: the column is not on the server", target.name));
     assert!(
-        column_names(&table_of(&scratch, "t").await).contains(&"added".to_string()),
-        "{}: the column is not on the server",
+        !col.nullable,
+        "{}: the column came back nullable, which the draft did not ask for",
+        target.name
+    );
+    assert!(
+        ddl::defaults_equal(col.default.as_deref(), Some("7")),
+        "{}: the default came back as {:?}, not 7",
+        target.name,
+        col.default
+    );
+    assert!(
+        ddl::types_equal(&col.type_name, "INTEGER", target.engine.dialect()),
+        "{}: the type came back as {:?}, not INTEGER",
+        target.name,
+        col.type_name
+    );
+
+    scratch.teardown().await;
+}
+
+/// A column moved through the designer lands in its new position, **with its
+/// data**.
+///
+/// Gated on the capability rather than the engine, the way `views.rs` gates the
+/// rename: `supports_column_reorder` is what the app asks, and it had no live
+/// coverage at all — on MySQL a reorder is an `ALTER … MODIFY … AFTER`, which
+/// restates the column's whole definition, so getting it wrong silently drops a
+/// default or a NOT NULL along with moving it. The data assertion is the
+/// expensive half: a reorder implemented as a drop-and-add would pass a test
+/// that checked only the order.
+pub async fn a_reordered_column_lands_where_it_was_put(target: &'static Target) {
+    let dialect = target.engine.dialect();
+    if !ddl::supports_column_reorder(dialect) {
+        // PostgreSQL has no column order to change, which is the capability's
+        // whole point — there is nothing here to assert, and saying so is better
+        // than a test that quietly does nothing.
+        return;
+    }
+    let scratch = Scratch::create(target, "ddl_reorder").await;
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} (id INTEGER NOT NULL PRIMARY KEY, a VARCHAR(8) NOT NULL DEFAULT 'x', \
+             b VARCHAR(8))",
+            scratch.qualified("t")
+        ))
+        .await;
+    scratch
+        .exec(&format!(
+            "INSERT INTO {} (id, a, b) VALUES (1, 'kept', 'also')",
+            scratch.qualified("t")
+        ))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    // What `a` was before the move, in the server's own spelling — comparing
+    // against that rather than against `"x"` is what keeps this a test of the
+    // reorder instead of a test of how each engine quotes a default.
+    let before = current
+        .columns
+        .iter()
+        .find(|c| c.name == "a")
+        .expect("a")
+        .clone();
+    let mut draft = TableDraft::from_table(&current);
+    // Move `b` ahead of `a`.
+    let b = draft
+        .columns
+        .iter()
+        .position(|c| c.info.name == "b")
+        .expect("b is there");
+    let moved = draft.columns.remove(b);
+    draft.columns.insert(1, moved);
+
+    apply(&scratch, &current, &draft, target).await;
+    assert_settled(&scratch, "t", target, "reordering a column").await;
+
+    let after = table_of(&scratch, "t").await;
+    assert_eq!(
+        column_names(&after),
+        ["id", "b", "a"],
+        "{}: the column did not move",
+        target.name
+    );
+    // The column that moved past kept everything it had — a reorder that
+    // restates a definition is where that gets lost.
+    let a = after.columns.iter().find(|c| c.name == "a").expect("a");
+    assert!(!a.nullable, "{}: `a` came back nullable", target.name);
+    assert!(
+        ddl::defaults_equal(a.default.as_deref(), before.default.as_deref()),
+        "{}: `a`'s default was {:?} and came back as {:?}",
+        target.name,
+        before.default,
+        a.default
+    );
+    assert!(
+        ddl::types_equal(&a.type_name, &before.type_name, dialect),
+        "{}: `a`'s type was {:?} and came back as {:?}",
+        target.name,
+        before.type_name,
+        a.type_name
+    );
+    // And the row is still there, with its values.
+    let rows = scratch
+        .exec(&format!(
+            "SELECT a, b FROM {} WHERE id = 1",
+            scratch.qualified("t")
+        ))
+        .await;
+    assert_eq!(
+        (
+            rows.cell(0, 0).expect("a").display().to_string(),
+            rows.cell(0, 1).expect("b").display().to_string()
+        ),
+        ("kept".to_string(), "also".to_string()),
+        "{}: the reorder lost the row's data",
         target.name
     );
 

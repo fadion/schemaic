@@ -538,6 +538,17 @@ pub async fn a_granted_role_comes_back_and_a_revoke_takes_it_off(target: &'stati
     let change = ddl::grant_change(&revoking, &member.principal).expect("a complete draft");
     member.run(change).await;
 
+    // **The half the name promises and the test did not have.** `member.run`
+    // only asserts the server *accepted* the statement, which a `REVOKE` naming
+    // the wrong role does too — so this is what says the role actually came off,
+    // and it mirrors the grant assertion above rather than being a new shape.
+    let after = member.grants().await;
+    assert!(
+        !after.iter().any(|s| s.contains(&role.principal.name)),
+        "{}: the revoked role is still in {after:?}",
+        target.endpoint()
+    );
+
     member.teardown().await;
     role.teardown().await;
     scratch.teardown().await;

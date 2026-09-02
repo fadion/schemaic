@@ -81,6 +81,100 @@ pub async fn a_streamed_export_delivers_every_row(target: &'static Target) {
         );
     }
 
+    // **The rows themselves, in the order asked for.** Counting chunks and rows
+    // says the right *number* arrived; it says nothing about whether they are
+    // the table's rows, in the `ORDER BY`'s order, or the same row 5,000 times.
+    // Concatenated across the chunk seams, which is where a re-fetched or
+    // dropped page would show.
+    let ids: Vec<String> = chunks
+        .iter()
+        .filter_map(|c| c.as_ref().ok())
+        .flat_map(|rs| {
+            (0..rs.row_count())
+                .map(move |r| rs.cell(r, 0).expect("an id cell").display().to_string())
+        })
+        .collect();
+    let want: Vec<String> = (1..=ROWS).map(|i| i.to_string()).collect();
+    assert_eq!(
+        ids, want,
+        "{}: the ids that arrived are not 1..={ROWS} in order",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// A **cancelled** export tells the writer it stopped, rather than closing the
+/// channel as though the table had ended.
+///
+/// This is the file's own opening claim — "a channel that simply closes reads as
+/// 'the table ended', so a failure that only came back from `stream_query`'s
+/// return value would be a half-written file reported as finished" — and it was
+/// the one failure mode with no case: every test here fails the *statement*, and
+/// none of them cancels.
+pub async fn a_cancelled_export_tells_the_writer_it_stopped(target: &'static Target) {
+    let scratch = Scratch::create(target, "export_cancel").await;
+    seed(&scratch).await;
+
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let db = scratch.db.clone();
+    let database = scratch.database.clone();
+    let sql = format!(
+        "SELECT id, name FROM {} ORDER BY id",
+        scratch.qualified("big")
+    );
+    let token = cancel.clone();
+    let export = tokio::spawn(async move {
+        db.stream_query(Some(&database), &sql, CHUNK, token, tx)
+            .await
+    });
+
+    // Take one chunk, then stop: the export is mid-table, which is the state a
+    // Cancel is actually pressed in.
+    let mut chunks = Vec::new();
+    if let Some(first) = rx.recv().await {
+        chunks.push(first);
+    }
+    cancel.cancel();
+    // **Then wait before draining**, and the reason is the whole shape of a
+    // cancel: it is a `select!` arm, so it can only win at a point where the
+    // read *yields*. Draining immediately keeps the channel free, and 5,000 tiny
+    // rows off a local MySQL then run to completion without the read ever
+    // pending — the export reported `Ok(5000)` with the token already cancelled.
+    // That is not a defect (a cancel cannot interrupt work that never yields,
+    // and a real export is far larger), but it makes the timing the test's
+    // problem: the pause lets the sender fill the channel and block, which is
+    // where the cancel is seen.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    while let Some(c) = rx.recv().await {
+        chunks.push(c);
+    }
+    let sent = export.await.expect("the export task");
+
+    assert!(
+        matches!(sent, Err(schemaic_db::DbError::Cancelled)),
+        "{}: a cancelled export reported {:?}",
+        target.name,
+        sent.map(|n| n.to_string()).map_err(|e| e.to_string())
+    );
+    let rows: usize = chunks
+        .iter()
+        .map(|c| c.as_ref().map_or(0, |rs| rs.row_count()))
+        .sum();
+    assert!(
+        rows < ROWS as usize,
+        "{}: the cancel arrived after the whole table had been sent, so it \
+         cancelled nothing",
+        target.name
+    );
+    assert!(
+        chunks.iter().any(|c| c.is_err()),
+        "{}: the writer saw a closed channel and no error, so it would rename a \
+         half-written file over the user's",
+        target.name
+    );
+
     scratch.teardown().await;
 }
 

@@ -222,7 +222,13 @@ pub async fn every_type_renders_as_the_grid_shows_it(target: &'static Target) {
     }
 
     scratch.teardown().await;
-    report(target, "rendered wrongly", failures, ran);
+    report(
+        target,
+        "rendered wrongly",
+        failures,
+        ran,
+        target.type_cases().count(),
+    );
 }
 
 /// The text the grid shows is the value: written back as a literal, it produces
@@ -294,7 +300,13 @@ pub async fn the_text_the_grid_shows_writes_back_unchanged(target: &'static Targ
     }
 
     scratch.teardown().await;
-    report(target, "did not survive a write back", failures, ran);
+    report(
+        target,
+        "did not survive a write back",
+        failures,
+        ran,
+        target.type_cases().filter(|c| c.writable).count(),
+    );
 }
 
 /// Give `case` a table of its own holding the value and a NULL, and return both
@@ -324,22 +336,19 @@ async fn seed_case(scratch: &Scratch, case: &TypeCase) -> Result<ResultSet, Stri
         .map_err(|e| format!("selecting it back failed: {e}"))
 }
 
-/// The fewest cases a leg may run before the matrix is assumed to have lost
-/// them rather than passed them.
-///
-/// A floor, not a count, so adding a type does not edit this — and it is here
-/// because both matrix tests are green when they run **nothing at all**: an
-/// empty `type_cases()`, a filter that matched none, and the suite reports two
-/// passes having asserted less than any single test would. The smallest run is
-/// MySQL's write back, at twenty-one of its twenty-two cases.
-const TYPE_CASE_FLOOR: usize = 20;
-
 /// Fail once, listing every case that did not hold.
-fn report(target: &Target, what: &str, failures: Vec<String>, ran: usize) {
-    assert!(
-        ran >= TYPE_CASE_FLOOR,
-        "{}: the type matrix ran {ran} cases, fewer than the {TYPE_CASE_FLOOR} \
-         every leg carries — it lost them rather than passing them",
+///
+/// `expected` is how many cases this leg *has*, so "it ran them" is an equality
+/// rather than a floor. It was a single `TYPE_CASE_FLOOR = 20` over legs of 21
+/// and 25: PostgreSQL could lose its entire numeric family and both matrix tests
+/// would still pass, which is the exact failure the floor was added to catch
+/// one size down. The count is derivable from the leg's own slices and needs no
+/// maintenance, so there is nothing to be gained by weakening it.
+fn report(target: &Target, what: &str, failures: Vec<String>, ran: usize, expected: usize) {
+    assert_eq!(
+        ran, expected,
+        "{}: the type matrix ran {ran} of this leg's {expected} cases — it lost \
+         them rather than passing them",
         target.name
     );
     assert!(

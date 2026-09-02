@@ -410,15 +410,22 @@ impl Drop for Scratch {
             // supply one — and an unbounded `block_on` inside a `Drop` hangs the
             // whole binary with no output at all. A timeout turns that into the
             // named leftover the message below is for.
-            rt.block_on(tokio::time::timeout(TEARDOWN_TIMEOUT, async {
-                for sql in &plan {
-                    base.fetch_query(None, sql, 1, CancellationToken::new())
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            }))
-            .unwrap_or_else(|_| Err(format!("teardown timed out after {TEARDOWN_TIMEOUT:?}")))
+            //
+            // The `timeout` is constructed **inside** `block_on`: it builds a
+            // `Sleep`, which panics with "there is no reactor running" if it is
+            // made before the runtime is entered.
+            rt.block_on(async {
+                tokio::time::timeout(TEARDOWN_TIMEOUT, async {
+                    for sql in &plan {
+                        base.fetch_query(None, sql, 1, CancellationToken::new())
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap_or_else(|_| Err(format!("teardown timed out after {TEARDOWN_TIMEOUT:?}")))
+            })
         })
         .join();
 
