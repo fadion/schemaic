@@ -685,54 +685,26 @@ fn freshness_note(stats: &TableStats) -> Option<AnyView> {
 /// A titled group of `label: value` rows. The heading is the app's form-section
 /// heading (`widgets::form_section`), so a group here reads at the same weight as
 /// **General** in Settings rather than inventing a third heading style.
+/// This panel's rows at its own gap — see [`crate::widgets::fact_section`],
+/// which is the shared view and where the reasoning lives.
 fn section(title: &'static str, rows: Vec<AnyView>) -> AnyView {
     section_with_gap(title, rows, row_gap)
 }
 
 /// [`section`] for a group whose rows need more air than the shared [`row_gap()`]
 /// — the index list, whose rows are taller and less uniform than a detail list's.
-/// `gap` is a `fn` rather than a number so the rows re-space when the interface
-/// scale changes — a captured length freezes at the scale the view was built at
-/// (see `dividers::scaled_arg_gate`, where the same shape was two visible bugs).
 fn section_with_gap(title: &'static str, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
-    v_stack((
-        crate::widgets::form_section(title),
-        v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap()).width_full()),
-    ))
-    .style(|s| s.flex_col().gap(theme::scaled(7.0)).width_full())
-    .into_any()
+    crate::widgets::fact_section(title, rows, gap)
 }
 
-/// One `label: value` row of a section.
+/// One `label: value` row of a section, at this panel's label column.
 fn detail(label: &'static str, value: String) -> AnyView {
-    h_stack((
-        text(label).style(|s| {
-            s.width(label_w())
-                .flex_shrink(0.0_f32)
-                .font_size(font_body())
-                .color(theme::text_faint())
-        }),
-        // `text_dim` — the app's form-label colour (`widgets::form_label_style`,
-        // what "Font size" wears in Settings). Full `text()` made a column of
-        // read-only facts shout louder than the editable fields elsewhere.
-        text(value).style(|s| s.font_size(font_body()).color(theme::text_dim())),
-    ))
-    .style(|s| s.items_start().gap(theme::scaled(10.0)).width_full())
-    .into_any()
+    crate::widgets::fact_row(label.to_string(), value, label_w)
 }
 
 /// An icon-led sentence — a caveat, a warning, or an engine's limitation.
 fn note_line(icon: &'static str, color: fn() -> Color, message: String) -> AnyView {
-    h_stack((
-        icons::icon(icon, 14.0).style(move |s| {
-            s.flex_shrink(0.0_f32)
-                .color(color())
-                .margin_top(theme::scaled(1.0))
-        }),
-        text(message).style(move |s| s.font_size(font_body()).color(color())),
-    ))
-    .style(|s| s.items_start().gap(theme::scaled(7.0)).width_full())
-    .into_any()
+    crate::widgets::fact_note(icon, color, message)
 }
 
 /// Copy on the left; the handoff to the editor and Close on the right.

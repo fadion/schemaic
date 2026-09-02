@@ -1296,6 +1296,69 @@ pub(crate) fn form_section_owned(label: String) -> impl IntoView {
     })
 }
 
+// ── read-only fact panels ────────────────────────────────────────────────────
+//
+// The three views a panel of *observed* facts is built from — a heading with
+// rows under it, a `label: value` row, and an icon-led caveat. They were
+// `properties.rs`'s private helpers until the Users and privileges browser
+// arrived and copied all three character for character, at which point the
+// reasoning below existed twice and the values could drift apart with nothing
+// on screen to say they had.
+
+/// A heading with its rows under it.
+pub(crate) fn fact_section(title: &'static str, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
+    v_stack((
+        form_section(title),
+        v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap()).width_full()),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(7.0)).width_full())
+    .into_any()
+}
+
+/// One `label: value` row of a [`fact_section`].
+///
+/// `label_w` is a `fn` and not a number for the reason `gap` above is one: a
+/// length resolved at build freezes at the scale the view was built at (see
+/// `dividers::scaled_arg_gate`, where the same shape was two visible bugs). It
+/// is a parameter rather than a constant because the two panels that use this
+/// have differently sized label columns, and a shared column would leave one of
+/// them ragged.
+pub(crate) fn fact_row(label: String, value: String, label_w: fn() -> f64) -> AnyView {
+    h_stack((
+        text(label).style(move |s| {
+            s.width(label_w())
+                .flex_shrink(0.0_f32)
+                .font_size(theme::font_body())
+                .color(theme::text_faint())
+        }),
+        // `text_dim` — the app's form-label colour (`form_label_style`, what
+        // "Font size" wears in Settings). Full `text()` made a column of
+        // read-only facts shout louder than the editable fields elsewhere.
+        text(value).style(|s| s.font_size(theme::font_body()).color(theme::text_dim())),
+    ))
+    .style(|s| s.items_start().gap(theme::scaled(10.0)).width_full())
+    .into_any()
+}
+
+/// An icon-led sentence — a caveat, a warning, a state, or an engine's
+/// limitation.
+pub(crate) fn fact_note(
+    icon: &'static str,
+    color: fn() -> floem::peniko::Color,
+    message: String,
+) -> AnyView {
+    h_stack((
+        icons::icon(icon, 14.0).style(move |s| {
+            s.flex_shrink(0.0_f32)
+                .color(color())
+                .margin_top(theme::scaled(1.0))
+        }),
+        text(message).style(move |s| s.font_size(theme::font_body()).color(color())),
+    ))
+    .style(|s| s.items_start().gap(theme::scaled(7.0)).width_full())
+    .into_any()
+}
+
 /// A rule between sections: the same weight and colour as the one under a modal
 /// header, inset with the rest of the body content.
 ///
