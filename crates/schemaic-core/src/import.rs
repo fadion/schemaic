@@ -543,6 +543,18 @@ pub enum IssueKind {
     NotAnInteger,
     NotANumber,
     NotABoolean,
+    /// The worksheet itself could not evaluate this cell — `#N/A`, `#REF!`,
+    /// `#DIV/0!`.
+    ///
+    /// **Raised whatever the column's type is**, which is the whole reason it
+    /// exists. `cell_text` keeps Excel's own spelling of a formula error on the
+    /// stated ground that "passing it on surfaces as a coercion `Issue` naming
+    /// the row" — but that surfacing was `coerce`'s type dispatch, and
+    /// `ColKind::Other` (every text, date, JSON, blob and enum column) has none.
+    /// So a `VLOOKUP` column's `#N/A` went into a `VARCHAR` with no issue, no
+    /// warning and a report saying the rows imported — the case where the value
+    /// is least recoverable.
+    CellError,
     /// The field is NULL (or empty) but the column doesn't allow it.
     NullInNotNull,
     /// The record has a different number of fields than the header did.
@@ -559,6 +571,7 @@ impl IssueKind {
             IssueKind::NotAnInteger => "not a whole number".into(),
             IssueKind::NotANumber => "not a number".into(),
             IssueKind::NotABoolean => "not a true/false value".into(),
+            IssueKind::CellError => "the sheet could not evaluate this cell".into(),
             IssueKind::NullInNotNull => "empty, but the column can't be NULL".into(),
             IssueKind::FieldCount { expected, found } => {
                 format!("has {found} fields, expected {expected}")
@@ -1279,7 +1292,14 @@ fn xlsx_rows(
             if !took_header {
                 for (i, c) in full.into_iter().enumerate() {
                     let name = c.unwrap_or_default();
-                    let name = if cfg.trim { name.trim() } else { &name[..] };
+                    // The shared strip, not a fourth reader of its own. A BOM
+                    // that survived a round-trip through a BOM'd CSV lands
+                    // *inside* the first header name and silently breaks
+                    // name-matching on the very first column — the failure this
+                    // module's own header comment names, and which the CSV path
+                    // was the only one taking the cure for.
+                    let name = strip_bom(&name);
+                    let name = if cfg.trim { name.trim() } else { name };
                     columns.push(if name.is_empty() {
                         format!("Column {}", i + 1)
                     } else {
@@ -1401,6 +1421,29 @@ fn duration_hms(days: f64) -> String {
 ///   `#DIV/0!`) rather than a null: it is a cell the sheet itself could not
 ///   evaluate, and passing it on surfaces as a coercion [`Issue`] naming the
 ///   row, where a silent null would not.
+/// Is this field one of Excel's own formula-error spellings?
+///
+/// The closed set the format defines, matched exactly — `#N/A` and its siblings
+/// are not values a sheet can otherwise produce, and `cell_text` writes them
+/// with `Display`, which is Excel's spelling rather than calamine's variant
+/// name. Case-sensitive and whole-field, so a `VARCHAR` holding the sentence
+/// "check the #REF! column" is text, which it is.
+fn is_worksheet_error(text: &str) -> bool {
+    matches!(
+        text,
+        "#DIV/0!"
+            | "#N/A"
+            | "#NAME?"
+            | "#NULL!"
+            | "#NUM!"
+            | "#REF!"
+            | "#VALUE!"
+            | "#GETTING_DATA"
+            | "#SPILL!"
+            | "#CALC!"
+    )
+}
+
 fn cell_text(c: &calamine::Data) -> Field {
     use calamine::Data;
     match c {
@@ -1408,8 +1451,16 @@ fn cell_text(c: &calamine::Data) -> Field {
         Data::String(s) => Some(s.clone()),
         Data::Int(i) => Some(i.to_string()),
         Data::Float(f) => Some(f.to_string()),
-        // The spellings `coerce`'s boolean family already accepts.
-        Data::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
+        // `1`/`0`, not `true`/`false`. Both spellings are in `ColKind::Bool`'s
+        // accepted list, so this is not a trade between engines — it is the one
+        // that also works where the column is *not* classified `Bool`. MySQL and
+        // MariaDB report a `BOOLEAN` column as `tinyint(1)`, so `classify` gives
+        // `ColKind::Int` and `coerce("true", Int)` is `NotAnInteger`: every row
+        // of an ordinary spreadsheet's TRUE/FALSE column was refused, and the
+        // same workbook imported fine on PostgreSQL and SQLite. The asymmetry
+        // is already written down in `bool_literal_is_integer`; this was the one
+        // place in the file that forgot it.
+        Data::Bool(b) => Some(if *b { "1".into() } else { "0".into() }),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Some(s.clone()),
         // A duration is an elapsed time and not a clock time, so it is the one
         // kind `to_ymd_hms_milli` says nothing useful about — hence the split
@@ -1601,12 +1652,16 @@ pub fn insert_columns(mapping: &Mapping, table: &TableInfo) -> Vec<usize> {
 /// [`insert_columns`] order, collecting anything wrong with it.
 ///
 /// `line` is the record's 1-based line in the file, so an issue can say where.
+/// `format` is here for one reason: a worksheet's formula errors
+/// ([`IssueKind::CellError`]) are wrong for every column type, and only a
+/// worksheet has them.
 pub fn coerce_record(
     fields: &[Field],
     mapping: &Mapping,
     table: &TableInfo,
     nulls: &NullRule,
     dialect: SqlDialect,
+    format: ImportFormat,
     line: u64,
 ) -> (Vec<Value>, Vec<Issue>) {
     let cols = insert_columns(mapping, table);
@@ -1664,6 +1719,20 @@ pub fn coerce_record(
                     };
                 }
             };
+            // Asked before the type dispatch, and independently of it: a cell
+            // the sheet could not evaluate is wrong for *every* column type,
+            // and `ColKind::Other` — text, date, JSON, blob, enum — has no
+            // dispatch to catch it with. Format-gated, because only a worksheet
+            // has formula errors: `#N/A` typed into a CSV is text.
+            if format == ImportFormat::Xlsx && is_worksheet_error(field) {
+                issues.push(Issue {
+                    line,
+                    column: col.name.clone(),
+                    text: field.to_string(),
+                    kind: IssueKind::CellError,
+                });
+                return Value::Null;
+            }
             match coerce(
                 field,
                 classify(&col.type_name),
@@ -1739,7 +1808,7 @@ pub fn validate<R: std::io::Read>(
         out.rows += 1;
         // See `trim_to_mapping` — the check must see exactly what the import will.
         fields.truncate(trim_to_mapping(&fields, format, mapping));
-        let (_, issues) = coerce_record(&fields, mapping, table, &nulls, dialect, line);
+        let (_, issues) = coerce_record(&fields, mapping, table, &nulls, dialect, format, line);
         for i in issues {
             if out.issues.len() >= max_issues {
                 out.more_issues = true;
@@ -1794,6 +1863,7 @@ impl RowCtx {
             &self.table,
             &self.nulls,
             self.dialect,
+            self.format,
             line,
         );
         match issues.first() {
@@ -2710,6 +2780,147 @@ mod tests {
             sheet: sheet.map(str::to_string),
             ..cfg(has_header)
         }
+    }
+
+    /// **A spreadsheet's TRUE/FALSE column, into the type MySQL actually
+    /// reports.** Driven from the *declared type string* through `classify`,
+    /// not from `ColKind::Bool`, because in isolation `"true"` looks right and
+    /// that is exactly what let this ship: MySQL and MariaDB report a `BOOLEAN`
+    /// column as `tinyint(1)`, so `classify` gives `Int`, and every row of an
+    /// ordinary workbook was refused with "not a whole number (true)" while the
+    /// same file imported fine on PostgreSQL and SQLite.
+    #[test]
+    fn a_boolean_cell_imports_into_a_mysql_boolean_column() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("id"), Cell::Text("flag")],
+                &[Cell::Num(1.0), Cell::Bool(true)],
+                &[Cell::Num(2.0), Cell::Bool(false)],
+            ],
+        )]);
+        // What MySQL/MariaDB put in `ColumnInfo::type_name` for a `BOOLEAN`.
+        assert_eq!(classify("tinyint(1)"), ColKind::Int);
+        let table = tbl(&[("id", "int", false), ("flag", "tinyint(1)", false)]);
+        let mapping = auto_map(&["id".into(), "flag".into()], &table, true);
+        let v = validate(
+            &bytes[..],
+            ImportFormat::Xlsx,
+            &xlsx_cfg(true, None),
+            &table,
+            &mapping,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert!(v.issues.is_empty(), "{:?}", v.issues);
+
+        // And on the engines where the column really is boolean, both spellings
+        // were always accepted — so this is not a trade between them.
+        for dialect in [MySql, Postgres] {
+            let kind = classify(if dialect == MySql {
+                "tinyint(1)"
+            } else {
+                "bool"
+            });
+            assert!(coerce("1", kind, false, &NullRule::default(), dialect).is_ok());
+            assert!(coerce("0", kind, false, &NullRule::default(), dialect).is_ok());
+        }
+    }
+
+    /// **The same header, through the two readers, must map the same way.**
+    /// A BOM that survived a round-trip through a BOM'd CSV lands inside the
+    /// first header name; the CSV reader strips it and the worksheet reader did
+    /// not, so the first column silently imported into nothing. Asserted
+    /// against the CSV path rather than against a literal, because the claim is
+    /// that the two agree.
+    #[test]
+    fn a_bom_on_the_first_worksheet_header_is_stripped_like_a_csvs() {
+        let bytes = workbook(&[(
+            "S",
+            &[
+                &[Cell::Text("\u{feff}id"), Cell::Text("name")],
+                &[Cell::Num(1.0), Cell::Text("Ada")],
+            ],
+        )]);
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        let csv = read_sample(
+            "\u{feff}id,name\n1,Ada\n".as_bytes(),
+            ImportFormat::Csv,
+            &cfg(true),
+            10,
+        )
+        .unwrap();
+        assert_eq!(s.columns, csv.columns);
+        assert_eq!(s.columns, ["id", "name"]);
+
+        let table = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        assert_eq!(
+            auto_map(&s.columns, &table, true).targets,
+            auto_map(&csv.columns, &table, true).targets
+        );
+    }
+
+    /// **A cell the sheet could not evaluate is wrong for every column type.**
+    /// `cell_text` keeps Excel's spelling on the stated ground that it "surfaces
+    /// as a coercion Issue naming the row" — but that surfacing was `coerce`'s
+    /// type dispatch, and `ColKind::Other` has none. So the test is written
+    /// against a **varchar** column: against an `int` one it passes vacuously,
+    /// which is the trap the house rule names.
+    #[test]
+    fn an_error_cell_is_reported_even_for_a_text_column() {
+        use calamine::{CellErrorType, Data};
+        let table = tbl(&[("id", "int", false), ("note", "varchar", true)]);
+        let mapping = auto_map(&["id".into(), "note".into()], &table, true);
+
+        // The seam, both ends: what the reader writes for an error cell is what
+        // the coercion recognises. `rust_xlsxwriter` cannot author an error cell,
+        // so the fixture is the reader's own output rather than a workbook — and
+        // joining the two here is the point, since each half looked right alone.
+        for e in [CellErrorType::NA, CellErrorType::Div0, CellErrorType::Ref] {
+            let text = cell_text(&Data::Error(e)).expect("an error cell is not a null");
+            assert!(is_worksheet_error(&text), "{text}");
+        }
+        let na = cell_text(&Data::Error(CellErrorType::NA)).unwrap();
+
+        let (_, issues) = coerce_record(
+            &f(&["2", &na]),
+            &mapping,
+            &table,
+            &NullRule::default(),
+            MySql,
+            ImportFormat::Xlsx,
+            3,
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].kind, IssueKind::CellError);
+        assert_eq!(issues[0].column, "note");
+        assert_eq!(issues[0].line, 3);
+
+        // …and the same text in a CSV is text: only a worksheet has formula
+        // errors, and this must not start refusing files that never had one.
+        let (_, issues) = coerce_record(
+            &f(&["2", &na]),
+            &mapping,
+            &table,
+            &NullRule::default(),
+            MySql,
+            ImportFormat::Csv,
+            3,
+        );
+        assert!(issues.is_empty(), "{issues:?}");
+
+        // A sentence that merely mentions one is text on every format.
+        let (_, issues) = coerce_record(
+            &f(&["2", "check the #REF! column"]),
+            &mapping,
+            &table,
+            &NullRule::default(),
+            MySql,
+            ImportFormat::Xlsx,
+            3,
+        );
+        assert!(issues.is_empty(), "{issues:?}");
     }
 
     #[test]
@@ -3932,8 +4143,15 @@ mod tests {
     fn coerce_record_orders_values_to_match_insert_columns() {
         let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
         let m = auto_map(&["name".into(), "id".into()], &t, true);
-        let (vals, issues) =
-            coerce_record(&f(&["Smith", "7"]), &m, &t, &NullRule::default(), MySql, 2);
+        let (vals, issues) = coerce_record(
+            &f(&["Smith", "7"]),
+            &m,
+            &t,
+            &NullRule::default(),
+            MySql,
+            ImportFormat::Csv,
+            2,
+        );
         // insert_columns is [0 (id), 1 (name)] — values follow that, not the file.
         assert_eq!(vals, vec![Value::Int(7), Value::Str("Smith".into())]);
         assert!(issues.is_empty());
@@ -3949,6 +4167,7 @@ mod tests {
             &t,
             &NullRule::default(),
             MySql,
+            ImportFormat::Csv,
             42,
         );
         assert_eq!(issues.len(), 1);
@@ -3964,7 +4183,15 @@ mod tests {
     fn coerce_record_reports_a_field_count_mismatch() {
         let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
         let m = auto_map(&["id".into(), "name".into()], &t, true);
-        let (vals, issues) = coerce_record(&f(&["7"]), &m, &t, &NullRule::default(), MySql, 3);
+        let (vals, issues) = coerce_record(
+            &f(&["7"]),
+            &m,
+            &t,
+            &NullRule::default(),
+            MySql,
+            ImportFormat::Csv,
+            3,
+        );
         assert!(issues.iter().any(|i| i.kind
             == IssueKind::FieldCount {
                 expected: 2,
