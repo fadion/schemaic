@@ -1785,7 +1785,21 @@ const MY_USERS_MYSQL_SQL: &str = "SELECT CAST(User AS CHAR), CAST(Host AS CHAR),
             CAST(plugin AS CHAR), CAST(password_expired AS CHAR), CAST(account_locked AS CHAR) \
      FROM mysql.user ORDER BY User, Host";
 
-/// The pair alone, for a server that has neither extra column — and for the
+/// **`is_role` on its own**, for a MariaDB that has roles but not password
+/// expiry — every 10.1, 10.2 and 10.3, which is a window still in service.
+///
+/// Without this rung such a server fell through to the pair below, where
+/// `is_role` is `None` on every row, so `from_mysql_rows` folded each role into
+/// a `User` and kept the host MariaDB stores as `''`. A role `readers` then
+/// listed as `readers@` and three of the four actions built from it are errors
+/// the model already documents: `SHOW GRANTS FOR 'readers'@''` is 1141,
+/// `GRANT … TO 'readers'@''` is 1133, and `DROP ROLE` has no `@host` grammar at
+/// all. Role-ness is the one column whose absence changes what a statement
+/// *is*, so it gets a rung of its own rather than sharing the pair's.
+const MY_USERS_ROLE_SQL: &str = "SELECT CAST(User AS CHAR), CAST(Host AS CHAR), CAST(is_role AS CHAR) \
+     FROM mysql.user ORDER BY User, Host";
+
+/// The pair alone, for a server that has none of the extra columns — and for the
 /// version of `mysql.user` a future release trims again.
 const MY_USERS_PLAIN_SQL: &str =
     "SELECT CAST(User AS CHAR), CAST(Host AS CHAR) FROM mysql.user ORDER BY User, Host";
@@ -1833,6 +1847,14 @@ async fn collect_my_users(conn: &mut Conn) -> Result<users::Principals, DbError>
     if let Ok(rows) = conn.query_map(MY_USERS_MYSQL_SQL, |r: MyUserTuple| r).await {
         return Ok(users::Principals::complete(users::from_mysql_rows(
             &my_user_rows(rows, false),
+        )));
+    }
+    if let Ok(rows) = conn
+        .query_map(MY_USERS_ROLE_SQL, |r: (String, String, Option<String>)| r)
+        .await
+    {
+        return Ok(users::Principals::complete(users::from_mysql_rows(
+            &my_role_rows(rows),
         )));
     }
     if let Ok(rows) = conn
@@ -1890,6 +1912,94 @@ fn my_user_rows(rows: Vec<MyUserTuple>, mariadb: bool) -> Vec<MyUserRow> {
             account_locked: if mariadb { None } else { fifth },
         })
         .collect()
+}
+
+/// [`MY_USERS_ROLE_SQL`]'s three columns, as rows.
+///
+/// A named function rather than a closure inside the ladder, for the reason
+/// [`my_user_rows`] is one: the mapping is the whole content of a rung, and a
+/// rung whose mapping is inline is a rung no test can reach.
+fn my_role_rows(rows: Vec<(String, String, Option<String>)>) -> Vec<MyUserRow> {
+    rows.into_iter()
+        .map(|(user, host, is_role)| MyUserRow {
+            user,
+            host,
+            is_role,
+            ..Default::default()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod my_user_tests {
+    use super::{MyUserRow, my_role_rows, my_user_rows};
+
+    /// **Which column the fifth one is.** Two bare boolean literals twelve lines
+    /// apart decide it, and nothing in any tier asserted the result: transposing
+    /// them makes every locked MySQL account a `Role`, drops its host, and
+    /// `DROP USER "app"` then resolves to a *different* account. The live role
+    /// test finds its role by name and never asks what kind it is.
+    #[test]
+    fn the_fifth_column_lands_in_the_field_this_servers_spelling_meant() {
+        let row = |fifth: &str| {
+            vec![(
+                "app".to_string(),
+                "%".to_string(),
+                Some("plugin".to_string()),
+                Some("N".to_string()),
+                Some(fifth.to_string()),
+            )]
+        };
+        // MariaDB's fifth column is `is_role`…
+        let maria = my_user_rows(row("Y"), true);
+        assert_eq!(maria[0].is_role.as_deref(), Some("Y"));
+        assert_eq!(maria[0].account_locked, None);
+        // …and MySQL 8's is `account_locked`, which does not make a role.
+        let mysql = my_user_rows(row("Y"), false);
+        assert_eq!(mysql[0].is_role, None);
+        assert_eq!(mysql[0].account_locked.as_deref(), Some("Y"));
+        // The other four columns are the same either way.
+        assert_eq!(maria[0].user, mysql[0].user);
+        assert_eq!(maria[0].host, mysql[0].host);
+        assert_eq!(maria[0].plugin, mysql[0].plugin);
+        assert_eq!(maria[0].password_expired, mysql[0].password_expired);
+    }
+
+    /// The rung that exists so a MariaDB with roles but no password expiry still
+    /// knows a role when it sees one. Fed through `from_mysql_rows`, because
+    /// what the missing column costs is a *principal*, not a field: a role kept
+    /// as a `User` carries MariaDB's empty host into `'readers'@''`, which three
+    /// of the four statements reject.
+    #[test]
+    fn the_role_rung_still_tells_a_role_from_a_user() {
+        let rows = my_role_rows(vec![
+            ("app".into(), "%".into(), Some("N".into())),
+            ("readers".into(), String::new(), Some("Y".into())),
+        ]);
+        let out = schemaic_core::users::from_mysql_rows(&rows);
+        let role = out
+            .iter()
+            .find(|p| p.name == "readers")
+            .expect("the role is listed");
+        assert_eq!(role.kind, schemaic_core::users::PrincipalKind::Role);
+        // A role has no host, so nothing writes `'readers'@''`.
+        assert_eq!(role.host, None);
+        assert_eq!(role.display(), "readers");
+
+        let user = out.iter().find(|p| p.name == "app").expect("the user");
+        assert_eq!(user.kind, schemaic_core::users::PrincipalKind::User);
+        assert_eq!(user.host.as_deref(), Some("%"));
+
+        // And the rung below it — the bare pair — is what this one exists to
+        // stop being reached on such a server: with no `is_role` the same role
+        // folds into a user with an empty host.
+        let bare = schemaic_core::users::from_mysql_rows(&[MyUserRow {
+            user: "readers".into(),
+            host: String::new(),
+            ..Default::default()
+        }]);
+        assert_eq!(bare[0].kind, schemaic_core::users::PrincipalKind::User);
+    }
 }
 
 /// Why a connection has no Server Activity to report. One sentence, one place,
