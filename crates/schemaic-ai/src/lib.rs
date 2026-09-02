@@ -9,9 +9,25 @@
 
 use schemaic_core::transcript::{Seg, ToolCall, TurnStats};
 
-/// SQL keywords + schema identifiers come from the app; this is the tool set we
-/// forbid so the assistant stays a conversational SQL helper (the MCP DB tools
-/// are allow-listed separately by the app).
+/// A **backstop**, not the guard. `--tools ""` is what leaves the session with
+/// no built-in tools; this list names the ones whose misuse would be worst, so
+/// that a future CLI which stops honouring `--tools` does not silently hand the
+/// SQL assistant a shell.
+///
+/// It is deliberately not a *complete* denylist, because a complete denylist is
+/// not maintainable: the first ten names here were the whole of it, and the CLI
+/// they run grew nineteen more they had never heard of — every one live in the
+/// AI panel, and three of them (`Skill`, `ToolSearch`, `Monitor`) measured
+/// *running inside a turn without raising a permission request at all*.
+/// Enumerating what to refuse is the wrong shape; naming what to allow is
+/// [`build_session_args`]'s job.
+///
+/// **It is a snapshot, and it has to name the worst of what it can see.** The
+/// second group below is that measured nineteen. Listing only the first ten left
+/// the backstop covering the shell and the filesystem while `Artifact` — which
+/// publishes a page to the web — `SendMessage`, `RemoteTrigger` and `CronCreate`
+/// walked past it, so the fallback did not fall back on anything that mattered.
+/// A name the CLI does not know is harmless here; a name missing from it is not.
 const DISALLOWED_TOOLS: &[&str] = &[
     "Bash",
     "Edit",
@@ -23,18 +39,169 @@ const DISALLOWED_TOOLS: &[&str] = &[
     "WebFetch",
     "WebSearch",
     "Task",
+    // Measured live in the panel against the shipped CLI, none of them known to
+    // the ten above. Ordered as the `system`/`init` event reported them.
+    "Artifact",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "EnterWorktree",
+    "ExitWorktree",
+    "ListAgents",
+    "Monitor",
+    "PushNotification",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "TaskOutput",
+    "TaskStop",
+    "ToolSearch",
+    "Workflow",
 ];
+
+/// Which of the sealing flags the detected `claude` understands.
+///
+/// The flags below are not universally old, and Schemaic spawns whatever binary
+/// the user has: passing one an older CLI does not know is not a degraded
+/// session but a dead one — it exits with `error: unknown option '--tools'`
+/// before the first turn, and the AI panel is gone until the user upgrades. So
+/// the flags are asked for rather than assumed.
+///
+/// **A capability, not a version.** The question is whether *this* binary
+/// accepts the flag, which its own `--help` answers directly; a version number
+/// only stands in for that answer and needs a table mapping releases to flags
+/// that nothing here can keep true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CliSeal {
+    pub tools: bool,
+    pub setting_sources: bool,
+    pub strict_mcp_config: bool,
+}
+
+impl CliSeal {
+    /// Every flag passed — a current CLI, and the answer for an *unreadable*
+    /// probe. See [`seal_from_help`] for why that is the safe direction.
+    pub const ALL: CliSeal = CliSeal {
+        tools: true,
+        setting_sources: true,
+        strict_mcp_config: true,
+    };
+
+    /// No flag passed — what a CLI too old for any of them gets.
+    pub const NONE: CliSeal = CliSeal {
+        tools: false,
+        setting_sources: false,
+        strict_mcp_config: false,
+    };
+}
+
+/// Read [`CliSeal`] out of a `claude --help`.
+///
+/// **An unreadable answer is not evidence of absence.** Empty or unrecognisable
+/// help text yields [`CliSeal::ALL`], so a probe that failed for a transient
+/// reason on a *working* CLI degrades to a spawn that may error loudly — never
+/// to a session quietly running unsealed. The dangerous direction here is
+/// "assume the flag is missing and carry on": that reopens the hole with nothing
+/// on screen to say so, which is exactly the failure this whole change exists to
+/// close. Only a help text we actually read, that actually lacks the flag, drops
+/// it.
+pub fn seal_from_help(help: &str) -> CliSeal {
+    if help.trim().is_empty() {
+        return CliSeal::ALL;
+    }
+    CliSeal {
+        tools: mentions_flag(help, "--tools"),
+        setting_sources: mentions_flag(help, "--setting-sources"),
+        strict_mcp_config: mentions_flag(help, "--strict-mcp-config"),
+    }
+}
+
+/// Does `help` list exactly this flag — not one that merely starts with it?
+///
+/// `--tools` is a prefix of nothing today, but `--allowed-tools` and
+/// `--disallowedTools` are near enough that a bare `contains` is the kind of
+/// match that starts passing for the wrong reason after a rename. The character
+/// after the flag has to end it.
+fn mentions_flag(help: &str, flag: &str) -> bool {
+    help.match_indices(flag).any(|(i, _)| {
+        help[i + flag.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+    })
+}
+
+/// The sealing flags this CLI accepts, in the order both arg builders emit them.
+///
+/// One definition, so the session and the one-shot paths cannot come to seal
+/// themselves differently — the one-shot paths are the ones with no surface to
+/// notice it if they did.
+fn seal_args(seal: CliSeal) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if seal.strict_mcp_config {
+        a.push("--strict-mcp-config".into());
+    }
+    if seal.setting_sources {
+        a.push("--setting-sources".into());
+        a.push("user".into());
+    }
+    if seal.tools {
+        // Empty built-in set. The MCP tools the app allow-lists are unaffected —
+        // this empties the *built-in* set only.
+        a.push("--tools".into());
+        a.push(String::new());
+    }
+    a
+}
 
 /// Build the args for a persistent streaming session.
 ///
 /// `mcp_config_json` (if set) is passed to `--mcp-config` and its tools are
 /// allow-listed so the assistant can call them without an interactive prompt.
+///
+/// `seal` is what the detected CLI accepts — see [`CliSeal`]. A flag it does not
+/// know is left out rather than killing the spawn; `DISALLOWED_TOOLS` is passed
+/// unconditionally and is what stands in for `--tools` on a CLI too old for it,
+/// which is the case that backstop exists for.
+///
+/// **The assistant is given no built-in tools.** `--tools ""` empties the
+/// built-in set, leaving the session exactly the MCP tools the app allow-lists
+/// and nothing else. This is the guard; [`DISALLOWED_TOOLS`] is only a backstop
+/// behind it. The denylist alone was never the guard it looked like — measured
+/// against the shipped CLI it left nineteen built-ins live, including `Artifact`
+/// (which publishes a page to the web), `CronCreate`, `SendMessage` and
+/// `Workflow`. An assistant that has just read a client's rows should not be one
+/// tool call away from publishing them — and they did not ask first: driving the
+/// old flag set with a permission route deliberately left unanswered, `Skill`,
+/// `ToolSearch` and `Monitor` each executed inside the turn with no
+/// `can_use_tool` request emitted at all. What justifies this flag is what those
+/// tools can do, *not* the stall recorded in `TODO.md`, whose cause these
+/// measurements do not explain and which remains unidentified.
+///
+/// **The session sees only the MCP server and the settings we hand it.**
+/// `--strict-mcp-config` and `--setting-sources user` are not tuning; they close
+/// the hole that `DISALLOWED_TOOLS` and the allow-list look like they already
+/// close. Without the first, the user's own global MCP servers load into
+/// Schemaic's SQL assistant — tools nobody here allow-listed, reachable by the
+/// same unprompted route the built-ins took, and on a machine whose global
+/// settings allow-list them they do not even pause. Without the second, the CLI
+/// also reads `.claude/settings.json`
+/// and its local sibling relative to the working directory, and this child is
+/// spawned in [`std::env::temp_dir`] — world-writable on most systems, so
+/// anything that drops a settings file there is granting permissions in
+/// Schemaic's AI panel. `user` is kept because the user's own global settings are
+/// their own choice; the two directory-relative sources are the ones nobody
+/// chose.
 pub fn build_session_args(
     system_context: &str,
     model: Option<&str>,
     effort: Option<&str>,
     mcp_config_json: Option<&str>,
     mcp_tools: &[&str],
+    seal: CliSeal,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-p".into(),
@@ -47,6 +214,9 @@ pub fn build_session_args(
         "--permission-mode".into(),
         "default".into(),
     ];
+    // All three ahead of the variadic --allowedTools/--disallowedTools, which
+    // would read a later flag's name as a tool name.
+    a.extend(seal_args(seal));
     if let Some(m) = model {
         a.push("--model".into());
         a.push(m.into());
@@ -80,15 +250,25 @@ pub fn build_session_args(
 /// Args for a one-shot inline (Ctrl+K) generation: `-p <intent>
 /// --append-system-prompt <system> --model <model>`. Pure — the app spawns
 /// `claude` with these — so the flag set/order is unit-tested.
-pub fn inline_args(intent: &str, system: &str, model: &str) -> Vec<String> {
-    vec![
+///
+/// **Sealed the same way [`build_session_args`] is, and for a sharper reason.**
+/// Every caller — Ctrl+K, AI Fill, AI Seed — wants one string back and reads it
+/// with a parser; none of them has a surface that could render a tool call, and
+/// each discards everything but the value it parses out. So a tool call on this
+/// path leaves no trace anywhere: not in a transcript, not in a chip, not in the
+/// string the caller keeps. They need no tool and no server — the whole request
+/// is in the prompt.
+pub fn inline_args(intent: &str, system: &str, model: &str, seal: CliSeal) -> Vec<String> {
+    let mut a: Vec<String> = vec![
         "-p".into(),
         intent.into(),
         "--append-system-prompt".into(),
         system.into(),
         "--model".into(),
         model.into(),
-    ]
+    ];
+    a.extend(seal_args(seal));
+    a
 }
 
 /// What the platform will accept as one spawned command line.
@@ -499,7 +679,7 @@ mod tests {
 
     #[test]
     fn session_args_include_streaming_flags_and_disallowed_last() {
-        let a = build_session_args("", None, None, None, &[]);
+        let a = build_session_args("", None, None, None, &[], CliSeal::ALL);
         // Core streaming flags present.
         assert!(pos(&a, "-p").is_some());
         assert!(pos(&a, "--input-format").is_some());
@@ -520,7 +700,14 @@ mod tests {
 
     #[test]
     fn session_args_thread_model_effort_and_system_prompt() {
-        let a = build_session_args("ctx", Some("claude-opus-4-8"), Some("high"), None, &[]);
+        let a = build_session_args(
+            "ctx",
+            Some("claude-opus-4-8"),
+            Some("high"),
+            None,
+            &[],
+            CliSeal::ALL,
+        );
         let m = pos(&a, "--model").unwrap();
         assert_eq!(a[m + 1], "claude-opus-4-8");
         let e = pos(&a, "--effort").unwrap();
@@ -532,7 +719,14 @@ mod tests {
     #[test]
     fn session_args_allowlist_mcp_tools_only_with_config() {
         // Tools without a config are NOT allow-listed (guarded on mcp_config_json).
-        let a = build_session_args("", None, None, None, &["mcp__schemaic__run_query"]);
+        let a = build_session_args(
+            "",
+            None,
+            None,
+            None,
+            &["mcp__schemaic__run_query"],
+            CliSeal::ALL,
+        );
         assert!(pos(&a, "--allowedTools").is_none());
         // With a config, the tools follow --allowedTools before --disallowedTools.
         let a = build_session_args(
@@ -541,6 +735,7 @@ mod tests {
             None,
             Some("{\"mcpServers\":{}}"),
             &["mcp__schemaic__run_query", "mcp__schemaic__list_schema"],
+            CliSeal::ALL,
         );
         let cfg = pos(&a, "--mcp-config").unwrap();
         assert_eq!(a[cfg + 1], "{\"mcpServers\":{}}");
@@ -549,6 +744,128 @@ mod tests {
         assert!(al < dis, "allowed before disallowed");
         assert!(a[al + 1..dis].contains(&"mcp__schemaic__run_query".to_string()));
         assert!(a[al + 1..dis].contains(&"mcp__schemaic__list_schema".to_string()));
+    }
+
+    #[test]
+    fn the_session_loads_no_mcp_server_and_no_config_dir_of_its_own_finding() {
+        let a = build_session_args(
+            "",
+            None,
+            None,
+            Some("{\"mcpServers\":{}}"),
+            &["mcp__schemaic__run_query"],
+            CliSeal::ALL,
+        );
+        // Only the server we hand it: without this the user's own global MCP
+        // servers load into the SQL assistant, and their tools are neither
+        // allow-listed nor disallowed — the one class that prompts.
+        assert!(pos(&a, "--strict-mcp-config").is_some());
+        // Settings from the user, never from the CWD — which is the (often
+        // world-writable) temp dir.
+        let s = pos(&a, "--setting-sources").expect("setting-sources pinned");
+        assert_eq!(a[s + 1], "user");
+        // Both sit ahead of the two variadic tool lists, which would swallow
+        // them as tool names.
+        let al = pos(&a, "--allowedTools").unwrap();
+        assert!(pos(&a, "--strict-mcp-config").unwrap() < al);
+        assert!(s < al);
+    }
+
+    /// **Captured from `claude --help`, not written from memory** — the same rule
+    /// the engine-error fixtures follow, and for the same reason: this parser is
+    /// the thing that decides whether the sealing flags are passed at all, so a
+    /// fixture shaped the way the help *ought* to look would prove nothing about
+    /// the binary Schemaic actually spawns. The near-miss names are real: the CLI
+    /// lists two spellings of each tool-list flag on one line, and mentions
+    /// `--tools` inside another flag's prose.
+    const HELP: &str = "\
+  --allowedTools, --allowed-tools <tools...>
+  --disallowedTools, --disallowed-tools <tools...>
+                                        --tools names them, and ignores user,
+  --setting-sources <sources>           Comma-separated list of setting sources
+  --settings <file-or-json>             Path to a settings JSON file or a JSON
+  --strict-mcp-config                   Only use MCP servers from --mcp-config,
+  --tools <tools...>                    Specify the list of available tools from";
+
+    #[test]
+    fn a_current_cli_advertises_every_sealing_flag() {
+        assert_eq!(seal_from_help(HELP), CliSeal::ALL);
+    }
+
+    /// The one that matters: `--allowed-tools` and `--disallowedTools` both end
+    /// in the letters of `--tools`, and a `contains` would call a CLI that has
+    /// neither `--tools` nor `--setting-sources` fully sealed — passing flags
+    /// that kill the spawn.
+    #[test]
+    fn a_flag_is_not_found_inside_another_flags_name() {
+        let old = "\
+  --allowedTools, --allowed-tools <tools...>
+  --disallowedTools, --disallowed-tools <tools...>
+  --settings <file-or-json>             Path to a settings JSON file or a JSON
+  --mcp-config <configs...>             Load MCP servers from a JSON file";
+        assert_eq!(seal_from_help(old), CliSeal::NONE);
+    }
+
+    #[test]
+    fn each_flag_is_read_on_its_own() {
+        let only_strict = "  --strict-mcp-config    Only use MCP servers from --mcp-config";
+        assert_eq!(
+            seal_from_help(only_strict),
+            CliSeal {
+                tools: false,
+                setting_sources: false,
+                strict_mcp_config: true,
+            }
+        );
+    }
+
+    /// An unreadable probe must not be read as "the flags are absent" — that
+    /// silently unseals a session on a CLI that was merely busy or noisy.
+    #[test]
+    fn an_unreadable_probe_seals_rather_than_opens() {
+        for help in ["", "   \n\t "] {
+            assert_eq!(seal_from_help(help), CliSeal::ALL, "{help:?}");
+        }
+    }
+
+    /// The whole point of the probe: an old CLI gets a spawnable command line,
+    /// and the backstop is what still stands between it and a shell.
+    #[test]
+    fn an_old_cli_gets_no_sealing_flags_but_keeps_the_backstop() {
+        let a = build_session_args("", None, None, None, &[], CliSeal::NONE);
+        for flag in ["--tools", "--setting-sources", "--strict-mcp-config"] {
+            assert!(pos(&a, flag).is_none(), "{flag} must not be passed: {a:?}");
+        }
+        let d = pos(&a, "--disallowedTools").expect("the backstop still goes");
+        assert!(a[d + 1..].contains(&"Artifact".to_string()));
+        assert!(a[d + 1..].contains(&"Bash".to_string()));
+
+        let inline = inline_args("i", "s", "m", CliSeal::NONE);
+        assert!(!inline.iter().any(|x| x == "--tools"), "{inline:?}");
+    }
+
+    #[test]
+    fn the_session_is_given_no_built_in_tools_at_all() {
+        let a = build_session_args(
+            "",
+            None,
+            None,
+            Some("{\"mcpServers\":{}}"),
+            &["mcp__schemaic__run_query"],
+            CliSeal::ALL,
+        );
+        // `--tools ""` is the guard; the empty string is its whole value, so it
+        // must be present *and* empty. A missing value would read the next flag
+        // as a tool name and hand the session that tool.
+        let t = pos(&a, "--tools").expect("--tools present");
+        assert_eq!(a[t + 1], "", "--tools takes the empty list");
+        // Ahead of the variadic lists, like the other prefix flags.
+        assert!(t < pos(&a, "--allowedTools").unwrap());
+        // The MCP allow-list is untouched: `--tools` empties the *built-in* set,
+        // and the tools Schemaic serves are what the panel is for.
+        let al = pos(&a, "--allowedTools").unwrap();
+        let dis = pos(&a, "--disallowedTools").unwrap();
+        assert!(a[al + 1..dis].contains(&"mcp__schemaic__run_query".to_string()));
     }
 
     #[test]
@@ -576,8 +893,25 @@ mod tests {
     }
 
     #[test]
+    fn a_one_shot_generation_is_given_no_tools_and_no_servers() {
+        // Ctrl+K, AI Fill and AI Seed all ask for one string back. They ran with
+        // the full built-in set, the user's own MCP servers and every settings
+        // file — and unlike the chat panel they have no surface that could show
+        // a tool call, so anything the model reached for happened unseen.
+        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8", CliSeal::ALL);
+        let t = a.iter().position(|x| x == "--tools").expect("--tools");
+        assert_eq!(a[t + 1], "");
+        assert!(a.iter().any(|x| x == "--strict-mcp-config"));
+        let s = a
+            .iter()
+            .position(|x| x == "--setting-sources")
+            .expect("--setting-sources");
+        assert_eq!(a[s + 1], "user");
+    }
+
+    #[test]
     fn inline_args_flags_in_order() {
-        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8");
+        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8", CliSeal::ALL);
         assert_eq!(
             a,
             vec![
@@ -587,6 +921,12 @@ mod tests {
                 "SCHEMA",
                 "--model",
                 "claude-opus-4-8",
+                // `seal_args`' order, shared with the session builder.
+                "--strict-mcp-config",
+                "--setting-sources",
+                "user",
+                "--tools",
+                "",
             ]
         );
     }
@@ -699,7 +1039,14 @@ mod tests {
 
     #[test]
     fn an_ordinary_command_line_is_not_refused() {
-        let args = build_session_args("a system prompt", Some("haiku"), None, None, &[]);
+        let args = build_session_args(
+            "a system prompt",
+            Some("haiku"),
+            None,
+            None,
+            &[],
+            CliSeal::ALL,
+        );
         assert_eq!(oversize_reason(&args, arg_limit()), None);
     }
 
@@ -709,7 +1056,7 @@ mod tests {
         // becomes if this isn't caught, and which sends the user to check an
         // installation that is fine.
         let huge = "x".repeat(40_000);
-        let args = build_session_args(&huge, None, None, None, &[]);
+        let args = build_session_args(&huge, None, None, None, &[], CliSeal::ALL);
         let why = oversize_reason(&args, 30_000).expect("must refuse");
         assert!(why.contains("schema scope"), "{why}");
         assert!(!why.contains("installed"), "{why}");

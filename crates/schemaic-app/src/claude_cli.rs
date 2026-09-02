@@ -115,3 +115,61 @@ pub(crate) fn claude_bin(override_path: &str) -> String {
     }
     detect_claude_bin().unwrap_or_else(|| "claude".to_string())
 }
+
+/// What sealing flags the CLI at `bin` accepts, from its own `--help`.
+///
+/// **Cached per resolved binary path**, because the answer cannot change while
+/// that file does not and the probe costs ~140 ms — enough to be felt if it ran
+/// on the UI thread before every AI action instead of once.
+/// [`warm_seal_cache`] fills it off-thread at startup so the first AI action
+/// usually finds it already there.
+///
+/// A probe that cannot run at all yields [`schemaic_ai::CliSeal::ALL`] (see
+/// [`schemaic_ai::seal_from_help`]): a binary that answers nothing is one the
+/// spawn is about to fail on anyway, and guessing *absent* there would silently
+/// unseal a session on a CLI that was merely busy.
+///
+/// **The one stale case is an upgrade in place**, where the path does not change
+/// but the binary behind it grows the flags: the cached answer stays until
+/// Schemaic restarts, so a session spawned in between is sealed the old way.
+/// What covers it is `DISALLOWED_TOOLS`, which is passed at every seal level and
+/// now names the whole measured built-in set — the two halves of that change
+/// exist for each other, and dropping either leaves this window open.
+pub(crate) fn claude_seal(bin: &str) -> schemaic_ai::CliSeal {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, schemaic_ai::CliSeal>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(c) = cache.lock()
+        && let Some(seal) = c.get(bin)
+    {
+        return *seal;
+    }
+    let help = std::process::Command::new(bin)
+        .arg("--help")
+        .output()
+        .ok()
+        .map(|o| {
+            // `--help` goes to stdout; keep stderr as a fallback for a CLI that
+            // prints usage there, so a readable answer isn't mistaken for none.
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s
+        })
+        .unwrap_or_default();
+    let seal = schemaic_ai::seal_from_help(&help);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(bin.to_string(), seal);
+    }
+    seal
+}
+
+/// Fill [`claude_seal`]'s cache for `bin` on a background thread.
+///
+/// Called once at startup with the auto-detected path. Nothing waits on it: a
+/// miss simply pays the probe where it would have anyway.
+pub(crate) fn warm_seal_cache(bin: String) {
+    std::thread::spawn(move || {
+        let _ = claude_seal(&bin);
+    });
+}
