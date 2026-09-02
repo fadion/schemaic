@@ -3536,6 +3536,15 @@ impl Target {
     }
 }
 
+/// What stands in for an account password in a script that leaves the preview.
+///
+/// Shaped so it is obviously not a password and obviously has to be replaced:
+/// it survives the emitter's quoting as a literal, so the statement still parses
+/// and fails at the server rather than silently creating an account whose
+/// password is this string — which is the failure mode of a placeholder that
+/// looks plausible.
+pub const PASSWORD_PLACEHOLDER: &str = "PUT-THE-PASSWORD-HERE";
+
 /// A set of changes against one table, ready to review and emit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeSet {
@@ -3707,6 +3716,63 @@ impl ChangeSet {
             self.withheld_header(),
             client_script(&self.emit(), self.dialect)
         )
+    }
+
+    /// The script as it may **leave** the preview — for the clipboard, and for
+    /// the editor tab the session file writes to disk.
+    ///
+    /// **The preview shows the real statement; nothing else gets to.** A
+    /// `CREATE USER … IDENTIFIED BY 'hunter2'` is the one plan this app emits
+    /// that carries a plaintext credential, and both exits from the preview put
+    /// it somewhere durable: "Open in editor" makes a query tab, whose text the
+    /// next session save writes into `tabs.json` in the clear and restores on
+    /// every launch; "Copy" puts it on the OS clipboard, which on Windows
+    /// persists in Clipboard History and cloud-syncs. Three doc sites asserted
+    /// the opposite ("never persisted, never logged").
+    ///
+    /// **One function, so a third exit inherits it.** The alternative — each
+    /// button remembering — is the shape the write guard's own invariant exists
+    /// to rule out.
+    ///
+    /// The password is replaced *before* the emitter runs, not scrubbed out of
+    /// its output: the set is cloned with [`PASSWORD_PLACEHOLDER`] in place of
+    /// each secret and re-emitted, so there is no scanning to get wrong and no
+    /// second emitter. The result is still the statement the user needs, with
+    /// the one word they have to type back — and a header saying so.
+    pub fn export_script(&self) -> String {
+        let (clean, redacted) = self.without_secrets();
+        if !redacted {
+            return self.editor_script();
+        }
+        format!(
+            "-- The password is not in this copy. An editor tab is saved with your\n\
+             -- session and a clipboard is not private, so Schemaic writes neither.\n\
+             -- Replace {PASSWORD_PLACEHOLDER} below before running this.\n\
+             {}",
+            clean.editor_script()
+        )
+    }
+
+    /// This set with every account password replaced, and whether any was.
+    ///
+    /// Separate from [`export_script`](Self::export_script) so the *decision* —
+    /// which changes carry a secret — is a pure function with a test, rather
+    /// than a condition inside a formatter. A seventh account change that
+    /// carries one has to be added here, and
+    /// `every_account_change_that_carries_a_password_is_scrubbed` is what says
+    /// so.
+    pub fn without_secrets(&self) -> (ChangeSet, bool) {
+        let mut out = self.clone();
+        let mut redacted = false;
+        for c in &mut out.changes {
+            if let Change::CreateAccount(d) = c
+                && !d.password.is_empty()
+            {
+                d.password = PASSWORD_PLACEHOLDER.to_string();
+                redacted = true;
+            }
+        }
+        (out, redacted)
     }
 
     fn q(&self, name: &str) -> String {
@@ -18897,6 +18963,74 @@ mod database_tests {
                 assert!(sql[0].ends_with(';'), "{:?}", sql[0]);
                 assert!(!summary.is_empty());
             }
+        }
+    }
+
+    /// **The preview shows the password; nothing that leaves it may.** "Open in
+    /// editor" put `IDENTIFIED BY 'hunter2'` into a query tab, which the next
+    /// session save writes into `tabs.json` in the clear and restores on every
+    /// launch; "Copy" put it on the OS clipboard, which on Windows persists and
+    /// cloud-syncs. Three doc sites said the password is "never persisted,
+    /// never logged".
+    ///
+    /// Both halves are asserted, and the second is the point: a test that only
+    /// checked the secret's absence would pass just as well against a function
+    /// that returned an empty string.
+    #[test]
+    fn a_script_that_leaves_the_preview_carries_no_password() {
+        for d in [MySql, Postgres] {
+            let cs = account(
+                "app@%",
+                d,
+                Change::CreateAccount(Box::new(crate::users::AccountDraft {
+                    name: "app".into(),
+                    password: "hunter2".into(),
+                    ..Default::default()
+                })),
+            );
+            // The preview itself is unchanged — it is the statement that runs.
+            assert!(cs.emit()[0].contains("hunter2"), "{:?}", cs.emit());
+            assert!(cs.editor_script().contains("hunter2"));
+
+            let out = cs.export_script();
+            assert!(!out.contains("hunter2"), "{out}");
+            // …and it is still the statement, with the one word to type back.
+            assert!(out.contains("CREATE"), "{out}");
+            assert!(out.contains("app"), "{out}");
+            assert!(out.contains(PASSWORD_PLACEHOLDER), "{out}");
+            assert!(out.contains("Replace"), "{out}");
+        }
+
+        // A plan with no secret is handed over untouched, header and all — the
+        // escape hatch is not paying for a case it does not have.
+        let plain = account("app@%", MySql, Change::DropAccount(Box::new(an_account())));
+        assert_eq!(plain.export_script(), plain.editor_script());
+        assert!(!plain.export_script().contains("Replace"));
+    }
+
+    /// The decision, over every account change there is: a variant that carries
+    /// a password and is not scrubbed fails here rather than in `tabs.json`.
+    #[test]
+    fn every_account_change_that_carries_a_password_is_scrubbed() {
+        for c in every_account_change() {
+            let mut c = c;
+            // Give each variant that *has* a password field a real one.
+            if let Change::CreateAccount(d) = &mut c {
+                d.password = "hunter2".into();
+            }
+            let cs = account("app@%", MySql, c);
+            let (clean, redacted) = cs.without_secrets();
+            let carried = cs.emit().iter().any(|s| s.contains("hunter2"));
+            assert_eq!(
+                redacted, carried,
+                "a change whose statement carries the password must report it: {:?}",
+                cs.changes
+            );
+            assert!(
+                !clean.emit().iter().any(|s| s.contains("hunter2")),
+                "{:?}",
+                clean.emit()
+            );
         }
     }
 

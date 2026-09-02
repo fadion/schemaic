@@ -458,6 +458,26 @@ fn masked_field(
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
+    v_stack((
+        text(lbl).style(form_label_style),
+        masked_edit_field(sig, ring, tabindex),
+    ))
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+}
+
+/// [`masked_field`] without the label, for a form that lays its own out.
+///
+/// **`pub(crate)` because there must be exactly one of these.** The account
+/// editor's Password was the app's only *unmasked* secret field — the four
+/// others here all went through this — so its real characters were on screen
+/// and a Ctrl+A/Ctrl+C away from the clipboard. A second masking widget beside
+/// this one is how the two come to disagree about `reconstruct_real`'s
+/// deletion rule, which is the part that is easy to get subtly wrong.
+pub(crate) fn masked_edit_field(
+    sig: RwSignal<String>,
+    ring: FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
     let real = sig;
     let disp = RwSignal::new(mask_of_len(real.get_untracked().chars().count()));
     // Untracked mirrors of the last state each effect committed, so an effect
@@ -499,19 +519,15 @@ fn masked_field(
         disp.set(masked);
     });
 
-    v_stack((
-        text(lbl).style(form_label_style),
-        edit_field(
-            disp,
-            FieldCfg {
-                background: theme::bg_deepest,
-                focus: Some((ring.clone(), tabindex)),
-                ..Default::default()
-            },
-        )
-        .style(|s| s.width_full()),
-    ))
-    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
+    edit_field(
+        disp,
+        FieldCfg {
+            background: theme::bg_deepest,
+            focus: Some((ring.clone(), tabindex)),
+            ..Default::default()
+        },
+    )
+    .style(|s| s.width_full())
 }
 
 // Manage Connections: list + editable form (create / update / delete).
