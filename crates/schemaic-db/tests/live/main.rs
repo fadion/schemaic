@@ -89,6 +89,7 @@ live_suite!(
         an_expression_column_has_no_provenance,
         a_join_attributes_each_column_to_its_own_table,
         a_primary_key_becomes_the_write_key,
+        a_write_built_from_the_resolved_key_lands_on_that_row,
         a_not_null_unique_index_is_the_fallback_key,
         a_nullable_unique_index_is_no_key_at_all,
         a_table_with_no_key_is_read_only,
@@ -100,6 +101,7 @@ live_suite!(
     ddl: [
         an_introspected_table_diffs_to_nothing_against_its_own_draft,
         an_added_column_lands_and_reads_back_as_drafted,
+        a_reordered_column_lands_where_it_was_put,
         a_dropped_column_goes_and_the_rest_stays,
         a_renamed_column_keeps_its_data,
         a_retyped_column_reads_back_as_the_new_type,
@@ -119,6 +121,7 @@ live_suite!(
     ],
     streaming: [
         a_streamed_export_delivers_every_row,
+        a_cancelled_export_tells_the_writer_it_stopped,
         a_statement_with_no_rows_to_export_is_refused,
         a_failed_export_reports_the_failure_to_the_writer,
     ],
@@ -130,6 +133,7 @@ live_suite!(
     views: [
         an_introspected_view_diffs_to_nothing_against_its_own_draft,
         an_edited_view_body_lands_and_settles,
+        a_view_that_drops_a_column_takes_the_destructive_arm_where_it_must,
         a_renamed_view_lands_under_the_new_name,
         a_view_is_introspected_as_a_view,
         a_view_is_never_writable_through_a_key_that_does_not_identify_a_row,
@@ -139,6 +143,7 @@ live_suite!(
         an_added_trigger_lands_and_fires,
         a_dropped_trigger_stops_firing,
         a_renamed_trigger_still_fires,
+        one_of_two_triggers_can_be_dropped_without_the_other,
     ],
     writeback: [
         a_staged_update_writes_exactly_the_row_it_names,

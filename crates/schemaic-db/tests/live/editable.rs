@@ -10,10 +10,16 @@
 //!
 //! The ladder itself (`edit.rs`) goes: primary key, else a unique non-foreign
 //! index whose columns are all present and all `NOT NULL`, else the backend's
-//! implicit key, else the table is **read-only**. Each rung has a test here, and
-//! so does each refusal — the refusals matter more, because a wrong key does not
-//! fail loudly: it writes to a row nobody asked for, and only the 1-row safety
-//! net stands behind it.
+//! implicit key, else the table is **read-only**. The refusals matter more than
+//! the rungs, because a wrong key does not fail loudly: it writes to a row
+//! nobody asked for, and only the 1-row safety net stands behind it — so each
+//! refusal has a test here, and so do the first two rungs.
+//!
+//! **The third rung is not tested here and cannot be.** The implicit key is
+//! SQLite's `rowid`, and SQLite is not a leg of this tier — it is the one
+//! backend the pure suite reaches directly, and `core::edit`'s own tests are
+//! where that rung is pinned. Saying "each rung has a test here" read as a
+//! coverage claim this file does not make.
 
 use schemaic_core::edit::{EditModel, EditTable};
 use schemaic_core::model::{ColumnOrigin, ResultSet};
@@ -228,6 +234,212 @@ pub async fn a_primary_key_becomes_the_write_key(target: &'static Target) {
     );
 
     scratch.teardown().await;
+}
+
+/// **The key the model resolved, used to write** — through `edit::build_edits`
+/// and `commit_writes`, over every type this leg calls writable.
+///
+/// `build_edits` and `row_key` were called by **nothing** in this tier: every
+/// live write built its `RowEdit` by hand, so every key value one was given was
+/// a value the test had written down. What that leaves untested is precisely the
+/// composition the tier exists for — whether the text the grid shows for a key
+/// column, handed back as a literal, re-selects the row it came from. A type
+/// whose rendering does not round-trip through its own key is a write that lands
+/// on the wrong row or on none, and the 1-row net is all that stands behind it.
+pub async fn a_write_built_from_the_resolved_key_lands_on_that_row(target: &'static Target) {
+    use schemaic_core::edit;
+    use schemaic_core::model::GridWrite;
+    use tokio_util::sync::CancellationToken;
+
+    let scratch = Scratch::create(target, "keyed_write").await;
+    let mut failures = Vec::new();
+    let mut keyed = 0usize;
+    let mut plain = 0usize;
+
+    for case in target.type_cases().filter(|c| c.writable) {
+        let table = format!("kw_{}", case.name);
+        let qualified = scratch.qualified(&table);
+        // **Whether this type can *be* a key is the engine's answer, not a
+        // list here.** PostgreSQL has no btree operator class for `json`, and
+        // MySQL refuses a `TEXT` key without a length — so the shape is tried
+        // and the fallback used when it is refused, rather than a hand-kept
+        // exception list that would rot as the case set grows.
+        let as_key = scratch
+            .db
+            .run_ddl(
+                &scratch.database,
+                &[format!(
+                    "CREATE TABLE {qualified} (v {} NOT NULL PRIMARY KEY, payload VARCHAR(32))",
+                    case.sql_type
+                )],
+                CancellationToken::new(),
+            )
+            .await
+            .is_ok();
+        if as_key {
+            keyed += 1;
+            scratch
+                .exec(&format!(
+                    "INSERT INTO {qualified} (v, payload) VALUES ({}, 'before')",
+                    case.literal
+                ))
+                .await;
+        } else {
+            plain += 1;
+            scratch
+                .exec(&format!(
+                    "CREATE TABLE {qualified} (id INTEGER NOT NULL PRIMARY KEY, v {},                      payload VARCHAR(32))",
+                    case.sql_type
+                ))
+                .await;
+            scratch
+                .exec(&format!(
+                    "INSERT INTO {qualified} (id, v, payload) VALUES (1, {}, 'before')",
+                    case.literal
+                ))
+                .await;
+        }
+
+        let (mut rs, mut model) = scratch
+            .edit_model(&format!("SELECT * FROM {qualified}"))
+            .await;
+        // **A type that cannot be a *reliable* key is refused by the model, and
+        // that is the right answer** — `edit.rs`'s C2/C4 makes a floating-point
+        // or binary key read-only, because equality on one does not identify a
+        // row. So the table is rebuilt on an integer key rather than counted as
+        // a failure: the write still has to go through `build_edits`, which is
+        // what this test is about.
+        let mut as_key = as_key;
+        if as_key && model.table(0).is_none() {
+            as_key = false;
+            keyed -= 1;
+            plain += 1;
+            scratch.exec(&format!("DROP TABLE {qualified}")).await;
+            scratch
+                .exec(&format!(
+                    "CREATE TABLE {qualified} (id INTEGER NOT NULL PRIMARY KEY, v {},                      payload VARCHAR(32))",
+                    case.sql_type
+                ))
+                .await;
+            scratch
+                .exec(&format!(
+                    "INSERT INTO {qualified} (id, v, payload) VALUES (1, {}, 'before')",
+                    case.literal
+                ))
+                .await;
+            let re = scratch
+                .edit_model(&format!("SELECT * FROM {qualified}"))
+                .await;
+            rs = re.0;
+            model = re.1;
+        }
+        let Some(t) = model.table(0) else {
+            failures.push(format!(
+                "{}: no writable table even on an integer key",
+                case.name
+            ));
+            continue;
+        };
+        if t.key_cols.len() != 1 {
+            failures.push(format!("{}: {} key columns", case.name, t.key_cols.len()));
+            continue;
+        }
+
+        // Stage a dirty cell on `payload`, exactly as the grid does, and let
+        // `build_edits` derive the key from the row it is on — which is the
+        // composition nothing in this tier reached.
+        let payload = rs
+            .columns
+            .iter()
+            .position(|c| c.name == "payload")
+            .expect("the payload column");
+        let dirty: edit::DirtyCells = [((0usize, payload), Some("after".to_string()))]
+            .into_iter()
+            .collect();
+        let edits = edit::build_edits(&model, &rs, &dirty);
+        if edits.len() != 1 {
+            failures.push(format!("{}: built {} edits", case.name, edits.len()));
+            continue;
+        }
+        // The key the model built is the cell the grid shows — the half
+        // `row_key` decides, and the one a rendering that does not round-trip
+        // gets wrong.
+        let shown = rs
+            .cell(0, t.key_cols[0])
+            .expect("the key cell")
+            .display()
+            .to_string();
+        let carried = edits[0].key.first().map(|(_, v)| v.display().to_string());
+        if carried.as_deref() != Some(shown.as_str()) {
+            failures.push(format!(
+                "{}: the grid shows {shown:?} and the key carries {carried:?}",
+                case.name
+            ));
+        }
+
+        match scratch
+            .db
+            .commit_writes(
+                &GridWrite {
+                    updates: edits,
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(1) => {}
+            Ok(n) => {
+                failures.push(format!("{}: the write reported {n} rows", case.name));
+                continue;
+            }
+            Err(e) => {
+                failures.push(format!("{}: the write failed: {e}", case.name));
+                continue;
+            }
+        }
+        // …and it is *that* row that changed. Read back by the key the table
+        // actually has: `v = <literal>` where the type is comparable, and by
+        // `id` where it is not (PostgreSQL has no `json` equality either).
+        let where_clause = if as_key {
+            format!("v = {}", case.literal)
+        } else {
+            "id = 1".to_string()
+        };
+        let back = scratch
+            .exec(&format!(
+                "SELECT payload FROM {qualified} WHERE {where_clause}"
+            ))
+            .await;
+        let got = back.cell(0, 0).map(|c| c.display().to_string());
+        if got.as_deref() != Some("after") {
+            failures.push(format!("{}: the row reads back {got:?}", case.name));
+        }
+    }
+
+    scratch.teardown().await;
+    assert_eq!(
+        keyed + plain,
+        target.type_cases().filter(|c| c.writable).count(),
+        "{}: only {} writable types were written through a resolved key",
+        target.name,
+        keyed + plain
+    );
+    assert!(
+        keyed > 0,
+        "{}: no type could be a key at all, so nothing exercised `row_key` on a          value the server rendered",
+        target.name
+    );
+    assert!(
+        failures.is_empty(),
+        "{} — {} of {}'s writable types could not be written through the key the          model resolved:
+  {}",
+        target.endpoint(),
+        failures.len(),
+        target.name,
+        failures.join("
+  ")
+    );
 }
 
 /// With no primary key, a unique index over `NOT NULL` columns is the key.

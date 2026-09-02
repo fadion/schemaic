@@ -23,7 +23,8 @@ use crate::scratch::{Namespace, Scratch};
 ///
 /// Deliberately different column sets: two tables that merely share a name would
 /// hide a collapse behind identical shapes, and this is the fixture the
-/// `warehouse` sample database exists for at a larger scale.
+/// `warehouse` sample database exists for at a larger scale. They also share one
+/// column, which is what the *write* test needs — see [`seed_both`].
 pub async fn same_named_tables_in_two_namespaces_stay_distinct(target: &'static Target) {
     let mut scratch = Scratch::create(target, "ns_distinct").await;
     let alt = seed_both(&mut scratch).await;
@@ -33,13 +34,13 @@ pub async fn same_named_tables_in_two_namespaces_stay_distinct(target: &'static 
 
     assert_eq!(
         here.iter().map(String::as_str).collect::<Vec<_>>(),
-        ["id", "amount"],
+        ["id", "amount", "label"],
         "{}: the primary namespace's orders",
         target.name
     );
     assert_eq!(
         there.iter().map(String::as_str).collect::<Vec<_>>(),
-        ["id", "customer"],
+        ["id", "customer", "label"],
         "{}: the second namespace's orders",
         target.name
     );
@@ -123,7 +124,11 @@ pub async fn an_edit_lands_in_the_namespace_it_was_read_from(target: &'static Ta
                     database: table.database.clone(),
                     schema: table.schema.clone(),
                     table: table.table.clone(),
-                    set: vec![("customer".to_string(), Some("moved".to_string()))],
+                    // **A column both namespaces have.** Writing `customer`
+                    // would be refused outright by the wrong table, so the
+                    // assertion below could not have failed; `label` is in both,
+                    // so a write aimed at the wrong one lands silently.
+                    set: vec![("label".to_string(), Some("moved".to_string()))],
                     key: vec![("id".to_string(), Value::Int(1))],
                 }],
                 ..Default::default()
@@ -138,7 +143,7 @@ pub async fn an_edit_lands_in_the_namespace_it_was_read_from(target: &'static Ta
             &scratch,
             &alt,
             &format!(
-                "SELECT customer FROM {} WHERE id = 1",
+                "SELECT label FROM {} WHERE id = 1",
                 scratch.qualified_in(&alt, "orders")
             )
         )
@@ -152,12 +157,12 @@ pub async fn an_edit_lands_in_the_namespace_it_was_read_from(target: &'static Ta
             &scratch,
             &scratch.namespace_ref(),
             &format!(
-                "SELECT amount FROM {} WHERE id = 1",
+                "SELECT label FROM {} WHERE id = 1",
                 scratch.qualified("orders")
             )
         )
         .await,
-        "10",
+        "here",
         "{}: the other namespace's table was written to",
         target.name
     );
@@ -165,18 +170,28 @@ pub async fn an_edit_lands_in_the_namespace_it_was_read_from(target: &'static Ta
     scratch.teardown().await;
 }
 
-/// `orders` in both namespaces, with one row each and deliberately different
-/// columns. Returns the second namespace.
+/// `orders` in both namespaces, with one row each: one column each namespace has
+/// **and one they share**. Returns the second namespace.
+///
+/// The differing columns are what let the read tests prove the model resolved
+/// the right table — a `SELECT customer` against the wrong `orders` is an error,
+/// not a wrong answer. But that also made the *write* test's second assertion
+/// impossible to fail: a `SET customer = …` aimed at the wrong namespace would
+/// be refused by the server long before it could silently change the row this
+/// test then checks. `label` exists in both, so a write to the wrong namespace
+/// **succeeds** — which is the silent failure the module doc names, and the only
+/// state in which the untouched-table assertion can catch it.
 async fn seed_both(scratch: &mut Scratch) -> Namespace {
     scratch
         .exec(&format!(
-            "CREATE TABLE {} (id INTEGER NOT NULL PRIMARY KEY, amount INTEGER)",
+            "CREATE TABLE {} (id INTEGER NOT NULL PRIMARY KEY, amount INTEGER, \
+             label VARCHAR(16))",
             scratch.qualified("orders")
         ))
         .await;
     scratch
         .exec(&format!(
-            "INSERT INTO {} (id, amount) VALUES (1, 10)",
+            "INSERT INTO {} (id, amount, label) VALUES (1, 10, 'here')",
             scratch.qualified("orders")
         ))
         .await;
@@ -187,14 +202,15 @@ async fn seed_both(scratch: &mut Scratch) -> Namespace {
         .exec_in(
             &alt,
             &format!(
-                "CREATE TABLE {there} (id INTEGER NOT NULL PRIMARY KEY, customer VARCHAR(16))"
+                "CREATE TABLE {there} (id INTEGER NOT NULL PRIMARY KEY, customer VARCHAR(16), \
+                 label VARCHAR(16))"
             ),
         )
         .await;
     scratch
         .exec_in(
             &alt,
-            &format!("INSERT INTO {there} (id, customer) VALUES (1, 'original')"),
+            &format!("INSERT INTO {there} (id, customer, label) VALUES (1, 'original', 'there')"),
         )
         .await;
     alt

@@ -26,22 +26,76 @@ use crate::scratch::Scratch;
 /// The table every view here is built over.
 const BASE: &str = "(id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(32))";
 
-/// A view read off the server and drafted straight back proposes no change.
+/// A view read off the server, emitted from its own draft and read back reports
+/// the same definition — and the editor is then clean against the *first*
+/// reading.
+///
+/// **The gate crosses the emitter and the server**, and it has to. Diffing a
+/// view against `ViewDraft::from_table` of *itself* compares two copies of one
+/// expression: `diff_view` computes `old_body` by calling `from_table(current)`
+/// itself, so both sides are the same value by construction and the answer is
+/// "0 changes" for any body at all. Proved against the real `schemaic-core`: a
+/// `view_definition` of `">>> not a query at all <<<"`, of `""`, and of `"😀"`
+/// each diffs to zero changes on all three dialects. The test would have passed
+/// against a server that returned nothing.
+///
+/// So the draft is diffed against a *deliberately stale* reading — which is what
+/// makes `diff_view` emit — the statement is run, and the two assertions below
+/// compare values the server produced at two different times.
 pub async fn an_introspected_view_diffs_to_nothing_against_its_own_draft(target: &'static Target) {
+    let dialect = target.engine.dialect();
     let scratch = Scratch::create(target, "view_identity").await;
     seed_view(&scratch, "SELECT id, name FROM {} WHERE id > 0").await;
 
     let view = view_of(&scratch).await;
     let draft = ViewDraft::from_table(&view)
         .unwrap_or_else(|| panic!("{}: the view did not draft at all", target.name));
-    let set = ddl::diff_view(&view, &draft, target.engine.dialect());
 
+    // A body no server would ever report, purely to make the diff non-empty:
+    // the draft below is the server's own, and it is that draft the emitter has
+    // to be able to write back.
+    let mut stale = view.clone();
+    stale.view_definition = Some("SELECT id FROM nothing_at_all".to_string());
+    let set = ddl::diff_view(&stale, &draft, dialect);
     assert!(
-        set.changes.is_empty(),
-        "{}: a view drafted from itself proposed {:?}\n      emitting {:?}",
+        !set.changes.is_empty(),
+        "{}: the gate is vacuous — a differing body proposed no change",
+        target.name
+    );
+    let stmts = set.emit();
+    scratch
+        .db
+        .run_ddl(&scratch.database, &stmts, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: re-applying the server's own view failed at statement {} of {stmts:?}: {}",
+                target.name, e.at, e.message
+            )
+        });
+
+    // The server's two readings of the same view, either side of the round trip.
+    let after = view_of(&scratch).await;
+    assert_eq!(
+        after.view_definition, view.view_definition,
+        "{}: the view's definition changed by being written back through the emitter",
+        target.name
+    );
+
+    // And the editor is clean — the claim this file opens with. `current` and
+    // `draft` are now two independent readings, so this comparison has content.
+    let settled = ddl::diff_view(
+        &view,
+        &ViewDraft::from_table(&after)
+            .unwrap_or_else(|| panic!("{}: the view did not draft after", target.name)),
+        dialect,
+    );
+    assert!(
+        settled.changes.is_empty(),
+        "{}: the view no longer round-trips: {:?}\n      emitting {:?}",
         target.name,
-        set.changes,
-        set.emit()
+        settled.changes,
+        settled.emit()
     );
 
     scratch.teardown().await;
@@ -65,10 +119,29 @@ pub async fn an_edited_view_body_lands_and_settles(target: &'static Target) {
 
     apply_view(&scratch, &view, &draft, target).await;
 
+    // **Against the pre-edit reading, not against itself.** Re-drafting `after`
+    // and diffing it against `after` is one expression compared with itself and
+    // answers "no change" for any body — see
+    // `an_introspected_view_diffs_to_nothing_against_its_own_draft`. Diffing the
+    // *new* reading against the *old* view must, by contrast, report exactly the
+    // change that was applied: an edit that reported nothing would mean the
+    // server had not taken it.
     let after = view_of(&scratch).await;
+    let landed = ddl::diff_view(
+        &view,
+        &ViewDraft::from_table(&after).expect("a view draft"),
+        target.engine.dialect(),
+    );
+    assert!(
+        !landed.changes.is_empty(),
+        "{}: the server reports the same view body it had before the edit",
+        target.name
+    );
+    // …and re-applying what the server now reports settles: the second reading
+    // is stable, which is the "permanently dirty in the editor" claim.
     let settled = ddl::diff_view(
         &after,
-        &ViewDraft::from_table(&after).expect("a view draft"),
+        &ViewDraft::from_table(&view_of(&scratch).await).expect("a view draft"),
         target.engine.dialect(),
     );
     assert!(
@@ -92,6 +165,80 @@ pub async fn an_edited_view_body_lands_and_settles(target: &'static Target) {
         ["two", "three"],
         "{}: the view still returns its old rows",
         target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// **Dropping a column from a view's `SELECT`** — the redefinition PostgreSQL
+/// cannot do with `CREATE OR REPLACE`, and MySQL can.
+///
+/// This is `diff_view`'s destructive arm: `pg_replaceable` answers `Some(false)`
+/// for a narrower column list, and the change set then carries
+/// `recreate: true`, which drops the view, recreates it and replays whatever
+/// depended on it. No live case satisfied that predicate, so the arm — the one
+/// with a `DROP` in it — had never run against a server on any leg.
+///
+/// Asserted per leg because the answer genuinely differs, which is what
+/// `supports_or_replace_view` and `pg_replaceable` exist to say.
+pub async fn a_view_that_drops_a_column_takes_the_destructive_arm_where_it_must(
+    target: &'static Target,
+) {
+    let dialect = target.engine.dialect();
+    let scratch = Scratch::create(target, "view_narrow").await;
+    seed_view(&scratch, "SELECT id, name FROM {} WHERE id > 0").await;
+
+    let view = view_of(&scratch).await;
+    let mut draft = ViewDraft::from_table(&view).expect("a view draft");
+    draft.select = format!("SELECT id FROM {}", scratch.qualified("t"));
+
+    let set = ddl::diff_view(&view, &draft, dialect);
+    let recreated = set
+        .changes
+        .iter()
+        .any(|c| matches!(c, ddl::Change::ReplaceView { recreate: true, .. }));
+    assert_eq!(
+        recreated,
+        dialect == schemaic_core::intel::SqlDialect::Postgres,
+        "{}: narrowing a view's column list took the {} arm",
+        target.name,
+        if recreated { "recreate" } else { "replace" }
+    );
+
+    apply_view(&scratch, &view, &draft, target).await;
+
+    // Whichever arm it took, the server has the new view.
+    let after = view_of(&scratch).await;
+    assert_eq!(
+        after
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id"],
+        "{}: the view still reports its old column list",
+        target.name
+    );
+    let rows = scratch
+        .exec(&format!("SELECT id FROM {}", scratch.qualified("v")))
+        .await;
+    assert_eq!(
+        rows.row_count(),
+        3,
+        "{}: the narrowed view returns nothing",
+        target.name
+    );
+    // …and it round-trips, which a re-create that lost an option would not.
+    let settled = ddl::diff_view(
+        &after,
+        &ViewDraft::from_table(&view_of(&scratch).await).expect("a view draft"),
+        dialect,
+    );
+    assert!(
+        settled.changes.is_empty(),
+        "{}: the narrowed view no longer round-trips: {:?}",
+        target.name,
+        settled.changes
     );
 
     scratch.teardown().await;
