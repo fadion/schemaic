@@ -2462,6 +2462,56 @@ pub enum Change {
     DropSchema {
         name: String,
     },
+    /// `CREATE USER` / `CREATE ROLE`.
+    ///
+    /// **Not server-level, deliberately** — see [`is_server_level`], and the
+    /// group note below on why account changes take the ordinary in-database
+    /// route even though an account belongs to the server.
+    CreateAccount(Box<crate::users::AccountDraft>),
+    /// `DROP USER` / `DROP ROLE`, on an account the browser listed.
+    ///
+    /// Never `IF EXISTS`, for the reason [`Change::DropDatabase`] never is: the
+    /// account came off a list, so one that isn't there means the list is stale
+    /// and the user is about to be told a drop succeeded that dropped nothing.
+    DropAccount(Box<crate::users::Principal>),
+    /// `GRANT … ON … TO …`.
+    GrantPrivileges(Box<crate::users::PrivilegeChange>),
+    /// `REVOKE … ON … FROM …`.
+    RevokePrivileges(Box<crate::users::PrivilegeChange>),
+    /// `GRANT <role> TO <account>` — role membership, not privileges on an
+    /// object, which is a different statement shape and so a different variant.
+    GrantRole(Box<crate::users::RoleChange>),
+    /// `REVOKE <role> FROM <account>`.
+    RevokeRole(Box<crate::users::RoleChange>),
+}
+
+/// Is `change` about an **account** rather than about anything in the schema?
+///
+/// The six arms of the Users and privileges browser's write half. They are
+/// grouped by this predicate rather than matched one at a time because every
+/// downstream question — which statements they emit, whether the engine has them
+/// at all, whether they belong in a table's plan — is the same question for all
+/// six.
+///
+/// **They are not [`is_server_level`]**, even though an account belongs to the
+/// server, and the reason is PostgreSQL: `GRANT SELECT ON TABLE public.users`
+/// names an object in *one database's* catalogue, and the server-level route
+/// deliberately connects to no particular database — it would grant on whatever
+/// `public.users` the maintenance database happens to have, or fail. So account
+/// changes run the ordinary in-database route, in the database the browser is
+/// showing privileges for, which is correct on both engines: MySQL's grant
+/// tables are server-wide and answer the same from any connection, and
+/// PostgreSQL's are exactly the ones the browser was already scoped to.
+pub fn is_account_change(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::CreateAccount(_)
+            | Change::DropAccount(_)
+            | Change::GrantPrivileges(_)
+            | Change::RevokePrivileges(_)
+            | Change::GrantRole(_)
+            | Change::RevokeRole(_)
+    )
 }
 
 /// Is `change` **server-level** — about a database as a whole rather than about
@@ -2847,6 +2897,55 @@ impl Change {
             Change::DropDatabase { name } => format!("Drop database {name}"),
             Change::CreateSchema { name, .. } => format!("Create schema {name}"),
             Change::DropSchema { name } => format!("Drop schema {name}"),
+            // The account lines name the account for the same reason the
+            // database ones name the database: the preview's subject was typed
+            // into a form or picked out of a list, not right-clicked.
+            Change::CreateAccount(d) => match d.kind {
+                crate::users::PrincipalKind::User => format!("Create user {}", d.name),
+                crate::users::PrincipalKind::Role => format!("Create role {}", d.name),
+            },
+            Change::DropAccount(p) => {
+                format!("Drop {} {}", p.kind.label().to_lowercase(), p.display())
+            }
+            Change::GrantPrivileges(c) => format!(
+                "Grant {} to {}",
+                Self::privilege_words(&c.privileges),
+                c.account.display()
+            ),
+            Change::RevokePrivileges(c) => format!(
+                "Revoke {} from {}",
+                Self::privilege_words(&c.privileges),
+                c.account.display()
+            ),
+            Change::GrantRole(c) => {
+                format!("Grant {} to {}", c.role.display(), c.member.display())
+            }
+            Change::RevokeRole(c) => {
+                format!("Revoke {} from {}", c.role.display(), c.member.display())
+            }
+        }
+    }
+
+    /// The privilege list as a summary line says it: the names themselves while
+    /// they fit, and a count once they don't.
+    ///
+    /// Eighteen privileges is a legal selection at MySQL's database level, and
+    /// the summary is one line above the Apply button — spelled out it wraps to
+    /// four and pushes the statements off the panel. Three is where a list still
+    /// reads as a list.
+    fn privilege_words(privileges: &[String]) -> String {
+        match privileges.len() {
+            // **Not "nothing".** An empty selection emits no statement at all
+            // (`users::privilege_sql` answers `None`), so a summary reading
+            // "Grant nothing to app@%" describes a plan the preview then shows
+            // with an empty SQL box and a dimmed Apply — a change listed with no
+            // statement and no reason. Saying the list is empty is the sentence
+            // that matches what is on screen. Unreachable through the form,
+            // whose Apply asks `GrantDraft::is_ready` first; reachable by any
+            // caller that builds the change directly.
+            0 => "no privileges".to_string(),
+            1..=3 => privileges.join(", "),
+            n => format!("{n} privileges"),
         }
     }
 
@@ -3204,6 +3303,40 @@ impl Change {
                 "Drops the schema {name}. The server refuses while it still holds \
                  tables, views or routines, so this either takes an empty schema \
                  or fails — Schemaic never sends CASCADE."
+            )],
+            // **An account drop destroys its privileges, not its data**, and the
+            // sentence says which — because "drops the user" reads as reversible
+            // to anyone who has just been told a `DROP DATABASE` is not, and the
+            // thing that is actually lost is every grant it ever received, with
+            // no record of them left to put back.
+            //
+            // It also names the sessions, which is the surprise: on both engines
+            // the account's open connections keep running until they end on their
+            // own, so the drop looks like it did nothing for as long as one of
+            // them lasts.
+            Change::DropAccount(p) => vec![format!(
+                "Drops {} and every privilege it holds. The grants are not recorded \
+                 anywhere else, so putting the account back means granting them all \
+                 again from memory. Anything still connected as it keeps running \
+                 until it disconnects.",
+                p.display()
+            )],
+            // Taking a privilege away is destructive in the sense this list
+            // means — something that worked stops working — but it destroys no
+            // data and is undone by granting it back, which is what separates
+            // this sentence from the one above.
+            Change::RevokePrivileges(c) => vec![format!(
+                "Takes {} away from {}. Anything relying on it — an application, a \
+                 job, a view someone else owns — starts failing at its next \
+                 statement.",
+                Self::privilege_words(&c.privileges),
+                c.account.display()
+            )],
+            Change::RevokeRole(c) => vec![format!(
+                "Takes the role {} away from {}, and with it every privilege the \
+                 role carries.",
+                c.role.display(),
+                c.member.display()
             )],
             _ => Vec::new(),
         }
@@ -3758,6 +3891,9 @@ impl ChangeSet {
                 ));
             }
         }
+        // Privileges are stated on what the plan has by now finished building —
+        // see `account_statements` for why they cannot come earlier.
+        out.extend(self.account_statements());
         // …and the container goes last of all, after everything that lived in it.
         out.extend(self.container_drops());
         out
@@ -3932,6 +4068,9 @@ impl ChangeSet {
                 out.push(format!("ALTER TABLE {} RENAME TO {};", self.qname(), q(to)));
             }
         }
+        // Privileges are stated on what the plan has by now finished building —
+        // see `account_statements` for why they cannot come earlier.
+        out.extend(self.account_statements());
         // …and the container goes last of all, after everything that lived in it.
         out.extend(self.container_drops());
         out
@@ -4603,6 +4742,73 @@ impl ChangeSet {
                 _ => None,
             })
             .collect()
+    }
+
+    /// `CREATE USER`, `GRANT`, `REVOKE`, `DROP USER` — the Users and privileges
+    /// browser's write half, emitted at the **end** of the plan.
+    ///
+    /// The position is the same argument [`ChangeSet::container_drops`] makes
+    /// one level up: a privilege is granted *on* something, so it has to be
+    /// stated after whatever the plan creates and before nothing at all. A
+    /// `GRANT SELECT ON orders` emitted first would name a table the next
+    /// statement was about to create.
+    ///
+    /// **Within the group the order is create → grant → revoke → drop**, which
+    /// is the only order that composes: an account has to exist before it can be
+    /// granted anything, and has to still exist while it is. Sets built through
+    /// [`single`] hold one change and never exercise it; it is written down for
+    /// the same reason `container_drops`' position is, which is that a later edit
+    /// builds a real bug on a comment claiming any order would do.
+    ///
+    /// Filtered on [`supports_change`], like its two neighbours — a refusal the
+    /// preview's header already reported must not still reach the wire.
+    fn account_statements(&self) -> Vec<String> {
+        let d = self.dialect;
+        let mut out: Vec<String> = Vec::new();
+        let mine: Vec<&Change> = self
+            .changes
+            .iter()
+            .filter(|c| is_account_change(c) && supports_change(d, c))
+            .collect();
+        let mut push = |sql: String| out.push(format!("{sql};"));
+        for c in mine.iter() {
+            if let Change::CreateAccount(draft) = c {
+                // `None` is a draft with no name, which the form refuses before
+                // it gets here — and emitting nothing is the right backstop, not
+                // a half statement.
+                if let Some(sql) = crate::users::account_draft_sql(draft, d) {
+                    push(sql);
+                }
+            }
+        }
+        for c in mine.iter() {
+            match c {
+                Change::GrantRole(r) => push(crate::users::role_sql(r, d, false)),
+                Change::GrantPrivileges(p) => {
+                    if let Some(sql) = crate::users::privilege_sql(p, d, false) {
+                        push(sql);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in mine.iter() {
+            match c {
+                Change::RevokeRole(r) => push(crate::users::role_sql(r, d, true)),
+                Change::RevokePrivileges(p) => {
+                    if let Some(sql) = crate::users::privilege_sql(p, d, true) {
+                        push(sql);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in mine.iter() {
+            if let Change::DropAccount(p) = c {
+                push(crate::users::drop_account_sql(p, d));
+            }
+        }
+        out
     }
 }
 
@@ -7734,6 +7940,14 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             SqlDialect::MySql | SqlDialect::Sqlite => false,
         };
     }
+    // **An account is a server's, and SQLite has no server.** Asked through the
+    // capability rather than restated as a dialect comparison, so this and the
+    // browser that offers the action cannot drift into disagreeing about which
+    // engines have accounts at all — and so a fourth engine answers once, in
+    // `users::supports_user_admin`, rather than here as well.
+    if is_account_change(change) {
+        return crate::users::supports_user_admin(dialect);
+    }
     // **A database is a file on SQLite, and a file is not DDL.** Creating one
     // means writing a path the connection form owns, and dropping one means
     // deleting the user's file off disk — neither is a statement this module
@@ -9248,6 +9462,61 @@ pub fn single(table: &str, schema: Option<&str>, dialect: SqlDialect, change: Ch
 /// judge it, and `emit` on an engine that has no such statement writes nothing
 /// while the change list still reads as a plan.
 pub fn server_level(subject: &str, dialect: SqlDialect, change: Change) -> ChangeSet {
+    single(subject, None, dialect, change)
+}
+
+/// The change the grant form is asking for, or `None` while it is asking for
+/// none.
+///
+/// Pure, and here rather than in the view for the reason
+/// [`crate::database_editor`-style forms keep their `change_of` out of the
+/// render](self): four statements come out of one form, the mapping between the
+/// two toggles and those four is exactly the kind of thing that is invisible in
+/// a rendered form, and getting it backwards emits a `REVOKE` where the button
+/// said Grant.
+///
+/// [`crate::users::GrantDraft::is_ready`] answers the same question the form's
+/// Apply button asks, so an incomplete draft cannot reach a preview: this
+/// returns `None` for exactly the drafts that predicate rejects.
+pub fn grant_change(
+    draft: &crate::users::GrantDraft,
+    account: &crate::users::Principal,
+) -> Option<Change> {
+    use crate::users::GrantSubject;
+    Some(match draft.subject {
+        GrantSubject::Privileges => {
+            let c = Box::new(draft.change(account)?);
+            if draft.revoke {
+                Change::RevokePrivileges(c)
+            } else {
+                Change::GrantPrivileges(c)
+            }
+        }
+        GrantSubject::Role => {
+            let c = Box::new(draft.role_change(account)?);
+            if draft.revoke {
+                Change::RevokeRole(c)
+            } else {
+                Change::GrantRole(c)
+            }
+        }
+    })
+}
+
+/// A one-change set for an **account** — the six changes
+/// [`ChangeSet::account_statements`] writes.
+///
+/// Its own constructor for the reason [`server_level`] is one: `single`'s first
+/// argument is a *table*, and an account is not one. `subject` is the account's
+/// display name (`app@%`, or a bare role name), which lands in
+/// [`ChangeSet::table`] so the preview's title names what the plan is about, and
+/// is read by nothing else — each of these changes carries its own account.
+///
+/// **Not [`server_level`], despite the name being the tempting one.** That
+/// predicate decides which *runner* a plan takes, and an account plan takes the
+/// ordinary in-database one — see [`is_account_change`] for why PostgreSQL
+/// leaves no choice about that.
+pub fn account(subject: &str, dialect: SqlDialect, change: Change) -> ChangeSet {
     single(subject, None, dialect, change)
 }
 
@@ -18550,6 +18819,220 @@ mod database_tests {
             name: "sales".into()
         }));
         assert!(!is_server_level(&Change::DropTable));
+    }
+
+    // ── accounts ─────────────────────────────────────────────────────────────
+
+    fn an_account() -> crate::users::Principal {
+        crate::users::from_mysql_rows(&[crate::users::MyUserRow {
+            user: "app".into(),
+            host: "%".into(),
+            ..Default::default()
+        }])
+        .remove(0)
+    }
+
+    fn a_privilege_change(privs: &[&str]) -> Box<crate::users::PrivilegeChange> {
+        Box::new(crate::users::PrivilegeChange {
+            account: an_account(),
+            level: crate::users::GrantLevel::Database("shop".into()),
+            privileges: privs.iter().map(|s| s.to_string()).collect(),
+            with_grant_option: false,
+        })
+    }
+
+    fn every_account_change() -> Vec<Change> {
+        vec![
+            Change::CreateAccount(Box::new(crate::users::AccountDraft {
+                name: "app".into(),
+                ..Default::default()
+            })),
+            Change::DropAccount(Box::new(an_account())),
+            Change::GrantPrivileges(a_privilege_change(&["SELECT"])),
+            Change::RevokePrivileges(a_privilege_change(&["SELECT"])),
+            Change::GrantRole(Box::new(crate::users::RoleChange {
+                role: an_account(),
+                member: an_account(),
+                with_admin_option: false,
+            })),
+            Change::RevokeRole(Box::new(crate::users::RoleChange {
+                role: an_account(),
+                member: an_account(),
+                with_admin_option: false,
+            })),
+        ]
+    }
+
+    /// **An account plan is not server-level**, and this is the pin: routing one
+    /// down the maintenance-connection path would run a PostgreSQL
+    /// `GRANT … ON TABLE` against whichever database that connection landed in.
+    #[test]
+    fn an_account_change_takes_the_ordinary_in_database_route() {
+        for c in every_account_change() {
+            assert!(is_account_change(&c), "{c:?}");
+            assert!(!is_server_level(&c), "{c:?}");
+        }
+        assert!(!is_account_change(&Change::DropTable));
+    }
+
+    /// The list is written out rather than derived, so a new account change has
+    /// to be added here on purpose — the same bargain
+    /// `every_container_change_the_engine_accepts_emits_a_statement` makes.
+    ///
+    /// It is the **composition** that is under test, not the statement builders:
+    /// those are unit-tested in `users`, and what this catches is a variant that
+    /// reaches `emit` and produces nothing because its arm was never written.
+    #[test]
+    fn every_account_change_the_engine_accepts_emits_a_statement() {
+        for d in [MySql, Postgres] {
+            for c in every_account_change() {
+                let summary = c.summary();
+                let cs = account("app@%", d, c);
+                let sql = cs.emit();
+                assert_eq!(
+                    sql.len(),
+                    1,
+                    "{d:?} emitted {sql:?} for {summary:?}, expected one statement"
+                );
+                assert!(sql[0].ends_with(';'), "{:?}", sql[0]);
+                assert!(!summary.is_empty());
+            }
+        }
+    }
+
+    /// SQLite has no accounts, so the change is **withheld rather than silently
+    /// dropped**: `unsupported` is what the preview's INCOMPLETE header reads,
+    /// and an empty plan with no header would look like a plan with nothing to do.
+    #[test]
+    fn an_account_change_sqlite_refuses_is_withheld_not_silent() {
+        for c in every_account_change() {
+            let cs = account("app@%", Sqlite, c);
+            assert!(cs.emit().is_empty());
+            assert_eq!(cs.unsupported().len(), 1);
+        }
+    }
+
+    /// Taking a privilege away is destructive and giving one is not — the
+    /// difference the preview's Apply button is coloured by.
+    #[test]
+    fn revokes_and_drops_carry_a_consequence_and_grants_do_not() {
+        let destructive = |c: Change| account("app@%", MySql, c).destructive();
+        assert!(destructive(Change::DropAccount(Box::new(an_account()))).len() == 1);
+        assert!(destructive(Change::RevokePrivileges(a_privilege_change(&["SELECT"]))).len() == 1);
+        assert!(destructive(Change::GrantPrivileges(a_privilege_change(&["SELECT"]))).is_empty());
+        assert!(
+            destructive(Change::CreateAccount(Box::new(
+                crate::users::AccountDraft {
+                    name: "app".into(),
+                    ..Default::default()
+                }
+            )))
+            .is_empty()
+        );
+    }
+
+    /// **The mapping the two toggles make**, which is the one thing about this
+    /// form that is invisible in a rendered view: four statements come out of
+    /// it, and getting the direction backwards emits a `REVOKE` where the button
+    /// said Grant.
+    #[test]
+    fn the_forms_two_toggles_choose_between_exactly_four_changes() {
+        use crate::users::{GrantDraft, GrantLevelKind, GrantSubject};
+        let who = an_account();
+        let base = GrantDraft {
+            level: Some(GrantLevelKind::Global),
+            privileges: vec!["SELECT".into()],
+            role: "readers".into(),
+            ..Default::default()
+        };
+        let cases = [
+            (GrantSubject::Privileges, false, "Grant SELECT to app@%"),
+            (GrantSubject::Privileges, true, "Revoke SELECT from app@%"),
+            (GrantSubject::Role, false, "Grant readers to app@%"),
+            (GrantSubject::Role, true, "Revoke readers from app@%"),
+        ];
+        for (subject, revoke, summary) in cases {
+            let d = GrantDraft {
+                subject,
+                revoke,
+                ..base.clone()
+            };
+            let c = grant_change(&d, &who).expect("a complete draft");
+            assert_eq!(c.summary(), summary);
+            // And it reaches a statement of the right shape, which is the half a
+            // summary assertion alone would not catch.
+            let sql = account("app@%", MySql, c).emit();
+            assert_eq!(sql.len(), 1, "{sql:?}");
+            assert_eq!(sql[0].starts_with("REVOKE"), revoke, "{sql:?}");
+        }
+    }
+
+    /// An incomplete draft produces no change at all, so Apply cannot open a
+    /// preview on a plan with nothing in it.
+    #[test]
+    fn an_incomplete_draft_produces_no_change_and_is_not_ready() {
+        use crate::users::{GrantDraft, GrantLevelKind};
+        let account = an_account();
+        for d in [
+            // A level, but nothing ticked.
+            GrantDraft {
+                level: Some(GrantLevelKind::Global),
+                ..Default::default()
+            },
+            // Ticked, but no level.
+            GrantDraft {
+                privileges: vec!["SELECT".into()],
+                ..Default::default()
+            },
+            // A table level with only half a name.
+            GrantDraft {
+                level: Some(GrantLevelKind::Table),
+                qualifier: "shop".into(),
+                privileges: vec!["SELECT".into()],
+                ..Default::default()
+            },
+        ] {
+            assert!(grant_change(&d, &account).is_none(), "{d:?}");
+            assert!(!d.is_ready(&account), "{d:?}");
+        }
+    }
+
+    /// A change with nothing selected emits nothing rather than `GRANT ON …`,
+    /// which is a syntax error the preview would otherwise offer to run — and
+    /// **its summary says so** rather than claiming a grant of "nothing", which
+    /// is a change listed with no statement behind it and no reason given.
+    #[test]
+    fn a_grant_of_no_privileges_emits_nothing_and_says_it_has_none() {
+        let change = Change::GrantPrivileges(a_privilege_change(&[]));
+        assert_eq!(change.summary(), "Grant no privileges to app@%");
+        let cs = account("app@%", MySql, change);
+        assert!(cs.emit().is_empty());
+    }
+
+    /// The order within the group, which is the only order that composes: the
+    /// account has to exist before it is granted anything and has to still exist
+    /// while it is.
+    #[test]
+    fn an_account_is_created_before_it_is_granted_and_dropped_after() {
+        let cs = ChangeSet {
+            table: "app@%".into(),
+            schema: None,
+            dialect: MySql,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![
+                Change::DropAccount(Box::new(an_account())),
+                Change::GrantPrivileges(a_privilege_change(&["SELECT"])),
+                Change::CreateAccount(Box::new(crate::users::AccountDraft {
+                    name: "app".into(),
+                    ..Default::default()
+                })),
+            ],
+        };
+        let sql = cs.emit();
+        assert_eq!(sql.len(), 3, "{sql:?}");
+        assert!(sql[0].starts_with("CREATE USER"), "{sql:?}");
+        assert!(sql[1].starts_with("GRANT"), "{sql:?}");
+        assert!(sql[2].starts_with("DROP USER"), "{sql:?}");
     }
 
     /// The two capabilities are **not** one capability, which is the whole

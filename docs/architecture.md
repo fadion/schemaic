@@ -951,6 +951,46 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the ordinary in-database path — which is what `DdlScope` and `Db::run_server_ddl` are for.
     `DROP SCHEMA` is never `CASCADE`, the same call `DropObject` makes: cascading drops every
     table in the namespace, so the server is left to refuse and name what is still in there.
+    **Six account changes join them in not addressing `ChangeSet::table`** — `CreateAccount`,
+    `DropAccount`, `Grant`/`RevokePrivileges` and `Grant`/`RevokeRole`, the Users and privileges
+    browser's write half — built by `ddl::account(subject, dialect, change)`, a sibling of
+    `server_level` whose `subject` is the account's display name (`app@%`, or a bare role) and lands
+    in `ChangeSet::table` only so the preview's title names what the plan is about; each change
+    carries its own account. `is_account_change` groups them because every downstream question is
+    the same question for all six, and the load-bearing answer is that **they are not
+    `is_server_level`**. An account belongs to the server, but the server-level route deliberately
+    connects to no particular database, and a PostgreSQL `GRANT SELECT ON TABLE public.users` names
+    an object in *one database's* catalogue — it would grant on whatever the maintenance database
+    happens to hold, or fail. So they take the ordinary in-database route, in the database the
+    browser is showing privileges for, which is correct on both engines: MySQL's grant tables are
+    server-wide and answer the same from any connection, and PostgreSQL's are exactly the ones the
+    browser was already scoped to (`an_account_change_takes_the_ordinary_in_database_route`).
+    `supports_change` answers for them in an early arm returning `users::supports_user_admin`, so it
+    and the browser that offers the action cannot drift about which engines have accounts at all.
+    `ChangeSet::account_statements` emits them at the **end** of the plan, called from `emit_mysql`
+    and `emit_postgres` beside `container_drops` and filtered on `supports_change` like its
+    neighbours — a privilege is stated *on* something, so it comes after whatever the plan creates.
+    Within the group the order is **create → grant → revoke → drop**, the only one that composes: an
+    account has to exist before it can be granted anything and has to still exist while it is.
+    `an_account_is_created_before_it_is_granted_and_dropped_after` hand-builds the mixed set nothing
+    produces yet, exactly as `a_container_is_created_first_and_dropped_last` does one level up.
+    `summary`'s arms run their privilege list through `privilege_words`, which names them while
+    there are three or fewer and counts them beyond: eighteen is a legal selection at MySQL's
+    database level, and the summary is one line above Apply. An empty list reads **"no privileges",
+    not "nothing"** — `users::privilege_sql` emits no statement for one, so the preview headed a plan
+    "1 Change", listed it, and showed an empty SQL box under a dimmed Apply: a change described with
+    nothing behind it. The form's Apply asks `GrantDraft::is_ready` first, so this is reachable only
+    by a caller that builds the change directly. `risks` speaks for `DropAccount`,
+    `RevokePrivileges` and `RevokeRole`, and the account drop's sentence says what is actually
+    lost — **its privileges, not its data**, with no record of them left anywhere to put back —
+    plus the surprise that anything still connected as it keeps running until it disconnects.
+    `grant_change(draft, account)` is the last piece: the mapping from the grant form's Action and
+    Subject dropdowns (two toggles when the test was named) to those four statements, out of the
+    view because a mapping invisible in a rendered form is the
+    kind that ships backwards (`the_forms_two_toggles_choose_between_exactly_four_changes`).
+    `every_account_change_the_engine_accepts_emits_a_statement` is a hand-written list, extended on
+    purpose when a seventh arrives, and `an_account_change_sqlite_refuses_is_withheld_not_silent` is
+    the other side of it.
     What actually varies for views moved down a level, into
     two narrower facts that are false on SQLite and only there. `supports_or_replace_view` — SQLite has no
     `CREATE OR REPLACE VIEW` in any form, so a redefinition there is a `DROP` plus a `CREATE`, the
@@ -1676,6 +1716,167 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `set_interval` on the way in, so the picker can never be left with nothing marked; a choice
     equal to the default is still stored, or moving `DEFAULT_POLL_SECS` would silently move every
     connection someone had deliberately set to the old one.
+  - `users.rs` — the **Users and privileges** browser's model: which accounts a server knows, and
+    what each of them is allowed to do, over an already-fetched snapshot. No DB, no UI, no engine,
+    and deliberately the same shape as `activity.rs` — the fetch is one query set per engine in
+    `schemaic-db`, because the catalogues share nothing, while every decision about what a
+    `Principal` *says* lives here with the tests, because a principal means the same thing whichever
+    engine produced it. `supports_users` is the capability (**false for SQLite, and that is a
+    statement about SQLite rather than unfinished work**: it is a library linked into this process
+    and its access control is the filesystem's — the database file's permissions, granted to an OS
+    user by the OS — so there is no account to browse and no statement that would create one), and
+    `supports_user_admin` is *computed* from it rather than spelling out a second `!= Sqlite`. A
+    `Principal` is `name`/`host`/`kind`/`system`/`attributes`, and the `Option` on `host` is the one
+    place the two engines disagree about what an account *is*: on MySQL/MariaDB it **is** the
+    `(user, host)` pair, where `'app'@'%'` and `'app'@'localhost'` are two accounts with different
+    passwords and different privileges, while a PostgreSQL role is not host-scoped at all — its host
+    rules live in `pg_hba.conf`, a file, and no catalogue publishes it. **A *role* carries no host on
+    any engine here, and `from_mysql_rows` drops the one the catalogue stored rather than working
+    around it in each statement builder.** MariaDB keeps `''` for a role and MySQL 8 keeps `'%'`, and
+    the first reading of that was that a statement naming one still has to match what the server
+    stored; measured on MariaDB 10.11, the server says the opposite. `SHOW GRANTS FOR 'r'@''` is
+    ERROR 1141, `GRANT SELECT ON world.* TO 'r'@''` is ERROR 1133 (*Can't find any matching row in
+    the user table*), and `DROP ROLE 'r'@''` is ERROR 1064 — a **syntax** error, because MariaDB's
+    `DROP ROLE` grammar has no `@host` in it at all — while the bare name works for all three, and on
+    MySQL 8 a bare role name resolves to the `%` row it stored. That was three of the browser's four
+    role actions broken on MariaDB. It is fixed in the fold and not in the builders because the
+    *display* was wrong by the same value: `Some("")` renders through `display()` as `readers@`,
+    trailing `@`, in the list, the detail heading, the preview's subject and the Drop confirm's
+    title. `a_role_carries_no_host_because_no_statement_naming_one_accepts_it` pins it, and its
+    counterpart `a_user_keeps_the_host_that_makes_it_a_distinct_account` pins the half that must not
+    move with it. `system` marks the accounts the server owns and maintains (the reserved
+    `mysql.`/`mariadb.` prefixes, PostgreSQL's `pg_` predefined roles, **and the one exact name
+    `mysql`**), and they are **kept rather than filtered** — "why can `pg_monitor` read that"
+    is a real question — but `sort_principals` leads its key with the flag, because PostgreSQL 16
+    ships fourteen `pg_*` roles and a fresh cluster has two accounts of its own, so sorting by name
+    alone buries the ones an administrator actually made in a list that is four-fifths furniture.
+    **`mysql` is on that list as a name rather than as a prefix because the prefix cannot reach it** —
+    `"mysql"` does not start with `"mysql."`. MariaDB's `mysql_install_db` creates `mysql@localhost`
+    for unix-socket authentication of the OS `mysql` user, and while it was uncovered that account
+    sorted among the administrator's own, undimmed, and was offered Privileges and Drop — the two
+    actions the browser withholds from server-owned accounts precisely because changing them breaks
+    the server. The trade is named where the match is: an administrator who named a real account
+    `mysql` finds it read-only here, against a one-click `DROP USER` on the server's own login.
+    `an_account_that_only_looks_like_the_servers_is_not_marked_as_it` keeps `mysqldump` and
+    `mariadbctl` on the administrator's side of that line.
+    **`MyUserRow`'s every field but the pair is an `Option`, because the two servers disagree about
+    which columns exist**: MariaDB 10.11 has `is_role` and no `account_locked`, MySQL 8.4 the
+    reverse, and selecting the union fails outright with `Unknown column`. So `None` here means
+    *this server does not publish it*, never *no*, and an absent column produces **no attribute at
+    all** rather than a `No` the browser would be asserting on the server's behalf
+    (`a_column_the_server_lacks_produces_no_attribute`). **Role detection is MariaDB's `is_role`
+    flag or nothing**: MySQL 8 has no such column and implements `CREATE ROLE` as a locked,
+    password-expired user, so reading that pair back as "role" would relabel every genuinely locked
+    account as one — on MySQL every row is a `User` and the Locked attribute says the rest, which
+    `a_locked_mysql_account_is_not_guessed_to_be_a_role` pins. On PostgreSQL `rolcanlogin` is the
+    user/role split, and it is the only split PostgreSQL makes; `from_pg_rows` lists only the
+    attributes that are *set*, since a role with nine "No" rows is where `Superuser` stops standing
+    out. `account_sql` is the account as **executed** SQL names it (`SHOW GRANTS FOR 'app'@'%'`),
+    and it is deliberately **not** a fifth identifier quoter: MySQL spells an account as two *string
+    literals*, so it goes through the one literal quoter (`schema::ddl_string` → `export::sql_literal`,
+    which already knows MySQL escapes a backslash inside a literal and PostgreSQL does not), and
+    the host-less half is `export::ident_sql` — PostgreSQL's roles, and a MySQL/MariaDB role too now
+    that one carries no host, which is the branch every statement naming a role takes.
+    `parse_grantee` is the inverse, for the fallback fetch: it splits
+    `information_schema.USER_PRIVILEGES`'s `'app'@'%'` cell back into the pair by **unquoting through
+    `sql::skip_noncode`** rather than splitting on `@`, because
+    `'a@b'@'%'` is a legal account and the first `@` would invent two — and it unquotes **by the rule
+    the scanner scanned with**. `skip_noncode` reads the literal as MySQL, where a backslash escapes,
+    so undoing `''` alone left `'o\'brien'@'%'` scanned as one literal and unquoted to `o\'brien`:
+    the backslash still in the account name, and every statement then built against an account that
+    does not exist. `unquote_mysql_literal` is that narrow inverse — the quote and backslash forms
+    and not the rest of MySQL's escape table (the newline, NUL and Ctrl-Z spellings), because a
+    half-known table is worse than a stated one. Latent rather than live, since
+    `information_schema` writes the doubled form; what was wrong was the two rules disagreeing
+    (`a_backslash_escape_is_undone_the_way_the_scanner_read_it`).
+    **PostgreSQL has no `SHOW GRANTS`, so `pg_grant_statements` has to write what MySQL merely
+    repeats.** `PgAclRow` is one `aclexplode` row joined back to its object, and the statements are
+    grouped by object **and** by `grantable`, because `WITH GRANT OPTION` belongs to the statement
+    rather than to the privilege and folding two privileges that disagree about it into one line
+    would claim it for both. The grouping is **one pass, comparing each row against the group before
+    it** rather than searching every group so far: all four of `pg::fetch_grants`'s queries order by
+    object, so a row either continues the group before it or starts a new one and the search back is
+    work with no answer to find. The old shape also cloned two `String`s per row for a key it usually
+    threw away — a role with privileges on every table of a 500-table schema is 3,500 rows and ~500
+    groups, roughly 875,000 String-pair comparisons. A row arriving out of order **opens a second
+    group naming the same object** rather than corrupting anything, so the ordering is an
+    optimisation the caller supplies and not a contract it can break; the two halves are
+    `rows_in_object_order_become_one_statement_per_object` and
+    `rows_out_of_object_order_still_name_the_right_privileges`. A complete set collapses to
+    `ALL PRIVILEGES` — what the administrator almost certainly typed, and what fits on a line where
+    seven comma-separated words do not — while a privilege the kind's list doesn't know (a newer
+    server's) sorts **last**, is still printed, and blocks the collapse. `PgObjectKind` covers databases, schemas, tables and sequences only:
+    functions and procedures are absent on purpose, since `GRANT EXECUTE ON FUNCTION` must name the
+    argument types and an overloaded name alone is ambiguous, so the `Grants::note` saying so beats a
+    statement naming the wrong overload. The grantee is taken **unquoted** and quoted here with
+    `export::ident_if_needed` (`pg_ident`) — SQL the user only reads — which is exactly what keeps it
+    from being confused with `account_sql`'s unconditional quoting for SQL that runs.
+    `Grants { statements, note }` is the honesty half, and `pg_scope_note` writes the note:
+    PostgreSQL keeps schema, table and sequence privileges in the catalogue of the database holding
+    the object, so one connection answers for one database and the note names which. A privilege
+    screen that is quietly partial is the one way this feature can mislead.
+    **`redact_secrets` is why nothing here can put a credential on screen.** MariaDB's `SHOW GRANTS`
+    carries the account's stored hash inline (`IDENTIFIED BY PASSWORD '*01E8…'`), and for
+    `mysql_native_password` that hash *is* the credential — the client proves knowledge of it, so
+    anyone reading it off a screenshot can authenticate as the account. **The rule is positional,
+    not a list of spellings**: every single-quoted literal after an `IDENTIFIED` keyword is replaced
+    with `<hidden>` — single-quoted only, because MySQL also reads `"…"` as a string while on
+    PostgreSQL the same bytes are an identifier, and blanking those would blank out an object name —
+    *except* one introduced by `WITH` or `VIA`, which names the plugin rather than the
+    secret, and scanning stops at `REQUIRE`, whose literals are X.509 subjects and issuers — public
+    by nature, and the reason a blanket "redact every literal" would be worse rather than safer.
+    That covers `IDENTIFIED BY 'plaintext'`, MySQL's `IDENTIFIED WITH 'plugin' AS '$A$005$…'` and
+    MariaDB's `IDENTIFIED VIA … USING '*01E8…'` without knowing which server wrote which. Literal
+    boundaries come from `sql::skip_noncode` — the one boundary lexer — so an escaped quote inside a
+    hash cannot end the span early and leave its tail on screen
+    (`an_escaped_quote_inside_the_secret_does_not_end_it_early`).
+    **The write half's statement builders live here beside the readers**, for the reason everything
+    else in this module does: what a `GRANT` says is decided the same way whichever engine will run
+    it, and here it has tests. `GrantLevel` is one enum with per-dialect arms — `Global`,
+    `Database`, `Schema`, `Table { qualifier, name }`, `Sequence { qualifier, name }` — because
+    **the two engines mean different things by the same word**: a MySQL `GRANT … ON db.*` reaches
+    every table in the database, while a PostgreSQL `GRANT … ON DATABASE d` grants on the database
+    *object* (`CONNECT`/`CREATE`/`TEMPORARY`) and says nothing about the tables in it, so one shared
+    "database level" would change meaning under the user on a connection switch. `levels_for` says
+    which arms an engine offers: MySQL has `Global` and no `Schema`/`Sequence`, and **PostgreSQL has
+    no `Global` at all** — a statement about PostgreSQL rather than a gap, since its cluster-wide
+    powers are role *attributes* (`SUPERUSER`, `CREATEDB`, `REPLICATION`) carried on the role and set
+    with `ALTER ROLE`, not privileges `GRANT` can express. SQLite gets an empty list rather than a
+    panic, `supports_user_admin` being the gate that should have stopped the caller.
+    `privileges_for(dialect, level)` is **curated, not exhaustive, on MySQL's global level**:
+    `GRANT` there also takes the server-administration privileges (`SHUTDOWN`, `SUPER`, and MySQL
+    8's few dozen dynamic ones), a list that differs by server *and by version*, that no catalogue
+    publishes as a menu, and that nobody should be handed a checkbox for next to `SELECT` — the
+    editor is where the whole language is available. PostgreSQL's lists are the complete ones and
+    are *read off* `PgObjectKind::all_privileges` rather than restated, so the set this form offers
+    and the set that reads back as `ALL PRIVILEGES` cannot disagree;
+    `granting_every_postgres_table_privilege_reads_back_as_all_privileges` pins exactly that
+    composition by ticking every box and running the result through `pg_grant_statements`.
+    `PrivilegeChange` + `privilege_sql(change, dialect, revoke)` write the `GRANT`/`REVOKE` — one
+    struct for both directions, since what a revoke takes away is exactly what a grant gives, and
+    `WITH GRANT OPTION` is ignored on the revoke side rather than given a second field nobody sets.
+    It returns `None` for an empty privilege list, because `GRANT ON db.*` is a syntax error: the
+    backstop *under* the form's own Apply gate, not the gate. `RoleChange` + `role_sql` are the
+    membership pair, and `AccountDraft` + `account_draft_sql` the `CREATE USER`/`CREATE ROLE` — a
+    role takes no host and no password on either engine, and an empty password emits **no clause at
+    all**, which is a real account on both (PostgreSQL's must authenticate some other way, MySQL's
+    has simply not been given one yet). `drop_account_sql` is the last, and like `DropDatabase` never
+    `IF EXISTS`: the account came off the browser's list, so one that isn't there means the list is
+    stale and a drop that dropped nothing is about to be reported as a success.
+    `GrantDraft` is the grant form's state, held here so the view holds none of it — `subject`
+    (`Privileges` or `Role`), `revoke`, `level`, `qualifier`, `name`, `privileges`,
+    `with_grant_option`, `role`, `with_admin_option`. **Two name fields for five levels**, because
+    that is how the levels nest: a database and a schema each name one thing, a table and a sequence
+    name one thing *inside* another, and the whole-server level names none. `level()`, `change()` and
+    `role_change()` answer what it describes, and `is_ready` is the **single completeness question
+    Apply reads**, so a form that cannot produce a statement cannot offer one — the alternative is an
+    enabled button whose plan turns out to be `GRANT ON …`, refused a second time much further from
+    the user. `toggle` keeps the ticked privileges in the engine's own documented order however the
+    boxes were clicked, so two people who pick the same set get the same statement.
+    **Object names in these statements go through `export::ident_sql`** and its unconditional
+    quoting, because this is SQL that is *executed* — the opposite call to the browser's read-only
+    `GRANT` list and its `ident_if_needed` (`pg_ident`), which is the same distinction one paragraph
+    up. Accounts themselves still go through `account_sql`.
   - `diff.rs` — the line-level diff behind the inline-AI (Ctrl+K) preview. `line_diff` is the LCS
     pass, one tagged row per displayed line (context / removed / added); `inline_plan` re-addresses
     those rows as **document line numbers**, which is what lets the UI draw the suggestion in the
@@ -2907,6 +3108,32 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   pid is asked for at open, and holding it is what lets the app recognise one of its own pinned
   Manual-mode connections in a list of session ids — see the repair below. SQLite errors rather
   than answering empty (`core::activity::supports_activity`); the app is gated not to ask.
+  **`Db::fetch_principals`/`Db::fetch_grants`** are the Users and privileges browser's backend, and
+  they gate on `users::supports_users` before the engine `match` for the same reason those two do,
+  with `NO_USERS_MSG` as the one sentence both raise. The MySQL half is `collect_my_users`: **four
+  queries, of which exactly one runs to completion** — MariaDB's `mysql.user` column set, then MySQL
+  8's, then the bare `(User, Host)` pair, then `information_schema.USER_PRIVILEGES`. **The fallbacks
+  fire on an *error*, not on an empty result**, the rule the lock-wait pair above had to learn:
+  `mysql.user` is never legitimately empty, so an empty answer would mean the read was denied and
+  only the error says so. The last query is the one whose failure the caller sees, and it is the one
+  an *application* account can actually read — `mysql.user` needs `SELECT` on the `mysql` database,
+  which a properly-provisioned account has not got, while `USER_PRIVILEGES` shows it its own row: one
+  account is a poor list, but it is a true one and it is the account the person opening this is most
+  likely asking about. `my_user_rows` only slots the fifth column into `is_role` or `account_locked`
+  by which query answered; everything else is `users::from_mysql_rows`. `fetch_grants` runs
+  `SHOW GRANTS FOR <account_sql>` and pipes **every row through `users::redact_secrets` at the
+  boundary**, not in the view, so a second caller — the grant/revoke step beside it, a copy
+  button — cannot forget to. `pg::fetch_principals` reads `pg_roles` on the **maintenance**
+  connection (the catalogue is cluster-wide and the browser may be open with no database selected)
+  and, unlike `pg::roles` behind the Owner dropdown, **keeps** the `pg_` predefined roles, since they
+  hold real privileges and `users::from_pg_rows` sorts them last. `pg::fetch_grants` is **four
+  queries, because PostgreSQL has no `SHOW GRANTS`**: `pg_auth_members`, then `aclexplode` over
+  `pg_database.datacl`, `pg_namespace.nspacl` and `pg_class.relacl` (relkinds `r p v m f S`, filtered
+  rather than left open so an index or a composite type can't reach the statement builder, and `S`
+  the only one taking the `SEQUENCE` keyword). Three of the four see **one database only**, which is
+  what `users::pg_scope_note` says on screen. Every one of them compares against the role's own oid,
+  so a role dropped since the list was fetched yields an empty answer rather than an error. `pg_bool`
+  is the small reader `simple_query`'s text protocol needs, which spells a boolean `t`/`f`.
   Populates each result column's
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
@@ -3160,6 +3387,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   ordinary plan calls `refresh_db(database)`. Left on the latter, a drop re-introspected a name
   that no longer exists and a create re-introspected one the tree had never heard of — both find
   no node and return, leaving the tree showing a database that is gone.
+  **An account plan needs a third refresh on top of whichever branch it took.** It runs the
+  `Database` route (`ddl::is_account_change`), whose refresh re-introspects a *schema* and knows
+  nothing about `mysql.user` — so a created account never appeared and a dropped one stayed on the
+  list until the browser was closed and reopened. `app/main.rs` therefore re-fetches the account
+  list after a successful apply when the browser is open, and puts the selection back to **nothing**
+  rather than keeping it, since the account it named may be the one that was just dropped.
   **It also suspends foreign keys for the duration and checks them before the commit** — `PRAGMA
   foreign_keys = OFF` outside the transaction, since SQLite ignores the pragma inside one. It used
   to turn them *on*, and enforcing during a plan is not the safe reading it looks like: with them
@@ -3608,11 +3841,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   introspector reads back differently leaves a table that is correct on the server and permanently
   dirty in the designer, and neither half's own tests can see it. Breaking `ddl::defaults_equal`
   fails all fifteen of them with `AlterColumn { from: X, to: X }`, which is that symptom exactly.
-  **Two capability differences are recorded as leg data rather than discovered per test**, since a
+  **Three capability differences are recorded as leg data rather than discovered per test**, since a
   test asserting one answer would be wrong on two servers out of three: `Target::non_transactional`
-  (MySQL's `MyISAM`, which accepts `BEGIN` and ignores it) and `Target::transactional_ddl`
+  (MySQL's `MyISAM`, which accepts `BEGIN` and ignores it), `Target::transactional_ddl`
   (PostgreSQL wraps a DDL plan, so a refused one applies **nothing** and `DdlError::applied` is 0,
-  while MySQL commits each `ALTER` as it runs and the count is what the preview reports).
+  while MySQL commits each `ALTER` as it runs and the count is what the preview reports), and
+  `Target::grants_are_database_scoped` (whether a grant list covers one database, and so whether
+  `Grants::note` is there to qualify it).
   **`runtime.rs` covers the four paths that need a connection to *behave*** — `.sql` scripts, bulk
   imports, the pinned manual-transaction `Session`, and cancelling a statement already running — and
   every one of them is an exception to something, which is precisely what a pure test cannot check.
@@ -3649,6 +3884,46 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   on the table that must *not* have moved. Collapsing the schema out of `analyze_edit`'s grouping
   key fails three PostgreSQL tests including that one; the MySQL legs are correctly unmoved, their
   namespace being the database, and that half rests on the same assertion's `database` comparison.
+  **In `users.rs` the reads are of accounts that were already there and the writes make their own.**
+  An account is server-wide — it is not inside the scratch database and would not go away with it —
+  so the read half asks about the account the suite **connected as** (`Target::user()`), that being
+  the only one every leg is guaranteed to have, while the write half creates one named with the
+  tier's `scratch::PREFIX` and drops it in a guard. That is the same bargain `Scratch` makes with
+  databases and it is checked by the same `assert_scratch_name`, called on the way **in and again on
+  the way out**, so the rule that nothing here touches what it did not create holds for accounts too
+  — and it has to carry more weight here, since an account is not namespaced by anything the server
+  enforces. A `ScratchAccount` dropped without `teardown` — a test that panicked — prints the name on
+  stderr rather than pretending: `Drop` cannot `await`, and the prefix is what makes the leftover
+  self-identifying. What this covers is the half nothing else reaches: three servers, four
+  catalogues, and a `mysql.user` column set that differs between MySQL 8 and MariaDB 10 in both
+  directions, where a query naming a column the server hasn't got fails outright and only a live
+  server says so. Four read tests — the connected account is in the list and carries a host part on
+  exactly the engines where an account *is* the pair; its privileges come back as `GRANT` statements
+  on both catalogues; the note is present exactly where `grants_are_database_scoped` says and names
+  the database it covers; and `no_password_material_survives_the_fetch`, which is the assertion that
+  the redaction is on the fetch rather than on one view that happens to call it.
+  **The five write tests go through the real emit-and-run path** — `ddl::account` →
+  `ChangeSet::emit` → `Db::run_ddl` — rather than asserting statement text, because a statement no
+  engine accepts is exactly what only a server can tell you:
+  `a_created_account_is_one_the_server_then_lists`, `a_created_role_is_one_the_server_accepts`,
+  `a_granted_privilege_comes_back_and_a_revoke_takes_it_off`,
+  `a_granted_role_comes_back_and_a_revoke_takes_it_off` and
+  `a_dropped_account_is_gone_from_the_list`, fifteen in all across MariaDB 10.11, MySQL 8.4 and
+  PostgreSQL 16. The grant round trip reads its
+  privilege **off `users::privileges_for`** rather than naming one, and that is the tier earning its
+  keep: naming `SELECT` was the first version and PostgreSQL refused the plan, a database being an
+  *object* there that carries only `CONNECT`, `CREATE` and `TEMPORARY` rather than a shorthand for
+  everything in it. Taking the engine's own first entry is what makes it one test instead of three,
+  and it exercises the same list the grant form is built from.
+  **The role test reads its role back out of the catalogue before touching it, and that is what makes
+  it a test.** It created and dropped one through the principal it had *drafted* —
+  `AccountDraft::principal` gives a role no host — so the catalogue's own representation, the one
+  every action in the browser acts on, was never exercised, and `core::users`'s MariaDB role-host
+  defect sat under a green leg. It now finds the role in `fetch_principals`, reads its grants (the
+  statement the browser issues the moment a row is clicked, and the one MariaDB refused with 1141)
+  and drops *that* principal through `ScratchAccount::drop_as`, which exists to drop an account as
+  some other principal describes it and asserts the two name the same account. Watched red against
+  the unfixed fold, with the server's own ERROR 1141 as the failure.
   **What the tier deliberately does not cover: SSH tunnels and TLS.** Not an oversight and not
   difficulty in the tests — the obstacle is that both need a server configured *before* it starts,
   and GitHub Actions brings `services:` containers up before any step runs, so the repository is not
@@ -3728,6 +4003,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `form_separator`/`form_gap()`/`control_button`/`footer_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
     than copying them a third time.
+    Also the **read-only fact panel** — `fact_section` (a heading with its rows under it), `fact_row`
+    (one `label: value` line) and `fact_note` (an icon-led caveat), the three views a panel of
+    *observed* facts is built from. They were `properties.rs`'s private helpers until `users_view.rs`
+    copied all three character for character, at which point the reasoning existed twice and the
+    values could drift apart with nothing on screen to say they had. Both modules call these now and
+    keep one-line wrappers over them (`properties::section`/`section_with_gap`/`detail`/`note_line`,
+    `users_view::section`/`detail`/`note`) for the label column and row gap that legitimately differ
+    between the two panels. The gap and the label width are `fn() -> f64` and not numbers, for the
+    reason every other length here is: one resolved at build freezes at the scale it was built at.
     And the **keyboard-navigation cluster**, which is the subject of the Tab gotchas below:
     `FocusRing` (a modal's Tab order — `register`/`unregister`/`step_from`/`remember`/`focus_at`,
     plus the `ring_step` wrap rule and its deliberate opposite `list_step`, which clamps),
@@ -3761,6 +4045,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     and are load-bearing anyway: a group's wrapper fills the layer only while one of its members is
     open, since an always-full-window box would eat every click beneath it. See the absolute-child
     invariant for the full argument and for what the gate holds up.
+    **"Open" is not always the same question as "on screen", and `workspace_modals_up` is where the
+    two come apart.** The Users and privileges browser renders nothing while one of its own account
+    forms or the DDL preview is up — those are raised from it and painted in the *earlier* DDL
+    group — so the predicate counts `overlay.users` only while `ddl.account`, `ddl.grant` and
+    `ddl.preview` are all `None`. A wrapper that still filled the layer would be a transparent
+    full-window box sitting on top of the form, swallowing every click meant for it: the same
+    always-full-window failure as above, arrived at through a member that is open but invisible
+    rather than through a group that is closed. `users_view::users_overlay` asks the identical three
+    signals, and the two must not be able to disagree.
   - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). A code
     block carries a **standing** 24px header — the language on the left, `Copy` and (for SQL only)
     `Insert` / `Run` on the right, as words rather than icons, since a permanent icon row over every
@@ -4045,9 +4338,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     what the panel paints. It was `bg_editor` — the UI theme's text-field surface, chosen off the
     *other* axis — which is the pairing `contrast.rs`'s entry records at 1.70:1. The Query History
     panel's preview runs through the same `highlight_sql_mono` onto the same two colours (a long
-    list of past runs read as the same wall of grey this one did); the AI panel's code blocks keep
-    `bg_editor`, and are not part of this because they carry no token colours at all — plain `text`
-    on a field surface, which `UI_PAIRINGS` already covers. The two previews are the same treatment
+    list of past runs read as the same wall of grey this one did); and the AI panel's fenced blocks
+    take the same two accessors, a **third instance rather than the exception** they were once
+    recorded as here — a SQL block goes through the same `highlight_sql_mono` once the turn has
+    settled, and a block that stays plain (non-SQL, or still streaming) keeps `preview_bg` and
+    `preview_fg` regardless, a second background for it being two kinds of block in one
+    conversation. The two previews are the same treatment
     down to the base the uncoloured identifiers take: the panels share a column and are read the
     same way, and a brighter base in one of them spent on identifiers the contrast the keywords are
     there to carry.
@@ -4156,6 +4452,120 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       reason: a failed count must not replace statistics that loaded.
     - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
       was asked about before writing.
+  - `users_view.rs` — the **Users and privileges** browser (`users_overlay`), over `core::users`.
+    It lists the server's accounts, shows one account's privileges, and is where the four write
+    actions are raised from — the forms themselves are `account_editor.rs`. Mounted in the
+    workspace group beside `properties_overlay`/`erd_overlay`/`monitor_overlay` and counted by
+    `workspace_modals_up`.
+    **It renders nothing while one of its own forms or the DDL preview is up.** Its `dyn_container`
+    is keyed on `(target, hidden)`, where `hidden` reads `ddl.account`/`ddl.grant`/`ddl.preview`,
+    and the outer fill style asks the same question. That is the pairing every schema editor already
+    has with the preview one level up, and here it is load-bearing rather than tidy: the two account
+    forms live in the modal layer's **DDL group**, which is painted *before* the workspace group, so
+    both opened *behind* the browser that raised them. `modals::workspace_modals_up` asks the
+    identical three signals, because a wrapper that still filled the layer would be a transparent
+    full-window box sitting on top of the form and swallowing every click meant for it. Cancel over
+    there returns here with the list intact.
+    **Opened from the SCHEMA gear and from a right-click on the tree's blank space, for the reason
+    `Create database` sits in both**: an account belongs to the *server*, not to any row in the tree,
+    so the modal has no object and takes none, and the gear is not a duplicate of the blank-space
+    entry because a connection whose tree already fills the panel leaves no blank space to
+    right-click. In the gear it sits **above** `Create database` — a read entry before a write one,
+    skeleton group 2 before group 4. It shipped below it, which is the cross-group inversion
+    `menu_order_gate` exists to catch and cannot see in this menu, so the gear now reads Refresh ·
+    Collapse all · Users and privileges · Create database · Show table sizes. The entry
+    is **absent** where the engine has no accounts at all (`users::supports_users` — SQLite) and with
+    no saved connection (`ctx.exists`), and **dimmed on a down connection but not on a read-only
+    one**: browsing accounts writes nothing, so the read-only refusal that guards `Create database`
+    would be answering a question this action does not ask, while a connection that cannot be reached
+    would open the browser onto a fetch that fails. `open_for_server` is the one door, and it resets
+    every signal it reads on the way in rather than on close, so a second opening cannot flash the
+    previous server's accounts while the new list is in flight; the database it is given is the
+    active tab's, because that is the one PostgreSQL's schema and table privileges can be read from.
+    Two panes: a filtered account list (`users::matches`, one field over the whole `app@host` display
+    name) on the left, and the selected account's attributes and `GRANT` statements on the right.
+    **The list column runs the full height of the body and the footer belongs to the right column**,
+    which is Manage Connections' shape and was adopted from it: a footer spanning both put a rule
+    through the list just above its last row, and the count under a list the count is not about. The
+    column keeps its `border_right`, so the only line crossing it is the one dividing the two panes.
+    Inside it the search box is full width (placeholder `Search accounts`), the list sits 10px below it
+    with 5px between rows — Manage Connections' figure, two lists of names in one app spaced the
+    same — and `+ New account` is an `in_ring_button` row pinned at the foot: `CIRCLE_PLUS` plus accent
+    text at `menu_item_style`'s 12px inset, the shape and the place `New connection` has.
+    **The list is keyed on `(state, filter)` and deliberately not on the selection** — picking a row
+    would otherwise throw the whole list away to change one row's background, and take the scroll
+    position under the pointer with it — so the selected row's background is a *reactive style* over
+    `overlay.users_selected` instead. That closure reads it with **`with`, never `get`**: it runs for
+    every row on every restyle, hover included, and `get` clones the whole `Principal` and its
+    attribute vector to answer one equality test — the per-item case the Floem gotcha below is
+    about. **The rows wear the connection list's affordances, copied
+    rather than approximated**: resting `theme::conn_list_text()`, hover brightening the *text* to
+    `conn_list_sel_text()` with no background behind it, and selected being that same bright text on
+    a full-width `conn_list_sel_bg()`. A row is full width and carries the 12px inset as its own
+    padding — the column carries none — because otherwise a selected background stops short of the
+    column's edges; the search box repeats the inset for the same reason. A `system` account stays
+    `text_faint` in **every** state, and that colour is set on the label rather than on the row, so
+    the row's own colour cannot overrule it. Copy is always enabled and a no-op before a selection,
+    the same bargain the properties modal's Copy makes: the alternative is a button whose enabled state is a
+    `dyn_container` over the fetch, rebuilding its focus-ring registration on every click. It copies
+    what the pane shows, which is already redacted, because redaction happens at the fetch.
+    **Each `GRANT` is rendered with `widgets::highlight_sql_mono`** — `theme::preview_fg` on a
+    `theme::preview_bg` block, the same call Query History, the snippet library and the AI chat's
+    fenced SQL make, with the dialect read off **`UsersTarget::dialect`** — captured at open beside
+    `conn_id` and for its reason, since the statements being highlighted belong to the server the
+    browser was opened on rather than to whichever connection the switcher has since moved to. Its
+    two sibling targets (`AccountTarget`, `GrantTarget`) carry one for the same reason. It was a
+    plain monospace `text()` on `code_bg`. The
+    two preview colours are the **editor's** axis and are paired deliberately — `contrast.rs`
+    measures them against each other — so the base has to be `preview_fg` and the surface has to be
+    named `preview_bg`, even though that accessor resolves to `code_bg` today: a coloured block
+    taking `preview_fg` onto anything the cross-axis gate does not read would be untested for
+    legibility. And a `GRANT` now reads the same here as in the tab it would be pasted into.
+    **Each write action sits beside the thing it acts on**, not in the footer: `+ New account` at the
+    foot of the list column, under the list it adds to rather than beside the box that searches it,
+    so the column reads top to bottom as *find one, or make one*; and a `Privileges` /
+    `Drop` pair under the selected account's name. That pair is an `Option<AnyView>` the detail pane
+    **extends its section list with**, never an `empty()` placeholder: the stack has a 16px gap and
+    floem gaps an empty child like any other, so an absent actions row left a hole between the
+    account's name and its attributes — the trap `properties::stats_body` states. The footer's
+    actions are about the *modal* —
+    copy what is shown, close it — and a Drop down there would sit one Tab from Close, which is the
+    wrong pair of neighbours for an irreversible action. `WriteGate::of` is asked **once, in
+    `users_overlay`**, and the answer is passed into both panes: the two rows asked it independently
+    to begin with, which is two places for one answer to drift — one of them leaving `+ New account`
+    live while `Privileges`/`Drop` were dimmed, with nothing on screen to say which was right — and
+    it re-walked the connection list for an answer that cannot differ between them. Its capability
+    half reads `target.dialect` and its read-only half the *live* connection, deliberately: what the
+    browser is about cannot change while it is open, and a read-only setting can. It gives
+    **three refusals with three remedies**, because they have three different answers: no
+    engine support is *absent* (there is nothing about this connection the user could change),
+    while read-only and no-database-selected are both dimmed and each say under the buttons which
+    one it is. The last is the reason the sentence is there at all: an account change takes the
+    ordinary in-database route (`ddl::is_account_change`), so with nothing selected there is nowhere
+    to send it, and a dimmed pair with no explanation reads as a bug. Actions are
+    **never offered for an account the server maintains** (`Principal::system`, the flag that
+    already dims its row): dropping `mysql.sys` or `pg_monitor` breaks the server rather than the
+    account, and no privilege screen should make that one click away — the pane says so in a line
+    instead. Drop goes through a `Confirm` whose body is the change's own `Change::risks` via
+    `overlays::risk_prompt`, so the question and the preview's warning cannot drift into saying
+    different things about one act, and then through the preview like everything else.
+    **Reversing a listed `GRANT` into a `REVOKE` by parsing it was built, tested and then removed.**
+    It is the feature the right-hand pane invites — a button beside each statement — and it needed
+    either a raw-statement `Change` variant, which would have become the escape hatch every
+    structured change routes around, or a parser whose wrong guess emits a `REVOKE` that takes away
+    more than the line the user clicked. The grant form serves both directions instead, which is
+    what its Action toggle is for.
+    - The two requests are tracked apart — `UsersState` for the list, `GrantsState` for one
+      account's privileges — for the reason the properties modal's exact `COUNT(*)` is tracked apart
+      from its statistics: a failure to read one account's grants must not replace a list of accounts
+      that loaded fine. `SchemaActions::principals` asks `supports_users` before the round trip and
+      reports `UsersState::Unsupported`, which is a different thing to say than a fetch that failed
+      and is distinct from an empty `Loaded` (that would read as "a server with no users").
+    - Both callbacks outlive a close, so each checks `overlay.users` still holds the target it was
+      asked about; `grants` additionally checks `users_selected` is still the same account, since a
+      second click while one is in flight would otherwise land the wrong account's privileges in the
+      pane. Nothing is persisted — the browser opts out of `SavedTab` by construction, as every
+      other modal does.
   - `import_view.rs` — the file-import modal (schema context menu → **Import**), over
     `core::import`. Two steps (Source → Mapping) in one panel driven by the `ImportUi` bundle;
     `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread. A probe or
@@ -4674,6 +5084,98 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **different levels** — `CreateDatabase` is server-level and `CreateSchema` is not.
     `ddl_preview::preview_container` is the one exit, and it reads that level off the change
     (`ddl::is_server_level`) rather than taking a caller's word for it.
+  - `account_editor.rs` — the Users and privileges browser's **write half**: two overlays in one
+    module, `account_editor_overlay` (create an account) and `grant_editor_overlay` (grant or
+    revoke), both raised from `users_view` and both ending at `ddl_preview::preview_account`, which
+    is the third sibling of `preview_change`/`preview_container` and the only thing here that runs
+    anything. Mounted in the modal layer's DDL group sharing `object_editor.rs`'s tuple element,
+    counted by `ddl_editors_up`, and on `PAINTS_A_BACKDROP` as one file with two overlays. The
+    read-only refusal is inside `open_for_new`/`open_for_grant` rather than at the button, the same
+    rule `database_editor::open_for_new` follows: a launch guards itself in the step that launches
+    it, and the browser's dimming is what *says* the action is unavailable.
+    The account form **only ever creates** — the shape `database_editor` has and for the same
+    reasons: an account is dropped from its own row in the browser, and neither engine offers a
+    rename that is safe to perform. Its Kind picker comes first because it decides what the rest of
+    the form means: a role takes no host and no password on either engine, so those fields **vanish
+    rather than sitting there inert**, and Host is absent on PostgreSQL, which has no such thing at
+    all. **The form holds a password, and nothing else in this crate does.** It is blanked on every
+    open — a form that reopened holding the last one would put a credential on screen nobody typed
+    this time — cleared on Cancel, never persisted and never logged, and it becomes visible in
+    exactly one place: the preview's SQL. That is deliberate. The preview is the app's one gate
+    between a plan and a server, and a statement shown there with a field blanked out would not be
+    the statement it ran.
+    **Every fixed-list choice in both forms is the app's `<select>`** — `settings::focusable_dropdown`,
+    the control the settings modals wear, so the popup, the keyboard, the tinted current value and
+    the chevron box are one implementation. Four rows moved onto it: the account form's **Kind**, and
+    the grant form's **Action**, **Subject** and **Level**, all of which were rows of `action_button`s
+    that read as picked or not, and the module's own `toggle_button` is gone with them.
+    `bound_dropdown` and `bound_toggle` sit beside `bound_field` and exist for the reason it does:
+    `focusable_dropdown`/`focusable_toggle` bind to an `RwSignal<T>` and these values live in a
+    **field of a draft struct**, not in a signal of their own, so each seeds a local signal once and
+    writes back through an effect only on a genuine change — a rebuild cannot read as an edit.
+    `bound_dropdown` takes `label` as a `fn` rather than a closure because `focusable_dropdown`'s is,
+    and wraps the control at `field_w()` so a form of mixed controls lines up.
+    `picked_outline(style, picked)` survives the move with **one** caller left, `privilege_tag`:
+    `theme::accent()` when chosen and `Color::TRANSPARENT` when not, so only the colour changes.
+    Taffy sizes the border box, so a 1px rule added *only* while picked grows a button sized by its
+    own padding by 2px, which is what the Kind, Level, privilege and option toggles all did the
+    moment they were clicked while they were buttons — and in a wrapping cloud it re-flows every tag
+    after it on the line. It is the same accounting `widgets::row_menu_mark_pad` does one level down,
+    taken from the other end: a tree row's height is fixed by what surrounds it so the 2px is given
+    back out of its padding, while a button here has nothing to give back, so the border has to be
+    there all along. See the UI convention.
+    The grant form is **one form for four statements** — grant or revoke, privileges or a role —
+    and the mapping from its Action and Subject dropdowns to `Change::{Grant,Revoke}{Privileges,Role}`
+    is `core::ddl::grant_change`, pure and unit-tested rather than four arms in the render.
+    **The Action dropdown is over a `bool`**: `GrantDraft::revoke` stays the `bool` that
+    `PrivilegeChange` and `ddl::grant_change` read and that their tests pin, and the free
+    `action_label(bool) -> &'static str` gives it its two words. An enum invented for the form would
+    be a second spelling of the same fact sitting one conversion away from the tested one.
+    It opens pre-picked to the widest level the engine has, so the name fields mean something before
+    the user has noticed the picker, and **changing the level clears the ticked privileges**: kept,
+    they would carry `EVENT` down to a table level that has no such privilege and emit a statement
+    the server refuses. That pre-picking is `initial_grant_draft(dialect)`, its own function beside
+    the openers rather than a literal inside `open_for_grant`, because the **Level row exists only
+    when the draft holds a level** — `if let Some(current) = seed.level`, and no row at all when it
+    is `None`, since a dropdown with nothing in it is a worse answer than no row. **The row has no
+    fallback of its own, deliberately**, and that absence is the first thing a future editor would
+    tidy back in: an `or_else(|| levels.first().copied())` here would paint a level the draft does
+    not hold, while the fields below stay gated on `seed.level` and so stay hidden — and because
+    `bound_dropdown` writes back only on a *genuine change*, picking the very entry already shown
+    would not be the change that unstuck it. With the seeding in one named function, `None` means
+    exactly *an engine with no levels*, which cannot reach this form at all
+    (`users::supports_user_admin` gates the browser's button). The coupling is pinned by
+    `the_grant_form_opens_holding_a_level_wherever_the_engine_has_one` and
+    `the_level_it_opens_on_is_the_first_the_picker_offers`.
+    **The privileges are a wrapping tag cloud** — `h_stack_from_iter` under `FlexWrap::Wrap` at 6px,
+    where they were one per line. Eighteen is a legal selection at MySQL's database level, and
+    eighteen rows is a column of short words taller than the panel: a set you have to scroll to see
+    the shape of. Wrapped, the whole set is one block, which is the question the row is actually
+    asking — *which of these*. `privilege_tag` (once `privilege_row`) still reads the draft inside
+    its own style, so clicking one tag does not rebuild the cloud of eighteen, and it is the one
+    control here still wearing `picked_outline`.
+    The database the browser is scoped to is *suggested* beside the qualifier
+    field rather than filled in, since a prefilled name on a form that grants privileges is a value
+    nobody read.
+    **Both forms' `dyn_container`s are keyed on a memo over the form's *shape*, never on the draft
+    signal** — `account_form_shape` (the Kind) and `grant_form_shape` (`(subject, revoke, level)`),
+    two pure functions naming the fields that decide which rows exist, because the values in those
+    rows do not. Keyed off the draft, both rebuilt the entire form on every keystroke in a name
+    field and on every privilege tag, tearing the field down mid-word and taking the caret with it:
+    floem's `create_updater` does **no equality check**, so a key that merely recomputes to the same
+    value still fires. That is `widgets::overlay_open_key`'s bug, reproduced in two more places.
+    `form_shape_tests` pins the two functions — typing or tagging never changes a shape, each
+    dropdown does — and **that is the whole of what it can see**: whether the key closure reads
+    `shape.get()` or the draft is a line in a view, which is how `overlay_open_key`'s own pin, taken
+    on the memo in isolation, let the regression walk past it. Preview SQL is gated on
+    `users::GrantDraft::is_ready`, the same predicate the footer's sentence is written from, and the
+    press then asks `ddl::grant_change`, which answers `None` for exactly the drafts that predicate
+    rejects — the doubled refusal every launch here makes, since a disabled button is not a guard.
+    **"With grant option" and "With admin option" are the app's switch** — `settings::focusable_toggle`
+    through `bound_toggle`, reading the draft, so a yes/no in this form reads as a yes/no everywhere
+    else one appears. They shipped as an always-"Yes" button whose `current` parameter was ignored,
+    so the two rows that exist only to show a state showed none of it: nothing on screen said whether
+    the statement about to be previewed would carry the clause.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
     question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while Claude's turn has
@@ -4716,19 +5218,44 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     would predict. `menu_icon_tuck()` and `menu_edge_pad()` are functions for the same reason — an
     offset frozen between two growing boxes is not an offset but a drift, and at 160% a 154px panel
     tucked by a literal 30 landed its right edge ~18px inside the icon instead of flush past it.
+    **`risk_prompt(change, dialect)` is where a destructive confirm gets its body**, from the
+    change's own `Change::risks` rather than from a sentence typed at the call site, so the question
+    and the preview's warning cannot say different things about one act. It was
+    `container_drop_prompt` while the database and schema drops here were its only callers; it was
+    always generic over any `Change`, and the account drop `users_view` raises is what made the
+    narrower name wrong. An empty `risks()` — an arm a later edit emptied — falls back to a question
+    rather than to a modal with a blank body, which is an irreversible action asked with nothing in
+    it (`a_riskless_change_still_asks_something`).
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav).
-    **A right-click on the tree's empty space raises its own menu** — `Create database` and
-    `Refresh`, both about the *panel* rather than about anything in it, because nothing in it was
-    clicked. It hangs off the tree's own box with no hit test of its own: every row raises its
+    **A right-click on the tree's empty space raises its own menu** — `Users and privileges`,
+    `Refresh` and `Create database`, all three about the *panel* rather than about anything in it,
+    because nothing in it was clicked. It hangs off the tree's own box with no hit test of its own:
+    every row raises its
     menu with `on_secondary_click_stop`, so what reaches this handler is exactly a click that
     landed on no row, and a hit test here would be a second answer to a question floem's
     propagation already answers. It uses the **generic** `popup_menu` channel rather than
     `context_menu`, which carries a `CtxKind` describing the row that was clicked — and this
     menu exists precisely because there wasn't one. `blank_space_entries` is the decision, split
-    out to be asserted like `overlays::create_children`: it returns **nothing at all** on SQLite
-    rather than a menu holding only `Refresh`, since a one-row menu on blank space reads as a
-    misfire and the gear still carries Refresh for anyone looking for it.
+    out to be asserted like `overlays::create_children`, and it returns `BlankEntry`s carrying a
+    `BlankKind` rather than bare labels, because the builder routes on the discriminant: on labels
+    with a catch-all arm a third entry falls into whichever branch was written last and renders as
+    a live row that does nothing.
+    **The early return now asks whether the engine has anything here beyond `Refresh`** —
+    `databases || users`, where it used to ask `supports_database_editing` alone. SQLite still
+    raises **nothing at all**, having neither a database to create nor an account to browse, which
+    is the original point: a one-row menu on blank space reads as a misfire, and the gear still
+    carries Refresh for anyone looking for it. Left asking only the first question, that lone
+    `Refresh` would have appeared the moment a second entry arrived.
+    `Users and privileges` is skeleton group 2 and sits **before** `Refresh`, which the skeleton
+    says closes that group. It is dimmed on a **down** connection and **not** on a read-only one —
+    browsing accounts writes nothing, and the write actions inside the browser gate themselves —
+    where `Create database` is dimmed on either. `blank_space_is_a_subsequence_of_the_skeleton` is
+    this menu's own half of `overlays::menu_order_gate`, which cannot see a menu built in this file;
+    see that gate for what it does and does not reach. The tests look entries up **by label**
+    (`labels`/`disabled`, the second panicking when the row is absent) rather than by index, so a
+    fourth entry cannot silently shift what an older assertion checks, and an assertion about a row
+    that is not there fails instead of passing by finding nothing.
     The standalone objects hang off the same levels the tables do, in
     `Types`/`Domains`/`Sequences`/`Functions`/`Procedures` folders after them
     (`object_groups`/`object_group_node`/
@@ -5568,7 +6095,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     callers pass.
     `preview_bg`/`preview_fg` are the surface and base text of a **syntax-coloured preview**, and
     they are named here rather than spelled at each site so the cross-axis gate in `contrast.rs`
-    measures the surface the previews actually paint. Both come from the *editor* axis, which is the
+    measures the surface the previews actually paint — the account browser's `GRANT` block is the
+    latest caller, and its move off `code_bg` is exactly that distinction and nothing else:
+    `preview_bg()` *is* `code_bg()`, the same pixel, but spelled through the accessor the gate reads
+    rather than through one it does not. Both come from the *editor* axis, which is the
     whole point: the token colours are reproductions of palettes tuned against their own background,
     the editor theme is chosen independently of the light/dark UI theme, and pairing them with a UI
     surface is a combination nobody chose — see `contrast.rs` for the ratios that cost.
@@ -6639,7 +7169,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   and `result_attachment` states the cap it applied.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
-  read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`). Never hand-roll a second
+  read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where
+  a span ended early leaves the tail of a password hash on screen). Never hand-roll a second
   scanner — five drifting copies was the original bug. **It's dialect-aware:** `skip_noncode`/
   `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`/
   `first_statement`, `statement_bounds_open` (the resumable form the script splitter feeds),
@@ -6987,12 +7518,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   where another file is attached under that name. `import::build_insert` held a second copy of it,
   which is how the SQLite case reached one path and not the other.
   `filter::quote_ident`, `schema::ddl_ident_in`, `db::pg::pg_ident`,
-  `db::ident_sqlite` and
+  `db::ident_sqlite`, `users::pg_ident` and
   `db::ident` are all thin delegations; the three engine-fixed ones in `schemaic-db` are bound by a
   test in that crate, since they can't take a dialect. **Don't write a fifth** — there were four,
   each having independently arrived at the same escaping, which is the drift hazard rather than the
   reassurance: the literal half of the same split (`schema::ddl_string` missing MySQL's backslash
   escaping while `export::sql_literal` had it) shipped as a High.
+  **A MySQL account is not an identifier**, which is the one case that looks like it wants a fifth
+  and doesn't: `'app'@'%'` is two *string literals*, so `users::account_sql` goes through the literal
+  quoter (`schema::ddl_string`) and only PostgreSQL's host-less half reaches `export::ident_sql`.
   SQLite *reads* three quotings but **emits only `"x"`**: it is the one of the three with a defined
   escape, since a `]` cannot be written inside brackets at all. Its literals take Postgres' arm —
   no backslash escape, so doubling one would corrupt the value.
@@ -7101,7 +7635,24 @@ Re-introducing the anti-patterns these guard against is a regression:
 
 - **No pointer cursor on buttons/icons** — native apps keep the arrow cursor; a pointer feels
   web-like. Use the default; reserve `CursorStyle::Text` for text inputs (a genuine hyperlink may
-  keep `Pointer`).
+  keep `Pointer`). The account browser's rows shipped with `CursorStyle::Pointer` and are named here
+  because a rule with no instance reads as a preference: after that one was removed the only
+  `CursorStyle::Pointer` left in `schemaic-ui` is the terminal's hyperlink run in `lib.rs`, which is
+  the exception the bracket allows. One `grep` is the whole check.
+- **A selection outline is painted in both states; only its colour changes.** Taffy sizes the
+  **border box**, so a 1px rule added only while a control is picked grows it 2px: a button sized by
+  its own padding jumped a pixel each way the moment it was chosen and the row re-flowed around it,
+  which is how every toggle in the two account forms shipped.
+  `account_editor::picked_outline(style, picked)` is the one helper, and it paints the border
+  always, `theme::accent()` when picked and `Color::TRANSPARENT` when not, which leaves
+  the colour as the only thing that moves. Its remaining caller is the grant form's `privilege_tag`
+  — Kind, Level and the two option rows are now the app's `<select>` and its switch — and that
+  wrapping tag cloud is the reason the helper is still here: the tags **wrap**, so a tag that grew
+  as it was picked would re-flow every tag after it on the line, not just itself.
+  This is the same accounting `widgets::row_menu_mark_pad`
+  does for a tree row (*Popup menus*), taken from the other end — that row's height is fixed by what
+  surrounds it, so the 2px is given back out of its padding, while a button sized by its own padding
+  has nothing to give back and needs the border there all along.
 - **`btn_primary_text` is not "white on the accent".** It is the *label* colour of the Primary
   button, chosen against `btn_primary`'s own dark navy fill — `#8EA7EA`, a light blue. Painting it
   on a saturated fill leaves a glyph nobody can see, which is exactly how the import list's
@@ -7599,6 +8150,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   it properly needs a body signal per row, the way the routine editor got one; there is a note at the
   key saying so. The view editor took the memo safely for the opposite reason: `fetch_algorithm`
   patches a term in the diff and not a control, so its rebuild delivered nothing to the screen.
+  **The two account forms are the same bug in its other flavour**, found later and in two more
+  places: no fetch anywhere near them, just a key reading the draft signal that every keystroke
+  writes, so typing a name rebuilt the form around the field being typed in. They take a memo over
+  a pure *shape* function (`account_editor::{account_form_shape, grant_form_shape}`) rather than
+  `overlay_open_key`, because what must not rebuild them is a value **inside** the form rather than
+  a patch arriving from outside it.
   **And only the key closure is wrapped in an effect — the *builder* is called outside it**, so a
   scaled metric read there subscribes nothing and freezes at the scale the view was built at. Two
   sites paid for that. `schema_tree`'s `SchemaTreeCtx` therefore carries `indent_levels: u32`, a
@@ -8466,6 +9023,18 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   server and replaces every row it stores. Nothing but `group` keeps them on opposite sides
   of the separator, and a `Refresh view` sorted into the read group would put a write where
   the eye expects a reload.
+  **The gate reads `overlays.rs` and nothing else** — `this_file()` hard-codes the path — and two
+  menus in the app are outside it, both of which then shipped the inversion it was written to catch.
+  The SCHEMA gear put `Create database` (group 4) *above* `Users and privileges` (group 2), and the
+  tree's blank-space menu did the same; the gear now runs Refresh · Collapse all · Users and
+  privileges · Create database · Show table sizes, and the blank-space menu carries its own half of
+  the gate in `schema_tree::blank_space_is_a_subsequence_of_the_skeleton`, asserted over the entry
+  **values** rather than over the source, since unlike the context menus those entries are data. It
+  mirrors the group number for each of its labels from `group` here by hand, which is why
+  `Users and privileges` is in this table at all: it is **not a context-menu row today**, but an
+  unknown label fails, so a second menu cannot place an entry this one has never heard of. The
+  vacuity guard (`arms.len() == 7`) counts arms of the builder the gate already reads, so it cannot
+  notice a third source either.
   **`Export` is the one label the gate skips outright**, and it is an exemption rather than a third
   deviation: it has two honest homes — with `Generate DDL` on a database or a namespace, among the
   read entries that hand you what the node holds; directly below `Import` on a table, where the two

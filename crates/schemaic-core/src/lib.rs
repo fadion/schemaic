@@ -61,6 +61,7 @@ pub mod transcript;
 pub mod tx;
 pub mod typename;
 pub mod update;
+pub mod users;
 pub mod window_chrome;
 
 /// Product name, shown in the window title and about screen.
