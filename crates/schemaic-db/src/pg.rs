@@ -61,6 +61,7 @@ use schemaic_core::schema::{
 };
 use schemaic_core::sql;
 use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
+use schemaic_core::users::{self, Grants, PgAclRow, PgObjectKind, PgRoleRow, Principal};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
@@ -2389,6 +2390,174 @@ pub(crate) async fn roles(db: &Db) -> Result<Vec<String>, DbError> {
         .into_iter()
         .filter_map(|r| r.into_iter().next().flatten())
         .collect())
+}
+
+/// The PostgreSQL half of [`Db::fetch_principals`](crate::Db::fetch_principals).
+///
+/// Server-level, on the maintenance connection: `pg_roles` is a cluster-wide
+/// catalogue and the browser may be open on a connection with no database
+/// selected. Unlike [`roles`] this keeps the `pg_` predefined roles — they hold
+/// real privileges and "why can this account read that" is the question the
+/// browser exists to answer — and `users::from_pg_rows` sorts them last.
+pub(crate) async fn fetch_principals(db: &Db) -> Result<Vec<Principal>, DbError> {
+    let client = connect_maintenance(db).await?;
+    let rows = query_all(&client, PG_ROLES_SQL).await?;
+    let rows: Vec<PgRoleRow> = rows
+        .iter()
+        .filter(|r| r.len() >= 10)
+        .map(|r| PgRoleRow {
+            name: cell(r, 0),
+            superuser: pg_bool(r, 1),
+            inherit: pg_bool(r, 2),
+            createrole: pg_bool(r, 3),
+            createdb: pg_bool(r, 4),
+            canlogin: pg_bool(r, 5),
+            replication: pg_bool(r, 6),
+            bypassrls: pg_bool(r, 7),
+            // Not `num`, which refuses a negative — and `-1` is precisely the
+            // value that means "no limit" and has to survive as one.
+            connlimit: opt(r, 8).and_then(|s| s.parse().ok()).unwrap_or(-1),
+            valid_until: opt(r, 9),
+        })
+        .collect();
+    Ok(users::from_pg_rows(&rows))
+}
+
+/// `pg_roles` in the order [`PgRoleRow`] reads it.
+const PG_ROLES_SQL: &str = "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, \
+            rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, \
+            CAST(rolvaliduntil AS text) \
+     FROM pg_catalog.pg_roles ORDER BY rolname";
+
+/// A boolean column from `simple_query`'s text protocol, which spells it `t`/`f`.
+fn pg_bool(row: &[Option<String>], i: usize) -> bool {
+    opt(row, i).as_deref() == Some("t")
+}
+
+/// The PostgreSQL half of [`Db::fetch_grants`](crate::Db::fetch_grants).
+///
+/// **Four queries, because PostgreSQL has no `SHOW GRANTS`.** Privileges live as
+/// `aclitem[]` columns on the objects themselves, one catalogue per kind, and
+/// `aclexplode` is what turns each array into rows. `users::pg_grant_statements`
+/// puts them back together — the reassembly is there, with the tests, and not
+/// here, because it is a decision about what a privilege is *called* and this is
+/// only the fetch.
+///
+/// **Three of the four see one database only.** `pg_database` is cluster-wide,
+/// but `pg_namespace` and `pg_class` are per-database catalogues, so a
+/// connection answers for the database it is attached to and knows nothing about
+/// the others. That is what [`users::pg_scope_note`] says on the screen, rather
+/// than a list that looks complete and isn't.
+pub(crate) async fn fetch_grants(
+    db: &Db,
+    database: Option<&str>,
+    principal: &Principal,
+) -> Result<Grants, DbError> {
+    // No database selected: the cluster-wide half is still answerable, and a
+    // maintenance connection is where `fetch_principals` already stands.
+    let (client, scope) = match database {
+        Some(d) => (connect_to(db, d).await?, Some(d.to_string())),
+        None => (connect_maintenance(db).await?, None),
+    };
+    let who = pg_str_lit(&principal.name);
+    // Every ACL query compares against the role's own oid. A role that has since
+    // been dropped yields NULL, which matches nothing — an empty list, not an
+    // error, which is the right answer to "what may a role that isn't there do".
+    let oid = format!("(SELECT oid FROM pg_catalog.pg_roles WHERE rolname = {who})");
+
+    let members = query_all(
+        &client,
+        &format!(
+            "SELECT r.rolname, m.admin_option FROM pg_catalog.pg_auth_members m \
+             JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+             WHERE m.member = {oid} ORDER BY r.rolname"
+        ),
+    )
+    .await?;
+    let member_of: Vec<(String, bool)> = members
+        .iter()
+        .map(|r| (cell(r, 0), pg_bool(r, 1)))
+        .collect();
+
+    let mut acl: Vec<PgAclRow> = Vec::new();
+    let databases = query_all(
+        &client,
+        &format!(
+            "SELECT d.datname, a.privilege_type, a.is_grantable \
+             FROM pg_catalog.pg_database d, aclexplode(d.datacl) a \
+             WHERE a.grantee = {oid} ORDER BY d.datname, a.privilege_type"
+        ),
+    )
+    .await?;
+    acl.extend(databases.iter().map(|r| PgAclRow {
+        kind: PgObjectKind::Database,
+        schema: None,
+        name: cell(r, 0),
+        privilege: cell(r, 1),
+        grantable: pg_bool(r, 2),
+    }));
+
+    // **The per-database half runs only when a database was named.** With none
+    // selected the client above stands on PostgreSQL's *maintenance* database,
+    // and these two queries would answer for it — a database the user did not
+    // choose and is not looking at — while the note said nothing at all. See
+    // `users::pg_no_database_note`, which is what is said instead.
+    if scope.is_some() {
+        let schemas = query_all(
+            &client,
+            &format!(
+                "SELECT n.nspname, a.privilege_type, a.is_grantable \
+             FROM pg_catalog.pg_namespace n, aclexplode(n.nspacl) a \
+             WHERE a.grantee = {oid} ORDER BY n.nspname, a.privilege_type"
+            ),
+        )
+        .await?;
+        acl.extend(schemas.iter().map(|r| PgAclRow {
+            kind: PgObjectKind::Schema,
+            schema: None,
+            name: cell(r, 0),
+            privilege: cell(r, 1),
+            grantable: pg_bool(r, 2),
+        }));
+
+        // Views and materialised views are granted `ON TABLE` like the tables they
+        // stand in for; only a sequence takes its own keyword. `relkind` is filtered
+        // rather than left open so an index or a composite type — which have no
+        // `GRANT` spelling at all — can't reach the statement builder.
+        let rels = query_all(
+            &client,
+            &format!(
+                "SELECT n.nspname, c.relname, c.relkind, a.privilege_type, a.is_grantable \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             CROSS JOIN LATERAL aclexplode(c.relacl) a \
+             WHERE a.grantee = {oid} AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') \
+             ORDER BY n.nspname, c.relname, a.privilege_type"
+            ),
+        )
+        .await?;
+        acl.extend(rels.iter().map(|r| PgAclRow {
+            kind: if cell(r, 2) == "S" {
+                PgObjectKind::Sequence
+            } else {
+                PgObjectKind::Table
+            },
+            schema: Some(cell(r, 0)),
+            name: cell(r, 1),
+            privilege: cell(r, 3),
+            grantable: pg_bool(r, 4),
+        }));
+    }
+
+    let mut statements = users::pg_membership_statements(&principal.name, &member_of);
+    statements.extend(users::pg_grant_statements(&principal.name, &acl));
+    Ok(Grants {
+        statements,
+        note: Some(match scope.as_deref() {
+            Some(d) => users::pg_scope_note(d),
+            None => users::pg_no_database_note(),
+        }),
+    })
 }
 
 /// The browse list against a client the caller already has — what `fetch_schema`
