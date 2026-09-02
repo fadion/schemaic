@@ -35,11 +35,12 @@ async fn connected_principal(target: &'static Target) -> Principal {
         .await
         .unwrap_or_else(|e| panic!("fetch_principals on {}: {e}", target.endpoint()));
     let want = target.user();
-    list.iter()
+    list.list
+        .iter()
         .find(|p| p.name == want)
         .cloned()
         .unwrap_or_else(|| {
-            let names: Vec<String> = list.iter().map(|p| p.display()).collect();
+            let names: Vec<String> = list.list.iter().map(|p| p.display()).collect();
             panic!(
                 "{} does not list the account it connected as ({want}); it listed: {names:?}",
                 target.endpoint()
@@ -89,8 +90,13 @@ pub async fn an_accounts_grants_come_back_as_grant_statements(target: &'static T
     scratch.teardown().await;
 }
 
-/// A list that covers one database says so, and one that covers the server does
-/// not pretend to be qualified.
+/// **Every grant list qualifies itself**, and one that covers a single database
+/// names it.
+///
+/// Both halves are partial in a way the reader cannot see from the statements:
+/// PostgreSQL's covers one database and no ownership or superuser rights;
+/// MySQL's covers direct grants only. Neither may answer with `None`, which is
+/// the claim "this is all of it".
 pub async fn a_grant_list_says_which_database_it_covers_when_it_covers_only_one(
     target: &'static Target,
 ) {
@@ -101,17 +107,31 @@ pub async fn a_grant_list_says_which_database_it_covers_when_it_covers_only_one(
         .fetch_grants(Some(&scratch.database), &me)
         .await
         .unwrap_or_else(|e| panic!("fetch_grants on {}: {e}", target.endpoint()));
-    assert_eq!(
-        grants.note.is_some(),
-        target.grants_are_database_scoped,
-        "{}: note was {:?}",
-        target.endpoint(),
-        grants.note
-    );
-    if let Some(note) = &grants.note {
+    let note = grants.note.as_deref().unwrap_or_else(|| {
+        panic!(
+            "{}: a partial grant list qualified itself with nothing",
+            target.endpoint()
+        )
+    });
+    if target.grants_are_database_scoped {
         assert!(
             note.contains(&scratch.database),
             "{}: the note does not name the database it covers: {note}",
+            target.endpoint()
+        );
+        // And what no ACL entry records — the omission that made
+        // `pg_read_all_data` read as an account with no privileges at all.
+        for claim in ["owning an object", "superuser"] {
+            assert!(
+                note.contains(claim),
+                "{}: the note does not admit {claim:?}: {note}",
+                target.endpoint()
+            );
+        }
+    } else {
+        assert!(
+            note.contains("role"),
+            "{}: the note does not name what it leaves out: {note}",
             target.endpoint()
         );
     }
@@ -133,13 +153,20 @@ pub async fn a_grant_list_with_no_database_says_it_is_covering_none(target: &'st
         .await
         .unwrap_or_else(|e| panic!("fetch_grants on {}: {e}", target.endpoint()));
     if !target.grants_are_database_scoped {
-        // A server-wide grant list is complete whether or not a database is
-        // selected, so there is nothing to qualify.
+        // A server-wide grant list needs no *database* qualification — but it is
+        // not complete, and it used to say `note: None`, which claimed it was.
+        // `SHOW GRANTS` is direct-only on both servers, so everything held
+        // through a granted role is missing from it.
+        let note = grants.note.as_deref().unwrap_or_else(|| {
+            panic!(
+                "{}: a direct-only grant list said nothing about the roles it does not expand",
+                target.endpoint()
+            )
+        });
         assert!(
-            grants.note.is_none(),
-            "{}: a server-wide list should have nothing to qualify, got {:?}",
-            target.endpoint(),
-            grants.note
+            note.contains("role"),
+            "{}: the note does not name what it leaves out: {note}",
+            target.endpoint()
         );
         return;
     }
@@ -351,7 +378,7 @@ pub async fn a_created_account_is_one_the_server_then_lists(target: &'static Tar
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"));
     assert!(
-        list.iter().any(|p| p.name == account.principal.name),
+        list.list.iter().any(|p| p.name == account.principal.name),
         "{}: the account this test created is not in the list",
         target.endpoint()
     );
@@ -381,6 +408,7 @@ pub async fn a_created_role_is_one_the_server_accepts(target: &'static Target) {
         .fetch_principals()
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"))
+        .list
         .into_iter()
         .find(|p| p.name == role.principal.name)
         .unwrap_or_else(|| {
@@ -493,7 +521,7 @@ pub async fn a_dropped_account_is_gone_from_the_list(target: &'static Target) {
         .await
         .unwrap_or_else(|e| panic!("fetch_principals: {e}"));
     assert!(
-        !list.iter().any(|p| p.name == name),
+        !list.list.iter().any(|p| p.name == name),
         "{}: {name} is still listed after being dropped",
         target.endpoint()
     );

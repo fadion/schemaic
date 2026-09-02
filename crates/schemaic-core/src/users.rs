@@ -644,14 +644,128 @@ pub struct Grants {
     pub note: Option<String>,
 }
 
+/// The account list, and what it does **not** cover.
+///
+/// The same shape as [`Grants`], and for the same reason. A `Vec<Principal>` has
+/// no channel for "the wide reads were refused, this is one account out of
+/// eight" — so an ordinary application account, with no `SELECT` on `mysql`,
+/// browsed a list of exactly itself, rendered as an ordinary complete list with
+/// a footer reading "1 account". `Grants::note` was added in the same commit for
+/// this exact reason and this half did not get it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Principals {
+    pub list: Vec<Principal>,
+    /// What the list does not cover, when the answer is necessarily partial.
+    pub note: Option<String>,
+}
+
+impl Principals {
+    /// A complete answer — every account the server has.
+    pub fn complete(list: Vec<Principal>) -> Self {
+        Self { list, note: None }
+    }
+}
+
+/// The sentence [`Principals::note`] carries when the server refused every read
+/// wide enough to see other accounts.
+pub fn my_own_account_only_note() -> String {
+    "This connection cannot read mysql.user, so this is not the server's account list — it is \
+     the one account this connection can see, its own. Connect as an account with SELECT on the \
+     mysql database to browse the rest."
+        .to_string()
+}
+
+/// The sentence [`Grants::note`] carries on MySQL and MariaDB.
+///
+/// `SHOW GRANTS` is documented on both servers as **direct grants only**: a
+/// privilege the account holds through a role it has been granted does not
+/// appear, and no `USING` form is issued here that would expand one. The list
+/// was shipped with `note: None`, so a role-based setup — the normal way a
+/// modern MySQL 8 or MariaDB installation is provisioned — showed an account
+/// with almost nothing on it and said nothing about why.
+pub fn my_scope_note() -> String {
+    "Privileges held through a granted role are not expanded: SHOW GRANTS lists what is granted \
+     directly to the account, and the roles it is a member of, but not what those roles \
+     themselves hold. Open the role's own privileges to see those."
+        .to_string()
+}
+
 /// The sentence [`Grants::note`] carries on PostgreSQL, naming the database the
 /// connection is attached to.
-pub fn pg_scope_note(database: &str) -> String {
-    format!(
+///
+/// `extra` is what this particular role's read could not express — see
+/// [`pg_implicit_note`]. It goes first, because "this role is a superuser" is
+/// the sentence that changes how the rest of the screen should be read.
+pub fn pg_scope_note(database: &str, extra: Option<&str>) -> String {
+    let base = format!(
         "Schema, table and sequence privileges are those in {database} — PostgreSQL keeps them in \
          each database's own catalogue, so privileges in other databases are not listed. \
-         Privileges held through role membership or granted to PUBLIC are not expanded."
-    )
+         Privileges held through role membership or granted to PUBLIC are not expanded, and \
+         neither are the privileges a role holds by owning an object or by being a superuser."
+    );
+    match extra {
+        Some(e) => format!("{e} {base}"),
+        None => base,
+    }
+}
+
+/// What this role holds that no ACL entry records, as a sentence — or `None`
+/// when there is nothing to say.
+///
+/// **The reason this exists rather than a fifth ACL query.** PostgreSQL's
+/// `aclexplode` reads only *explicit* entries, and three of the commonest ways a
+/// role gets its power leave none: a superuser bypasses every check, an owner
+/// holds every privilege on what it owns, and a `pg_*` predefined role's powers
+/// are wired into the server. Clicking `pg_read_all_data` therefore printed
+/// **"This account holds no privileges."** — the pane's own words — and an owner
+/// of fourteen tables got one statement about a database they were not looking
+/// at, under a note that enumerated its omissions and did not include these.
+///
+/// They are stated rather than emitted as `GRANT`s because they are not grants:
+/// there is no statement that would produce them and none that would revoke
+/// them, so a line shaped like one would be a lie in the other direction.
+pub fn pg_implicit_note(
+    role: &str,
+    superuser: bool,
+    owns: usize,
+    database: &str,
+) -> Option<String> {
+    // A superuser's sentence subsumes both of the others: it already holds every
+    // privilege on everything, so counting what it owns adds nothing.
+    if superuser {
+        return Some(
+            "This role is a SUPERUSER: it bypasses every permission check, so it holds every \
+             privilege on every object whether or not anything below says so."
+                .to_string(),
+        );
+    }
+    let mut out: Vec<String> = Vec::new();
+    if is_pg_predefined(role) {
+        out.push(format!(
+            "{role} is one of PostgreSQL's predefined roles: what it can do is built into the \
+             server rather than granted, so it is recorded in no catalogue this reads."
+        ));
+    }
+    if owns > 0 {
+        out.push(format!(
+            "This role owns {owns} object{s} in {database} (schemas, tables, sequences or the \
+             database itself). An owner holds every privilege on what it owns, and PostgreSQL \
+             records no grant for that, so none of it is listed below.",
+            s = if owns == 1 { "" } else { "s" },
+        ));
+    }
+    (!out.is_empty()).then(|| out.join(" "))
+}
+
+/// Is this one of PostgreSQL's own `pg_*` roles?
+///
+/// The same prefix test `pg::roles` uses to keep them out of a *grantable* role
+/// list — a prefix comparison, with no escaping to depend on. They are kept in
+/// the account browser deliberately, because "why can this account read that" is
+/// the question it exists to answer, which is exactly why their powers have to
+/// be accounted for.
+pub fn is_pg_predefined(role: &str) -> bool {
+    role.starts_with("pg_")
 }
 
 /// The same sentence for a connection with **no database selected**.
@@ -664,12 +778,16 @@ pub fn pg_scope_note(database: &str) -> String {
 /// at — under no note at all. A list that names `public.users` while the user is
 /// thinking about another database is worse than a list that stops short and
 /// says why.
-pub fn pg_no_database_note() -> String {
-    "Schema, table and sequence privileges are not listed: PostgreSQL keeps them in each \
-     database's own catalogue, and this connection has no database selected. Open a query tab \
-     on a database to see them. Privileges held through role membership or granted to PUBLIC \
-     are not expanded."
-        .to_string()
+pub fn pg_no_database_note(extra: Option<&str>) -> String {
+    let base = "Schema, table and sequence privileges are not listed: PostgreSQL keeps them in \
+         each database's own catalogue, and this connection has no database selected. Open a \
+         query tab on a database to see them. Privileges held through role membership or granted \
+         to PUBLIC are not expanded, and neither are the privileges a role holds by owning an \
+         object or by being a superuser.";
+    match extra {
+        Some(e) => format!("{e} {base}"),
+        None => base.to_string(),
+    }
 }
 
 /// Strip password material out of a grant statement.
@@ -1790,16 +1908,98 @@ mod tests {
 
     #[test]
     fn the_postgres_note_names_the_database_it_is_limited_to() {
-        assert!(pg_scope_note("warehouse").contains("warehouse"));
+        assert!(pg_scope_note("warehouse", None).contains("warehouse"));
     }
 
     /// The two notes have to say *different* things, because the lists behind
     /// them are different: one covers a database, the other covers none.
     #[test]
     fn the_no_database_note_does_not_claim_to_cover_one() {
-        let n = pg_no_database_note();
+        let n = pg_no_database_note(None);
         assert!(n.contains("not listed"), "{n}");
-        assert_ne!(n, pg_scope_note("postgres"));
+        assert_ne!(n, pg_scope_note("postgres", None));
+    }
+
+    /// **The note has to enumerate what the read cannot see, or it certifies a
+    /// wrong answer as complete.** `aclexplode` reads explicit entries only, so
+    /// ownership, superuser and a `pg_*` role's wired-in powers leave nothing
+    /// for it to find — and clicking `pg_read_all_data` printed "This account
+    /// holds no privileges."
+    #[test]
+    fn the_postgres_note_admits_the_privileges_no_acl_entry_records() {
+        for n in [pg_scope_note("warehouse", None), pg_no_database_note(None)] {
+            assert!(n.contains("owning an object"), "{n}");
+            assert!(n.contains("superuser"), "{n}");
+            assert!(n.contains("role membership"), "{n}");
+        }
+    }
+
+    /// And when the read *can* say which of them applies, it leads with it: the
+    /// superuser sentence changes how everything below it should be read.
+    #[test]
+    fn a_superusers_note_says_so_before_it_says_anything_else() {
+        let su =
+            pg_implicit_note("root", true, 0, "warehouse").expect("a superuser has something say");
+        assert!(su.contains("SUPERUSER"), "{su}");
+        assert!(pg_scope_note("warehouse", Some(&su)).starts_with(&su));
+
+        // Ownership is counted, and named with the database it was counted in —
+        // the count is per-database for the same reason the ACL read is.
+        let owns = pg_implicit_note("app", false, 14, "warehouse").expect("an owner does too");
+        assert!(owns.contains("14"), "{owns}");
+        assert!(owns.contains("warehouse"), "{owns}");
+        assert!(pg_implicit_note("app", false, 1, "w").is_some_and(|s| s.contains("1 object in")));
+
+        // A role that is neither adds no sentence, rather than a sentence
+        // saying it owns nothing — the note is already long.
+        assert_eq!(pg_implicit_note("app", false, 0, "warehouse"), None);
+        // A superuser's sentence wins over the ownership count: it subsumes it.
+        assert_eq!(
+            pg_implicit_note("root", true, 14, "warehouse"),
+            pg_implicit_note("root", true, 0, "warehouse")
+        );
+    }
+
+    /// **The case the finding was reported from.** `pg_read_all_data` is a
+    /// superuser of nothing and owns nothing, so every ACL query returns empty
+    /// and the pane printed "This account holds no privileges." — about a role
+    /// whose entire purpose is reading every table in the cluster.
+    #[test]
+    fn a_predefined_role_is_not_reported_as_holding_nothing() {
+        let n = pg_implicit_note("pg_read_all_data", false, 0, "warehouse")
+            .expect("a predefined role's powers are recorded nowhere this reads");
+        assert!(n.contains("pg_read_all_data"), "{n}");
+        assert!(n.contains("predefined"), "{n}");
+        // Both, when both apply, in one sentence rather than two notes.
+        let both = pg_implicit_note("pg_monitor", false, 3, "w").expect("both");
+        assert!(both.contains("predefined"), "{both}");
+        assert!(both.contains("3 objects"), "{both}");
+
+        assert!(is_pg_predefined("pg_read_all_data"));
+        assert!(!is_pg_predefined("pgbouncer"));
+        assert!(!is_pg_predefined("app"));
+    }
+
+    /// MySQL's list was shipped with `note: None`, and `SHOW GRANTS` is
+    /// documented on both servers as direct-only — so on a role-provisioned
+    /// server most of what an account can do was missing with nothing saying so.
+    #[test]
+    fn the_mysql_note_admits_that_a_role_is_not_expanded() {
+        let n = my_scope_note();
+        assert!(n.contains("role"), "{n}");
+        assert!(n.contains("directly"), "{n}");
+    }
+
+    /// The account list's own note, for the rung where every wider read was
+    /// refused. It has to say the list is *not* the server's — a footer reading
+    /// "1 account" is otherwise indistinguishable from a server that has one.
+    #[test]
+    fn the_restricted_account_list_says_it_is_not_the_servers() {
+        let n = my_own_account_only_note();
+        assert!(n.contains("mysql.user"), "{n}");
+        assert!(n.contains("not the server's account list"), "{n}");
+        // A complete list carries none, so the note's presence is the signal.
+        assert_eq!(Principals::complete(Vec::new()).note, None);
     }
 
     // ── the levels and their privileges ──────────────────────────────────────

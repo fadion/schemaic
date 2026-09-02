@@ -1698,7 +1698,7 @@ impl Db {
     /// `match` below picks a *catalogue*, and a fourth engine added to [`Engine`]
     /// should stop here with one honest sentence rather than fall through to
     /// `mysql.user` and fail a lookup deep inside a driver.
-    pub async fn fetch_principals(&self) -> Result<Vec<Principal>, DbError> {
+    pub async fn fetch_principals(&self) -> Result<users::Principals, DbError> {
         if !users::supports_users(self.engine.dialect()) {
             return Err(DbError::Query(NO_USERS_MSG.to_string()));
         }
@@ -1753,9 +1753,13 @@ impl Db {
             })
             .await
             .map_err(|e| DbError::Query(e.to_string()))
+            // **A note, not `None`.** `SHOW GRANTS` is direct-only on both
+            // servers, so everything the account holds through a granted role is
+            // absent from this list — and on a role-provisioned server that is
+            // most of it. See `users::my_scope_note`.
             .map(|statements| Grants {
                 statements,
-                note: None,
+                note: Some(users::my_scope_note()),
             });
         let _ = conn.disconnect().await;
         out
@@ -1817,15 +1821,19 @@ type MyUserTuple = (
 /// would be cheaper: `SELECT @@version` is itself a round-trip, and it answers
 /// the wrong question — what matters is which columns this build of `mysql.user`
 /// has, not what it calls itself.
-async fn collect_my_users(conn: &mut Conn) -> Result<Vec<Principal>, DbError> {
+async fn collect_my_users(conn: &mut Conn) -> Result<users::Principals, DbError> {
     if let Ok(rows) = conn
         .query_map(MY_USERS_MARIADB_SQL, |r: MyUserTuple| r)
         .await
     {
-        return Ok(users::from_mysql_rows(&my_user_rows(rows, true)));
+        return Ok(users::Principals::complete(users::from_mysql_rows(
+            &my_user_rows(rows, true),
+        )));
     }
     if let Ok(rows) = conn.query_map(MY_USERS_MYSQL_SQL, |r: MyUserTuple| r).await {
-        return Ok(users::from_mysql_rows(&my_user_rows(rows, false)));
+        return Ok(users::Principals::complete(users::from_mysql_rows(
+            &my_user_rows(rows, false),
+        )));
     }
     if let Ok(rows) = conn
         .query_map(MY_USERS_PLAIN_SQL, |(u, h): (String, String)| MyUserRow {
@@ -1835,7 +1843,7 @@ async fn collect_my_users(conn: &mut Conn) -> Result<Vec<Principal>, DbError> {
         })
         .await
     {
-        return Ok(users::from_mysql_rows(&rows));
+        return Ok(users::Principals::complete(users::from_mysql_rows(&rows)));
     }
     // The one whose failure the caller sees, because by here every wider read
     // has already been refused and this error is the reason why.
@@ -1854,7 +1862,16 @@ async fn collect_my_users(conn: &mut Conn) -> Result<Vec<Principal>, DbError> {
             ..Default::default()
         })
         .collect();
-    Ok(users::from_mysql_rows(&rows))
+    // **Reaching here is news, and the list has to say so.** Every wider read
+    // was refused, so what follows is this connection's own row and nothing
+    // else — which renders identically to a server that genuinely has one
+    // account. The three `if let Ok` above discard their errors deliberately
+    // (a denied read is the expected case, not a failure), and that is exactly
+    // why the *absence* has to be carried out rather than inferred from a count.
+    Ok(users::Principals {
+        list: users::from_mysql_rows(&rows),
+        note: Some(users::my_own_account_only_note()),
+    })
 }
 
 /// Slot the fifth column into whichever field this server's spelling meant it

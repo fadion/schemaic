@@ -1399,6 +1399,29 @@ fn duration_hms(days: f64) -> String {
     format!("{sign}{h}:{m:02}:{s:02}")
 }
 
+/// Is this field one of Excel's own formula-error spellings?
+///
+/// The closed set the format defines, matched exactly — `#N/A` and its siblings
+/// are not values a sheet can otherwise produce, and [`cell_text`] writes them
+/// with `Display`, which is Excel's spelling rather than calamine's variant
+/// name. Case-sensitive and whole-field, so a `VARCHAR` holding the sentence
+/// "check the #REF! column" is text, which it is.
+fn is_worksheet_error(text: &str) -> bool {
+    matches!(
+        text,
+        "#DIV/0!"
+            | "#N/A"
+            | "#NAME?"
+            | "#NULL!"
+            | "#NUM!"
+            | "#REF!"
+            | "#VALUE!"
+            | "#GETTING_DATA"
+            | "#SPILL!"
+            | "#CALC!"
+    )
+}
+
 /// One worksheet cell as the text an import coerces, or `None` for a cell that
 /// holds nothing.
 ///
@@ -1419,31 +1442,8 @@ fn duration_hms(days: f64) -> String {
 ///   the 3600× trap lives.
 /// - A **formula error** becomes Excel's own spelling of it (`#REF!`,
 ///   `#DIV/0!`) rather than a null: it is a cell the sheet itself could not
-///   evaluate, and passing it on surfaces as a coercion [`Issue`] naming the
-///   row, where a silent null would not.
-/// Is this field one of Excel's own formula-error spellings?
-///
-/// The closed set the format defines, matched exactly — `#N/A` and its siblings
-/// are not values a sheet can otherwise produce, and `cell_text` writes them
-/// with `Display`, which is Excel's spelling rather than calamine's variant
-/// name. Case-sensitive and whole-field, so a `VARCHAR` holding the sentence
-/// "check the #REF! column" is text, which it is.
-fn is_worksheet_error(text: &str) -> bool {
-    matches!(
-        text,
-        "#DIV/0!"
-            | "#N/A"
-            | "#NAME?"
-            | "#NULL!"
-            | "#NUM!"
-            | "#REF!"
-            | "#VALUE!"
-            | "#GETTING_DATA"
-            | "#SPILL!"
-            | "#CALC!"
-    )
-}
-
+///   evaluate, and [`is_worksheet_error`] is what turns that into an
+///   [`IssueKind::CellError`] naming the row, where a silent null would not.
 fn cell_text(c: &calamine::Data) -> Field {
     use calamine::Data;
     match c {

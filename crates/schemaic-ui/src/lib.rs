@@ -3461,7 +3461,12 @@ pub enum UsersState {
     /// The fetch is in flight (the state the browser opens in).
     #[default]
     Loading,
-    Loaded(Vec<schemaic_core::users::Principal>),
+    /// The accounts, **and what the list does not cover** — see
+    /// [`schemaic_core::users::Principals::note`]. It was a bare `Vec`, and an
+    /// application account with no `SELECT` on `mysql` browsed a list of exactly
+    /// itself under a footer reading "1 account", indistinguishable from a
+    /// server that has one.
+    Loaded(schemaic_core::users::Principals),
     /// This engine has no accounts at all
     /// ([`schemaic_core::users::supports_users`]) — SQLite. Distinct from an
     /// empty `Loaded`, which would read as "a server with no users".

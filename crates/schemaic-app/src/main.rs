@@ -6809,7 +6809,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let want = target.clone();
             let report = create_ext_action(
                 cx,
-                move |res: Result<Vec<schemaic_core::users::Principal>, String>| {
+                move |res: Result<schemaic_core::users::Principals, String>| {
                     // The browser has since closed, or reopened on another
                     // server: this answer is about neither.
                     if users.with_untracked(|t| t.as_ref() != Some(&want)) {
