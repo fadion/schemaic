@@ -98,6 +98,21 @@ impl CliSeal {
     };
 }
 
+/// Read [`CliSeal`] out of a whole `claude --help` **probe** — what it exited
+/// with, and what it printed on each stream.
+///
+/// The status is half the answer and the caller must not decide it alone: a
+/// `--help` that fails loudly still prints something, and that something is a
+/// diagnostic, not a help text. `--help` itself goes to stdout; stderr is kept
+/// as a fallback for a CLI that prints its usage there, so a readable answer is
+/// not mistaken for none.
+pub fn seal_from_probe(exit_ok: bool, stdout: &str, stderr: &str) -> CliSeal {
+    if !exit_ok {
+        return CliSeal::ALL;
+    }
+    seal_from_help(&format!("{stdout}{stderr}"))
+}
+
 /// Read [`CliSeal`] out of a `claude --help`.
 ///
 /// **An unreadable answer is not evidence of absence.** Empty or unrecognisable
@@ -108,8 +123,15 @@ impl CliSeal {
 /// on screen to say so, which is exactly the failure this whole change exists to
 /// close. Only a help text we actually read, that actually lacks the flag, drops
 /// it.
+///
+/// **"Read" is a positive test, not `!is_empty()`.** Emptiness was the only
+/// unreadable case, and a probe that catches a diagnostic instead of help —
+/// an npm shim whose `node` is missing, a one-line usage from a wrapper, an
+/// auth wall — is non-empty, mentions none of the three flags, and was read as
+/// their absence. So the text has to look like help first: see
+/// [`looks_like_help`].
 pub fn seal_from_help(help: &str) -> CliSeal {
-    if help.trim().is_empty() {
+    if !looks_like_help(help) {
         return CliSeal::ALL;
     }
     CliSeal {
@@ -117,6 +139,18 @@ pub fn seal_from_help(help: &str) -> CliSeal {
         setting_sources: mentions_flag(help, "--setting-sources"),
         strict_mcp_config: mentions_flag(help, "--strict-mcp-config"),
     }
+}
+
+/// Is this a help text at all, or something else the probe caught?
+///
+/// It has to document at least one flag that every build of the CLI has always
+/// had. Deliberately *not* the three sealing flags — their absence is the
+/// answer this function is qualifying, so testing for them would make the gate
+/// circular and it could never seal.
+fn looks_like_help(help: &str) -> bool {
+    ["--help", "--print", "--model", "--version"]
+        .iter()
+        .any(|f| mentions_flag(help, f))
 }
 
 /// Does `help` list exactly this flag — not one that merely starts with it?
@@ -778,6 +812,12 @@ mod tests {
     /// the binary Schemaic actually spawns. The near-miss names are real: the CLI
     /// lists two spellings of each tool-list flag on one line, and mentions
     /// `--tools` inside another flag's prose.
+    ///
+    /// The `-h, --help` line is part of the capture and is **load-bearing**, not
+    /// padding: it is one of the always-present flags `looks_like_help` requires
+    /// before it will read an absence as an absence. An excerpt that drops it is
+    /// not a help text as far as the parser is concerned — which is the whole
+    /// point of that gate, so the fixtures carry it.
     const HELP: &str = "\
   --allowedTools, --allowed-tools <tools...>
   --disallowedTools, --disallowed-tools <tools...>
@@ -785,7 +825,8 @@ mod tests {
   --setting-sources <sources>           Comma-separated list of setting sources
   --settings <file-or-json>             Path to a settings JSON file or a JSON
   --strict-mcp-config                   Only use MCP servers from --mcp-config,
-  --tools <tools...>                    Specify the list of available tools from";
+  --tools <tools...>                    Specify the list of available tools from
+  -h, --help                            Display help for command";
 
     #[test]
     fn a_current_cli_advertises_every_sealing_flag() {
@@ -807,7 +848,8 @@ mod tests {
   --allowedTools, --allowed-tools <tools...>
   --disallowedTools, --disallowed-tools <tools...>
   --settings <file-or-json>             Path to a settings JSON file or a JSON
-  --mcp-config <configs...>             Load MCP servers from a JSON file";
+  --mcp-config <configs...>             Load MCP servers from a JSON file
+  -h, --help                            Display help for command";
         assert_eq!(seal_from_help(old), CliSeal::NONE);
     }
 
@@ -827,13 +869,15 @@ mod tests {
         let collides = "\
   --toolsmith <name>                    A longer name with ours as its prefix
   --setting-sources-file <path>         Another, extended by a dash
-  --mcp-config <configs...>             Load MCP servers from a JSON file";
+  --mcp-config <configs...>             Load MCP servers from a JSON file
+  -h, --help                            Display help for command";
         assert_eq!(seal_from_help(collides), CliSeal::NONE);
     }
 
     #[test]
     fn each_flag_is_read_on_its_own() {
-        let only_strict = "  --strict-mcp-config    Only use MCP servers from --mcp-config";
+        let only_strict = "  --strict-mcp-config    Only use MCP servers from --mcp-config\n  \
+                           -h, --help             Display help for command";
         assert_eq!(
             seal_from_help(only_strict),
             CliSeal {
@@ -851,6 +895,54 @@ mod tests {
         for help in ["", "   \n\t "] {
             assert_eq!(seal_from_help(help), CliSeal::ALL, "{help:?}");
         }
+    }
+
+    /// **Non-empty is not the same as read.** Each of these is what the probe
+    /// actually catches when the spawn *succeeds* and the answer is not help: an
+    /// npm `claude.cmd` shim whose `node` is missing, a wrapper's one-line
+    /// usage, an auth wall. Emptiness was the only unreadable case, so all three
+    /// were read as "this CLI lacks all three flags" and the session ran with no
+    /// `--strict-mcp-config` and no `--setting-sources user` — the two with no
+    /// backstop behind them.
+    #[test]
+    fn a_diagnostic_is_not_a_help_text_and_seals_too() {
+        for probe in [
+            "'node' is not recognized as an internal or external command,\r\n\
+             operable program or batch file.\r\n",
+            "Usage: claude [options] [command] [prompt]",
+            "Invalid API key · Please run /login",
+            "Error: connect ECONNREFUSED 127.0.0.1:443",
+        ] {
+            assert_eq!(seal_from_help(probe), CliSeal::ALL, "{probe:?}");
+        }
+    }
+
+    /// The other side of that gate: a real help text that genuinely lacks the
+    /// three flags must still drop them, or the probe stops answering anything.
+    #[test]
+    fn a_help_text_that_lacks_a_flag_still_drops_it() {
+        let old = "Usage: claude [options] [command] [prompt]\n\
+                   Options:\n  \
+                     -p, --print            Print response and exit\n  \
+                     --model <model>        Model for the session\n  \
+                     -h, --help             Display help for command\n";
+        assert_eq!(seal_from_help(old), CliSeal::NONE);
+    }
+
+    /// The exit status is part of the answer, and `claude_seal` was holding it
+    /// and throwing it away: a `--help` that fails loudly is not a help text,
+    /// whatever it managed to print first.
+    #[test]
+    fn a_loudly_failing_probe_seals_whatever_it_printed() {
+        let help = "  --tools <t>\n  --setting-sources <s>\n  --strict-mcp-config\n  -h, --help\n";
+        assert_eq!(seal_from_probe(true, help, ""), CliSeal::ALL);
+        assert_eq!(seal_from_probe(false, help, ""), CliSeal::ALL);
+        // … and stderr stays a fallback for a CLI that prints its usage there,
+        // so a readable answer is not mistaken for none.
+        assert_eq!(seal_from_probe(true, "", help), CliSeal::ALL);
+        let old = "Usage: claude\n  -p, --print   Print response and exit\n";
+        assert_eq!(seal_from_probe(true, old, ""), CliSeal::NONE);
+        assert_eq!(seal_from_probe(false, old, ""), CliSeal::ALL);
     }
 
     /// The whole point of the probe: an old CLI gets a spawnable command line,
