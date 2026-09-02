@@ -3853,6 +3853,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   a capability instead of comparing a dialect. **MariaDB is a leg of its own**, not a MySQL
   stand-in: the divergences are in exactly what this crate reads, which is how a MySQL 8
   `CHECK_CLAUSE` escaping quirk once hid behind a MariaDB that returned runnable text.
+  **`endpoint.rs` is where a leg comes from**, and it is the whole environment contract: three
+  `SCHEMAIC_IT_<ENGINE>_HOST`/`_PORT`/`_USER`/`_PASSWORD` groups with localhost defaults, plus
+  `SCHEMAIC_IT_ENGINES` as the one way to run fewer than all three. An *unreachable* endpoint is a
+  hard failure rather than a skip — a tier that green-lights by not running is the failure mode
+  this whole directory exists to avoid — so narrowing it costs a developer a deliberate sentence
+  (`SCHEMAIC_IT_ENGINES=mariadb,pg`), and CI refuses that variable outright.
   **The type matrix (`cases.rs`) is what the tier is for.** A value's journey from a column to a
   cell is decided by the driver, the wire protocol and this crate's decoding together, and `core`'s
   tests can only assert what `Value` does with text it is *given*. Each case is a column type, a
@@ -5380,8 +5386,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     it (`a_riskless_change_still_asks_something`).
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
     nav).
-    **A right-click on the tree's empty space raises its own menu** — `Users and privileges`,
-    `Refresh` and `Create database`, all three about the *panel* rather than about anything in it,
+    **A right-click on the tree's empty space raises its own menu** — `Refresh`,
+    `Users and privileges` and `Create database`, all three about the *panel* rather than about
+    anything in it,
     because nothing in it was clicked. It hangs off the tree's own box with no hit test of its own:
     every row raises its
     menu with `on_secondary_click_stop`, so what reaches this handler is exactly a click that
