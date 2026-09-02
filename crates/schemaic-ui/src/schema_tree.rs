@@ -706,13 +706,16 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
 /// it.
 ///
 /// **Three entries, and every one of them is about the panel rather than about
-/// anything in it**, because nothing in it was clicked. `Create database` is the
-/// third home of that action (the SCHEMA gear and the tree's `Create ▸` submenu
-/// are the other two) and the one people reach for first, since right-clicking
-/// empty space is what every file manager trains; `Users and privileges` is here
-/// for the same reason and is the gear's neighbour there too; `Refresh` is the
-/// same whole-tree refresh the gear offers, and it is here because a connection
-/// showing nothing is exactly when you want it and has no row to right-click.
+/// anything in it**, because nothing in it was clicked. `Refresh` leads: it is
+/// the same whole-tree refresh the gear offers, it is here because a connection
+/// showing nothing is exactly when you want it and has no row to right-click,
+/// and it is both the entry this menu is opened for most often and the only one
+/// that costs nothing — so it is the one that should be under the cursor.
+/// `Create database` is the third home of that action (the SCHEMA gear and the
+/// tree's `Create ▸` submenu are the other two) and the one people reach for
+/// first, since right-clicking empty space is what every file manager trains;
+/// `Users and privileges` is here for the same reason and is the gear's
+/// neighbour there too.
 ///
 /// Empty on SQLite, which has neither a database to create nor an account to
 /// browse — and then the handler raises nothing at all, rather than a menu whose
@@ -835,17 +838,6 @@ pub(crate) fn blank_space_entries(
     // drift `8a85fa1` was written about. `blank_space_is_a_subsequence_of_the_
     // skeleton` below is this menu's half of that gate.
     let mut out = Vec::new();
-    if users {
-        // Group 2, and **before** Refresh, which the skeleton says closes the
-        // group. Dimmed on a down connection like every other entry here, but
-        // **not** on a read-only one: browsing accounts writes nothing, and the
-        // write actions inside the browser gate themselves.
-        out.push(BlankEntry {
-            label: "Users and privileges",
-            kind: BlankKind::Users,
-            disabled: down,
-        });
-    }
     // Never dimmed: re-reading the schema is a read, and a read-only
     // connection is the one most worth re-reading.
     out.push(BlankEntry {
@@ -853,6 +845,25 @@ pub(crate) fn blank_space_entries(
         kind: BlankKind::Refresh,
         disabled: false,
     });
+    if users {
+        // Group 2, and **after** Refresh rather than before it, where the
+        // skeleton's wording says the group closes with Refresh. Same kind of
+        // deviation as the two recorded at `overlays::menu_order_gate::group`
+        // for the context menus, and tolerated for the same reason: it stays
+        // inside the group, so the cross-group rule is untouched and the read
+        // entry is still above the writing one. What moves is only which of the
+        // two reads is under the cursor, and Refresh is both what this menu is
+        // opened for most often and the only entry in it that costs nothing.
+        //
+        // Dimmed on a down connection like the write entry below, but **not** on
+        // a read-only one: browsing accounts writes nothing, and the write
+        // actions inside the browser gate themselves.
+        out.push(BlankEntry {
+            label: "Users and privileges",
+            kind: BlankKind::Users,
+            disabled: down,
+        });
+    }
     if databases {
         out.push(BlankEntry {
             label: "Create database",
@@ -3608,11 +3619,11 @@ mod tests {
     /// render one thing and do another, and a labels-only assertion is exactly
     /// what would not notice.
     #[test]
-    fn blank_space_offers_accounts_refresh_and_create() {
+    fn blank_space_offers_refresh_accounts_and_create() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(
                 blank_labels(d, false),
-                ["Users and privileges", "Refresh", "Create database"],
+                ["Refresh", "Users and privileges", "Create database"],
                 "{d:?}"
             );
             let kinds: Vec<BlankKind> = blank_space_entries(d, false, true, false)
@@ -3622,8 +3633,8 @@ mod tests {
             assert_eq!(
                 kinds,
                 [
-                    BlankKind::Users,
                     BlankKind::Refresh,
+                    BlankKind::Users,
                     BlankKind::CreateDatabase
                 ],
                 "{d:?}"
@@ -3664,7 +3675,7 @@ mod tests {
         // connection that is down, which this cannot see and must not punish.
         assert_eq!(
             labels(&blank_space_entries(SqlDialect::MySql, false, true, false)),
-            vec!["Users and privileges", "Refresh", "Create database"]
+            vec!["Refresh", "Users and privileges", "Create database"]
         );
     }
 
