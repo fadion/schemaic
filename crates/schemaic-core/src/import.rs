@@ -779,11 +779,12 @@ pub fn read_sample<R: std::io::Read>(
     cfg: &ReadConfig,
     limit: usize,
 ) -> Result<Sample, ImportError> {
-    // **Not** byte-bounded for Excel: an `.xlsx` is a ZIP whose directory is at
-    // the end of the file, so a truncated prefix does not open at all — the cap
-    // would turn "preview a 9 MB workbook" into "this file is corrupt". See
+    // Not bounded at `SAMPLE_MAX_BYTES` for Excel: an `.xlsx` is a ZIP whose
+    // directory is at the end of the file, so a truncated prefix does not open
+    // at all — that cap would turn "preview a 9 MB workbook" into "this file is
+    // corrupt". It is bounded at `XLSX_MAX_BYTES` instead, inside
     // [`open_xlsx`]; the disclosure for reading it whole is
-    // [`xlsx_memory_warning`].
+    // [`xlsx_memory_warning`], and the *rows* are streamed either way.
     if format == ImportFormat::Xlsx {
         return read_xlsx_sample(r, cfg, limit);
     }
@@ -1087,13 +1088,7 @@ pub fn xlsx_size_refusal(format: ImportFormat, file_bytes: u64) -> Option<String
     if format != ImportFormat::Xlsx || file_bytes <= XLSX_MAX_BYTES {
         return None;
     }
-    Some(format!(
-        "This workbook is {}, and an Excel file has to be read whole before any \
-         of it can be shown — {} is the most this can open. Export the sheet as \
-         CSV and import that instead; a CSV loads in constant memory.",
-        crate::format::human_bytes(file_bytes as i64),
-        crate::format::human_bytes(XLSX_MAX_BYTES as i64)
-    ))
+    Some(oversize_workbook(Some(file_bytes)))
 }
 
 /// The Excel preview **and** the workbook's sheet names, from one read of the
@@ -1135,14 +1130,48 @@ pub fn read_workbook_sample<R: std::io::Read>(
 /// format (see [`read_sample`]) and makes an Excel import memory-bound like
 /// JSON's rather than streamed like CSV's; [`xlsx_memory_warning`] is the
 /// disclosure of that.
+/// **The ceiling is enforced here, not only where the file is picked.**
+/// [`xlsx_size_refusal`] answers from the size on disk so the app can refuse
+/// without opening anything, but that is a step a *launcher* has to remember —
+/// and only the probe did. The two load-path opens went straight to
+/// `read_to_end`. Reading through a `take` makes the bound a property of the
+/// reader every path shares; the launcher's check survives because it can say
+/// so before the file is touched, and because it names the size.
 fn open_xlsx<R: std::io::Read>(
     r: R,
 ) -> Result<calamine::Xlsx<std::io::Cursor<Vec<u8>>>, ImportError> {
     use calamine::Reader;
     let mut bytes = Vec::new();
-    let mut r = r;
+    // One byte past the ceiling, so "exactly at it" and "over it" are
+    // distinguishable without reading the rest.
+    let mut r = std::io::Read::take(r, XLSX_MAX_BYTES + 1);
     std::io::Read::read_to_end(&mut r, &mut bytes).map_err(|e| ImportError::Read(e.to_string()))?;
+    if bytes.len() as u64 > XLSX_MAX_BYTES {
+        return Err(ImportError::Read(oversize_workbook(None)));
+    }
     calamine::Xlsx::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Read(e.to_string()))
+}
+
+/// The refusal for a workbook past [`XLSX_MAX_BYTES`], with the size named when
+/// the caller knows it.
+///
+/// One sentence, two callers: [`xlsx_size_refusal`], which is asked before the
+/// file is opened and can say how big it is, and [`open_xlsx`], which is reading
+/// through a cap and only knows it was exceeded.
+fn oversize_workbook(file_bytes: Option<u64>) -> String {
+    let size = match file_bytes {
+        Some(n) => format!("This workbook is {}", crate::format::human_bytes(n as i64)),
+        None => format!(
+            "This workbook is over {}",
+            crate::format::human_bytes(XLSX_MAX_BYTES as i64)
+        ),
+    };
+    format!(
+        "{size}, and an Excel file has to be read whole before any of it can be \
+         shown — {} is the most this can open. Export the sheet as CSV and \
+         import that instead; a CSV loads in constant memory.",
+        crate::format::human_bytes(XLSX_MAX_BYTES as i64)
+    )
 }
 
 /// Walk one worksheet's rows as [`Field`]s, the way [`json_records`] walks a
@@ -1192,7 +1221,6 @@ fn xlsx_rows(
     limit: usize,
     mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
 ) -> Result<bool, ImportError> {
-    use calamine::Reader;
     let name = match &cfg.sheet {
         // Not a fall back to the first sheet: a workbook the user edited between
         // the preview and the load would then import a different table than the
@@ -1211,27 +1239,46 @@ fn xlsx_rows(
             .cloned()
             .ok_or_else(|| ImportError::Read("this workbook has no sheets".into()))?,
     };
-    let range = wb
-        .worksheet_range(&name)
+    let mut cells = wb
+        .worksheet_cells_reader(&name)
         .map_err(|e| ImportError::Read(e.to_string()))?;
+    let dims = cells.dimensions();
+    let width = sheet_width(dims)?;
+    // The used range's own left edge. A sheet with a title block starts partway
+    // across, and its first data column is the row's column 0 — the same
+    // correction `range.start()` used to make, and the reason a cell is placed
+    // relative to this rather than at its absolute column.
+    let left = dims.start.1;
 
-    let width = range.width();
-    // The used range's own origin, so every row below carries the number Excel
-    // shows rather than its offset within the range. `(0, 0)` for an empty
-    // sheet, which has no rows to number anyway.
-    let (top, _) = range.start().unwrap_or((0, 0));
-    let mut rows = range
-        .rows()
-        .enumerate()
-        .map(|(n, row)| (u64::from(top) + n as u64 + 1, row));
-    // `width` is the used range's, so every row is already this wide — a header
-    // shorter than the data still yields a name per column, which is what keeps
-    // the field count uniform and makes a real count mismatch meaningful.
-    if cfg.dialect.has_header {
-        match rows.next() {
-            Some((_, head)) => {
-                for (i, c) in head.iter().enumerate() {
-                    let name = cell_text(c).unwrap_or_default();
+    // Records emitted so far. Not the row's index: a skipped blank row advances
+    // one and not the other, which is the whole reason the two are separate.
+    let mut seen = 0usize;
+    let mut took_header = !cfg.dialect.has_header;
+    if !cfg.dialect.has_header {
+        columns.extend((1..=width).map(|i| format!("Column {i}")));
+    }
+    // One row at a time. Cells arrive in sheet order and an empty cell is not
+    // emitted at all, so a row is complete when a cell for a later row shows up
+    // — and a *wholly* empty row never appears, which is exactly the rule the
+    // doc above states, arrived at for free instead of by a filter.
+    let mut row: Vec<Option<String>> = vec![None; width];
+    let mut at: Option<u32> = None;
+    loop {
+        let cell = cells
+            .next_cell()
+            .map_err(|e| ImportError::Read(e.to_string()))?;
+        let finished = match &cell {
+            Some(c) => at.is_some_and(|r| r != c.get_position().0),
+            None => at.is_some(),
+        };
+        if finished {
+            // `at` is 0-based within the sheet, so the number Excel shows in its
+            // margin — the equivalent of a CSV's line number — is one more.
+            let line = u64::from(at.take().unwrap_or(0)) + 1;
+            let full = std::mem::replace(&mut row, vec![None; width]);
+            if !took_header {
+                for (i, c) in full.into_iter().enumerate() {
+                    let name = c.unwrap_or_default();
                     let name = if cfg.trim { name.trim() } else { &name[..] };
                     columns.push(if name.is_empty() {
                         format!("Column {}", i + 1)
@@ -1239,40 +1286,75 @@ fn xlsx_rows(
                         name.to_string()
                     });
                 }
+                took_header = true;
+            } else {
+                // Asked *after* a whole row has been assembled, so a sheet
+                // padded with empty rows past its data does not report there is
+                // more to read.
+                if seen >= limit {
+                    return Ok(true);
+                }
+                seen += 1;
+                if !on_record(full, line) {
+                    return Ok(false);
+                }
             }
-            // An empty sheet: no header to take, and no rows to emit.
-            None => return Ok(false),
         }
-    } else {
-        columns.extend((1..=width).map(|i| format!("Column {i}")));
-    }
-
-    // Records emitted so far. Not the row's index: a skipped blank row advances
-    // one and not the other, which is the whole reason the two are separate.
-    let mut seen = 0usize;
-    for (line, row) in rows {
-        if row.iter().all(|c| matches!(c, calamine::Data::Empty)) {
+        let Some(c) = cell else { break };
+        let (r, col) = c.get_position();
+        at = Some(r);
+        let Some(text) = cell_text(&c.get_value().clone().into()) else {
             continue;
-        }
-        // Asked *after* the blank check, so a sheet padded with empty rows past
-        // its data does not report there is more to read.
-        if seen >= limit {
-            return Ok(true);
-        }
-        seen += 1;
-        let fields = row
-            .iter()
-            .map(|c| {
-                let t = cell_text(c)?;
-                Some(if cfg.trim { t.trim().to_string() } else { t })
-            })
-            .collect();
-        if !on_record(fields, line) {
-            break;
+        };
+        let text = if cfg.trim {
+            text.trim().to_string()
+        } else {
+            text
+        };
+        // A cell outside the declared range is dropped rather than widening or
+        // shifting the row: every record has to carry the same field count, or
+        // the mismatch report becomes noise on every row after the widest one.
+        if let Some(slot) = col.checked_sub(left).and_then(|i| row.get_mut(i as usize)) {
+            *slot = Some(text);
         }
     }
+    // A sheet with no cells at all: no header to take, and no rows to emit.
     Ok(false)
 }
+
+/// How wide a row of this sheet is, from the extent the sheet **declares**.
+///
+/// **The width is decided before a cell is read, and it is the only unbounded
+/// thing in an Excel import.** The rows are streamed, so a sheet's height costs
+/// nothing to skip past; a row buffer is the one allocation whose size the file
+/// controls, and Excel's own ceiling is 16,384 columns. A workbook claiming more
+/// is refused here rather than believed.
+///
+/// This is what replaced materialising the sheet. `worksheet_range` builds the
+/// **dense** bounding rectangle of every cell present, so a legal 5,461-byte
+/// workbook holding two cells at opposite corners cost 262 MB — 48,099× the file
+/// — and the worst legal sheet 550 GB, which is not an error but
+/// `handle_alloc_error`, i.e. the process. Both size guards measured the file on
+/// disk, which is the wrong quantity in the wrong place: the same call is made
+/// by the preview and by both load-path opens, so a guard the *launcher*
+/// remembers is a guard two of the three do not have.
+fn sheet_width(dims: calamine::Dimensions) -> Result<usize, ImportError> {
+    // A sheet with no `<dimension>` element reads as the degenerate (0,0)-(0,0),
+    // which is also what a one-cell sheet reads as — either way one column is
+    // the right answer, and the header row is what names them.
+    let width = u64::from(dims.end.1.saturating_sub(dims.start.1)) + 1;
+    if width > XLSX_MAX_COLS {
+        return Err(ImportError::Read(format!(
+            "this sheet claims {width} columns; an Excel worksheet holds {XLSX_MAX_COLS}. \
+             Export it as CSV and import that instead."
+        )));
+    }
+    Ok(width as usize)
+}
+
+/// Columns in an Excel worksheet — the ceiling [`sheet_width`] holds a sheet's
+/// claim to.
+pub const XLSX_MAX_COLS: u64 = 16_384;
 
 /// An Excel duration — `days` as the fraction of a day it stores — as
 /// `[-]H:MM:SS`, the form a `TIME` column reads.
@@ -1418,18 +1500,36 @@ pub fn json_memory_warning(format: ImportFormat, file_bytes: u64) -> Option<Stri
 /// How much memory an Excel load needs, as a multiple of the file's size.
 ///
 /// **Larger than JSON's, and the multiplier is against the *compressed* size.**
-/// An `.xlsx` is a ZIP of XML: the sheet's markup is several times the data it
-/// carries and then deflates well, so a 50 MB workbook is a far bigger table
-/// than a 50 MB CSV. This is a deliberately conservative estimate rather than a
-/// measured one — unlike [`JSON_MEMORY_FACTOR`], which came off a counting
-/// allocator — because the ratio depends on how repetitive the sheet's strings
-/// are, and a warning that under-states is worth nothing.
-pub const XLSX_MEMORY_FACTOR: u64 = 25;
+/// **Measured, on the same counting allocator [`JSON_MEMORY_FACTOR`] came off**,
+/// after the reader stopped materialising the sheet. It used to be a guess of
+/// 25× against the compressed size, on the reasoning that an `.xlsx` is a ZIP of
+/// XML whose markup deflates well — which was right about the file and wrong
+/// about what was actually held: the cost was the **dense** `Range` the old
+/// reader built, not the file.
+///
+/// Two shapes, both `read_sample`, `--release`:
+///
+/// | Workbook | File | Peak | Ratio | Preview |
+/// | --- | --- | --- | --- | --- |
+/// | 200 k × 50, mixed number/text (the project's own target) | 32 MB | 64 MB | 2.0× | 21 ms |
+/// | 120 k × 50, every cell a distinct 60-char string | 21 MB | 32 MB | 1.5× | 18 ms |
+///
+/// The ratio is stable because what is held is the file's own bytes plus the
+/// strings of the rows actually read — not the sheet. 4× is that measurement
+/// with headroom for a workbook shaped unlike either, and it is still an
+/// over-estimate rather than an under-one, which is the direction a warning has
+/// to be wrong in.
+pub const XLSX_MEMORY_FACTOR: u64 = 4;
 
-/// Past this file size, [`xlsx_memory_warning`] speaks up. Lower than
-/// [`JSON_WARN_BYTES`] in the same proportion the factor is higher, so both
-/// warnings fire at roughly the same *estimated* footprint.
-pub const XLSX_WARN_BYTES: u64 = 40 * 1024 * 1024;
+/// Past this file size, [`xlsx_memory_warning`] speaks up.
+///
+/// Higher than it was (40 MB), because the thing it was warning about is gone:
+/// at 25× a 40 MB workbook was estimated at 1 GB and measured 1,085 MB, and it
+/// now costs 64 MB. Set where [`JSON_WARN_BYTES`] is set — the point at which
+/// the estimate stops being something a machine absorbs without noticing — and
+/// with the same factor, so the two warnings again fire at the same estimated
+/// footprint.
+pub const XLSX_WARN_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Roughly the peak memory an Excel import of `file_bytes` will need.
 pub fn xlsx_load_estimate(file_bytes: u64) -> u64 {
@@ -3174,6 +3274,86 @@ mod tests {
         // is warned about and still opens.
         assert!(memory_warning(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1).is_some());
         assert!(xlsx_size_refusal(ImportFormat::Xlsx, XLSX_WARN_BYTES + 1).is_none());
+    }
+
+    /// **The ordering this test's neighbour is named for, asked of the thing
+    /// that reads.** `xlsx_size_refusal` is a step the *launcher* takes, and
+    /// only one of the three launchers took it — the two load-path opens went
+    /// straight to `read_to_end`. Asserted by handing the reader more bytes than
+    /// the ceiling and getting a refusal rather than an allocation, which is the
+    /// property, rather than by re-checking the threshold function.
+    #[test]
+    fn the_reader_refuses_an_oversized_workbook_even_when_nobody_asked_first() {
+        // Not a real workbook — it never gets that far, which is the point.
+        let huge = std::io::Read::take(std::io::repeat(b'x'), XLSX_MAX_BYTES + 4096);
+        let err = read_sample(huge, ImportFormat::Xlsx, &xlsx_cfg(true, None), 10)
+            .expect_err("past the ceiling");
+        assert!(err.to_string().contains("CSV"), "{err}");
+        // …and a small non-workbook still fails as a *workbook* problem, so the
+        // cap has not swallowed the ordinary error.
+        let err = read_sample(
+            &b"not a zip"[..],
+            ImportFormat::Xlsx,
+            &xlsx_cfg(true, None),
+            10,
+        )
+        .expect_err("not a workbook");
+        assert!(!err.to_string().contains("CSV"), "{err}");
+    }
+
+    /// **A workbook is streamed, not materialised.** `worksheet_range` builds
+    /// the dense bounding rectangle of every cell present, so this file — two
+    /// cells, opposite corners of a legal sheet, a few kilobytes on disk — asked
+    /// for 17.2 billion `Data` values, about 550 GB. That is not an `Err` but
+    /// `handle_alloc_error`, so the process goes and any unsaved editor text
+    /// with it, at *probe* time: selecting the file is enough.
+    ///
+    /// **If this is ever regressed the failure is an abort, not a red test.**
+    /// There is no assertion that can catch an allocation that kills the
+    /// process, so the test is the reproduction itself: it passes in
+    /// milliseconds against a streaming reader and takes the test binary with it
+    /// against a materialising one.
+    #[test]
+    fn a_sheet_whose_corners_are_far_apart_costs_only_its_cells() {
+        use rust_xlsxwriter::Workbook;
+        let mut wb = Workbook::new();
+        let sheet = wb.add_worksheet();
+        sheet.write_string(0, 0, "id").unwrap();
+        // The last cell of the largest legal worksheet.
+        sheet.write_string(1_048_575, 16_383, "x").unwrap();
+        let bytes = wb.save_to_buffer().unwrap();
+        assert!(bytes.len() < 16 * 1024, "{} bytes", bytes.len());
+
+        let s = read_sample(&bytes[..], ImportFormat::Xlsx, &xlsx_cfg(true, None), 10).unwrap();
+        // One header row and one data row, a million rows apart, and the width
+        // the sheet declares.
+        assert_eq!(s.columns.len(), 16_384);
+        assert_eq!(s.columns[0], "id");
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(s.rows[0][16_383].as_deref(), Some("x"));
+    }
+
+    /// The one thing a sheet's declared extent can still make unbounded: the row
+    /// buffer. Excel's own ceiling is 16,384 columns, so a workbook claiming
+    /// more is refused rather than believed.
+    #[test]
+    fn a_sheet_claiming_more_columns_than_excel_has_is_refused() {
+        use calamine::Dimensions;
+        assert_eq!(sheet_width(Dimensions::default()).unwrap(), 1);
+        assert_eq!(
+            sheet_width(Dimensions::new((0, 0), (9, 3))).unwrap(),
+            4,
+            "inclusive of both edges"
+        );
+        // An offset used range is as wide as it is, not as far right as it ends.
+        assert_eq!(sheet_width(Dimensions::new((4, 2), (9, 5))).unwrap(), 4);
+        assert_eq!(
+            sheet_width(Dimensions::new((0, 0), (0, XLSX_MAX_COLS as u32 - 1))).unwrap(),
+            XLSX_MAX_COLS as usize
+        );
+        let err = sheet_width(Dimensions::new((0, 0), (0, XLSX_MAX_COLS as u32)))
+            .expect_err("past Excel's own ceiling");
+        assert!(err.to_string().contains("CSV"), "{err}");
     }
 
     /// The memory disclosure fires for a big workbook and for nothing else. The
