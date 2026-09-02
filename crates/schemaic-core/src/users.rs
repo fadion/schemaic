@@ -146,7 +146,7 @@ pub fn matches(p: &Principal, needle: &str) -> bool {
     needle.is_empty() || contains_ignore_ascii_case(&p.display(), needle)
 }
 
-/// The indices of `list` that [`matches`] `needle`, in list order.
+/// The indices of `list` that [`matches()`] `needle`, in list order.
 ///
 /// **Indices, and computed once.** The browser's list is virtualised, so the
 /// filter has to be a value the scroll can index rather than a predicate each
