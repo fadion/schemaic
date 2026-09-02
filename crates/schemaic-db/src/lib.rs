@@ -41,6 +41,7 @@ use schemaic_core::schema::{
 };
 use schemaic_core::sql;
 use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats, count_rows_sql};
+use schemaic_core::users::{self, Grants, MyUserRow, Principal};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
@@ -1689,6 +1690,189 @@ impl Db {
         let _ = conn.disconnect().await;
         out
     }
+
+    /// Every account the server will tell us about.
+    ///
+    /// Gated on [`supports_users`](schemaic_core::users::supports_users) for the
+    /// same reason [`Db::fetch_sessions`] is gated on `supports_activity`: the
+    /// `match` below picks a *catalogue*, and a fourth engine added to [`Engine`]
+    /// should stop here with one honest sentence rather than fall through to
+    /// `mysql.user` and fail a lookup deep inside a driver.
+    pub async fn fetch_principals(&self) -> Result<Vec<Principal>, DbError> {
+        if !users::supports_users(self.engine.dialect()) {
+            return Err(DbError::Query(NO_USERS_MSG.to_string()));
+        }
+        match self.engine {
+            Engine::Postgres => return pg::fetch_principals(self).await,
+            Engine::MySql => {}
+            // Unreachable — `supports_users` above is the gate.
+            Engine::Sqlite => return Err(DbError::Query(NO_USERS_MSG.to_string())),
+        }
+        let mut conn = self.open(None, false).await?;
+        let out = collect_my_users(&mut conn).await;
+        let _ = conn.disconnect().await;
+        out
+    }
+
+    /// What one account is allowed to do, as `GRANT` statements.
+    ///
+    /// `database` is the database PostgreSQL's per-database privileges are read
+    /// from — see [`users::pg_scope_note`] for why one connection can only ever
+    /// answer for one — and is ignored on MySQL, whose grant tables are
+    /// server-wide and answer for every database at once.
+    pub async fn fetch_grants(
+        &self,
+        database: Option<&str>,
+        principal: &Principal,
+    ) -> Result<Grants, DbError> {
+        if !users::supports_users(self.engine.dialect()) {
+            return Err(DbError::Query(NO_USERS_MSG.to_string()));
+        }
+        match self.engine {
+            Engine::Postgres => return pg::fetch_grants(self, database, principal).await,
+            Engine::MySql => {}
+            // Unreachable — `supports_users` above is the gate.
+            Engine::Sqlite => return Err(DbError::Query(NO_USERS_MSG.to_string())),
+        }
+        // `SHOW GRANTS FOR` takes an account, not a placeholder, so the pair goes
+        // in as SQL — through `users::account_sql`, which is the one literal
+        // quoting and the reason a host of `it's` cannot end the statement early.
+        let sql = format!(
+            "SHOW GRANTS FOR {}",
+            users::account_sql(principal, SqlDialect::MySql)
+        );
+        let mut conn = self.open(None, false).await?;
+        let out = conn
+            .query_map(sql, |g: String| {
+                // **Every statement out of here is redacted**, at the boundary
+                // rather than in the view: MariaDB answers with the account's
+                // password hash inline, and a second reader of this method — the
+                // grant/revoke step, a copy-all button — would otherwise have to
+                // remember to do it too.
+                users::redact_secrets(&g, SqlDialect::MySql)
+            })
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))
+            .map(|statements| Grants {
+                statements,
+                note: None,
+            });
+        let _ = conn.disconnect().await;
+        out
+    }
+}
+
+/// Why a connection has no accounts to browse. One sentence, one place, so the
+/// two methods that raise it can't drift apart — and, like [`NO_SESSIONS_MSG`],
+/// it names the capability rather than the engine because that is what the
+/// caller asked. The browser checks `supports_users` itself and shows its own
+/// explanation; this is the backstop for a caller that didn't.
+const NO_USERS_MSG: &str = "this connection's engine has no user accounts";
+
+/// `mysql.user`, MariaDB's spelling. `is_role` is the flag that makes a role a
+/// role, and only MariaDB has it.
+const MY_USERS_MARIADB_SQL: &str = "SELECT CAST(User AS CHAR), CAST(Host AS CHAR), \
+            CAST(plugin AS CHAR), CAST(password_expired AS CHAR), CAST(is_role AS CHAR) \
+     FROM mysql.user ORDER BY User, Host";
+
+/// The same, MySQL 8's spelling — `account_locked` in place of `is_role`, which
+/// does not exist there.
+const MY_USERS_MYSQL_SQL: &str = "SELECT CAST(User AS CHAR), CAST(Host AS CHAR), \
+            CAST(plugin AS CHAR), CAST(password_expired AS CHAR), CAST(account_locked AS CHAR) \
+     FROM mysql.user ORDER BY User, Host";
+
+/// The pair alone, for a server that has neither extra column — and for the
+/// version of `mysql.user` a future release trims again.
+const MY_USERS_PLAIN_SQL: &str =
+    "SELECT CAST(User AS CHAR), CAST(Host AS CHAR) FROM mysql.user ORDER BY User, Host";
+
+/// The last resort, and the one an *application* account can actually read.
+///
+/// `mysql.user` needs `SELECT` on the `mysql` database. A connection that hasn't
+/// got it — which is every properly-provisioned application account — can still
+/// read `information_schema.USER_PRIVILEGES`, where it sees its own row. One
+/// account is a poor list, but it is a true one, and it is the account whose
+/// grants the person opening this is most likely asking about.
+const MY_USERS_GRANTEE_SQL: &str =
+    "SELECT DISTINCT GRANTEE FROM information_schema.USER_PRIVILEGES ORDER BY GRANTEE";
+
+/// One `mysql.user` row as the two wide queries project it.
+type MyUserTuple = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The MySQL/MariaDB half of [`Db::fetch_principals`]: four queries, of which
+/// exactly one runs to completion.
+///
+/// **The fallbacks fire on an *error*, not on an empty result** — the same rule
+/// the lock-wait pair in [`collect_sessions`] had to learn. `mysql.user` is never
+/// legitimately empty (the server cannot run without accounts), so an empty
+/// answer would mean the query was denied, and an error is what actually says
+/// so. Trying MariaDB's column first and MySQL's second costs one failed
+/// round-trip on MySQL and none on MariaDB, and there is no version probe that
+/// would be cheaper: `SELECT @@version` is itself a round-trip, and it answers
+/// the wrong question — what matters is which columns this build of `mysql.user`
+/// has, not what it calls itself.
+async fn collect_my_users(conn: &mut Conn) -> Result<Vec<Principal>, DbError> {
+    if let Ok(rows) = conn
+        .query_map(MY_USERS_MARIADB_SQL, |r: MyUserTuple| r)
+        .await
+    {
+        return Ok(users::from_mysql_rows(&my_user_rows(rows, true)));
+    }
+    if let Ok(rows) = conn.query_map(MY_USERS_MYSQL_SQL, |r: MyUserTuple| r).await {
+        return Ok(users::from_mysql_rows(&my_user_rows(rows, false)));
+    }
+    if let Ok(rows) = conn
+        .query_map(MY_USERS_PLAIN_SQL, |(u, h): (String, String)| MyUserRow {
+            user: u,
+            host: h,
+            ..Default::default()
+        })
+        .await
+    {
+        return Ok(users::from_mysql_rows(&rows));
+    }
+    // The one whose failure the caller sees, because by here every wider read
+    // has already been refused and this error is the reason why.
+    let grantees: Vec<String> = conn
+        .query_map(MY_USERS_GRANTEE_SQL, |g: String| g)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let rows: Vec<MyUserRow> = grantees
+        .iter()
+        // A cell that isn't an account pair is dropped rather than guessed at —
+        // see `users::parse_grantee`.
+        .filter_map(|g| users::parse_grantee(g))
+        .map(|(user, host)| MyUserRow {
+            user,
+            host,
+            ..Default::default()
+        })
+        .collect();
+    Ok(users::from_mysql_rows(&rows))
+}
+
+/// Slot the fifth column into whichever field this server's spelling meant it
+/// for. The fold that reads it — `users::from_mysql_rows` — is where every
+/// decision about what a [`Principal`] *says* lives, and it needs the two
+/// columns kept apart rather than merged into a "flag" it would have to
+/// re-interpret.
+fn my_user_rows(rows: Vec<MyUserTuple>, mariadb: bool) -> Vec<MyUserRow> {
+    rows.into_iter()
+        .map(|(user, host, plugin, expired, fifth)| MyUserRow {
+            user,
+            host,
+            plugin,
+            password_expired: expired,
+            is_role: if mariadb { fifth.clone() } else { None },
+            account_locked: if mariadb { None } else { fifth },
+        })
+        .collect()
 }
 
 /// Why a connection has no Server Activity to report. One sentence, one place,
