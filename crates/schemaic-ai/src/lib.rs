@@ -792,18 +792,43 @@ mod tests {
         assert_eq!(seal_from_help(HELP), CliSeal::ALL);
     }
 
-    /// The one that matters: `--allowed-tools` and `--disallowedTools` both end
-    /// in the letters of `--tools`, and a `contains` would call a CLI that has
-    /// neither `--tools` nor `--setting-sources` fully sealed — passing flags
-    /// that kill the spawn.
+    /// A CLI listing none of the three is read as having none of them — with
+    /// today's real near-miss names present, so the obvious false positive is
+    /// ruled out on the text the binary actually prints.
+    ///
+    /// This one does **not** exercise `mentions_flag`'s end-character check, and
+    /// says so rather than implying coverage: today's near misses are all a dash
+    /// short (`--allowed-tools` puts one dash before `tools`, not two), so a bare
+    /// `contains` answers this fixture identically. The check is pinned by
+    /// `a_flag_is_not_found_inside_a_longer_flags_name` below.
     #[test]
-    fn a_flag_is_not_found_inside_another_flags_name() {
+    fn a_cli_listing_none_of_the_flags_is_read_as_having_none() {
         let old = "\
   --allowedTools, --allowed-tools <tools...>
   --disallowedTools, --disallowed-tools <tools...>
   --settings <file-or-json>             Path to a settings JSON file or a JSON
   --mcp-config <configs...>             Load MCP servers from a JSON file";
         assert_eq!(seal_from_help(old), CliSeal::NONE);
+    }
+
+    /// The check `mentions_flag` exists for, and the direction it fails in.
+    ///
+    /// A flag whose name merely *starts* with one of ours is one rename away —
+    /// the CLI already ships `--setting-sources` next to `--settings`, and
+    /// `--allowedTools` next to `--allowed-tools`. Under a bare `contains` a
+    /// binary offering `--toolsmith` but not `--tools` reads as sealed, and
+    /// Schemaic then passes it a flag it does not know, which kills the spawn
+    /// and takes the AI panel with it.
+    #[test]
+    fn a_flag_is_not_found_inside_a_longer_flags_name() {
+        // No description may spell a bare flag: `mentions_flag` reads prose too
+        // (the real help discusses one flag inside another's description), so a
+        // fixture that named them would match for the wrong reason.
+        let collides = "\
+  --toolsmith <name>                    A longer name with ours as its prefix
+  --setting-sources-file <path>         Another, extended by a dash
+  --mcp-config <configs...>             Load MCP servers from a JSON file";
+        assert_eq!(seal_from_help(collides), CliSeal::NONE);
     }
 
     #[test]
