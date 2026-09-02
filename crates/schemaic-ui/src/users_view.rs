@@ -263,7 +263,8 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
             ),
             UsersState::Failed(e) => list_note(icons::TRIANGLE_ALERT, theme::error, e),
             UsersState::Loaded(list) => {
-                let rows: Vec<AnyView> = list
+                let mut rows: Vec<AnyView> = list
+                    .list
                     .iter()
                     .filter(|p| schemaic_core::users::matches(p, &needle))
                     .map(|p| {
@@ -286,6 +287,14 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
                             format!("No account matches “{}”.", needle.trim())
                         },
                     );
+                }
+                // **Under the list, the way the privileges pane renders
+                // `Grants::note`.** A list that is silently partial is the one
+                // way this feature can mislead, and the footer's "1 account" is
+                // exactly as confident about a denied read as about a server
+                // with one account.
+                if let Some(n) = list.note {
+                    rows.push(list_note(icons::CIRCLE_QUESTION, theme::text_faint, n));
                 }
                 v_stack_from_iter(rows)
                     .style(|s| s.flex_col().width_full().gap(row_gap()))
@@ -805,10 +814,11 @@ fn footer(
         UsersState::Loaded(list) => {
             let needle = filter.get();
             let shown = list
+                .list
                 .iter()
                 .filter(|p| schemaic_core::users::matches(p, &needle))
                 .count();
-            let total = list.len();
+            let total = list.list.len();
             // "3 of 40 accounts" only while a filter is narrowing them — an
             // unfiltered list saying "40 of 40" invites a hunt for the missing
             // ones.

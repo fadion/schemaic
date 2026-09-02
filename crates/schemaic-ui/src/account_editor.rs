@@ -629,6 +629,7 @@ fn grant_form(
                         "role_name",
                         move || match roles.get_untracked() {
                             crate::UsersState::Loaded(list) => list
+                                .list
                                 .iter()
                                 .filter(|p| p.kind == PrincipalKind::Role)
                                 .map(|p| p.name.clone())

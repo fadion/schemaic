@@ -2399,7 +2399,7 @@ pub(crate) async fn roles(db: &Db) -> Result<Vec<String>, DbError> {
 /// selected. Unlike [`roles`] this keeps the `pg_` predefined roles — they hold
 /// real privileges and "why can this account read that" is the question the
 /// browser exists to answer — and `users::from_pg_rows` sorts them last.
-pub(crate) async fn fetch_principals(db: &Db) -> Result<Vec<Principal>, DbError> {
+pub(crate) async fn fetch_principals(db: &Db) -> Result<users::Principals, DbError> {
     let client = connect_maintenance(db).await?;
     let rows = query_all(&client, PG_ROLES_SQL).await?;
     let rows: Vec<PgRoleRow> = rows
@@ -2420,7 +2420,9 @@ pub(crate) async fn fetch_principals(db: &Db) -> Result<Vec<Principal>, DbError>
             valid_until: opt(r, 9),
         })
         .collect();
-    Ok(users::from_pg_rows(&rows))
+    // Complete: `pg_roles` is world-readable, so unlike MySQL's `mysql.user`
+    // there is no rung below this one and nothing to disclose.
+    Ok(users::Principals::complete(users::from_pg_rows(&rows)))
 }
 
 /// `pg_roles` in the order [`PgRoleRow`] reads it.
@@ -2549,13 +2551,38 @@ pub(crate) async fn fetch_grants(
         }));
     }
 
+    // **What no ACL entry records.** `aclexplode` reads explicit entries only,
+    // and the three commonest ways a role holds power leave none: superuser,
+    // ownership, and a `pg_*` predefined role's wired-in rights. Without this,
+    // clicking `pg_read_all_data` printed "This account holds no privileges."
+    // See `users::pg_implicit_note`.
+    let implicit = query_all(
+        &client,
+        &format!(
+            "SELECT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = {who}), \
+                    (SELECT count(*) FROM pg_catalog.pg_database WHERE datdba = {oid}) \
+                  + (SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspowner = {oid}) \
+                  + (SELECT count(*) FROM pg_catalog.pg_class \
+                     WHERE relowner = {oid} AND relkind IN ('r', 'p', 'v', 'm', 'f', 'S'))"
+        ),
+    )
+    .await?;
+    let extra = implicit.first().and_then(|r| {
+        users::pg_implicit_note(
+            &principal.name,
+            pg_bool(r, 0),
+            opt(r, 1).and_then(|s| s.parse().ok()).unwrap_or(0),
+            scope.as_deref().unwrap_or("this cluster"),
+        )
+    });
+
     let mut statements = users::pg_membership_statements(&principal.name, &member_of);
     statements.extend(users::pg_grant_statements(&principal.name, &acl));
     Ok(Grants {
         statements,
         note: Some(match scope.as_deref() {
-            Some(d) => users::pg_scope_note(d),
-            None => users::pg_no_database_note(),
+            Some(d) => users::pg_scope_note(d, extra.as_deref()),
+            None => users::pg_no_database_note(extra.as_deref()),
         }),
     })
 }
