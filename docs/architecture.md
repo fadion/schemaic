@@ -2551,20 +2551,59 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     - `prompt.rs` — fences DB content so an embedded ` ``` ` can't escape into prose. Every prompt
       built from server-controlled text goes through it. It also owns **what the assistant is told
       about the result on screen**: `result_shape` renders a `QueryState` as columns + types, row
-      count, cap, elapsed, database and (on a failure) the engine's error verbatim — *never a cell
+      count, cap, elapsed, database and (on a failure) the engine's error text — *never a cell
       value* — while `result_attachment` renders the rows the user deliberately attached, capped at
       `ATTACH_ROW_CAP` with the cap stated in its own header so a model handed 200 of 5,000 rows
       can't mistake the sample for the set. **The error text is the one arm gated on `AiData`**, and
       `result_shape` takes the level as an argument for it: an engine's error is not shape.
       `Duplicate entry 'alice@corp.com' for key 'users.email'` is a stored cell quoted back by the
-      server — so below `may_query` the failure is still reported and the text withheld, naming the
-      setting so the model asks the user to paste it rather than retrying blind. **The gate is
-      `may_query` — `Full` alone — and not `may_attach`**, because the reason is level-independent
-      and `Full` is the only level whose consent covers a value the user did not hand over:
-      `OnRequest` is the default and its consent line reads *"Rows you attach from a result leave
-      this machine with that question"*, and nobody attached that one.
+      server. **The gate is `may_query` — `Full` alone — and not `may_attach`**, because the reason
+      is level-independent and `Full` is the only level whose consent covers a value the user did
+      not hand over: `OnRequest` is the default and its consent line reads *"Rows you attach from a
+      result leave this machine with that question"*, and nobody attached that one.
+      **What the gate decides is verbatim-or-redacted, not sent-or-withheld.** Below `Full` the
+      message goes through `redact_engine_error`, which takes the values out and keeps the
+      constraint, the column and the error class, and rides under a note telling the model that
+      values were removed and that the user can paste the original line. Withholding the whole
+      message was the first answer, and it was right about the value and wrong about the message:
+      `users.email` is schema, which every level already sends, and it is the half that makes the
+      error actionable — so dropping it bought no privacy and left a model told only *"the last run
+      FAILED, the message is withheld"*, the level paying for its caution in usefulness rather than
+      in exposure.
+      **`redact_engine_error` is per-template, not a blunt quote-stripper**, because engines quote
+      identifiers in the same syntax as values (`for key 'users.email'`, `constraint
+      "users_email_key"`) and blanking every quoted run would destroy exactly the half worth
+      keeping. Each rule is anchored on the phrase that locates the *value* in one engine's message
+      — MySQL/MariaDB's `Duplicate entry 'V' for key` and `Incorrect <type> value: 'V' for column`,
+      PostgreSQL's `Key (cols)=(V)`, `Failing row contains (V…)` and
+      `invalid input syntax for type T: "V"`; SQLite's constraint reports name no value and pass
+      through untouched. It takes **no dialect** — every engine's patterns are tried, and one
+      engine's anchor does not occur in another's message, so a wrong dialect cannot be passed to
+      it. It is **not a SQL scan**, so it is not built on `sql::skip_noncode` and is not an
+      exception to that invariant: the input is an engine's prose, and the quoting rules are the
+      message's rather than the dialect's. Two things are kept whole on purpose, because they are
+      the user's own text rather than stored data — a syntax error's quoted-back SQL, and
+      PostgreSQL's `LINE n:` echo of the statement with the caret line under it
+      (`redaction_keeps_the_postgres_line_echo_of_the_users_own_statement`). **The rules are applied
+      line by line**, so an anchor cannot reach across into the next line's text: the
+      paren-delimited PostgreSQL details close on the *last* delimiter in the line, because a value
+      can contain one itself, and over a whole message that reach would take the statement echo with
+      it. Within a line it can over-redact an unrelated trailing parenthetical, which is the safe
+      direction to be wrong in. **The residual risk is
+      named rather than papered over:** a message shaped like nothing in the table passes through,
+      so a value in an unrecognised template still reaches the model. What the levels below `Full`
+      promise is that *rows* do not leave, and the rules cover the messages that carry them.
+      Every string in `redaction_answers_the_messages_the_engines_actually_emit` was **captured from
+      a live MariaDB 10.11 and PostgreSQL 16** rather than written from memory of the format,
+      because the rules are anchored on exact phrasing and a plausible template no engine emits
+      protects nothing — the live capture is what showed that MariaDB spells the column in backticks
+      in error 1366, and that PostgreSQL appends the `LINE n:` echo.
       `the_engines_error_leaves_only_where_the_consent_line_covers_it` asserts the property over
-      every level rather than one, so a fourth level can't be added on the wrong side. Both build on `pipe_table`, the one
+      every level rather than one, so a fourth level can't be added on the wrong side, and it
+      asserts **both halves** — the value is gone *and* `users.email` survives. The second assertion
+      is the point: withholding everything also keeps the value out, so a test checking only the
+      value's absence passes just as well against the behaviour this replaced and would not notice a
+      regression to sending nothing. Both build on `pipe_table`, the one
       table renderer for anything a model reads (the MCP tools call it too), so a cell containing
       `|`, a newline or a megabyte of JSON is handled identically wherever it appears.
       `ai_fix_prompt` is the **one wording of "fix this"**, for all three ways to ask — the editor's
@@ -2582,10 +2621,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       goes through. Its statement is **optional**, which is what lets *Explain* be offered for every
       error the modal can show while *AI fix* is offered for one kind: an explanation needs only the
       words, and a commit error, a failed export or a server that never answered are exactly the ones
-      whose modal is otherwise a dead end. **Neither prompt consults `AiData`**, unlike
-      `result_shape` two paragraphs up, and the difference is consent rather than sensitivity: that
-      gate is for text the model is handed *automatically each turn*, while these two carry an error
-      the user pressed a button to send — the same election an attached row is.
+      whose modal is otherwise a dead end. **Both prompts take the level and apply `result_shape`'s
+      gate to the same text**: below `may_query` the message they carry is the redacted one, while
+      the SQL and the statement — the user's own text — still go in full. `ai_fix_prompt` redacts
+      the problems **before** anything is built from them, so the `FixPrompt::input` *label* is
+      redacted too and not only the intent: the Ctrl+K box shows that label, and a retry sends the
+      box's contents, which is the path `editor_pane.rs`'s `CmdK::intent` doc comment already warns
+      about. The argument that a button press is itself an election — the same one an attached row
+      is, and so grounds for these two being laxer than the text the model is handed *automatically
+      each turn* — was weighed again when the redaction landed and **not** adopted: with the value
+      gone there is nothing left to widen the gate for, and all three sites keep one rule.
+      `the_gate_agrees_with_the_one_result_shape_applies_to_the_same_string` pins that on what they
+      *keep* as well as on what they drop, so one of them cannot drift back to withholding the whole
+      message while the others redact.
     - `summary.rs` — the grid's "AI Summary" cell/column prompts. `sample_column` spreads its
       sample *evenly* across loaded rows rather than taking the first N, because a sorted result's
       head often shares a date/status/prefix that reads as a pattern that isn't real; `sample_row`
@@ -3951,6 +3999,105 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   containers; the lint job compiles it via `--features schemaic-db/live-tests`, since otherwise it
   would be the one code in the repository no push compiles.
 - `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
+  **The spawned session is sealed to what Schemaic hands it, and that is `build_session_args`'s
+  three flags rather than `DISALLOWED_TOOLS`.** The denylist named ten built-in tools and read like
+  the guard; measured against the shipped CLI by reading the `system`/`init` event's own `tools`
+  array, the old flag set left **nineteen** more live in the AI panel that it had never heard of —
+  `Artifact`, `CronCreate`, `CronDelete`, `CronList`, `DesignSync`, `EnterWorktree`, `ExitWorktree`,
+  `ListAgents`, `Monitor`, `PushNotification`, `RemoteTrigger`, `ReportFindings`, `ScheduleWakeup`,
+  `SendMessage`, `Skill`, `TaskOutput`, `TaskStop`, `ToolSearch` and `Workflow`. `Artifact`
+  publishes a page to the web, `SendMessage`/`PushNotification`/`RemoteTrigger` send outbound and
+  `CronCreate` schedules recurring agent runs: an assistant that had just read a client's rows was
+  one tool call away from publishing them. Enumerating what to *refuse* is the wrong shape — naming
+  what to *allow* is the right one, and after the change the same `init` probe reports
+  `tools: ["mcp__schemaic__run_query"]` with the MCP server still `connected` and a real turn
+  completing. `--tools ""` empties the **built-in** set and leaves the MCP allow-list untouched
+  (`the_session_is_given_no_built_in_tools_at_all` pins the empty string as the flag's whole value:
+  drop it and the next flag's name is read as a tool). `--strict-mcp-config` loads only the server
+  passed via `--mcp-config`, so the user's own global servers do not join Schemaic's SQL assistant.
+  `--setting-sources user` keeps the user's own `~/.claude/settings.json` — their own choice — and
+  drops the two directory-relative sources, because the session child is spawned in
+  `std::env::temp_dir` (world-writable on most systems, so anything that drops a
+  `.claude/settings.json` there was granting permissions in Schemaic's AI panel); the one-shot paths
+  below inherit the app's own working directory instead, and the flag covers them for the same
+  reason. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
+  otherwise swallow a later flag's name as a tool name, and both
+  `the_session_loads_no_mcp_server_and_no_config_dir_of_its_own_finding` and the test above pin that
+  order. **They did not prompt — they ran.** Driving the old flag set with
+  `--permission-mode default` and a `--permission-prompt-tool stdio` route deliberately left
+  unanswered, `Skill`, `ToolSearch` and `Monitor` all executed inside the turn and **no
+  `can_use_tool` control request was emitted at all**, in two separate trials. So the exposure is not
+  that these tools ask and go unheard; it is that they do not ask. Whether an un-allow-listed tool
+  can *also* stall a turn is a separate question this measurement does not answer, and the only
+  evidence on it is the older `propose_table_change` observation recorded under `mcp.rs` — that such
+  a call is simply denied, invisibly. The TODO item that reported a turn stalling with no message is
+  therefore **not** explained by these nineteen, and its cause is still unidentified; emptying the
+  built-in set was justified by what the tools can do, not by that symptom.
+  `DISALLOWED_TOOLS` is kept as a **backstop** in case a future CLI stops
+  honouring `--tools`, and it now names **all twenty-nine** — the original ten plus that measured
+  nineteen, in the order the `init` event reported them. It named only the ten for a while, under a
+  description claiming it covered the worst misuse, and a review found it omitted every tool the
+  same measurement had called worst: `Artifact`, `SendMessage`, `RemoteTrigger` and `CronCreate`
+  all walked past it, so the fallback fell back on the shell and the filesystem and on nothing that
+  mattered. It is still a **snapshot rather than a complete denylist** — a complete denylist is
+  precisely what failed, and this one can only ever name what somebody has looked at — but a
+  snapshot has to name the worst of what it can see: a name the CLI does not know is harmless in a
+  denylist, a name missing from it is not. Re-measured against the live CLI, all twenty-nine spawn
+  cleanly and the `init` event still reports `tools: []`.
+  **The three flags are passed only if the CLI accepts them, and that is asked of the binary rather
+  than of a version number.** Schemaic spawns whatever `claude` the user has and pins no version,
+  and a flag an older CLI does not know does not degrade the session, it kills it — the child exits
+  with `error: unknown option '--tools'` before the first turn and the AI panel is gone until the
+  user upgrades. So `claude_cli::claude_seal` runs `<bin> --help` and `seal_from_help` reads a
+  `CliSeal` out of it, one `bool` per flag; `build_session_args` and `inline_args` both take one and
+  turn it into argv through the single private `seal_args`, so the session and the one-shot paths
+  cannot come to seal themselves differently — the one-shot paths being the ones with no surface
+  that would show it if they did. A version number would only stand in for the answer `--help`
+  gives directly, and would need a table mapping releases to flags that nothing in this repository
+  can keep true.
+  **The failure direction is deliberate and is the security-relevant half.** An empty or unreadable
+  help text yields `CliSeal::ALL`, not `NONE`: a probe that failed for a transient reason on a
+  *working* CLI degrades to a spawn that may error loudly, never to a session quietly running
+  unsealed. Guessing "absent" on no evidence would silently reopen the hole this whole change
+  exists to close, with nothing on screen to say so
+  (`an_unreadable_probe_seals_rather_than_opens`). Only a help text that was actually read, and
+  that actually lacks the flag, drops it. On a CLI too old for `--tools`, `DISALLOWED_TOOLS` is what
+  still stands between the assistant and a shell — that is the case the backstop exists for, and
+  `an_old_cli_gets_no_sealing_flags_but_keeps_the_backstop` pins it.
+  **The `HELP` fixture is captured from the real `claude --help`, not written from memory** — the
+  same rule the engine-error fixtures follow, and for the same reason: this parser decides whether
+  the sealing flags are passed at all, so a fixture shaped the way help *ought* to look would prove
+  nothing about the binary Schemaic spawns. The capture is what supplied the real near-miss names:
+  the CLI lists two spellings of each tool-list flag on one line (`--allowedTools, --allowed-tools
+  <tools...>`) and mentions `--tools` inside another flag's prose, and
+  `a_cli_listing_none_of_the_flags_is_read_as_having_none` holds a help text of nothing but those
+  names to `CliSeal::NONE`. `mentions_flag` requires the character after the flag to end it rather
+  than using a bare `contains` — **not** because any name in today's help contains `--tools` (none
+  does; the near misses are all a dash short), but because these names are one rename away from
+  doing so, and the direction it would fail in is passing flags that kill the spawn. **That is why
+  the real capture cannot be the test of the check, and a second fixture is.** Because today's near
+  misses are a dash short, a `contains` answers the captured help identically — the test that held
+  only it asserted the check in its doc comment and exercised none of it, and was split once that
+  was noticed. `a_flag_is_not_found_inside_a_longer_flags_name` supplies the collision the capture
+  cannot (`--toolsmith`, `--setting-sources-file`, and neither of ours) and fails against a
+  `contains` variant with `tools: true, setting_sources: true`; the captured fixture keeps its own
+  narrower claim and says in its doc that it is not the check's test. Its descriptions deliberately
+  spell no bare flag, since `mentions_flag` reads prose too and a first draft passed on that
+  instead. It matches
+  anywhere in the text, prose included, so a help that merely *discusses* `--tools` in another
+  flag's description reads as advertising it — an imprecision kept because it errs towards sealing,
+  which is the direction every other choice here errs in too. The
+  probe costs **~140 ms measured**, so `claude_seal` caches the answer per resolved binary path and
+  `main.rs` calls `warm_seal_cache` once at startup on a background thread; without it that wait
+  sits on the UI thread ahead of every AI action. The warm runs against the *auto-detected* path,
+  so a user with a `cli_path` override pays the probe once on their first AI action instead.
+  **`inline_args` is sealed the same way, and its case is sharper.** Ctrl+K, AI Fill and AI Seed
+  each want one string back that a parser then reads, and none of them has a surface that could
+  render a tool call — so where the chat panel merely stalls on a tool it cannot prompt for, those
+  three would have run one *invisibly*. They pass no `--mcp-config` at all, so `--strict-mcp-config`
+  leaves them with no servers, which is correct: the whole request is in the prompt
+  (`a_one_shot_generation_is_given_no_tools_and_no_servers`, and `inline_args_flags_in_order` holds
+  the exact argv).
 - `schemaic-term` — terminal panel + shell (`shell.rs`).
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
@@ -6567,8 +6714,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `shown_panel` again rather than a second fallback rule (a stale `active_result` shows the first
   panel in the pane, and the AI has to describe the same statement) — so columns, types, counts, the cap and
   the elapsed time ride on every turn, and *no cell value ever does*. A failed run's error text rides
-  only where the connection's `AiData` allows it, since the server quotes stored values into its
-  messages; `ai_context` passes the level in beside the dialect. It is
+  on every level, but **verbatim only where the connection's `AiData` allows it**: the server quotes
+  stored values into its messages, so below `Full` `core::prompt::redact_engine_error` takes those
+  out and the rest of the message still goes; `ai_context` passes the level in beside the dialect. It is
   diffed like the rest of the context, and a cleared panel is reported as cleared rather than
   omitted: a stale shape would have the model explaining an error the user has already fixed. The
   same snapshot sends the editor **selection** in place of the whole buffer when there is one
@@ -6628,7 +6776,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session temp `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
-  discovery — PATH/PATHEXT/override) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
+  discovery — PATH/PATHEXT/override — plus the one part of it that is *not* pure, `claude_seal`,
+  which spawns `<bin> --help` and caches the `CliSeal` it reads per resolved path; see
+  `schemaic-ai`) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
   stays in `main.rs`.
   **Every prompt's database list comes out of one funnel**, `snapshot_databases`: it reads the
@@ -6687,7 +6837,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   tool the model can see, which is why the listing is where the level has to bite; the server-side
   refusal is the backstop for a client working from a stale listing. The mirror of that listing is
   `ai.rs`'s `AI_TOOLS_WITH_QUERY` / `AI_TOOLS_READ_ONLY`, the `--allowedTools` the CLI is spawned
-  with: it runs non-interactively, so a tool missing from its level's list has nobody to approve it
+  with — and since `build_session_args` empties the built-in set with `--tools ""`, that list is now
+  the session's *entire* tool set rather than an addition to it (on a CLI whose `--help` does not
+  advertise the flag it is an addition again, with the twenty-nine-name backstop behind it — see
+  `schemaic-ai`): it runs
+  non-interactively, so a tool missing from its level's list has nobody to approve it
   and the call is simply denied. Two lists in two files drift —
   `propose_table_change` was offered by the server from the day it landed and named by neither
   list, so the assistant's check of a proposed change against the live table was denied every time,
@@ -7172,6 +7326,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   the user attached them, so the gesture is the consent and there is no setting to forget. And
   what is sent is kept honest at both ends: `result_shape` states out loud that no rows were sent,
   and `result_attachment` states the cap it applied.
+  **This gate covers what reaches the model, not what the model may then do with it** — that half is
+  the spawned CLI session's tool set, and it was open. Measured against the shipped CLI, the
+  `claude` child had nineteen built-in tools nobody had allow-listed, `Artifact` (which publishes a
+  page to the web) and `SendMessage`/`PushNotification`/`RemoteTrigger` among them, so rows the user
+  had deliberately attached under this gate were one tool call away from leaving anyway — and tools
+  from that set were measured *executing inside a turn without raising a permission request at all*,
+  so nothing would have stood between the attachment and the send.
+  `schemaic_ai::build_session_args` and `inline_args` close that with `--tools ""` on every CLI
+  whose `--help` advertises the flag, and fall back to the twenty-nine-name denylist on one that
+  does not rather than dying on an unknown option — see `schemaic-ai`, which is also where the
+  reason the denylist could not do it on its own is written down.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where
