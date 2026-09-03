@@ -60,6 +60,7 @@ use std::time::Instant;
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection as SqliteConn, OpenFlags};
+use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 #[cfg(test)]
 use schemaic_core::model::CellTag;
 use schemaic_core::model::{
@@ -959,6 +960,70 @@ fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
         }
     };
     (sql, params)
+}
+
+/// [`Db::fetch_blob`]'s SQLite body — read one `BLOB` cell.
+///
+/// `length()` is the octet count **only for a blob**; on text it counts
+/// characters, and `substr` slices them. That is not guarded here but upstream,
+/// and it is a *per-value* guard rather than a per-column one, because on this
+/// engine the column cannot answer it: a declared `BLOB` is an affinity, so one
+/// row of it can hold text while the next holds bytes.
+/// [`schemaic_core::blob::blob_source`] requires the cell's own text to be the
+/// `<n bytes>` placeholder — the only evidence a `ResultSet` keeps that a
+/// value's bytes were dropped rather than rendered — so a text value never
+/// reaches this statement and a character count is never reported as octets.
+pub(crate) async fn fetch_blob(
+    db: &Db,
+    r: &BlobRef,
+    cancel: CancellationToken,
+) -> Result<Option<BlobValue>, DbError> {
+    refuse_if_cancelled(&cancel)?;
+    let r = r.clone();
+    let db = db.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let work = tokio::task::spawn_blocking(move || {
+        let conn = open(&db)?;
+        let _ = tx.send(conn.get_interrupt_handle());
+        let mut params = Vec::new();
+        let w = where_clause(&r.key, &mut params);
+        let col = ident_sqlite(&r.column);
+        // The table is named bare for `statement_for`'s reason: a connection is
+        // one file, so there is nothing to disambiguate.
+        let sql = format!(
+            "SELECT length({col}), substr({col}, 1, {FETCH_CAP}) FROM {} WHERE {w} LIMIT 1",
+            ident_sqlite(&r.table)
+        );
+        let mut stmt = conn.prepare(&sql).map_err(query_err)?;
+        let mut got = stmt
+            .query(rusqlite::params_from_iter(params))
+            .map_err(query_err)?;
+        let Some(row) = got.next().map_err(query_err)? else {
+            return Ok(None);
+        };
+        // `length(NULL)` is NULL — a NULL cell and a vanished row are the same
+        // answer here, as they are on the other two engines.
+        let Some(len) = row.get::<_, Option<i64>>(0).map_err(query_err)? else {
+            return Ok(None);
+        };
+        let bytes = row
+            .get::<_, Option<Vec<u8>>>(1)
+            .map_err(query_err)?
+            .unwrap_or_default();
+        Ok(Some(BlobValue {
+            bytes,
+            len: len.max(0) as u64,
+        }))
+    });
+
+    let interrupt = rx.await.ok();
+    tokio::select! {
+        res = work => res.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        _ = cancel.cancelled() => {
+            if let Some(h) = interrupt { h.interrupt(); }
+            Err(DbError::Cancelled)
+        }
+    }
 }
 
 /// Re-read the rows a commit changed, so the grid can splice them in place
@@ -5540,6 +5605,153 @@ mod tests {
         );
         // A plain column has no expression.
         assert_eq!(generated_expr_of(sql, "a"), None);
+    }
+
+    fn blob_ref(table: &str, column: &str, key: &[(&str, Value)]) -> BlobRef {
+        BlobRef {
+            database: MAIN.to_string(),
+            schema: None,
+            table: table.to_string(),
+            column: column.to_string(),
+            key: key
+                .iter()
+                .map(|(c, v)| (c.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    /// **The bytes come back as bytes, and the length is the whole value's.**
+    ///
+    /// The round trip the whole feature rests on: a blob the grid only ever saw
+    /// as `<n bytes>` is re-read by its row key and arrives byte-identical,
+    /// including the embedded NUL and the high bytes that a text path would have
+    /// mangled — which is what the placeholder exists to prevent in the first
+    /// place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_is_fetched_back_byte_for_byte() {
+        let (keeper, db) = shared_memory("blob_roundtrip");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        // A PNG header: a NUL, bytes above 0x7f, and a CR/LF pair — every class
+        // a text round-trip loses.
+        let bytes: Vec<u8> = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        keeper
+            .execute("INSERT INTO t VALUES (1, ?)", [&bytes])
+            .unwrap();
+
+        let got = fetch_blob(
+            &db,
+            &blob_ref("t", "payload", &[("id", Value::Int(1))]),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("fetch")
+        .expect("a row with bytes");
+        assert_eq!(got.bytes, bytes);
+        assert_eq!(got.len, bytes.len() as u64);
+        assert!(!got.truncated());
+        assert_eq!(
+            schemaic_core::blob::sniff(&got.bytes),
+            schemaic_core::blob::BlobKind::Png
+        );
+    }
+
+    /// A NULL cell is "no bytes to show", not an error and not an empty blob.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_null_blob_fetches_as_nothing() {
+        let (keeper, db) = shared_memory("blob_null");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB);
+                 INSERT INTO t VALUES (1, NULL);",
+            )
+            .unwrap();
+        let got = fetch_blob(
+            &db,
+            &blob_ref("t", "payload", &[("id", Value::Int(1))]),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("fetch");
+        assert_eq!(got, None);
+    }
+
+    /// **A zero-length blob is a value, and must not answer like a NULL.**
+    ///
+    /// `length(x'')` is 0, not NULL, and the two travel the same two fields back
+    /// to the panel — so the arm that reads the length has to distinguish "no
+    /// row / no value" from "a value that happens to be empty", or saving an
+    /// empty blob offers nothing to save.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_blob_is_a_value_not_a_null() {
+        let (keeper, db) = shared_memory("blob_empty");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB);
+                 INSERT INTO t VALUES (1, x'');",
+            )
+            .unwrap();
+        let got = fetch_blob(
+            &db,
+            &blob_ref("t", "payload", &[("id", Value::Int(1))]),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("fetch")
+        .expect("an empty blob is still a value");
+        assert!(got.bytes.is_empty());
+        assert_eq!(got.len, 0);
+        assert!(!got.truncated());
+    }
+
+    /// A row deleted since the result loaded reports nothing rather than failing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vanished_row_fetches_as_nothing() {
+        let (keeper, db) = shared_memory("blob_gone");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        let got = fetch_blob(
+            &db,
+            &blob_ref("t", "payload", &[("id", Value::Int(404))]),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("fetch");
+        assert_eq!(got, None);
+    }
+
+    /// The key is the row's identity, and it addresses exactly the row clicked —
+    /// not whichever one a `LIMIT 1` would have returned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_key_selects_the_row_it_names() {
+        let (keeper, db) = shared_memory("blob_keyed");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        for (id, byte) in [(1u8, b'a'), (2, b'b'), (3, b'c')] {
+            keeper
+                .execute(
+                    "INSERT INTO t VALUES (?, ?)",
+                    rusqlite::params![id, [byte; 4].as_slice()],
+                )
+                .unwrap();
+        }
+        for (id, byte) in [(1i64, b'a'), (2, b'b'), (3, b'c')] {
+            let got = fetch_blob(
+                &db,
+                &blob_ref("t", "payload", &[("id", Value::Int(id))]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fetch")
+            .expect("row present");
+            assert_eq!(
+                got.bytes, [byte; 4],
+                "row {id} returned another row's bytes"
+            );
+        }
     }
 }
 

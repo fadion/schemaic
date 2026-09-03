@@ -26,6 +26,7 @@ use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
 use floem::action::save_as;
 use floem::file::{FileDialogOptions, FileSpec};
 
+use schemaic_core::blob::BlobRef;
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::edit::{self, EditModel, analyze_edit, refetch_key, refetch_template, row_key};
@@ -50,7 +51,7 @@ use crate::widgets::{
     MenuEntry, autohide, autohide_state, centered_msg, in_strip_button, loading_dots,
     measure_text_px, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
 };
-use crate::{ConnNode, FieldCfg, PopupAnchor, cell_editors, edit_field, icons, theme};
+use crate::{BlobTarget, ConnNode, FieldCfg, PopupAnchor, cell_editors, edit_field, icons, theme};
 
 // ===== moved from lib.rs (results grid) =====
 /// The lifecycle phase of a [`QueryState`], without its payload — a deduped key
@@ -312,6 +313,10 @@ struct GridState {
     /// reveals the AI panel + sends a message; `dismiss` closes any open menu;
     /// `commit` executes staged edits.
     summarize: RwSignal<Option<SummarizeFn>>,
+    /// Open the binary-cell panel — see [`crate::ViewBlobFn`]. In a signal for the
+    /// reason [`GridState::summarize`] is: `GridState` is `Copy`, and an `Rc`
+    /// field is not.
+    view_blob: RwSignal<crate::ViewBlobFn>,
     /// Stage result rows for the AI panel's next question (see
     /// [`crate::AttachFn`]) — the "Attach to chat" menu actions.
     attach: RwSignal<Option<crate::AttachFn>>,
@@ -601,6 +606,7 @@ impl GridState {
             last_mouse: gctx.last_mouse,
             source: gctx.source,
             summarize: RwSignal::new(Some(gctx.summarize.clone())),
+            view_blob: RwSignal::new(gctx.view_blob.clone()),
             attach: RwSignal::new(Some(gctx.attach.clone())),
             dismiss: RwSignal::new(Some(gctx.dismiss.clone())),
             commit: RwSignal::new(Some(gctx.commit.clone())),
@@ -2646,6 +2652,9 @@ pub(crate) struct GridCtx {
     /// (see [`crate::SchemaActions::db_stats`]) — called once per capped result,
     /// which is where the `1,000 of ~4.2m` total comes from.
     pub(crate) db_stats: Rc<dyn Fn(u64, String)>,
+    /// Raise the binary-cell panel on one cell and fetch its bytes — the grid
+    /// holds none, so the panel's content is a second query the app runs.
+    pub(crate) view_blob: crate::ViewBlobFn,
     /// AI-fill a single cell (sample base table → one-shot AI → stage the result).
     pub(crate) ai_fill: crate::AiFillFn,
     /// AI-generate seed rows (Insert Row / Seed Table) → stage pending rows.
@@ -7642,6 +7651,61 @@ fn set_rows_deleted(gs: GridState, idxs: &[usize], deleted: bool) {
     }
 }
 
+/// Raise the binary-cell panel on an already-resolved cell.
+///
+/// Two gestures open it — the cell menu's `View binary` and a double-click on
+/// the cell — and they go through here rather than each calling the action,
+/// because the connection they carry is a decision rather than a lookup:
+/// `conn_at_load` and not the tab's live one. Spelled twice, that is one edit
+/// away from the two gestures reading the same blob from different servers.
+fn open_blob(gs: GridState, bref: BlobRef, target: BlobTarget) {
+    (gs.view_blob.get_untracked())(gs.conn_at_load, bref, target);
+}
+
+/// Can the binary-cell panel be opened on this cell, and with what?
+///
+/// **Every reason it cannot is a reason the menu entry is absent**, rather than
+/// present and refusing — the entry is the only signal the app gives that a
+/// `<n bytes>` cell has anything behind it, so one that opens a panel saying
+/// "nothing here" is worse than no entry.
+///
+/// Three refusals, and each is a different fact:
+///
+/// * A **pending new row** has no committed row to re-read; its staged cells
+///   live only in the grid.
+/// * A **NULL** cell has no bytes, and the grid already knows that without
+///   asking the server — opening a panel to be told so is a round trip for a
+///   sentence the cell is already showing.
+/// * Anything [`schemaic_core::blob::blob_source`] refuses: a column that is not
+///   raw bytes, an expression with no base column, a table with no usable key.
+///
+/// The *connection* is not among them, deliberately. The fetch runs over
+/// `GridState::conn_at_load` — the one the rows came from, on the same argument
+/// the export makes — and a result on screen came from a connection by
+/// construction; there is no "no connection" state here to test for, and
+/// inventing a sentinel for one would be a rule nothing else in the app keeps.
+fn blob_launch(
+    gs: GridState,
+    rs: &ResultSet,
+    data_idx: usize,
+    ci: usize,
+    pending: Option<usize>,
+) -> Option<(BlobRef, BlobTarget)> {
+    if pending.is_some() {
+        return None;
+    }
+    if rs.cell(data_idx, ci).map(|c| c.is_null()).unwrap_or(true) {
+        return None;
+    }
+    let model = gs.edit_model.get_untracked();
+    let bref = schemaic_core::blob::blob_source(&model, rs, data_idx, ci)?;
+    let target = BlobTarget {
+        title: bref.title(),
+        stem: bref.save_stem(),
+    };
+    Some((bref, target))
+}
+
 /// The gutter's right-click menu: what can be done to **rows** as such.
 ///
 /// Deliberately not the cell menu. That one is built around one cell's value —
@@ -8613,13 +8677,21 @@ fn data_cell(
             // and the next hover drags a selection out of nowhere.
             gs.selecting.set(false);
             gs.row_selecting.set(false);
-            // Double-click edits an editable cell; on a read-only cell it does
-            // nothing (viewing is via the right-click menu's View item).
+            // Double-click edits an editable cell. On a **binary** one it opens
+            // the panel instead — the gesture is otherwise unbound there, since
+            // C2 holds the column read-only, and "open the thing I clicked" is
+            // what a double-click means everywhere else in the app. Every other
+            // read-only cell still does nothing but select (viewing a whole row
+            // is the right-click menu's Edit row).
             if gs.edit_model.get_untracked().editable(ci) {
                 start_edit(gs, i, ci);
             } else {
                 gs.active.set(Some((i, ci)));
                 gs.anchor.set(Some((i, ci)));
+                let rs = gs.rs.get_untracked();
+                if let Some((bref, target)) = blob_launch(gs, &rs, data_idx, ci, pending) {
+                    open_blob(gs, bref, target);
+                }
             }
         })
         // Right-click → View · Edit · Copy · Set to NULL · AI summary.
@@ -8743,6 +8815,15 @@ fn data_cell(
             if pending.is_none() {
                 entries.push(MenuEntry::action("Edit row", move || {
                     open_edit_row(gs, data_idx)
+                }));
+            }
+            // "View binary" — the one entry that opens a cell the grid is not
+            // holding. `blob_launch` answers `None` for everything that cannot
+            // be re-read (a NULL, an expression column, a table with no key), so
+            // the entry is absent rather than present-and-refusing.
+            if let Some((bref, target)) = blob_launch(gs, &rs, data_idx, ci, pending) {
+                entries.push(MenuEntry::action("View binary", move || {
+                    open_blob(gs, bref.clone(), target.clone());
                 }));
             }
             // Right-clicking inside a block keeps it selected, so the entry is

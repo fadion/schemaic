@@ -231,7 +231,12 @@ fn fmt_epoch_secs(secs: i64) -> String {
 }
 
 /// Human-readable byte size (`1.5 MB`); negatives fall back to the plain number.
-pub(crate) fn human_bytes(n: i64) -> String {
+///
+/// Public because the binary-cell panel says the same sentence about a blob that
+/// [`ColumnFormat::Bytes`] says about a number in a cell, and two spellings of
+/// "1.5 MB" in one application is the kind of drift that is only ever noticed in
+/// a screenshot.
+pub fn human_bytes(n: i64) -> String {
     if n < 0 {
         return n.to_string();
     }

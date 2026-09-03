@@ -27,6 +27,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params};
 use schemaic_core::activity::{self, KillKind, SessionInfo};
+use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::export;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
@@ -5155,6 +5156,103 @@ impl Db {
     }
 }
 
+impl Db {
+    /// Read one binary cell's bytes — the query behind the grid's binary-cell
+    /// panel.
+    ///
+    /// The bytes of a `BLOB` are dropped at the wire on every engine (see
+    /// [`schemaic_core::blob`]), so looking at one is a second, *targeted* query
+    /// rather than a lookup in the loaded result. It is aimed by the same row
+    /// identity a write of that row would carry, which is why a result whose
+    /// binary column has no keyed base table never gets here at all —
+    /// `blob_source` answers `None` and the panel is not offered.
+    ///
+    /// `Ok(None)` means the cell is SQL `NULL` **or** the row is gone (someone
+    /// else deleted it since the result loaded); both are "there are no bytes to
+    /// show", and the caller says so rather than inventing an error.
+    pub async fn fetch_blob(
+        &self,
+        r: &BlobRef,
+        cancel: CancellationToken,
+    ) -> Result<Option<BlobValue>, DbError> {
+        match self.engine {
+            Engine::Postgres => return pg::fetch_blob(self, r, cancel).await,
+            Engine::Sqlite => return sqlite::fetch_blob(self, r, cancel).await,
+            Engine::MySql => {}
+        }
+        // `None`, not the target database: `build_blob_select` qualifies the
+        // table as `db`.`table` itself, so the session default is never
+        // consulted and a `USE` would be a round trip that decides nothing —
+        // the same shape `refetch_rows` below already has.
+        let mut conn = self.open(None, false).await?;
+        let conn_id = conn.id();
+        let outcome = tokio::select! {
+            res = blob_on(&mut conn, r) => res,
+            _ = cancel.cancelled() => {
+                self.kill_query(conn_id).await;
+                Err(DbError::Cancelled)
+            }
+        };
+        let _ = conn.disconnect().await;
+        outcome
+    }
+}
+
+/// [`Db::fetch_blob`]'s MySQL body, on an already-open connection — so the
+/// pinned connection of a manual-transaction tab can run the same read and see
+/// its own uncommitted bytes.
+pub(crate) async fn blob_on(conn: &mut Conn, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
+    let (sql, params) = build_blob_select(r);
+    let row: Option<mysql_async::Row> = conn
+        .exec_first(sql, params)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let Some(row) = row else { return Ok(None) };
+    // `OCTET_LENGTH(NULL)` is NULL, which is how a NULL cell arrives here.
+    let Some(len) = row.get::<Option<u64>, _>(0).flatten() else {
+        return Ok(None);
+    };
+    let bytes = row
+        .get::<Option<Vec<u8>>, _>(1)
+        .flatten()
+        .unwrap_or_default();
+    Ok(Some(BlobValue { bytes, len }))
+}
+
+/// Build the `SELECT OCTET_LENGTH(c), SUBSTRING(c, 1, ?) … WHERE <key> <=> ? …
+/// LIMIT 1` behind [`blob_on`].
+///
+/// **The length and the bytes come from one row of one statement**, not two
+/// queries: asked separately they can straddle another session's `UPDATE`, and
+/// the pair is what [`BlobValue::truncated`] reads to decide whether saving the
+/// buffer would write a file that is not the data.
+///
+/// `SUBSTRING` on a binary string is byte-indexed in MySQL (it is
+/// character-indexed only for a character string), so the cap really is
+/// [`FETCH_CAP`] octets. The WHERE is `build_update`'s, NULL-safe `<=>` and all
+/// — the identity of a row is one thing on this path, whether it is being
+/// written or read.
+fn build_blob_select(r: &BlobRef) -> (String, Params) {
+    let mut params: Vec<MyValue> = Vec::with_capacity(r.key.len() + 1);
+    params.push(MyValue::UInt(FETCH_CAP as u64));
+    let where_sql = r
+        .key
+        .iter()
+        .map(|(col, val)| {
+            params.push(value_to_param(val));
+            format!("{} <=> ?", ident(col))
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let col = ident(&r.column);
+    let sql = format!(
+        "SELECT OCTET_LENGTH({col}), SUBSTRING({col}, 1, ?) FROM {}.{} WHERE {where_sql} LIMIT 1",
+        ident(&r.database),
+        ident(&r.table),
+    );
+    (sql, Params::Positional(params))
+}
+
 /// Re-`SELECT` just-edited rows on an already-open connection. Read-only, so it
 /// is safe both on a fresh connection and inside an open transaction — and
 /// inside one it is *required*, since only that connection can see the
@@ -6036,6 +6134,83 @@ mod tests {
         assert_eq!(
             build_refetch_sql(&t),
             "SELECT `a``b` FROM `d``b`.`t``t` WHERE `a``b` <=> ? LIMIT 1"
+        );
+    }
+
+    fn blob_ref(key: &[(&str, Value)]) -> BlobRef {
+        BlobRef {
+            database: "db".to_string(),
+            schema: None,
+            table: "staff".to_string(),
+            column: "picture".to_string(),
+            key: key
+                .iter()
+                .map(|(c, v)| (c.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    /// **The cap binds before the key.** The `SUBSTRING` placeholder sits in the
+    /// select list and every key placeholder in the `WHERE` after it, so the
+    /// parameter vector has to be built in that order — reversed, MySQL reads
+    /// the row's id as a byte count and the key as a length, and the statement
+    /// still runs.
+    #[test]
+    fn build_blob_select_binds_the_cap_first_then_the_key() {
+        let (sql, params) = build_blob_select(&blob_ref(&[("staff_id", Value::UInt(1))]));
+        assert_eq!(
+            sql,
+            "SELECT OCTET_LENGTH(`picture`), SUBSTRING(`picture`, 1, ?) \
+             FROM `db`.`staff` WHERE `staff_id` <=> ? LIMIT 1"
+        );
+        let Params::Positional(p) = params else {
+            panic!("positional params expected");
+        };
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0], MyValue::UInt(FETCH_CAP as u64));
+        assert_eq!(p[1], MyValue::UInt(1));
+    }
+
+    /// A composite key joins with `AND`, in `row_key` order — the same WHERE
+    /// `build_update` builds, because it is the same row identity.
+    #[test]
+    fn build_blob_select_joins_a_composite_key_with_and() {
+        let (sql, params) = build_blob_select(&blob_ref(&[
+            ("a", Value::Int(1)),
+            ("b", Value::Str("x".to_string())),
+        ]));
+        assert!(
+            sql.ends_with("WHERE `a` <=> ? AND `b` <=> ? LIMIT 1"),
+            "{sql}"
+        );
+        let Params::Positional(p) = params else {
+            panic!("positional params expected");
+        };
+        assert_eq!(p.len(), 3, "cap + two key values");
+    }
+
+    /// A NULL key value still compares, because the WHERE is NULL-safe — a
+    /// plain `= NULL` would silently match no row and report the cell empty.
+    #[test]
+    fn build_blob_select_keeps_the_null_safe_comparison() {
+        let (sql, _) = build_blob_select(&blob_ref(&[("k", Value::Null)]));
+        assert!(sql.contains("`k` <=> ?"), "{sql}");
+    }
+
+    #[test]
+    fn build_blob_select_escapes_every_identifier() {
+        let r = BlobRef {
+            database: "d`b".to_string(),
+            schema: None,
+            table: "t`t".to_string(),
+            column: "c`c".to_string(),
+            key: vec![("k`k".to_string(), Value::Int(1))],
+        };
+        let (sql, _) = build_blob_select(&r);
+        assert_eq!(
+            sql,
+            "SELECT OCTET_LENGTH(`c``c`), SUBSTRING(`c``c`, 1, ?) \
+             FROM `d``b`.`t``t` WHERE `k``k` <=> ? LIMIT 1"
         );
     }
 

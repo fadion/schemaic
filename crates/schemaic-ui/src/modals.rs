@@ -227,6 +227,11 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             erd_overlay(ui.clone()),
             properties::properties_overlay(ui.clone()),
             users_view::users_overlay(ui.clone()),
+            // The binary-cell panel joins this group on the merits: like the
+            // properties modal beside it, it is a question asked *about the
+            // result on screen* rather than about the schema tree, and it is
+            // raised from the grid's own cell menu.
+            crate::blob_view::blob_overlay(ui.clone()),
         ))
         .style(move |s| {
             if workspace_modals_up() {
@@ -370,14 +375,15 @@ pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
     }
 }
 
-/// The workspace group's modals — Live Monitor, the ER diagram, Properties, and
-/// the Users and privileges browser, which is the one that is not simply open or
-/// closed. See the note in the body.
+/// The workspace group's modals — Live Monitor, the ER diagram, Properties, the
+/// binary-cell panel, and the Users and privileges browser, which is the one
+/// that is not simply open or closed. See the note in the body.
 fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let mon_open = ui.overlay.monitor_open;
     let erd_open = ui.overlay.erd;
     let props_open = ui.overlay.properties;
     let users_open = ui.overlay.users;
+    let blob_open = ui.blob.target;
     // **The browser counts only while it is the thing on screen.** It renders
     // nothing while one of the account forms or the DDL preview is up — those
     // are raised from it and painted in an earlier group — and a wrapper that
@@ -390,6 +396,7 @@ fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
         mon_open.get()
             || erd_open.get().is_some()
             || props_open.get().is_some()
+            || blob_open.get().is_some()
             || (users_open.get().is_some()
                 && account_open.get().is_none()
                 && grant_open.get().is_none()
@@ -479,6 +486,9 @@ mod modal_backdrop_gate {
     /// more often than not. The floor below is what stops a rename making it pass by
     /// finding nothing.
     const PAINTS_A_BACKDROP: &[&str] = &[
+        // In the layer's workspace group, beside `properties.rs`, raised by
+        // `workspace_modals_up`'s `blob_open.get().is_some()` arm.
+        "blob_view.rs",
         "connection_form.rs",
         // A loose child of the layer, directly above `connection_form.rs`'s
         // modal, which is what raises it.
