@@ -261,15 +261,24 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
     // same 12px the rows put their glyph on.
     .style(|s| s.width_full().padding_horiz(row_inset()));
 
-    // **Keyed on the list and the filter, not on the selection.** Picking a row
-    // changes one row's background, and keying on `selected` would throw every
-    // row away and build them all again to do it — on a server with a few
-    // hundred accounts, once per click. The selected row's background is a
-    // *reactive style* reading `selected` instead, which is what floem restyles
-    // without rebuilding — see `account_row`.
+    // **Keyed on the list alone — not on the selection, and not on the filter.**
+    //
+    // Picking a row changes one row's background, and keying on `selected` would
+    // throw every row away and build them all again to do it. The selected row's
+    // background is a *reactive style* reading `selected` instead, which is what
+    // floem restyles without rebuilding — see `account_row`.
+    //
+    // **The filter is now the same trick.** It was part of this key, so one
+    // keystroke discarded every row view and constructed new ones: at the ~1,000
+    // accounts a shared server has, measured in the review at >=13 ms of a
+    // 16.7 ms frame, and >=55 ms at 5,000 — dominated by re-parsing each row's
+    // SVG glyph through `usvg`. Each row now decides for itself whether it is
+    // filtered out, in its own style, and a row that is out takes `display:none`
+    // — so it costs no gap and no layout, and the icon is parsed once per
+    // account for the life of the modal rather than once per keystroke.
     let list = dyn_container(
-        move || (state.get(), filter.get()),
-        move |(st, needle)| match st {
+        move || state.get(),
+        move |st| match st {
             UsersState::Loading => {
                 list_note(icons::CLOCK, theme::text_faint, "Loading accounts".into())
             }
@@ -280,36 +289,64 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
             ),
             UsersState::Failed(e) => list_note(icons::TRIANGLE_ALERT, theme::error, e),
             UsersState::Loaded(list) => {
-                // **Filtered once**, through `users::filter_indices`, rather
-                // than by re-asking the predicate per row here and again in the
-                // footer — each of which re-`format!`ed every account's
-                // `display()`. At the ~1,000 accounts a shared server has, that
-                // second pass alone was measured in the review at several
-                // milliseconds of a 16.7 ms frame, per keystroke.
-                let mut rows: Vec<AnyView> =
-                    schemaic_core::users::filter_indices(&list.list, &needle)
-                        .into_iter()
-                        .map(|i| {
-                            account_row(
-                                list.list[i].clone(),
-                                selected,
-                                grants,
-                                fetch.clone(),
-                                row_target.clone(),
+                let accounts = std::rc::Rc::new(list.list);
+                let mut rows: Vec<AnyView> = accounts
+                    .iter()
+                    .map(|p| {
+                        account_row(
+                            p.clone(),
+                            selected,
+                            grants,
+                            fetch.clone(),
+                            row_target.clone(),
+                            filter,
+                        )
+                    })
+                    .collect();
+
+                // **The empty state is a row of its own**, hidden while anything
+                // matches. It is the one part that genuinely depends on the
+                // needle — it quotes it — so it is the only thing here rebuilt
+                // per keystroke, and it is one note rather than a list.
+                let anything_shown = {
+                    let accounts = accounts.clone();
+                    move |needle: &str| {
+                        accounts
+                            .iter()
+                            .any(|p| schemaic_core::users::matches(p, needle))
+                    }
+                };
+                let shown_style = anything_shown.clone();
+                rows.push(
+                    dyn_container(
+                        move || filter.get(),
+                        move |needle| {
+                            if anything_shown(&needle) {
+                                return crate::widgets::nothing().into_any();
+                            }
+                            list_note(
+                                icons::CIRCLE_QUESTION,
+                                theme::text_faint,
+                                if needle.trim().is_empty() {
+                                    "This server reports no accounts.".into()
+                                } else {
+                                    format!("No account matches \u{201c}{}\u{201d}.", needle.trim())
+                                },
                             )
-                        })
-                        .collect();
-                if rows.is_empty() {
-                    return list_note(
-                        icons::CIRCLE_QUESTION,
-                        theme::text_faint,
-                        if needle.trim().is_empty() {
-                            "This server reports no accounts.".into()
-                        } else {
-                            format!("No account matches “{}”.", needle.trim())
                         },
-                    );
-                }
+                    )
+                    // The container is hidden too, not just its child: an empty
+                    // flex child still claims the stack's gap.
+                    .style(move |s| {
+                        if shown_style(&filter.get()) {
+                            s.hide()
+                        } else {
+                            s.width_full()
+                        }
+                    })
+                    .into_any(),
+                );
+
                 // **Under the list, the way the privileges pane renders
                 // `Grants::note`.** A list that is silently partial is the one
                 // way this feature can mislead, and the footer's "1 account" is
@@ -361,7 +398,9 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
 /// dropped in beside them would otherwise start hard against the edge.
 fn list_note(icon: &'static str, color: fn() -> floem::peniko::Color, message: String) -> AnyView {
     container(note(icon, color, message))
-        .style(|s| s.width_full().padding_horiz(row_inset()))
+        // `min_width(0)` so the note inside can shrink and wrap rather than
+        // pushing this container past the column — see `widgets::fact_note`.
+        .style(|s| s.width_full().min_width(0.0).padding_horiz(row_inset()))
         .into_any()
 }
 
@@ -374,8 +413,13 @@ fn account_row(
     grants: RwSignal<GrantsState>,
     fetch: Rc<dyn Fn(UsersTarget, Principal)>,
     target: UsersTarget,
+    filter: RwSignal<String>,
 ) -> AnyView {
     let display = p.display();
+    // The name this row matches on, resolved once. `users::matches` would
+    // re-derive it from the `Principal` on every restyle — hover included — and
+    // the whole point of filtering here is that it costs no allocation.
+    let searchable = display.clone();
     // The comparison the reactive style makes, resolved once: a `Principal` is a
     // handful of `String`s and this runs on every restyle of every row.
     let me = p.clone();
@@ -423,6 +467,13 @@ fn account_row(
         // test. On a server with a couple of hundred accounts that is a couple
         // of hundred heap allocations per frame while the pointer moves down
         // the list.
+        // **Filtered out is `display:none`**, so the row costs no layout and no
+        // gap — an empty flex child would still claim the stack's spacing. This
+        // is what makes the filter a restyle instead of a rebuild; see the
+        // container above.
+        if !schemaic_core::users::matches_display(&searchable, &filter.get()) {
+            return s.hide();
+        }
         let mine = selected.with(|sel| sel.as_ref() == Some(&me));
         let s = s
             .width_full()
@@ -522,6 +573,18 @@ fn heading(p: &Principal) -> AnyView {
 }
 
 /// The privileges, in whichever of the four states the per-account fetch is in.
+/// How many `GRANT` statements the pane renders before it stops and says so.
+///
+/// Not a limit on the *answer* — `Grants::statements` is whole, Copy privileges
+/// takes all of it, and the note below the list says how many there are. It is a
+/// limit on what is built: each row lexes SQL and shapes a `RichText`, and a
+/// role with privileges across a large schema runs to several hundred, all of
+/// which re-shape on a theme switch.
+///
+/// Two hundred is well past what anyone reads down a scroll and well short of
+/// where the cost is felt.
+const STATEMENT_CAP: usize = 200;
+
 fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
     let rows: Vec<AnyView> = match st {
         GrantsState::Idle | GrantsState::Loading => {
@@ -548,9 +611,28 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
             } else {
                 statements
                     .iter()
+                    .take(STATEMENT_CAP)
                     .map(|s| statement_row(s, dialect))
                     .collect()
             };
+            // **What the cap left out, said rather than left off.** Every row
+            // here lexes its SQL and shapes a `RichText`, and all of them
+            // re-shape on a theme change; `pg_grant_statements`' own comment
+            // documents the input as a role with privileges on every table of a
+            // 500-table schema. A pane that silently stopped at the cap would be
+            // the "quietly partial privilege screen" this whole feature is
+            // written against, so the count is on screen and Copy still takes
+            // the lot — it is the *rendering* that is capped, not the answer.
+            if statements.len() > STATEMENT_CAP {
+                rows.push(note(
+                    icons::CIRCLE_QUESTION,
+                    theme::text_faint,
+                    format!(
+                        "Showing the first {STATEMENT_CAP} of {} statements.                          Copy privileges takes all of them.",
+                        statements.len()
+                    ),
+                ));
+            }
             if let Some(n) = n {
                 rows.push(note(icons::CIRCLE_QUESTION, theme::text_faint, n));
             }
