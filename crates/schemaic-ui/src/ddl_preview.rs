@@ -952,58 +952,66 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
+/// A `DdlUi` with every signal freshly made, for the tests in this crate that
+/// need one.
+///
+/// Every editor signal is written out, so a test fails to compile rather than
+/// silently pass when a seventh one is added. `pub(crate)` because
+/// `account_editor`'s opener tests need the same bundle and a second copy is how
+/// the two come to disagree about what an editor is.
+#[cfg(test)]
+pub(crate) fn test_ddl_ui(scope: floem::reactive::Scope) -> crate::DdlUi {
+    crate::DdlUi {
+        designer: scope.create_rw_signal(None),
+        draft: scope.create_rw_signal(Default::default()),
+        tab: scope.create_rw_signal(crate::DesignerTab::Table),
+        selected: scope.create_rw_signal(0),
+        rev: scope.create_rw_signal(0),
+        view: scope.create_rw_signal(None),
+        view_draft: scope.create_rw_signal(Default::default()),
+        view_rows: scope.create_rw_signal(14),
+        trigger: scope.create_rw_signal(None),
+        trigger_draft: scope.create_rw_signal(Default::default()),
+        routine: scope.create_rw_signal(None),
+        routine_draft: scope.create_rw_signal(Default::default()),
+        routine_body: scope.create_rw_signal(String::new()),
+        routine_source_pending: scope.create_rw_signal(false),
+        routine_body_stale: scope.create_rw_signal(false),
+        event: scope.create_rw_signal(None),
+        event_draft: scope.create_rw_signal(Default::default()),
+        event_body: scope.create_rw_signal(String::new()),
+        event_source_pending: scope.create_rw_signal(false),
+        event_body_stale: scope.create_rw_signal(false),
+        functions: scope.create_rw_signal(Vec::new()),
+        database: scope.create_rw_signal(None),
+        database_draft: scope.create_rw_signal(Default::default()),
+        account: scope.create_rw_signal(None),
+        account_draft: scope.create_rw_signal(Default::default()),
+        grant: scope.create_rw_signal(None),
+        grant_draft: scope.create_rw_signal(Default::default()),
+        roles: scope.create_rw_signal(Vec::new()),
+        object: scope.create_rw_signal(None),
+        object_draft: scope.create_rw_signal(Default::default()),
+        object_errors: scope.create_rw_signal(Vec::new()),
+        object_rev: scope.create_rw_signal(0),
+        preview: scope.create_rw_signal(None),
+        sql: scope.create_rw_signal(String::new()),
+        sql_rows: scope.create_rw_signal(16),
+        applying: scope.create_rw_signal(false),
+        error: scope.create_rw_signal(None),
+        applied: scope.create_rw_signal(false),
+        generation: scope.create_rw_signal(0),
+        session: scope.create_rw_signal(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use floem::reactive::Scope;
     use schemaic_core::intel::SqlDialect;
 
-    /// Every editor signal, so the test fails to compile rather than silently
-    /// pass if a seventh one is added.
-    fn ddl_ui(scope: Scope) -> crate::DdlUi {
-        crate::DdlUi {
-            designer: scope.create_rw_signal(None),
-            draft: scope.create_rw_signal(Default::default()),
-            tab: scope.create_rw_signal(crate::DesignerTab::Table),
-            selected: scope.create_rw_signal(0),
-            rev: scope.create_rw_signal(0),
-            view: scope.create_rw_signal(None),
-            view_draft: scope.create_rw_signal(Default::default()),
-            view_rows: scope.create_rw_signal(14),
-            trigger: scope.create_rw_signal(None),
-            trigger_draft: scope.create_rw_signal(Default::default()),
-            routine: scope.create_rw_signal(None),
-            routine_draft: scope.create_rw_signal(Default::default()),
-            routine_body: scope.create_rw_signal(String::new()),
-            routine_source_pending: scope.create_rw_signal(false),
-            routine_body_stale: scope.create_rw_signal(false),
-            event: scope.create_rw_signal(None),
-            event_draft: scope.create_rw_signal(Default::default()),
-            event_body: scope.create_rw_signal(String::new()),
-            event_source_pending: scope.create_rw_signal(false),
-            event_body_stale: scope.create_rw_signal(false),
-            functions: scope.create_rw_signal(Vec::new()),
-            database: scope.create_rw_signal(None),
-            database_draft: scope.create_rw_signal(Default::default()),
-            account: scope.create_rw_signal(None),
-            account_draft: scope.create_rw_signal(Default::default()),
-            grant: scope.create_rw_signal(None),
-            grant_draft: scope.create_rw_signal(Default::default()),
-            roles: scope.create_rw_signal(Vec::new()),
-            object: scope.create_rw_signal(None),
-            object_draft: scope.create_rw_signal(Default::default()),
-            object_errors: scope.create_rw_signal(Vec::new()),
-            object_rev: scope.create_rw_signal(0),
-            preview: scope.create_rw_signal(None),
-            sql: scope.create_rw_signal(String::new()),
-            sql_rows: scope.create_rw_signal(16),
-            applying: scope.create_rw_signal(false),
-            error: scope.create_rw_signal(None),
-            applied: scope.create_rw_signal(false),
-            generation: scope.create_rw_signal(0),
-            session: scope.create_rw_signal(0),
-        }
-    }
+    use super::test_ddl_ui as ddl_ui;
 
     /// After a successful Apply — and after "Open in editor" — **no** editor may
     /// still be holding its pre-apply draft.

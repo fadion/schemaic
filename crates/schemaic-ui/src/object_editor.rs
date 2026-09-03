@@ -698,6 +698,7 @@ fn domain_form(
                             .map(|t| t.to_string())
                             .collect()
                     },
+                    "This engine suggests no base types",
                     ring.clone(),
                     21,
                 ),
