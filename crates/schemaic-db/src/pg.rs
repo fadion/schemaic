@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use schemaic_core::activity::{self, KillKind, SessionInfo};
+use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
@@ -3468,6 +3469,101 @@ pub(crate) async fn write_on(
     Ok(total)
 }
 
+/// [`Db::fetch_blob`]'s PostgreSQL body — read one `bytea` cell.
+pub(crate) async fn fetch_blob(
+    db: &Db,
+    r: &BlobRef,
+    cancel: CancellationToken,
+) -> Result<Option<BlobValue>, DbError> {
+    let client = connect_to(db, &r.database).await?;
+    let token = client.cancel_token();
+    tokio::select! {
+        res = blob_on(&client, r) => res,
+        _ = cancel.cancelled() => {
+            cancel_query(db, &token).await;
+            Err(DbError::Cancelled)
+        }
+    }
+}
+
+/// [`fetch_blob`]'s body on an already-open client, so a manual-transaction
+/// tab's pinned connection can read bytes it has written but not committed.
+///
+/// **The bytes arrive as text and are decoded here**, because this path speaks
+/// the simple-query protocol like every other read in this module: a `bytea`
+/// comes over as `\x89504e47…`, which is what [`bytea_hex_bytes`] turns back
+/// into the value. That is also why the length is taken from `octet_length` and
+/// not from the hex string — they agree for a whole value and deliberately do
+/// not for a capped one.
+pub(crate) async fn blob_on(client: &Client, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
+    let col = pg_ident(&r.column);
+    let sql = format!(
+        "SELECT octet_length({col}), substring({col} from 1 for {FETCH_CAP}) FROM {} WHERE {} LIMIT 1",
+        pg_qname(r.schema.as_deref(), &r.table),
+        where_key(&r.key),
+    );
+    let msgs = client
+        .simple_query(&sql)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    for m in msgs {
+        let SimpleQueryMessage::Row(row) = m else {
+            continue;
+        };
+        // A NULL cell makes `octet_length` NULL too, which `get` reports as
+        // `None` — the same "no bytes to show" as a row that is gone.
+        let Some(len) = row.get(0).and_then(|s| s.parse::<u64>().ok()) else {
+            return Ok(None);
+        };
+        // **A value this cannot decode is an error, not an empty one.** The
+        // decoder refuses anything that is not the `\x…` hex form — a server
+        // with `bytea_output = escape` sends the other one — and substituting
+        // an empty buffer here would pair *no bytes* with the real
+        // `octet_length`: the panel would report 35.5 KB over an empty dump and
+        // call the value truncated, which is the "looks like data" failure
+        // `bytea_hex_bytes`' own doc refuses to commit. Naming the setting is
+        // the only part of this the user can act on.
+        let bytes = match row.get(1) {
+            // A zero-length `bytea` is `\x`, which decodes to an empty vec —
+            // distinct from a column that decoded to nothing.
+            Some(text) => bytea_hex_bytes(text).ok_or_else(|| {
+                DbError::Query(
+                    "this server sends bytea in a format Schemaic cannot decode \
+                     (expected the hex form `\\x…`); set `bytea_output = hex` on \
+                     the server or the session to read binary values"
+                        .to_string(),
+                )
+            })?,
+            // The length was not NULL but the value was: impossible from one
+            // row, and not something to invent bytes for.
+            None => return Ok(None),
+        };
+        return Ok(Some(BlobValue { bytes, len }));
+    }
+    Ok(None)
+}
+
+/// Decode the text protocol's `\x…` `bytea` form into the bytes it stands for.
+///
+/// The byte-counting half of this is [`bytea_hex_len`], and both are deliberate
+/// about rejecting rather than salvaging: a `bytea` whose text is not the hex
+/// form (a server with `bytea_output = escape`) must not be *half* decoded into
+/// something that looks like data, for the same reason `binary_display`
+/// replaced MySQL's `from_utf8_lossy`.
+fn bytea_hex_bytes(text: &str) -> Option<Vec<u8>> {
+    let hex = text.strip_prefix("\\x")?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
 /// Re-`SELECT` the given just-edited rows by their (post-edit) key, so the grid
 /// can splice DB truth back in without re-running the whole query. One
 /// `SELECT … LIMIT 1` per row; rows that no longer match are skipped. Read-only.
@@ -4183,6 +4279,34 @@ mod tests {
         assert_eq!(bytea_hex_len("\\x4"), None);
         assert_eq!(bytea_hex_len("\\xzz"), None);
         assert_eq!(bytea_hex_len("48656c"), None);
+    }
+
+    /// **The decoder and the counter agree on what is hex output.** They are the
+    /// two halves of one `bytea` text form — one runs on every loaded cell, the
+    /// other only when the panel fetches — and a value either has this encoding
+    /// or does not. A decoder that salvaged what the counter rejects would put
+    /// bytes on screen that are not the value.
+    #[test]
+    fn bytea_hex_decodes_to_the_bytes_it_counts() {
+        assert_eq!(bytea_hex_bytes("\\x48656c6c6f"), Some(b"Hello".to_vec()));
+        assert_eq!(bytea_hex_bytes("\\x"), Some(Vec::new()));
+        // Case-insensitive, and the high bytes a text path would have mangled.
+        assert_eq!(
+            bytea_hex_bytes("\\x89504E470D0a1A0a"),
+            Some(b"\x89PNG\r\n\x1a\n".to_vec())
+        );
+        for bad in ["\\x4", "\\xzz", "48656c", "Hello\\000", ""] {
+            assert_eq!(bytea_hex_bytes(bad), None, "{bad:?} should not decode");
+            assert_eq!(bytea_hex_len(bad), None, "{bad:?} should not count");
+        }
+        // And where it does decode, the two answers are the same length.
+        for good in ["\\x", "\\x00", "\\xdeadbeef"] {
+            assert_eq!(
+                bytea_hex_bytes(good).map(|b| b.len()),
+                bytea_hex_len(good),
+                "{good:?}"
+            );
+        }
     }
 
     /// A `text` column may legitimately hold the characters `\x4869`, and the

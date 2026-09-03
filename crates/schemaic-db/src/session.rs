@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use mysql_async::Conn;
 use mysql_async::prelude::Queryable;
+use schemaic_core::blob::{BlobRef, BlobValue};
 use schemaic_core::model::{GridWrite, RefetchRow, RefetchTemplate, ResultSet, Value};
 use schemaic_core::tx::{self, StmtOutcome};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +39,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Db, DbError, Engine, TxScope, collect_rows, pg, refetch_on, write_on};
+use crate::{Db, DbError, Engine, TxScope, blob_on, collect_rows, pg, refetch_on, write_on};
 
 /// An operation's result plus what it means for the enclosing transaction.
 ///
@@ -551,6 +552,44 @@ impl Session {
             }
         };
         Session::classify_isolated(&mut guard, result).await
+    }
+
+    /// Read one binary cell's bytes **on this connection**.
+    ///
+    /// The same reason [`Session::refetch_rows`] exists: a fresh connection
+    /// cannot see what this transaction has written, so a blob the user changed
+    /// with their own `UPDATE` a statement ago would otherwise open the panel on
+    /// the pre-transaction bytes and call them current.
+    pub async fn fetch_blob(
+        &self,
+        r: &BlobRef,
+        cancel: CancellationToken,
+    ) -> Outcome<Option<BlobValue>> {
+        let mut guard = self.inner.lock().await;
+        let result = match &mut *guard {
+            Backend::MySql { conn, conn_id } => {
+                let conn_id = *conn_id;
+                tokio::select! {
+                    res = blob_on(conn, r) => res,
+                    _ = cancel.cancelled() => {
+                        self.db.kill_query(conn_id).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+            Backend::Postgres { client } => {
+                let token = client.cancel_token();
+                tokio::select! {
+                    res = pg::blob_on(client, r) => res,
+                    // Over this session's own transport. See `pg::cancel_query`.
+                    _ = cancel.cancelled() => {
+                        pg::cancel_query(&self.db, &token).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+        };
+        Session::classify(&mut guard, result).await
     }
 
     /// Re-read just-edited rows **on this connection** — the only one that can

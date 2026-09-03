@@ -76,6 +76,28 @@ impl EditModel {
         self.tables.get(idx)
     }
 
+    /// The keyed base table with this exact provenance, **whether or not any of
+    /// its columns is editable**.
+    ///
+    /// [`EditModel::table_index`] is the same lookup asked through the
+    /// `col_table` map, and cannot answer for a column C2 excluded — a
+    /// binary column has no entry there even though its table has a perfectly
+    /// good key, which is precisely the case [`crate::blob::blob_source`] is
+    /// about. Matching on the triple rather than on the table name alone is the
+    /// same requirement `analyze_edit`'s grouping states: `sales.orders` and
+    /// `archive.orders` are different tables, and one must never answer for the
+    /// other.
+    pub fn table_for_origin(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Option<&EditTable> {
+        self.tables
+            .iter()
+            .find(|t| t.database == database && t.schema.as_deref() == schema && t.table == table)
+    }
+
     /// The sole base table an `INSERT` would target, if the result maps to exactly
     /// one writable table (the destination for a new row). `None` for a
     /// multi-table join or a non-editable / read-only result.

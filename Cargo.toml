@@ -35,7 +35,22 @@ schemaic-ui = { path = "crates/schemaic-ui" }
 # UI
 # `rfd-tokio` enables the native file picker (`file_action::open_file`), used by
 # the Manage-Connections SSH key-pair "Browse…" button.
-floem = { version = "0.2.0", features = ["rfd-tokio"] }
+#
+# **`image-gif` / `image-bmp` are the binary-cell panel's preview**, and they are
+# here rather than left off because the alternative is worse than a missing
+# feature: `img()` renders whatever it can decode and draws *nothing* for what it
+# cannot, so a GIF in a BLOB would open a panel that says "GIF image · 12 KB"
+# above an empty box. floem's `default-image-formats` covers PNG, JPEG, WebP and
+# ICO; these two close the gap between what `blob::sniff` can name and what the
+# renderer can show, and `blob::BlobKind::is_image` is the list of both.
+#
+# They are not free in the same way: `image-bmp` is a decoder already inside the
+# `image` crate floem compiles, and costs nothing but the code; `image-gif`
+# pulls `gif` 0.14 — a *second* copy alongside the 0.13 resvg already brings in,
+# which `cargo deny`'s `bans` allows and which is the whole price. Pure Rust,
+# MIT/Apache, and the alternative was a panel captioned "GIF image" over an
+# empty box.
+floem = { version = "0.2.0", features = ["rfd-tokio", "image-gif", "image-bmp"] }
 
 # Async / DB (wired in M1)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

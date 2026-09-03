@@ -26,6 +26,7 @@
 //! The macro takes them grouped by module because the group a test belongs to is
 //! the one thing its name does not say.
 
+mod blob;
 mod cases;
 mod ddl;
 mod editable;
@@ -75,6 +76,13 @@ macro_rules! live_suite {
 }
 
 live_suite!(
+    blob: [
+        a_blob_reads_back_byte_for_byte,
+        a_blob_fetch_lands_on_the_row_its_key_names,
+        a_null_blob_reports_nothing,
+        a_binary_cell_in_a_real_result_resolves_and_fetches,
+        a_stored_png_still_sniffs_as_one_after_the_round_trip,
+    ],
     suite: [
         a_ping_reaches_the_server,
         a_seeded_table_round_trips_through_a_query,

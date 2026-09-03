@@ -9,7 +9,9 @@
 mod account_editor;
 mod activity_panel;
 mod ai_panel;
+mod blob_view;
 pub use ai_panel::mark_messages_seen;
+pub use blob_view::{BlobPane, BlobState, BlobTarget, BlobUi};
 mod cell_editors;
 mod completion;
 mod connection_form;
@@ -601,6 +603,34 @@ pub struct ErdExportRequest {
 /// and run here ([`ErdDoc::into_bytes`]); the modal owns the save dialog and the
 /// measurement the font system pins to the UI thread.
 pub type ErdExportFn = Rc<dyn Fn(ErdExportRequest, ExportDoneFn)>;
+
+/// One binary cell's bytes, and where to write them.
+#[derive(Clone)]
+pub struct BlobSaveRequest {
+    pub path: std::path::PathBuf,
+    /// The whole value. The panel refuses to offer a save of a **truncated**
+    /// buffer, so what arrives here is always the value and never its front —
+    /// see `blob::BlobValue::truncated`.
+    pub bytes: std::sync::Arc<schemaic_core::blob::BlobValue>,
+    /// Which opening of the panel asked for this save — handed back to
+    /// [`BlobUi::saved_at`], which drops a report from a superseded one.
+    pub epoch: u64,
+}
+
+/// Write a binary cell's bytes to a file **off the UI thread**, reporting the
+/// path written or why it failed into [`BlobUi::saved`].
+///
+/// Off-thread for the same reason the ERD export is: the buffer is up to
+/// `blob::FETCH_CAP`, and a 64 MiB `fs::write` on the UI thread is a frozen
+/// window. The panel owns the save dialog; this only writes.
+pub type BlobSaveFn = Rc<dyn Fn(BlobSaveRequest)>;
+
+/// Raise the binary-cell panel on one cell and fetch its bytes.
+///
+/// The `u64` is the connection the **rows** came from (`conn_at_load`), not the
+/// tab's current one: a blob re-read over a different connection is a different
+/// database's row with the same key.
+pub type ViewBlobFn = Rc<dyn Fn(u64, schemaic_core::blob::BlobRef, BlobTarget)>;
 
 /// The table an import is loading into, captured when the modal opens so a
 /// schema refresh underneath it can't retarget the import.
@@ -3201,6 +3231,21 @@ pub struct TabsActions {
     /// Stop the running streamed export. The app owns the cancellation token, as
     /// it does for query runs and imports.
     pub export_cancel: Rc<dyn Fn()>,
+    /// Write a binary cell's bytes to a file on a worker thread. The
+    /// binary-cell panel owns the save dialog and decides whether a save may be
+    /// offered at all; this writes.
+    pub save_blob: BlobSaveFn,
+    /// Raise the binary-cell panel on a grid cell and fetch its bytes — see
+    /// [`ViewBlobFn`].
+    pub view_blob: ViewBlobFn,
+    /// Stop the binary-cell panel's in-flight read.
+    ///
+    /// The panel's exit calls this before closing, for `export_cancel`'s reason
+    /// narrowed to a read: the fetch can be a 64 MiB transfer, and a panel
+    /// dismissed on the first frame would otherwise hold a connection busy
+    /// streaming a payload whose only reader has gone. Idempotent — cancelling
+    /// a finished or absent read does nothing.
+    pub cancel_blob: Rc<dyn Fn()>,
     /// Write an exported ER diagram to a file on a worker thread. The diagram
     /// modal owns the save dialog and renders the document; this rasterises (PNG
     /// only) and writes.
@@ -4380,6 +4425,9 @@ pub struct Ui {
     /// The grid export's progress modal — the one surface that says how far an
     /// export has got, for both scopes.
     pub export: ExportUi,
+    /// The binary-cell panel — the hex/preview modal a `<n bytes>` cell opens
+    /// into, and the only surface in the app that holds a blob's real bytes.
+    pub blob: BlobUi,
     /// The script-load modal — **Import** on a database or namespace node, the
     /// inverse of the *Export* directly above it in the same menu.
     pub script: ScriptUi,
@@ -6192,6 +6240,7 @@ fn center(ui: Ui) -> impl IntoView {
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
     let db_stats = ui.schema_actions.db_stats.clone();
+    let view_blob = ui.tab_actions.view_blob.clone();
     // Properties for a query tab's source table — the results toolbar's entry.
     // Built here because `GridCtx` takes callbacks, not the whole `Ui` (like
     // `create_view` below), and because only the loaded schema knows whether the
@@ -6386,6 +6435,7 @@ fn center(ui: Ui) -> impl IntoView {
                     open_monitor: open_monitor.clone(),
                     open_properties: open_properties.clone(),
                     db_stats: db_stats.clone(),
+                    view_blob: view_blob.clone(),
                     ai_fill: ai_fill.clone(),
                     ai_seed: ai_seed.clone(),
                     dismiss: dismiss_menus.clone(),

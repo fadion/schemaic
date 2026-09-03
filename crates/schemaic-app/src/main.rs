@@ -3676,6 +3676,135 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         )
     };
 
+    // The binary-cell panel's own state, built here so both halves below can
+    // report into it: the fetch that fills it and the save that writes from it.
+    let blob = schemaic_ui::BlobUi::new();
+
+    // Read one binary cell's bytes for the panel. The grid holds none — every
+    // engine drops them at the wire — so opening a `<n bytes>` cell is a second,
+    // targeted `SELECT` keyed by the row's own identity.
+    //
+    // **The connection is the result's, and the session is the tab's.** A blob
+    // is re-read over `conn_at_load`, because that is where the row with this
+    // key lives; but when the *active* tab holds a manual transaction on that
+    // same connection, the read has to go over its pinned session or it cannot
+    // see bytes the transaction has written and not committed. The two
+    // conditions are separate and both are required — a session belonging to
+    // some other connection would answer with a different database's row.
+    // The in-flight read's token, so the panel's exit can stop it and a second
+    // opening cannot leave the first one streaming. A plain `Rc<RefCell<..>>`
+    // rather than a signal: nothing renders from it, and every touch is on the
+    // UI thread.
+    let blob_cancel: Rc<std::cell::RefCell<Option<CancellationToken>>> =
+        Rc::new(Default::default());
+
+    let view_blob: schemaic_ui::ViewBlobFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let session_for = session_for.clone();
+        let blob_cancel = blob_cancel.clone();
+        Rc::new(
+            move |conn_id: u64,
+                  r: schemaic_core::blob::BlobRef,
+                  target: schemaic_ui::BlobTarget| {
+                let epoch = blob.open(target);
+                let db = match db_for(conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        blob.loaded(epoch, schemaic_ui::BlobState::Failed(e));
+                        return;
+                    }
+                };
+                // Only the active tab can hold a transaction, and only its own
+                // connection's. A tab whose session cannot be resolved is not an
+                // error here: a read over a fresh connection is still the right
+                // answer, just without the uncommitted rows.
+                let id = active.get_untracked();
+                let tab = tabs
+                    .with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+                    .filter(|t| t.conn_id.get_untracked() == conn_id);
+                let session = tab.and_then(|t| session_for(&t).ok().flatten());
+                let report =
+                    create_ext_action(cx, move |st: schemaic_ui::BlobState| blob.loaded(epoch, st));
+                // **A read on the pinned connection still tells the transaction
+                // what happened to it.** `Session` reports an `Outcome`, not a
+                // `Result`, because a statement that lost the connection has to
+                // reach `TxState::on_statement` — otherwise the footer pill goes
+                // on claiming a live transaction over a dead socket and leaves
+                // Commit enabled for one that no longer exists. Every other
+                // session call site folds this; a blob read is not special.
+                let engine = tx_engine(&db);
+                let fold = tab.map(|tab| {
+                    create_ext_action(cx, move |stmt: StmtOutcome| {
+                        tab.tx
+                            .update(|t| *t = t.on_statement(engine, "SELECT", stmt));
+                    })
+                });
+                // A previous read is superseded rather than left running: the
+                // panel can only show one cell, so the earlier answer has no
+                // reader even before the epoch guard drops it.
+                let token = CancellationToken::new();
+                if let Some(prev) = blob_cancel.borrow_mut().replace(token.clone()) {
+                    prev.cancel();
+                }
+                handle.spawn(async move {
+                    let out = match &session {
+                        Some(s) => {
+                            let out = s.fetch_blob(&r, token).await;
+                            if let Some(fold) = fold {
+                                fold(out.stmt);
+                            }
+                            out.result
+                        }
+                        None => db.fetch_blob(&r, token).await,
+                    };
+                    report(match out {
+                        Ok(Some(v)) => {
+                            let kind = schemaic_core::blob::sniff(&v.bytes);
+                            schemaic_ui::BlobState::Ready {
+                                value: std::sync::Arc::new(v),
+                                kind,
+                            }
+                        }
+                        Ok(None) => schemaic_ui::BlobState::Empty,
+                        Err(e) => schemaic_ui::BlobState::Failed(e.to_string()),
+                    });
+                });
+            },
+        )
+    };
+
+    // Write the panel's bytes to the file its dialog chose. Off the UI thread
+    // for the reason the ERD export is: the buffer runs to `blob::FETCH_CAP`,
+    // and a 64 MiB `fs::write` on the UI thread is a frozen window.
+    // Stop whatever the panel is reading. Idempotent: a finished read's token
+    // is still here and cancelling it does nothing.
+    let cancel_blob: Rc<dyn Fn()> = {
+        let blob_cancel = blob_cancel.clone();
+        Rc::new(move || {
+            if let Some(token) = blob_cancel.borrow_mut().take() {
+                token.cancel();
+            }
+        })
+    };
+
+    let save_blob: schemaic_ui::BlobSaveFn = {
+        let handle = handle.clone();
+        Rc::new(move |req: schemaic_ui::BlobSaveRequest| {
+            let epoch = req.epoch;
+            let report =
+                create_ext_action(cx, move |r: Result<String, String>| blob.saved_at(epoch, r));
+            handle.spawn_blocking(move || {
+                let shown = req.path.display().to_string();
+                report(
+                    std::fs::write(&req.path, &req.bytes.bytes)
+                        .map(|()| shown)
+                        .map_err(|e| format!("Save failed: {e}")),
+                );
+            });
+        })
+    };
+
     // Commit staged grid changes (cell edits + new-row inserts): run them in one
     // transaction off-thread, then reflect the database's truth (triggers /
     // defaults / computed columns). If the grid supplied a re-fetch request (a
@@ -9460,6 +9589,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             export_file,
             export_cancel,
             export_erd,
+            save_blob,
+            view_blob,
+            cancel_blob,
             set_tx_mode,
             commit_tx,
             rollback_tx,
@@ -9654,6 +9786,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             done: RwSignal::new(None),
             error: RwSignal::new(None),
         },
+        // Its own reset lives on the bundle (`BlobUi::open`), because a panel
+        // reopened on a second cell must not inherit the first one's "Saved
+        // to …" — see that method.
+        blob,
         // The load half of `dump` above, and the same bundle rule.
         script: schemaic_ui::ScriptUi {
             target: RwSignal::new(None),

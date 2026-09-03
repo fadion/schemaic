@@ -8,6 +8,7 @@
 
 pub mod activity;
 pub mod aggregate;
+pub mod blob;
 pub mod celledit;
 pub mod chat;
 pub mod conn_import;
