@@ -3705,9 +3705,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let blob_cancel = blob_cancel.clone();
         Rc::new(
             move |conn_id: u64,
-                  r: schemaic_core::blob::BlobRef,
-                  target: schemaic_ui::BlobTarget| {
-                let epoch = blob.open(target);
+                  r: Option<schemaic_core::blob::BlobRef>,
+                  target: schemaic_ui::BlobTarget,
+                  stage: Option<schemaic_ui::BlobStageFn>| {
+                // **Supersede the previous read first, whatever this opening
+                // turns out to be.** The panel shows one cell, so an earlier
+                // fetch has no reader the moment this one opens — and the
+                // epoch guard only stops its *answer* landing, not the transfer
+                // itself, which runs to `FETCH_CAP` holding a connection (or the
+                // tab's pinned session) busy. This sat below the `BlobRef`
+                // branch and so was skipped entirely by a cell with nothing to
+                // fetch: opening a NULL cell left the previous blob streaming.
+                let token = CancellationToken::new();
+                if let Some(prev) = blob_cancel.borrow_mut().replace(token.clone()) {
+                    prev.cancel();
+                }
+                // Nothing committed to read — a pending new row, or a NULL cell.
+                // The panel opens *in* the same `Empty` the server would have
+                // answered with, and is a loader rather than a viewer. Opened in
+                // that state rather than told about it a line later: the two are
+                // one turn apart, which is close enough for the panel's rebuild
+                // to carry the state it no longer has.
+                let Some(r) = r else {
+                    blob.open(target, stage, schemaic_ui::BlobState::Empty);
+                    return;
+                };
+                let epoch = blob.open(target, stage, schemaic_ui::BlobState::Loading);
                 let db = match db_for(conn_id) {
                     Ok(db) => db,
                     Err(e) => {
@@ -3740,13 +3763,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             .update(|t| *t = t.on_statement(engine, "SELECT", stmt));
                     })
                 });
-                // A previous read is superseded rather than left running: the
-                // panel can only show one cell, so the earlier answer has no
-                // reader even before the epoch guard drops it.
-                let token = CancellationToken::new();
-                if let Some(prev) = blob_cancel.borrow_mut().replace(token.clone()) {
-                    prev.cancel();
-                }
                 handle.spawn(async move {
                     let out = match &session {
                         Some(s) => {
@@ -3785,6 +3801,49 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             if let Some(token) = blob_cancel.borrow_mut().take() {
                 token.cancel();
             }
+        })
+    };
+
+    // Read a file into the panel, off the UI thread for `save_blob`'s reason in
+    // reverse: the file can be as large as the value it replaces.
+    let load_blob: schemaic_ui::BlobLoadFn = {
+        let handle = handle.clone();
+        Rc::new(move |req: schemaic_ui::BlobLoadRequest| {
+            let epoch = req.epoch;
+            let report = create_ext_action(cx, move |r: Result<Vec<u8>, String>| {
+                blob.loaded_file(epoch, r)
+            });
+            handle.spawn_blocking(move || {
+                // **The size is checked before the read, not after.** Refusing a
+                // 4 GB file by looking at the `Vec` it produced means allocating
+                // it first, which is the failure the cap is for. `metadata` is
+                // one stat call and the read still bounds itself below, since a
+                // file can grow between the two.
+                let cap = schemaic_core::blob::LOAD_CAP as u64;
+                let too_big = |n: u64| {
+                    format!(
+                        "That file is {} — the most that can be loaded is {}.",
+                        schemaic_core::format::human_bytes(n as i64),
+                        schemaic_core::format::human_bytes(cap as i64)
+                    )
+                };
+                match std::fs::metadata(&req.path) {
+                    Ok(m) if schemaic_core::blob::load_too_large(m.len()) => {
+                        return report(Err(too_big(m.len())));
+                    }
+                    Ok(_) => {}
+                    // No metadata is not a refusal — the read below reports the
+                    // real error, which says more than a guess about size would.
+                    Err(_) => {}
+                }
+                report(match std::fs::read(&req.path) {
+                    Ok(bytes) if schemaic_core::blob::load_too_large(bytes.len() as u64) => {
+                        Err(too_big(bytes.len() as u64))
+                    }
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Err(format!("Load failed: {e}")),
+                });
+            });
         })
     };
 
@@ -9590,6 +9649,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             export_cancel,
             export_erd,
             save_blob,
+            load_blob,
             view_blob,
             cancel_blob,
             set_tx_mode,

@@ -618,19 +618,67 @@ pub struct BlobSaveRequest {
 }
 
 /// Write a binary cell's bytes to a file **off the UI thread**, reporting the
-/// path written or why it failed into [`BlobUi::saved`].
+/// path written or why it failed into [`BlobUi::note`].
 ///
 /// Off-thread for the same reason the ERD export is: the buffer is up to
 /// `blob::FETCH_CAP`, and a 64 MiB `fs::write` on the UI thread is a frozen
 /// window. The panel owns the save dialog; this only writes.
 pub type BlobSaveFn = Rc<dyn Fn(BlobSaveRequest)>;
 
-/// Raise the binary-cell panel on one cell and fetch its bytes.
+/// One file's bytes, and which opening of the panel asked for them.
+#[derive(Clone)]
+pub struct BlobLoadRequest {
+    pub path: std::path::PathBuf,
+    /// Handed back to [`BlobUi::loaded_file`], which drops a report from a
+    /// superseded opening — the same guard [`BlobSaveRequest::epoch`] carries.
+    pub epoch: u64,
+}
+
+/// Read a file into a binary cell **off the UI thread**, reporting its bytes (or
+/// why it failed) into [`BlobUi::loaded_file`].
+///
+/// Bytes only — no file name. The status line sits under a title already naming
+/// the cell, and the sentence has to fit beside the footer's buttons.
+///
+/// The mirror of [`BlobSaveFn`], off-thread for the same reason: the file can be
+/// as big as the value, and reading one on the UI thread is a frozen window.
+/// The panel owns the open dialog; this only reads.
+pub type BlobLoadFn = Rc<dyn Fn(BlobLoadRequest)>;
+
+/// Where a file loaded in the binary-cell panel goes: the grid stages the bytes
+/// into the cell the panel was opened on.
+///
+/// **The grid supplies it, because the grid is what holds the staged edit.** The
+/// panel knows the cell only well enough to *name* it (`BlobTarget`) — giving it
+/// the coordinates to write would put the cell's identity in two places, which
+/// is what [`BlobTarget`]'s own doc refuses for the read half.
+///
+/// **It returns whether the bytes were staged**, and the panel says so either
+/// way. A file dialog stands open for as long as the user takes to choose, and
+/// the grid can move underneath it — the pending row discarded, the result
+/// re-run read-only, the row marked for deletion — so the sink has to be able to
+/// refuse. A sink that refused silently while the panel reported "Loaded file"
+/// would be indistinguishable from one that worked, and the difference is a
+/// column that does or does not get written.
+pub type BlobStageFn = Rc<dyn Fn(Vec<u8>) -> bool>;
+
+/// Raise the binary-cell panel on one cell, fetch its bytes, and say where a
+/// file loaded in it should go.
 ///
 /// The `u64` is the connection the **rows** came from (`conn_at_load`), not the
 /// tab's current one: a blob re-read over a different connection is a different
 /// database's row with the same key.
-pub type ViewBlobFn = Rc<dyn Fn(u64, schemaic_core::blob::BlobRef, BlobTarget)>;
+///
+/// The `BlobRef` is `None` wherever there is nothing committed to read — a
+/// pending new row, and a committed row whose cell is `NULL`. The panel opens
+/// `Empty` on either and is a loader rather than a viewer; being *told* `Empty`
+/// a line after opening is what used to panic it. The
+/// `BlobStageFn` is `None` the other way round — a cell in a result nothing can
+/// be written to — and the panel is then a viewer with no *Load from file*.
+/// Both `None` at once cannot happen, because the grid offers no entry for a
+/// cell that can be neither read nor written.
+pub type ViewBlobFn =
+    Rc<dyn Fn(u64, Option<schemaic_core::blob::BlobRef>, BlobTarget, Option<BlobStageFn>)>;
 
 /// The table an import is loading into, captured when the modal opens so a
 /// schema refresh underneath it can't retarget the import.
@@ -3235,6 +3283,9 @@ pub struct TabsActions {
     /// binary-cell panel owns the save dialog and decides whether a save may be
     /// offered at all; this writes.
     pub save_blob: BlobSaveFn,
+    /// Read a file into the binary-cell panel on a worker thread — the write
+    /// half of [`BlobSaveFn`]. See [`BlobLoadFn`].
+    pub load_blob: BlobLoadFn,
     /// Raise the binary-cell panel on a grid cell and fetch its bytes — see
     /// [`ViewBlobFn`].
     pub view_blob: ViewBlobFn,

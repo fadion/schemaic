@@ -64,8 +64,8 @@ use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 #[cfg(test)]
 use schemaic_core::model::CellTag;
 use schemaic_core::model::{
-    Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
-    ResultSet, Rollback, Value, WriteStep, binary_display, one_row_verdict,
+    CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
+    ResultBuilder, ResultSet, Rollback, Value, WriteStep, binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
@@ -903,6 +903,20 @@ pub(crate) async fn commit_writes(
     }
 }
 
+/// One staged cell value as a bound SQLite parameter.
+///
+/// The `Bytes` arm is the whole reason this is a function: SQLite's `Text` and
+/// `Blob` are different storage classes with different comparison semantics, and
+/// a blob bound as `Text` on a `BLOB`-affinity column stores text — the affinity
+/// converts nothing, since `BLOB` affinity is the one that never coerces.
+fn cell_param(v: &CellEdit) -> rusqlite::types::Value {
+    match v {
+        CellEdit::Text(t) => rusqlite::types::Value::Text(t.clone()),
+        CellEdit::Bytes(b) => rusqlite::types::Value::Blob(b.to_vec()),
+        CellEdit::Null => rusqlite::types::Value::Null,
+    }
+}
+
 /// The SQL and bound parameters for one step of a [`GridWrite`].
 ///
 /// The table is named **bare**, not `main.t`: a connection is one file, so there
@@ -922,10 +936,7 @@ fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
                 .set
                 .iter()
                 .map(|(col, val)| {
-                    params.push(match val {
-                        Some(t) => rusqlite::types::Value::Text(t.clone()),
-                        None => rusqlite::types::Value::Null,
-                    });
+                    params.push(cell_param(val));
                     format!("{} = ?", ident_sqlite(col))
                 })
                 .collect::<Vec<_>>()
@@ -938,10 +949,7 @@ fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
                 .cols
                 .iter()
                 .map(|(col, val)| {
-                    params.push(match val {
-                        Some(t) => rusqlite::types::Value::Text(t.clone()),
-                        None => rusqlite::types::Value::Null,
-                    });
+                    params.push(cell_param(val));
                     ident_sqlite(col)
                 })
                 .collect::<Vec<_>>();
@@ -3819,7 +3827,7 @@ mod tests {
             table: table.to_string(),
             set: set
                 .iter()
-                .map(|(c, v)| (c.to_string(), v.map(str::to_string)))
+                .map(|(c, v)| (c.to_string(), CellEdit::from_opt(v.map(str::to_string))))
                 .collect(),
             key: key
                 .iter()
@@ -4747,8 +4755,8 @@ mod tests {
                 schema: None,
                 table: "t".to_string(),
                 cols: vec![
-                    ("id".into(), Some("1".into())),
-                    ("v".into(), Some("z".into())),
+                    ("id".into(), CellEdit::Text("1".into())),
+                    ("v".into(), CellEdit::Text("z".into())),
                 ],
             }],
             deletes: vec![RowDelete {
@@ -4773,6 +4781,151 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows, [(1, "z".to_string()), (2, "B".to_string())]);
+    }
+
+    /// **Bytes reach the file as a blob, and the storage class is the assertion.**
+    ///
+    /// SQLite would take a blob bound as `Text` without complaint and store it as
+    /// text — `BLOB` affinity is the one affinity that coerces nothing, so the
+    /// wrong storage class is not an error anywhere, it is just the wrong value
+    /// forever. `typeof()` is what tells the two apart, and the byte comparison
+    /// on its own would not: a fixture of ASCII bytes round-trips identically
+    /// through both arms. Hence a payload of octets that are not valid UTF-8.
+    #[tokio::test]
+    async fn a_staged_blob_is_written_as_a_blob_and_not_as_text() {
+        let (keeper, db) = shared_memory("blob_write");
+        keeper
+            .execute_batch(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, payload BLOB);
+                 INSERT INTO docs VALUES (1, 'one', NULL);",
+            )
+            .unwrap();
+        let png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE];
+        let write = GridWrite {
+            updates: vec![RowEdit {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "docs".to_string(),
+                set: vec![
+                    ("title".to_string(), CellEdit::Text("edited".to_string())),
+                    ("payload".to_string(), CellEdit::bytes(png.clone())),
+                ],
+                key: vec![("id".to_string(), Value::Int(1))],
+            }],
+            inserts: vec![RowInsert {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "docs".to_string(),
+                cols: vec![
+                    ("id".into(), CellEdit::Text("2".into())),
+                    // An empty file: a zero-length blob, which is a value and
+                    // not the NULL the column started at.
+                    ("payload".into(), CellEdit::bytes(Vec::new())),
+                ],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_writes(&db, &write, CancellationToken::new())
+                .await
+                .expect("commit"),
+            2
+        );
+
+        let (kind, bytes, title): (String, Vec<u8>, String) = keeper
+            .query_row(
+                "SELECT typeof(payload), payload, title FROM docs WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "blob", "stored as a blob, not as text");
+        assert_eq!(bytes, png, "and byte for byte what was staged");
+        assert_eq!(
+            title, "edited",
+            "the text column of the same row still text"
+        );
+
+        let (kind, len): (String, i64) = keeper
+            .query_row(
+                "SELECT typeof(payload), length(payload) FROM docs WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), len), ("blob", 0), "empty is not NULL");
+    }
+
+    /// **The write half end to end, over a real database**: read a table with a
+    /// `BLOB` column, let `analyze_edit` decide what may be written, stage bytes
+    /// the way the blob panel does, group them through `build_edits`, commit,
+    /// and read the value back.
+    ///
+    /// The pure tests each pin one link. This is the *composition* — the seam
+    /// the project's own testing note says these bugs live at, and there are
+    /// four links here that were only ever asserted apart: C2's narrowing
+    /// (`text_editable` vs `editable`), the `DirtyCells` widening, the grouping,
+    /// and the parameter binding.
+    #[tokio::test]
+    async fn a_blob_column_is_writable_end_to_end_but_never_as_text() {
+        use schemaic_core::edit::{DirtyCells, analyze_edit, build_edits};
+
+        let (keeper, db) = shared_memory("blob_end_to_end");
+        keeper
+            .execute_batch(
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, payload BLOB);
+                 INSERT INTO docs VALUES (1, 'one', NULL);",
+            )
+            .unwrap();
+
+        // Read it the way the grid does, so the columns carry real provenance
+        // (`attach_origins` is what sets the `binary` flag from the declared
+        // type — the fixtures above hand-build it instead).
+        let rs = run_query(
+            &keeper,
+            "SELECT id, title, payload FROM docs",
+            &mut crate::RowDest::Capped(100),
+        )
+        .expect("select");
+        let model = analyze_edit(&rs, |_db, _s, t| Some(table_info_of(&keeper, t)));
+
+        let payload = 2usize;
+        assert!(model.binary(payload), "declared BLOB");
+        assert!(
+            model.editable(payload) && !model.text_editable(payload),
+            "writable as bytes, never as text"
+        );
+
+        let png = vec![0x89u8, b'P', b'N', b'G', 0xFF, 0xFE];
+        let dirty: DirtyCells = [
+            ((0usize, 1usize), CellEdit::Text("edited".into())),
+            ((0usize, payload), CellEdit::bytes(png.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let write = GridWrite {
+            updates: build_edits(&model, &rs, &dirty),
+            ..Default::default()
+        };
+        assert_eq!(write.updates.len(), 1, "one row, one UPDATE");
+
+        assert_eq!(
+            commit_writes(&db, &write, CancellationToken::new())
+                .await
+                .expect("commit"),
+            1
+        );
+        let (kind, bytes, title): (String, Vec<u8>, String) = keeper
+            .query_row(
+                "SELECT typeof(payload), payload, title FROM docs WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (kind.as_str(), &bytes, title.as_str()),
+            ("blob", &png, "edited")
+        );
     }
 
     /// The implicit key end to end: read a keyless table, resolve its key, and
@@ -4810,7 +4963,7 @@ mod tests {
                 database: MAIN.to_string(),
                 schema: None,
                 table: "t".to_string(),
-                set: vec![("b".to_string(), Some("edited".to_string()))],
+                set: vec![("b".to_string(), CellEdit::Text("edited".to_string()))],
                 key: key_of(1),
             }],
             deletes: vec![RowDelete {
@@ -4906,7 +5059,7 @@ mod tests {
                 database: MAIN.to_string(),
                 schema: None,
                 table: "t".to_string(),
-                set: vec![("b".to_string(), Some("BOBS-EDIT".to_string()))],
+                set: vec![("b".to_string(), CellEdit::Text("BOBS-EDIT".to_string()))],
                 key: schemaic_core::edit::row_key(&rs, tbl, 0),
             }],
             ..Default::default()
@@ -4975,7 +5128,10 @@ mod tests {
                     database: MAIN.to_string(),
                     schema: None,
                     table: "t".to_string(),
-                    set: vec![("b".to_string(), Some("edited-by-user".to_string()))],
+                    set: vec![(
+                        "b".to_string(),
+                        CellEdit::Text("edited-by-user".to_string()),
+                    )],
                     key: stale.clone(),
                 }],
                 ..Default::default()

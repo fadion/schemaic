@@ -11,7 +11,15 @@
 //! ([`BlobState::Ready`]), nothing at all because the cell is `NULL` or the row
 //! is gone ([`BlobState::Empty`]), or a failure. There is deliberately no fourth
 //! state for "not fetched yet but might be fine" — the fetch starts as the modal
-//! opens, so [`BlobState::Loading`] is what the panel is born in.
+//! opens, so [`BlobState::Loading`] is what a panel with something to fetch is
+//! born in. One with nothing to fetch is born [`BlobState::Empty`]: the panel
+//! opens *in* its state rather than being told a moment later, which is
+//! [`BlobUi::open`]'s reason for taking one.
+//!
+//! **It is a write surface too.** A file loaded here does not go to the server
+//! from this module — it goes to the grid's staged edits through the
+//! [`BlobUi::stage`] sink the grid supplies, and reaches the table on the grid's
+//! Commit like any typed edit.
 //!
 //! **The hex dump is virtualized and the preview is not.** A capped fetch is
 //! still 64 MiB, which is four million hex lines, so they are built one visible
@@ -23,7 +31,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use floem::action::save_as;
+use floem::action::{open_file, save_as};
 use floem::file::{FileDialogOptions, FileSpec};
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
@@ -40,7 +48,7 @@ use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, focus_root_with_ring, modal_footer_split,
     modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{BlobSaveRequest, Ui};
+use crate::{BlobLoadRequest, BlobSaveRequest, Ui};
 
 /// The cell the panel is open on — what it needs to *say*, not what it needs to
 /// fetch.
@@ -56,6 +64,15 @@ pub struct BlobTarget {
     /// The extension comes from what the bytes turn out to be, which is not
     /// known yet when this is built.
     pub stem: String,
+    /// The most bytes this column can hold, if its declared type says — see
+    /// [`schemaic_core::blob::column_byte_cap`]. `None` is "no answer", never
+    /// "no limit".
+    ///
+    /// Carried on the target rather than asked for at load time because it is a
+    /// fact about the *cell the panel is open on*, which is exactly what this
+    /// struct is, and because by the time a file comes back the grid the cap was
+    /// read from may have been re-run underneath.
+    pub cap: Option<u64>,
 }
 
 /// Which of the two views of the same bytes is showing.
@@ -98,9 +115,23 @@ pub struct BlobUi {
     /// Which pane. Set when the bytes land — an image opens on its preview and
     /// anything else on the hex — and then only by the user.
     pub pane: RwSignal<BlobPane>,
-    /// The outcome of the last save from this panel: the path written, or why
-    /// it failed. Cleared when the panel closes.
-    pub saved: RwSignal<Option<Result<String, String>>>,
+    /// The status line under the body: what the last save or load did, or why it
+    /// failed. Cleared when the panel closes.
+    ///
+    /// One line for both because there is one place to put it, and the two are
+    /// never in flight at once — a load replaces what a save reported on, so a
+    /// stale "Saved to …" beside freshly loaded bytes would be a sentence about
+    /// a file that is no longer what the panel is showing.
+    pub note: RwSignal<Option<Result<String, String>>>,
+    /// Where a file loaded here goes — `None` when the cell cannot be written,
+    /// which is what leaves *Load from file* **disabled**. Disabled rather than
+    /// absent, unlike the grid's menu entry: the entry is the only sign a
+    /// `<n bytes>` cell has anything behind it, so one that opens a panel to
+    /// refuse is worse than none — a button in a panel already open is the
+    /// opposite case, and a footer that changed shape between cells would read
+    /// as the panel being a different thing each time.
+    /// See [`crate::BlobStageFn`].
+    pub stage: RwSignal<Option<crate::BlobStageFn>>,
     /// Which opening of the panel is the current one.
     ///
     /// **Only the opening that started a fetch may report into it.** The panel
@@ -119,7 +150,8 @@ impl BlobUi {
             target: RwSignal::new(None),
             state: RwSignal::new(BlobState::Loading),
             pane: RwSignal::new(BlobPane::Hex),
-            saved: RwSignal::new(None),
+            note: RwSignal::new(None),
+            stage: RwSignal::new(None),
             epoch: RwSignal::new(0),
         }
     }
@@ -128,15 +160,35 @@ impl BlobUi {
     /// what the fetch must hand back to [`BlobUi::loaded`].
     ///
     /// **Every field is reset, not just the two that obviously change.** A
-    /// second cell opened after a first left `saved` holding the first one's
+    /// second cell opened after a first left `note` holding the first one's
     /// "Saved to …", under a title naming the second — a sentence about a file
     /// that has nothing to do with what is on screen.
-    pub fn open(self, target: BlobTarget) -> u64 {
+    ///
+    /// `stage` is where the next cell's bytes go, so it is reset like the rest:
+    /// carrying the previous cell's over would aim *Load from file* at a row the
+    /// panel is no longer about, and that is a wrong write rather than a wrong
+    /// sentence.
+    ///
+    /// **`state` is a parameter, not always `Loading`.** A cell with bytes to
+    /// fetch opens `Loading`, but one with nothing committed behind it — a NULL
+    /// cell, a pending new row — is `Empty` the moment it opens and there is
+    /// nothing to wait for. Reporting that *after* opening is what made the panel
+    /// panic: `open` and the report ran in the same turn, so the rebuild queued
+    /// by `target` carried a `Loading` phase over a state that was already
+    /// `Empty`. Opening in the final state leaves no transition to disagree
+    /// about, and it is the truer statement anyway — the panel is born knowing.
+    pub fn open(
+        self,
+        target: BlobTarget,
+        stage: Option<crate::BlobStageFn>,
+        state: BlobState,
+    ) -> u64 {
         let epoch = self.epoch.get_untracked().wrapping_add(1);
         self.epoch.set(epoch);
-        self.state.set(BlobState::Loading);
+        self.state.set(state);
         self.pane.set(BlobPane::Hex);
-        self.saved.set(None);
+        self.note.set(None);
+        self.stage.set(stage);
         self.target.set(Some(target));
         epoch
     }
@@ -149,7 +201,8 @@ impl BlobUi {
         self.epoch.set(self.epoch.get_untracked().wrapping_add(1));
         self.target.set(None);
         self.state.set(BlobState::Loading);
-        self.saved.set(None);
+        self.note.set(None);
+        self.stage.set(None);
     }
 
     /// Report a finished fetch, and open the pane the content deserves.
@@ -182,7 +235,103 @@ impl BlobUi {
         if self.epoch.get_untracked() != epoch {
             return;
         }
-        self.saved.set(Some(outcome));
+        self.note
+            .set(Some(outcome.map(|path| format!("Saved to {path}"))));
+    }
+
+    /// Report a finished **load**: show the file's bytes and stage them into the
+    /// cell the panel was opened on.
+    ///
+    /// `outcome` is the file's bytes, or why they could not be read — **not** its
+    /// name. The status line does not use one: it sits under a title already
+    /// naming the cell, and the sentence that has to fit beside three buttons is
+    /// better spent saying the bytes are staged rather than which file they came
+    /// from. Threading a name nothing reads is how a parameter rots.
+    ///
+    /// Epoch-guarded like every other report here — a read that outlived its
+    /// panel must not stage into whatever the user opened next, which is the one
+    /// failure in this family that writes to a database rather than to a label.
+    ///
+    /// **The epoch moves, and it moves last.** The panel's rebuild key is
+    /// `(epoch, open, phase)`, and replacing one `Ready` value with another
+    /// changes no phase — so without the bump the body is never torn down and
+    /// the panel goes on showing the *old* image over the new bytes' status
+    /// line. Moving it is also truthful about the read still in flight on a cell
+    /// the user has just replaced: its answer is about a value nobody is looking
+    /// at.
+    ///
+    /// *Last* because the rebuild the bump triggers reads the payload
+    /// **untracked** — that is the whole design of the key, and it means the
+    /// state has to be there before the key admits it. Bumping first rebuilds
+    /// the body against the value being replaced, and the `state.set` behind it
+    /// then changes no key term and so rebuilds nothing: the panel would settle
+    /// showing the old bytes under the new file's name. The same ordering
+    /// `BlobUi::open` keeps, for the same reason.
+    ///
+    /// The sentence says **staged**, not written. The bytes are in the grid's
+    /// dirty map like any typed edit and reach the table on Commit; a panel that
+    /// said "Loaded" and left it there would read as a save.
+    pub fn loaded_file(self, epoch: u64, outcome: Result<Vec<u8>, String>) {
+        if self.epoch.get_untracked() != epoch {
+            return;
+        }
+        let bytes = match outcome {
+            Ok(v) => v,
+            Err(e) => {
+                self.note.set(Some(Err(e)));
+                return;
+            }
+        };
+        // No sink means the panel is a viewer; there was no button to press, so
+        // this is unreachable rather than a case. Reported rather than ignored:
+        // silently dropping the file would look exactly like a load that worked.
+        let Some(stage) = self.stage.get_untracked() else {
+            self.note
+                .set(Some(Err("This cell cannot be written.".to_string())));
+            return;
+        };
+        // **Refused here, where the user chose the file.** The server would
+        // refuse it too, but at the commit: `ERROR 1406: Data too long` names
+        // the column rather than the file, arrives after this panel has closed,
+        // and takes every other staged edit in the batch down with it. Nothing
+        // is staged, so the panel keeps showing the value that is still there.
+        if let Some(cap) = self
+            .target
+            .with_untracked(|t| t.as_ref().and_then(|t| t.cap))
+            && bytes.len() as u64 > cap
+        {
+            self.note.set(Some(Err(format!(
+                "That file is {} — this column holds at most {}.",
+                human_bytes(bytes.len() as i64),
+                human_bytes(cap as i64)
+            ))));
+            return;
+        }
+        // **The sink gets the last word.** The file dialog stood open while the
+        // grid was free to move: the pending row may be gone, the row may have
+        // been marked for deletion, the result may have been re-run read-only.
+        // A refusal reported as "Loaded file." is the one outcome worse than
+        // either — it looks exactly like a write that will happen and is not.
+        if !(stage)(bytes.clone()) {
+            self.note.set(Some(Err(
+                "That cell is no longer accepting a value — nothing was staged.".to_string(),
+            )));
+            return;
+        }
+        let kind = schemaic_core::blob::sniff(&bytes);
+        let value = Arc::new(BlobValue {
+            len: bytes.len() as u64,
+            bytes,
+        });
+        self.pane.set(match kind.is_image() {
+            true => BlobPane::Preview,
+            false => BlobPane::Hex,
+        });
+        self.state.set(BlobState::Ready { value, kind });
+        self.epoch.set(self.epoch.get_untracked().wrapping_add(1));
+        self.note.set(Some(Ok(
+            "Loaded file. Commit in the grid to write it.".to_string()
+        )));
     }
 }
 
@@ -421,6 +570,7 @@ fn phase_of(state: &BlobState) -> Phase {
 pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
     let b = ui.blob;
     let save = ui.tab_actions.save_blob.clone();
+    let load = ui.tab_actions.load_blob.clone();
     let cancel = ui.tab_actions.cancel_blob.clone();
 
     // One decision for every exit — the ✕, the footer button and Escape — so
@@ -453,6 +603,20 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
     // restyle rather than a teardown, and the image is decoded once. The
     // payload behind a phase (bytes, kind, message) arrives with the change
     // that admits it, so the builder reads it untracked.
+    //
+    // **The phase term triggers the rebuild; it does not describe it.** The
+    // builder below deliberately ignores the `phase` it is handed and reads the
+    // live state, because a queued key can be one revision behind the signal by
+    // the time floem processes it. Two terms changing in one turn queue *two*
+    // values — the memo notifies on each — and both are built, in order, against
+    // whatever the signals hold at processing time. That is harmless when the
+    // builder reads the state (the first build is redundant, the second is the
+    // same), and it is a panic when the builder trusts the tuple: opening the
+    // panel on a NULL cell sets `target` and then reports `Empty` in the same
+    // turn, so the first queued key said `Loading` over a state that was already
+    // `Empty`. `BlobUi::open` takes the state it is opening in for that reason —
+    // there is no transition left on that path — and this reads the state anyway,
+    // so the next caller to add one cannot bring the panic back.
     let key = floem::reactive::create_memo(move |_| {
         (
             b.epoch.get(),
@@ -463,7 +627,7 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
 
     dyn_container(
         move || key.get(),
-        move |(_epoch, open, phase)| {
+        move |(_epoch, open, _phase)| {
             if !open {
                 return empty().into_any();
             }
@@ -471,7 +635,6 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             let state = b.state.get_untracked();
-            debug_assert_eq!(phase_of(&state), phase, "the memo and the state disagree");
             let ring = FocusRing::new();
             let (exit_title, exit_btn, exit_esc) = (exit.clone(), exit.clone(), exit.clone());
 
@@ -555,21 +718,49 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
             // changing, and folding it into the outer key is what made
             // completing a save re-decode the image and drop keyboard focus.
             let status: floem::AnyView = dyn_container(
-                move || b.saved.get(),
-                move |saved| match (saved, save_hint.clone()) {
-                    (Some(Ok(path)), _) => label(move || format!("Saved to {path}"))
-                        .style(|s| s.color(theme::text_muted()))
+                move || b.note.get(),
+                // `text_ellipsis` on each: the footer lets this line shrink
+                // rather than push the buttons out, and a shrunk line should end
+                // in a `…` rather than in a clipped word. A load failure carries
+                // the OS's message, which is the one here with no length bound
+                // at all.
+                move |note| match (note, save_hint.clone()) {
+                    (Some(Ok(msg)), _) => label(move || msg.clone())
+                        .style(|s| s.color(theme::text_muted()).text_ellipsis())
                         .into_any(),
                     (Some(Err(msg)), _) => label(move || msg.clone())
-                        .style(|s| s.color(theme::diag_error()))
+                        .style(|s| s.color(theme::diag_error()).text_ellipsis())
                         .into_any(),
                     (None, Some(hint)) => label(move || hint.clone())
-                        .style(|s| s.color(theme::text_muted()))
+                        .style(|s| s.color(theme::text_muted()).text_ellipsis())
                         .into_any(),
                     (None, None) => empty().into_any(),
                 },
             )
             .into_any();
+
+            // *Load from file* is offered exactly when the grid handed over a
+            // sink for the bytes — a writable cell. Unlike Save, it does not
+            // depend on what was read: a cell too large to *save* whole can
+            // still be replaced, and a NULL one has nothing to read and is
+            // precisely where a first file goes.
+            let loadable = b.stage.with_untracked(Option::is_some);
+            let load_click = {
+                let load = load.clone();
+                let epoch = b.epoch.get_untracked();
+                move || {
+                    let load = load.clone();
+                    open_file(
+                        FileDialogOptions::new().title("Load binary value from file"),
+                        move |file| {
+                            let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                                return; // cancelled
+                            };
+                            (load)(BlobLoadRequest { path, epoch });
+                        },
+                    );
+                }
+            };
 
             let save_click = {
                 let save = save.clone();
@@ -630,11 +821,19 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
                     status,
                     h_stack((
                         action_button(
+                            "Load from file",
+                            ActionKind::Neutral,
+                            loadable,
+                            ring.clone(),
+                            ACTION_TAB + 1,
+                            load_click,
+                        ),
+                        action_button(
                             "Save to file",
                             ActionKind::Neutral,
                             saveable,
                             ring.clone(),
-                            ACTION_TAB + 1,
+                            ACTION_TAB + 2,
                             save_click,
                         ),
                         action_button(
@@ -642,7 +841,7 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
                             ActionKind::Primary,
                             true,
                             ring.clone(),
-                            ACTION_TAB + 2,
+                            ACTION_TAB + 3,
                             move || (exit_btn)(),
                         ),
                     ))
@@ -683,6 +882,17 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
 mod tests {
     use super::*;
 
+    /// A target with no size cap — the shape every test here wants, and a
+    /// constructor rather than a literal so a new field on `BlobTarget` does not
+    /// have to be spelt out in a dozen fixtures that do not care about it.
+    fn tgt(title: String, stem: String) -> BlobTarget {
+        BlobTarget {
+            title,
+            stem,
+            cap: None,
+        }
+    }
+
     fn value(len: u64, bytes: usize) -> BlobValue {
         BlobValue {
             bytes: vec![0; bytes],
@@ -700,15 +910,17 @@ mod tests {
     #[test]
     fn a_report_from_a_closed_panel_cannot_land_in_the_next_one() {
         let ui = BlobUi::new();
-        let first = ui.open(BlobTarget {
-            title: "staff.picture".into(),
-            stem: "staff_picture_1".into(),
-        });
+        let first = ui.open(
+            tgt("staff.picture".into(), "staff_picture_1".into()),
+            None,
+            BlobState::Loading,
+        );
         ui.close();
-        let second = ui.open(BlobTarget {
-            title: "staff.password".into(),
-            stem: "staff_password_1".into(),
-        });
+        let second = ui.open(
+            tgt("staff.password".into(), "staff_password_1".into()),
+            None,
+            BlobState::Loading,
+        );
         assert_ne!(first, second, "each opening needs its own epoch");
 
         // The first cell's bytes arrive, late.
@@ -742,41 +954,332 @@ mod tests {
     #[test]
     fn a_save_from_a_closed_panel_cannot_claim_the_next_one_wrote_a_file() {
         let ui = BlobUi::new();
-        let first = ui.open(BlobTarget {
-            title: "a.b".into(),
-            stem: "a_b".into(),
-        });
+        let first = ui.open(tgt("a.b".into(), "a_b".into()), None, BlobState::Loading);
         ui.close();
-        let second = ui.open(BlobTarget {
-            title: "c.d".into(),
-            stem: "c_d".into(),
-        });
+        let second = ui.open(tgt("c.d".into(), "c_d".into()), None, BlobState::Loading);
 
         ui.saved_at(first, Ok("C:/tmp/a_b.png".into()));
         assert_eq!(
-            ui.saved.get_untracked(),
+            ui.note.get_untracked(),
             None,
             "a file saved from the previous panel was reported under this one"
         );
         ui.saved_at(second, Ok("C:/tmp/c_d.bin".into()));
-        assert_eq!(ui.saved.get_untracked(), Some(Ok("C:/tmp/c_d.bin".into())));
+        assert_eq!(
+            ui.note.get_untracked(),
+            Some(Ok("Saved to C:/tmp/c_d.bin".into()))
+        );
+    }
+
+    /// **The epoch guard's one case that writes to a database.**
+    ///
+    /// Every other superseded report here lands in a label — a stale "Saved to
+    /// …", a stale image. A stale *load* calls the staging closure, and the
+    /// closure the panel is holding aims at whatever cell it was last opened on.
+    /// So: pick a file, press Escape, open a different cell, and the read
+    /// completes — the bytes must not be staged into the second cell, and must
+    /// not be staged into the first either, since the panel that asked is gone.
+    #[test]
+    fn a_file_read_that_outlived_its_panel_stages_into_nothing() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ui = BlobUi::new();
+        let into_first: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let into_second: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = |log: &Rc<RefCell<Vec<Vec<u8>>>>| -> crate::BlobStageFn {
+            let log = log.clone();
+            Rc::new(move |b: Vec<u8>| {
+                log.borrow_mut().push(b);
+                true
+            })
+        };
+
+        let first = ui.open(
+            tgt("a.b".into(), "a_b".into()),
+            Some(sink(&into_first)),
+            BlobState::Loading,
+        );
+        ui.close();
+        ui.open(
+            tgt("c.d".into(), "c_d".into()),
+            Some(sink(&into_second)),
+            BlobState::Loading,
+        );
+
+        ui.loaded_file(first, Ok(vec![1, 2, 3]));
+        assert!(
+            into_first.borrow().is_empty() && into_second.borrow().is_empty(),
+            "a file chosen in a panel that is gone was staged anyway"
+        );
+        assert_eq!(ui.note.get_untracked(), None, "and said nothing about it");
+    }
+
+    /// **A panel with nothing to fetch is `Empty` from the first frame.**
+    ///
+    /// It used to be told a line later, and the two lines are one turn apart —
+    /// close enough that the rebuild queued by `open`'s own `target.set` carried
+    /// a `Loading` phase over a state that was already `Empty`, which the panel's
+    /// builder asserted against and panicked on. Clicking *Edit binary* on a
+    /// NULL cell was the whole reproduction.
+    ///
+    /// Asserted through `open` rather than on the ordering inside it, because
+    /// the ordering was never the part that could be wrong: the question is
+    /// whether a caller can put the panel in a state its own rebuild key
+    /// disagrees with, and the answer is that it no longer has the two steps
+    /// needed to try.
+    #[test]
+    fn a_panel_with_nothing_to_fetch_opens_empty_in_one_step() {
+        let ui = BlobUi::new();
+        ui.open(
+            tgt("staff.picture".into(), "staff_picture_1".into()),
+            None,
+            BlobState::Empty,
+        );
+        assert!(
+            matches!(ui.state.get_untracked(), BlobState::Empty),
+            "the panel must be born in the state it is in"
+        );
+        // The rebuild key's phase term and the state the builder reads are the
+        // same fact here, which is the whole property: there is no moment
+        // between them for a queued key to be stale about.
+        assert_eq!(ui.state.with_untracked(phase_of), Phase::Empty);
+        assert!(ui.target.with_untracked(Option::is_some), "and it is up");
+    }
+
+    /// The load's whole effect, in one place: the bytes are staged into the cell
+    /// the panel is open on, the panel shows *them* rather than what it read,
+    /// and the sentence says **staged** — not saved, not written.
+    ///
+    /// The epoch moving is part of the effect and is asserted here rather than on
+    /// its own: the panel's rebuild key is `(epoch, open, phase)`, and replacing
+    /// one `Ready` value with another changes no phase — so without the bump the
+    /// body is never rebuilt and the old image stays on screen above the new
+    /// bytes' status line.
+    #[test]
+    fn loading_a_file_stages_it_shows_it_and_says_it_is_not_written_yet() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ui = BlobUi::new();
+        let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = {
+            let staged = staged.clone();
+            Rc::new(move |b: Vec<u8>| {
+                staged.borrow_mut().push(b);
+                true
+            }) as crate::BlobStageFn
+        };
+        let epoch = ui.open(
+            tgt("staff.picture".into(), "staff_picture_1".into()),
+            Some(sink),
+            BlobState::Loading,
+        );
+        // A one-pixel PNG, so `sniff` has something real to answer about and the
+        // pane choice is the image one rather than a default.
+        let png = bomb_png(1, 1);
+        ui.loaded_file(epoch, Ok(png.clone()));
+
+        assert_eq!(
+            &*staged.borrow(),
+            std::slice::from_ref(&png),
+            "staged byte for byte"
+        );
+        match ui.state.get_untracked() {
+            BlobState::Ready { value, kind } => {
+                assert_eq!(value.bytes, png);
+                assert_eq!(value.len, png.len() as u64);
+                assert!(kind.is_image());
+            }
+            other => panic!("the panel should show what was loaded, got {other:?}"),
+        }
+        assert_eq!(ui.pane.get_untracked(), BlobPane::Preview);
+        assert_ne!(
+            ui.epoch.get_untracked(),
+            epoch,
+            "the body must be rebuilt, or the previous value stays on screen"
+        );
+        let note = ui.note.get_untracked().expect("a status line").expect("ok");
+        assert!(
+            note.contains("Commit"),
+            "the line must not read as a write: {note}"
+        );
+    }
+
+    /// **The oversized file is refused here, and nothing is staged.**
+    ///
+    /// A 137 KB JPEG into `sakila.staff.picture` — a `BLOB`, so 64 KiB — is the
+    /// report this came from. The server does refuse it, but at the commit:
+    /// `ERROR 1406: Data too long` names the column rather than the file,
+    /// arrives after this panel has closed, and rolls back every other staged
+    /// edit in the same batch. Refusing at the point the file was chosen costs
+    /// one comparison and keeps the batch intact.
+    ///
+    /// Both halves matter and both are asserted: the message has to name the two
+    /// sizes (a bare "too large" leaves the user guessing which file would fit),
+    /// and the sink must not have been called — a panel that says no while
+    /// staging anyway is the worst of the three outcomes.
+    #[test]
+    fn a_file_over_the_columns_cap_is_refused_before_anything_is_staged() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ui = BlobUi::new();
+        let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = {
+            let staged = staged.clone();
+            Rc::new(move |b: Vec<u8>| {
+                staged.borrow_mut().push(b);
+                true
+            }) as crate::BlobStageFn
+        };
+        let epoch = ui.open(
+            BlobTarget {
+                title: "staff.picture".into(),
+                stem: "staff_picture_1".into(),
+                cap: Some(65_535), // a MySQL `BLOB`
+            },
+            Some(sink),
+            BlobState::Empty,
+        );
+
+        ui.loaded_file(epoch, Ok(vec![0u8; 140_000]));
+        assert!(
+            staged.borrow().is_empty(),
+            "an oversized file was staged despite the refusal"
+        );
+        let msg = ui
+            .note
+            .get_untracked()
+            .expect("a status line")
+            .expect_err("a refusal");
+        assert!(
+            msg.contains("136.7 KB") && msg.contains("64.0 KB"),
+            "the message must name both sizes, got {msg:?}"
+        );
+        // And the panel still shows what is really in the column.
+        assert!(
+            matches!(ui.state.get_untracked(), BlobState::Empty),
+            "a refused load must not replace what the panel is showing"
+        );
+
+        // Exactly at the cap is a fit, not an overrun — the comparison is `>`,
+        // and an off-by-one here refuses a file the column takes.
+        ui.loaded_file(epoch, Ok(vec![0u8; 65_535]));
+        assert_eq!(staged.borrow().len(), 1, "a file of exactly the cap fits");
+    }
+
+    /// No cap is "no answer", not "no limit" — an unloaded schema and a `bytea`
+    /// give the same `None`, and the server stays the authority. A file that
+    /// large is not something this panel refuses on its own guess.
+    #[test]
+    fn with_no_cap_the_panel_refuses_nothing() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ui = BlobUi::new();
+        let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = {
+            let staged = staged.clone();
+            Rc::new(move |b: Vec<u8>| {
+                staged.borrow_mut().push(b);
+                true
+            }) as crate::BlobStageFn
+        };
+        let epoch = ui.open(
+            tgt("t.payload".into(), "t_payload".into()),
+            Some(sink),
+            BlobState::Empty,
+        );
+        ui.loaded_file(epoch, Ok(vec![0u8; 5_000_000]));
+        assert_eq!(staged.borrow().len(), 1);
+    }
+
+    /// **A sink that refuses is said out loud.** The file dialog stands open for
+    /// as long as the user takes to choose, and the grid is free to move
+    /// underneath it — the pending row discarded, the row marked for deletion,
+    /// the result re-run read-only. The panel used to call the sink and report
+    /// success regardless, which for those cases is a sentence promising a write
+    /// that will never happen.
+    #[test]
+    fn a_sink_that_refuses_is_reported_rather_than_dressed_as_a_load() {
+        let ui = BlobUi::new();
+        let refusing: crate::BlobStageFn = Rc::new(|_: Vec<u8>| false);
+        let epoch = ui.open(
+            tgt("t.payload".into(), "t_payload".into()),
+            Some(refusing),
+            BlobState::Empty,
+        );
+        ui.loaded_file(epoch, Ok(vec![1, 2, 3]));
+        assert!(
+            matches!(ui.note.get_untracked(), Some(Err(_))),
+            "a refused stage must not read as a load"
+        );
+        assert!(
+            matches!(ui.state.get_untracked(), BlobState::Empty),
+            "and must not replace what the panel is showing"
+        );
+    }
+
+    /// A read-only cell hands over no sink, and the panel refuses rather than
+    /// dropping the file quietly — a load that silently did nothing looks exactly
+    /// like one that worked.
+    #[test]
+    fn a_load_into_a_panel_with_nowhere_to_put_it_says_so() {
+        let ui = BlobUi::new();
+        let epoch = ui.open(
+            tgt("v.blob".into(), "v_blob".into()),
+            None,
+            BlobState::Loading,
+        );
+        ui.loaded_file(epoch, Ok(vec![9]));
+        assert!(
+            matches!(ui.note.get_untracked(), Some(Err(_))),
+            "a refusal, not silence"
+        );
+    }
+
+    /// `open` resets the sink along with everything else. Carrying the previous
+    /// cell's over would aim *Load from file* at a row the panel is no longer
+    /// about — a wrong write rather than a wrong sentence.
+    #[test]
+    fn opening_another_cell_does_not_inherit_the_previous_sink() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ui = BlobUi::new();
+        let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = {
+            let staged = staged.clone();
+            Rc::new(move |b: Vec<u8>| {
+                staged.borrow_mut().push(b);
+                true
+            }) as crate::BlobStageFn
+        };
+        ui.open(
+            tgt("a.b".into(), "a_b".into()),
+            Some(sink),
+            BlobState::Loading,
+        );
+        // The second cell is read-only, so it brings no sink of its own.
+        let second = ui.open(tgt("c.d".into(), "c_d".into()), None, BlobState::Loading);
+        assert!(ui.stage.with_untracked(Option::is_none));
+        ui.loaded_file(second, Ok(vec![7]));
+        assert!(
+            staged.borrow().is_empty(),
+            "the first cell took the second cell's file"
+        );
     }
 
     /// Opening a second cell clears the first one's save sentence.
     #[test]
     fn opening_another_cell_does_not_inherit_the_previous_saved_line() {
         let ui = BlobUi::new();
-        let first = ui.open(BlobTarget {
-            title: "a.b".into(),
-            stem: "a_b".into(),
-        });
+        let first = ui.open(tgt("a.b".into(), "a_b".into()), None, BlobState::Loading);
         ui.saved_at(first, Ok("C:/tmp/a_b.png".into()));
-        assert!(ui.saved.get_untracked().is_some());
-        ui.open(BlobTarget {
-            title: "c.d".into(),
-            stem: "c_d".into(),
-        });
-        assert_eq!(ui.saved.get_untracked(), None);
+        assert!(ui.note.get_untracked().is_some());
+        ui.open(tgt("c.d".into(), "c_d".into()), None, BlobState::Loading);
+        assert_eq!(ui.note.get_untracked(), None);
     }
 
     // ---- the preview gate, measured -----------------------------------------

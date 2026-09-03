@@ -71,8 +71,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`capped_columns_are_not_inherited_by_the_next_chunk`). Note that
     the **grid's** result is still materialised whole up to the row cap; it is the *export* that
     streams. `Column`/`ColumnOrigin`/`ColumnFlags` carry the
-    write-back provenance the wire reports per column, and a binary column is unconditionally
-    read-only (it can't round-trip through text). **A raw-bytes cell has exactly one rendering, and
+    write-back provenance the wire reports per column, and a binary column is read-only **as
+    text**: `<n bytes>` is a placeholder rather than a value, so typing or pasting one back would
+    write the ASCII of its own size into the column (`edit::EditModel::text_editable`). The bytes
+    themselves are writable, through the blob panel and nothing else.
+    **A raw-bytes cell has exactly one rendering, and
     it lives here:** `binary_display(len)` → `<n bytes>`, with `is_binary_display` as its
     recognizer and `type_is_binary` / `Column::is_binary` as the question "is this column bytes at
     all". The three engines each used to answer differently — SQLite showed the size, MySQL
@@ -137,6 +140,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `one_row_verdict` (the 1-row safety net's verdict *and* its message),
     `Rollback`/`engine_is_transactional` (what a rollback actually achieved — see the invariant
     below), and `drop_committed` (which staged edits a commit un-stages).
+    **`CellEdit` is what one staged cell holds** — `Null | Text | Bytes` — and it replaced the
+    `Option<String>` that had room for exactly two of the three. `Text` is what was typed or pasted,
+    bound as a string parameter and coerced by the server to whatever the column is; `Bytes` is raw
+    octets and is the only shape that can write a binary column, a `BLOB` having no lossless text
+    form. **It holds an `Arc<[u8]>` rather than a `Vec<u8>`**, because a staged cell is cloned far
+    more often than it is written: the grid painter clones the value out of the dirty map on every
+    repaint of that cell, the row panel's `blob_value` on every change to the map, and `build_edits`
+    again per commit — each one a full copy of the buffer while it is a `Vec`, so a 60 MB file is
+    60 MB of memcpy per repaint, on the UI thread. The copy that remains is the one at bind time,
+    where MySQL's and SQLite's `cell_param` want an owned `Vec` (`b.to_vec()`) and nothing can avoid
+    it; PostgreSQL renders a hex literal instead and never takes one.
+    `CellEdit::bytes(impl Into<Arc<[u8]>>)` is the constructor, so a `Vec` off a file read and a
+    slice in a test both build one without a call site spelling the conversion.
+    `as_text` answers `None` for `Bytes` **as well as** for `Null`, which is the point rather
+    than an omission: every caller of it is a text path — the re-fetch key, the paste round trip, the
+    clipboard — and a byte string decoded lossily into one of those is the mojibake `binary_display`
+    exists to have stopped. `display` renders `Bytes` as that same `<n bytes>`, so a cell a file has
+    just been loaded into reads the way it will read after the commit and is no more copyable back
+    into the column than a stored blob is. Only the blob panel produces `Bytes`; `from_opt` is the
+    widening for the text paths that still speak `Option<String>`. One type the whole way down —
+    `StagedEdits`, `RowEdit::set`, `RowInsert::cols`, `edit::DirtyCells` and the grid's `dirty` /
+    `new_rows` all carry it — so there is no seam where bytes would have to be re-encoded to cross.
   - `aggregate.rs` — what a multi-cell grid selection adds up to (`aggregate` → `Aggregates` +
     `summary`). The arithmetic is **fixed-point, not `f64`**, and that is the whole reason the
     module has substance: `Column::is_numeric` counts `DECIMAL`/`NUMERIC`, while `Value` leaves
@@ -455,13 +480,57 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `refetch_template_keys_on_the_implicit_key` — the last because a read-only key column is still
     part of the row the splice re-reads.
     **`EditModel::table_for_origin` is the lookup that does not go through `col_table`**, and it
-    exists because a *read* can be aimed at a column a write may not touch. A binary column is
-    excluded from the map (it can't round-trip as text), so `table_index` answers `None` for it
-    while its base table sits in `tables` with a perfectly good resolved key — which is exactly the
-    case `blob::blob_source` is about, and a fetch written against the write model's own lookup
-    would simply never offer itself. It matches the whole `(database, schema, table)` triple, the
+    exists because a *read* can be aimed at a column a write may not touch. A binary column **was**
+    the case it was written for: it was excluded from the map outright, so `table_index` answered
+    `None` for it while its base table sat in `tables` with a perfectly good resolved key, and a
+    fetch written against the write model's own lookup would simply never have offered itself.
+    Since C2 narrowed to text (below) that column has a `col_table` entry like any other, and
+    `blob::blob_source` still asks through here — an implicit key is excluded on the same terms, and
+    this is the lookup that cannot go stale on the question a second time. It matches the whole
+    `(database, schema, table)` triple, the
     same requirement `analyze_edit`'s grouping states: `sales.orders` and `archive.orders` are
     different tables and one must never answer for the other.
+    **C2 is two rules now, and only one of them still refuses the column.** It used to be one
+    sentence — a binary column can't round-trip as text — enforced in two places: `analyze_edit`
+    left the column out of `col_table`, and `resolve_key` refused it as a WHERE key. The first was
+    one claim doing two jobs. It is exactly true of *text* and was never true of bytes, and
+    excluding the column made the cell unwritable by any means at all, which is what kept the blob
+    panel a viewer. So a binary column is `editable` like any other now, and
+    `EditModel::text_editable(ci)` — `editable(ci) && !binary(ci)` — is the narrower refusal that
+    replaced it: the grid asks it wherever text would land in the cell (`plan_paste`'s predicate,
+    `start_edit`, the Tab/Enter hop `next_editable_col`, the row panel's `ColSpec::editable`, AI
+    Fill Value and the AI seed, `add_cloned_rows`, the *Edit field* and *Paste* cell-menu entries,
+    the Enter key and the double-click). *Set to NULL* deliberately still asks `editable`, because
+    emptying a blob writes no text. `resolve_key`'s half is unchanged — a binary column is still no
+    WHERE key, where the lossiness really is fatal and there is no byte-shaped way round it.
+    **`binary(ci)` is a recorded `col_binary` vector, and it asks two signals where editing used to
+    ask one**: `holds_bytes` is `Column::is_binary` **or** `ResultSet::binary_columns`. SQLite types
+    values rather than columns, so a blob living in a column declared `TEXT` has neither a wire flag
+    nor a type-name signal, and only the backend's own `ValueRef::Blob` assertion — the second
+    signal the export has always asked — can answer for it. `resolve_key` was moved onto the same
+    function, because C2's two halves have to agree on the word: a column one of them calls binary
+    and the other does not is either a lossy `WHERE` or a writable placeholder. It is recorded on
+    the model rather than re-derived at each call because "editable" and "editable *as text*" are
+    two different questions once a blob can be written, and the callers still asking the first are
+    the two that write no text: `blob_launch`, the surface that puts bytes in a cell, and
+    *Set to NULL*.
+    **`byte_cap(ci)` is a third recorded vector (`col_cap`), filled where the schema is already in
+    hand.** `analyze_edit` resolves each table group's schema **once** and both readers take that one
+    answer: it records `blob::column_byte_cap` of each binary column's declared type, and hands the
+    same `Option<&TableInfo>` to `resolve_key`, which no longer takes the closure at all
+    (`resolve_key(info, cis, rs)`). The UI's `schema_for` hands back a *cloned* `TableInfo` — every
+    column, index, check and foreign key — and `analyze_edit` runs in an effect on each result load
+    and each schema refresh, so asking twice doubled that clone per group. The type is read from the
+    *schema* and not from `rs`, because a result column's type name has had its length stripped and
+    its family flattened (see `column_byte_cap` for why only the schema can answer). Only binary columns are
+    asked, since only they have a surface that can overrun a limit, and a table with no loaded
+    schema simply has no caps: `None` is "no answer" here too. The answer rides to the panel on
+    `BlobTarget::cap` rather than being asked for when the file comes back, because by then the grid
+    it was read from may have been re-run underneath.
+    `refetch_key` reads a `Bytes` edit's **original** value rather than guessing at a text form for
+    it, so the re-fetch finds nothing rather than the wrong row. That arm is unreachable today,
+    since `resolve_key` never lets a binary column be a key; it is written down because the one
+    thing that function must not do is invent a byte string's text form.
     **`staged_cell` is the one revert-to-original rule**, for a single cell: `Revert` when the value
     being staged *is* what was already there — drop any edit at that cell and don't count it — and
     `Stage` otherwise. The NULL normalisation is inside it rather than at the call site because it is
@@ -474,7 +543,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     so the report and the dirty map cannot disagree about what landed.
     **The staged-cells → `RowEdit` grouping is here for the same reason, and it is the step a paste
     stresses.** `build_edits(model, rs, dirty)` folds a `DirtyCells` map — `(data row, result
-    column) → new value`, `None` being SQL NULL, the shape `GridState::dirty` holds — into one
+    column) → new value`, each a `model::CellEdit`, the shape `GridState::dirty` holds — into one
     `RowEdit` per (base table, data row) via `row_edit_for`, which builds the `SET` list and the
     `WHERE` key off the row's *original* values; `origin_column` is the one reader of a result
     column's real name on its base table. `GridState::build_edits` is now a thin wrapper over it. A
@@ -540,8 +609,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     longer round-trips. The ambiguity is in the selection model, not in either surface, and both now
     agree with what is drawn rather than with each other.
   - `blob.rs` — **one raw-bytes cell, fetched on demand**: the pure half of the grid's binary-cell
-    panel. This is the *read* half of binary data and nothing more — a blob is still never editable,
-    and nothing here writes one back. Because the bytes never reach the grid (see `model.rs` above),
+    panel. Nothing here writes a blob back — the file goes to the grid's dirty map as a
+    `CellEdit::Bytes` (see `blob_view.rs`), never through here — though the panel it serves is a
+    write surface now, and the two questions a write has to settle before staging anything *are*
+    here: `column_byte_cap` and `LOAD_CAP`, below.
+    Because the bytes never reach the grid (see `model.rs` above),
     opening a `<n bytes>` cell is a second query, and what aims it is
     `blob_source(model, rs, di, ci) -> Option<BlobRef>`: the column's own wire provenance —
     `database`/`schema`/`table` and the **real** column name, not the query's alias — plus
@@ -559,13 +631,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`a_text_value_in_a_binary_column_is_not_fetchable`). A NULL cell fails the same check, for the
     different and simpler reason that there are no bytes.
     **It cannot ask `EditModel::table_index`, and that composition is the load-bearing part.** The
-    rule that binary columns are never editable keeps the column out of `col_table`, so the write
-    model answers `None` for the very column being fetched;
+    rule that binary columns are never editable used to keep the column out of `col_table`, so the
+    write model answered `None` for the very column being fetched;
     `EditModel::table_for_origin` finds the keyed base table by the provenance triple instead
-    (`a_same_named_table_in_another_schema_is_not_the_source`). That rule is *unchanged* — binary
-    columns are still read-only and still barred as WHERE keys — which is what
-    `a_binary_column_c2_made_read_only_still_resolves_a_source` pins from both sides in one test:
-    the model still refuses the column, and the fetch still finds its table. The binary signal read
+    (`a_same_named_table_in_another_schema_is_not_the_source`). C2 has since narrowed to *text*, so
+    the column is in the map like any other and this lookup is merely the one that cannot go stale
+    on that question again — which is what
+    `a_binary_column_resolves_a_source_and_a_bytes_only_write` pins from both sides in one test: the
+    column takes a write but not a text one (`editable` yes, `text_editable` no), and the fetch
+    still finds its table. Binary columns remain barred as WHERE keys. The binary signal read
     here is the same pair `export::dropped_binary_columns` uses, `Column::is_binary` **or**
     `ResultSet::binary_columns`, so a SQLite blob in a column declared `TEXT` is fetchable
     (`a_dynamically_asserted_binary_column_resolves_a_source`); an implicit key is not, being no
@@ -591,6 +665,44 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Everything that is not a plain filename character becomes `_`, because a key value is server
     data on its way to a save dialog — a separator, a `..` or an NTFS stream colon must not steer
     where the file lands (`the_save_stem_cannot_escape_into_a_path`).
+    **`column_byte_cap(type_name)` is the write's one pure question: how much does this column
+    actually hold?** It exists so an oversized file is refused where the user picked it. The other
+    place it gets refused is MySQL's `ERROR 1406: Data too long`, which arrives at the *commit*,
+    names the column rather than the file, and rolls back the whole staged batch — every unrelated
+    edit in it included. The four MySQL blob families answer from the family alone (TINYBLOB 255,
+    BLOB 65535, MEDIUMBLOB 16777215, LONGBLOB 4294967295), since the bound there is the family and
+    not a parameter — MySQL resolves a `BLOB(M)` declaration to the smallest family that holds `M`
+    and reports what it resolved to, so no length ever survives to be read (measured on MySQL 8.4:
+    `BLOB(70000)` introspects as `mediumblob` and `BLOB(200)` as `tinyblob`, and
+    `information_schema.CHARACTER_MAXIMUM_LENGTH` agrees with all four numbers) — while
+    `BINARY(n)`/`VARBINARY(n)` take theirs from the parameter.
+    **It reads the *declared* type (`ColumnInfo::type_name`) and never a result column's wire type
+    name**, which is the load-bearing part rather than a preference: MySQL reports all four sizes as
+    `MYSQL_TYPE_BLOB`, so the wire says `BLOB` for a `LONGBLOB` and strips the length off a
+    `VARBINARY` — only the schema knows, and a cap read off the wire would refuse a 1 MB file the
+    `MEDIUMBLOB` behind it was waiting for. Each family name is matched whole and case-insensitively
+    on the head word, which is what keeps `LONGBLOB` from answering as a `BLOB`
+    (`a_longer_family_name_is_not_read_as_a_shorter_one`, beside
+    `each_blob_family_carries_its_own_cap` and
+    `a_fixed_width_binary_column_takes_its_cap_from_its_parameter`).
+    **`None` is "no answer", never "no limit"**, and every caller must treat it so: `bytea`, SQLite,
+    an unknown type name, an unloaded schema and a bare `VARBINARY` all give it
+    (`an_unbounded_or_unreadable_type_answers_no_cap`), and after one the server is the authority it
+    always was.
+    **`LOAD_CAP` bounds a loaded file whatever the column says**, and it is `FETCH_CAP` — 64 MiB —
+    deliberately. The read half has always been bounded and the write half was
+    not: a `SELECT` can hand back only `FETCH_CAP`, but a file picker hands over whatever is on disk,
+    `fs::read` allocates all of it and the staged edit holds it, while a `LONGBLOB`'s own cap is 4 GB
+    and the column whose schema has not loaded reports no cap at all. The same number as the read cap
+    rather than a larger one, because a value above it comes back truncated, refuses to save and
+    displays as a prefix of itself — writing one in would create cells this app can never render or
+    export whole again. `load_too_large(len)` compares with `>`, so a file of exactly the cap fits,
+    that being the largest the read half can return whole
+    (`a_file_of_exactly_the_load_cap_still_fits`, which pins the boundary and the two constants'
+    equality together). The app's `load_blob` asks it of `fs::metadata` **before** the read — refusing
+    a 4 GB file by inspecting the `Vec` it produced means allocating it first — and again of the
+    bytes afterwards, since a file can grow between the two; missing metadata is not itself a
+    refusal, the read below reporting the real error.
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML/Excel export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping). **Rows arrive through a pull source,
     not as a `&ResultSet`**: `RowChunks::next_chunk` hands over one `RowChunk { rs, order }` at a
@@ -3638,6 +3750,38 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   folds its `Outcome::stmt` into `TxState::on_statement`: a read is still a statement, and one that
   loses the connection has to reach the tab or the footer pill goes on claiming a live transaction
   over a dead socket.
+  **Writing one back is three bindings, one per engine, and each is a decision about the wire rather
+  than a spelling.** MySQL's `cell_param` sends `MyValue::Bytes` for both `CellEdit::Text` and
+  `CellEdit::Bytes` — the protocol has one length-prefixed octet string and the server coerces it to
+  the column — but they arrive there by different routes and only one is reversible: `Text` is the
+  user's characters encoded as UTF-8, `Bytes` is the octets themselves. Collapsing the two at the
+  *call site* is what would hurt, because `String::into_bytes` over a lossily-decoded blob is not
+  the blob. SQLite's `cell_param` binds `rusqlite::types::Value::Blob`, since `Text` and `Blob` are
+  different storage classes and `BLOB` affinity is the one that never coerces — a blob bound as text
+  on such a column stores text. PostgreSQL inlines its values, and `pg_cell_lit` (the widened
+  `pg_opt_lit`) emits `decode('<hex>', 'hex')`, deliberately **not** `'\x…'::bytea`: that form needs
+  its leading backslash to survive the string literal and reach `bytea`'s input function as that
+  type's hex marker, which holds only while `standard_conforming_strings` is on — settable per
+  database and per role, the same dependency `pg::roles` already refuses to take. With it off the
+  *string* literal claims the backslash first, as its own hex escape: `'\x41424344'` resolves to the
+  seven characters `A424344` (`\x41` being the escape for `A`), `bytea` then reads those in its
+  escape format, and the column takes seven bytes of ASCII where four bytes of value belonged. How
+  that presents depends on the payload — bytes whose escaped form is still valid UTF-8 store the
+  wrong value with no error at all, and one that is not fails the statement outright, which is how
+  most real blobs would land. `decode`'s argument is hex
+  digits and nothing else, so there is nothing in it to escape and nothing to quote; the hex is
+  lower-case and zero-padded to two digits per byte
+  (`bytea_hex_is_zero_padded_two_digits_per_byte`), because an odd-length string shifts every byte
+  after the short one and `decode` rejects it — a failure that would appear on some blobs only.
+  The live tier's `staged_bytes_reach_the_column_as_bytes` runs the whole chain — stage, commit,
+  re-read — on all three servers, and it is what proves the MySQL binding; it does **not** pin the
+  PostgreSQL choice, because a server with the default setting takes both forms, which is precisely
+  why the argument is written down rather than left to the test. SQLite's leg needs no server and
+  is in `sqlite.rs` (`a_staged_blob_is_written_as_a_blob_and_not_as_text`, which asserts the stored
+  `typeof()` and not merely the bytes: a payload that happens to be ASCII reads back identically
+  through either arm, so the storage class is the only thing that tells the wrong write apart), and
+  `a_blob_column_is_writable_end_to_end_but_never_as_text` composes the four links the pure tests
+  each pin apart — C2's narrowing, the `DirtyCells` widening, the grouping and the binding.
   **`Db::run_script` is `stream_query` inverted** — it takes a bounded
   `Receiver<script::Statement>` where that one takes a Sender — and it is the load half of the
   round trip `dump.rs` opens. It executes each statement in order on one pinned connection, stops
@@ -4667,6 +4811,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `form_separator`/`form_gap()`/`control_button`/`footer_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
     than copying them a third time.
+    **`modal_footer_split` shrinks the status and never the actions.** A flex item's `min-width` is
+    `auto`, so a long sentence in the left slot refuses to compress and pushes what follows it out
+    of the panel — which is how the binary panel's load line shipped its three buttons off the
+    right-hand edge of the modal, and what a long enough "Saved to …" path would have done to the
+    same footer on any other day. The status is wrapped in a container with
+    `min_width(0)`/`flex_shrink(1)` and the actions in one with `flex_shrink(0)`. Every modal shares
+    this row, so the fix belongs to the widget rather than to the one sentence that exposed it, and
+    the caller's half is `text_ellipsis` on a status that can run long — so it ends in a `…` rather
+    than in a clipped word.
     Also the **read-only fact panel** — `fact_section` (a heading with its rows under it), `fact_row`
     (one `label: value` line) and `fact_note` (an icon-led caveat), the three views a panel of
     *observed* facts is built from. They were `properties.rs`'s private helpers until `users_view.rs`
@@ -6909,12 +7062,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     question asked about the *result on screen* rather than about the schema tree — and counted in
     `workspace_modals_up`, without which its backdrop would resolve `inset(0)` against nothing.
     Its content does not come from the result: `BlobUi`'s `state` is filled by the app's
-    `ViewBlobFn`, and the three things that can arrive each get a sentence — the bytes, `Empty`
-    (the cell is NULL *or* the row is gone, one state because the panel's honest sentence is the
-    same and the difference is not one this can establish), or a failure. There is deliberately no
-    fourth "not fetched yet" state: the fetch starts as the modal opens, so `Loading` is what the
-    panel is born in. **`BlobUi::open` resets every field, not the two that obviously change** — a
-    second cell opened after a first left `saved` holding the first one's "Saved to …" under a
+    `ViewBlobFn` — `(conn_id, Option<BlobRef>, BlobTarget, Option<BlobStageFn>)`, the `BlobRef`
+    absent for a cell with nothing committed to read and the stage fn absent for one nothing can
+    write — and the three things that can arrive each get a sentence: the bytes, `Empty`
+    (the cell is NULL *or* the row is gone *or* the row is not committed yet, one state because the
+    panel's honest sentence is the same and the difference is not one this can establish), or a
+    failure. There is deliberately no
+    fourth "not fetched yet" state: the fetch starts as the modal opens, so `Loading` is what a
+    panel with something to read is born in. **`BlobUi::open` takes the state it opens in**
+    (`open(target, stage, state)`) rather than always `Loading`, because a cell with a `None`
+    `BlobRef` — a NULL cell, a pending row — has nothing to fetch and the app answers `Empty` for it
+    without a round trip. Saying so a line *later* was a panic: the two calls are one turn apart, so
+    the rebuild queued by `open`'s own `target.set` carried a `Loading` phase over a state that was
+    already `Empty`, and the builder asserted the two agreed. Born in the final state there is no
+    transition to disagree about, and it is the truer statement anyway — the panel knows. Pinned by
+    `a_panel_with_nothing_to_fetch_opens_empty_in_one_step`, asserted through `open` rather than on
+    the ordering inside it: the question is whether a caller can still put the panel in a state its
+    own rebuild key disagrees with. **`BlobUi::open` resets every field, not the two that obviously
+    change** — a
+    second cell opened after a first left `note` holding the first one's "Saved to …" under a
     title naming the second — and **which pane opens is decided in `loaded`, not in the view**,
     since a view that picked it would re-pick it on every rebuild and drag the user back off the
     pane they switched to. The hex dump is virtualized on the results grid's own
@@ -6950,17 +7116,95 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     worker (a 64 MiB `fs::write` on the UI thread is a frozen window, the ERD export's reason), and
     the `BlobRef` that addresses the row stays in the app with the connection it has to be asked
     over, so two places are never responsible for aiming one fetch.
+    **The panel is a write surface now, not only a viewer.** `BlobUi::stage` holds where a loaded
+    file goes: a `BlobStageFn` the **grid** supplies, because the grid is what holds the staged
+    edit and this panel knows the cell only well enough to *name* it — giving it the coordinates
+    would put one cell's identity in two places, which `BlobTarget` already refuses for the read
+    half. `None` there is a cell nothing can write, and it is what leaves *Load from file*
+    disabled; the button sits before *Save to file* and the three actions take `ACTION_TAB + 1/2/3`.
+    The panel owns the open dialog and the app does the read: `BlobLoadFn`
+    (`TabActions::load_blob`, a `std::fs::read` on a blocking worker) is `BlobSaveFn` in reverse and
+    off-thread for the same reason — the file can be as large as the value it replaces.
+    Unlike Save it does not depend on what was *read*: a value too large to save whole can still be
+    replaced, and a NULL cell has nothing to read and is exactly where a first file goes. `stage` is
+    reset by `open`/`close` like every other field, and for a sharper reason than the status line —
+    carrying the previous cell's sink over would aim the button at a row the panel is no longer
+    about, a wrong write rather than a wrong sentence. `BlobUi::loaded_file(epoch, …)` takes a
+    `Result<Vec<u8>, String>` — the file's bytes or why they could not be read, and **not** its
+    name. The status line sits under a title that already names the cell and has to fit beside three
+    buttons, so it spends its words on *Loaded file. Commit in the grid to write it.* and the name
+    is dropped rather than threaded to a parameter nothing reads. It stages the bytes, shows them,
+    and says **staged**: they are in the grid's
+    dirty map like any typed edit and reach the table on Commit, so a line reading "Loaded" would
+    read as a save. It is epoch-guarded like every other report here, and it is the one in the
+    family whose late arrival would write to a *database* rather than to a label; a load arriving
+    with no sink is refused in words rather than dropped, because doing nothing quietly looks
+    exactly like a load that worked.
+    **And the sink itself can refuse**: `BlobStageFn` returns a `bool`, and the panel says which way
+    it went. The file dialog stands open for as long as the user takes to choose and the grid is free
+    to move underneath it — the pending row discarded, the row marked for deletion, the result re-run
+    read-only — so the gate `blob_launch` passed is not necessarily the one that holds when the bytes
+    land, and `GridState::stage_bytes` asks it again (see the grid). Reporting a refusal as *Loaded
+    file.* is the worst of the outcomes available: it is indistinguishable from a write that will
+    happen, and the difference is a column that does or does not get written. A refusal replaces
+    nothing —
+    the panel goes on showing the value that is still there — and the note says so, both halves
+    pinned by `a_sink_that_refuses_is_reported_rather_than_dressed_as_a_load`.
+    **An oversized file is refused here, before anything is staged**, against `BlobTarget::cap` —
+    the column's declared capacity, which `grid::blob_launch` reads off `EditModel::byte_cap`. The
+    message names both sizes ("That file is 136.7 KB — this column holds at most 64.0 KB.") because
+    the column's own limit is a fact the user has no other way to learn. The alternative is the
+    server's, and it is much worse placed: MySQL's `ERROR 1406: Data too long` arrives at the
+    commit, names the column rather than the file, lands after this panel has closed, and takes
+    every other staged edit in the batch down with the rollback. The comparison is `>`, so a file of
+    exactly the cap fits, and a `None` cap refuses nothing — "no answer" is not "no limit", and the
+    server remains the authority behind it
+    (`a_file_over_the_columns_cap_is_refused_before_anything_is_staged`,
+    `with_no_cap_the_panel_refuses_nothing`). That is the *column's* limit and it is the only one
+    this panel knows: the app's `load_blob` applies `blob::LOAD_CAP` before it reads the file at all,
+    and its refusal arrives here as an ordinary load failure. Both sentences, and the sink's, land in
+    the same status line as any other error.
+    `saved` became `note` because there is one line under the body
+    and both reports use it — they are never in flight at once, a load being precisely what makes a
+    stale "Saved to …" a sentence about a file that is no longer what the panel is showing — and
+    `saved_at` now formats its own "Saved to {path}". All three spellings of that line — the note,
+    the failure, the save hint — carry `text_ellipsis`, because it shares the footer with three
+    buttons: `widgets::modal_footer_split` is what lets the slot shrink instead of pushing them out,
+    and the ellipsis is the caller's half of that bargain. A load failure carries the OS's message,
+    which is the one with no length bound at all.
     **The `dyn_container` key is a memo of the panel's *shape*, not of its signals** — the rule
     `widgets::overlay_open_key` states, and this panel is where breaking it costs most. A key that
-    read `state` and `saved` directly rebuilt everything on every write to either, which finished a
+    read `state` and `note` directly rebuilt everything on every write to either, which finished a
     save by clearing focus off the button just pressed (floem drops `app_state.focus` when a view is
-    removed) and re-ran `img()` over the whole buffer. The memo is `(epoch, open, phase, pane)` —
+    removed) and re-ran `img()` over the whole buffer. The memo is `(epoch, open, phase)` —
     `epoch` is the session term, since a second cell is a different panel even when both are
     `Ready` — and the status line has a container of its own so a save's outcome moves nothing else.
+    **The phase term is there to *trigger* the rebuild, not to describe it**, and the builder
+    accordingly ignores the `phase` it is handed and reads the live state. A queued key can be one
+    revision behind the signals: two terms written in one turn queue two values — the memo notifies
+    on each — and floem builds both, in order, against whatever the signals hold at processing time.
+    Reading the state makes the first of those a redundant rebuild with the right content. Trusting
+    the tuple made it a `debug_assert_eq!(phase_of(&state), phase)` that *Edit binary* on a NULL cell
+    tripped, and that assert is gone. `open` taking its state closed the one path that produced a
+    stale key here; the builder reading the state is what stops the next caller to add one from
+    bringing the panic back.
+    **That key is why `loaded_file` writes in the order it does.** A file loaded over the bytes
+    already on screen is `Ready` → `Ready`, which changes no `phase` and no `open`, so the epoch
+    bump is the only thing that gets a rebuild at all: without it the panel goes on showing the
+    *old* image over the new bytes' status line. And the bump goes **last**, because the builder
+    reads the payload untracked — bumping first rebuilds the body against the value being replaced,
+    and the `state.set` behind it then changes no term and so rebuilds nothing.
     **Every exit cancels before it closes** (`TabsActions::cancel_blob`): the epoch guard already
     stops a late answer landing in the next panel, but that is about correctness rather than work,
     and an uncancelled read streams up to `FETCH_CAP` to nobody while holding a connection — or the
-    tab's pinned session — busy. Opening a second cell supersedes the first read the same way.
+    tab's pinned session — busy. Opening a second cell supersedes the first read the same way, and
+    the app's `view_blob` does that **before** it branches on the `BlobRef`. The cancel block sat
+    below the `None` early return, so the one opening with nothing of its own to fetch — a NULL cell,
+    a pending row — skipped it entirely and left an earlier fetch streaming to `FETCH_CAP` over a
+    connection whose only reader had gone, which is precisely the cost `cancel_blob`'s doc says the
+    cancel exists to avoid. The new token also has to *replace* the stored one rather than only
+    cancel it: keeping the stale token there pointed the new panel's Escape at a read that was
+    already over.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
     surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
@@ -9122,6 +9366,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   it properly needs a body signal per row, the way the routine editor got one; there is a note at the
   key saying so. The view editor took the memo safely for the opposite reason: `fetch_algorithm`
   patches a term in the diff and not a control, so its rebuild delivered nothing to the screen.
+  **The session term has a second job, and the binary-cell panel is where it shows.** A key that
+  dedups by *shape* will not admit a payload that replaces one `Ready` value with another, so
+  `BlobUi::loaded_file` — a file loaded over the bytes on screen — bumps the epoch to get a rebuild
+  at all, and bumps it **last**, because the builder reads the payload untracked and the key must
+  not admit it before the state is there. Both orderings are a one-line mistake with a settled,
+  plausible-looking panel as the symptom: no bump and the old image stays over the new file's
+  status line; bump first and the rebuild renders the value being replaced.
+  **And a queued key can be one revision behind its own signals, so the builder must read the state
+  rather than the key it was handed.** Two terms of a keying memo written in one turn queue *two*
+  values — the memo notifies on each — and floem builds both, in order, against whatever the signals
+  hold at processing time. A key is therefore a trigger, not a description of what is about to be
+  built. The binary panel asserted the two agreed (`debug_assert_eq!(phase_of(&state), phase)`) and
+  panicked on *Edit binary* over a NULL cell, where the app called `open` and then reported `Empty`
+  in the same turn: the first queued key said `Loading` over a state that was already `Empty`. It
+  was fixed on both sides, and only one of them is local to that panel — the caller stopped making
+  the transition (`BlobUi::open` takes the state it opens in), and the builder now ignores the
+  phase, which turns a stale key back into what it always was, a redundant rebuild with the right
+  content.
   **The two account forms are the same bug in its other flavour**, found later and in two more
   places: no fetch anywhere near them, just a key reading the draft signal that every keystroke
   writes, so typing a name rebuilt the form around the field being typed in. They take a memo over
@@ -10605,21 +10867,52 @@ for keyboard nav.
   `CellInk` (`Staged`, `StagedNull`, `Absent`, `Fk`, `Plain`) rather than an `if` chain inside the
   style closure — the fifth case is why: a staged SQL NULL and a staged four-character `NULL` went
   through one arm and painted identically. A paste no longer produces the second by accident, but a
-  *typed* `NULL` still does, so the distinction stays load-bearing (see the paste rules above).
+  *typed* `NULL` still does, so the distinction stays load-bearing (see the paste rules above). It
+  takes the staged `CellEdit`, and a staged **blob** weighs as `Staged` rather than `StagedNull`:
+  it paints `<n bytes>`, and the italic in this grid means *absence*, where a placeholder stands
+  for a value that is there. The green fill is what says it changed.
 - **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers `Copy › CSV / JSON`
   of that column's values (`export_column_csv`/`_json`); a data cell offers `View`, `Edit` (editable
   cells only), a Copy entry whose scope and wording come from `edit::copy_scope` (**Copy** for the
   whole block when the right-click was inside a multi-cell selection, **Copy value** for one cell —
   the same word for three different amounts was the bug), `Set to NULL` (editable **and** nullable —
-  stages `dirty` `None`), and
+  stages a `CellEdit::Null`, and it is `editable` it asks, not `text_editable`, because emptying a
+  blob writes no text), and
   `AI summary` (reveals the AI panel, prompts with source table + column for context).
-  **`View binary` is the one entry that opens a cell the grid is not holding** (`blob_launch` →
+  **`Edit binary` / `View binary` is the one entry that opens a cell the grid is not holding**
+  (`blob_launch` →
   `open_blob` → `ui.tab_actions.view_blob`, over `core::blob::blob_source`; a **double-click** on
   the cell is the same call, which is why both go through `open_blob` rather than reaching the
-  action apiece — the connection they carry is a decision, not a lookup). **Every reason it cannot open is
-  a reason it is absent rather than dimmed** — a pending new row, a NULL cell, an expression column,
-  or a keyless table. The entry is the only signal the app gives that a `<n bytes>` cell has anything
-  behind it, so one that opened a panel saying "nothing here" would be worse than no entry. The
+  action apiece — the connection they carry is a decision, not a lookup). `blob_launch` returns a
+  `BlobLaunch { bref, target, stage }`, and its `label()` picks the word: a cell with somewhere to
+  put bytes is *Edit binary*, one without is *View binary*. Two labels for one entry because they
+  are two different offers, and the panel behind them differs by a button. **It refuses only when
+  there is neither anything to read nor anywhere to write.** A NULL cell and a pending new row used
+  to be refusals outright, and they were *read*-side ones: there is nothing committed to fetch, so
+  `bref` is `None`, the panel opens `Empty` — and that is exactly where a first file goes. `stage`
+  is `None` for a column `EditModel::editable` refuses (an expression, a keyless table) or a row
+  marked for deletion. With both `None` there is no entry at all: **every reason it cannot open is a
+  reason it is absent rather than dimmed**, because the entry is the only signal the app gives that
+  a `<n bytes>` cell has anything behind it, so one that opened a panel saying "nothing here" would
+  be worse than no entry. `blob_launch` asks `editable` and deliberately not `text_editable` — this
+  is the one surface that puts bytes in a cell, and `text_editable` is precisely what keeps
+  everything *else* out of a binary column. Where the file lands is `GridState::stage_bytes` /
+  `stage_new_bytes`, and neither carries the revert-to-original rule a typed edit gets from
+  `edit::staged_cell`: the grid holds a placeholder and not the stored bytes, so there is nothing to
+  compare a loaded file against and a load always stages. **Both re-ask the write gate and return
+  whether they staged**, because the path from `blob_launch`'s answer to this write runs through a
+  file dialog and a worker thread, and the grid is free to move in between. `stage_bytes` asks
+  `del_rows` as well as `editable`: `toggle_delete` purges a marked row from `dirty`, so a file
+  staged afterwards puts it back, and the commit then carries a `RowDelete` *and* a `RowEdit` for one
+  row — `GridWrite::plan` runs the deletes first, the update matches nothing, and `one_row_verdict`
+  rolls the whole batch back over an edit the user could never see. `stage_new_bytes` re-checks that
+  the pending row is still there, `new_rows` being free to shrink under an open dialog (Discard, a
+  commit, a removed skeleton row). The `bool` is what the panel reports — see `blob_view.rs`.
+  The `BlobTarget` it builds also carries
+  the column's `EditModel::byte_cap`, which is what lets the panel refuse an oversized file at the
+  picker instead of at the commit (see `blob_view.rs`). The **row panel's** per-field *Edit*/*View*
+  button is built from this same launcher rather than from a second set of rules — see it below.
+  The
   *connection* is deliberately not among the refusals: a result on screen came from one by
   construction, and a sentinel for "no connection" would be a rule nothing else in the app keeps.
   The fetch carries `conn_at_load` rather than the tab's current connection, on the argument the
@@ -10641,7 +10934,8 @@ for keyboard nav.
   `View` item opens an **integrated in-flow bottom strip** (not a popup — `border_top` + panel bg, like
   the old viewer; the grid above shrinks) rendering the row as a **structured, per-field editor**, one
   row per column, over `core::rowjson`. Header = `Row {gutter#} · {table}` + a Save (✓) icon (shown
-  only when the result has ≥1 editable column; otherwise it's a read-only row viewer) then Close (✕);
+  only when the result has ≥1 writable column, text **or** binary — `any_editable`, below;
+  otherwise it's a read-only row viewer) then Close (✕);
   a "Saving…" line shows while a save is in flight. Its **errors are not inline** — they go to
   `commit_err`, the same bottom bar a grid commit failure uses, because an inline message rendered
   under the field it came from was, on a JSON column, nested several scrolls down, so a save that
@@ -10669,7 +10963,41 @@ for keyboard nav.
   a field that can't (invalid JSON) stops the write rather than letting the stale value through.
   This is the row panel's counterpart to `commit_grid`'s "flush any open in-cell edit first".
   Read-only fields (expression/`binary`) are shown for context but edits to them are rejected —
-  **a key column is editable**, here as in the grid (`EditModel::editable` asks only whether the
+  a binary one for the panel's own reason, its `ColSpec::editable` being `text_editable`: every
+  field here is an `edit_field`, and a binary column's would hold `<n bytes>`.
+  **That used to be the end of it, and it left the row panel blind to blobs**: the field showed the
+  byte count and offered nothing at all, so a blob was the one column you had to close this panel to
+  touch. `field_row` now takes a `blob: Option<BlobField>` — `type BlobField = (&'static str,
+  Rc<dyn Fn()>)`, the word its button reads and what pressing it does — which `edit_row_panel`
+  builds from the same `blob_launch` the cell menu uses, so a column that launcher refuses reads
+  exactly as it did before: the count, and no button. The word is *Edit* where the cell takes a
+  write and *View* where it does not, the cell menu's pair shortened because the row is already
+  headed by the column's name and *Edit binary* would say it twice. The button is that column's
+  editor, in the place every other column's editor is.
+  **A blob column has to count toward the ✓ as well**, and `any_editable` is where that was missed.
+  It gates the Save icon, and `ColSpec::editable` is `text_editable` — so a row whose only writable
+  column is binary (a SQLite `BLOB` in a rowid-keyed table, where the rowid is an implicit key and
+  therefore left out of `col_table`) showed the *Edit* button, staged the file, and then offered no
+  way to save it. It now also asks `EditModel::editable` across the columns, the same predicate
+  `blob_launch` asks, so the two cannot disagree about whether the row has anything to write.
+  **`grid::blob_value` draws that field reactively off `gs.dirty`, unlike every other read-only
+  field here.** The panel seeds its fields from the stored row and rebuilds only when the row or the
+  editors change, which is right for a field nothing but its own input can alter — but this one's
+  value can change while the panel stands still, because its button stages into the grid. Without
+  the subscription the count stayed at the stored size after a file was loaded, and the row's ✓ then
+  wrote bytes the panel had never shown. It resolves the two shapes the cell can hold the way the
+  grid painter does — the staged value if there is one, else the stored text — and `value_text` is
+  the dim, ellipsized line it shares with `readonly_value`.
+  **`commit_row_update` folds this row's staged `CellEdit::Bytes` into its own changes** before
+  building the `RowEdit`, so the ✓ writes the file the panel was used to load instead of leaving it
+  green in the grid awaiting a second, different Commit. **Only `Bytes`, and only ones no field
+  change already covers**: a staged *text* edit on the same row is deliberately not swept in,
+  because this panel seeds its fields from the stored result rather than from the dirty map and
+  would be writing something it never showed. The bytes are appended *after* the text changes, so
+  `edit::row_edit_for`'s sort is what puts the `SET` back in column order —
+  `a_row_panels_text_fields_and_a_staged_blob_sort_into_one_statement` pins that composition rather
+  than either half of it. **A key column is editable**, here as
+  in the grid (`EditModel::editable` asks only whether the
   column maps to a base table) — the single exception being an implicit key, which maps to no column
   of the table and is left out when the model is built — which is why both re-fetches go through
   the one `edit::refetch_key`:
@@ -10691,9 +11019,10 @@ for keyboard nav.
   `commit_grid` → a `GridWrite { updates, inserts }` → the app's `commit_edits`. On success the app
   re-runs the query; on failure the error shows in the toolbar and green edits stay. No global "Edit"
   toggle. A read-only cell's double-click only selects it — **except a binary one**, where it opens
-  the binary-cell panel (`open_blob`, the same call `View binary` makes). C2 holds that column
-  read-only, so the gesture was unbound there, and "open the thing I clicked" is what a double-click
-  means everywhere else in the app.
+  the binary-cell panel (`open_blob`, the same call the cell menu's entry makes). C2 — now
+  `EditModel::text_editable` — keeps the inline editor off that column whether or not the column
+  itself is writable, so the gesture was free there, and "open the thing I clicked" is what a
+  double-click means everywhere else in the app.
 - **A column whose legal values are written down doesn't edit as text.** Booleans, `ENUM`s, `SET`s
   and dates get their own control, in the grid *and* in the row panel, over
   `core::celledit` + `core::date` (the rules) and `ui::cell_editors` (the widgets) — both of which
