@@ -220,6 +220,9 @@ fn optional_field(
     initial: Option<String>,
     placeholder: &'static str,
     options: impl Fn() -> Vec<String> + 'static,
+    // What the chevron's menu says when `options` answers nothing — see
+    // `suggest_chevron`.
+    empty_note: &'static str,
     ring: &FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut DatabaseDraft, Option<String>) + 'static,
@@ -243,7 +246,7 @@ fn optional_field(
             },
         )
         .style(move |s| s.width(field_w())),
-        suggest_chevron(ui, sig, options, ring.clone(), tabindex + 1),
+        suggest_chevron(ui, sig, options, empty_note, ring.clone(), tabindex + 1),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
     .into_any()
@@ -299,6 +302,7 @@ fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing
                     draft.charset.clone(),
                     "server default",
                     || ddl::MYSQL_CHARSETS.iter().map(|c| c.to_string()).collect(),
+                    "No character sets to suggest",
                     &ring,
                     20,
                     |d, v| d.charset = v,
@@ -319,6 +323,7 @@ fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing
                             .map(|c| c.to_string())
                             .collect()
                     },
+                    "No collations to suggest",
                     &ring,
                     30,
                     |d, v| d.collation = v,
@@ -341,6 +346,10 @@ fn form(ui: &Ui, target: &DatabaseTarget, draft: &DatabaseDraft, ring: FocusRing
                     draft.owner.clone(),
                     "you",
                     move || roles.get_untracked(),
+                    // Reachable: the roles arrive from a fetch, so the list is
+                    // empty until it lands and for good if it fails — and a
+                    // chevron that answers with silence reads as broken.
+                    "No roles on this server",
                     &ring,
                     40,
                     |d, v| d.owner = v,

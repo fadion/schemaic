@@ -673,10 +673,14 @@ fn field_view(
 // particular not the `&Ui` it read the two `Copy` overlay signals off, so it can
 // outlive that borrow and be returned from a form builder that took `ui` by
 // reference. `F` has to be named for that list to be writable at all.
+/// `empty_note` is what the menu says when [`suggest_chevron`]'s `options`
+/// answer nothing — see the "nothing to suggest" arm for why the menu is not
+/// simply withheld.
 pub(crate) fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
     ui: &Ui,
     sig: RwSignal<String>,
     options: F,
+    empty_note: &'static str,
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView + use<F> {
@@ -720,25 +724,29 @@ pub(crate) fn suggest_chevron<F: Fn() -> Vec<String> + 'static>(
             popup.set(None);
             return;
         }
-        // **Nothing to suggest, nothing to open.** `popup_menu_overlay` builds a
-        // panel for any `Some`, and an empty entry list is still a panel: its
+        // **Nothing to suggest is an answer, not silence.** An *empty* panel is
+        // not an option: `popup_menu_overlay` builds one for any `Some`, its
         // height sums to the padding and border alone and its measured width is
         // zero, so it clamps to the 170px `popup_width` floor and draws an empty
         // bordered box at the chevron that then eats the click meant to dismiss
-        // it. Unreachable while every caller passed a constant list; the Owner
-        // field's roles arrive from a fetch, and are empty until it lands and
-        // for good if it fails.
+        // it. But returning without opening anything is worse in the way that
+        // matters: the chevron looks pressable, answers with nothing, and is
+        // indistinguishable from one that is broken — which is exactly how it
+        // was reported. So the menu opens carrying one **disabled** row saying
+        // why it is empty. Reachable wherever the list comes from a fetch: the
+        // database editor's owners, and the grant form's roles on a server that
+        // has none.
         let entries = options();
-        if entries.is_empty() {
-            return;
-        }
-        anchor.set(here);
-        popup.set(Some(
+        let entries: Vec<MenuEntry> = if entries.is_empty() {
+            vec![MenuEntry::action(empty_note, || {}).disabled(true)]
+        } else {
             entries
                 .into_iter()
                 .map(|o| MenuEntry::action(o.clone(), move || sig.set(o.clone())))
-                .collect(),
-        ));
+                .collect()
+        };
+        anchor.set(here);
+        popup.set(Some(entries));
     });
     let pressed = open.clone();
     let button = crate::widgets::in_ring_button(
@@ -786,7 +794,14 @@ fn bound_field_with_menu(
     let sig = bound_signal(ui, initial, apply);
     h_stack((
         field_view(sig, width, placeholder, mono, ring.clone(), tabindex),
-        suggest_chevron(ui, sig, move || options.clone(), ring, tabindex + 1),
+        suggest_chevron(
+            ui,
+            sig,
+            move || options.clone(),
+            "No suggestions",
+            ring,
+            tabindex + 1,
+        ),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
     .into_any()

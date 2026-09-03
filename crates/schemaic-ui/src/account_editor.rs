@@ -105,6 +105,26 @@ fn field_w() -> f64 {
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
+/// Clear what a fresh form must not inherit, **then** seed this one's draft.
+///
+/// The order is the whole of it, and getting it backwards is not a subtle
+/// failure: `close_peers` clears every editor's draft — including the one being
+/// opened — so seeding first and clearing second left the grant form with
+/// `GrantDraft::default()`, whose `level` is `None`. The form shows its Level row
+/// only when the draft holds a level, so the entire body vanished: no level, no
+/// name fields, no privilege cloud, and a footer reading "Pick a level, name what
+/// it applies to, and tick a privilege" about controls that were not on screen.
+///
+/// One function rather than the sequence written out twice, so a third form
+/// cannot get the order wrong — `a_freshly_opened_form_keeps_the_draft_it_was_
+/// seeded_with` is what holds it.
+fn reset_then_seed<T: 'static>(d: crate::DdlUi, draft: floem::reactive::RwSignal<T>, seed: T) {
+    d.error.set(None);
+    d.preview.set(None);
+    ddl_preview::close_peers(d, false);
+    draft.set(seed);
+}
+
 /// Open the account form on a blank draft.
 ///
 /// **The read-only refusal is here, not at the call site**, which is the rule
@@ -125,10 +145,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str) {
     // **Blank, every time.** The draft carries a password, and a form that
     // reopened holding the last one would put a credential on screen that
     // nobody typed this time.
-    d.account_draft.set(AccountDraft::default());
-    d.error.set(None);
-    d.preview.set(None);
-    ddl_preview::close_peers(d, false);
+    reset_then_seed(d, d.account_draft, AccountDraft::default());
     d.account.set(Some(AccountTarget {
         conn_id: ctx.conn_id,
         database: database.to_string(),
@@ -145,10 +162,7 @@ pub(crate) fn open_for_grant(ui: &Ui, database: &str, account: &Principal) {
     }
     let d = ui.ddl;
     d.session.update(|g| *g += 1);
-    d.grant_draft.set(initial_grant_draft(ctx.dialect));
-    d.error.set(None);
-    d.preview.set(None);
-    ddl_preview::close_peers(d, false);
+    reset_then_seed(d, d.grant_draft, initial_grant_draft(ctx.dialect));
     d.grant.set(Some(GrantTarget {
         conn_id: ctx.conn_id,
         database: database.to_string(),
@@ -277,6 +291,9 @@ fn suggested_field<D: Clone + 'static>(
     initial: String,
     placeholder: &'static str,
     options: impl Fn() -> Vec<String> + Clone + 'static,
+    // What the chevron's menu says when `options` answers nothing — see
+    // `suggest_chevron`.
+    empty_note: &'static str,
     ring: &FocusRing,
     tabindex: u32,
     apply: impl Fn(&mut D, &str) + 'static,
@@ -299,7 +316,7 @@ fn suggested_field<D: Clone + 'static>(
             },
         )
         .style(move |s| s.width(field_w())),
-        suggest_chevron(ui, sig, options, ring.clone(), tabindex + 1),
+        suggest_chevron(ui, sig, options, empty_note, ring.clone(), tabindex + 1),
     ))
     .style(|s| s.flex_row().items_center().gap(theme::scaled(2.0)))
     .into_any()
@@ -689,6 +706,12 @@ fn grant_form(
                                 .collect(),
                             _ => Vec::new(),
                         },
+                        // Reachable, and the reason this note exists: MySQL,
+                        // MariaDB and PostgreSQL all have roles and a great many
+                        // servers have none, so the shortcut has nothing to
+                        // shortcut — and a chevron that answered with silence
+                        // read as broken.
+                        "This server has no roles",
                         &ring,
                         10,
                         |d, v| d.role = v.to_string(),
@@ -763,6 +786,7 @@ fn grant_form(
                                 seed.qualifier.clone(),
                                 q_placeholder,
                                 move || vec![here.clone()],
+                                "No suggestions",
                                 &ring,
                                 30,
                                 |d, v| d.qualifier = v.to_string(),
@@ -1241,5 +1265,49 @@ mod form_shape_tests {
                 );
             }
         }
+    }
+
+    /// **The regression this ordering exists for.** `close_peers` clears every
+    /// editor's draft, and both openers seeded theirs *before* calling it — so
+    /// the grant form opened on `GrantDraft::default()`, whose `level` is
+    /// `None`, and the form renders its Level row (and everything below it: the
+    /// name fields and the whole privilege cloud) only when the draft holds one.
+    /// The modal came up with an Action, a Subject and nothing else, under a
+    /// footer asking for a level that was not on screen.
+    #[test]
+    fn a_freshly_opened_form_keeps_the_draft_it_was_seeded_with() {
+        use floem::reactive::Scope;
+        let scope = Scope::new();
+        let d = crate::ddl_preview::test_ddl_ui(scope);
+
+        // A previous session's leftovers, which the reset is there to remove.
+        d.grant_draft.set(GrantDraft {
+            role: "stale".into(),
+            ..Default::default()
+        });
+        d.account_draft.set(AccountDraft {
+            name: "stale".into(),
+            password: "hunter2".into(),
+            ..Default::default()
+        });
+
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let seed = initial_grant_draft(dialect);
+            assert!(seed.level.is_some(), "{dialect:?}: the seed has a level");
+            reset_then_seed(d, d.grant_draft, seed.clone());
+            assert_eq!(
+                d.grant_draft.get_untracked(),
+                seed,
+                "{dialect:?}: the reset wiped the seed"
+            );
+        }
+
+        // And the account form's blank seed is the blank draft, so the *only*
+        // way to tell the two orderings apart there is that the password from
+        // the previous session must be gone either way.
+        reset_then_seed(d, d.account_draft, AccountDraft::default());
+        assert_eq!(d.account_draft.get_untracked(), AccountDraft::default());
+
+        scope.dispose();
     }
 }
