@@ -106,6 +106,7 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let grant_open = ui.ddl.grant;
             let dump_open = ui.dump.target;
             let script_open = ui.script.target;
+            let export_open = ui.export.target;
             stack((
                 error_modal_overlay(ui.clone()),
                 crate::snippet_edit::snippet_edit_overlay(ui.clone()),
@@ -128,9 +129,20 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 stack((
                     crate::dump_view::dump_overlay(ui.clone()),
                     crate::script_view::script_overlay(ui.clone()),
+                    // The grid export's progress modal joins this element rather
+                    // than claiming one of its own — the stack is at Floem's
+                    // 16-arity limit, and it belongs here on the merits: it is
+                    // the dump modal's twin (same footer, same Stop, built beside
+                    // it in `dump_view`), and the two cannot be up together,
+                    // since a grid export and a schema-tree export are launched
+                    // from different surfaces and each refuses a second run.
+                    crate::dump_view::export_progress_overlay(ui.clone()),
                 ))
                 .style(move |s| {
-                    if dump_open.get().is_some() || script_open.get().is_some() {
+                    if dump_open.get().is_some()
+                        || script_open.get().is_some()
+                        || export_open.get().is_some()
+                    {
                         s.absolute().inset(0.0)
                     } else {
                         s
@@ -298,6 +310,7 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let import_open = ui.import.target;
     let dump_open = ui.dump.target;
     let script_open = ui.script.target;
+    let export_open = ui.export.target;
     let snippet_edit = ui.overlay.snippet_edit;
     let editors = ddl_editors_up(ui.ddl);
     move || {
@@ -313,6 +326,12 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
             // and it is the *second* signal in that element, which is the shape
             // most likely to be forgotten.
             || script_open.get().is_some()
+            // The grid export's progress modal is the *third* signal in that
+            // same tuple element, painted in this group — so it is in this list
+            // for the reason the two above are, and it is the shape most likely
+            // to be forgotten of all: a modal nobody opens deliberately, raised
+            // by an export the user started somewhere else entirely.
+            || export_open.get().is_some()
             // The snippet editor is painted in this group, so it has to be in
             // this list — the event editor shipped missing from exactly here and
             // rendered nothing at all, because the wrapper's `inset(0)` resolved
@@ -469,8 +488,12 @@ mod modal_backdrop_gate {
         // together), raised by `ddl_editors_up`'s `d.database` arm.
         "database_editor.rs",
         "ddl_preview.rs",
-        // In the layer's DDL group, raised by `ddl_modals_up`'s
-        // `dump_open.get().is_some()` arm.
+        // In the layer's DDL group — **one file, two overlays**, sharing one
+        // tuple element with `script_view.rs`: the Export panel, raised by
+        // `ddl_modals_up`'s `dump_open` arm, and the grid export's
+        // progress modal beside it, raised by its `export_open` arm. The second
+        // is the shape this gate is weakest against, since the file was already
+        // on the list before it existed.
         "dump_view.rs",
         "erd_view.rs",
         "event_editor.rs",

@@ -831,6 +831,13 @@ fn save_log(
                 // The log is the rows in hand by definition — it is a record of
                 // what the monitor saw, not a query anything could re-run.
                 scope: crate::ExportScope::Fetched,
+                // **Nothing here offers a Stop**, so this run stays out of the
+                // app's single cancel slot — see `ExportRequest::stoppable`. It
+                // is not a statement about size: the log is small, but the reason
+                // is that there is no control bound to it, and a run in the slot
+                // would refuse the grid's export (and be refused by it) over a
+                // window the user cannot see.
+                stoppable: false,
             },
             // `try_update`: the modal may have closed while the dialog was open
             // or the write ran, and a plain `set` would panic on a freed signal.
@@ -840,11 +847,17 @@ fn save_log(
                 crate::ExportOutcome::Done(_) => {
                     exported.try_update(|v| *v = true);
                 }
-                // A log export is never streamed, so there is nothing to cancel
-                // and this cannot arrive. Spelled out rather than folded in with
-                // `Done`: if it ever could, marking the log exported off a
-                // half-written file is exactly the wrong answer — Clear would
-                // stop asking about a log that was never fully saved.
+                // This cannot arrive, but **not for the reason it used to be**:
+                // "a log export is never streamed" stopped being the reason when
+                // the `Fetched` render was chunked and became stoppable between
+                // blocks. What keeps it unreachable now is that nothing here
+                // offers a Stop, which is exactly what `stoppable: false` above
+                // says — so no token this run watches is ever cancelled.
+                //
+                // Spelled out rather than folded in with `Done` because the day
+                // that changes, marking the log exported off a half-written file
+                // is exactly the wrong answer: Clear would stop asking about a
+                // log that was never fully saved.
                 crate::ExportOutcome::Cancelled => {}
                 // **A failure that lands after the modal closed has to go
                 // somewhere.** `monitor_export_err` is only visible inside the

@@ -147,6 +147,57 @@ fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal
 /// dimmed, which is the same thing the flat form said with the group it dimmed.
 /// `None` when the engine offers nothing to create at all, so the caller leaves
 /// the row out rather than showing a submenu that opens onto nothing.
+/// The `Export ▸` submenu: one entry per
+/// [`ExportFormat`](schemaic_core::export::ExportFormat), all six opening the
+/// same modal.
+///
+/// **One builder for all three schema-tree nodes**, because the entry is the
+/// same offer everywhere it appears and the three arms differ only in what they
+/// hand the picker. Spelled out per arm, the six labels and their order would be
+/// three lists to keep in step — and the order is
+/// [`ExportFormat::ALL`](schemaic_core::export::ExportFormat::ALL)'s, the same
+/// one the grid's Download menu lists, so a user meets the formats in one order
+/// throughout the app.
+///
+/// `SQL` opens the dump — a single `.sql` file with its content and replay
+/// options. The other five write one file per table into a folder. That split is
+/// the modal's to make ([`crate::DumpTarget::writes_folder`]); this only says
+/// which format was clicked.
+///
+/// Offered on a read-only connection, like the single entry it replaces: every
+/// one of these reads the server and writes a local file.
+fn export_submenu(
+    ui: &Ui,
+    database: &str,
+    schema: Option<&str>,
+    preselect: Option<&str>,
+) -> MenuEntry {
+    let children = schemaic_core::export::ExportFormat::ALL
+        .iter()
+        .map(|&format| {
+            let (ui, db, ns, pre) = (
+                ui.clone(),
+                database.to_string(),
+                schema.map(str::to_string),
+                preselect.map(str::to_string),
+            );
+            MenuEntry::action(format.label(), move || {
+                let ctx = crate::table_designer::edit_ctx(&ui);
+                crate::dump_view::open_dump(
+                    ui.clone(),
+                    ctx.conn_id,
+                    db.clone(),
+                    ns.clone(),
+                    pre.clone(),
+                    ctx.dialect,
+                    format,
+                );
+            })
+        })
+        .collect();
+    MenuEntry::sub("Export", children)
+}
+
 fn create_submenu(
     ui: &Ui,
     database: &str,
@@ -1474,21 +1525,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             .disabled(conn_read_only(&connections, active_conn)),
                         );
                     }
-                    {
-                        let dui = import_ui.clone();
-                        let db = menu.name.clone();
-                        entries.push(MenuEntry::action("Export", move || {
-                            let ctx = crate::table_designer::edit_ctx(&dui);
-                            crate::dump_view::open_dump(
-                                dui.clone(),
-                                ctx.conn_id,
-                                db.clone(),
-                                None,
-                                None,
-                                ctx.dialect,
-                            );
-                        }));
-                    }
+                    entries.push(export_submenu(&import_ui, &menu.name, None, None));
                     // On PostgreSQL a database node stands for its `public`
                     // namespace (other namespaces get their own node), so a new
                     // table lands where the tree says it will.
@@ -1725,22 +1762,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                     // This one *is* confined: the picker is filtered to the
                     // namespace, so a `sales` export carries no `public` table.
-                    {
-                        let dui = import_ui.clone();
-                        let db = database.clone();
-                        let ns = menu.name.clone();
-                        entries.push(MenuEntry::action("Export", move || {
-                            let ctx = crate::table_designer::edit_ctx(&dui);
-                            crate::dump_view::open_dump(
-                                dui.clone(),
-                                ctx.conn_id,
-                                db.clone(),
-                                Some(ns.clone()),
-                                None,
-                                ctx.dialect,
-                            );
-                        }));
-                    }
+                    entries.push(export_submenu(
+                        &import_ui,
+                        &database,
+                        Some(&menu.name),
+                        None,
+                    ));
                     entries.extend(create_submenu(
                         &import_ui,
                         &database,
@@ -2128,25 +2155,19 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // database one click away. Offered on a read-only
                         // connection, unlike Import: this reads the server and
                         // writes a local file.
-                        {
-                            let dui = import_ui.clone();
-                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
-                            entries.push(MenuEntry::action("Export", move || {
-                                let ctx = crate::table_designer::edit_ctx(&dui);
-                                crate::dump_view::open_dump(
-                                    dui.clone(),
-                                    ctx.conn_id,
-                                    db.clone(),
-                                    // The picker still offers the whole database:
-                                    // the namespace here is the *table's*, and
-                                    // narrowing to it would hide the neighbours
-                                    // this table's foreign keys point at.
-                                    None,
-                                    Some(schemaic_core::schema::display_name(ns.as_deref(), &tbl)),
-                                    ctx.dialect,
-                                );
-                            }));
-                        }
+                        entries.push(export_submenu(
+                            &import_ui,
+                            &database,
+                            // The picker still offers the whole database: the
+                            // namespace here is the *table's*, and narrowing to
+                            // it would hide the neighbours this table's foreign
+                            // keys point at.
+                            None,
+                            Some(&schemaic_core::schema::display_name(
+                                schema.as_deref(),
+                                &table,
+                            )),
+                        ));
 
                         // ── Schema editing ────────────────────────────────────
                         // Everything here ends at the DDL preview; nothing runs
@@ -6420,6 +6441,22 @@ mod menu_order_gate {
                 });
                 continue;
             }
+            // `export_submenu` is the same case as `create_submenu` above: all
+            // three arms build their `Export ▸` entry through it, so the
+            // constructor is in the helper and not here. Without this the gate
+            // stops seeing `Export` in the menu at all — and the skip below,
+            // which is what states that its placement is deliberate, becomes a
+            // branch that can never run while still reading as live coverage.
+            if t.starts_with("entries.push(export_submenu(") {
+                out.push(Built {
+                    arm: arm.clone(),
+                    line: i as u32 + 1,
+                    label: "Export".to_string(),
+                    destructive: false,
+                    top_level: true,
+                });
+                continue;
+            }
             let is_ctor = ["action(", "action_icon(", "action_colored(", "sub("]
                 .iter()
                 .any(|c| t.contains(&format!("MenuEntry::{c}")));
@@ -6588,7 +6625,7 @@ mod menu_order_gate {
             // **`Export` is deliberately outside the skeleton**, and it is the
             // one label that legitimately sits *inside* the writing group
             // without writing anything. On a database or a namespace it is the
-            // middle of `Import → Export → Create ▸`, the three entries about
+            // middle of `Import → Export ▸ → Create ▸`, the three entries about
             // the node as a whole; on a table it sits directly below `Import`.
             // Both placements pair it with the import it is the round trip of,
             // which is the thing a reader is looking for, and neither can be
@@ -6641,6 +6678,33 @@ mod menu_order_gate {
             built.len() >= 35,
             "only {} rows found across the seven menus — has the builder moved?",
             built.len()
+        );
+    }
+
+    /// The gate must **see** `Export`, not merely be willing to skip it.
+    ///
+    /// It is built by `export_submenu` rather than by a constructor in the
+    /// builder, so `built_entries` needs its own branch for the call — exactly as
+    /// it has one for `create_submenu`. Without that branch the scan finds no
+    /// `Export` at all: the skip in
+    /// `every_menu_is_a_subsequence_of_the_skeleton` never runs, its comment
+    /// about the entry's deliberate placement describes nothing, and the day
+    /// someone gives `Export` a group in the skeleton the gate has no entry to
+    /// check it against. This is the seam — a helper's output and the scanner
+    /// that has to recognise it — and it is the one a test written against the
+    /// scanner alone would miss.
+    #[test]
+    fn the_scan_sees_the_export_submenu_in_all_three_arms() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let arms: Vec<String> = built_entries(&src)
+            .into_iter()
+            .filter(|b| b.top_level && b.label == "Export")
+            .map(|b| b.arm)
+            .collect();
+        assert_eq!(
+            arms,
+            vec!["Database", "Schema", "Table"],
+            "the three nodes that offer Export are the three the scan should find it in"
         );
     }
 

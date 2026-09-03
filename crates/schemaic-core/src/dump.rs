@@ -38,7 +38,7 @@
 //! the *table*, not of the engine — the data answers it directly.
 
 use crate::ddl::{Change, ChangeSet, ObjectKind};
-use crate::export::{ident_sql, qualified_table};
+use crate::export::{ExportFormat, export_file_names, ident_sql, qualified_table};
 use crate::intel::SqlDialect;
 use crate::schema::{DbSchema, ServerFlavour, TableInfo, display_name};
 
@@ -974,6 +974,107 @@ pub fn plan(
     }
 }
 
+// ── The folder export: one file per table ────────────────────────────────────
+
+/// One table's file, in a folder export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileStep {
+    /// The table's namespace, where the engine has them — carried so the
+    /// renderer can name the source the way the SQL export does.
+    pub schema: Option<String>,
+    pub table: String,
+    /// What to run for this table's rows.
+    pub select: String,
+    /// The file's name **under the chosen folder** — never a path. Sanitized and
+    /// unique across the plan; see [`crate::export::export_file_names`].
+    pub file: String,
+}
+
+/// A folder export, decided: which table goes into which file, and what to read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilePlan {
+    pub files: Vec<FileStep>,
+    /// Tables the user ticked that this run's fresh introspection could not
+    /// find. Same guarantee, and the same reason, as [`DumpPlan::missing`]: a
+    /// folder one file short of what was ticked looks exactly like a complete
+    /// one.
+    pub missing: Vec<String>,
+}
+
+/// Plan a **folder** export — the schema tree's `Export ▸ CSV` and its siblings,
+/// which write one file per table rather than one file for the set.
+///
+/// **Not [`plan`] with the options turned down, and the row step is why.** A
+/// dump's `SELECT` names its columns through [`exported_columns`], which leaves
+/// out everything the server assigns for itself: an `INSERT` that named an
+/// identity column would be an error rather than a value. A CSV of `orders`
+/// without `orders.id` is not the table, so this reads `*` — every column the
+/// row has. The two differ in exactly the place a shared step would have hidden.
+///
+/// Views are included for the mirror-image reason: [`plan`] gives a view
+/// structure and no rows because an `INSERT` into one is not a restore, while a
+/// CSV of a view is simply its rows.
+///
+/// `chosen` holds display names ([`display_name`]); the plan keeps their order,
+/// and anything not resolvable against `schema` lands in
+/// [`FilePlan::missing`] rather than being dropped.
+pub fn file_plan(
+    schema: &DbSchema,
+    database: &str,
+    chosen: &[String],
+    format: ExportFormat,
+    dialect: SqlDialect,
+) -> FilePlan {
+    // **`Sql` is the dump's, and refused here rather than merely documented.**
+    // Every doc around this path says the format is never `Sql`, and until this
+    // line that held only because `run_export` branches on `writes_folder()`
+    // first — one new call site away from a corrupt file. With `Sql` the steps
+    // below would render `INSERT`s from `SELECT *`, naming exactly the
+    // server-assigned columns [`exported_columns`] keeps out of them, and the
+    // file would fail at restore *after* its rows had landed.
+    //
+    // An empty plan, not a panic: the caller already reports one as "Nothing to
+    // export", which is a refusal the user can read.
+    if matches!(format, ExportFormat::Sql) {
+        return FilePlan::default();
+    }
+    let mut found: Vec<&TableInfo> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for name in chosen {
+        match schema
+            .tables
+            .iter()
+            .find(|t| display_name(t.schema.as_deref(), &t.name) == *name)
+        {
+            Some(t) => found.push(t),
+            None => missing.push(name.clone()),
+        }
+    }
+    // Named from the *resolved* tables, so the counter that breaks a collision
+    // is not spent on a table that will never be written.
+    let names: Vec<String> = found
+        .iter()
+        .map(|t| display_name(t.schema.as_deref(), &t.name))
+        .collect();
+    let files = export_file_names(&names, format);
+    FilePlan {
+        files: found
+            .into_iter()
+            .zip(files)
+            .map(|(t, file)| FileStep {
+                schema: t.schema.clone(),
+                table: t.name.clone(),
+                select: format!(
+                    "SELECT * FROM {}",
+                    qualified_table(database, t.schema.as_deref(), &t.name, dialect)
+                ),
+                file,
+            })
+            .collect(),
+        missing,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1135,170 @@ mod tests {
             .iter()
             .map(|t| display_name(t.schema.as_deref(), &t.name))
             .collect()
+    }
+
+    // ── file_plan ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn file_plan_names_one_file_per_chosen_table() {
+        let schema = schema_of(vec![table("actor"), table("film")]);
+        let p = file_plan(
+            &schema,
+            "sakila",
+            &all(&schema),
+            ExportFormat::Csv,
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            p.files.iter().map(|f| f.file.clone()).collect::<Vec<_>>(),
+            vec!["actor.csv", "film.csv"]
+        );
+        assert!(p.missing.is_empty());
+    }
+
+    #[test]
+    fn file_plan_selects_every_column_including_the_server_assigned_ones() {
+        // The difference from `plan`, and the reason this is not a thin wrapper
+        // over it: an `INSERT` may not name an identity column, so `plan`'s row
+        // step leaves it out — but a CSV of `orders` without `orders.id` is not
+        // the table. A folder export reads the whole row.
+        let mut t = table("orders");
+        t.columns.push(ColumnInfo {
+            name: "id".to_string(),
+            type_name: "int".to_string(),
+            auto_increment: true,
+            ..Default::default()
+        });
+        let schema = schema_of(vec![t]);
+        let p = file_plan(
+            &schema,
+            "shop",
+            &all(&schema),
+            ExportFormat::Csv,
+            SqlDialect::MySql,
+        );
+        assert_eq!(p.files.len(), 1);
+        assert!(
+            p.files[0].select.contains('*'),
+            "every column, not a named list: {}",
+            p.files[0].select
+        );
+    }
+
+    #[test]
+    fn file_plan_includes_views() {
+        // `plan` gives a view structure and no rows, because an `INSERT` into one
+        // is not a restore. A CSV of a view is just its rows, so it is offered.
+        let schema = schema_of(vec![table("actor"), view("actor_info")]);
+        let p = file_plan(
+            &schema,
+            "sakila",
+            &all(&schema),
+            ExportFormat::Json,
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            p.files.iter().map(|f| f.table.clone()).collect::<Vec<_>>(),
+            vec!["actor", "actor_info"]
+        );
+    }
+
+    #[test]
+    fn file_plan_reports_a_table_the_introspection_lost() {
+        // Same guarantee as `DumpPlan::missing`: a folder one file short of what
+        // was ticked must not read as a clean success.
+        let schema = schema_of(vec![table("actor")]);
+        let chosen = vec!["actor".to_string(), "ghost".to_string()];
+        let p = file_plan(
+            &schema,
+            "sakila",
+            &chosen,
+            ExportFormat::Csv,
+            SqlDialect::MySql,
+        );
+        assert_eq!(p.files.len(), 1);
+        assert_eq!(p.missing, vec!["ghost".to_string()]);
+    }
+
+    #[test]
+    fn file_plan_qualifies_the_select_per_engine() {
+        let mut t = table("orders");
+        t.schema = Some("sales".to_string());
+        let schema = schema_of(vec![t]);
+        let chosen = all(&schema);
+        let pg = file_plan(
+            &schema,
+            "shop",
+            &chosen,
+            ExportFormat::Csv,
+            SqlDialect::Postgres,
+        );
+        assert_eq!(pg.files[0].select, "SELECT * FROM \"sales\".\"orders\"");
+        // And the file name keeps the namespace, so two same-named tables in
+        // different schemas do not need a counter to tell them apart.
+        assert_eq!(pg.files[0].file, "sales.orders.csv");
+    }
+
+    #[test]
+    fn file_plan_breaks_a_file_name_collision() {
+        // Straight through to `export_file_names` — stated here because the seam
+        // between the two is where a silent overwrite would live.
+        let schema = schema_of(vec![table("a:b"), table("a*b")]);
+        let p = file_plan(
+            &schema,
+            "db",
+            &all(&schema),
+            ExportFormat::Csv,
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            p.files.iter().map(|f| f.file.clone()).collect::<Vec<_>>(),
+            vec!["a_b.csv", "a_b_2.csv"]
+        );
+    }
+
+    /// **The invariant is enforced, not narrated.** Every doc around this path
+    /// says the format is never `Sql`, and today that holds only because
+    /// `run_export` branches on `writes_folder()` before reaching it — one call
+    /// site away from a corrupt file. `Sql` here would emit `INSERT`s built from
+    /// `SELECT *`, naming the identity columns `exported_columns` exists to keep
+    /// out of them: a file that fails at restore, after the rows have landed.
+    ///
+    /// An empty plan rather than a panic, so the caller reports a refusal
+    /// instead of taking the window down.
+    #[test]
+    fn file_plan_refuses_sql_rather_than_writing_inserts() {
+        let schema = schema_of(vec![table("actor")]);
+        let p = file_plan(
+            &schema,
+            "sakila",
+            &all(&schema),
+            ExportFormat::Sql,
+            SqlDialect::MySql,
+        );
+        assert!(p.files.is_empty(), "SQL is the dump's, not this path's");
+        // Every other format still plans normally — the refusal is one variant
+        // wide, not a general timidity.
+        for f in ExportFormat::ALL {
+            if f == ExportFormat::Sql {
+                continue;
+            }
+            assert_eq!(
+                file_plan(&schema, "sakila", &all(&schema), f, SqlDialect::MySql)
+                    .files
+                    .len(),
+                1,
+                "{} should still plan",
+                f.label()
+            );
+        }
+    }
+
+    #[test]
+    fn file_plan_of_nothing_is_empty() {
+        let schema = schema_of(vec![table("actor")]);
+        let p = file_plan(&schema, "db", &[], ExportFormat::Csv, SqlDialect::MySql);
+        assert!(p.files.is_empty() && p.missing.is_empty());
     }
 
     /// Every `Text` step, joined — what the file's non-row half reads as.

@@ -165,13 +165,20 @@ impl ExportFormat {
         to_string(|w| self.render_to(w, rs, order, source, dialect).map(|_| ()))
     }
 
-    /// Stream the same rendering into `w` — the file export's path, so a large
-    /// result never exists twice in memory. Identical output to [`Self::render`],
-    /// returning what was written and what could not be carried
-    /// ([`ExportTally`]).
+    /// Render into `w` in **one chunk**, so a large result never exists twice in
+    /// memory. Identical output to [`Self::render`], returning what was written
+    /// and what could not be carried ([`ExportTally`]).
+    ///
+    /// **No file export goes through this any more.** It was the file path, and
+    /// the app's `Fetched` export moved off it onto [`SliceChunks`] when that
+    /// export gained a progress modal — a single chunk offers no moment at which
+    /// to report a count or notice a Stop. What is left is the one-chunk
+    /// spelling: [`Self::render`] (the clipboard) is built on it, and so are the
+    /// tests. `chunking_a_fetched_result_cannot_change_the_bytes` is what holds
+    /// the two paths byte-identical.
     ///
     /// Errors are the writer's own (a full disk, a revoked permission). They must
-    /// reach the user: unlike the buffered path, which either produced the whole
+    /// reach the user: unlike [`Self::render`], which either produces the whole
     /// text or nothing, a failure here leaves a **truncated file** that looks
     /// complete.
     pub fn render_to<W: Write + Send>(
@@ -421,6 +428,100 @@ impl RowChunks for OneChunk<'_> {
     }
 }
 
+/// A [`RowChunks`] over rows **already in memory**, handed out `size` at a time.
+///
+/// [`OneChunk`]'s sibling, and the difference is the only thing it exists for:
+/// progress. A fetched export has every row in hand, so it *could* be rendered
+/// in one block — and was — but then there is no moment between "started" and
+/// "finished" at which anything can be reported, and a large export to a slow
+/// format looks identical to a hung one.
+///
+/// **Nothing is copied.** A chunk is the same `&ResultSet` and a *slice* of the
+/// same order vector, so this is a cursor over one allocation rather than a
+/// partition of the rows. That is also why it borrows rather than owning: the
+/// caller already holds both for the length of the export.
+///
+/// A `size` of `0` is clamped to the whole slice rather than rejected — the
+/// figure comes from a tuning constant, and an export that spins handing out
+/// empty chunks forever is a worse answer than one that writes a single block.
+pub struct SliceChunks<'a> {
+    rs: &'a ResultSet,
+    order: &'a [usize],
+    at: usize,
+    size: usize,
+    /// Has a chunk been handed out yet? What makes the **empty** result yield one
+    /// anyway — see [`RowChunks::next_chunk`]'s implementation below.
+    started: bool,
+    #[allow(clippy::type_complexity)]
+    watch: Option<Box<dyn FnMut(u64) -> bool + 'a>>,
+}
+
+impl<'a> SliceChunks<'a> {
+    pub fn new(rs: &'a ResultSet, order: &'a [usize], size: usize) -> Self {
+        SliceChunks {
+            rs,
+            order,
+            at: 0,
+            size: if size == 0 { usize::MAX } else { size },
+            started: false,
+            watch: None,
+        }
+    }
+
+    /// Watch the export go by: `f` is called as each chunk is handed out, with
+    /// the **running row total**, and returning `false` stops the export.
+    ///
+    /// **One hook doing both jobs, on purpose.** They are asked at the same
+    /// instant and answered from the same place — the caller reports the count
+    /// to its progress channel and asks its cancellation token in one closure —
+    /// and two hooks would be two chances to check them at different moments,
+    /// which is how a Stop comes to be noticed one chunk late.
+    ///
+    /// A `false` surfaces as an [`io::Error`], because that is the only way a
+    /// [`RowChunks`] can end an export *without* it looking finished: the
+    /// renderers treat `Ok(None)` as end-of-stream and would publish a truncated
+    /// file as a complete one. Same reasoning, and the same failure, as
+    /// `PullChunks`' cancelled-read arm.
+    pub fn watching(mut self, f: impl FnMut(u64) -> bool + 'a) -> Self {
+        self.watch = Some(Box::new(f));
+        self
+    }
+}
+
+impl RowChunks for SliceChunks<'_> {
+    fn next_chunk(&mut self) -> io::Result<Option<RowChunk<'_>>> {
+        // **An empty result still yields one (empty) chunk**, exactly as
+        // [`OneChunk`] does — which is what `started` is for, and the opposite of
+        // what stood here first.
+        //
+        // Five renderers write their header *on the first chunk they see*. Ending
+        // the stream before any chunk therefore writes no header at all: a
+        // `SELECT` that matched nothing exported a **0-byte file** where the
+        // whole-render path wrote `id,name\n`. The rule that reads as safe here
+        // is the one that loses the file, and
+        // `an_empty_result_writes_the_same_bytes_through_either_path` is what
+        // holds the two paths together.
+        if self.at >= self.order.len() && self.started {
+            return Ok(None);
+        }
+        self.started = true;
+        let end = self.at.saturating_add(self.size).min(self.order.len());
+        let range = self.at..end;
+        self.at = end;
+        // Before the chunk is handed over, so a stop is acted on rather than
+        // reported after the rows it was meant to prevent were written.
+        if let Some(w) = self.watch.as_mut()
+            && !w(end as u64)
+        {
+            return Err(io::Error::other("export cancelled"));
+        }
+        Ok(Some(RowChunk {
+            rs: self.rs,
+            order: &self.order[range],
+        }))
+    }
+}
+
 /// A [`RowChunks`] over whole result sets pulled from `next` — every row of each,
 /// in the order the server sent them.
 ///
@@ -508,6 +609,44 @@ pub fn suggested_filename(base: Option<&str>, format: ExportFormat) -> String {
         stem = format!("_{stem}");
     }
     format!("{stem}.{}", format.extension())
+}
+
+/// One file name per table, for an export that writes a **folder** rather than a
+/// file — the schema tree's `Export ▸ CSV` and its siblings.
+///
+/// Each name is [`suggested_filename`]'s, so the sanitizing rule is stated once;
+/// what this adds is the part a single file never needed: **uniqueness**. Two
+/// distinct tables can sanitize to one name (`a:b` and `a*b` both become `a_b`),
+/// and on Windows and macOS `Orders` and `orders` are one file — so a folder
+/// export that trusted the names would write the second table over the first and
+/// still report both. A later name gets `_2`, `_3`, … before the extension.
+///
+/// The suffix is checked against the set too, not just appended: a real `a_b_2`
+/// standing beside two tables that both want `a_b` would otherwise be clobbered
+/// by the deduplicator's own choice.
+///
+/// Returned in `tables`' order, one entry each, so a caller can zip the two.
+pub fn export_file_names(tables: &[String], format: ExportFormat) -> Vec<String> {
+    let ext = format.extension();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(tables.len());
+    for table in tables {
+        let name = suggested_filename(Some(table), format);
+        // The stem, so the counter goes before the extension rather than after
+        // it — `a_b_2.csv`, not `a_b.csv_2`.
+        let stem = name
+            .strip_suffix(&format!(".{ext}"))
+            .unwrap_or(&name)
+            .to_string();
+        let mut candidate = name;
+        let mut n = 1u32;
+        while !taken.insert(candidate.to_lowercase()) {
+            n += 1;
+            candidate = format!("{stem}_{n}.{ext}");
+        }
+        out.push(candidate);
+    }
+    out
 }
 
 /// A cell as a JSON value (non-finite floats → null).
@@ -1653,6 +1792,109 @@ pub fn export_cancel_note(name: &str, partial: bool) -> String {
     } else {
         format!("Export cancelled — {name} was not changed.")
     }
+}
+
+/// What a finished **folder** export says: how many files landed, where, what
+/// they could not carry, and what was ticked but never found.
+///
+/// The file-per-table sibling of [`export_note`], and it delegates the caveat
+/// half to that function rather than restating it — the wording of "this column
+/// could not be carried" belongs in one place, and a folder export loses exactly
+/// what a single file does. What it adds is the count: a folder is a thing whose
+/// completeness the user cannot see at a glance, so the number of files is the
+/// first fact, and the tables that went missing are the last.
+///
+/// `missing` is [`crate::dump::FilePlan::missing`] — ticked tables this run's own
+/// introspection could not find. Named here as well as counted, because a folder
+/// one file short of what was asked for looks exactly like a complete one.
+pub fn files_note(files: usize, tally: &ExportTally, folder: &str, missing: &[String]) -> String {
+    // **The count first, the destination in the second clause** — the shape the
+    // dump's own report has (`Wrote 5 tables. Exported 115k rows to shop.sql`),
+    // and the reason to follow it rather than say "12 files to out" here is that
+    // `export_note` names the destination too: both would spell the folder, one
+    // sentence apart, in the message a user reads once.
+    let mut s = format!(
+        "Wrote {files} {}.",
+        crate::text::plural(files, "file", "files")
+    );
+    // `streaming: true`, so the row count is always stated: a folder export has
+    // no other way to say how much arrived, and `export_note` otherwise returns
+    // `None` for a clean write.
+    if let Some(note) = export_note(tally, folder, true) {
+        s.push(' ');
+        s.push_str(&note);
+    }
+    s.push_str(&missing_clause(missing));
+    s
+}
+
+/// The tables a folder export was asked for and could not find, as a sentence —
+/// or nothing at all when it found them.
+///
+/// **Shared by all three of the folder export's reports**, because all three
+/// need it and the arm least likely to be read is the one that used to go
+/// without: a folder two files short of what was ticked looks exactly like a
+/// complete one whether the export finished, stopped, or failed, and a stopped
+/// export is *more* likely to be inspected than a finished one.
+fn missing_clause(missing: &[String]) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+    format!(
+        " {} ticked {} not found and {} no file: {}.",
+        missing.len(),
+        crate::text::plural(missing.len(), "table", "tables"),
+        crate::text::plural(missing.len(), "was", "were"),
+        missing.join(", "),
+    )
+}
+
+/// What a **stopped** folder export says.
+///
+/// It leads with what the user *kept*, which is where this parts company with
+/// [`export_cancel_note`]: a stopped single-file export has nothing but a
+/// fragment to talk about, while this leaves whole, published files behind — each
+/// renamed into place only once its table was complete. The fragment of the table
+/// that was in flight is mentioned second, and not at all when there is no file
+/// to be proud of yet.
+pub fn files_cancel_note(files: usize, folder: &str, missing: &[String]) -> String {
+    let mut s = if files == 0 {
+        format!("Export cancelled — no file was finished, so nothing was written to {folder}.")
+    } else {
+        format!(
+            "Export cancelled — {files} {} finished in {folder}; the table in progress was left \
+             unwritten.",
+            crate::text::plural(files, "file was", "files were")
+        )
+    };
+    s.push_str(&missing_clause(missing));
+    s
+}
+
+/// What a **failed** folder export says.
+///
+/// [`export_failure_note`]'s question with the other answer: there, the
+/// reassurance is that the destination was not touched, because there was one
+/// destination and the user may already have had a file at it. Here the folder
+/// is not empty, and the useful fact is how much of the export is really in it —
+/// a message that stopped at the error would send the user to a folder they
+/// could not interpret.
+///
+/// `files == 0` is the refused-before-anything-landed case, and it must not
+/// mention a folder at all — the same rule [`export_failure_note`]'s `None` arm
+/// follows.
+pub fn files_failure_note(message: &str, files: usize, folder: &str, missing: &[String]) -> String {
+    let mut s = if files == 0 {
+        message.to_string()
+    } else {
+        format!(
+            "{message} — {files} {} already written to {folder} {} kept.",
+            crate::text::plural(files, "file", "files"),
+            crate::text::plural(files, "is", "are"),
+        )
+    };
+    s.push_str(&missing_clause(missing));
+    s
 }
 
 /// The `All rows` menu entry's label: the scope's size, and every way the file
@@ -3155,6 +3397,109 @@ mod tests {
         assert!(!msg.contains("is incomplete"), "{msg}");
     }
 
+    // ── The folder export's three sentences ──────────────────────────────────
+
+    #[test]
+    fn a_folder_export_reports_its_files_and_its_caveats() {
+        let t = ExportTally {
+            rows: 115_000,
+            ..Default::default()
+        };
+        let msg = files_note(12, &t, "sakila-csv", &[]);
+        assert!(msg.starts_with("Wrote 12 files."), "{msg}");
+        assert!(msg.contains("115k rows"), "{msg}");
+        // The destination is stated once, by `export_note` — naming it in both
+        // clauses spells the folder twice in a sentence read once.
+        assert_eq!(msg.matches("sakila-csv").count(), 1, "{msg}");
+    }
+
+    #[test]
+    fn a_folder_export_of_one_file_says_file() {
+        let t = ExportTally {
+            rows: 3,
+            ..Default::default()
+        };
+        assert!(
+            files_note(1, &t, "out", &[]).starts_with("Wrote 1 file."),
+            "{}",
+            files_note(1, &t, "out", &[])
+        );
+    }
+
+    #[test]
+    fn a_folder_export_names_what_the_files_could_not_carry() {
+        // The whole reason the tally travels with the count: a green "Wrote 12
+        // files." over a folder whose every blob is a placeholder is the failure
+        // this sentence exists to prevent. Same rule as `export_note`'s.
+        let t = ExportTally {
+            rows: 10,
+            withheld: vec!["photo".to_string()],
+            ..Default::default()
+        };
+        let msg = files_note(12, &t, "out", &[]);
+        assert!(msg.contains("photo"), "{msg}");
+        assert!(msg.contains("cannot hold raw bytes"), "{msg}");
+    }
+
+    #[test]
+    fn a_folder_export_names_the_tables_it_could_not_find() {
+        // A folder one file short of what was ticked looks exactly like a
+        // complete one, so the shortfall goes in the same sentence as the count.
+        let t = ExportTally::default();
+        let msg = files_note(2, &t, "out", &["ghost".to_string(), "gone".to_string()]);
+        assert!(msg.contains("ghost, gone"), "{msg}");
+        assert!(msg.contains("not found"), "{msg}");
+    }
+
+    #[test]
+    fn a_stopped_folder_export_says_what_it_kept() {
+        // The completed files are whole and are what the user asked for, so the
+        // sentence leads with them rather than with the fragment.
+        let msg = files_cancel_note(7, "out", &[]);
+        assert!(msg.starts_with("Export cancelled"), "{msg}");
+        assert!(msg.contains("7 files"), "{msg}");
+        assert!(msg.contains("out"), "{msg}");
+        // Nothing was written yet: the sentence must not claim files that are
+        // not there.
+        let none = files_cancel_note(0, "out", &[]);
+        assert!(!none.contains("0 files"), "{none}");
+        assert!(none.contains("no file"), "{none}");
+    }
+
+    /// **Every arm names the tables that were never found**, not just the happy
+    /// one — a folder short of what was ticked looks complete whichever way the
+    /// export ended, and a stopped export is the more likely of the two to be
+    /// inspected.
+    #[test]
+    fn a_stopped_or_failed_folder_export_still_names_what_went_missing() {
+        let gone = vec!["ghost".to_string(), "gone".to_string()];
+        for msg in [
+            files_cancel_note(7, "out", &gone),
+            files_cancel_note(0, "out", &gone),
+            files_failure_note("Export failed: disk", 3, "out", &gone),
+            files_failure_note("Export failed: no connection", 0, "out", &gone),
+        ] {
+            assert!(msg.contains("ghost, gone"), "{msg}");
+            assert!(msg.contains("not found"), "{msg}");
+        }
+        // And nothing is appended when nothing went missing — the common case
+        // must not grow a clause about an empty set.
+        assert!(!files_cancel_note(7, "out", &[]).contains("not found"));
+    }
+
+    #[test]
+    fn a_failed_folder_export_still_names_the_files_that_landed() {
+        // The difference from `export_failure_note`: the folder is not empty, and
+        // a message that did not say so sends the user looking for nothing.
+        let msg = files_failure_note("Export failed: No space left on device", 3, "out", &[]);
+        assert!(msg.starts_with("Export failed: No space left"), "{msg}");
+        assert!(msg.contains("3 files"), "{msg}");
+        // Failed before anything landed — no count to report, and no folder to
+        // send anyone to.
+        let none = files_failure_note("Export failed: no connection", 0, "out", &[]);
+        assert_eq!(none, "Export failed: no connection");
+    }
+
     /// The sibling is the destination plus a suffix and nothing cleverer — a
     /// rename inside one directory is what makes the publish atomic, so the name
     /// must not move the file anywhere.
@@ -3972,6 +4317,263 @@ mod tests {
         let long = "x".repeat(400);
         let out = suggested_filename(Some(&long), ExportFormat::Csv);
         assert!(out.len() < 120, "{} chars", out.len());
+    }
+
+    /// A fetched export renders in blocks now, so there is something to report
+    /// while it runs — and the block boundary must not change one byte of the
+    /// output. That is the whole risk of the change: five renderers write a
+    /// header on the first chunk and rows on every one, so a source that
+    /// suddenly yields three chunks where it yielded one is exactly how a CSV
+    /// grows two extra header lines.
+    #[test]
+    fn chunking_a_fetched_result_cannot_change_the_bytes() {
+        let (cols, rows) = awkward_rows();
+        let rs = ResultSet::from_rows(cols, rows);
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        for f in ExportFormat::ALL {
+            if !f.is_text() {
+                continue; // compared through its own reader below
+            }
+            let whole = to_string(|w| f.render_to(w, &rs, &order, None, MySql).map(|_| ()));
+            // Every size that puts a boundary somewhere interesting: before the
+            // first row, between rows, and past the end.
+            for size in 1..=order.len() + 1 {
+                let mut src = SliceChunks::new(&rs, &order, size);
+                let chunked = to_string(|w| f.stream_to(w, &mut src, None, MySql).map(|_| ()));
+                assert_eq!(
+                    whole,
+                    chunked,
+                    "{} differs when chunked {size} at a time",
+                    f.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slice_chunks_yields_every_row_once_in_order() {
+        let rs = rs();
+        let order = vec![1usize, 0];
+        let mut src = SliceChunks::new(&rs, &order, 1);
+        let mut seen = Vec::new();
+        while let Some(c) = src.next_chunk().unwrap() {
+            seen.extend_from_slice(c.order);
+        }
+        assert_eq!(seen, order, "the display order is what is written");
+    }
+
+    #[test]
+    fn slice_chunks_of_an_empty_result_still_yields_one_chunk() {
+        // **One empty chunk, then done** — matching [`OneChunk`], which hands out
+        // a chunk whether or not the order is empty.
+        //
+        // The opposite was written here first, with the reasoning exactly
+        // backwards: five renderers write their header *on the first chunk they
+        // see*, so a source that yields none for an empty result writes no header
+        // at all. That shipped a 0-byte CSV where the whole-render path wrote
+        // `id,name\n`, and this test asserted it was correct.
+        let rs = rs();
+        let order: Vec<usize> = Vec::new();
+        let mut src = SliceChunks::new(&rs, &order, 4);
+        let first = src
+            .next_chunk()
+            .unwrap()
+            .expect("a chunk, so the header lands");
+        assert!(first.order.is_empty(), "the chunk carries no rows");
+        assert!(
+            src.next_chunk().unwrap().is_none(),
+            "and exactly one, so no renderer writes a second header"
+        );
+    }
+
+    /// The empty-result half of `chunking_a_fetched_result_cannot_change_the_bytes`.
+    ///
+    /// Its own test rather than another `size` in that loop, because the fixture
+    /// has to differ: that one's rows are what make a chunk boundary interesting,
+    /// and **an empty order has no boundary to place** — which is precisely why
+    /// the parity loop could not catch this. A result with no rows is an ordinary
+    /// thing to export (a `SELECT` that matched nothing, a filter narrowed to
+    /// zero), and the file it writes must still be a file.
+    #[test]
+    fn an_empty_result_writes_the_same_bytes_through_either_path() {
+        let rs = rs();
+        let order: Vec<usize> = Vec::new();
+        for f in ExportFormat::ALL {
+            if !f.is_text() {
+                continue; // binary; its own round-trip tests cover it
+            }
+            let whole = to_string(|w| f.render_to(w, &rs, &order, None, MySql).map(|_| ()));
+            let mut src = SliceChunks::new(&rs, &order, 4);
+            let chunked = to_string(|w| f.stream_to(w, &mut src, None, MySql).map(|_| ()));
+            assert_eq!(whole, chunked, "{} differs on an empty result", f.label());
+        }
+        // And it is not vacuously equal because both are empty: CSV still has to
+        // carry its header row.
+        let mut src = SliceChunks::new(&rs, &order, 4);
+        let csv = to_string(|w| {
+            ExportFormat::Csv
+                .stream_to(w, &mut src, None, MySql)
+                .map(|_| ())
+        });
+        assert!(!csv.is_empty(), "an empty result is not a 0-byte file");
+        assert!(csv.contains("id"), "the header names the columns: {csv:?}");
+    }
+
+    #[test]
+    fn a_watched_slice_reports_the_running_total() {
+        let (cols, rows) = awkward_rows();
+        let rs = ResultSet::from_rows(cols, rows);
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let mut seen: Vec<u64> = Vec::new();
+        {
+            let mut src = SliceChunks::new(&rs, &order, 2).watching(|n| {
+                seen.push(n);
+                true
+            });
+            while src.next_chunk().unwrap().is_some() {}
+        }
+        // Cumulative, not per-chunk — the modal shows "40k of ~180k", so what it
+        // is handed has to be the total so far.
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+        assert_eq!(
+            seen.last().copied(),
+            Some(order.len() as u64),
+            "the last report is every row: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_watcher_that_says_stop_fails_the_export_rather_than_ending_it() {
+        // **An error, not `Ok(None)`.** End-of-stream is what a finished export
+        // looks like, so a stop reported that way would have the writer rename a
+        // truncated file over the destination and call it done — the exact
+        // failure `PullChunks`' cancelled-read arm exists to prevent.
+        let (cols, rows) = awkward_rows();
+        let rs = ResultSet::from_rows(cols, rows);
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let mut src = SliceChunks::new(&rs, &order, 1).watching(|_| false);
+        let err = match src.next_chunk() {
+            Err(e) => e,
+            Ok(_) => panic!("a stop must be an error, not an end of stream"),
+        };
+        assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    #[test]
+    fn a_stopped_export_writes_nothing_through_the_renderer() {
+        // The seam, not the source in isolation: `stream_to` has to propagate the
+        // refusal rather than treat it as a short read. Asked of every text
+        // format, because each writes its header on the first chunk and a
+        // swallowed error would leave a header-only file looking valid.
+        let (cols, rows) = awkward_rows();
+        let rs = ResultSet::from_rows(cols, rows);
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        for f in ExportFormat::ALL {
+            let mut out: Vec<u8> = Vec::new();
+            let mut src = SliceChunks::new(&rs, &order, 1).watching(|_| false);
+            assert!(
+                f.stream_to(&mut out, &mut src, None, MySql).is_err(),
+                "{} swallowed the stop",
+                f.label()
+            );
+        }
+    }
+
+    #[test]
+    fn slice_chunks_never_takes_a_zero_step() {
+        // A `0` here would loop forever handing out empty chunks. Clamped rather
+        // than asserted: the size comes from a tuning constant, and an export
+        // that hangs is a worse answer than one that writes a single block.
+        let rs = rs();
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let mut src = SliceChunks::new(&rs, &order, 0);
+        let first = src.next_chunk().unwrap().expect("a chunk").order.len();
+        assert_eq!(first, order.len(), "a zero step writes the lot in one go");
+        assert!(src.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn export_file_names_are_one_per_table_in_order() {
+        let tables = vec!["actor".to_string(), "film".to_string()];
+        assert_eq!(
+            export_file_names(&tables, ExportFormat::Csv),
+            vec!["actor.csv".to_string(), "film.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn export_file_names_sanitize_each_table() {
+        // Same rule as `suggested_filename`, because it is the same function
+        // underneath — a server-controlled name must not become a path.
+        let tables = vec!["a/b".to_string(), "CON".to_string()];
+        assert_eq!(
+            export_file_names(&tables, ExportFormat::Json),
+            vec!["a_b.json".to_string(), "_CON.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn export_file_names_break_a_sanitizing_collision() {
+        // Two distinct tables whose names sanitize to one file. Writing both
+        // would leave the folder holding the second under the first's name — a
+        // silently incomplete export, which is exactly what a backup must not be.
+        let tables = vec!["a:b".to_string(), "a*b".to_string(), "a?b".to_string()];
+        assert_eq!(
+            export_file_names(&tables, ExportFormat::Csv),
+            vec![
+                "a_b.csv".to_string(),
+                "a_b_2.csv".to_string(),
+                "a_b_3.csv".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn export_file_names_collide_case_insensitively() {
+        // Windows and macOS filesystems fold case, so `Orders.csv` and
+        // `orders.csv` are one file there and two on Linux. Deduplicating
+        // case-sensitively would make the export lossy on the two platforms this
+        // app actually ships to.
+        let tables = vec!["Orders".to_string(), "orders".to_string()];
+        assert_eq!(
+            export_file_names(&tables, ExportFormat::Csv),
+            vec!["Orders.csv".to_string(), "orders_2.csv".to_string()]
+        );
+    }
+
+    #[test]
+    fn export_file_names_keep_a_qualified_name_distinct() {
+        // PostgreSQL's display names carry the namespace, so two same-named
+        // tables in different schemas need no suffix at all.
+        let tables = vec!["public.orders".to_string(), "sales.orders".to_string()];
+        assert_eq!(
+            export_file_names(&tables, ExportFormat::Csv),
+            vec![
+                "public.orders.csv".to_string(),
+                "sales.orders.csv".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn export_file_names_suffix_does_not_collide_with_a_real_table() {
+        // The suffix is only safe if it is itself checked against the set: a
+        // real `a_b_2` beside two tables that both sanitize to `a_b` would
+        // otherwise be overwritten by the deduplicator's own choice.
+        let tables = vec!["a:b".to_string(), "a_b_2".to_string(), "a*b".to_string()];
+        assert_eq!(
+            export_file_names(&tables, ExportFormat::Csv),
+            vec![
+                "a_b.csv".to_string(),
+                "a_b_2.csv".to_string(),
+                "a_b_3.csv".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn export_file_names_handles_an_empty_selection() {
+        assert!(export_file_names(&[], ExportFormat::Csv).is_empty());
     }
 
     #[test]

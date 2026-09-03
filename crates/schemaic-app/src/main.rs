@@ -2952,10 +2952,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // finished.
     let export_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
 
+    // The streamed export's progress, reported from the **writer**, one message
+    // per block. A channel rather than a callback for the reason the dump's and
+    // the AI stream's are: `create_ext_action` is one-shot and has to be built on
+    // the UI thread, and this fires many times from a `spawn_blocking` worker.
+    //
+    // Counted where the rows are *written* rather than where they are read: the
+    // channel between the two is bounded, so a reader-side count would run two
+    // blocks ahead of the file and report rows that are not in it yet — and on a
+    // cancel it would be two blocks wrong about what survived.
+    // Created here and handed to `Ui` below, the way `dump_progress` is: the
+    // signal has to exist before the closure that feeds it, and the bundle it
+    // belongs to is built at the end.
+    let (export_tx, export_rx) = crossbeam_channel::unbounded::<u64>();
+    let export_stream = create_signal_from_channel(export_rx);
+    let export_progress: RwSignal<Option<u64>> = RwSignal::new(None);
+    create_effect(move |_| {
+        if let Some(rows) = export_stream.get() {
+            export_progress.set(Some(rows));
+        }
+    });
+
     let export_file: schemaic_ui::ExportFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
         let export_token = export_token.clone();
+        let export_tx = export_tx.clone();
         Rc::new(
             move |req: schemaic_ui::ExportRequest, done: schemaic_ui::ExportDoneFn| {
                 use schemaic_ui::{ExportOutcome, ExportScope};
@@ -2997,26 +3019,121 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     |part: &std::path::Path, path: &std::path::Path| std::fs::rename(part, path);
 
                 match req.scope {
-                    // Everything is already in memory: one blocking task, exactly
-                    // as this has always worked.
+                    // Everything is already in memory, so this is one blocking
+                    // task and no channel — but it is **rendered in blocks all
+                    // the same**, through `SliceChunks`.
+                    //
+                    // Not for memory: the rows are already here, and a chunk is
+                    // the same `&ResultSet` with a *slice* of the same order
+                    // vector, so nothing is copied either way. It is for the two
+                    // things a single block cannot offer. **Progress**: rendered
+                    // whole there is no moment between "started" and "finished"
+                    // at which anything can be reported, and a 200k-row Excel
+                    // export looks identical to a hung one for as long as it
+                    // takes. **A Stop that works**: the modal offers one, and
+                    // between blocks is the only place a synchronous render can
+                    // notice it.
+                    //
+                    // `chunking_a_fetched_result_cannot_change_the_bytes` is what
+                    // says this is invisible in the file — five renderers write a
+                    // header on the first chunk and rows on every one, so a
+                    // source that suddenly yields three chunks where it yielded
+                    // one is exactly how a CSV grows two extra header lines.
                     ExportScope::Fetched => {
-                        let report = create_ext_action(cx, move |o: ExportOutcome| (done)(o));
+                        // **The same single slot the streamed scope claims — but
+                        // only for a run someone can stop.** The slot exists so
+                        // one Stop always reaches the run it points at, and it
+                        // refuses a second export to keep that true; a run with
+                        // no Stop on screen has nothing to keep true and must
+                        // stay out of it. The grid raises the modal and asks for
+                        // the slot; the Live Monitor's log export does not, and
+                        // putting it in would have it refused — *"An export is
+                        // already running"* — over a modal the user cannot see
+                        // and a save that has nothing to do with theirs. See
+                        // `ExportRequest::stoppable`.
+                        //
+                        // Among the runs that *do* claim it there is no save the
+                        // refusal can cost, because the modal covers the window
+                        // while one is going: there is no second grid export to
+                        // start.
+                        let token = if req.stoppable {
+                            if export_token.borrow().is_some() {
+                                (done)(ExportOutcome::Failed {
+                                    message: "An export is already running. Cancel it or wait for \
+                                              it to finish."
+                                        .to_string(),
+                                    // Nothing was opened.
+                                    partial: false,
+                                });
+                                return;
+                            }
+                            let token = CancellationToken::new();
+                            *export_token.borrow_mut() = Some(token.clone());
+                            token
+                        } else {
+                            // Its own token, never in the slot: it is never
+                            // cancelled, so the checks below are constant-false
+                            // and this path behaves exactly as it did before the
+                            // `Fetched` render was chunked.
+                            CancellationToken::new()
+                        };
+                        let report = {
+                            let export_token = export_token.clone();
+                            let stoppable = req.stoppable;
+                            create_ext_action(cx, move |o: ExportOutcome| {
+                                // **Only a run that took the slot may clear it**,
+                                // or an unstoppable log export finishing would
+                                // release the slot out from under the grid export
+                                // that is actually holding it — and the next
+                                // Stop would reach nothing.
+                                if stoppable {
+                                    *export_token.borrow_mut() = None;
+                                }
+                                (done)(o)
+                            })
+                        };
                         let (rs, order) = (req.rs.clone(), req.order.clone());
+                        let progress = export_tx.clone();
+                        let reports = req.stoppable;
+                        let sweep_part = part_of(&path);
+                        let incremental = format.writes_incrementally();
                         handle.spawn_blocking(move || {
                             let part = part_of(&path);
+                            let w_token = token.clone();
                             let write =
                                 || -> std::io::Result<schemaic_core::export::ExportTally> {
                                     use std::io::Write as _;
                                     let mut w = create(&part)?;
-                                    // `render_to`, not `stream_to` over a hand-built
-                                    // `OneChunk`: that *is* `render_to`'s body, and
-                                    // spelling it out here left the wrapper with no
-                                    // caller and two copies of one construction to
-                                    // drift apart.
-                                    let tally = format.render_to(
-                                        &mut w,
+                                    // One hook, both jobs, asked at one instant —
+                                    // see `SliceChunks::watching`. `false` ends
+                                    // the render as an *error*, which is the only
+                                    // way to stop without the file looking
+                                    // finished.
+                                    let mut src = schemaic_core::export::SliceChunks::new(
                                         rs.as_ref(),
                                         order.as_slice(),
+                                        EXPORT_CHUNK_ROWS,
+                                    )
+                                    .watching(move |n| {
+                                        // **Only a run with the modal reports.**
+                                        // `export_progress` is one signal for the
+                                        // window and the messages carry no run
+                                        // id, so an unstoppable run — the Live
+                                        // Monitor's log export, which by design
+                                        // stays out of the cancel slot and can
+                                        // therefore overlap a grid export — would
+                                        // drive the grid modal's counter with its
+                                        // own row count. `ExportTarget::run`
+                                        // guards the outcome against exactly this
+                                        // and nothing guarded the count.
+                                        if reports {
+                                            let _ = progress.send(n);
+                                        }
+                                        !w_token.is_cancelled()
+                                    });
+                                    let tally = format.stream_to(
+                                        &mut w,
+                                        &mut src,
                                         source.as_ref().map(|(d, ns, t)| {
                                             (d.as_str(), ns.as_deref(), t.as_str())
                                         }),
@@ -3027,19 +3144,40 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     // last block never reached the disk — silently
                                     // truncating the file.
                                     w.flush()?;
+                                    drop(w);
+                                    // **Only now** does the destination change, and
+                                    // not at all if this was stopped — the streamed
+                                    // scope's rule, and it has to hold here for the
+                                    // same reason: a truncated render must never be
+                                    // renamed over the user's file.
+                                    if token.is_cancelled() {
+                                        return Err(std::io::Error::other("export cancelled"));
+                                    }
                                     publish(&part, &path)?;
                                     Ok(tally)
                                 };
                             report(match write() {
                                 Ok(tally) => ExportOutcome::Done(tally),
+                                // The user's own Stop is neither a success nor a
+                                // failure, and the token is the witness — the
+                                // error above is indistinguishable from a write
+                                // error by its text alone.
+                                Err(_) if token.is_cancelled() => ExportOutcome::Cancelled,
                                 // `partial`: the write had begun, so the `.part`
-                                // sibling holds whatever arrived. The destination
-                                // itself is untouched, which is what the message
-                                // says.
-                                Err(e) => ExportOutcome::Failed {
-                                    message: format!("Export failed: {e}"),
-                                    partial: true,
-                                },
+                                // sibling holds whatever arrived — unless the
+                                // format buffers, in which case the sibling is
+                                // empty and is swept rather than left as litter
+                                // for a message to point at. The destination
+                                // itself is untouched either way.
+                                Err(e) => {
+                                    if !incremental {
+                                        let _ = std::fs::remove_file(&sweep_part);
+                                    }
+                                    ExportOutcome::Failed {
+                                        message: format!("Export failed: {e}"),
+                                        partial: incremental,
+                                    }
+                                }
                             });
                         });
                     }
@@ -3100,7 +3238,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // rows, so a deep queue would be exactly the memory this
                         // avoids. Two lets the server read the next block while
                         // the disk takes the last.
-                        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::channel::<schemaic_db::ExportChunk>(2);
                         let part = part_of(&path);
                         // A copy for the failure arms, which run in the other
                         // task: a buffered format leaves an empty sibling and
@@ -3112,6 +3251,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // rename a truncated file over the destination and only
                         // *then* have the reader declare the cancel.
                         let w_token = token.clone();
+                        let progress = export_tx.clone();
                         let writer = handle.spawn_blocking(move || {
                             use std::io::Write as _;
                             // One for the pull closure below, one for the check
@@ -3119,6 +3259,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // two different moments.
                             let src_token = w_token.clone();
                             let mut w = create(&part).map_err(|e| e.to_string())?;
+                            // Rows handed to the renderer so far. Counted here
+                            // rather than at the reader because the channel
+                            // between them is bounded and would run two blocks
+                            // ahead of the file — reporting rows that are not in
+                            // it yet, and being two blocks wrong about what
+                            // survived a cancel.
+                            let mut rows_done = 0u64;
                             let mut src = schemaic_core::export::PullChunks::new(move || match rx
                                 .blocking_recv()
                             {
@@ -3137,7 +3284,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     Err(std::io::Error::other("export cancelled"))
                                 }
                                 None => Ok(None),
-                                Some(Ok(rs)) => Ok(Some(rs)),
+                                Some(Ok(rs)) => {
+                                    rows_done += rs.row_count() as u64;
+                                    // Best-effort, the rule every progress
+                                    // channel here follows: a full channel or a
+                                    // closed receiver must never hold up a write.
+                                    let _ = progress.send(rows_done);
+                                    Ok(Some(rs))
+                                }
                                 // The reason the reader put on the channel.
                                 // Without this the writer would read the
                                 // close as "the table ended" and call a
@@ -3337,6 +3491,54 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let (handle2, tx) = (handle.clone(), dump_tx.clone());
                 handle.spawn(async move {
                     let outcome = dump::run(db, req, handle2, token, tx, EXPORT_CHUNK_ROWS).await;
+                    report(outcome);
+                });
+            },
+        )
+    };
+
+    // The folder export, wired exactly as the dump above and **sharing its
+    // cancel slot**: both are launched from the one modal, which refuses a second
+    // run while either is going, so the two can never be in flight together —
+    // and separate slots would only create the case where the footer's Stop
+    // reaches neither. Progress rides the dump's channel for the same reason: it
+    // is the same footer line, counting the same "3 of 12".
+    let files_run: schemaic_ui::FilesFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let dump_token = dump_token.clone();
+        let dump_tx = dump_tx.clone();
+        Rc::new(
+            move |req: schemaic_ui::FilesRequest, done: schemaic_ui::FilesDoneFn| {
+                use schemaic_ui::FilesOutcome;
+                let db = match (db_for)(req.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        // Refused before the first file, so `files: 0` — the
+                        // message must not send the user to a folder nothing was
+                        // written to.
+                        return (done)(FilesOutcome::Failed {
+                            message: format!("Export failed: {e}"),
+                            files: 0,
+                            // Refused before a plan existed, so nothing is known
+                            // to be missing — `missing` is the plan's answer.
+                            missing: Vec::new(),
+                        });
+                    }
+                };
+                let token = CancellationToken::new();
+                *dump_token.borrow_mut() = Some(token.clone());
+                let report = {
+                    let dump_token = dump_token.clone();
+                    create_ext_action(cx, move |o: FilesOutcome| {
+                        *dump_token.borrow_mut() = None;
+                        (done)(o);
+                    })
+                };
+                let (handle2, tx) = (handle.clone(), dump_tx.clone());
+                handle.spawn(async move {
+                    let outcome =
+                        dump::run_files(db, req, handle2, token, tx, EXPORT_CHUNK_ROWS).await;
                     report(outcome);
                 });
             },
@@ -9376,6 +9578,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             },
             dump_tables,
             dump_run,
+            files_run,
             dump_cancel,
             script_probe,
             script_run,
@@ -9442,6 +9645,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             error: RwSignal::new(None),
             done: RwSignal::new(None),
             generation: RwSignal::new(0),
+        },
+        // Two signals, no reset-on-open: the modal is raised by an export rather
+        // than by a menu, and `save_export` sets both at the launch.
+        export: schemaic_ui::ExportUi {
+            target: RwSignal::new(None),
+            progress: export_progress,
+            done: RwSignal::new(None),
+            error: RwSignal::new(None),
         },
         // The load half of `dump` above, and the same bundle rule.
         script: schemaic_ui::ScriptUi {

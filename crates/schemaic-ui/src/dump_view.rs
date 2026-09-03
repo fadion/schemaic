@@ -10,6 +10,22 @@
 //! is decided in the core and written in the app, and this view only says what
 //! the user asked for.
 //!
+//! **One panel, six formats.** `Export ▸` is a submenu, and the format the user
+//! picked is [`crate::DumpTarget::format`]. `SQL` is the dump described above.
+//! The other five write **one file per table into a folder**
+//! ([`schemaic_core::dump::file_plan`] → `SchemaActions::files_run`), and for
+//! those the six options are not shown at all: every one of them is about a
+//! `.sql` file — what structure to emit, what to drop first, what to wrap the
+//! load in — and a CSV can honour none of it. The split is asked as a capability,
+//! [`crate::DumpTarget::writes_folder`], never as a `format == Sql` at each of
+//! the six places that branch on it.
+//!
+//! The **grid** export's progress modal lives here too
+//! ([`export_progress_overlay`]) — a different feature reached from a different
+//! surface, but this panel's footer with nothing above it, and keeping the two
+//! in one file is what keeps them looking alike through the next change to
+//! either.
+//!
 //! **The modal stays open while the dump runs**, like the import modal and for
 //! the same reason: its signals are the only channel the run reports to, so
 //! closing would hide work still in flight and leave its outcome with no reader.
@@ -30,7 +46,9 @@ use crate::widgets::{
     focus_root_with_ring, form_hint, form_section, form_separator, link_button, modal_footer_split,
     modal_h, modal_pad_h, modal_title_owned, modal_w, panel_style,
 };
-use crate::{DumpOutcome, DumpRequest, DumpTarget, Ui};
+use schemaic_core::export::ExportFormat;
+
+use crate::{DumpOutcome, DumpRequest, DumpTarget, FilesOutcome, FilesRequest, Ui};
 
 /// The panel's nominal size, scaled like every other modal's.
 fn panel_w() -> f64 {
@@ -54,6 +72,10 @@ const TAB_OPTS: u32 = 100;
 /// `preselect` ticks exactly one table instead of all of them — what a table
 /// node's own *Export* opens. The picker still lists the whole database, so the
 /// neighbours that table's foreign keys point at are one click away.
+///
+/// `format` is which entry of the `Export ▸` submenu was clicked. It decides
+/// what the modal *is*: `Sql` is the dump this module was written for, and the
+/// other five are a folder of one file per table. See [`DumpTarget::format`].
 pub(crate) fn open_dump(
     ui: Ui,
     conn_id: u64,
@@ -61,6 +83,7 @@ pub(crate) fn open_dump(
     schema: Option<String>,
     preselect: Option<String>,
     dialect: SqlDialect,
+    format: ExportFormat,
 ) {
     let d = ui.dump;
     // The other half of `script_view::open_script`'s rule — the two share one
@@ -79,6 +102,7 @@ pub(crate) fn open_dump(
         database: database.clone(),
         schema: schema.clone(),
         dialect,
+        format,
     }));
 
     let opened = d.generation.get_untracked();
@@ -119,6 +143,24 @@ pub(crate) fn open_dump(
     );
 }
 
+/// The footer's Export button: whichever of the two writers this modal is for.
+///
+/// **The branch is here and nowhere else.** Both halves below end at
+/// `accept_dialog_launch` and set the same four signals, and the one thing that
+/// must never happen is a modal opened on CSV launching the dump — so the
+/// question is asked once, of [`DumpTarget::writes_folder`], at the only point
+/// where either can start.
+fn run_export(ui: Ui) {
+    let Some(target) = ui.dump.target.get_untracked() else {
+        return;
+    };
+    if target.writes_folder() {
+        run_files(ui, target);
+    } else {
+        run_dump(ui, target);
+    }
+}
+
 /// Launch the dump the modal describes, after the save dialog names a file.
 ///
 /// **The guard is in the same synchronous step as the launch** — the disabled
@@ -126,11 +168,8 @@ pub(crate) fn open_dump(
 /// disabled style only takes effect on a later update pass
 /// (`widgets::accept_launch`, and the two imports that each opened their own
 /// transaction before it existed).
-fn run_dump(ui: Ui) {
+fn run_dump(ui: Ui, target: DumpTarget) {
     let d = ui.dump;
-    let Some(target) = d.target.get_untracked() else {
-        return;
-    };
     // **Read at the moment of the launch, not before the dialog.** floem's save
     // dialog is not window-modal, so the modal stays live behind it: untick every
     // table, tick one, choose a filename — and the file was written from the
@@ -282,6 +321,200 @@ fn run_dump(ui: Ui) {
             }),
         );
     });
+}
+
+/// Launch a **folder** export, after the directory dialog names a folder.
+///
+/// [`run_dump`]'s twin for the picker's five non-SQL formats, and every guard in
+/// it is here for the reason stated there: the selection is read *after* the
+/// dialog closes because floem's dialog is not window-modal and the modal stays
+/// live behind it; the launch is accepted through `accept_dialog_launch` because
+/// by then the modal that asked may be gone; and the outcome checks `generation`
+/// because closing the modal does not stop the export.
+///
+/// What it does **not** carry is [`schemaic_core::dump::DumpOptions`]. A CSV has
+/// no `CREATE TABLE` to drop first, no transaction to wrap and no foreign-key
+/// guard to lower, so there is nothing for the six toggles to say — which is why
+/// the modal hides them for these formats rather than passing values the writer
+/// would ignore.
+fn run_files(ui: Ui, target: DumpTarget) {
+    let d = ui.dump;
+    if d.chosen.with_untracked(|c| c.is_empty()) {
+        return;
+    }
+    let dialog = FileDialogOptions::new()
+        // A directory, not a file: this export writes one file *per table*, and
+        // the names are `dump::file_plan`'s to choose — they have to be, because
+        // two tables can sanitize to one file name and only the plan sees the
+        // whole set.
+        .select_directories()
+        .title(format!("Export to {}", target.format.label()));
+    let actions = ui.schema_actions.clone();
+    let asked_at = d.generation.get_untracked();
+    let format = target.format;
+    floem::action::open_file(dialog, move |file| {
+        let Some(folder) = file.and_then(|f| f.path.first().cloned()) else {
+            return; // The dialog was dismissed.
+        };
+        if !crate::widgets::accept_dialog_launch(
+            d.running.get_untracked(),
+            false,
+            d.target.get_untracked().is_some(),
+            asked_at,
+            d.generation.get_untracked(),
+        ) {
+            return;
+        }
+        // The selection as it stands *now* — the tables may have been unticked
+        // while the dialog stood open. `run_dump`'s rule, and its bug.
+        let tables = d.chosen.get_untracked();
+        if tables.is_empty() {
+            return;
+        }
+        d.running.set(true);
+        d.error.set(None);
+        d.done.set(None);
+        d.progress.set(None);
+        // The folder's own name, for the three sentences below: they are about
+        // *this* folder and the outcome carries none of it, so the modal is the
+        // only place that still knows. The last component rather than the whole
+        // path — the path can be long enough to push the caveats off the footer,
+        // and the user chose this folder a moment ago.
+        let name = folder
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| folder.display().to_string());
+        let opened = d.generation.get_untracked();
+        (actions.files_run)(
+            FilesRequest {
+                folder,
+                conn_id: target.conn_id,
+                database: target.database.clone(),
+                tables,
+                format,
+                dialect: target.dialect,
+            },
+            Rc::new(move |outcome| {
+                if d.generation.get_untracked() != opened {
+                    return;
+                }
+                d.running.set(false);
+                d.progress.set(None);
+                // All three sentences are `core::export`'s, beside the ones the
+                // dump and the grid use — a report about a folder is a decision
+                // with arms (nothing finished, some finished, a table ticked and
+                // never found), and it is not one to make inside a callback the
+                // suite cannot reach.
+                match outcome {
+                    FilesOutcome::Done {
+                        files,
+                        tally,
+                        missing,
+                    } => d.done.set(Some(schemaic_core::export::files_note(
+                        files, &tally, &name, &missing,
+                    ))),
+                    FilesOutcome::Cancelled { files, missing } => d.error.set(Some(
+                        schemaic_core::export::files_cancel_note(files, &name, &missing),
+                    )),
+                    FilesOutcome::Failed {
+                        message,
+                        files,
+                        missing,
+                    } => d.error.set(Some(schemaic_core::export::files_failure_note(
+                        &message, files, &name, &missing,
+                    ))),
+                }
+            }),
+        );
+    });
+}
+
+/// The dump's two option sections — what goes in the file, and what the file
+/// does when it is replayed.
+///
+/// **Only ever built for [`ExportFormat::Sql`]**, which is why it is a function:
+/// the rows are `focusable_toggle_row`s, so building them for a folder export
+/// and then not showing them would leave eight tab stops behind controls that
+/// are not on screen. The caller's branch decides; this only knows how to draw
+/// them.
+fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl IntoView {
+    let what = v_stack((
+        form_section("Contents"),
+        crate::settings::focusable_toggle_row(
+            "Structure",
+            "CREATE TABLE, its triggers, and the foreign keys, restated after the data.",
+            d.structure,
+            ring.clone(),
+            TAB_OPTS,
+        ),
+        crate::settings::focusable_toggle_row(
+            "Data",
+            "Every row, as INSERT statements.",
+            d.data,
+            ring.clone(),
+            TAB_OPTS + 10,
+        ),
+        crate::settings::focusable_toggle_row(
+            "Other objects",
+            "Types, sequences, routines and events these tables lean on.",
+            d.other_objects,
+            ring.clone(),
+            TAB_OPTS + 20,
+        ),
+    ))
+    .style(|s| s.flex_col().width_full().gap(theme::scaled(10.0)));
+
+    // The guard is offered only where the engine has one an ordinary role can
+    // throw — asked of the dialect through the core predicate, never spelled out
+    // again here.
+    let has_guard = schemaic_core::dump::fk_guard_sql(dialect).is_some();
+    let replay = v_stack((
+        form_section("Replaying"),
+        crate::settings::focusable_toggle_row(
+            "Drop before create",
+            "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
+             that already holds these tables.",
+            d.drop_if_exists,
+            ring.clone(),
+            TAB_OPTS + 30,
+        ),
+        crate::settings::focusable_toggle_row(
+            "One transaction",
+            "Wrap the load, so a failure leaves nothing behind.",
+            d.wrap_transaction,
+            ring.clone(),
+            TAB_OPTS + 40,
+        ),
+        if has_guard {
+            crate::settings::focusable_toggle_row(
+                "Disable foreign-key checks",
+                "Off for the duration of the load, so the order rows arrive in can't \
+                 refuse them.",
+                d.disable_fk_checks,
+                ring.clone(),
+                TAB_OPTS + 50,
+            )
+            .into_any()
+        } else {
+            // Said, rather than shown greyed: PostgreSQL's switch is
+            // superuser-only, so offering it would be a checkbox that fails the
+            // restore for most roles.
+            form_hint(
+                "This engine has no session switch for foreign-key checks; the file \
+                 adds the constraints after the data instead.",
+            )
+            .into_any()
+        },
+    ))
+    .style(|s| s.flex_col().width_full().gap(theme::scaled(10.0)));
+
+    v_stack((
+        form_separator(theme::scaled(16.0)),
+        what,
+        form_separator(theme::scaled(16.0)),
+        replay,
+    ))
+    .style(|s| s.flex_col().width_full().gap(theme::scaled(16.0)))
 }
 
 /// One table row: the app's [`crate::widgets::check_box`], then the table name.
@@ -436,88 +669,34 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
             let ui = ui.clone();
             let (exit_x, exit_esc, exit_footer) = (exit.clone(), exit.clone(), exit.clone());
 
-            let what = v_stack((
-                form_section("Contents"),
-                crate::settings::focusable_toggle_row(
-                    "Structure",
-                    "CREATE TABLE, its triggers, and the foreign keys, restated after the data.",
-                    d.structure,
-                    ring.clone(),
-                    TAB_OPTS,
-                ),
-                crate::settings::focusable_toggle_row(
-                    "Data",
-                    "Every row, as INSERT statements.",
-                    d.data,
-                    ring.clone(),
-                    TAB_OPTS + 10,
-                ),
-                crate::settings::focusable_toggle_row(
-                    "Other objects",
-                    "Types, sequences, routines and events these tables lean on.",
-                    d.other_objects,
-                    ring.clone(),
-                    TAB_OPTS + 20,
-                ),
-            ))
-            .style(|s| s.flex_col().width_full().gap(theme::scaled(10.0)));
-
-            // The guard is offered only where the engine has one an ordinary
-            // role can throw — asked of the dialect through the core predicate,
-            // never spelled out again here.
-            let has_guard = schemaic_core::dump::fk_guard_sql(target.dialect).is_some();
-            let replay = v_stack((
-                form_section("Replaying"),
-                crate::settings::focusable_toggle_row(
-                    "Drop before create",
-                    "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
-                     that already holds these tables.",
-                    d.drop_if_exists,
-                    ring.clone(),
-                    TAB_OPTS + 30,
-                ),
-                crate::settings::focusable_toggle_row(
-                    "One transaction",
-                    "Wrap the load, so a failure leaves nothing behind.",
-                    d.wrap_transaction,
-                    ring.clone(),
-                    TAB_OPTS + 40,
-                ),
-                if has_guard {
-                    crate::settings::focusable_toggle_row(
-                        "Disable foreign-key checks",
-                        "Off for the duration of the load, so the order rows arrive in can't \
-                         refuse them.",
-                        d.disable_fk_checks,
-                        ring.clone(),
-                        TAB_OPTS + 50,
-                    )
-                    .into_any()
-                } else {
-                    // Said, rather than shown greyed: PostgreSQL's switch is
-                    // superuser-only, so offering it would be a checkbox that
-                    // fails the restore for most roles.
-                    form_hint(
-                        "This engine has no session switch for foreign-key checks; the file \
-                         adds the constraints after the data instead.",
-                    )
-                    .into_any()
-                },
-            ))
-            .style(|s| s.flex_col().width_full().gap(theme::scaled(10.0)));
+            // **The two option sections are the dump's alone.** Every one of them
+            // is about a `.sql` file — what structure to emit, what to drop
+            // first, what to wrap the load in — and a CSV can honour none of it.
+            // Shown greyed they would read as options this format merely happens
+            // to have turned off; absent, the panel says what it is.
+            //
+            // Built inside the branch, not merely hidden by it: each row is a
+            // `focusable_toggle_row`, so constructing them for a folder export
+            // would leave eight tab stops behind controls that are not on screen.
+            let folder = target.writes_folder();
+            let options: floem::AnyView = if folder {
+                // What replaces them: the one sentence a folder export needs,
+                // since it has no options and its destination is not a file.
+                form_hint(&format!(
+                    "One {} file per table, written into a folder you choose.",
+                    target.format.label()
+                ))
+                .into_any()
+            } else {
+                dump_options(d, target.dialect, ring.clone()).into_any()
+            };
 
             // Choices only. **Everything the run says about itself is in the
             // footer** — this body scrolls, so a progress line or an outcome put
             // here is one the user has to go looking for, and the whole point of
             // both is being seen without looking.
-            let body = v_stack((
-                table_picker(ui.clone(), ring.clone()),
-                form_separator(theme::scaled(16.0)),
-                what,
-                form_separator(theme::scaled(16.0)),
-                replay,
-            ))
-            .style(|s| s.flex_col().width_full().gap(theme::scaled(16.0)));
+            let body = v_stack((table_picker(ui.clone(), ring.clone()), options))
+                .style(|s| s.flex_col().width_full().gap(theme::scaled(16.0)));
 
             // **Rebuilt on what enables it**, not read once while the panel is
             // built: `action_button` takes a plain `bool`, so a state read here
@@ -536,7 +715,12 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
                     (
                         d.running.get(),
                         d.chosen.with(|c| c.is_empty()),
-                        d.options().is_empty(),
+                        // **Only the dump can have nothing to write.** The six
+                        // toggles are what `is_empty` reads, and a folder export
+                        // does not show them — so asking it here would leave the
+                        // Export button gated on controls that are not on screen
+                        // and whose last values came from someone else's dump.
+                        !folder && d.options().is_empty(),
                         d.done.get(),
                         d.error.get(),
                     )
@@ -642,7 +826,7 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
                                 !running && !none_chosen && !no_content,
                                 ring,
                                 ACTION_TAB + 10,
-                                move || run_dump(run_ui.clone()),
+                                move || run_export(run_ui.clone()),
                             ),
                         ))
                         .style(|s| s.items_center().gap(theme::scaled(8.0)))
@@ -654,9 +838,17 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
             .style(|s| s.width_full());
 
             let close_x: Rc<dyn Fn()> = exit_x.clone();
+            // **The format is in the title**, because it is the one thing about
+            // this modal the picker below cannot show and the user cannot change
+            // from here — six submenu entries open the same panel, and without
+            // it the CSV one and the dump are the same window.
             let title = match target.schema.as_deref() {
-                Some(ns) => format!("Export {}.{ns}", target.database),
-                None => format!("Export {}", target.database),
+                Some(ns) => format!(
+                    "Export {}.{ns} to {}",
+                    target.database,
+                    target.format.label()
+                ),
+                None => format!("Export {} to {}", target.database, target.format.label()),
             };
             let panel = v_stack((
                 modal_title_owned(title, close_x, ring.clone()),
@@ -690,6 +882,215 @@ pub(crate) fn dump_overlay(ui: Ui) -> impl IntoView {
     )
     .style(move |s| {
         if d.target.get().is_some() {
+            s.absolute().inset(0.0)
+        } else {
+            s
+        }
+    })
+}
+
+/// The grid export's progress modal — raised by **every** grid export, both
+/// scopes.
+///
+/// **Here rather than in `grid.rs`, because it is this panel's twin.** It is the
+/// dump modal's footer with nothing above it: the same running line, the same
+/// red Stop in the same fixed position, the same backdrop. A user who exports a
+/// database from the tree and a result from the grid meets one thing twice, and
+/// keeping the two in one file is what makes that survive the next change to
+/// either.
+///
+/// It is the export's **single affordance**: progress and a Stop while the write
+/// runs, then the outcome and a Close. It does not close itself — see
+/// [`crate::ExportUi`] for why a modal that did could not confirm a fast export
+/// at all, and why the grid's bar no longer reports one.
+pub(crate) fn export_progress_overlay(ui: Ui) -> impl IntoView {
+    let e = ui.export;
+    let cancel = ui.tab_actions.export_cancel.clone();
+    // **One decision for every exit** — the footer button and Escape — so the two
+    // cannot disagree, which is the rule `dump_overlay` states and the reason it
+    // routes both through one closure. Here it matters more than there: the two
+    // exits mean *opposite* things depending on the state, and an Escape wired
+    // straight to `target.set(None)` would silently abandon a running export,
+    // leaving a stream writing a `.part` sibling with its Stop nowhere on screen.
+    let exit: Rc<dyn Fn()> = {
+        let cancel = cancel.clone();
+        Rc::new(move || {
+            let finished =
+                e.done.with_untracked(Option::is_some) || e.error.with_untracked(Option::is_some);
+            if finished {
+                e.target.set(None);
+                e.progress.set(None);
+                e.done.set(None);
+                e.error.set(None);
+            } else {
+                // Stop. The modal stays up and turns into its finished state
+                // when the cancel is reported, so the user sees what became of
+                // the file rather than the window simply vanishing.
+                (cancel)();
+            }
+        })
+    };
+    dyn_container(
+        // The **whole** state, not just `target`: the panel is rebuilt when the
+        // run ends so the footer can change word and colour. Reading only
+        // `target` left a finished export showing a red Stop over a file that
+        // was already written.
+        move || (e.target.get(), e.done.get(), e.error.get()),
+        move |(target, done, error)| {
+            let Some(target) = target else {
+                return empty().into_any();
+            };
+            let ring = FocusRing::new();
+            let (exit_btn, exit_esc) = (exit.clone(), exit.clone());
+            let finished = done.is_some() || error.is_some();
+            let (total, approx) = (target.total, target.approx);
+            let outcome: Option<(String, bool)> = match (done, error) {
+                // The error arm wins if both are somehow set: a failure the user
+                // has to act on must not be hidden behind a success.
+                (_, Some(e)) => Some((e, false)),
+                (Some(d), None) => Some((d, true)),
+                (None, None) => None,
+            };
+            let body = v_stack((
+                dyn_container(
+                    move || (e.progress.get(), outcome.clone()),
+                    move |(rows, outcome)| match outcome {
+                        // **Finished: what became of the file, in place of the
+                        // count.** Green for a clean write, the error colour for
+                        // a failure *or a cancel* — a stopped export's sentence
+                        // is about a file that is not what was asked for, and a
+                        // green tick over it is the one reading it must not get.
+                        Some((msg, ok)) => text(msg)
+                            .style(move |s| {
+                                s.color(if ok {
+                                    theme::status_ok()
+                                } else {
+                                    theme::error()
+                                })
+                                .font_size(theme::font_label())
+                                .min_width(0.0)
+                            })
+                            .into_any(),
+                        // **What has been written, not that something is being
+                        // written.** The count is the difference between an
+                        // export that looks stuck and one visibly grinding
+                        // through a large table — the dump's line, and its
+                        // reason.
+                        None => match rows {
+                            Some(rows) => text(match total {
+                                // The `~` is the *estimated* case only — a
+                                // streamed export is re-reading the server and
+                                // carries the catalogue's guess, the same mark
+                                // and the same figure the `All rows` entry the
+                                // user chose from shows. A fetched export knows
+                                // exactly what it holds, and dressing that up as
+                                // an estimate would hedge a number that needs no
+                                // hedging.
+                                Some(total) if approx => format!(
+                                    "{} of ~{} rows",
+                                    schemaic_core::text::human_count(rows as usize),
+                                    schemaic_core::text::human_count(total as usize),
+                                ),
+                                Some(total) => format!(
+                                    "{} of {} rows",
+                                    schemaic_core::text::human_count(rows as usize),
+                                    schemaic_core::text::human_count(total as usize),
+                                ),
+                                None => format!(
+                                    "{} {}",
+                                    schemaic_core::text::human_count(rows as usize),
+                                    schemaic_core::text::plural(rows as usize, "row", "rows"),
+                                ),
+                            })
+                            .style(|s| s.color(theme::text()).font_size(theme::font_body()))
+                            .into_any(),
+                            // Before the first block there is nothing to count,
+                            // and the server's first read is the slow part —
+                            // animated, because a static label and a hung one
+                            // look identical.
+                            None => crate::widgets::loading_dots(
+                                "Starting",
+                                theme::text_muted,
+                                theme::font_label,
+                            )
+                            .into_any(),
+                        },
+                    },
+                ),
+                // The destination, under whichever line is above it. **Past
+                // tense once the run is over**: `Writing orders.csv` beside
+                // `Exported 16k rows` would describe a file still being written
+                // and one already finished, in the same breath.
+                text(format!(
+                    "{} {}",
+                    if finished { "File:" } else { "Writing" },
+                    target.name
+                ))
+                .style(|s| {
+                    s.color(theme::text_muted())
+                        .font_size(theme::font_label())
+                        .min_width(0.0)
+                }),
+            ))
+            .style(|s| {
+                s.flex_col()
+                    .items_center()
+                    .width_full()
+                    .gap(theme::scaled(6.0))
+                    .padding_horiz(modal_pad_h())
+                    .padding_vert(theme::scaled(22.0))
+            });
+
+            let panel = v_stack((
+                body,
+                modal_footer_split(
+                    empty().into_any(),
+                    // **One button in one place, wearing the word for the state
+                    // it is in** — the dump footer's rule. Red while it stops
+                    // something, because that is an action rather than a way out;
+                    // neutral once it is only a way out. Keeping the slot fixed
+                    // is what stops the control moving under the cursor when the
+                    // line above it changes width.
+                    action_button(
+                        if finished { "Close" } else { "Stop" },
+                        if finished {
+                            ActionKind::Neutral
+                        } else {
+                            ActionKind::Danger
+                        },
+                        true,
+                        ring.clone(),
+                        ACTION_TAB,
+                        move || (exit_btn)(),
+                    )
+                    .into_any(),
+                )
+                .into_any(),
+            ))
+            .on_click_stop(|_| {})
+            .style(move |s| panel_style(s).width(modal_w(360.0)));
+
+            // Escape routes through the **same** decision as the button, so it
+            // stops a running export and dismisses a finished one — never the
+            // other way round, and never a close that abandons a live write.
+            focus_root_with_ring(container(panel), ring)
+                .on_key_down(
+                    Key::Named(NamedKey::Escape),
+                    |_| true,
+                    move |_| (exit_esc)(),
+                )
+                .style(|s| {
+                    s.size_full()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .background(theme::modal_backdrop())
+                })
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        if e.target.get().is_some() {
             s.absolute().inset(0.0)
         } else {
             s
