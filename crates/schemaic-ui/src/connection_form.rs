@@ -1102,18 +1102,9 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 .into_any()
         },
     )
-    // **The container is hidden too, not just its child.** The `hide()` above
-    // takes the *inner* view out of layout, and this `dyn_container` is still a
-    // flex child of the column below — so on `Disable` it contributed the 20px
-    // gap for a box with nothing in it. Same rule, one level up: the arm that
-    // knows there is nothing to show has to reach the box that would hold it.
-    .style(move |s| {
-        if mode.get().negotiates_tls() {
-            s.width_full()
-        } else {
-            s.hide()
-        }
-    });
+    // The container is hidden too, not just its child — see
+    // `widgets::collapse_unless`.
+    .style(move |s| crate::widgets::collapse_unless(s, mode.get().negotiates_tls()));
 
     v_stack((picker, files)).style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
@@ -1215,7 +1206,11 @@ fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
             .into_any()
         },
     )
-    .style(|s| s.width_full());
+    // **The box, not just the child.** The `hide()` in the `!on` arm above takes
+    // the *inner* view out of layout and this container went on claiming the
+    // column's 20px gap — which is the space that sat above **SSL / TLS** on the
+    // default form, where the tunnel is off. See `widgets::collapse_unless`.
+    .style(move |s| crate::widgets::collapse_unless(s, ssh_enabled.get()));
 
     // Between the coordinates and the credentials, where libpq's own field order
     // puts it and where every other client shows it. 65: the gap the surrounding

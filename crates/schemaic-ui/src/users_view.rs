@@ -335,15 +335,9 @@ fn list_pane(ui: &Ui, target: &UsersTarget, gate: WriteGate, ring: FocusRing) ->
                             )
                         },
                     )
-                    // The container is hidden too, not just its child: an empty
-                    // flex child still claims the stack's gap.
-                    .style(move |s| {
-                        if shown_style(&filter.get()) {
-                            s.hide()
-                        } else {
-                            s.width_full()
-                        }
-                    })
+                    // The container is hidden too, not just its child — see
+                    // `widgets::collapse_unless`.
+                    .style(move |s| crate::widgets::collapse_unless(s, !shown_style(&filter.get())))
                     .into_any(),
                 );
 
