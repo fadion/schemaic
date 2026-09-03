@@ -39,6 +39,62 @@ use crate::model::{ResultSet, Value};
 /// about that to refuse a save rather than write a corrupt file.
 pub const FETCH_CAP: usize = 64 * 1024 * 1024;
 
+/// Most pixels a preview will decode: 32 megapixels.
+///
+/// **[`FETCH_CAP`] does not bound this, which is the whole reason it exists.**
+/// The renderer decodes to RGBA, so what a preview costs is width × height × 4
+/// — a function of the image's *dimensions*, not of the bytes it arrived in. A
+/// 40 KB PNG can legitimately declare 30000 × 30000 and expand to 3.6 GB, and
+/// the bytes here came out of a database rather than off this machine, so the
+/// dimensions are input like any other and are not to be trusted on the way to
+/// an allocation.
+///
+/// 32 megapixels is ~128 MB of RGBA. Above any image a cell realistically
+/// holds — an avatar, a logo, a scan — and below what a desktop cannot absorb.
+pub const PREVIEW_PIXEL_CAP: u64 = 32_000_000;
+
+/// Whether a preview may be built, given what the header says it would decode
+/// to.
+///
+/// The **decision** lives here, pure and tested; the **measurement** does not,
+/// because reading dimensions means a decoder. The caller hands over what it
+/// managed to read and this says what to do with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewVerdict {
+    /// Within budget — decode and draw it.
+    Show,
+    /// The header parsed and declares more than [`PREVIEW_PIXEL_CAP`] pixels.
+    TooLarge { width: u32, height: u32 },
+    /// No dimensions could be read.
+    ///
+    /// **Not the same as "small enough to try".** Nothing bounds the decode
+    /// here, and the reason the header did not parse is very likely that the
+    /// bytes are not the image [`sniff`] took them for — in which case the
+    /// renderer draws *nothing at all*, silently, and the panel becomes a
+    /// caption over an empty box. Saying so is strictly better than showing it.
+    Unmeasurable,
+}
+
+/// [`PreviewVerdict`] for the dimensions a caller managed to read.
+///
+/// Multiplied as `u64`, deliberately: `u32 * u32` overflows at a little over
+/// four gigapixels, and a header declaring 65536 × 65536 would otherwise wrap
+/// to zero and pass a cap it exceeds by two orders of magnitude.
+pub fn preview_verdict(dims: Option<(u32, u32)>) -> PreviewVerdict {
+    let Some((width, height)) = dims else {
+        return PreviewVerdict::Unmeasurable;
+    };
+    // A zero dimension decodes to nothing and draws nothing — it is a header
+    // this cannot use, not an image within budget.
+    if width == 0 || height == 0 {
+        return PreviewVerdict::Unmeasurable;
+    }
+    if u64::from(width) * u64::from(height) > PREVIEW_PIXEL_CAP {
+        return PreviewVerdict::TooLarge { width, height };
+    }
+    PreviewVerdict::Show
+}
+
 /// Which cell's bytes to fetch, and how to find its row again.
 ///
 /// The `(database, schema, table, column)` quartet is the column's own wire
@@ -458,6 +514,83 @@ mod tests {
                  stop calling it renderable"
             );
         }
+    }
+
+    // ---- preview budget ----------------------------------------------------
+
+    #[test]
+    fn an_ordinary_image_is_shown() {
+        assert_eq!(preview_verdict(Some((1920, 1080))), PreviewVerdict::Show);
+        assert_eq!(preview_verdict(Some((1, 1))), PreviewVerdict::Show);
+        // A 24-megapixel photo is large and still legitimate.
+        assert_eq!(preview_verdict(Some((6000, 4000))), PreviewVerdict::Show);
+    }
+
+    #[test]
+    fn the_cap_is_the_boundary_and_not_one_past_it() {
+        // Exactly the cap is allowed; one pixel more is not.
+        assert_eq!(
+            preview_verdict(Some((PREVIEW_PIXEL_CAP as u32, 1))),
+            PreviewVerdict::Show
+        );
+        assert_eq!(
+            preview_verdict(Some((PREVIEW_PIXEL_CAP as u32 + 1, 1))),
+            PreviewVerdict::TooLarge {
+                width: PREVIEW_PIXEL_CAP as u32 + 1,
+                height: 1
+            }
+        );
+    }
+
+    /// **The bomb this exists for.** A small, entirely valid PNG can declare
+    /// enormous dimensions; what it costs to draw is width × height × 4, and
+    /// `FETCH_CAP` bounds neither term.
+    #[test]
+    fn a_decompression_bomb_is_refused_by_its_dimensions() {
+        assert_eq!(
+            preview_verdict(Some((30_000, 30_000))),
+            PreviewVerdict::TooLarge {
+                width: 30_000,
+                height: 30_000
+            }
+        );
+    }
+
+    /// **The multiply must not wrap.** `u32 * u32` overflows a little past four
+    /// gigapixels, so a header declaring 65536 × 65536 would come out as zero
+    /// in 32 bits and pass a cap it exceeds enormously — in release, silently.
+    #[test]
+    fn dimensions_that_overflow_u32_still_exceed_the_cap() {
+        let (w, h) = (65_536u32, 65_536u32);
+        assert_eq!(w.wrapping_mul(h), 0, "the premise: this wraps in 32 bits");
+        assert_eq!(
+            preview_verdict(Some((w, h))),
+            PreviewVerdict::TooLarge {
+                width: w,
+                height: h
+            }
+        );
+        assert_eq!(
+            preview_verdict(Some((u32::MAX, u32::MAX))),
+            PreviewVerdict::TooLarge {
+                width: u32::MAX,
+                height: u32::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn unreadable_dimensions_are_not_treated_as_permission() {
+        assert_eq!(preview_verdict(None), PreviewVerdict::Unmeasurable);
+        // A zero dimension draws nothing; it is a header this cannot use.
+        assert_eq!(
+            preview_verdict(Some((0, 100))),
+            PreviewVerdict::Unmeasurable
+        );
+        assert_eq!(
+            preview_verdict(Some((100, 0))),
+            PreviewVerdict::Unmeasurable
+        );
     }
 
     // ---- hex dump ----------------------------------------------------------

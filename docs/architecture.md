@@ -6918,8 +6918,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     title naming the second — and **which pane opens is decided in `loaded`, not in the view**,
     since a view that picked it would re-pick it on every rebuild and drag the user back off the
     pane they switched to. The hex dump is virtualized on the results grid's own
-    `VirtualVector<usize>` shape (a capped fetch is still four million lines) while the preview is
-    not and needs no trick, an image that decodes at all being already in memory; the panel's width
+    `VirtualVector<usize>` shape (a capped fetch is still four million lines); the panel's width
     is the wider of a comfortable modal and what a `hex_line` actually measures, because a dump that
     wraps stops being a dump. The header names the kind and the whole value's size through
     `format::human_bytes`, and adds *showing the first 64.0 MB* when the fetch was capped — the
@@ -6929,7 +6928,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     views of one value is what the app's `<select>` is for, and going through `in_ring_picker`
     inherits the edge-flipping, the arrow keys, the Enter/Escape peel and the tint-not-fill
     vocabulary rather than approximating them. It exists only for bytes that are an image — a
-    dropdown offering one option is a control that cannot do anything.
+    dropdown offering one option is a control that cannot do anything. **Both panes are built once
+    and switched by style**, not rebuilt per switch: `img()` decodes at construction, so a rebuild
+    each way would decode the whole image again for a view whose bytes have not moved, and taffy
+    filters `Display::None` out before layout so the hidden one costs nothing to keep — which is
+    also why `pane` is not a term in the panel's rebuild key.
+    **Nothing reaches `img()` unmeasured.** The renderer decodes to RGBA, so a preview costs
+    width x height x 4 — driven by what the *header claims*, not by what the blob weighs, and
+    `FETCH_CAP` bounds neither term. These bytes came out of a database, so that claim is untrusted
+    input on the way to an allocation: a 70-byte PNG can declare 65535 x 65535 and ask for 17 GB.
+    `blob_view::image_dims` reads the header and stops (`ImageReader::into_dimensions`, never a
+    decode) and `core::blob::preview_verdict` rules on it against `PREVIEW_PIXEL_CAP`, 32 megapixels
+    — ~128 MB of RGBA, above any image a cell realistically holds. Both of its refusals *say so*
+    rather than leaving an empty box, and `Unmeasurable` is one of them: `sniff` matches magic bytes
+    and stops, so a truncated PNG still reads as a PNG, and floem would decode nothing and draw
+    nothing under a caption naming the format. The measurement is the UI's because it needs a
+    decoder; the decision is core's, pure and tested, and the composition is pinned by a fixture
+    that rewrites a real PNG's IHDR rather than encoding one at size — encoding it would be the
+    very allocation the gate exists to prevent.
     The modal owns the save dialog and nothing more — `BlobSaveFn` does the write on a blocking
     worker (a 64 MiB `fs::write` on the UI thread is a frozen window, the ERD export's reason), and
     the `BlobRef` that addresses the row stays in the app with the connection it has to be asked
@@ -8844,9 +8860,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   BMP) are enabled as `image-gif`/`image-bmp` on the floem dependency in the root `Cargo.toml`,
   with `the_renderable_kinds_are_exactly_the_ones_floem_is_built_to_decode` pinning the half a test
   can reach. And it paints into whatever box layout hands it regardless of fit, which is why that
-  panel shows an image at natural size in a scroll: fitting it would mean knowing the dimensions,
-  i.e. decoding the bytes a second time or hand-parsing five container headers to get an answer
-  that is wrong for the sixth.
+  panel shows an image at natural size in a scroll: fitting it would mean scaling by hand from the
+  dimensions. **It also decodes eagerly, at construction, to RGBA** — so what an `img()` costs is
+  the header's declared width x height x 4, and a small blob can be an enormous allocation. That is
+  why the binary-cell panel measures before it builds one (`blob::preview_verdict`), and why the
+  view is built once and hidden rather than rebuilt per pane switch.
 - **A view must not subscribe to a signal that changes as part of unmounting it** — the change and
   the teardown land in the same update pass, and whichever order they run in, a nested
   `dyn_container` inside the doomed view rebuilds a child whose style/effect closures then read
