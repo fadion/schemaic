@@ -1349,6 +1349,23 @@ pub(crate) fn fact_row(label: String, value: String, label_w: fn() -> f64) -> An
     .into_any()
 }
 
+/// The style a **container** wants when the thing inside it may render nothing:
+/// full width when it has something, `display:none` when it has not.
+///
+/// **Hiding the child is only half of it**, and this exists because that half
+/// keeps getting written on its own. A `dyn_container` whose arm returns
+/// `empty().hide()` still *is* a flex child of the column around it, so it goes
+/// on claiming that column's `gap` for a box with nothing in it — which is how
+/// the connection form came to show 20px of nothing above **SSL / TLS** with the
+/// tunnel off, twice, in two different containers, each fixed at the child and
+/// neither at the box. Same rule [`nothing`] states for the child — taffy
+/// excludes a `display:none` item from gap accounting and counts a zero-sized
+/// one — applied to the container that holds it, which is the half `nothing`
+/// cannot reach from the inside.
+pub(crate) fn collapse_unless(s: floem::style::Style, shown: bool) -> floem::style::Style {
+    if shown { s.width_full() } else { s.hide() }
+}
+
 /// An icon-led sentence — a caveat, a warning, a state, or an engine's
 /// limitation.
 ///
