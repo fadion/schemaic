@@ -1942,14 +1942,24 @@ pub(crate) fn modal_footer(actions: impl IntoView + 'static) -> impl IntoView {
 /// [`modal_footer`] with something pinned to the *left* as well — a status the
 /// footer's buttons act on (the designer's change count), which belongs at the
 /// far edge rather than crowded against them.
+///
+/// **The status shrinks and the buttons do not.** A flex item's `min-width` is
+/// `auto`, so a long sentence refuses to compress and pushes whatever follows it
+/// out of the panel — which is how the binary panel's "Loaded …" line shipped
+/// its three buttons off the right-hand edge, and what a long enough
+/// "Saved to …" path would have done to the same footer on any day. Every modal
+/// shares this row, so the fix belongs here rather than in one sentence: the
+/// status may shrink to nothing, the actions never shrink at all, and a caller
+/// whose sentence can run long adds `text_ellipsis` to end it in a `…` rather
+/// than in a clipped word.
 pub(crate) fn modal_footer_split(
     status: impl IntoView + 'static,
     actions: impl IntoView + 'static,
 ) -> impl IntoView {
     h_stack((
-        status,
-        empty().style(|s| s.flex_grow(1.0_f32).min_width(10.0)),
-        actions,
+        container(status).style(|s| s.min_width(0.0).flex_shrink(1.0_f32)),
+        empty().style(|s| s.flex_grow(1.0_f32).min_width(10.0).flex_shrink(1.0_f32)),
+        container(actions).style(|s| s.flex_shrink(0.0_f32)),
     ))
     .style(|s| {
         s.width_full()
