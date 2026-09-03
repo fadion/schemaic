@@ -353,9 +353,12 @@ pub async fn a_write_built_from_the_resolved_key_lands_on_that_row(target: &'sta
             .iter()
             .position(|c| c.name == "payload")
             .expect("the payload column");
-        let dirty: edit::DirtyCells = [((0usize, payload), Some("after".to_string()))]
-            .into_iter()
-            .collect();
+        let dirty: edit::DirtyCells = [(
+            (0usize, payload),
+            schemaic_core::model::CellEdit::Text("after".to_string()),
+        )]
+        .into_iter()
+        .collect();
         let edits = edit::build_edits(&model, &rs, &dirty);
         if edits.len() != 1 {
             failures.push(format!("{}: built {} edits", case.name, edits.len()));
@@ -551,8 +554,13 @@ pub async fn a_binary_column_is_read_only_inside_an_editable_row(target: &'stati
 
     let payload = index_of(&rs, "payload", target);
     assert!(
-        !model.editable(payload),
-        "{}: a binary column was offered as editable",
+        !model.text_editable(payload),
+        "{}: a binary column was offered a text edit",
+        target.name
+    );
+    assert!(
+        model.editable(payload) && model.binary(payload),
+        "{}: a binary column takes a bytes write",
         target.name
     );
     let name = index_of(&rs, "name", target);

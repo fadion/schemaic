@@ -51,9 +51,9 @@ use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
-    Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
-    ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, binary_display,
-    one_row_verdict,
+    CellEdit, Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
+    ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep,
+    binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, RoutineInfo, RoutineKind,
@@ -3196,11 +3196,41 @@ fn pg_str_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// A settable cell value (`Some(text)` or explicit SQL `NULL`) as a literal.
-fn pg_opt_lit(v: &Option<String>) -> String {
+/// A settable cell value as a literal — this module's `SET`/`VALUES` payload.
+///
+/// **`decode('…', 'hex')`, not `'\x…'::bytea`.** The `\x` form needs its
+/// backslash to survive the *string* literal and reach `bytea`'s input function
+/// as that type's hex marker — true only while `standard_conforming_strings` is
+/// on. That is the same dependency [`roles`] refuses to take, and it is settable
+/// per database and per role.
+///
+/// With it off the string literal claims the backslash first, as its own hex
+/// escape: `'\x41424344'` becomes the seven characters `A424344` (`\x41` → `A`,
+/// the rest left alone), `bytea` reads *those* in its escape format, and the
+/// column takes seven bytes of ASCII where four bytes of value belonged — no
+/// error, no warning the app would see. Measured, not reasoned: with
+/// `standard_conforming_strings = off`, `encode('\x41424344'::bytea, 'hex')`
+/// answers `41343234333434`. It is not even reliably silent — a payload whose
+/// escaped form is not valid UTF-8 fails the *statement* instead, which is how
+/// most real blobs would present.
+///
+/// `decode` has no escaping to depend on: its argument is hex digits and nothing
+/// else, so there is nothing in it to escape and nothing in it to quote. The
+/// live tier's `staged_bytes_reach_the_column_as_bytes` proves the bytes arrive
+/// but **does not** pin this choice — a server with the default setting takes
+/// both forms, which is precisely why the argument is written down here.
+fn pg_cell_lit(v: &CellEdit) -> String {
     match v {
-        Some(s) => pg_str_lit(s),
-        None => "NULL".to_string(),
+        CellEdit::Text(s) => pg_str_lit(s),
+        CellEdit::Bytes(b) => {
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(b.len() * 2);
+            for byte in b.iter() {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            format!("decode('{hex}', 'hex')")
+        }
+        CellEdit::Null => "NULL".to_string(),
     }
 }
 
@@ -3233,7 +3263,7 @@ fn build_update(edit: &RowEdit) -> String {
     let set_sql = edit
         .set
         .iter()
-        .map(|(c, v)| format!("{} = {}", pg_ident(c), pg_opt_lit(v)))
+        .map(|(c, v)| format!("{} = {}", pg_ident(c), pg_cell_lit(v)))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -3260,7 +3290,7 @@ fn build_insert(ins: &RowInsert) -> String {
     let vals = ins
         .cols
         .iter()
-        .map(|(_, v)| pg_opt_lit(v))
+        .map(|(_, v)| pg_cell_lit(v))
         .collect::<Vec<_>>()
         .join(", ");
     format!("INSERT INTO {name} ({cols}) VALUES ({vals})")
@@ -4388,8 +4418,8 @@ mod tests {
             schema: None,
             table: "city".into(),
             set: vec![
-                ("name".into(), Some("Kabul".into())),
-                ("district".into(), None), // set to NULL
+                ("name".into(), CellEdit::Text("Kabul".into())),
+                ("district".into(), CellEdit::Null), // set to NULL
             ],
             key: vec![("id".into(), Value::Int(1))],
         };
@@ -4400,13 +4430,61 @@ mod tests {
         );
     }
 
+    /// **The bytea literal, and the form it deliberately is not.**
+    /// `standard_conforming_strings` is settable per database and per role, and
+    /// this module already refuses to depend on it once (`roles`). `decode` is
+    /// the form that has nothing to escape: hex digits only, so there is no
+    /// backslash to be eaten and no quote to double.
+    #[test]
+    fn build_update_emits_a_bytea_literal_with_nothing_to_escape() {
+        let png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let edit = RowEdit {
+            database: "d".into(),
+            schema: None,
+            table: "docs".into(),
+            set: vec![
+                ("title".into(), CellEdit::Text("x".into())),
+                ("payload".into(), CellEdit::bytes(png)),
+            ],
+            key: vec![("id".into(), Value::Int(1))],
+        };
+        let sql = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE \"docs\" SET \"title\" = 'x', \"payload\" = decode('89504e470d0a1a0a', 'hex') \
+             WHERE \"id\" IS NOT DISTINCT FROM 1"
+        );
+        // The whole point of the form: no backslash to survive a literal.
+        assert!(!sql.contains('\\'), "no escape for the server to interpret");
+    }
+
+    /// Hex is lower-case and **two digits per byte, always** — a `0x0A` written
+    /// as one digit shifts every byte after it and `decode` rejects an odd-length
+    /// string, so the failure would be a runtime error on some blobs only.
+    #[test]
+    fn bytea_hex_is_zero_padded_two_digits_per_byte() {
+        let lit = pg_cell_lit(&CellEdit::bytes(vec![0x00, 0x01, 0x0F, 0xA0, 0xFF]));
+        assert_eq!(lit, "decode('00010fa0ff', 'hex')");
+        // An empty file is an empty bytea, not NULL — `decode('', 'hex')` is a
+        // zero-length bytea, which is the value the user loaded.
+        assert_eq!(
+            pg_cell_lit(&CellEdit::bytes(Vec::new())),
+            "decode('', 'hex')"
+        );
+        assert_eq!(pg_cell_lit(&CellEdit::Null), "NULL");
+        assert_eq!(pg_cell_lit(&CellEdit::Text("O'B".into())), "'O''B'");
+    }
+
     #[test]
     fn build_insert_shapes_including_default_values() {
         let ins = RowInsert {
             database: "world".into(),
             schema: None,
             table: "country".into(),
-            cols: vec![("code".into(), Some("AAA".into())), ("name".into(), None)],
+            cols: vec![
+                ("code".into(), CellEdit::Text("AAA".into())),
+                ("name".into(), CellEdit::Null),
+            ],
         };
         assert_eq!(
             build_insert(&ins),
@@ -4466,7 +4544,7 @@ mod tests {
             database: "warehouse".into(),
             schema: Some("sales".into()),
             table: "orders".into(),
-            set: vec![("total".into(), Some("9".into()))],
+            set: vec![("total".into(), CellEdit::Text("9".into()))],
             key: vec![("id".into(), Value::Int(1))],
         };
         assert_eq!(
@@ -4479,7 +4557,7 @@ mod tests {
             database: "warehouse".into(),
             schema: Some("sales".into()),
             table: "orders".into(),
-            cols: vec![("total".into(), Some("9".into()))],
+            cols: vec![("total".into(), CellEdit::Text("9".into()))],
         };
         assert_eq!(
             build_insert(&ins),

@@ -15,7 +15,7 @@
 //! (a wrong key misdirects an UPDATE), so it lives here with tests rather than
 //! welded to Floem signals in the UI.
 
-use crate::model::{RefetchTemplate, ResultSet, RowEdit, Value};
+use crate::model::{CellEdit, Column, RefetchTemplate, ResultSet, RowEdit, Value};
 use crate::schema::TableInfo;
 use std::collections::HashMap;
 
@@ -52,18 +52,60 @@ pub struct EditTable {
 
 /// Which result columns are editable, and to which base table each writes.
 /// `col_table[ci]` is the index into `tables` for column `ci`, or `None` if the
-/// column is read-only (an expression/aggregate, a binary column, or one whose
+/// column is read-only (an expression/aggregate, an implicit key, or one whose
 /// table has no reconstructible row key).
+///
+/// `col_binary[ci]` says whether that column holds raw bytes. It is recorded
+/// rather than re-derived because "editable" and "editable *as text*" are two
+/// different questions once a blob can be written, and only one caller in the
+/// grid is asking the first — see [`EditModel::text_editable`].
 #[derive(Default, Debug)]
 pub struct EditModel {
     col_table: Vec<Option<usize>>,
+    col_binary: Vec<bool>,
+    col_cap: Vec<Option<u64>>,
     tables: Vec<EditTable>,
 }
 
 impl EditModel {
-    /// Can result column `ci` be edited?
+    /// Can result column `ci` be written at all — by typing, by pasting, or by
+    /// loading a file into it through the blob panel?
     pub fn editable(&self, ci: usize) -> bool {
         self.col_table.get(ci).copied().flatten().is_some()
+    }
+
+    /// Does result column `ci` hold raw bytes?
+    pub fn binary(&self, ci: usize) -> bool {
+        self.col_binary.get(ci).copied().unwrap_or(false)
+    }
+
+    /// The most bytes result column `ci` can hold, from its **declared** type —
+    /// [`crate::blob::column_byte_cap`], filled in while the schema is in hand.
+    ///
+    /// `None` is "no answer", not "no limit": an unbounded type, an unloaded
+    /// schema, and a column with no provenance all give it, and after it the
+    /// server is the authority it always was. Only binary columns are asked, so
+    /// only they get one.
+    pub fn byte_cap(&self, ci: usize) -> Option<u64> {
+        self.col_cap.get(ci).copied().flatten()
+    }
+
+    /// Can result column `ci` be written **as text** — typed into, pasted over,
+    /// filled by the AI, cleared with Delete?
+    ///
+    /// This is the narrow gate that replaced C2's blanket refusal of a binary
+    /// column. A blob cell shows [`crate::model::binary_display`]'s `<n bytes>`
+    /// placeholder rather than its value, so every text path is a path that
+    /// would write that placeholder into the column: paste round-trips the
+    /// grid's own text, the inline editor opens on it, Ctrl+C copies it. Bytes
+    /// reach the column one way only, through the blob panel's *Load from file*,
+    /// and that is the one caller that asks [`EditModel::editable`] instead.
+    ///
+    /// Deliberately `editable && !binary` rather than a second `col_*` vector:
+    /// there is one decision about whether the table can be written at all, and
+    /// two questions asked of it.
+    pub fn text_editable(&self, ci: usize) -> bool {
+        self.editable(ci) && !self.binary(ci)
     }
 
     /// The `tables` index that column `ci` writes to, if editable.
@@ -80,10 +122,12 @@ impl EditModel {
     /// its columns is editable**.
     ///
     /// [`EditModel::table_index`] is the same lookup asked through the
-    /// `col_table` map, and cannot answer for a column C2 excluded — a
-    /// binary column has no entry there even though its table has a perfectly
-    /// good key, which is precisely the case [`crate::blob::blob_source`] is
-    /// about. Matching on the triple rather than on the table name alone is the
+    /// `col_table` map, and cannot answer for a column that map excludes — an
+    /// implicit key has no entry there even though its table has a perfectly
+    /// good key. (A *binary* column used to be the other such case, and is why
+    /// [`crate::blob::blob_source`] asks through here; since C2 was narrowed to
+    /// text it has a `col_table` entry like any other column, and this lookup is
+    /// merely the one that still cannot be wrong.) Matching on the triple rather than on the table name alone is the
     /// same requirement `analyze_edit`'s grouping states: `sales.orders` and
     /// `archive.orders` are different tables, and one must never answer for the
     /// other.
@@ -145,10 +189,17 @@ pub fn refetch_template(rs: &ResultSet, model: &EditModel) -> Option<RefetchTemp
 /// The `WHERE` key identifying data row `di` **after** an edit, for re-fetching
 /// it into the grid.
 ///
-/// `edited` is that row's changed result columns → their new value (`None` = SQL
-/// `NULL`); a key column among them is looked up by the value it was changed
-/// **to**, since that is what the just-committed `UPDATE` left in the table.
-/// Every other key column reads its original value out of `rs`.
+/// `edited` is that row's changed result columns → their new value; a key column
+/// among them is looked up by the value it was changed **to**, since that is
+/// what the just-committed `UPDATE` left in the table. Every other key column
+/// reads its original value out of `rs`.
+///
+/// A [`CellEdit::Bytes`] among them reads its *original* value instead, and the
+/// re-fetch then finds nothing rather than the wrong row. That is the honest
+/// answer and costs nothing: `resolve_key` never lets a binary column be a key,
+/// so the only way one reaches here is a binary column that is not a key — where
+/// this arm is unreachable — and guessing at a byte string's text form is the
+/// one thing this function must not do.
 ///
 /// This is the single builder for both write paths. There used to be two, and
 /// only the staged-batch one handled an edited key column; the row panel's built
@@ -161,21 +212,42 @@ pub fn refetch_key(
     template: &RefetchTemplate,
     rs: &ResultSet,
     di: usize,
-    edited: &HashMap<usize, Option<String>>,
+    edited: &HashMap<usize, CellEdit>,
 ) -> Vec<Value> {
     template
         .key_cols
         .iter()
         .map(|&kci| match edited.get(&kci) {
             // Bound as text, exactly as the `UPDATE`'s own SET value was.
-            Some(Some(text)) => Value::Str(text.clone()),
-            Some(None) => Value::Null,
-            None => rs
+            Some(CellEdit::Text(text)) => Value::Str(text.clone()),
+            Some(CellEdit::Null) => Value::Null,
+            Some(CellEdit::Bytes(_)) | None => rs
                 .cell(di, kci)
                 .map(|c| c.to_value())
                 .unwrap_or(Value::Null),
         })
         .collect()
+}
+
+/// Does result column `ci` hold raw bytes — **both** signals, which is one more
+/// than the type name alone can answer with.
+///
+/// [`Column::is_binary`] is the wire flag or the type name, and on SQLite
+/// neither can be trusted to say yes: that engine types *values*, so a blob in
+/// a column declared `TEXT` is legal and the declaration says the wrong thing
+/// outright. [`ResultSet::binary_columns`] is the backend's own assertion that
+/// it saw `ValueRef::Blob` there, and is the second signal the export has always
+/// asked. Editing asked only the first, and that mattered less while C2 refused
+/// every binary column outright; with the refusal narrowed to *text*, this
+/// predicate is the whole of what keeps a `<n bytes>` placeholder from being
+/// typed back over the bytes it stands for.
+///
+/// One function because C2's two halves must agree on the word: the edit gate
+/// ([`EditModel::text_editable`]) and the key gate ([`resolve_key`]) both ask
+/// it, and a column one of them calls binary and the other does not is either a
+/// lossy `WHERE` or a writable placeholder.
+fn holds_bytes(rs: &ResultSet, ci: usize) -> bool {
+    rs.columns.get(ci).is_some_and(Column::is_binary) || rs.binary_columns.contains(&ci)
 }
 
 /// Compute the [`EditModel`]. `schema_for(database, schema, table)` returns the
@@ -188,6 +260,8 @@ pub fn analyze_edit(
 ) -> EditModel {
     let ncols = rs.columns.len();
     let mut col_table: Vec<Option<usize>> = vec![None; ncols];
+    let col_binary: Vec<bool> = (0..ncols).map(|ci| holds_bytes(rs, ci)).collect();
+    let mut col_cap: Vec<Option<u64>> = vec![None; ncols];
     let mut tables: Vec<EditTable> = Vec::new();
 
     // Distinct (database, schema, table) in first-seen order → its result
@@ -207,7 +281,33 @@ pub fn analyze_edit(
     }
 
     for ((db, schema, table), cis) in &groups {
-        if let Some(key_cols) = resolve_key(&schema_for, db, schema.as_deref(), table, cis, rs) {
+        // **One lookup per table, shared by both readers.** The UI's `schema_for`
+        // scans its database nodes and hands back a *cloned* `TableInfo` —
+        // every column, index, check and foreign key — and this runs in an
+        // effect on each result load and each schema refresh. Asking twice
+        // (once here, once inside `resolve_key`) doubled that clone per group.
+        let info = schema_for(db, schema.as_deref(), table);
+        // The declared type of each binary column of this table, for
+        // `blob::column_byte_cap`. Read from the **schema** rather than from
+        // `rs` because a result column's type name has had its length stripped —
+        // see that function. A table with no loaded schema simply has no caps,
+        // and the server stays the authority it was.
+        if let Some(info) = info.as_ref() {
+            for &ci in cis {
+                if !col_binary[ci] {
+                    continue;
+                }
+                let Some(name) = rs.columns[ci].origin.as_ref().map(|o| o.column.as_str()) else {
+                    continue;
+                };
+                col_cap[ci] = info
+                    .columns
+                    .iter()
+                    .find(|c| c.name == name)
+                    .and_then(|c| crate::blob::column_byte_cap(&c.type_name));
+            }
+        }
+        if let Some(key_cols) = resolve_key(info.as_ref(), cis, rs) {
             let idx = tables.len();
             let confirm_cols = confirm_columns(&key_cols, cis, rs);
             tables.push(EditTable {
@@ -218,14 +318,23 @@ pub fn analyze_edit(
                 confirm_cols,
             });
             for &ci in cis {
-                // C2: binary columns can't round-trip as text → never editable,
-                // even when their table has a usable key. An implicit key is
-                // excluded for a different reason (see `ColumnOrigin`): it is no
-                // column of the table, so there is nothing to write to.
+                // An implicit key is no column of the table (see
+                // `ColumnOrigin::implicit_key`), so there is nothing to write to.
+                //
+                // A **binary** column used to be excluded here too — C2, "binary
+                // columns can't round-trip as text". That was one claim doing
+                // two jobs. It is still exactly true of *text*, and
+                // `EditModel::text_editable` is where it now lives; it was never
+                // true of bytes, and excluding the column here was what made the
+                // whole table unwritable through the blob panel as well. C2
+                // survives unchanged in the other place it is stated —
+                // `resolve_key` still refuses a binary column as a WHERE key,
+                // where the lossiness really is fatal and there is no
+                // byte-shaped way around it.
                 let excluded = rs.columns[ci]
                     .origin
                     .as_ref()
-                    .map(|o| o.binary || o.implicit_key)
+                    .map(|o| o.implicit_key)
                     .unwrap_or(false);
                 if !excluded {
                     col_table[ci] = Some(idx);
@@ -233,7 +342,12 @@ pub fn analyze_edit(
             }
         }
     }
-    EditModel { col_table, tables }
+    EditModel {
+        col_table,
+        col_binary,
+        col_cap,
+        tables,
+    }
 }
 
 /// The `WHERE` identity of data row `di` in `rs` for base table `tbl`: each key
@@ -276,8 +390,8 @@ pub fn origin_column(rs: &ResultSet, ci: usize) -> String {
 }
 
 /// One base table's `UPDATE` for data row `di`: the `SET` list from `sets`
-/// (result-column index → new value, `None` = SQL NULL) and the `WHERE` key from
-/// the row's **original** values.
+/// (result-column index → new [`CellEdit`]) and the `WHERE` key from the row's
+/// **original** values.
 ///
 /// The WHERE key's construction is the part that matters: it is the identity every
 /// write on this path is aimed at, and it had drifted into three copies (a fourth,
@@ -288,7 +402,7 @@ pub fn row_edit_for(
     rs: &ResultSet,
     ti: usize,
     di: usize,
-    mut sets: Vec<(usize, Option<String>)>,
+    mut sets: Vec<(usize, CellEdit)>,
 ) -> Option<RowEdit> {
     let tbl = model.table(ti)?;
     sets.sort_by_key(|(ci, _)| *ci); // stable SET-clause order
@@ -305,14 +419,14 @@ pub fn row_edit_for(
     })
 }
 
-/// The grid's staged cell edits: `(data row, result column) → new value`, where
-/// `None` is SQL NULL. The shape `GridState::dirty` holds.
-pub type DirtyCells = std::collections::HashMap<(usize, usize), Option<String>>;
+/// The grid's staged cell edits: `(data row, result column) → new value`. The
+/// shape `GridState::dirty` holds.
+pub type DirtyCells = std::collections::HashMap<(usize, usize), CellEdit>;
 
 /// [`build_edits`]' working grouping: `(base-table index, data row) →
 /// [(result column, new value)]`. A `BTreeMap` so the `UPDATE` order is
 /// deterministic.
-type EditGroups = std::collections::BTreeMap<(usize, usize), Vec<(usize, Option<String>)>>;
+type EditGroups = std::collections::BTreeMap<(usize, usize), Vec<(usize, CellEdit)>>;
 
 /// Turn a staged `dirty` map into one [`RowEdit`] per (base table, data row).
 ///
@@ -378,14 +492,10 @@ fn confirm_columns(key_cols: &[usize], cis: &[usize], rs: &ResultSet) -> Vec<usi
 
 /// Find the result-column indices forming a usable row key for one base table,
 /// or `None` if the table's rows can't be identified safely (read-only).
-fn resolve_key(
-    schema_for: &impl Fn(&str, Option<&str>, &str) -> Option<TableInfo>,
-    db: &str,
-    schema: Option<&str>,
-    table: &str,
-    cis: &[usize],
-    rs: &ResultSet,
-) -> Option<Vec<usize>> {
+/// `info` is this table's loaded schema, or `None` when it has none — resolved
+/// once by the caller, since [`analyze_edit`] needs the same lookup for the
+/// column caps and the UI's copy of it is an expensive clone.
+fn resolve_key(info: Option<&TableInfo>, cis: &[usize], rs: &ResultSet) -> Option<Vec<usize>> {
     // C1: if the same base column is exposed more than once for this table (a
     // self-join collapsing two aliases, or `id, id AS id2`), an edit can't be
     // attributed to one row — refuse the whole table.
@@ -408,7 +518,7 @@ fn resolve_key(
     let all_present =
         |names: &[String]| -> Option<Vec<usize>> { names.iter().map(|n| col_ci(n)).collect() };
 
-    let candidate: Option<Vec<usize>> = if let Some(t) = schema_for(db, schema, table) {
+    let candidate: Option<Vec<usize>> = if let Some(t) = info {
         // Primary key, if it's fully present in the result.
         let pk: Vec<String> = t
             .columns
@@ -481,13 +591,10 @@ fn resolve_key(
     let key = candidate?;
     // C2/C4: a binary or floating-point key column can't be matched reliably in
     // a WHERE (lossy bytes / FLOAT↔DOUBLE precision), so the table is read-only.
+    // `holds_bytes`, not the wire flag alone — the same question the edit gate
+    // asks, for the reason stated there.
     for &kci in &key {
-        if rs.columns[kci]
-            .origin
-            .as_ref()
-            .map(|o| o.binary)
-            .unwrap_or(false)
-        {
+        if holds_bytes(rs, kci) {
             return None;
         }
         let ty = rs.columns[kci].type_name.to_ascii_uppercase();
@@ -659,9 +766,9 @@ pub struct GridCells<'a> {
     /// The saved formatter per result column, as the painter reads it.
     pub formats: &'a [crate::format::ColumnFormat],
     /// Staged edits, keyed by (**data** row, column).
-    pub dirty: &'a HashMap<(usize, usize), Option<String>>,
+    pub dirty: &'a HashMap<(usize, usize), CellEdit>,
     /// Pending new rows, in the display order they are drawn past the real ones.
-    pub new_rows: &'a [HashMap<usize, Option<String>>],
+    pub new_rows: &'a [HashMap<usize, CellEdit>],
 }
 
 impl GridCells<'_> {
@@ -695,15 +802,13 @@ impl GridCells<'_> {
         // it will hold is a server default the cell previews as `<auto>`.
         if i >= nreal {
             return match self.new_rows.get(i - nreal).and_then(|r| r.get(&ci)) {
-                Some(Some(t)) => t.clone(),
-                Some(None) => STAGED_NULL.to_string(),
+                Some(v) => v.display(),
                 None => String::new(),
             };
         }
         let di = self.order.get(i).copied().unwrap_or(i);
         match self.dirty.get(&(di, ci)) {
-            Some(Some(t)) => t.clone(),
-            Some(None) => STAGED_NULL.to_string(),
+            Some(v) => v.display(),
             None => {
                 let fmt = match formatted {
                     true => self.formats.get(ci).copied().unwrap_or_default(),
@@ -1136,15 +1241,21 @@ pub enum BlankCell {
     IsAValue,
 }
 
-/// The entry a staged value produces in a pending row: `None` means *remove the
-/// column* (so the `INSERT` omits it), `Some(v)` means store `v`.
+/// The entry a staged **text** value produces in a pending row: `None` means
+/// *remove the column* (so the `INSERT` omits it), `Some(v)` means store `v`.
 ///
-/// Only a blank is ambiguous — see [`BlankCell`]. SQL NULL (`None`) is an explicit
-/// value on either reading and is always stored.
-pub fn pending_cell(val: Option<String>, blank: BlankCell) -> Option<Option<String>> {
+/// Only a blank is ambiguous — see [`BlankCell`]. SQL NULL is an explicit value
+/// on either reading and is always stored.
+///
+/// Text-shaped on purpose: only typing and pasting reach here, and neither
+/// produces bytes. A file loaded into a pending row's cell goes in directly
+/// (`GridState::stage_new_bytes`) because it has no blank to be ambiguous
+/// about — an empty file is `<0 bytes>`, a value, and "unset" is the cell
+/// nobody has touched.
+pub fn pending_cell(val: Option<String>, blank: BlankCell) -> Option<CellEdit> {
     match &val {
         Some(s) if s.is_empty() && blank == BlankCell::UnsetsIt => None,
-        _ => Some(val),
+        _ => Some(CellEdit::from_opt(val)),
     }
 }
 
@@ -1350,12 +1461,12 @@ mod tests {
         // range's own headline path (a copied NULL reads back as `None` through
         // `pasted_value`); every earlier fixture built each cell as `Some(..)`,
         // so nothing carried a `None` from a paste all the way to a statement.
-        let mut dirty: HashMap<(usize, usize), Option<String>> = HashMap::new();
+        let mut dirty: DirtyCells = HashMap::new();
         for di in 0..3 {
             for ci in 1..5 {
                 let val = match ci == 3 {
-                    true => None,
-                    false => Some(format!("r{di}c{ci}")),
+                    true => CellEdit::Null,
+                    false => CellEdit::Text(format!("r{di}c{ci}")),
                 };
                 dirty.insert((di, ci), val);
             }
@@ -1375,17 +1486,17 @@ mod tests {
                 e.set.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
                 (1..5)
                     .map(|ci| match ci == 3 {
-                        true => None,
-                        false => Some(format!("r{di}c{ci}")),
+                        true => CellEdit::Null,
+                        false => CellEdit::Text(format!("r{di}c{ci}")),
                     })
                     .collect::<Vec<_>>()
             );
             // Named rather than left to the vector above: a pasted NULL has to
-            // reach the statement as `None`, which is what the engines render
-            // as SQL `NULL` rather than the four-character string.
+            // reach the statement as `CellEdit::Null`, which is what the engines
+            // render as SQL `NULL` rather than the four-character string.
             assert_eq!(
                 e.set.iter().find(|(c, _)| c == "c").map(|(_, v)| v.clone()),
-                Some(None),
+                Some(CellEdit::Null),
                 "the pasted NULL column arrived as a value, not as SQL NULL"
             );
             // And the WHERE key is the row's own identity, from its original
@@ -1443,8 +1554,8 @@ mod tests {
         let model = analyze_edit(&r, schema);
         assert!(!model.editable(1), "an expression column is not editable");
 
-        let mut dirty: HashMap<(usize, usize), Option<String>> = HashMap::new();
-        dirty.insert((0, 1), Some("7".into()));
+        let mut dirty: DirtyCells = HashMap::new();
+        dirty.insert((0, 1), CellEdit::Text("7".into()));
         assert!(build_edits(&model, &r, &dirty).is_empty());
 
         // Nothing staged at all is nothing to write.
@@ -1717,9 +1828,15 @@ mod tests {
         }
     }
 
+    /// **C2, both halves, and the seam between them.** The rule used to be one
+    /// sentence — "a binary column can't round-trip as text" — enforced in two
+    /// places, and narrowing it to text meant only one of them moved. The pin is
+    /// that the *key* half did not: a `BLOB` column is writable now, and a
+    /// `VARBINARY` primary key still takes the whole table read-only, because a
+    /// lossy `WHERE` has no byte-shaped escape the way a `SET` does.
     #[test]
-    fn c2_binary_column_not_editable_binary_key_readonly() {
-        // A binary (BLOB) non-key column: read-only, but the INT PK stays editable.
+    fn c2_binary_column_writable_as_bytes_never_as_text_or_a_key() {
+        // A binary (BLOB) non-key column: writable, but only as bytes.
         let r = rs(vec![
             col("id", "INT", "docs", true, false),
             col("blob", "BLOB", "docs", false, true),
@@ -1730,7 +1847,20 @@ mod tests {
         };
         let m = analyze_edit(&r, schema);
         assert!(m.editable(0), "INT PK editable");
-        assert!(!m.editable(1), "BLOB column read-only");
+        assert!(m.text_editable(0), "and editable by typing");
+        assert!(!m.binary(0));
+
+        assert!(m.editable(1), "the BLOB column takes a write now");
+        assert!(m.binary(1));
+        assert!(
+            !m.text_editable(1),
+            "but never a text one — that would write the `<n bytes>` placeholder"
+        );
+        assert_eq!(
+            m.table_index(1),
+            Some(0),
+            "and it maps to its base table, so a write knows where to land"
+        );
 
         // A binary PK makes the whole table read-only (can't build a safe WHERE).
         let r2 = rs(vec![
@@ -1743,6 +1873,303 @@ mod tests {
         let m2 = analyze_edit(&r2, schema2);
         assert!(!m2.editable(0));
         assert!(!m2.editable(1));
+        assert!(!m2.text_editable(0) && !m2.text_editable(1));
+    }
+
+    /// The type name is the second signal, and on two of the three engines it is
+    /// the only one — a SQLite `BLOB` column arrives with no wire `binary` flag
+    /// at all. `EditModel::binary` has to agree with `Column::is_binary` or the
+    /// text gate opens on a column whose cells are placeholders.
+    #[test]
+    fn binary_is_read_from_the_type_name_when_the_wire_does_not_say() {
+        let mut blob = col("payload", "BLOB", "docs", false, false); // wire flag OFF
+        blob.type_name = "BLOB".into();
+        let r = rs(vec![col("id", "INT", "docs", true, false), blob]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "docs")
+                .then(|| schema_with_pk("docs", &["id"], &[("id", "int"), ("payload", "blob")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(m.binary(1), "the type name says BLOB");
+        assert!(m.editable(1) && !m.text_editable(1));
+    }
+
+    /// **The hole the C2 split turned from harmless into a write.**
+    ///
+    /// SQLite types *values*, not columns: a blob in a column declared `TEXT` is
+    /// legal, and `Column::is_binary` answers `false` for it — which is why
+    /// `ResultSet::binary_columns` exists, and why the export already asks both.
+    /// The editing system asked only the first. That was survivable while C2
+    /// refused every binary column outright *and* this column looked like text
+    /// (it was editable, and pasting its `<n bytes>` placeholder over it was a
+    /// hazard nobody had hit); now that the text gate is the only thing standing
+    /// between a placeholder and the column, asking one signal where the engine
+    /// gives two is the whole of the guard.
+    #[test]
+    fn a_column_the_backend_saw_bytes_in_is_binary_whatever_it_was_declared() {
+        // Declared TEXT, no wire binary flag — exactly what SQLite reports for a
+        // blob stored in a text-affinity column.
+        let mut rs = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "t", true, false),
+                col("payload", "TEXT", "t", false, false),
+            ],
+            vec![vec![Value::Int(1), Value::Str("<9 bytes>".into())]],
+        );
+        // The backend's own assertion, the one signal that can answer here.
+        rs.binary_columns = vec![1];
+
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int"), ("payload", "text")]))
+        };
+        let m = analyze_edit(&rs, schema);
+        assert!(m.binary(1), "the backend saw bytes in it");
+        assert!(
+            !m.text_editable(1),
+            "so the `<n bytes>` placeholder must not be typeable back over it"
+        );
+        assert!(
+            m.editable(1),
+            "and the blob panel can still replace the value"
+        );
+    }
+
+    /// The **key** half of C2 asks the same widened question. A blob key column
+    /// takes the whole table read-only, and "blob" has to mean the same thing in
+    /// both halves or a column the edit gate calls binary is one the key gate
+    /// happily builds a lossy `WHERE` out of.
+    #[test]
+    fn a_key_column_the_backend_saw_bytes_in_takes_the_table_read_only() {
+        let mut rs = ResultSet::from_rows(
+            vec![
+                col("id", "TEXT", "t", true, false), // declared TEXT, is the PK
+                col("v", "INT", "t", false, false),
+            ],
+            vec![vec![Value::Str("<4 bytes>".into()), Value::Int(1)]],
+        );
+        rs.binary_columns = vec![0];
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "text"), ("v", "int")]))
+        };
+        let m = analyze_edit(&rs, schema);
+        assert!(!m.editable(0) && !m.editable(1), "no safe WHERE, no writes");
+    }
+
+    /// A column out of range answers the safe way round: not binary (so nothing
+    /// mis-reports a blob), and not editable either (so `text_editable`'s `&&`
+    /// still refuses it).
+    #[test]
+    fn a_column_past_the_end_is_neither_binary_nor_editable() {
+        let r = rs(vec![col("id", "INT", "t", true, false)]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(!m.binary(99));
+        assert!(!m.editable(99));
+        assert!(!m.text_editable(99));
+    }
+
+    /// **The composition the write half turns on**, and the one the type change
+    /// alone does not buy: bytes staged on a binary cell have to survive
+    /// `build_edits`' grouping and `row_edit_for`'s sort and arrive in the
+    /// statement's `SET` list *as bytes*, next to the text edits of the same row
+    /// rather than instead of them. One `UPDATE`, two columns, two shapes.
+    #[test]
+    fn bytes_and_text_staged_on_one_row_reach_one_update_each_in_its_own_shape() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "docs", true, false),
+                col("title", "VARCHAR", "docs", false, false),
+                col("payload", "BLOB", "docs", false, true),
+            ],
+            vec![vec![
+                Value::Int(1),
+                Value::Str("old".into()),
+                Value::Str("<9 bytes>".into()),
+            ]],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "docs").then(|| {
+                schema_with_pk(
+                    "docs",
+                    &["id"],
+                    &[("id", "int"), ("title", "varchar"), ("payload", "blob")],
+                )
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        let dirty: DirtyCells = [
+            ((0, 1), CellEdit::Text("readme".into())),
+            ((0, 2), CellEdit::bytes(vec![0x89, b'P', b'N', b'G'])),
+        ]
+        .into_iter()
+        .collect();
+
+        let edits = build_edits(&m, &r, &dirty);
+        assert_eq!(edits.len(), 1, "one row, one UPDATE");
+        assert_eq!(
+            edits[0].set,
+            vec![
+                ("title".to_string(), CellEdit::Text("readme".into())),
+                (
+                    "payload".to_string(),
+                    CellEdit::bytes(vec![0x89, b'P', b'N', b'G'])
+                ),
+            ],
+            "sorted by result column, and each value in the shape it was staged in"
+        );
+        // The key is unchanged by any of this — it is still the INT PK, never
+        // the binary column.
+        assert_eq!(edits[0].key, vec![("id".to_string(), Value::Int(1))]);
+    }
+
+    /// **The row panel's save, which is a different composition from the grid's.**
+    ///
+    /// The grid folds a whole `DirtyCells` map through `build_edits`; the row
+    /// panel builds one row's changes itself and calls `row_edit_for` directly,
+    /// mixing text it read out of its own fields with bytes the blob panel
+    /// staged. Both shapes have to survive the same sort into one statement —
+    /// and the sort is the part worth pinning, because the panel appends its
+    /// staged bytes *after* the text changes and the `SET` order must still come
+    /// out by column.
+    #[test]
+    fn a_row_panels_text_fields_and_a_staged_blob_sort_into_one_statement() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "staff", true, false),
+                col("picture", "BLOB", "staff", false, true),
+                col("first_name", "VARCHAR", "staff", false, false),
+            ],
+            vec![vec![
+                Value::Int(1),
+                Value::Str("<9 bytes>".into()),
+                Value::Str("Mike".into()),
+            ]],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "staff").then(|| {
+                schema_with_pk(
+                    "staff",
+                    &["id"],
+                    &[
+                        ("id", "int"),
+                        ("picture", "blob"),
+                        ("first_name", "varchar"),
+                    ],
+                )
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        // The order the panel hands them over in: its text fields first, then
+        // the bytes it found staged on the row.
+        let sets = vec![
+            (2usize, CellEdit::Text("Ada".into())),
+            (1usize, CellEdit::bytes(vec![0x89, b'P', b'N', b'G'])),
+        ];
+        let edit = row_edit_for(&m, &r, 0, 0, sets).expect("one writable table");
+        assert_eq!(
+            edit.set,
+            vec![
+                (
+                    "picture".to_string(),
+                    CellEdit::bytes(vec![0x89, b'P', b'N', b'G'])
+                ),
+                ("first_name".to_string(), CellEdit::Text("Ada".into())),
+            ],
+            "sorted by result column regardless of the order the panel appended"
+        );
+        assert_eq!(edit.key, vec![("id".to_string(), Value::Int(1))]);
+    }
+
+    /// A staged blob paints as the same `<n bytes>` placeholder a stored one
+    /// does, on **both** the surfaces `GridCells` answers for.
+    ///
+    /// The clipboard is the half that matters. `pasted_value` resolves the four
+    /// characters `NULL` and nothing else, so if a staged blob copied as its own
+    /// bytes lossily decoded, Ctrl+C then Ctrl+V over the column would stage
+    /// that mojibake as `Text` on a cell whose column cannot hold it — which is
+    /// the whole failure `binary_display` was introduced to stop, reintroduced
+    /// one layer up.
+    #[test]
+    fn a_staged_blob_paints_and_copies_as_the_placeholder() {
+        let rs = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "docs", true, false),
+                col("payload", "BLOB", "docs", false, true),
+            ],
+            vec![vec![Value::Int(1), Value::Str("<4 bytes>".into())]],
+        );
+        let (order, formats) = (vec![0], vec![crate::format::ColumnFormat::None; 2]);
+        let new_rows = Vec::new();
+        // Four bytes, none of them valid UTF-8 on its own.
+        let dirty: DirtyCells = HashMap::from([(
+            (0usize, 1usize),
+            CellEdit::bytes(vec![0x89, 0xFF, 0xFE, 0x00]),
+        )]);
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(g.text(0, 1, true), "<4 bytes>");
+        assert_eq!(g.tsv((0, 0, 0, 1), None), "1	<4 bytes>");
+        // …and an empty file loaded into a cell is `<0 bytes>`, not blank —
+        // blank is what an *unset* pending cell reads as, and the two mean
+        // different things at commit.
+        let dirty: DirtyCells = HashMap::from([((0usize, 1usize), CellEdit::bytes(Vec::new()))]);
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(g.text(0, 1, true), "<0 bytes>");
+    }
+
+    /// The same placeholder rule on a **pending new row**, whose values live in
+    /// `new_rows` rather than in `dirty` and are resolved by their own branch.
+    #[test]
+    fn a_blob_loaded_into_a_pending_row_paints_as_the_placeholder_too() {
+        let rs = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "docs", true, false),
+                col("payload", "BLOB", "docs", false, true),
+            ],
+            vec![vec![Value::Int(1), Value::Str("<4 bytes>".into())]],
+        );
+        let (order, formats) = (vec![0], vec![crate::format::ColumnFormat::None; 2]);
+        let dirty = HashMap::new();
+        let new_rows: Vec<HashMap<usize, CellEdit>> = vec![
+            [(1usize, CellEdit::bytes(vec![1, 2, 3]))]
+                .into_iter()
+                .collect(),
+        ];
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+        assert_eq!(g.text(1, 1, true), "<3 bytes>");
+        assert_eq!(g.text(1, 0, true), "", "and an unset cell is still blank");
+    }
+
+    /// `CellEdit::as_text` answers `None` for bytes, which is what keeps the
+    /// re-fetch key from guessing at a byte string's text form.
+    #[test]
+    fn a_bytes_value_has_no_text_and_is_not_null() {
+        let b = CellEdit::bytes(vec![0xFF]);
+        assert_eq!(b.as_text(), None);
+        assert!(!b.is_null());
+        assert_eq!(b.as_bytes(), Some(&[0xFFu8][..]));
+        assert_eq!(CellEdit::Null.as_bytes(), None);
+        assert_eq!(CellEdit::Text("x".into()).as_bytes(), None);
+        assert_eq!(CellEdit::Text("x".into()).as_text(), Some("x"));
+        assert_eq!(CellEdit::Null.as_text(), None);
+        assert_eq!(CellEdit::from_opt(None), CellEdit::Null);
+        assert_eq!(
+            CellEdit::from_opt(Some("x".into())),
+            CellEdit::Text("x".into())
+        );
+    }
+
+    /// The word a staged NULL paints has two spellings in the tree — `STAGED_NULL`
+    /// here, and [`CellEdit::display`]'s own arm over in `model`. They must be the
+    /// same four characters: the first is what `pasted_value` resolves back to
+    /// NULL, the second is what the grid and the clipboard emit, and a drift
+    /// between them turns "copy a NULL column and paste it straight back" into a
+    /// staged rewrite of every row.
+    #[test]
+    fn a_staged_null_paints_the_literal_paste_resolves() {
+        assert_eq!(CellEdit::Null.display(), STAGED_NULL);
+        assert_eq!(pasted_value(CellEdit::Null.display()), None);
     }
 
     #[test]
@@ -1820,8 +2247,9 @@ mod tests {
     #[test]
     fn an_untouched_key_column_refetches_by_its_original_value() {
         let (r, tpl) = keyed_users_row();
-        let edited: HashMap<usize, Option<String>> =
-            [(1, Some("grace".to_string()))].into_iter().collect();
+        let edited: HashMap<usize, CellEdit> = [(1, CellEdit::Text("grace".to_string()))]
+            .into_iter()
+            .collect();
         assert_eq!(refetch_key(&tpl, &r, 0, &edited), vec![Value::Int(5)]);
     }
 
@@ -1831,8 +2259,8 @@ mod tests {
         // exists, so re-fetching by 5 finds nothing and the grid keeps showing
         // the stale key.
         let (r, tpl) = keyed_users_row();
-        let edited: HashMap<usize, Option<String>> =
-            [(0, Some("6".to_string()))].into_iter().collect();
+        let edited: HashMap<usize, CellEdit> =
+            [(0, CellEdit::Text("6".to_string()))].into_iter().collect();
         assert_eq!(
             refetch_key(&tpl, &r, 0, &edited),
             vec![Value::Str("6".to_string())]
@@ -1842,7 +2270,7 @@ mod tests {
     #[test]
     fn a_key_column_edited_to_null_refetches_by_null() {
         let (r, tpl) = keyed_users_row();
-        let edited: HashMap<usize, Option<String>> = [(0, None)].into_iter().collect();
+        let edited: HashMap<usize, CellEdit> = [(0, CellEdit::Null)].into_iter().collect();
         assert_eq!(refetch_key(&tpl, &r, 0, &edited), vec![Value::Null]);
     }
 
@@ -1869,8 +2297,8 @@ mod tests {
         let tpl = super::refetch_template(&r, &m).expect("spliceable");
         assert_eq!(tpl.key_cols, vec![0, 1]);
         // Only `b` was edited: `a` keeps its original, `b` takes the new value.
-        let edited: HashMap<usize, Option<String>> =
-            [(1, Some("9".to_string()))].into_iter().collect();
+        let edited: HashMap<usize, CellEdit> =
+            [(1, CellEdit::Text("9".to_string()))].into_iter().collect();
         assert_eq!(
             refetch_key(&tpl, &r, 0, &edited),
             vec![Value::Int(1), Value::Str("9".to_string())]
@@ -2167,8 +2595,8 @@ mod tests {
         rs: &'a ResultSet,
         order: &'a [usize],
         formats: &'a [crate::format::ColumnFormat],
-        dirty: &'a HashMap<(usize, usize), Option<String>>,
-        new_rows: &'a [HashMap<usize, Option<String>>],
+        dirty: &'a HashMap<(usize, usize), CellEdit>,
+        new_rows: &'a [HashMap<usize, CellEdit>],
     ) -> GridCells<'a> {
         GridCells {
             rs,
@@ -2286,10 +2714,12 @@ mod tests {
         let (rs, order, formats) = cells_fixture();
         let new_rows = Vec::new();
         // Data row 1 = display row 0.
-        let dirty: HashMap<(usize, usize), Option<String>> =
-            [((1, 0), Some("999".to_string())), ((0, 1), None)]
-                .into_iter()
-                .collect();
+        let dirty: DirtyCells = [
+            ((1, 0), CellEdit::Text("999".to_string())),
+            ((0, 1), CellEdit::Null),
+        ]
+        .into_iter()
+        .collect();
         let g = cells(&rs, &order, &formats, &dirty, &new_rows);
         assert_eq!(g.tsv((0, 0, 1, 1), None), "999\tsecond\n1709294400\tNULL");
         assert_eq!(
@@ -2310,8 +2740,8 @@ mod tests {
     fn a_pending_new_row_reads_only_what_was_typed() {
         let (rs, order, formats) = cells_fixture();
         let dirty = HashMap::new();
-        let new_rows: Vec<HashMap<usize, Option<String>>> = vec![
-            [(0, Some("42".to_string())), (1, None)]
+        let new_rows: Vec<HashMap<usize, CellEdit>> = vec![
+            [(0, CellEdit::Text("42".to_string())), (1, CellEdit::Null)]
                 .into_iter()
                 .collect(),
         ];
@@ -2319,7 +2749,7 @@ mod tests {
         assert_eq!(g.text(2, 0, true), "42");
         assert_eq!(g.text(2, 1, true), "NULL");
         // A row past `new_rows` too, and a column nobody typed into.
-        let empty: Vec<HashMap<usize, Option<String>>> = Vec::new();
+        let empty: Vec<HashMap<usize, CellEdit>> = Vec::new();
         let g = cells(&rs, &order, &formats, &dirty, &empty);
         assert_eq!(g.text(2, 0, true), "");
     }
@@ -2580,7 +3010,7 @@ mod tests {
         let (order, formats) = (vec![0, 1, 2], vec![crate::format::ColumnFormat::None]);
         // Row 2 carries a *staged* NULL over its value — it paints as `NULL` and
         // copies as `NULL`, so it must come back the same way a stored one does.
-        let dirty = HashMap::from([((2, 0), None)]);
+        let dirty: DirtyCells = HashMap::from([((2usize, 0usize), CellEdit::Null)]);
         let new_rows = Vec::new();
         let g = cells(&rs, &order, &formats, &dirty, &new_rows);
         let copied = g.tsv((0, 0, 2, 0), None);
@@ -2904,7 +3334,7 @@ mod tests {
         // A paste: the empty cell is stored, the same as it would be on a real row.
         assert_eq!(
             pending_cell(Some(String::new()), IsAValue),
-            Some(Some(String::new()))
+            Some(CellEdit::Text(String::new()))
         );
         // A typed clear: the column goes back to unset, so the INSERT omits it.
         assert_eq!(pending_cell(Some(String::new()), UnsetsIt), None);
@@ -2912,11 +3342,11 @@ mod tests {
         for blank in [IsAValue, UnsetsIt] {
             assert_eq!(
                 pending_cell(Some("a".to_string()), blank),
-                Some(Some("a".to_string())),
+                Some(CellEdit::Text("a".to_string())),
                 "{blank:?}"
             );
             // ...and SQL NULL, which is explicit on both and is never an undo.
-            assert_eq!(pending_cell(None, blank), Some(None), "{blank:?}");
+            assert_eq!(pending_cell(None, blank), Some(CellEdit::Null), "{blank:?}");
         }
     }
 

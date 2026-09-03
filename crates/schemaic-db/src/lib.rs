@@ -31,9 +31,9 @@ use schemaic_core::blob::{BlobRef, BlobValue, FETCH_CAP};
 use schemaic_core::export;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
-    Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep,
-    binary_display, one_row_verdict,
+    CellEdit, Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow,
+    RefetchTemplate, ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value,
+    WriteStep, binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, EventInfo, EventSchedule, EventSource, EventStatus,
@@ -5286,6 +5286,22 @@ pub(crate) async fn refetch_on(
     Ok(out)
 }
 
+/// One staged cell value as a MySQL bound parameter.
+///
+/// `Text` and `Bytes` both become `MyValue::Bytes` — the wire has one
+/// length-prefixed octet-string and the server coerces it to the column type —
+/// but they arrive there by different routes and only one of them is reversible:
+/// `Text` is the user's characters encoded as UTF-8, `Bytes` is the octets
+/// themselves, unencoded. Collapsing the two at the *call site* is what would
+/// hurt, because `String::into_bytes` on a lossily-decoded blob is not the blob.
+fn cell_param(v: &CellEdit) -> MyValue {
+    match v {
+        CellEdit::Text(t) => MyValue::Bytes(t.clone().into_bytes()),
+        CellEdit::Bytes(b) => MyValue::Bytes(b.to_vec()),
+        CellEdit::Null => MyValue::NULL,
+    }
+}
+
 /// Build a parameterized `UPDATE db.table SET … WHERE …` for one row edit.
 /// Identifiers are backtick-escaped; every value is a bound parameter.
 fn build_update(edit: &RowEdit) -> (String, Params) {
@@ -5294,10 +5310,7 @@ fn build_update(edit: &RowEdit) -> (String, Params) {
         .set
         .iter()
         .map(|(col, val)| {
-            params.push(match val {
-                Some(v) => MyValue::Bytes(v.clone().into_bytes()),
-                None => MyValue::NULL,
-            });
+            params.push(cell_param(val));
             format!("{} = ?", ident(col))
         })
         .collect::<Vec<_>>()
@@ -5323,20 +5336,16 @@ fn build_update(edit: &RowEdit) -> (String, Params) {
 }
 
 /// Build a parameterized `INSERT INTO db.table (cols) VALUES (?, …)` for one new
-/// row. Identifiers are backtick-escaped; every value is a bound parameter
-/// (`Some` → string param coerced by the server, `None` → SQL `NULL`). Columns
-/// not listed take their server default — with none listed, `() VALUES ()`
-/// inserts an all-defaults row.
+/// row. Identifiers are backtick-escaped; every value is a bound parameter — see
+/// [`cell_param`]. Columns not listed take their server default — with none
+/// listed, `() VALUES ()` inserts an all-defaults row.
 fn build_insert(ins: &RowInsert) -> (String, Params) {
     let mut params: Vec<MyValue> = Vec::with_capacity(ins.cols.len());
     let cols_sql = ins
         .cols
         .iter()
         .map(|(col, val)| {
-            params.push(match val {
-                Some(v) => MyValue::Bytes(v.clone().into_bytes()),
-                None => MyValue::NULL,
-            });
+            params.push(cell_param(val));
             ident(col)
         })
         .collect::<Vec<_>>()
@@ -5792,8 +5801,8 @@ mod tests {
             schema: None,
             table: "users".to_string(),
             cols: vec![
-                ("name".to_string(), Some("Ada".to_string())),
-                ("email".to_string(), None), // explicit NULL
+                ("name".to_string(), CellEdit::Text("Ada".to_string())),
+                ("email".to_string(), CellEdit::Null), // explicit NULL
             ],
         };
         let (sql, _) = build_insert(&ins);
@@ -5817,7 +5826,7 @@ mod tests {
             database: "d`b".to_string(),
             schema: None,
             table: "t".to_string(),
-            cols: vec![("a`b".to_string(), Some("x".to_string()))],
+            cols: vec![("a`b".to_string(), CellEdit::Text("x".to_string()))],
         };
         let (sql, _) = build_insert(&weird);
         assert_eq!(sql, "INSERT INTO `d``b`.`t` (`a``b`) VALUES (?)");
@@ -5857,8 +5866,8 @@ mod tests {
             schema: None,
             table: "users".to_string(),
             set: vec![
-                ("name".to_string(), Some("Ada".to_string())),
-                ("nickname".to_string(), None), // set to NULL
+                ("name".to_string(), CellEdit::Text("Ada".to_string())),
+                ("nickname".to_string(), CellEdit::Null), // set to NULL
             ],
             key: vec![("id".to_string(), Value::Int(7))],
         };
@@ -5874,13 +5883,96 @@ mod tests {
         assert!(matches!(p[2], MyValue::Int(7)));
     }
 
+    /// **Bytes bind as bytes, and the two shapes are not the same param.**
+    /// `MyValue::Bytes` is the wire shape both take, which is exactly why this
+    /// is worth pinning: `Text` reaches it through `String::into_bytes` (UTF-8
+    /// encoding the user's characters) and `Bytes` reaches it unencoded, so the
+    /// two agree on every ASCII fixture and diverge on the first byte a blob
+    /// actually contains. The fixture is a PNG header for that reason — `0x89`
+    /// is not valid UTF-8 on its own, so a `Bytes` value that had gone through
+    /// the text arm could not have arrived intact.
+    #[test]
+    fn build_update_binds_bytes_unencoded_next_to_a_text_column() {
+        let png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let edit = RowEdit {
+            database: "sakila".to_string(),
+            schema: None,
+            table: "staff".to_string(),
+            set: vec![
+                ("first_name".to_string(), CellEdit::Text("Ada".to_string())),
+                ("picture".to_string(), CellEdit::bytes(png.clone())),
+                ("last_name".to_string(), CellEdit::Null),
+            ],
+            key: vec![("staff_id".to_string(), Value::Int(1))],
+        };
+        let (sql, params) = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE `sakila`.`staff` SET `first_name` = ?, `picture` = ?, `last_name` = ? \
+             WHERE `staff_id` <=> ?"
+        );
+        let p = positional(&params);
+        assert_eq!(p.len(), 4);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if b == b"Ada"));
+        assert!(
+            matches!(&p[1], MyValue::Bytes(b) if *b == png),
+            "the blob's own octets, not a re-encoding of them"
+        );
+        assert!(matches!(p[2], MyValue::NULL));
+        assert!(matches!(p[3], MyValue::Int(1)));
+    }
+
+    /// The same for an `INSERT` — a new row can carry a file too, and the
+    /// `VALUES` list binds in column order.
+    #[test]
+    fn build_insert_binds_bytes_in_column_order() {
+        let ins = RowInsert {
+            database: "db".to_string(),
+            schema: None,
+            table: "docs".to_string(),
+            cols: vec![
+                (
+                    "payload".to_string(),
+                    CellEdit::bytes(vec![0xFF, 0x00, 0xFE]),
+                ),
+                ("title".to_string(), CellEdit::Text("x".to_string())),
+            ],
+        };
+        let (sql, params) = build_insert(&ins);
+        assert_eq!(
+            sql,
+            "INSERT INTO `db`.`docs` (`payload`, `title`) VALUES (?, ?)"
+        );
+        let p = positional(&params);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if *b == vec![0xFFu8, 0x00, 0xFE]));
+        assert!(matches!(&p[1], MyValue::Bytes(b) if b == b"x"));
+    }
+
+    /// An empty file is a value, not an absence: zero bytes bind as a zero-length
+    /// param, which MySQL stores as an empty blob. `NULL` is the other thing, and
+    /// the two must not collapse — a `NOT NULL BLOB` column accepts the first and
+    /// rejects the second.
+    #[test]
+    fn zero_bytes_is_an_empty_blob_and_not_null() {
+        let ins = RowInsert {
+            database: "db".to_string(),
+            schema: None,
+            table: "docs".to_string(),
+            cols: vec![("payload".to_string(), CellEdit::bytes(Vec::new()))],
+        };
+        let (_, params) = build_insert(&ins);
+        let p = positional(&params);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if b.is_empty()));
+        assert!(!matches!(p[0], MyValue::NULL));
+    }
+
     #[test]
     fn build_update_escapes_backtick_identifiers() {
         let edit = RowEdit {
             database: "d`b".to_string(),
             schema: None,
             table: "t`t".to_string(),
-            set: vec![("a`b".to_string(), Some("x".to_string()))],
+            set: vec![("a`b".to_string(), CellEdit::Text("x".to_string()))],
             key: vec![("k`k".to_string(), Value::Int(1))],
         };
         let (sql, _) = build_update(&edit);

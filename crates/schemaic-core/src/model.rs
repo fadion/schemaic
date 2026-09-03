@@ -366,9 +366,15 @@ pub fn type_is_binary(type_name: &str) -> bool {
 /// *as* the data and re-imported as wrong bytes.
 ///
 /// SQLite's was the honest answer and is now everyone's: it says what it is,
-/// it costs one short string for a 40 MB blob rather than a hex dump long
-/// enough to hang the grid, and the editing system independently refuses to
-/// write a binary column, so nothing round-trips it back into the database.
+/// and it costs one short string for a 40 MB blob rather than a hex dump long
+/// enough to hang the grid.
+///
+/// It used to be safe for a second reason — the editing system refused a binary
+/// column outright, so the placeholder could not be written back as data. That
+/// half is gone: a binary column *is* writable now, through
+/// [`CellEdit::Bytes`]. What replaces it is narrower and has to stay that way —
+/// [`crate::edit::EditModel::text_editable`] is what keeps typing and pasting
+/// off such a column, so the placeholder still never becomes the value.
 pub fn binary_display(len: usize) -> String {
     format!("<{len} bytes>")
 }
@@ -937,10 +943,99 @@ impl ResultBuilder {
     }
 }
 
+/// A staged cell value: what the user wants one cell to hold after the commit.
+///
+/// Three-way, because two of the ways are not the same kind of thing. `Text` is
+/// what the user typed or pasted, bound as a string parameter and coerced by the
+/// server to whatever the column is — the shape every write on this path used to
+/// have. `Bytes` is raw octets, and it exists because a `BLOB` has no lossless
+/// text form: the grid shows [`binary_display`]'s `<n bytes>` placeholder for
+/// one, so a binary cell round-tripped through `Text` would write the ASCII of
+/// its own size into the column. `Null` is SQL `NULL`, which used to be spelt
+/// `None` — an `Option<String>` had room for exactly two of the three.
+///
+/// Only the blob panel produces `Bytes`. Typing and pasting produce `Text` and
+/// `Null` only, and [`crate::edit::EditModel::text_editable`] keeps them off a
+/// binary column for the reason above.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CellEdit {
+    /// SQL `NULL`.
+    Null,
+    /// Bound as a string parameter; the server coerces it to the column type.
+    Text(String),
+    /// Bound as raw octets — the only shape that can write a binary column.
+    ///
+    /// **`Arc`, because a staged cell is cloned far more often than it is
+    /// written.** The grid's painter clones the value out of the dirty map on
+    /// every repaint of that cell, the row panel's field does it on every change
+    /// to the map, and `build_edits` does it again per commit — each a full copy
+    /// of the buffer when it is a `Vec`, which for a 60 MB file is 60 MB of
+    /// memcpy per repaint. The backends still take an owned `Vec` at bind time
+    /// and that copy is unavoidable; every other one is not.
+    Bytes(Arc<[u8]>),
+}
+
+impl CellEdit {
+    /// The text this value carries, or `None` for `Null` **and for `Bytes`**.
+    ///
+    /// Bytes answering `None` is the point: every caller of this is a text path
+    /// (the re-fetch key, the paste round-trip, the clipboard), and a byte
+    /// string decoded lossily into one of those is the mojibake
+    /// [`binary_display`] exists to have stopped.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            CellEdit::Text(t) => Some(t.as_str()),
+            CellEdit::Null | CellEdit::Bytes(_) => None,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, CellEdit::Null)
+    }
+
+    /// The bytes this value carries, if it is a `Bytes`.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            CellEdit::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// A `Bytes` from anything that can become one — `Vec<u8>` from a file read,
+    /// a slice from a test.
+    pub fn bytes(b: impl Into<Arc<[u8]>>) -> Self {
+        CellEdit::Bytes(b.into())
+    }
+
+    /// What a grid cell holding this staged value shows.
+    ///
+    /// `Bytes` renders as [`binary_display`] — the same placeholder a *stored*
+    /// blob gets, so a cell the user has just loaded a file into reads the same
+    /// way it will after the commit, and neither one is text anybody can copy
+    /// back into the column.
+    pub fn display(&self) -> String {
+        match self {
+            CellEdit::Null => "NULL".to_string(),
+            CellEdit::Text(t) => t.clone(),
+            CellEdit::Bytes(b) => binary_display(b.len()),
+        }
+    }
+
+    /// `Some(text)` → [`CellEdit::Text`], `None` → [`CellEdit::Null`] — the
+    /// widening of the shape this type replaced, for the text paths that still
+    /// speak `Option<String>` (paste, the inline editor, AI fill).
+    pub fn from_opt(v: Option<String>) -> Self {
+        match v {
+            Some(t) => CellEdit::Text(t),
+            None => CellEdit::Null,
+        }
+    }
+}
+
 /// One row's staged edits, ready to execute as a single `UPDATE`. Built by the
 /// grid's editing system from the result's per-column provenance: `database` /
-/// `table` are the real base table, `set` are the columns to change (new text,
-/// bound as a parameter), and `key` is the WHERE identity (columns + their
+/// `table` are the real base table, `set` are the columns to change (each a
+/// [`CellEdit`], bound as a parameter), and `key` is the WHERE identity (columns + their
 /// *original* typed values). The executor runs each of these in one transaction
 /// and requires every statement to affect exactly one row.
 #[derive(Clone, Debug)]
@@ -951,26 +1046,26 @@ pub struct RowEdit {
     /// so it must not depend on `search_path`.
     pub schema: Option<String>,
     pub table: String,
-    /// Columns to set → new value. `Some(text)` is bound as a string param (the
-    /// server coerces to the column type); `None` sets SQL `NULL`.
-    pub set: Vec<(String, Option<String>)>,
+    /// Columns to set → new value — see [`CellEdit`] for what each of the three
+    /// shapes binds as.
+    pub set: Vec<(String, CellEdit)>,
     /// WHERE identity: key columns → their original typed values.
     pub key: Vec<(String, Value)>,
 }
 
 /// One new row staged for `INSERT`. Built by the grid from the result's single
 /// base table: `database` / `table` are that table, and `cols` are the columns
-/// the user set → value (`Some(text)` bound as a string param; `None` = SQL
-/// `NULL`). Columns *omitted* from `cols` take their DB default (auto-increment,
-/// `DEFAULT`, or `NULL`). The executor runs each in the same transaction as the
-/// updates and requires it to affect exactly one row.
+/// the user set → value (see [`CellEdit`]). Columns *omitted* from `cols` take
+/// their DB default (auto-increment, `DEFAULT`, or `NULL`). The executor runs
+/// each in the same transaction as the updates and requires it to affect exactly
+/// one row.
 #[derive(Clone, Debug)]
 pub struct RowInsert {
     pub database: String,
     /// PostgreSQL namespace of `table` — see [`RowEdit::schema`].
     pub schema: Option<String>,
     pub table: String,
-    pub cols: Vec<(String, Option<String>)>,
+    pub cols: Vec<(String, CellEdit)>,
 }
 
 /// One row staged for `DELETE`, identified by its WHERE key (columns + their
@@ -1148,9 +1243,13 @@ pub fn engine_is_transactional(engine: &str) -> bool {
 }
 
 /// The grid's staged (green) cell edits: `(data row, result column)` → the new
-/// value, `None` meaning SQL `NULL`. Staged is *not* written — a commit is what
-/// turns these into [`RowEdit`]s.
-pub type StagedEdits = HashMap<(usize, usize), Option<String>>;
+/// [`CellEdit`]. Staged is *not* written — a commit is what turns these into
+/// [`RowEdit`]s.
+///
+/// The same map [`crate::edit::DirtyCells`] names, spelt twice because the two
+/// modules each own one end of it. Widening one and not the other is a
+/// compile error, which is the only guarantee worth having here.
+pub type StagedEdits = HashMap<(usize, usize), CellEdit>;
 
 /// Drop exactly the staged edits a completed commit covered, leaving every other
 /// one staged.
@@ -1804,7 +1903,7 @@ mod tests {
 
     fn staged(keys: &[(usize, usize)]) -> StagedEdits {
         keys.iter()
-            .map(|&k| (k, Some(format!("v{}{}", k.0, k.1))))
+            .map(|&k| (k, CellEdit::Text(format!("v{}{}", k.0, k.1))))
             .collect()
     }
 
@@ -2218,7 +2317,7 @@ mod tests {
             database: "db".into(),
             schema: None,
             table: table.into(),
-            set: vec![("name".into(), Some("x".into()))],
+            set: vec![("name".into(), CellEdit::Text("x".into()))],
             key: vec![("id".into(), Value::Int(1))],
         }
     }
@@ -2228,7 +2327,7 @@ mod tests {
             database: "db".into(),
             schema: None,
             table: table.into(),
-            cols: vec![("name".into(), Some("x".into()))],
+            cols: vec![("name".into(), CellEdit::Text("x".into()))],
         }
     }
 

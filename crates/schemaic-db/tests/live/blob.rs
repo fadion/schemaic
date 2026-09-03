@@ -170,9 +170,10 @@ pub async fn a_null_blob_reports_nothing(target: &'static Target) {
 /// The two halves are tested apart everywhere else — `blob_source` against a
 /// hand-built `EditModel`, `fetch_blob` against a hand-built `BlobRef` — and the
 /// seam between them is exactly where this feature could be wrong while both
-/// halves pass: C2 keeps a binary column out of the write model, so a
-/// `blob_source` asking the wrong question returns `None` here and the panel is
-/// never offered. This runs a real `SELECT`, derives the reference from its
+/// halves pass: `blob_source` deliberately does not ask through
+/// `EditModel::table_index`, and one written against the write model's own
+/// lookup returned `None` here for as long as C2 kept a binary column out of
+/// `col_table`. This runs a real `SELECT`, derives the reference from its
 /// provenance, and fetches with it.
 pub async fn a_binary_cell_in_a_real_result_resolves_and_fetches(target: &'static Target) {
     let scratch = Scratch::create(target, "blobend2end").await;
@@ -186,7 +187,8 @@ pub async fn a_binary_cell_in_a_real_result_resolves_and_fetches(target: &'stati
         ))
         .await;
 
-    // The premise: the grid shows a placeholder and refuses to edit the column.
+    // The premise: the grid shows a placeholder, so the column takes no *text*
+    // write — the bytes themselves go in through the blob panel.
     assert_eq!(
         rs.cell(0, 1).map(|c| c.display().to_string()).as_deref(),
         Some("<4 bytes>"),
@@ -194,8 +196,13 @@ pub async fn a_binary_cell_in_a_real_result_resolves_and_fetches(target: &'stati
         target.name
     );
     assert!(
-        !model.editable(1),
-        "{}: C2 should still hold the column read-only",
+        !model.text_editable(1),
+        "{}: the placeholder must not be typeable back over the value",
+        target.name
+    );
+    assert!(
+        model.editable(1),
+        "{}: but the column itself takes a write",
         target.name
     );
 
@@ -257,6 +264,92 @@ pub async fn a_stored_png_still_sniffs_as_one_after_the_round_trip(target: &'sta
         "{}: a PNG header did not survive the round trip: {:02x?}",
         target.name,
         got.bytes
+    );
+
+    scratch.teardown().await;
+}
+
+/// **The write half, on the wire.** Stage bytes the way the blob panel does,
+/// commit, and read them back through the same `fetch_blob` the panel uses.
+///
+/// This seam has no pure test on these two engines for the reason the module
+/// header gives about the read: only a server can answer whether MySQL binds a
+/// `MyValue::Bytes` as octets rather than as the characters they lossily decode
+/// to, and whether PostgreSQL's `decode('…','hex')` — a *literal*, since that
+/// module builds its writes as SQL text rather than as parameters — reaches a
+/// `bytea` column as the bytes it names. Both were assumptions when this was
+/// written, and the second one is a wager on `standard_conforming_strings` that
+/// the `'\x…'::bytea` spelling would have lost.
+///
+/// The payload is four bytes because the column is (`VARBINARY(4)` on the MySQL
+/// leg — [`crate::cases`] owns the width), and it is deliberately **not**
+/// [`DEADBEEF`]: `de 00 be ff` differs from what was seeded in two positions, so
+/// a write that did nothing fails; it carries an interior NUL, so a byte string
+/// truncated at the first one fails on length; and `0xde`/`0xff` are not valid
+/// UTF-8 on their own, so a value that went out through `String::from_utf8_lossy`
+/// arrives as replacement characters and fails on both.
+pub async fn staged_bytes_reach_the_column_as_bytes(target: &'static Target) {
+    use schemaic_core::edit::{DirtyCells, build_edits};
+    use schemaic_core::model::{CellEdit, GridWrite};
+
+    let scratch = Scratch::create(target, "blobwrite").await;
+    let (ty, literal) = binary_case(target);
+    seed(&scratch, "b", ty, &[(7, literal)]).await;
+
+    let (rs, model) = scratch
+        .edit_model(&format!(
+            "SELECT id, payload FROM {}",
+            scratch.qualified("b")
+        ))
+        .await;
+
+    // The narrowed C2, over a real result: writable, but not by typing.
+    assert!(
+        model.editable(1) && !model.text_editable(1),
+        "{}: a binary column must take a bytes write and no text one",
+        target.name
+    );
+
+    let payload: Vec<u8> = vec![0xde, 0x00, 0xbe, 0xff];
+    let dirty: DirtyCells = [((0usize, 1usize), CellEdit::bytes(payload.clone()))]
+        .into_iter()
+        .collect();
+    let write = GridWrite {
+        updates: build_edits(&model, &rs, &dirty),
+        ..Default::default()
+    };
+    assert_eq!(
+        write.updates.len(),
+        1,
+        "{}: one staged cell, one UPDATE",
+        target.name
+    );
+
+    let n = scratch
+        .db
+        .commit_writes(&write, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}: the commit failed: {e}", target.name));
+    assert_eq!(n, 1, "{}: the 1-row safety net", target.name);
+
+    let bref = blob_source(&model, &rs, 0, 1)
+        .unwrap_or_else(|| panic!("{}: the binary cell resolved no source", target.name));
+    let got = scratch
+        .db
+        .fetch_blob(&bref, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}: the re-read failed: {e}", target.name))
+        .unwrap_or_else(|| panic!("{}: the written cell read back as empty", target.name));
+    assert_eq!(
+        got.bytes, payload,
+        "{}: the column holds something other than the bytes staged",
+        target.name
+    );
+    assert_eq!(
+        got.len,
+        payload.len() as u64,
+        "{}: the column's length disagrees with its bytes",
+        target.name
     );
 
     scratch.teardown().await;

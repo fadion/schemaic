@@ -82,6 +82,7 @@ live_suite!(
         a_null_blob_reports_nothing,
         a_binary_cell_in_a_real_result_resolves_and_fetches,
         a_stored_png_still_sniffs_as_one_after_the_round_trip,
+        staged_bytes_reach_the_column_as_bytes,
     ],
     suite: [
         a_ping_reaches_the_server,

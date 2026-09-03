@@ -39,6 +39,32 @@ use crate::model::{ResultSet, Value};
 /// about that to refuse a save rather than write a corrupt file.
 pub const FETCH_CAP: usize = 64 * 1024 * 1024;
 
+/// Most bytes a file loaded *into* a cell may carry — the write half's
+/// [`FETCH_CAP`], and deliberately the same number.
+///
+/// **The read half has always been bounded and the write half was not.** A
+/// `SELECT` can only hand back `FETCH_CAP`, but a file picker will hand over
+/// whatever is on disk: `fs::read` allocates all of it, the staged edit holds
+/// it, and the statement binds it. A `LONGBLOB` column's own cap is 4 GB, and a
+/// column whose schema has not loaded reports no cap at all — so without this
+/// the only thing between a mis-clicked disk image and the process is how much
+/// memory the machine has.
+///
+/// The same number as the read cap because the panel would otherwise promise
+/// what it cannot show: a value larger than this comes back truncated, refuses
+/// to save, and displays as a prefix of itself. Writing one in would create
+/// cells this app can never again render or export whole.
+pub const LOAD_CAP: usize = FETCH_CAP;
+
+/// Is a file of `len` bytes too large to load into a cell?
+///
+/// A `>` rather than a `>=`: a file of exactly [`LOAD_CAP`] is the largest one
+/// the read half can hand back whole, so it is a value this app can still show,
+/// save and export — the boundary belongs inside.
+pub fn load_too_large(len: u64) -> bool {
+    len > LOAD_CAP as u64
+}
+
 /// Most pixels a preview will decode: 32 megapixels.
 ///
 /// **[`FETCH_CAP`] does not bound this, which is the whole reason it exists.**
@@ -354,14 +380,73 @@ pub fn hex_line(bytes: &[u8], row: usize) -> String {
     out
 }
 
+/// The most bytes a column of this declared type can hold, or `None` where the
+/// type sets no bound worth enforcing here.
+///
+/// **The point is to refuse an oversized file where the user chose it**, rather
+/// than at the commit — MySQL answers a `BLOB` overrun with
+/// `ERROR 1406: Data too long`, which arrives after the modal has closed, names
+/// the column rather than the file, and rolls the whole staged batch back with
+/// it.
+///
+/// It reads the **declared** type (`ColumnInfo::type_name`, the full text with
+/// its parameters — `mediumblob`, `varbinary(4)`), not the wire type name a
+/// result column carries. That is not a preference: MySQL reports all four blob
+/// sizes as `MYSQL_TYPE_BLOB` on the wire, so `Column::type_name` says `BLOB`
+/// for a `LONGBLOB` and `VARBINARY` with no length at all. Only the schema knows.
+///
+/// `None` is "no answer", never "no limit", and the caller must treat it that
+/// way: PostgreSQL's `bytea` and SQLite's `BLOB` genuinely have no bound anyone
+/// hits from a file picker (1 GB and `SQLITE_MAX_LENGTH`), and an unloaded
+/// schema or an unknown type name gives the same `None` — after which the server
+/// is still the authority it always was.
+pub fn column_byte_cap(type_name: &str) -> Option<u64> {
+    let head = type_name
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    // The four MySQL blob families, whose bound is the family and not a
+    // parameter: MySQL promotes a `BLOB(M)` *declaration* to the smallest family
+    // that holds M and reports what it promoted to, so a length never survives
+    // to be read here. Measured on MySQL 8.4 rather than assumed —
+    // `BLOB(70000)` introspects as `mediumblob`, `BLOB(200)` as `tinyblob`, and
+    // `information_schema.CHARACTER_MAXIMUM_LENGTH` agrees with all four numbers
+    // below.
+    for (name, cap) in [
+        ("TINYBLOB", 255u64),
+        ("BLOB", 65_535),
+        ("MEDIUMBLOB", 16_777_215),
+        ("LONGBLOB", 4_294_967_295),
+    ] {
+        if head.eq_ignore_ascii_case(name) {
+            return Some(cap);
+        }
+    }
+    // `BINARY(n)` / `VARBINARY(n)`, whose bound *is* the parameter. Without one
+    // the answer is unknown rather than zero: a bare `BINARY` is `BINARY(1)` to
+    // the server, but a bare one reaching here means the caller handed over a
+    // wire type name this function has already said it cannot read.
+    if head.eq_ignore_ascii_case("BINARY") || head.eq_ignore_ascii_case("VARBINARY") {
+        return type_name
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(n, _)| n.trim().parse::<u64>().ok());
+    }
+    None
+}
+
 /// The [`BlobRef`] for the binary cell at `(di, ci)`, or `None` if its bytes
 /// cannot be fetched safely.
 ///
-/// **Why this cannot ask [`EditModel::table_index`].** C2 keeps a binary column out
-/// of `col_table` — it is not writable as text — so the write model has no
-/// table for the very column this is about. The table itself *is* in the model
-/// whenever [`crate::edit::analyze_edit`] resolved a key for it, so the lookup
-/// is by the column's own provenance instead, and the key comes from
+/// **Why this does not ask [`EditModel::table_index`].** It once *could not*:
+/// C2 kept a binary column out of `col_table` outright, so the write model had
+/// no table for the very column this is about, and a `blob_source` written
+/// against that lookup returned `None` and never offered the feature. C2 has
+/// since narrowed to *text* — the column is in the map like every other one —
+/// so the lookup would work now, and it is still made by the column's own
+/// provenance ([`crate::edit::EditModel::table_for_origin`]) because that is the
+/// question actually being asked: a *read* is aimed at a keyed base table,
+/// whether or not anything may be written to the column. The key comes from
 /// [`row_key`] unchanged. A result whose binary column has no keyed base table
 /// answers `None`, and the fetch is never offered: `SELECT … LIMIT 1` over an
 /// ambiguous row would show bytes from a row the user did not click.
@@ -837,18 +922,24 @@ mod tests {
         })
     }
 
-    /// **The composition C2 breaks, not the predicate.** `analyze_edit` keeps a
-    /// binary column out of `col_table`, so `table_index` answers `None` for the
-    /// very column being fetched — a `blob_source` written against the write
-    /// model's own lookup returns `None` here and the feature never offers
-    /// itself. This asserts both halves in one place: the write model still
-    /// refuses the column, and the fetch still finds its table.
+    /// **The composition, which is where this used to break.** `analyze_edit`
+    /// once kept a binary column out of `col_table` (C2 in its blanket form), so
+    /// `table_index` answered `None` for the very column being fetched and a
+    /// `blob_source` written against the write model's own lookup found nothing.
+    /// C2 has since narrowed to text, so the column *is* in `col_table` — and
+    /// `table_for_origin` still has to answer, because this lookup is the one
+    /// that cannot go stale on that question again. Both halves in one place:
+    /// the column is writable but not as text, and the fetch finds its table.
     #[test]
-    fn a_binary_column_c2_made_read_only_still_resolves_a_source() {
+    fn a_binary_column_resolves_a_source_and_a_bytes_only_write() {
         let rs = staff_rs();
         let model = crate::edit::analyze_edit(&rs, staff_schema);
-        assert!(!model.editable(1), "C2 should still bar the binary column");
-        assert_eq!(model.table_index(1), None, "and leave it out of col_table");
+        assert!(model.editable(1), "the picture column takes a write");
+        assert!(
+            !model.text_editable(1),
+            "but not a text one — its cell is a placeholder"
+        );
+        assert_eq!(model.table_index(1), Some(0), "it maps to `staff`");
 
         let got = blob_source(&model, &rs, 0, 1).expect("picture should be fetchable");
         assert_eq!(
@@ -861,6 +952,78 @@ mod tests {
                 key: vec![("staff_id".to_string(), Value::UInt(1))],
             }
         );
+    }
+
+    /// The load ceiling's boundary, which is the only part of a `>` worth
+    /// pinning: a file of exactly [`LOAD_CAP`] is the largest the read half can
+    /// return whole, so refusing it would refuse a value the app can otherwise
+    /// handle end to end.
+    #[test]
+    fn a_file_of_exactly_the_load_cap_still_fits() {
+        assert!(!load_too_large(LOAD_CAP as u64));
+        assert!(load_too_large(LOAD_CAP as u64 + 1));
+        assert!(!load_too_large(0));
+        // The write ceiling is the read ceiling, deliberately: a larger value
+        // comes back truncated and refuses to save, so writing one in would
+        // create a cell this app can never render or export whole again.
+        assert_eq!(LOAD_CAP, FETCH_CAP);
+    }
+
+    /// **The four blob families are four different columns**, and MySQL's wire
+    /// type name calls all of them `BLOB` — which is why this reads the declared
+    /// type and why getting it wrong is silent: a `LONGBLOB` capped at 64 KiB
+    /// refuses files the column would take, and a `TINYBLOB` treated as `BLOB`
+    /// lets through 65 KiB the server rejects at commit.
+    #[test]
+    fn each_blob_family_carries_its_own_cap() {
+        assert_eq!(column_byte_cap("tinyblob"), Some(255));
+        assert_eq!(column_byte_cap("blob"), Some(65_535));
+        assert_eq!(column_byte_cap("mediumblob"), Some(16_777_215));
+        assert_eq!(column_byte_cap("longblob"), Some(4_294_967_295));
+        // Case is the server's business, not ours — MySQL's information_schema
+        // reports lower-case, the DDL a user typed may not.
+        assert_eq!(column_byte_cap("MEDIUMBLOB"), Some(16_777_215));
+        assert_eq!(column_byte_cap("MediumBlob"), Some(16_777_215));
+    }
+
+    /// The leading token decides, so `longblob` is never read as `blob` with a
+    /// prefix — the same rule [`crate::model::type_is_binary`] states, and the
+    /// reason both split on `(` and whitespace rather than comparing substrings.
+    #[test]
+    fn a_longer_family_name_is_not_read_as_a_shorter_one() {
+        assert_ne!(column_byte_cap("longblob"), column_byte_cap("blob"));
+        assert_ne!(column_byte_cap("tinyblob"), column_byte_cap("blob"));
+    }
+
+    /// `BINARY(n)`/`VARBINARY(n)` take their bound from the parameter, which is
+    /// the whole reason the *declared* type is what this reads: the wire name is
+    /// `VARBINARY` with the length stripped off.
+    #[test]
+    fn a_fixed_width_binary_column_takes_its_cap_from_its_parameter() {
+        assert_eq!(column_byte_cap("varbinary(4)"), Some(4));
+        assert_eq!(column_byte_cap("binary(16)"), Some(16));
+        assert_eq!(column_byte_cap("varbinary(65535)"), Some(65_535));
+        assert_eq!(column_byte_cap("VARBINARY( 8 )"), Some(8));
+    }
+
+    /// **`None` means "no answer", and the two sources of it are different
+    /// facts.** `bytea` and SQLite's `BLOB` have no bound a file picker reaches;
+    /// a wire type name with its length stripped, or a type nobody wrote down,
+    /// is simply unknown. Both leave the server the authority — which is the
+    /// only safe way for this to be wrong.
+    #[test]
+    fn an_unbounded_or_unreadable_type_answers_no_cap() {
+        assert_eq!(column_byte_cap("bytea"), None);
+        assert_eq!(column_byte_cap("BYTEA"), None);
+        // SQLite's declared types, including the untyped column.
+        assert_eq!(column_byte_cap(""), None);
+        assert_eq!(column_byte_cap("text"), None);
+        // A bare `VARBINARY` is the wire name, not a declaration — unknown, not
+        // `VARBINARY(1)`, because guessing 1 would refuse every file.
+        assert_eq!(column_byte_cap("varbinary"), None);
+        assert_eq!(column_byte_cap("binary"), None);
+        // And a parameter that is not a number is not a cap.
+        assert_eq!(column_byte_cap("varbinary(max)"), None);
     }
 
     #[test]

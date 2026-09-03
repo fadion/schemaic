@@ -13,7 +13,7 @@
 //! database is that level. `Scratch::alt_namespace` makes whichever this server
 //! has, so the tests below are written once and mean the same thing on both.
 
-use schemaic_core::model::{GridWrite, RowEdit, Value};
+use schemaic_core::model::{CellEdit, GridWrite, RowEdit, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoint::Target;
@@ -128,7 +128,7 @@ pub async fn an_edit_lands_in_the_namespace_it_was_read_from(target: &'static Ta
                     // would be refused outright by the wrong table, so the
                     // assertion below could not have failed; `label` is in both,
                     // so a write aimed at the wrong one lands silently.
-                    set: vec![("label".to_string(), Some("moved".to_string()))],
+                    set: vec![("label".to_string(), CellEdit::Text("moved".to_string()))],
                     key: vec![("id".to_string(), Value::Int(1))],
                 }],
                 ..Default::default()

@@ -29,15 +29,17 @@ use floem::file::{FileDialogOptions, FileSpec};
 use schemaic_core::blob::BlobRef;
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
-use schemaic_core::edit::{self, EditModel, analyze_edit, refetch_key, refetch_template, row_key};
+use schemaic_core::edit::{
+    self, DirtyCells, EditModel, analyze_edit, refetch_key, refetch_template, row_key,
+};
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_of};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
 use schemaic_core::model::{
-    CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet,
-    RowDelete, RowEdit, RowInsert, Value, drop_committed,
+    CellEdit, CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow,
+    ResultSet, RowDelete, RowEdit, RowInsert, Value, drop_committed,
 };
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
@@ -244,15 +246,16 @@ struct GridState {
     edit_cell: RwSignal<Option<(usize, usize)>>,
     /// Live buffer for the in-progress edit.
     edit_buf: RwSignal<String>,
-    /// Staged edits keyed by `(data_row, col)` → new text. Applied to the DB
-    /// only on an explicit commit (Ctrl+Enter / the toolbar ✓).
-    /// `Some(text)` sets a new value; `None` stages a SQL `NULL`.
-    dirty: RwSignal<HashMap<(usize, usize), Option<String>>>,
+    /// Staged edits keyed by `(data_row, col)` → new value. Applied to the DB
+    /// only on an explicit commit (Ctrl+Enter / the toolbar ✓). See
+    /// [`CellEdit`] for the three shapes a staged value takes — text and NULL
+    /// come from typing and pasting, bytes only from the blob panel.
+    dirty: RwSignal<DirtyCells>,
     /// Staged new rows (the "+ Row" button), each a map of result-column index →
-    /// value (`Some` = value, `None` = SQL NULL; absent = server default). They
-    /// render below the real rows (display index `nrows + pending_index`) and
-    /// `INSERT` on commit. Cleared on commit / discard.
-    new_rows: RwSignal<Vec<HashMap<usize, Option<String>>>>,
+    /// value (an absent column takes the server default). They render below the
+    /// real rows (display index `nrows + pending_index`) and `INSERT` on commit.
+    /// Cleared on commit / discard.
+    new_rows: RwSignal<Vec<HashMap<usize, CellEdit>>>,
     /// Data-row indices marked for deletion (the toolbar count + a red row tint);
     /// they `DELETE` on commit. Cleared on commit / discard.
     del_rows: RwSignal<HashSet<usize>>,
@@ -848,7 +851,7 @@ impl GridState {
                         d.remove(&(di, ci));
                     }
                     edit::StageOutcome::Stage => {
-                        d.insert((di, ci), val);
+                        d.insert((di, ci), CellEdit::from_opt(val));
                         staged += 1;
                     }
                 }
@@ -867,9 +870,69 @@ impl GridState {
     /// Manual inline edits use [`GridState::stage`], which clears when typed back to original.
     fn stage_set(&self, di: usize, ci: usize, val: Option<String>) {
         self.dirty.update(|d| {
-            d.insert((di, ci), val);
+            d.insert((di, ci), CellEdit::from_opt(val));
         });
         self.clear_bar();
+    }
+
+    /// Stage **bytes** into a real cell — the blob panel's *Load from file*, and
+    /// the only producer of [`CellEdit::Bytes`] there is.
+    ///
+    /// No revert rule, unlike [`GridState::stage_many`]. The rule compares the
+    /// staged value against the cell's *displayed* original, and a binary cell's
+    /// display is `<n bytes>` rather than its value — so the comparison could
+    /// only ever answer "different", and a version of it that looked plausible
+    /// would be comparing a file against a placeholder. The grid does not hold
+    /// the stored bytes to compare against (that is a round trip to the server,
+    /// which is what `fetch_blob` is), so loading a file always stages.
+    ///
+    /// **The write gate is here, not only in `blob_launch`.** The path from that
+    /// decision to this write runs through a file dialog and a worker thread, so
+    /// the two are separated by however long the user spends choosing — and by a
+    /// schema reload, a re-run, or a row marked for deletion underneath. Asking
+    /// again costs a lookup, and what it buys is that the answer is the one that
+    /// holds when the bytes actually land.
+    ///
+    /// **`del_rows` is half of that answer.** `blob_launch` refuses a doomed row
+    /// and this has to refuse it again: `toggle_delete` purges the row from
+    /// `dirty` when it is marked, so a file staged afterwards puts it back, and
+    /// the commit then carries a `RowDelete` *and* a `RowEdit` for one row —
+    /// deletes run first, the update matches nothing, and `one_row_verdict`
+    /// rolls the whole batch back over an edit the user could not see.
+    ///
+    /// Returns whether it staged, because the panel reports either way — see
+    /// [`crate::BlobStageFn`].
+    fn stage_bytes(&self, di: usize, ci: usize, bytes: Vec<u8>) -> bool {
+        if !self.edit_model.get_untracked().editable(ci)
+            || self.del_rows.with_untracked(|d| d.contains(&di))
+        {
+            return false;
+        }
+        self.dirty.update(|d| {
+            d.insert((di, ci), CellEdit::bytes(bytes));
+        });
+        self.clear_bar();
+        true
+    }
+
+    /// [`GridState::stage_bytes`] for a pending new row — same gate, and the row
+    /// has to still be there: `new_rows` can shrink between the dialog opening
+    /// and the file arriving (Discard, a commit, a removed skeleton row).
+    fn stage_new_bytes(&self, pidx: usize, ci: usize, bytes: Vec<u8>) -> bool {
+        if !self.edit_model.get_untracked().editable(ci) {
+            return false;
+        }
+        let staged = self.new_rows.try_update(|rows| match rows.get_mut(pidx) {
+            Some(r) => {
+                r.insert(ci, CellEdit::bytes(bytes));
+                true
+            }
+            None => false,
+        });
+        if staged == Some(true) {
+            self.clear_bar();
+        }
+        staged.unwrap_or(false)
     }
 
     /// Stage a value into pending new-row `pidx`, column `ci` (`None` = SQL NULL,
@@ -953,13 +1016,19 @@ impl GridState {
         let model = self.edit_model.get_untracked();
         let rs = self.rs.get_untracked();
         let ncols = rs.col_count();
-        let maps: Vec<HashMap<usize, Option<String>>> = data_idxs
+        let maps: Vec<HashMap<usize, CellEdit>> = data_idxs
             .iter()
             .map(|&data_idx| {
-                let mut map: HashMap<usize, Option<String>> = HashMap::new();
+                let mut map: HashMap<usize, CellEdit> = HashMap::new();
                 if data_idx < rs.row_count() {
                     for ci in 0..ncols {
-                        if !model.editable(ci) {
+                        // `text_editable`, not `editable`: a clone copies the
+                        // cell's **displayed** value, and a binary cell displays
+                        // `<n bytes>`. Copying that would put the placeholder in
+                        // the new row as text — the clone's bytes are not in the
+                        // grid to copy, so the honest clone leaves the column
+                        // unset and the `INSERT` takes its default.
+                        if !model.text_editable(ci) {
                             continue;
                         }
                         let auto = rs
@@ -975,9 +1044,9 @@ impl GridState {
                             map.insert(
                                 ci,
                                 if c.is_null() {
-                                    None
+                                    CellEdit::Null
                                 } else {
-                                    Some(c.display().to_string())
+                                    CellEdit::Text(c.display().to_string())
                                 },
                             );
                         }
@@ -1088,11 +1157,11 @@ impl GridState {
     /// `dirty` map — used by the whole-row JSON editor, which commits immediately.
     /// A join row edits >1 base table, so this may return several `RowEdit`s; the
     /// WHERE key comes from the ORIGINAL row (PK columns are read-only in the editor).
-    fn build_row_edits(&self, di: usize, changes: &[(usize, Option<String>)]) -> Vec<RowEdit> {
+    fn build_row_edits(&self, di: usize, changes: &[(usize, CellEdit)]) -> Vec<RowEdit> {
         let model = self.edit_model.get_untracked();
         let rs = self.rs.get_untracked();
         // Group changed columns by their base table (deterministic SQL via BTreeMap).
-        let mut groups: BTreeMap<usize, Vec<(usize, Option<String>)>> = BTreeMap::new();
+        let mut groups: BTreeMap<usize, Vec<(usize, CellEdit)>> = BTreeMap::new();
         for (ci, v) in changes {
             if let Some(ti) = model.table_index(*ci) {
                 groups.entry(ti).or_default().push((*ci, v.clone()));
@@ -1112,13 +1181,13 @@ impl GridState {
     fn build_row_refetch(
         &self,
         di: usize,
-        changes: &[(usize, Option<String>)],
+        changes: &[(usize, CellEdit)],
     ) -> Option<RefetchRequest> {
         self.sync_canonical.get_untracked()?;
         let rs = self.rs.get_untracked();
         let model = self.edit_model.get_untracked();
         let template = refetch_template(&rs, &model)?;
-        let edited: HashMap<usize, Option<String>> = changes.iter().cloned().collect();
+        let edited: HashMap<usize, CellEdit> = changes.iter().cloned().collect();
         let key = refetch_key(&template, &rs, di, &edited);
         Some(RefetchRequest {
             template,
@@ -1152,7 +1221,10 @@ impl GridState {
                 let cols = cis
                     .into_iter()
                     .filter_map(|ci| {
-                        real_col(ci).map(|name| (name, row.get(&ci).cloned().flatten()))
+                        row.get(&ci)
+                            .cloned()
+                            .zip(real_col(ci))
+                            .map(|(v, name)| (name, v))
                     })
                     .collect();
                 RowInsert {
@@ -1216,7 +1288,7 @@ impl GridState {
             .map(|di| {
                 // This row's staged edits, by result column — a key column among
                 // them is what the row now answers to.
-                let edited: HashMap<usize, Option<String>> = dirty
+                let edited: HashMap<usize, CellEdit> = dirty
                     .iter()
                     .filter(|((d, _), _)| *d == di)
                     .map(|((_, ci), v)| (*ci, v.clone()))
@@ -1544,8 +1616,8 @@ fn grid_cells<'a>(
     rs: &'a ResultSet,
     order: &'a [usize],
     formats: &'a [ColumnFormat],
-    dirty: &'a HashMap<(usize, usize), Option<String>>,
-    new_rows: &'a [HashMap<usize, Option<String>>],
+    dirty: &'a DirtyCells,
+    new_rows: &'a [HashMap<usize, CellEdit>],
 ) -> schemaic_core::edit::GridCells<'a> {
     schemaic_core::edit::GridCells {
         rs,
@@ -1732,8 +1804,12 @@ fn paste_selection(gs: GridState) {
     // walked in index order lands in columns the user never pointed at — and the
     // far-left one is the column they were protecting by freezing it.
     let frozen = gs.frozen.get_untracked();
+    // `text_editable`: a paste is text, and the clipboard's own round trip is
+    // what makes a binary column dangerous here — a copied blob cell carries the
+    // `<n bytes>` placeholder, and pasting it back would stage those characters
+    // as the column's value.
     let plan = schemaic_core::edit::plan_paste(&block, rect, rows, rs.col_count(), frozen, |ci| {
-        model.editable(ci)
+        model.text_editable(ci)
     });
     if plan.cells.is_empty() && plan.dropped == 0 && plan.read_only == 0 {
         return;
@@ -4017,7 +4093,11 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     gs.new_rows.with_untracked(|pending| {
                         let cells = (r0..=r1).map(|d| match order.get(d).copied() {
                             Some(di) => match dirty.get(&(di, ci)) {
-                                Some(staged) => staged.as_deref(),
+                                // `as_text`, so a staged blob counts as no
+                                // value — the same as a NULL. There is no
+                                // aggregate of a byte string, and its display
+                                // is a placeholder rather than data.
+                                Some(staged) => staged.as_text(),
                                 None => rs
                                     .cell(di, ci)
                                     .and_then(|c| (!c.is_null()).then(|| c.text())),
@@ -4027,7 +4107,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                             None => pending
                                 .get(d - order.len())
                                 .and_then(|m| m.get(&ci))
-                                .and_then(|v| v.as_deref()),
+                                .and_then(|v| v.as_text()),
                         });
                         schemaic_core::aggregate::aggregate_texts(column, cells)
                     })
@@ -4344,7 +4424,18 @@ fn source_table(gs: GridState) -> Option<String> {
 
 /// Open the inline editor on the cell at display `(i, ci)`, seeding the buffer
 /// with its current value (a staged edit if present, else the original).
+///
+/// **The text gate is here, not only in the callers.** Six of them reach this —
+/// Enter, double-click, the cell menu, the Tab/Enter hop, a fresh pending row, a
+/// clone — and every one of them asked `text_editable` first. Six copies of a
+/// refusal is five chances to add a seventh caller without it, and what a missed
+/// one costs is specific: the field seeds from a binary cell's `<n bytes>`
+/// placeholder, and pressing Enter stages those characters as the column's
+/// value.
 fn start_edit(gs: GridState, i: usize, ci: usize) {
+    if !gs.edit_model.get_untracked().text_editable(ci) {
+        return;
+    }
     let nrows = gs.rs.get_untracked().row_count();
     // A real row marked for deletion isn't editable (it's going away).
     if i < nrows {
@@ -4357,20 +4448,23 @@ fn start_edit(gs: GridState, i: usize, ci: usize) {
     gs.anchor.set(Some((i, ci)));
     let seed = if i >= nrows {
         // Pending new row: seed from its staged cell (empty = "use default").
-        match gs
-            .new_rows
+        gs.new_rows
             .with_untracked(|rows| rows.get(i - nrows).and_then(|r| r.get(&ci).cloned()))
-        {
-            Some(Some(t)) => t,
-            _ => String::new(),
-        }
+            .as_ref()
+            .and_then(CellEdit::as_text)
+            .unwrap_or_default()
+            .to_string()
     } else {
         let order = gs.order.get_untracked();
         let di = order.get(i).copied().unwrap_or(i);
         let cur = gs.dirty.with_untracked(|d| d.get(&(di, ci)).cloned());
         match cur {
-            Some(Some(t)) => t,          // staged text
-            Some(None) => String::new(), // staged NULL → edit from empty
+            Some(CellEdit::Text(t)) => t, // staged text
+            // A staged NULL edits from empty. So does a staged blob, and it can
+            // only be reached by a caller that has already decided this column
+            // takes text — `open_editor`'s own gate — so there is nothing to
+            // seed it with and nothing that could be seeded wrongly.
+            Some(CellEdit::Null | CellEdit::Bytes(_)) => String::new(),
             None => gs
                 .rs
                 .get_untracked()
@@ -4470,8 +4564,12 @@ fn commit_grid(gs: GridState) {
     (commit)(write, refetch, done);
 }
 
-/// Per-column context for the whole-row JSON editor: name, editability (PK /
-/// expression / binary → read-only), nullability, and the row's original value.
+/// Per-column context for the whole-row JSON editor: name, editability,
+/// nullability, and the row's original value.
+///
+/// `editable` here is `text_editable` — the panel is a form of text fields, and
+/// a binary column's field would hold `<n bytes>`. Loading a file into one is
+/// the blob panel's job, from the grid.
 fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
     let rs = gs.rs.get_untracked();
     let model = gs.edit_model.get_untracked();
@@ -4480,7 +4578,7 @@ fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
         .enumerate()
         .map(|(ci, c)| ColSpec {
             name: c.name.clone(),
-            editable: model.editable(ci),
+            editable: model.text_editable(ci),
             nullable: c
                 .origin
                 .as_ref()
@@ -4571,6 +4669,34 @@ fn commit_row_update(
             return;
         }
     };
+    // The row panel is a text form — every field is an `edit_field` — so its
+    // changes widen here and never carry bytes. A binary column is not offered
+    // one at all (`ColSpec::editable` is `text_editable`).
+    let mut changes: Vec<(usize, CellEdit)> = changes
+        .into_iter()
+        .map(|(ci, v)| (ci, CellEdit::from_opt(v)))
+        .collect();
+    // **A file loaded from this panel is part of this row's save.** The fields
+    // above are text inputs and a binary column has none — its editor is the
+    // *Edit* button, which stages bytes into the grid's dirty map. Leaving them
+    // out would make the panel's ✓ write every column the user touched except
+    // the one they opened a whole modal to change, and the bytes would sit green
+    // in the grid waiting for a second, different Commit.
+    //
+    // Only `Bytes`, and only on this row. A staged *text* edit elsewhere in the
+    // grid on this same row is deliberately not swept in: this panel seeds its
+    // fields from the stored result rather than from the dirty map, so writing
+    // one would write something the panel never showed.
+    changes.extend(gs.dirty.with_untracked(|d| {
+        let mut staged: Vec<(usize, CellEdit)> = d
+            .iter()
+            .filter(|((dr, _), v)| *dr == di && matches!(v, CellEdit::Bytes(_)))
+            .filter(|((_, ci), _)| changes.iter().all(|(c, _)| c != ci))
+            .map(|((_, ci), v)| (*ci, v.clone()))
+            .collect();
+        staged.sort_by_key(|(ci, _)| *ci); // deterministic SET order, as ever
+        staged
+    }));
     let updates = gs.build_row_edits(di, &changes);
     if updates.is_empty() {
         gs.edit_row_open.set(false); // nothing changed
@@ -4578,6 +4704,11 @@ fn commit_row_update(
     }
     // This path writes only this row's changed columns, so only those leave the
     // staged map — a green edit anywhere else is still uncommitted and stays.
+    //
+    // **After the fold above, deliberately.** A blob swept into this write has to
+    // be un-staged by it too, or the cell the panel just saved stays green in the
+    // grid and the next Commit writes it a second time. Built from `changes`
+    // rather than from the field list for exactly that reason.
     let committed: HashSet<(usize, usize)> = changes.iter().map(|(ci, _)| (di, *ci)).collect();
     let Some(commit) = gs.commit.get_untracked() else {
         return;
@@ -4608,15 +4739,17 @@ fn commit_row_update(
     (commit)(write, refetch, done);
 }
 
-/// The next (`forward`) / previous editable column after `ci`, if any — used to
-/// hop between cells while filling a row with Tab / Enter.
+/// The next (`forward`) / previous column after `ci` an **inline editor** can
+/// open on, if any — used to hop between cells while filling a row with Tab /
+/// Enter. A binary column is skipped: the hop opens a text field, and there is
+/// no text to put in one.
 fn next_editable_col(gs: GridState, ci: usize, forward: bool) -> Option<usize> {
     let model = gs.edit_model.get_untracked();
     let ncols = gs.rs.get_untracked().col_count();
     if forward {
-        (ci + 1..ncols).find(|&c| model.editable(c))
+        (ci + 1..ncols).find(|&c| model.text_editable(c))
     } else {
-        (0..ci).rev().find(|&c| model.editable(c))
+        (0..ci).rev().find(|&c| model.text_editable(c))
     }
 }
 
@@ -4665,7 +4798,7 @@ fn clone_rows(gs: GridState, data_idxs: &[usize]) {
     let ncols = rs.col_count();
     let disp = nrows + pidx;
     let model = gs.edit_model.get_untracked();
-    let first = (0..ncols).find(|&ci| model.editable(ci)).unwrap_or(0);
+    let first = (0..ncols).find(|&ci| model.text_editable(ci)).unwrap_or(0);
     floem::action::exec_after(std::time::Duration::ZERO, move |_| {
         // One tick is a smaller window than the find bar's 150 ms, but it is not
         // no window: `scroll_active_into_view` reads `gs.vp`.
@@ -4688,7 +4821,7 @@ fn add_pending_row(gs: GridState) {
     let ncols = rs.col_count();
     let disp = nrows + pidx;
     let model = gs.edit_model.get_untracked();
-    let first_editable = (0..ncols).find(|&ci| model.editable(ci));
+    let first_editable = (0..ncols).find(|&ci| model.text_editable(ci));
     match first_editable {
         Some(ci) => {
             floem::action::exec_after(std::time::Duration::ZERO, move |_| {
@@ -4769,7 +4902,8 @@ fn ai_fill_value(gs: GridState) {
         return;
     };
     let model = gs.edit_model.get_untracked();
-    if !model.editable(ci) {
+    // The model answers with text, so a binary column is not one it can fill.
+    if !model.text_editable(ci) {
         return;
     }
     let Some(ti) = model.table_index(ci) else {
@@ -4804,14 +4938,21 @@ fn ai_fill_value(gs: GridState) {
         if cj == ci || model.table_index(cj) != Some(ti) {
             continue;
         }
+        // A staged value contributes what the *cell shows*, which for a staged
+        // blob is the `<n bytes>` placeholder — the same thing the stored branch
+        // below already contributes for a binary column, since that is what the
+        // result set holds for one. Bytes never reach the prompt as text.
+        let staged_val = |v: CellEdit| (!v.is_null()).then(|| v.display());
         let val: Option<String> = match pending {
-            Some(p) => gs
-                .new_rows
-                .with_untracked(|rows| rows.get(p).and_then(|r| r.get(&cj).cloned()).flatten()),
+            Some(p) => gs.new_rows.with_untracked(|rows| {
+                rows.get(p)
+                    .and_then(|r| r.get(&cj).cloned())
+                    .and_then(staged_val)
+            }),
             None => {
                 let di = order.get(disp).copied().unwrap_or(disp);
                 match gs.dirty.with_untracked(|d| d.get(&(di, cj)).cloned()) {
-                    Some(v) => v, // staged edit
+                    Some(v) => staged_val(v), // staged edit
                     None => rs
                         .cell(di, cj)
                         .and_then(|c| (!c.is_null()).then(|| c.display().to_string())),
@@ -4890,7 +5031,9 @@ fn ai_seed_rows(gs: GridState, count: usize) {
     let mut fill_columns: Vec<String> = Vec::new();
     let mut name_to_ci: HashMap<String, usize> = HashMap::new();
     for cj in 0..ncols {
-        if !model.editable(cj) {
+        // Text only: the reply is JSON strings, and a binary column has no
+        // text form to seed. It is left to the server default.
+        if !model.text_editable(cj) {
             continue;
         }
         let Some(col) = rs.columns.get(cj) else {
@@ -5430,15 +5573,14 @@ enum CellInk {
     Plain,
 }
 
-fn cell_ink(
-    staged: Option<&Option<String>>,
-    is_null: bool,
-    placeholder: bool,
-    is_fk: bool,
-) -> CellInk {
+fn cell_ink(staged: Option<&CellEdit>, is_null: bool, placeholder: bool, is_fk: bool) -> CellInk {
     match staged {
-        Some(None) => CellInk::StagedNull,
-        Some(Some(_)) => CellInk::Staged,
+        Some(CellEdit::Null) => CellInk::StagedNull,
+        // A staged blob is `Staged`, not `StagedNull`: it paints `<n bytes>`,
+        // and the italic in this grid means *absence*. A stored blob's
+        // placeholder is upright, so a loaded one is too — the green fill is
+        // what says it changed.
+        Some(CellEdit::Text(_) | CellEdit::Bytes(_)) => CellInk::Staged,
         // The order is the painter's: a NULL original outranks the FK underline,
         // because there is no key in the cell to follow.
         None if is_null || placeholder => CellInk::Absent,
@@ -5880,12 +6022,37 @@ fn json_field(
     .into_any()
 }
 
-/// The read-only value cell: dim text (NULL → `<null>`), shown for context, no caret.
-fn readonly_value(f: FieldSig) -> AnyView {
-    if f.is_null.get_untracked() {
-        return null_sentinel();
-    }
-    text(f.buf.get_untracked())
+/// A binary field's value line — **reactive**, unlike every other read-only one.
+///
+/// The panel seeds its fields from the stored row and rebuilds only when the row
+/// or the editors change, which is right for a field nothing but its own input
+/// can alter. A blob field has an *Edit* button that stages into the grid, so
+/// its value can change while the panel stands still: without this the count
+/// stayed at the stored size after a file was loaded, and the row's ✓ then wrote
+/// bytes the panel had never shown.
+///
+/// The resolution is the grid painter's, narrowed to the two shapes this cell
+/// can hold: a staged value if there is one, else the stored text.
+fn blob_value(gs: GridState, di: usize, f: FieldSig) -> AnyView {
+    let ci = f.ci;
+    let stored = f.buf.get_untracked();
+    let stored_null = f.is_null.get_untracked();
+    dyn_container(
+        move || gs.dirty.with(|d| d.get(&(di, ci)).cloned()),
+        move |staged| match staged {
+            Some(v) if v.is_null() => null_sentinel(),
+            Some(v) => value_text(v.display()),
+            None if stored_null => null_sentinel(),
+            None => value_text(stored.clone()),
+        },
+    )
+    .style(|s| s.min_width(0.0).flex_grow(1.0_f32))
+    .into_any()
+}
+
+/// The dim, ellipsized line a read-only field's value is drawn as.
+fn value_text(v: String) -> AnyView {
+    text(v)
         .style(|s| {
             s.font_size(theme::scaled_font(13.0))
                 .color(theme::text_dim())
@@ -5896,11 +6063,36 @@ fn readonly_value(f: FieldSig) -> AnyView {
         .into_any()
 }
 
+/// The read-only value cell: dim text (NULL → `<null>`), shown for context, no
+/// caret. Static, unlike [`blob_value`]: nothing but the field's own input can
+/// change it, and a read-only field has none.
+fn readonly_value(f: FieldSig) -> AnyView {
+    if f.is_null.get_untracked() {
+        return null_sentinel();
+    }
+    value_text(f.buf.get_untracked())
+}
+
+/// A binary field's affordance in the row panel: the word its button reads, and
+/// what pressing it does.
+///
+/// Two labels for one button, the same pair the cell menu's entry carries and
+/// for the same reason — *Edit* on a cell that takes a write, *View* on one that
+/// does not, because they open a panel with a different set of buttons.
+type BlobField = (&'static str, Rc<dyn Fn()>);
+
 /// One field row: the column label + its value editor (editable) or read-only cell.
 ///
 /// `typed` is the column's type-aware control, already narrowed to what this
 /// field's **own value** fits (see [`typed_editor`]); [`CellEditor::Text`] is the
 /// plain input, and is what a value no control can represent comes back as.
+///
+/// `blob` is the binary-cell panel's launcher, `Some` only for a raw-bytes
+/// column. Such a field is `editable: false` — the panel's fields are text
+/// inputs and its value is the `<n bytes>` placeholder — which used to be the
+/// end of it: the row panel showed the count and offered nothing, so a blob was
+/// the one column you had to leave the panel to touch. The button is that
+/// column's editor, in the place every other column's editor is.
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn field_row(
     gs: GridState,
@@ -5911,12 +6103,42 @@ fn field_row(
     nullable: bool,
     autofocus: bool,
     f: FieldSig,
+    di: usize,
+    blob: Option<BlobField>,
 ) -> AnyView {
     let is_json = is_json_type(&type_name);
     // The one control that can outgrow a line: a `SET`'s chips wrap. (A date's
     // calendar is an overlay, so its row stays a row.)
     let grows = is_json || matches!(typed, CellEditor::Set(_));
-    let editor = if !editable {
+    let editor = if let Some((label, open)) = blob {
+        // The value and its own way in, on one line: the `<n bytes>` count (or
+        // `<null>`, which is where a *first* file goes) beside the button that
+        // opens it.
+        h_stack((
+            blob_value(gs, di, f),
+            container(text(label).style(|s| s.font_size(theme::scaled_font(12.0))))
+                .on_click_stop(move |_| (open)())
+                .style(|s| {
+                    s.padding_horiz(theme::scaled(8.0))
+                        .padding_vert(theme::scaled(2.0))
+                        .flex_shrink(0.0_f32)
+                        .border(1.0)
+                        .border_radius(4.0)
+                        .border_color(theme::border())
+                        .color(theme::text_dim())
+                        .cursor(CursorStyle::Pointer)
+                        .hover(|s| s.color(theme::text()).border_color(theme::text_dim()))
+                }),
+        ))
+        .style(|s| {
+            s.flex_row()
+                .items_center()
+                .gap(theme::scaled(8.0))
+                .width_full()
+                .min_width(0.0)
+        })
+        .into_any()
+    } else if !editable {
         readonly_value(f)
     } else if is_json {
         json_field(nullable, autofocus, f, gs.commit_err)
@@ -5996,7 +6218,14 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             let sigs = field_sigs(&cols);
             let rs = gs.rs.get_untracked();
             let first_editable = cols.iter().position(|c| c.editable);
-            let any_editable = first_editable.is_some();
+            // **A blob column counts, even though it has no text field.** This
+            // gates the ✓, and `ColSpec::editable` is `text_editable` — so a row
+            // whose only writable column is binary (a SQLite `BLOB` in a
+            // rowid-keyed table, where the key itself is excluded from the write
+            // model) showed the *Edit* button, staged the file, and then offered
+            // no way to save it.
+            let any_editable = first_editable.is_some()
+                || (0..cols.len()).any(|ci| gs.edit_model.get_untracked().editable(ci));
             let mut rows: Vec<AnyView> = Vec::with_capacity(cols.len());
             for (ci, c) in cols.iter().enumerate() {
                 let type_name = rs
@@ -6005,6 +6234,30 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     .map(|col| col.type_name.clone())
                     .unwrap_or_default();
                 let autofocus = first_editable == Some(ci);
+                // A raw-bytes column gets the binary panel instead of a field.
+                // `blob_launch` answers `None` when there is nothing to look at
+                // and nowhere to write, so a column it refuses reads exactly as
+                // it did before — the count, and no button to press.
+                let blob: Option<BlobField> = blob_launch(gs, &rs, di, ci, None).map(|launch| {
+                    // Short labels here: the row is already headed by the
+                    // column's name, so "Edit binary" would say it twice.
+                    let word = match launch.stage.is_some() {
+                        true => "Edit",
+                        false => "View",
+                    };
+                    let launch = Rc::new(launch);
+                    let open: Rc<dyn Fn()> = Rc::new(move || {
+                        open_blob(
+                            gs,
+                            BlobLaunch {
+                                bref: launch.bref.clone(),
+                                target: launch.target.clone(),
+                                stage: launch.stage.clone(),
+                            },
+                        );
+                    });
+                    (word, open)
+                });
                 // The column's control, narrowed to what *this row's* value fits:
                 // a value no control can represent (a `tinyint(1)` holding 7, an
                 // ENUM holding something MySQL rejected into it) keeps the text
@@ -6019,6 +6272,8 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     c.nullable,
                     autofocus,
                     sigs[ci],
+                    di,
+                    blob,
                 ));
             }
 
@@ -6406,7 +6661,7 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         Key::Named(NamedKey::Enter) => {
             // Enter edits the active cell when it's editable; on a read-only
             // cell it does nothing (viewing is via the right-click View item).
-            if gs.edit_model.get_untracked().editable(c) {
+            if gs.edit_model.get_untracked().text_editable(c) {
                 start_edit(gs, r, c);
             }
         }
@@ -7343,7 +7598,7 @@ fn grid_toolbar(
                 let fill_enabled = gs
                     .active
                     .get_untracked()
-                    .map(|(_, ci)| gs.edit_model.get_untracked().editable(ci))
+                    .map(|(_, ci)| gs.edit_model.get_untracked().text_editable(ci))
                     .unwrap_or(false);
                 // Every entry in this menu puts real values in a prompt: Fill and
                 // Insert carry the row being completed, Seed samples the table
@@ -7658,8 +7913,31 @@ fn set_rows_deleted(gs: GridState, idxs: &[usize], deleted: bool) {
 /// because the connection they carry is a decision rather than a lookup:
 /// `conn_at_load` and not the tab's live one. Spelled twice, that is one edit
 /// away from the two gestures reading the same blob from different servers.
-fn open_blob(gs: GridState, bref: BlobRef, target: BlobTarget) {
-    (gs.view_blob.get_untracked())(gs.conn_at_load, bref, target);
+fn open_blob(gs: GridState, launch: BlobLaunch) {
+    (gs.view_blob.get_untracked())(gs.conn_at_load, launch.bref, launch.target, launch.stage);
+}
+
+/// What opening the binary-cell panel on one cell needs: what to read (`None`
+/// for a pending row, which has nothing committed), what to call it, where a
+/// loaded file goes (`None` for a cell nothing can write), and whether the
+/// entry that opens it should say *view* or *edit*.
+struct BlobLaunch {
+    bref: Option<BlobRef>,
+    target: BlobTarget,
+    stage: Option<crate::BlobStageFn>,
+}
+
+impl BlobLaunch {
+    /// The menu entry's label. Two labels for one entry, because they are two
+    /// different offers and the panel behind them differs by a button: a
+    /// read-only cell can only be looked at, and a writable one is where its
+    /// value is replaced.
+    fn label(&self) -> &'static str {
+        match self.stage.is_some() {
+            true => "Edit binary",
+            false => "View binary",
+        }
+    }
 }
 
 /// Can the binary-cell panel be opened on this cell, and with what?
@@ -7669,17 +7947,30 @@ fn open_blob(gs: GridState, bref: BlobRef, target: BlobTarget) {
 /// `<n bytes>` cell has anything behind it, so one that opens a panel saying
 /// "nothing here" is worse than no entry.
 ///
-/// Three refusals, and each is a different fact:
+/// The refusal is now one fact rather than three: **there is nothing to read and
+/// nothing to write**. The panel used to be a viewer, so anything unreadable was
+/// unopenable; it is the write surface too now, and two of the old refusals were
+/// about reading only.
 ///
-/// * A **pending new row** has no committed row to re-read; its staged cells
-///   live only in the grid.
-/// * A **NULL** cell has no bytes, and the grid already knows that without
-///   asking the server — opening a panel to be told so is a round trip for a
-///   sentence the cell is already showing.
-/// * Anything [`schemaic_core::blob::blob_source`] refuses: a column that is not
-///   raw bytes, an expression with no base column, a table with no usable key.
+/// What it reads — `bref` — is `None` when there is no committed row behind the
+/// cell (a pending new row) and when the cell is `NULL`. Both are values the
+/// server would only confirm: a round trip for a sentence the cell already
+/// shows. The panel opens `Empty` on either, which is the same thing it would
+/// have been told.
 ///
-/// The *connection* is not among them, deliberately. The fetch runs over
+/// What it writes — `stage` — is `None` when [`EditModel::editable`] refuses the
+/// column, or when the row is marked for deletion. **`editable`, not
+/// `text_editable`**: this is the one surface that puts bytes in a cell, and
+/// `text_editable` is precisely the gate that keeps everything *else* out of a
+/// binary column.
+///
+/// A column [`schemaic_core::blob::blob_source`] cannot aim at — not raw bytes,
+/// an expression with no base column, a table with no usable key — still has no
+/// entry at all, but for the two halves separately: a `NULL` binary cell of a
+/// keyless table is unreadable *and* unwritable, and that is what `None` here
+/// means.
+///
+/// The *connection* is not among the refusals, deliberately. The fetch runs over
 /// `GridState::conn_at_load` — the one the rows came from, on the same argument
 /// the export makes — and a result on screen came from a connection by
 /// construction; there is no "no connection" state here to test for, and
@@ -7690,20 +7981,73 @@ fn blob_launch(
     data_idx: usize,
     ci: usize,
     pending: Option<usize>,
-) -> Option<(BlobRef, BlobTarget)> {
-    if pending.is_some() {
-        return None;
-    }
-    if rs.cell(data_idx, ci).map(|c| c.is_null()).unwrap_or(true) {
-        return None;
-    }
+) -> Option<BlobLaunch> {
     let model = gs.edit_model.get_untracked();
-    let bref = schemaic_core::blob::blob_source(&model, rs, data_idx, ci)?;
-    let target = BlobTarget {
-        title: bref.title(),
-        stem: bref.save_stem(),
+    if !model.binary(ci) {
+        return None;
+    }
+    // Readable: a committed, non-NULL cell whose column resolves to a row.
+    let bref = match pending.is_none()
+        && rs
+            .cell(data_idx, ci)
+            .is_some_and(|c: schemaic_core::model::CellRef<'_>| !c.is_null())
+    {
+        true => schemaic_core::blob::blob_source(&model, rs, data_idx, ci),
+        false => None,
     };
-    Some((bref, target))
+    // Writable: the column takes a write and this row is not on its way out.
+    let deleted = pending.is_none() && gs.del_rows.with_untracked(|d| d.contains(&data_idx));
+    let stage: Option<crate::BlobStageFn> = match model.editable(ci) && !deleted {
+        true => Some(match pending {
+            Some(p) => Rc::new(move |bytes: Vec<u8>| gs.stage_new_bytes(p, ci, bytes))
+                as crate::BlobStageFn,
+            None => Rc::new(move |bytes: Vec<u8>| gs.stage_bytes(data_idx, ci, bytes)),
+        }),
+        false => None,
+    };
+    if bref.is_none() && stage.is_none() {
+        return None; // nothing to look at and nothing to put there
+    }
+    // The title and the save name come from the row when there is one. A pending
+    // row has no key to name, so it borrows the column's own names — the panel
+    // still has to say which column it is about.
+    let cap = model.byte_cap(ci);
+    let target = match &bref {
+        Some(r) => BlobTarget {
+            title: r.title(),
+            stem: r.save_stem(),
+            cap,
+        },
+        None => {
+            let col = rs
+                .columns
+                .get(ci)
+                .map(|c| c.name.as_str())
+                .unwrap_or_default();
+            let table = rs
+                .columns
+                .get(ci)
+                .and_then(|c| c.origin.as_ref())
+                .map(|o| o.table.as_str())
+                .unwrap_or_default();
+            BlobTarget {
+                title: match table.is_empty() {
+                    true => col.to_string(),
+                    false => format!("{table}.{col}"),
+                },
+                stem: match table.is_empty() {
+                    true => col.to_string(),
+                    false => format!("{table}_{col}"),
+                },
+                cap,
+            }
+        }
+    };
+    Some(BlobLaunch {
+        bref,
+        target,
+        stage,
+    })
 }
 
 /// The gutter's right-click menu: what can be done to **rows** as such.
@@ -8357,13 +8701,13 @@ fn data_cell(
     // dirty values show the pending edit.
     let content = dyn_container(
         move || {
-            // `None` = not staged; `Some(None)` = staged NULL; `Some(Some(t))` = text.
+            // `None` = not staged; `Some(..)` is the staged `CellEdit`.
             // A pending new row reads from `new_rows` (no original); real rows read
             // the staged edit from `dirty` and the original from `rs`.
             let fmt = gs
                 .formats
                 .with(|f| f.get(ci).copied().unwrap_or(ColumnFormat::None));
-            let (staged, orig, orig_null): (Option<Option<String>>, String, bool) = match pending {
+            let (staged, orig, orig_null): (Option<CellEdit>, String, bool) = match pending {
                 Some(p) => {
                     let staged = gs
                         .new_rows
@@ -8382,12 +8726,7 @@ fn data_cell(
             (gs.edit_cell.get() == Some((i, ci)), staged, orig, orig_null)
         },
         {
-            move |(is_editing, staged, orig, is_null): (
-                bool,
-                Option<Option<String>>,
-                String,
-                bool,
-            )| {
+            move |(is_editing, staged, orig, is_null): (bool, Option<CellEdit>, String, bool)| {
                 if is_editing {
                     // A column whose values are already written down edits with
                     // its own control rather than a text field. A picker replaces
@@ -8564,8 +8903,11 @@ fn data_cell(
                 // [`cell_ink`].
                 let ink = cell_ink(staged.as_ref(), is_null, placeholder, is_fk);
                 let src = match &staged {
-                    Some(Some(t)) => t.clone(),       // staged text
-                    Some(None) => "NULL".to_string(), // staged SQL NULL
+                    // Staged text, staged SQL NULL, or a staged blob's
+                    // `<n bytes>` — one resolution, `CellEdit::display`, shared
+                    // with `edit::GridCells::text` so the clipboard and the AI
+                    // attachment read what the cell paints.
+                    Some(v) => v.display(),
                     None if placeholder => {
                         if auto_inc {
                             "<auto>".to_string()
@@ -8677,20 +9019,22 @@ fn data_cell(
             // and the next hover drags a selection out of nowhere.
             gs.selecting.set(false);
             gs.row_selecting.set(false);
-            // Double-click edits an editable cell. On a **binary** one it opens
-            // the panel instead — the gesture is otherwise unbound there, since
-            // C2 holds the column read-only, and "open the thing I clicked" is
-            // what a double-click means everywhere else in the app. Every other
-            // read-only cell still does nothing but select (viewing a whole row
-            // is the right-click menu's Edit row).
-            if gs.edit_model.get_untracked().editable(ci) {
+            // Double-click edits a cell that takes text. On a **binary** one it
+            // opens the panel instead — the cell holds a placeholder, not a
+            // value, so there is nothing for a text field to edit, and "open the
+            // thing I clicked" is what a double-click means everywhere else in
+            // the app. The panel is also where the column's *write* is, so this
+            // gesture reaches it whether the column is writable or not. Every
+            // other read-only cell still does nothing but select (viewing a whole
+            // row is the right-click menu's Edit row).
+            if gs.edit_model.get_untracked().text_editable(ci) {
                 start_edit(gs, i, ci);
             } else {
                 gs.active.set(Some((i, ci)));
                 gs.anchor.set(Some((i, ci)));
                 let rs = gs.rs.get_untracked();
-                if let Some((bref, target)) = blob_launch(gs, &rs, data_idx, ci, pending) {
-                    open_blob(gs, bref, target);
+                if let Some(launch) = blob_launch(gs, &rs, data_idx, ci, pending) {
+                    open_blob(gs, launch);
                 }
             }
         })
@@ -8709,7 +9053,7 @@ fn data_cell(
             let rs = gs.rs.get_untracked();
             // Effective value: staged text/NULL, else the original (real rows only —
             // a pending new row has no original, so unset cells are empty).
-            let staged_here_val: Option<Option<String>> = match pending {
+            let staged_here_val: Option<CellEdit> = match pending {
                 Some(p) => gs
                     .new_rows
                     .with_untracked(|rows| rows.get(p).and_then(|r| r.get(&ci).cloned())),
@@ -8719,8 +9063,7 @@ fn data_cell(
             // the same rule for the clipboard and the AI attachment, which read
             // the grid rather than paint it.
             let val = match staged_here_val {
-                Some(Some(t)) => t,
-                Some(None) => "NULL".to_string(),
+                Some(v) => v.display(),
                 None => match pending {
                     Some(_) => String::new(),
                     None => rs
@@ -8756,7 +9099,12 @@ fn data_cell(
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
             let model = gs.edit_model.get_untracked();
+            // Two questions, not one — see `EditModel::text_editable`. *Edit
+            // field* and *Paste* put text in the cell and ask the second; *Set to
+            // NULL* writes no text at all and asks the first, so a blob column
+            // can be emptied from the menu even though it cannot be typed into.
             let editable = model.editable(ci);
+            let text_editable = model.text_editable(ci);
             // Real row + a single writable table → row-level actions (clone/delete)
             // are available. `deleted` = this real row is already marked for deletion.
             let can_rows = pending.is_none() && model.insert_target().is_some();
@@ -8807,7 +9155,7 @@ fn data_cell(
             // marked for deletion isn't editable, and a pending new row has no
             // committed row to open in the panel (it's filled via inline cell edits).
             let mut entries: Vec<MenuEntry> = Vec::new();
-            if editable && !deleted {
+            if text_editable && !deleted {
                 entries.push(MenuEntry::action("Edit field", move || {
                     start_edit(gs, i, ci)
                 }));
@@ -8817,13 +9165,23 @@ fn data_cell(
                     open_edit_row(gs, data_idx)
                 }));
             }
-            // "View binary" — the one entry that opens a cell the grid is not
-            // holding. `blob_launch` answers `None` for everything that cannot
-            // be re-read (a NULL, an expression column, a table with no key), so
-            // the entry is absent rather than present-and-refusing.
-            if let Some((bref, target)) = blob_launch(gs, &rs, data_idx, ci, pending) {
-                entries.push(MenuEntry::action("View binary", move || {
-                    open_blob(gs, bref.clone(), target.clone());
+            // The one entry that opens a cell the grid is not holding — and,
+            // since the panel gained *Load from file*, the only way to write
+            // one. `blob_launch` answers `None` when there is neither anything
+            // to read nor anywhere to write, so the entry is absent rather than
+            // present-and-refusing, and it names which of the two it is.
+            if let Some(launch) = blob_launch(gs, &rs, data_idx, ci, pending) {
+                let label = launch.label();
+                let launch = Rc::new(launch);
+                entries.push(MenuEntry::action(label, move || {
+                    open_blob(
+                        gs,
+                        BlobLaunch {
+                            bref: launch.bref.clone(),
+                            target: launch.target.clone(),
+                            stage: launch.stage.clone(),
+                        },
+                    );
                 }));
             }
             // Right-clicking inside a block keeps it selected, so the entry is
@@ -8846,7 +9204,7 @@ fn data_cell(
             // batch of edits, so a result nothing can be typed into has nothing
             // to paste into either. The action still lands on the *selection*,
             // not on this cell — Ctrl+V and this entry do the same thing.
-            if editable && !deleted {
+            if text_editable && !deleted {
                 entries.push(MenuEntry::action("Paste", move || paste_selection(gs)));
             }
             // Server-side filter: splice this value into the base query's WHERE and
@@ -9571,8 +9929,8 @@ mod tests {
     /// treatment a NULL *original* has always had.
     #[test]
     fn a_staged_null_does_not_paint_like_a_staged_word_null() {
-        let sql_null: Option<Option<String>> = Some(None);
-        let the_word: Option<Option<String>> = Some(Some("NULL".to_string()));
+        let sql_null = Some(CellEdit::Null);
+        let the_word = Some(CellEdit::Text("NULL".to_string()));
         assert_ne!(
             cell_ink(sql_null.as_ref(), false, false, false),
             cell_ink(the_word.as_ref(), false, false, false),
@@ -9589,10 +9947,23 @@ mod tests {
         );
         // Any other staged text is ordinary staged text — the case above is not a
         // rule about the string `NULL`, it is a rule about a staged *absence*.
-        let other: Option<Option<String>> = Some(Some("Ada".to_string()));
+        let other = Some(CellEdit::Text("Ada".to_string()));
         assert_eq!(
             cell_ink(other.as_ref(), false, false, false),
             CellInk::Staged
+        );
+        // And a staged **blob** is staged text's weighting, not a staged
+        // absence's: it paints `<n bytes>`, a placeholder for a value that is
+        // there, where the italic in this grid means there is none.
+        let blob = Some(CellEdit::bytes(vec![1, 2, 3]));
+        assert_eq!(
+            cell_ink(blob.as_ref(), false, false, false),
+            CellInk::Staged
+        );
+        assert_ne!(
+            cell_ink(blob.as_ref(), false, false, false),
+            cell_ink(sql_null.as_ref(), false, false, false),
+            "loading a file into a cell and emptying it are opposite writes"
         );
         // A staged value outranks every unstaged treatment, including a NULL
         // original underneath it and the FK underline.

@@ -21,7 +21,7 @@
 //!   "rolled back all changes" over rows that are still there is how a user
 //!   re-runs an import and gets duplicates.
 
-use schemaic_core::model::{GridWrite, RowDelete, RowEdit, RowInsert, Value};
+use schemaic_core::model::{CellEdit, GridWrite, RowDelete, RowEdit, RowInsert, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoint::Target;
@@ -120,8 +120,8 @@ pub async fn a_staged_insert_lands_with_defaults_for_what_it_omits(target: &'sta
                 schema: scratch.namespace.map(str::to_string),
                 table: "w".to_string(),
                 cols: vec![
-                    ("id".to_string(), Some("4".to_string())),
-                    ("name".to_string(), Some("four".to_string())),
+                    ("id".to_string(), CellEdit::Text("4".to_string())),
+                    ("name".to_string(), CellEdit::Text("four".to_string())),
                 ],
             }],
             ..Default::default()
@@ -251,8 +251,8 @@ pub async fn deletes_run_before_inserts_so_a_unique_key_can_be_reused(target: &'
                 schema: scratch.namespace.map(str::to_string),
                 table: "u".to_string(),
                 cols: vec![
-                    ("id".to_string(), Some("2".to_string())),
-                    ("code".to_string(), Some("taken".to_string())),
+                    ("id".to_string(), CellEdit::Text("2".to_string())),
+                    ("code".to_string(), CellEdit::Text("taken".to_string())),
                 ],
             }],
             ..Default::default()
@@ -511,7 +511,7 @@ fn edit(
         table: table.to_string(),
         set: set
             .iter()
-            .map(|(c, v)| (c.to_string(), v.map(str::to_string)))
+            .map(|(c, v)| (c.to_string(), CellEdit::from_opt(v.map(str::to_string))))
             .collect(),
         key: key
             .iter()
