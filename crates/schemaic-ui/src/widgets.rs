@@ -1309,9 +1309,18 @@ pub(crate) fn form_section_owned(label: String) -> impl IntoView {
 pub(crate) fn fact_section(title: &'static str, rows: Vec<AnyView>, gap: fn() -> f64) -> AnyView {
     v_stack((
         form_section(title),
-        v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap()).width_full()),
+        v_stack_from_iter(rows).style(move |s| s.flex_col().gap(gap()).width_full().min_width(0.0)),
     ))
-    .style(|s| s.flex_col().gap(theme::scaled(7.0)).width_full())
+    // `min_width(0)` all the way down, so a row holding a sentence can shrink to
+    // the panel and wrap instead of pushing the section past it — flexbox floors
+    // an item at its content width otherwise, and one unconstrained row is
+    // enough to carry the whole column off the right edge.
+    .style(|s| {
+        s.flex_col()
+            .gap(theme::scaled(7.0))
+            .width_full()
+            .min_width(0.0)
+    })
     .into_any()
 }
 
@@ -1342,6 +1351,18 @@ pub(crate) fn fact_row(label: String, value: String, label_w: fn() -> f64) -> An
 
 /// An icon-led sentence — a caveat, a warning, a state, or an engine's
 /// limitation.
+///
+/// **The sentence wraps.** It is a *sentence*, not a label: the longest of them
+/// is the accounts browser's "Privileges held through a granted role are not
+/// expanded: SHOW GRANTS lists what is granted directly to the account…", and a
+/// note that runs off the right edge of the modal it is explaining is worse than
+/// no note, because the half that says what to do about it is the half that goes.
+///
+/// Wrapping in a flex row needs both terms and neither alone is enough: `min_width(0)`
+/// overrides flexbox's `min-width: auto`, which otherwise floors an item at its
+/// content width, and `flex_grow` gives it the row's remaining space to wrap
+/// *into* — `width_full` would be wrong here, because 100% of the row plus the
+/// icon overflows by the icon.
 pub(crate) fn fact_note(
     icon: &'static str,
     color: fn() -> floem::peniko::Color,
@@ -1353,9 +1374,19 @@ pub(crate) fn fact_note(
                 .color(color())
                 .margin_top(theme::scaled(1.0))
         }),
-        text(message).style(move |s| s.font_size(theme::font_body()).color(color())),
+        text(message).style(move |s| {
+            s.font_size(theme::font_body())
+                .color(color())
+                .min_width(0.0)
+                .flex_grow(1.0_f32)
+        }),
     ))
-    .style(|s| s.items_start().gap(theme::scaled(7.0)).width_full())
+    .style(|s| {
+        s.items_start()
+            .gap(theme::scaled(7.0))
+            .width_full()
+            .min_width(0.0)
+    })
     .into_any()
 }
 

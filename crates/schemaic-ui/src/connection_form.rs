@@ -982,10 +982,23 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 .unwrap_or_default()
                 .to_string()
         })
-        .style(|s| {
-            s.width_full()
+        .style(move |s| {
+            let s = s
+                .width_full()
                 .font_size(theme::font_hint())
-                .color(theme::text_dim())
+                .color(theme::text_dim());
+            // **Hidden when there is no caveat, not merely empty.** An empty
+            // `label` is still a flex child *and* still has a line box, so on
+            // every mode that has nothing to add — which is most of them, and
+            // all of them on PostgreSQL — it contributed a blank line plus the
+            // column's 6px gap under the description. This is the third instance
+            // of the rule the two comments below state: `display:none` takes
+            // the box out of layout, an empty view does not.
+            if mode.get().caveat(&draft.db_type.get()).is_none() {
+                s.hide()
+            } else {
+                s
+            }
         }),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full());
@@ -1089,7 +1102,18 @@ fn tls_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
                 .into_any()
         },
     )
-    .style(|s| s.width_full());
+    // **The container is hidden too, not just its child.** The `hide()` above
+    // takes the *inner* view out of layout, and this `dyn_container` is still a
+    // flex child of the column below — so on `Disable` it contributed the 20px
+    // gap for a box with nothing in it. Same rule, one level up: the arm that
+    // knows there is nothing to show has to reach the box that would hold it.
+    .style(move |s| {
+        if mode.get().negotiates_tls() {
+            s.width_full()
+        } else {
+            s.hide()
+        }
+    });
 
     v_stack((picker, files)).style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
