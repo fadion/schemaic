@@ -142,8 +142,20 @@ pub fn sort_principals(list: &mut [Principal]) {
 /// account are searchable with one field, and typing `localhost` finds every
 /// account scoped to it. An empty needle matches everything.
 pub fn matches(p: &Principal, needle: &str) -> bool {
+    matches_display(&p.display(), needle)
+}
+
+/// [`matches()`], against a display name the caller already has.
+///
+/// The browser's rows hold their own `display()` — it is the text they render —
+/// and each row decides whether it is filtered *in its own reactive style*, so
+/// the filter is a restyle rather than a rebuild. A style closure runs on every
+/// hover, so one that re-derived the name would `format!` once per row per
+/// pointer move. Both spellings go through this one predicate, so the rows and
+/// the footer's count cannot come to disagree about what matching means.
+pub fn matches_display(display: &str, needle: &str) -> bool {
     let needle = needle.trim();
-    needle.is_empty() || contains_ignore_ascii_case(&p.display(), needle)
+    needle.is_empty() || contains_ignore_ascii_case(display, needle)
 }
 
 /// The indices of `list` that [`matches()`] `needle`, in list order.
@@ -166,7 +178,7 @@ pub fn filter_indices(list: &[Principal], needle: &str) -> Vec<usize> {
     }
     list.iter()
         .enumerate()
-        .filter(|(_, p)| contains_ignore_ascii_case(&p.display(), needle))
+        .filter(|(_, p)| matches_display(&p.display(), needle))
         .map(|(i, _)| i)
         .collect()
 }
@@ -2164,8 +2176,11 @@ mod tests {
         assert_eq!(filter_indices(&list, "%"), any_host);
         assert!(filter_indices(&list, "nobody").is_empty());
         // And it cannot disagree with the predicate the footer's count and the
-        // row's own highlighting still use.
-        for needle in ["", "a", "localhost", "%", "APP"] {
+        // row's own highlighting still use — including the display-name
+        // spelling, which is the one **each row** asks in its own style. Three
+        // callers, one answer: a row that hid itself while the footer counted it
+        // would read as a list that had lost accounts.
+        for needle in ["", "a", "localhost", "%", "APP", "nobody", "  app  "] {
             let by_predicate: Vec<usize> = list
                 .iter()
                 .enumerate()
@@ -2173,6 +2188,14 @@ mod tests {
                 .map(|(i, _)| i)
                 .collect();
             assert_eq!(filter_indices(&list, needle), by_predicate, "{needle:?}");
+            for p in &list {
+                assert_eq!(
+                    matches_display(&p.display(), needle),
+                    matches(p, needle),
+                    "{needle:?} on {}",
+                    p.display()
+                );
+            }
         }
     }
 
