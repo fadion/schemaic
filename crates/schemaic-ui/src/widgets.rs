@@ -2007,6 +2007,33 @@ pub(crate) fn menu_icon_color(open: bool, hovered: bool) -> Color {
     }
 }
 
+/// A toolbar icon that currently does nothing — **the one definition**.
+///
+/// Faded rather than hidden: the icons in a toolbar are found by position, and a
+/// control that vanishes when it is unavailable moves every icon beside it.
+///
+/// It lives here because two shapes need the same answer and were about to spell
+/// it separately: [`toolbar_icon`], which owns its own enablement, and
+/// [`menu_icon_color_gated`], for a menu *trigger* whose colour already had three
+/// states before this was a fourth.
+pub(crate) fn icon_disabled() -> Color {
+    theme::text_muted().multiply_alpha(0.3)
+}
+
+/// [`menu_icon_color`] with a gate in front of it: a trigger with nothing to
+/// offer is dim and stays dim, whatever the pointer does.
+///
+/// Composed rather than a fourth arm inside `menu_icon_color`, because five of
+/// that function's six callers are triggers that are *always* available and
+/// would all have to start saying so.
+pub(crate) fn menu_icon_color_gated(enabled: bool, open: bool, hovered: bool) -> Color {
+    if enabled {
+        menu_icon_color(open, hovered)
+    } else {
+        icon_disabled()
+    }
+}
+
 /// The app's tooltip chrome, applied globally to Floem's `TooltipClass` (see the
 /// root stylesheet in `lib.rs`) so every `.tooltip(…)` gets it — a compact
 /// bordered panel matching the app's popovers, with a soft drop shadow lifting it
@@ -2083,7 +2110,7 @@ pub(crate) fn toolbar_icon(
     let hov = RwSignal::new(false);
     container(icons::icon(markup, 16.0).style(move |s| {
         let c = if !enabled() {
-            theme::text_muted().multiply_alpha(0.3)
+            icon_disabled()
         } else if hov.get() {
             theme::text()
         } else {
@@ -5096,6 +5123,32 @@ mod menu_icon_tests {
         assert_eq!(menu_icon_color(false, false), theme::text_muted());
         assert_ne!(menu_icon_color(true, true), menu_icon_color(false, true));
         assert_ne!(menu_icon_color(false, true), menu_icon_color(false, false));
+    }
+
+    /// **The gate outranks all three**, and hover is the arm that proves it: an
+    /// icon that lit up under the pointer would promise a menu the click does
+    /// not open, which is worse than no feedback at all.
+    #[test]
+    fn a_gated_trigger_stays_dim_whatever_the_pointer_does() {
+        for (open, hovered) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                menu_icon_color_gated(false, open, hovered),
+                icon_disabled(),
+                "open={open} hovered={hovered}"
+            );
+        }
+        // Enabled, it is exactly `menu_icon_color` — the gate adds a state, it
+        // does not restate the other three.
+        for (open, hovered) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                menu_icon_color_gated(true, open, hovered),
+                menu_icon_color(open, hovered)
+            );
+        }
+        // And the dim is visibly not one of the live states.
+        assert_ne!(icon_disabled(), theme::text_muted());
+        assert_ne!(icon_disabled(), theme::text());
+        assert_ne!(icon_disabled(), theme::accent());
     }
 }
 

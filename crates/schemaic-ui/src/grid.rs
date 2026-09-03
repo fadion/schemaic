@@ -462,6 +462,25 @@ fn next_export_id() -> u64 {
     })
 }
 
+/// Do the results toolbar's **Copy** and **Download** menus have anything to act
+/// on?
+///
+/// **Rows, not columns.** A result with no rows still has its column list, so
+/// every format can render *something* from it — a CSV header line, `[]`, an
+/// empty Markdown table — and that is exactly the output worth refusing: it is a
+/// file that describes a query rather than answering one, and a clipboard that
+/// looks like a failed paste. The formats are not wrong to produce it (an export
+/// of an empty result should be an empty result, not an error); the menus are
+/// wrong to offer it.
+///
+/// Only these two, and deliberately not the schema tree's `Export ▸`. That one
+/// names a *table*, whose row count nothing on screen has read — a greyed entry
+/// there would be a question the user cannot answer by looking, where here the
+/// stats line one row above already says `0 rows`.
+fn results_offer_export(rows: usize) -> bool {
+    rows > 0
+}
+
 /// May a save dialog that has just named a file raise the export modal?
 ///
 /// **`false` while an export is still writing**, and that is the whole of it:
@@ -7103,6 +7122,16 @@ fn grid_toolbar(
     // hitbox as the other icons; `on_event_stop(PointerDown)` keeps the root
     // pointer-down dismissal from closing the menu the same click opens it. The
     // `on_move` tracks the glyph origin so the dropdown anchors under it.
+    // **Live, not a build-time `bool`.** The toolbar outlives a re-run that
+    // replaces the rows under it, so a flag read while it was built would gate
+    // the menus on whatever the previous result held — `dyn_container`'s lesson
+    // one file over, and `action_button`'s in the dump footer.
+    //
+    // Read off `order`, which is what an export actually writes, rather than off
+    // the result: the two agree today and the one that decides the file is the
+    // honest thing to ask.
+    let has_rows = move || results_offer_export(gs.order.with(|o| o.len()));
+
     let copy_origin = RwSignal::new(Point::ZERO);
     let copy_hov = RwSignal::new(false);
     // Named, because the pointer and the keyboard both raise it: the face keeps
@@ -7113,6 +7142,13 @@ fn grid_toolbar(
     // twice — the face's click listener and the ring's Enter/Space arm, which
     // `in_ring_button` requires to be separate listeners.
     let open_copy: Rc<dyn Fn()> = Rc::new(move || {
+        // **The gate is on the action, not on the face.** The pointer and the
+        // ring's Enter/Space both arrive here, and only here — dimming the icon
+        // alone would leave the keyboard path opening a menu that is drawn as
+        // unavailable.
+        if !has_rows() {
+            return;
+        }
         // A second press closes what the first opened.
         if menu_is_mine(copy_origin) {
             close_mine(TB_COPY, &strip_copy);
@@ -7155,7 +7191,8 @@ fn grid_toolbar(
         icons::icon(icons::COPY, crate::consts::TOOLBAR_ICON_BASE)
             .on_move(move |p| follow_menu(copy_origin, p))
             .style(move |s| {
-                s.color(crate::widgets::menu_icon_color(
+                s.color(crate::widgets::menu_icon_color_gated(
+                    has_rows(),
                     menu_is_mine_live(copy_origin),
                     copy_hov.get(),
                 ))
@@ -7179,7 +7216,18 @@ fn grid_toolbar(
     // convention the menu-opening icons in the monitor toolbar already follow.
     // Deliberately *not* labelled Ctrl+C: that key copies the selection straight
     // to the clipboard, which is a different action from this menu.
-    .tooltip(|| text("Copy the results…").style(crate::widgets::tooltip_style));
+    //
+    // **A dimmed icon says it cannot be used; the tip says why.** Without the
+    // second half the only reading left is that the app is broken — the stats
+    // line says `0 rows` a few pixels away, but nothing joins the two.
+    .tooltip(move || {
+        text(if has_rows() {
+            "Copy the results…"
+        } else {
+            "Nothing to copy — no rows"
+        })
+        .style(crate::widgets::tooltip_style)
+    });
 
     // Download icon → the same format dropdown as Copy, but each choice opens a
     // save dialog and writes the file. Identical styling/anchoring to `copy_menu`
@@ -7188,6 +7236,10 @@ fn grid_toolbar(
     let save_hov = RwSignal::new(false);
     let strip_save = strip.clone();
     let open_save: Rc<dyn Fn()> = Rc::new(move || {
+        // Its twin's gate, for its twin's reason — see `open_copy`.
+        if !has_rows() {
+            return;
+        }
         if menu_is_mine(save_origin) {
             close_mine(TB_SAVE, &strip_save);
             return;
@@ -7210,7 +7262,8 @@ fn grid_toolbar(
         icons::icon(icons::DOWNLOAD, crate::consts::TOOLBAR_ICON_BASE)
             .on_move(move |p| follow_menu(save_origin, p))
             .style(move |s| {
-                s.color(crate::widgets::menu_icon_color(
+                s.color(crate::widgets::menu_icon_color_gated(
+                    has_rows(),
                     menu_is_mine_live(save_origin),
                     save_hov.get(),
                 ))
@@ -7232,7 +7285,15 @@ fn grid_toolbar(
     })
     // Named against its twin: the two icons are identical but for the glyph, and
     // "Export" would leave the pair reading as two spellings of the same thing.
-    .tooltip(|| text("Save the results to a file…").style(crate::widgets::tooltip_style));
+    // Its empty-result tip is its twin's too — see `copy_menu`.
+    .tooltip(move || {
+        text(if has_rows() {
+            "Save the results to a file…"
+        } else {
+            "Nothing to save — no rows"
+        })
+        .style(crate::widgets::tooltip_style)
+    });
 
     // AI seed-data menu → purple-sparkle actions (Fill Value / Insert Row / Seed
     // Table). Gated on a single writable table, like the row actions above. The
@@ -9011,29 +9072,6 @@ mod tests {
     /// the *first* export is still writing. Without this it would overwrite the
     /// running export's progress line with its own refusal and take that
     /// export's Stop off the screen for exactly as long as it mattered.
-    /// **The half `export_modal_closes` cannot cover**, and the reason the pair
-    /// has to be tested together rather than each on its own.
-    ///
-    /// That predicate guards the *report*, which arrives long after the launch.
-    /// Nothing guarded the **raise**, and the raise is what destroys state: a
-    /// second save dialog answered while an export ran overwrote the running
-    /// export's modal before the app had accepted the launch, so the guarded
-    /// report then found a modal it no longer owned and dropped itself. Every
-    /// test of the guard alone passed throughout — the defect was at the seam
-    /// between it and the thing that set the state it reads.
-    #[test]
-    fn a_second_dialog_cannot_take_the_modal_from_a_running_export() {
-        // Nothing on screen: the ordinary launch.
-        assert!(export_may_launch(false, false, false));
-        // An export is writing, its modal up with neither report set. A second
-        // dialog answered now must not touch it.
-        assert!(!export_may_launch(true, false, false));
-        // A finished report the user has not dismissed is not busy — starting
-        // another export is a fine way to dismiss it.
-        assert!(export_may_launch(true, true, false));
-        assert!(export_may_launch(true, false, true));
-    }
-
     #[test]
     fn only_the_export_that_raised_the_modal_can_report_into_it() {
         let (a, b) = (next_export_id(), next_export_id());
@@ -9064,6 +9102,39 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "an id was handed out twice");
+    }
+
+    /// **The half `export_modal_closes` cannot cover**, and the reason the pair
+    /// has to be tested together rather than each on its own.
+    ///
+    /// That predicate guards the *report*, which arrives long after the launch.
+    /// Nothing guarded the **raise**, and the raise is what destroys state: a
+    /// second save dialog answered while an export ran overwrote the running
+    /// export's modal before the app had accepted the launch, so the guarded
+    /// report then found a modal it no longer owned and dropped itself. Every
+    /// test of the guard alone passed throughout — the defect was at the seam
+    /// between it and the thing that set the state it reads.
+    #[test]
+    fn a_second_dialog_cannot_take_the_modal_from_a_running_export() {
+        // Nothing on screen: the ordinary launch.
+        assert!(export_may_launch(false, false, false));
+        // An export is writing, its modal up with neither report set. A second
+        // dialog answered now must not touch it.
+        assert!(!export_may_launch(true, false, false));
+        // A finished report the user has not dismissed is not busy — starting
+        // another export is a fine way to dismiss it.
+        assert!(export_may_launch(true, true, false));
+        assert!(export_may_launch(true, false, true));
+    }
+
+    /// An empty result offers the toolbar's two menus nothing, and the count it
+    /// asks about is **rows** — a 0-row result still has columns, which is why
+    /// every format happily rendered a header-only file for it.
+    #[test]
+    fn an_empty_result_offers_the_toolbar_menus_nothing() {
+        assert!(!results_offer_export(0));
+        assert!(results_offer_export(1));
+        assert!(results_offer_export(200_000));
     }
 
     /// **The bar is now only ever the tail of an operation.** Its fourth state

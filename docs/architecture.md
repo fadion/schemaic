@@ -9396,6 +9396,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   the ring, because rebuilding would reflow the sub-header the moment the first change lands, and
   Enter on a dimmed one does nothing because each closure re-checks the log. Passing `has_log()`
   into `enabled` is the tidy-looking edit that breaks this — it is read once, at build.
+  The results toolbar's copy and save icons take the second too, since they became gated on the
+  result having rows: ring membership is unchanged (`in_strip_button(…, true, …)`), the icons dim on
+  a 0-row result, and the `Rc<dyn Fn()>` each shares between its click listener and its Enter/Space
+  arm carries the refusal — so the pointer and the keyboard refuse together, where dimming the face
+  alone would have left Enter opening a menu drawn as unavailable (*Data grid*).
   **The ring member is a wrapper `in_ring_button` builds, never the caller's own view**, and that
   is a correctness rule rather than a layout preference. Two things resolve by exact `ViewId` with
   no descendant propagation, and they were resolving to *different* ids depending on each call
@@ -10014,6 +10019,19 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   `menu_is_mine` the click path uses) so the style closure re-runs when the channel changes; the
   panels' four read their own `RwSignal<bool>`. The results strip's AI icon keeps its busy arm
   *first*: a request in flight makes the glyph inert, whatever the menu and the pointer are doing.
+  **A trigger with nothing to offer is dim and stays dim**, through
+  `widgets::menu_icon_color_gated(enabled, open, hovered)` — the results strip's copy and download
+  icons on a 0-row result (*Data grid*). It *composes* `menu_icon_color` rather than adding a fourth
+  arm inside it, because five of that function's six callers are triggers that are always available
+  and would all have had to start saying so. The gate outranks all three states and **hover is the
+  arm that proves it**: an icon lighting up under the pointer promises a menu the click does not
+  open, which is worse than no feedback at all —
+  `widgets::menu_icon_tests::a_gated_trigger_stays_dim_whatever_the_pointer_does` pins that, and
+  pins that the enabled path is still exactly `menu_icon_color`. The dim itself is
+  `widgets::icon_disabled()` (`text_muted` at 30% alpha), **the one definition**, which
+  `toolbar_icon` had inline and now calls: faded rather than hidden, since the icons in a toolbar
+  are found by position and a control that vanishes when it is unavailable moves every icon beside
+  it.
   The query pane's database selector follows the same order in its own colours — it rests in
   `bubble_claude_text` rather than `text_muted`, so it states the rule inline rather than calling
   the helper, and both halves (label and chevron) take the answer, the label by inheriting it from
@@ -10719,7 +10737,25 @@ for keyboard nav.
   screen may be minutes old, and stitching a stale page onto fresh ones would be neither. The
   statement is snapshotted before the save dialog opens for the same reason the rows are — the
   dialog is modal and slow, and a filter typed while it stood open must not change what the export
-  was asked for.
+  was asked for. **Neither menu opens on an empty result**, and both used to: they offered their
+  format list on a 0-row result and cheerfully wrote a header-only CSV, a bare `[]` or an empty
+  Markdown table — a file that describes the query rather than answering it, and a clipboard paste
+  that looks like a failure. The gate is `grid::results_offer_export(rows)`, **rows and not
+  columns**, which is the whole of the distinction: a 0-row result still carries its column list, so
+  every format can render *something* from it, and that something is exactly what is worth refusing.
+  The formats are not wrong to produce it — an export of an empty result should be an empty result,
+  not an error — the menus are wrong to offer it
+  (`grid::tests::an_empty_result_offers_the_toolbar_menus_nothing`). Deliberately **not** the schema
+  tree's `Export ▸`: that entry names a *table*, whose row count nothing on screen has read, so a
+  greyed entry there would be a question the user cannot answer by looking, where here the stats
+  line one row above already says `0 rows`. **The gate is on the action, not on the face** — the
+  pointer click and the ring's Enter/Space both funnel through the `open_copy` / `open_save`
+  `Rc<dyn Fn()>` closures, so the early return lives inside those, and dimming the icon alone would
+  have left the keyboard path opening a menu drawn as unavailable (*Buttons are in the ring too*).
+  And `has_rows` is a **live closure, not a build-time `bool`**: the toolbar outlives a re-run that
+  replaces the rows under it, so a flag read while it was built would gate the menus on the previous
+  result. It reads `gs.order` rather than the result set, because `order` is what an export actually
+  writes; the two agree today and the one that decides the file is the honest thing to ask.
   **Every way the file will differ from the grid is declared at the point of choice, not discovered
   in the file**, and the label is `export::all_rows_label(size, sorted, manual_tx)` — one tested
   function in place of the `match` the menu used to hold, which had none. Two differences, neither of
@@ -10984,7 +11020,10 @@ for keyboard nav.
   to generate would be the only thing on screen disagreeing with the greyed glyph. Copy is
   deliberately **not** labelled Ctrl+C: that key copies the selection straight to the clipboard,
   which is a different action from the format menu the icon raises. `－` and clone keep their tip
-  while dimmed and it names the selection, which is also the answer to why they are inert.
+  while dimmed and it names the selection, which is also the answer to why they are inert. Copy and
+  save keep theirs while dimmed too, in an empty-result form — "Nothing to copy — no rows" /
+  "Nothing to save — no rows": a dimmed icon says only that it cannot be used, the tip says why, and
+  without the second half the only reading left is that the app is broken.
   `toolbar_sep` takes 8px of horizontal margin on top of the cluster's own 3px gap: the icons carry
   a padded hitbox and no visible edge, so a divider set at the plain group gap reads as *part of*
   the group beside it rather than the boundary between two.
