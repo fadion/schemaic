@@ -4984,6 +4984,7 @@ version = "0.22.0"
 dependencies = [
  "floem",
  "floem_renderer",
+ "image",
  "pulldown-cmark",
  "resvg",
  "schemaic-core",

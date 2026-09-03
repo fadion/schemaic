@@ -29,7 +29,10 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector, virtual_stack};
 
-use schemaic_core::blob::{BlobKind, BlobValue, FETCH_CAP, HEX_COLS, hex_line, hex_row_count};
+use schemaic_core::blob::{
+    BlobKind, BlobValue, FETCH_CAP, HEX_COLS, PreviewVerdict, hex_line, hex_row_count,
+    preview_verdict,
+};
 use schemaic_core::format::human_bytes;
 
 use crate::theme;
@@ -318,21 +321,64 @@ fn hex_view(value: Arc<BlobValue>) -> impl IntoView {
     .style(move |s| s.size_full().background(theme::bg_editor()))
 }
 
-/// The image preview: the bytes at their natural size, in a scroll.
+/// What the image's header says it would decode to, or `None` if it does not
+/// parse as one.
 ///
-/// **Natural size, not fitted.** floem's `img` paints into whatever box layout
-/// gives it and does not honour its own `ObjectFit`, so a fitted box would need
-/// this module to know the image's dimensions — which means decoding it a
-/// second time, or hand-parsing five container formats' headers to get an
-/// answer that is wrong for the sixth. Scrolling a large image is a smaller
-/// cost than showing every image stretched.
-fn preview_view(value: Arc<BlobValue>) -> impl IntoView {
-    scroll(container(img(move || value.bytes.clone())).style(|s| {
-        s.padding(theme::scaled(12.0))
-            .items_center()
-            .justify_center()
-    }))
-    .style(move |s| s.size_full().background(theme::bg_editor()))
+/// **Reads the header and stops.** `into_dimensions` does not decode the image,
+/// which is the point: this runs *to decide whether decoding is safe*, so it
+/// must not be the thing that allocates. `with_guessed_format` sniffs the same
+/// magic bytes [`schemaic_core::blob::sniff`] does, and disagreeing with it is
+/// not a problem — a format one recognises and the other cannot measure comes
+/// back `None`, which the verdict treats as a refusal.
+fn image_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// The image preview: the bytes at their natural size, in a scroll — or a
+/// sentence saying why there is no preview.
+///
+/// **Nothing is handed to `img()` unmeasured.** floem decodes to RGBA at
+/// construction, so a preview costs width × height × 4 — driven by the header's
+/// claim, not by the blob's size, and `FETCH_CAP` bounds neither term. These
+/// bytes came out of a database, so that claim is untrusted input on the way to
+/// an allocation: a 40 KB PNG declaring 30000 × 30000 would ask for 3.6 GB.
+/// [`schemaic_core::blob::preview_verdict`] is the gate, and both of its
+/// refusals say so on screen rather than leaving an empty box.
+///
+/// **Natural size, not fitted**, because floem's `img` paints into whatever box
+/// layout gives it and ignores its own `ObjectFit` — a fitted box would have to
+/// scale by hand from these very dimensions, and scrolling a large image is a
+/// smaller cost than showing every image stretched.
+fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
+    let body: floem::AnyView = match preview_verdict(image_dims(&value.bytes)) {
+        PreviewVerdict::Show => scroll(container(img(move || value.bytes.clone())).style(|s| {
+            s.padding(theme::scaled(12.0))
+                .items_center()
+                .justify_center()
+        }))
+        .style(|s| s.size_full())
+        .into_any(),
+        PreviewVerdict::TooLarge { width, height } => note_view(
+            format!(
+                "This image is {width} × {height} — too large to preview here.                  The bytes are intact: read them as Hex, or save them to a file."
+            ),
+            false,
+        )
+        .into_any(),
+        PreviewVerdict::Unmeasurable => note_view(
+            format!(
+                "These bytes begin like a {} but cannot be read as one.                  Read them as Hex, or save them to a file.",
+                kind.label()
+            ),
+            false,
+        )
+        .into_any(),
+    };
+    container(body).style(move |s| s.size_full().background(theme::bg_editor()))
 }
 
 /// A centred line, for the states with nothing to show.
@@ -401,22 +447,23 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
     // the body re-runs `img()`, which decodes the whole buffer again.
     //
     // `epoch` is this panel's session term — a second cell is a different panel
-    // even when both are `Ready` — and `phase` plus `pane` are the only other
-    // things that change which *views* exist. The payload behind them (bytes,
-    // kind, message) arrives with the phase change that admits it, so the
-    // builder reads it untracked.
+    // even when both are `Ready` — and `phase` is the only other thing that
+    // changes which *views* exist. The pane deliberately is not a term: both
+    // panes are built once and shown by style, so switching between them is a
+    // restyle rather than a teardown, and the image is decoded once. The
+    // payload behind a phase (bytes, kind, message) arrives with the change
+    // that admits it, so the builder reads it untracked.
     let key = floem::reactive::create_memo(move |_| {
         (
             b.epoch.get(),
             b.target.with(|t| t.is_some()),
             b.state.with(phase_of),
-            b.pane.get(),
         )
     });
 
     dyn_container(
         move || key.get(),
-        move |(_epoch, open, phase, pane)| {
+        move |(_epoch, open, phase)| {
             if !open {
                 return empty().into_any();
             }
@@ -459,18 +506,36 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
                 None => empty().into_any(),
             };
 
-            let body: floem::AnyView = match (&state, pane) {
-                (BlobState::Loading, _) => note_view("Reading…".to_string(), false).into_any(),
-                (BlobState::Empty, _) => note_view(
+            // **Both panes are built once and toggled by style**, rather than
+            // one being built per switch. `img()` decodes at construction, so
+            // rebuilding the body on every Preview↔Hex would decode the whole
+            // image again each way — for a view whose bytes have not moved.
+            // Taffy filters `Display::None` out before layout, so the hidden
+            // one costs nothing to have around, and the pane is no longer a
+            // term in the panel's rebuild key.
+            let shown = move |mine: BlobPane| {
+                move |s: floem::style::Style| match b.pane.get() == mine {
+                    true => s.size_full(),
+                    false => s.display(floem::taffy::style::Display::None),
+                }
+            };
+            let body: floem::AnyView = match &state {
+                BlobState::Loading => note_view("Reading…".to_string(), false).into_any(),
+                BlobState::Empty => note_view(
                     "This cell is NULL, or its row is no longer there.".to_string(),
                     false,
                 )
                 .into_any(),
-                (BlobState::Failed(msg), _) => note_view(msg.clone(), true).into_any(),
-                (BlobState::Ready { value, kind }, BlobPane::Preview) if kind.is_image() => {
-                    preview_view(value.clone()).into_any()
-                }
-                (BlobState::Ready { value, .. }, _) => hex_view(value.clone()).into_any(),
+                BlobState::Failed(msg) => note_view(msg.clone(), true).into_any(),
+                // An opaque blob has no preview to build, so it does not get
+                // the pair — the switch that would reach it is absent too.
+                BlobState::Ready { value, kind } if kind.is_image() => stack((
+                    preview_view(value.clone(), *kind).style(shown(BlobPane::Preview)),
+                    hex_view(value.clone()).style(shown(BlobPane::Hex)),
+                ))
+                .style(|s| s.size_full().flex_col())
+                .into_any(),
+                BlobState::Ready { value, .. } => hex_view(value.clone()).into_any(),
             };
 
             // Save writes exactly what the panel is showing, so it is offered
@@ -712,6 +777,121 @@ mod tests {
             stem: "c_d".into(),
         });
         assert_eq!(ui.saved.get_untracked(), None);
+    }
+
+    // ---- the preview gate, measured -----------------------------------------
+
+    /// PNG's CRC-32 (ISO-HDLC), so [`bomb_png`] can rewrite a chunk and stay a
+    /// valid PNG. Table-less: it runs over seventeen bytes, once.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A **valid** PNG whose IHDR declares `w` x `h`, built by encoding a real
+    /// 1x1 image and rewriting that chunk.
+    ///
+    /// Rewritten rather than encoded at size, for the obvious reason: encoding
+    /// 65535 x 65535 is the very allocation the gate exists to prevent. The CRC
+    /// is recomputed because a decoder that rejected the chunk would make this
+    /// test pass for the wrong reason — `Unmeasurable` is also a refusal, and
+    /// the case under test is the one where the header parses perfectly.
+    fn bomb_png(w: u32, h: u32) -> Vec<u8> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode a 1x1 png");
+        let mut png = png.into_inner();
+        // 8-byte signature, then the IHDR chunk: length, type, 13 bytes of
+        // data, CRC. Width and height are the first eight bytes of the data.
+        png[16..20].copy_from_slice(&w.to_be_bytes());
+        png[20..24].copy_from_slice(&h.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    /// **The bomb, end to end.** `preview_verdict` has a table of pure tests,
+    /// but the property that protects the app is the *composition*: bytes out
+    /// of a database, measured, and refused before anything decodes them.
+    ///
+    /// The fixture is a genuinely valid PNG — 70 bytes on the wire, declaring
+    /// 65535 x 65535. That is 4.29 gigapixels against a 32-megapixel cap, and
+    /// handing it to `img()` instead asks for 17 GB of RGBA. Nothing about the
+    /// blob's *size* could have caught it.
+    #[test]
+    fn a_tiny_valid_header_claiming_enormous_dimensions_is_refused_before_decoding() {
+        let bomb = bomb_png(65_535, 65_535);
+        assert!(
+            bomb.len() < 200,
+            "the fixture is small: {} bytes",
+            bomb.len()
+        );
+        assert_eq!(
+            image_dims(&bomb),
+            Some((65_535, 65_535)),
+            "the header must measure cleanly — a refusal for being unreadable              would pass this test without exercising the cap"
+        );
+        assert_eq!(
+            preview_verdict(image_dims(&bomb)),
+            PreviewVerdict::TooLarge {
+                width: 65_535,
+                height: 65_535
+            }
+        );
+    }
+
+    /// The same fixture just under the cap is shown, so the refusal above is
+    /// the *cap* talking and not the rewriting.
+    #[test]
+    fn the_same_fixture_within_budget_is_shown() {
+        let ok = bomb_png(4_000, 4_000);
+        assert_eq!(image_dims(&ok), Some((4_000, 4_000)));
+        assert_eq!(preview_verdict(image_dims(&ok)), PreviewVerdict::Show);
+    }
+
+    /// An ordinary image measures and passes. Encoded here rather than pasted
+    /// as a byte array so the test states its own dimensions.
+    #[test]
+    fn a_real_image_measures_and_is_shown() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(3, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode a 3x2 png");
+        let bytes = png.into_inner();
+        assert_eq!(image_dims(&bytes), Some((3, 2)));
+        assert_eq!(preview_verdict(image_dims(&bytes)), PreviewVerdict::Show);
+    }
+
+    /// **Unmeasurable is a refusal, not a shrug.** `sniff` matches magic bytes
+    /// and stops, so a truncated or corrupt PNG still reads as one; floem would
+    /// then decode nothing and draw nothing, leaving a caption over an empty
+    /// box. The panel says so instead.
+    #[test]
+    fn bytes_that_only_look_like_an_image_are_not_previewed() {
+        // A PNG signature with no IHDR behind it — exactly what `sniff` calls a
+        // PNG.
+        let truncated: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        assert_eq!(
+            schemaic_core::blob::sniff(truncated),
+            BlobKind::Png,
+            "the premise: this is what the header claims"
+        );
+        assert_eq!(image_dims(truncated), None);
+        assert_eq!(
+            preview_verdict(image_dims(truncated)),
+            PreviewVerdict::Unmeasurable
+        );
     }
 
     #[test]

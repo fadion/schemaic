@@ -18,6 +18,17 @@ serde_json = { workspace = true }
 # is handed the app's own embedded faces (see `erd_raster`).
 resvg = { version = "0.43", default-features = false, features = ["text"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
+# **Header reading only** — `blob_view` asks an image its dimensions before
+# handing the bytes to floem's `img()`, which decodes to RGBA (width x height x
+# 4) and so costs whatever the header *claims* rather than whatever the blob
+# weighs. `ImageReader::into_dimensions` reads the header and stops, which is
+# the whole of what is needed to refuse a decompression bomb out of a database.
+#
+# Already in the tree via floem (its own `img`), same version and same compile;
+# `default-features = false` because the format decoders come from floem's
+# `image-*` features and cargo unions them. Adding a format there is what makes
+# it measurable here, which is the coupling `blob::BlobKind` already states.
+image = { version = "0.25", default-features = false }
 
 [lints]
 workspace = true
