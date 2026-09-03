@@ -537,21 +537,49 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Pull and not push, because JSON decides it**: its renderer holds a `serde_json` sequence
     serializer open across the whole array, borrowing the writer, and that is not a value a push
     API could store between calls — inverting it keeps the serializer a local in one function.
-    `OneChunk` is a source of exactly one chunk (what the grid's own export uses) and `PullChunks`
-    adapts a `FnMut() -> io::Result<Option<ResultSet>>` — the app's `rx.blocking_recv()` —
+    `OneChunk` is a source of exactly one chunk (what `render_to`, and through it the clipboard, is
+    built on) and `PullChunks` adapts a `FnMut() -> io::Result<Option<ResultSet>>` — the app's
+    `rx.blocking_recv()` —
     materialising natural order into a **reused** `Vec<usize>`, one allocation for the whole
     export against six renderers that would each have needed a second code path. `OneChunk`
     yields **even for an empty result**, which is load-bearing rather than an edge case: CSV,
     Markdown and HTML take their header from the first chunk, so a source that yielded nothing for
     a zero-row result would write an empty file where the old code wrote a header. One empty chunk
     and no chunk at all are deliberately different things
-    (`an_empty_chunk_carries_a_header_and_no_chunk_carries_nothing`). Each `export_*_chunks` is
+    (`an_empty_chunk_carries_a_header_and_no_chunk_carries_nothing`).
+    **`SliceChunks` is `OneChunk`'s sibling for rows already in memory**, handed out `size` at a
+    time — what the app's `Fetched` export renders through, so that a save of rows already in hand
+    has a count to report and a Stop that lands between blocks. **Nothing is copied**: a chunk is
+    the same `&ResultSet` plus a *slice* of the same order vector, so it is a cursor over one
+    allocation rather than a partition of the rows. It parts company with `OneChunk` at exactly the
+    place that matters — **exhaustion is `Ok(None)`, never one empty chunk** — because five
+    renderers write their header on the first chunk they see, so an empty result would gain a header
+    through this path and have none through `render_to`. A `size` of `0` is clamped to the whole
+    slice rather than rejected: the figure comes from a tuning constant, and an export that spins
+    handing out empty chunks forever is a worse answer than one that writes a single block. Its one
+    hook is `SliceChunks::watching(f)`, `f: FnMut(u64) -> bool`, called as each chunk is handed out
+    with the **running row total** and returning `false` to stop — **one hook doing both jobs on
+    purpose**, because the caller reports to its progress channel and asks its cancellation token at
+    the same instant and out of the same closure, and two hooks would be two chances to ask them at
+    different moments, which is how a Stop comes to be noticed one chunk late. A `false` surfaces as
+    an `io::Error`, because that is the only way a `RowChunks` can end an export *without* it
+    looking finished: the renderers treat `Ok(None)` as end-of-stream and would publish a truncated
+    file as a complete one — the same reasoning, and the same failure, as `PullChunks`'
+    cancelled-read arm. Chunking a result that used to render whole must be invisible in the file,
+    and that is the whole risk of the change: `chunking_a_fetched_result_cannot_change_the_bytes`
+    renders every text format at every chunk size from 1 to len+1 and compares byte for byte
+    against `render_to`, and
+    `a_stopped_export_writes_nothing_through_the_renderer` asks the seam question of every format —
+    `stream_to` must propagate the refusal rather than treat it as a short read, since each writes a
+    header on the first chunk and a swallowed error would leave a header-only file looking valid.
+    Each `export_*_chunks` is
     now the *only* implementation: every `*_to<W: io::Write>` form is that function over a
     `OneChunk` and `ExportFormat::render_to` is `stream_to` over one, returning the same
     `io::Result<ExportTally>` — so there is no buffered renderer and streamed renderer to keep in
-    agreement, with the `String` versions still thin wrappers for the clipboard. `render_to` is the
-    wrapper the app's `Fetched` export calls: building the `OneChunk` and calling `stream_to` at the
-    call site is that body verbatim, and doing so left `render_to` with no production caller at all. Two tests hold that together —
+    agreement, with the `String` versions still thin wrappers for the clipboard. `render_to` is now
+    reached in production **only** through those wrappers: the app's `Fetched` export moved off it
+    onto `SliceChunks` when it gained a progress modal, so what is left of it is the one-chunk
+    spelling the clipboard and the tests render through. Two tests hold that together —
     `streaming_render_matches_the_string_render_in_every_format` for the byte-for-byte agreement
     per format, and `a_chunked_export_matches_the_same_rows_in_one_go` for the same rows split
     into blocks rendering identically; add a new format by writing the `*_chunks` and wrapping it.
@@ -695,6 +723,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     None of the three is an error — the file is written and the rows in it are real — so the one
     thing that must not happen is the caveat going unsaid, which is `export_note(tally, name,
     streaming)`'s job: silent for a clean non-streamed save, and never silent when there is a caveat.
+    **Nothing in production passes `false` any more.** The grid export reports into a modal that
+    stays up until it is dismissed, and a confirmation saying nothing about a clean save would be a
+    dialog reporting silence, so both call sites — the grid's and the dump's — and `files_note` ask
+    with `true`; the silent arm survives with only its tests for callers.
     `export_failure_note(message, partial)` is the same rule on the other side, and what it has to
     say changed with `part_path`: the destination is no longer opened until the export succeeds, so
     the sentence is not "your file is a fragment" but `— <name> was not changed; the rows that were
@@ -706,6 +738,32 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     pointing at it directs the user to an empty file. Both are pinned across every format by
     `neither_note_points_at_an_empty_sibling`, which asserts the `.part` sentence appears exactly
     where `writes_incrementally` says and that the *destination survived* half is said either way.
+    **The schema tree's folder export has three sentences of its own beside those**, and they are
+    here rather than in the modal's callback for the reason `absorb` is here: a report with arms
+    (nothing finished, some finished, a table ticked and never found) is a decision, and one written
+    inside a `create_ext_action` is a decision the suite cannot reach. `files_note(files, tally,
+    folder, missing)` **delegates the caveat half to `export_note`** rather than restating it — a
+    folder loses exactly what a single file does, and the wording of a loss belongs in one place —
+    and asks it with `streaming: true`, since a folder has no other way to say how much arrived and
+    `export_note` is otherwise silent on a clean write. What it adds is the count, a folder's
+    completeness not being visible at a glance, and the `missing` tables named last for the reason
+    `DumpPlan::missing` is named at all. `files_cancel_note(files, folder)` parts company with
+    `export_cancel_note` on purpose: a stopped single-file export has nothing but a fragment to talk
+    about, while this one leaves **whole, published files** behind — each renamed into place only
+    once its table was complete — so it leads with what the user kept and mentions the unwritten
+    table second, or not at all when no file finished. `files_failure_note(message, files, folder)`
+    follows `export_failure_note`'s `None` rule through `files == 0`: an export refused before the
+    first file lands must not send the user to a folder nothing was written to.
+    **`export_file_names(tables, format)` is what names those files**, and what it adds over
+    `suggested_filename` — whose sanitizing rule it reuses rather than repeating — is the part a
+    single file never needed: **uniqueness**. Two distinct tables can sanitize to one name (`a:b` and
+    `a*b` both become `a_b`), and Windows and macOS fold case, so `Orders` and `orders` are one file:
+    a folder export that trusted the names would write the second table over the first and still
+    report both. A later duplicate gets `_2`, `_3` before the extension, and the suffix is checked
+    against the set too, so a real `a_b_2` standing beside two tables that both want `a_b` is not
+    clobbered by the deduplicator's own choice
+    (`export_file_names_suffix_does_not_collide_with_a_real_table`). Names come back in the
+    selection's order, one per table, so the caller can zip the two.
     And
     `all_rows_label(size, sorted, manual_tx)` is the Download menu's `All rows` entry, three
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
@@ -945,6 +1003,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     re-introspection is deliberate (a backup of a shape the server no longer has is not a backup) and
     this is its cost, so it is reported rather than silent: a file one table short of what was ticked
     looks exactly like a complete one, and only the sibling *preselect* case was ever named.
+    **`file_plan` is the folder export beside `plan`, and deliberately not `plan` with its options
+    turned down.** The five non-SQL formats write one file per table, and the row step is where the
+    two genuinely differ: a dump's `SELECT` names its columns through `exported_columns`, which
+    leaves out everything the server assigns for itself, while a CSV of `orders` without `orders.id`
+    is not the table — so this reads `SELECT *`. Views are included for the mirror-image reason: a
+    view gets structure and no rows in a dump because an `INSERT` into one is not a restore, and a
+    CSV of a view is simply its rows. The two differ in exactly the place a shared step would have
+    hidden. Everything else is shared where it can be: the file names are
+    `export::export_file_names`, so the sanitizing and collision rules are stated once, and they are
+    taken from the **resolved** tables so the counter that breaks a collision is not spent on a table
+    that will never be written (`file_plan_breaks_a_file_name_collision`). `FilePlan::missing` is
+    `DumpPlan::missing`'s guarantee word for word, and `FileStep` keeps the table's namespace so the
+    writer can name the source the way the SQL export does. None of the ordering work above applies
+    to it — one file per table, and nothing in one file refers to anything in another.
     **Ordering is a topological sort over `TableInfo::foreign_keys`** (`order_tables`): a referenced
     table before the table referencing it, views last — a view's body selects from the tables above
     it and it holds no rows to order against anything — and ties broken by name, so two dumps of one
@@ -5110,7 +5182,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - `script_view.rs` — the **script-load** modal, **Import** to the user, over `core::script`; the
     inverse of `dump_view.rs` below, and the entry directly *above* it in the two menus that carry
     both (a database's and a PostgreSQL namespace's), where the group reads
-    **`Import → Export → Create ▸`**. Those menus could write a `.sql` file nothing here could read
+    **`Import → Export ▸ → Create ▸`**. Those menus could write a `.sql` file nothing here could read
     back, which is the hole this closes. **Import leads and the order is not alphabetical**: it is
     the entry that changes the database, so it takes the slot furthest from where the pointer rests
     after a right-click — the reasoning that keeps `Drop` last everywhere else in these menus.
@@ -5145,9 +5217,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `run_verdict` rather than a second, laxer gate.
   - `dump_view.rs` — the **schema + data dump** modal, **Export** to the user, over `core::dump`.
     Three entry points and one modal: a database's schema context menu and a PostgreSQL namespace's,
-    where it is the middle of **`Import → Export → Create ▸`** — the three entries about the node as
-    a whole, behind their own separator — and a **table's, directly below *Import***. All three pair
-    it with the import it is the round trip of. It is the one label that sits inside a writing group
+    where it is the middle of **`Import → Export ▸ → Create ▸`** — the three entries about the node
+    as a whole, behind their own separator — and a **table's, directly below *Import***. All three
+    pair it with the import it is the round trip of. **`Export` is a submenu of six**, one entry per
+    `export::ExportFormat::ALL` — JSON, CSV, SQL, Markdown, HTML, Excel, in the order the grid's
+    Download menu already lists them, so a user meets the formats in one order throughout the app.
+    All three nodes build it through the one `overlays::export_submenu(ui, database, schema,
+    preselect)`: the entry is the same offer wherever it appears and the arms differ only in what
+    they hand the picker, while spelled out per arm the six labels and their order would be three
+    lists to keep in step. It is the one label that sits inside a writing group
     without writing anything, which is why `menu_order_gate` exempts it from the skeleton by name:
     it writes a *file* and never the server, so it can never be the irreversible entry the ordering
     exists to place. The table
@@ -5156,8 +5234,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     narrowing to the table's own namespace would hide the neighbours its foreign keys point at. It is
     offered on a **read-only** connection, unlike Import — it reads the server and writes a local
     file. The code keeps the `dump` name throughout, for the reason `core::dump`'s entry gives. It
-    collects a table selection and the six `DumpOptions` and hands both to
-    `SchemaActions::dump_run`; nothing here builds SQL. The picker is **its own read**
+    collects a table selection and — for `Sql` — the six `DumpOptions`, and hands both to
+    `SchemaActions::dump_run`; nothing here builds SQL.
+    **One panel serves all six, and the split is asked as a capability.** Which entry was clicked is
+    `DumpTarget::format`, and `DumpTarget::writes_folder()` — `!matches!(format, Sql)`, written once
+    — is what the modal branches on: the title (`Export sakila to CSV`, the one thing about this
+    panel the body cannot show and the user cannot change from here), whether the option sections are
+    built at all, which dialog opens, which writer launches, what enables the footer's Export, and how
+    the outcome is worded. Six sites, and a `format == Sql` spelled out at each is six chances for one
+    of them to disagree with the others. `Sql` is the dump this module was written for, unchanged.
+    The other five write **one file per table into a folder** (`dump::file_plan` →
+    `SchemaActions::files_run`), and for those the two option sections are **not built**, not merely
+    hidden: every row in them is a `focusable_toggle_row`, so constructing and then hiding them would
+    leave eight tab stops behind controls that are not on screen — which is why they were lifted into
+    `dump_options(d, dialect, ring)`, and a `form_hint` naming the format takes their place. Shown
+    greyed instead they would read as options this format happens to have turned off, which is not
+    what they are: every one of them is about a `.sql` file, and a CSV can honour none of it.
+    `run_export` is the **one** branch point and the only place either writer can start, because the
+    thing that must never happen is a modal opened on CSV launching the dump. `run_files` opens a
+    **directory** dialog (`FileDialogOptions::select_directories()`, the first folder picker in the
+    codebase) and repeats every guard `run_dump` has, for the reasons stated there: the selection is
+    re-read *after* the dialog closes because floem's dialog is not window-modal and the modal stays
+    live behind it, the launch goes through `accept_dialog_launch` because by then the modal that
+    asked may be gone, and the outcome checks `generation` because closing the modal does not stop the
+    export. Its three sentences are `export::files_note`/`files_cancel_note`/`files_failure_note`
+    rather than the dump's, because all three are about a folder. The picker is **its own read**
     (`SchemaActions::dump_tables` → `Db::fetch_table_list`, names only — `fetch_schema` would read
     every column of every table to print them), because it has to be right for a database the tree
     has never been expanded on, where a picker built from the cached tree would silently offer
@@ -5220,10 +5321,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     land below the fold; nothing about the run is written there now. The progress line is its
     **own** `dyn_container` inside the footer's, because it ticks once per table and rebuilding the
     buttons beside it on each tick would take the focus ring with it. The whole footer is a `dyn_container` keyed on
-    running / the chosen set / `DumpUi::options().is_empty()` / the outcome, the shape the import
-    footer uses and for the same reason: `action_button` takes a plain `bool`, so a state read while
-    the panel is built is the state at build time, and an `Export` button left enabled after the last
-    table is unchecked launches an export of nothing.
+    running / the chosen set / `!folder && DumpUi::options().is_empty()` / the outcome, the shape the
+    import footer uses and for the same reason: `action_button` takes a plain `bool`, so a state read
+    while the panel is built is the state at build time, and an `Export` button left enabled after the
+    last table is unchecked launches an export of nothing. **Only the dump can have nothing to
+    write**, which is what the `!folder` is doing: the six toggles are what `options().is_empty()`
+    reads, a folder export does not show them, and asking it there would leave Export disabled by
+    controls that are not on screen and whose last values came from someone else's dump.
     It is painted in the DDL group, so `modals::ddl_modals_up` has to name `ui.dump.target` — the
     wrapper's `inset(0)` otherwise resolves against a box that predicate is keeping at zero by zero,
     and the modal renders nothing at all. The foreign-key toggle is offered only where
@@ -5233,6 +5337,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `watch_connection` closes the modal when the active connection changes under it — the Export
     button would otherwise launch against a `conn_id` that is no longer selected — unless a dump is
     running.
+    **The grid export's progress modal lives in this file too** (`export_progress_overlay`),
+    which is a different feature reached from a different surface and is nonetheless this panel's
+    footer with nothing above it: the same running line, the same red Stop in the same fixed slot,
+    the same backdrop. Someone who exports a database from the tree and a result from the grid meets
+    one thing twice, and keeping the two side by side in one file is what makes that survive the next
+    change to either. It is mounted in the **third** slot of the tuple element `dump_overlay` and
+    `script_overlay` already share — the stack is at floem's 16-arity limit, and the three can never
+    be up together — so it has to be named in `modals::ddl_modals_up` for the reason the other two
+    are, and it is the shape most likely to be forgotten of the three: a modal nobody opens
+    deliberately, raised by an export started somewhere else entirely. Its one line counts against
+    `ExportTarget::total`, and **the `~` on that figure is conditional**: it is drawn only where
+    `approx` says the denominator is the catalogue's guess, because a `Fetched` export knows exactly
+    how many rows it holds and dressing that up as an estimate hedges a number that needs no
+    hedging. **The outcome then replaces that line in the same slot**, the way the dump's does —
+    green for a clean write, the error colour for a failure *or* a cancel — and the line beneath it
+    switches from `Writing <file>` to `File: <file>`, so the panel cannot describe a file still being
+    written beside a sentence saying it is finished. Its `dyn_container` is keyed on
+    `(target, done, error)` rather than on `target` alone: the panel has to be rebuilt when the run
+    ends for the footer to change word and colour, and reading only `target` left a finished export
+    showing a red Stop over a file that was already written. For one revision it reported nothing at
+    all, on the argument that the grid's bar told the whole story in one strip; that bar has no
+    export state any more. The state behind it (`ExportUi`, the single `exit` closure both its exits
+    run, and who may write into it) is in *Data grid*.
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
     designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
@@ -6636,9 +6763,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     through `log_result_set` and hands an `ExportRequest` to the app's `ExportFn` worker with
     `source: None` and a default dialect, both of which only the SQL renderer would read. The log is
     always `ExportScope::Fetched` — it is a record of what the monitor saw, not a query anything
-    could re-run — so its `ExportOutcome::Cancelled` arm cannot arrive, and it is spelled out as an
-    explicit no-op rather than folded in with `Done`: marking the log exported off a half-written
-    file would stop Clear asking about it (`monitor::discard_needs_asking`).
+    could re-run — and it asks for **`stoppable: false`**, which is what keeps it out of the app's
+    single export-cancel slot: nothing in this modal offers a Stop, so no token this run watches is
+    ever cancelled, and a run in the slot would refuse the grid's export (and be refused by it) over
+    a window the user cannot see. So its `ExportOutcome::Cancelled` arm does not arrive, and it is
+    spelled out as an explicit no-op rather than folded in with `Done`: marking the log exported off
+    a half-written file would stop Clear asking about a log that was never fully saved
+    (`monitor::discard_needs_asking`). **The reason is not the one the arm shipped with.** It used to
+    be that a log export is never streamed and the `Fetched` scope was uncancellable by construction;
+    that stopped carrying the argument the moment the `Fetched` render was chunked and gained a Stop
+    between blocks, and for a while the arm rested on a fact that no longer implied anything. What
+    holds it now is the absence of any control bound to this run, which is exactly what
+    `stoppable: false` says.
     `status_line(export_err, poll_err, paused, partial, capped)` decides what the sub-header says:
     an error takes the line outright, worst-to-mislead first (a failed export beats a poll error,
     because the user believes they have a file and doesn't), and otherwise it is a lead — `Watching`
@@ -6892,10 +7028,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   override on a fresh manual run is the other half: a raised cap belongs to the result it was
   raised for, and carrying it forward would be the global setting the user didn't change.
   **The export is the other way past the cap, and it is a different shape.** `export_file` branches
-  on `ExportScope`: `Fetched` is the one `spawn_blocking` it has always been and writes through
-  `ExportFormat::render_to`, which is exactly a `OneChunk` plus `stream_to` — spelling that pair out
-  at the call site instead left the wrapper with no production caller and two copies of one
-  construction to drift apart. `AllRows` is
+  on `ExportScope`: `Fetched` is the one `spawn_blocking` it has always been and needs no channel of
+  rows, everything being in memory already — but it renders in `EXPORT_CHUNK_ROWS` blocks all the
+  same, through `export::SliceChunks` rather than `ExportFormat::render_to`. **Not for memory**: the
+  rows are in hand and a chunk copies nothing either way. It is for the two things a single block
+  cannot offer — **progress**, since rendered whole there is no moment between "started" and
+  "finished" at which anything can be reported and a large Excel export is indistinguishable from a
+  hung one, and **a Stop that works**, between blocks being the only place a synchronous render can
+  notice one. It reports through the same `export_tx` channel the streamed arm uses, out of the one
+  `watching` closure that also asks the token. The arm's outcome match therefore carries an
+  `Err(_) if token.is_cancelled() => ExportOutcome::Cancelled` arm, the token being the witness
+  because the refusal's error text cannot be told from a write error's; it asks the token once more
+  before `publish`, so a stopped render is never renamed over the destination; and its failure arm
+  runs the same `writes_incrementally()` sweep the streamed one does, so a buffered format's
+  zero-byte `.part` is removed rather than left for a message to point at. `AllRows` is
   **two tasks and a bounded channel of 2** — the reader is async (two of the three drivers are) and
   the writer is synchronous file IO, which must not run on a runtime worker. The writer's
   `PullChunks` closure turns a channel `Err` into an `io::Error` and a channel close into
@@ -6907,13 +7053,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   count is the wrong unit for a promise about memory (see `schemaic-db`'s streaming account). `export_token` is an
   `Rc<RefCell<Option<CancellationToken>>>` in the same shape as `import_token` — cleared when a run
   reports, so a later Cancel can't cancel an export that already finished.
-  **One slot means one streamed export, and the second is refused rather than queued or keyed.**
+  **One slot means one export, and the second is refused rather than queued or keyed.**
   Two sharing the slot is what the shape would otherwise permit: Cancel reached only the later one,
-  and whichever finished first cleared the slot and left the other with no way to stop it. The
-  `AllRows` branch therefore answers `ExportOutcome::Failed("An export is already running. Cancel it
-  or wait for it to finish.")` while the slot is full, rather than growing into a keyed map — a
-  single slot is correct once nothing can overwrite it. Only that branch asks: a `Fetched` save
-  takes no token and is never refused. `import_token` gets away with the same shape and no refusal
+  and whichever finished first cleared the slot and left the other with no way to stop it. Either
+  branch therefore answers `ExportOutcome::Failed("An export is already running. Cancel it
+  or wait for it to finish.")` to a run that would claim a full slot, rather than growing into a
+  keyed map — a single slot is correct once nothing can overwrite it. **What claims it is
+  `ExportRequest::stoppable`, not the scope.** The slot exists so one Stop always reaches the run it
+  points at, and it refuses a second export to keep that true — so only a run somebody can stop needs
+  to be in it.
+  `grid::save_export` answers `true` for both of its scopes, the progress modal carrying a Stop for
+  both; `monitor_view`'s log export answers `false`, and is therefore never refused and never
+  refuses. Claiming the slot on the *scope* alone was a real regression for exactly that save: the
+  Live Monitor's log is `ExportScope::Fetched` too, so a log export begun while a grid export ran met
+  *"An export is already running"* — a message about a modal the user cannot see, for a save that has
+  nothing to do with theirs — and a grid export begun while a log was writing met the same. Among the
+  runs that *do* claim it there is no save the refusal can cost, because the modal covers the window
+  while one is going: there is no second grid export to start. An unstoppable run gets its own
+  `CancellationToken` that nothing ever cancels, so the arm's two token checks are constant-false and
+  that path behaves exactly as it did before the `Fetched` render was chunked. **The completion
+  action clears the slot only when `stoppable` too** — otherwise a log export finishing would release
+  it out from under the grid export actually holding it, and the next Stop would reach nothing. The
+  log export's side of this is in `monitor_view.rs`'s entry.
+  `import_token` gets away with the same shape and no refusal
   only because its modal admits one run at a time, while the Download menu sits on every result tab.
   **The offer wears the accent, and its separator does not.** It shipped `text_dim` like the
   description beside it, reaching the accent only under the pointer — which put the one escape from
@@ -7381,9 +7543,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     disk, while a dump can only be launched from a modal that already refuses a second one, and
     folding the two together would let a running result-set export's Cancel stop a dump the user
     cannot even see. (Both features are called Export in the interface, which is why that sentence
-    names which one it means; `core::dump`'s entry has the naming split in full.) The sentences this
+    names which one it means; `core::dump`'s entry has the naming split in full.) **The folder
+    export shares that slot rather than taking a third**, which is the opposite call and rests on the
+    same fact: `files_run` and `dump_run` are launched from the one modal, which refuses a second run
+    while either is going, so the two can never be in flight together — and separate slots would only
+    create the case where the footer's Stop reaches neither. Its progress rides the dump's channel
+    for the same reason: it is the same footer line counting the same `3 of 12`. The sentences this
     module produces are worded for the interface — `Export failed: {e}`, and
     `Nothing to export — no table matched the selection.` for a plan with no steps.
+    **`run_files` is the file-per-table sibling of `run`**, over `core::dump::file_plan`, and it
+    keeps every one of the guarantees above **per file**: a freshly introspected schema, rows
+    streamed rather than gathered, a `.part` sibling (`write_one`) renamed over the destination only
+    once that table is whole, the token checked *before* that rename and asked again after the join
+    — a stop that lands between the last chunk and the publish never reaches the reader at all, so
+    the writer's refusal would otherwise be reported as a failure — a cancelled read raised as a
+    channel *error* rather than read as end of stream, and the
+    `writes_incrementally` sweep so a failed `Xlsx` leaves no zero-byte `.part` in a folder the user
+    is about to go looking through. **The loop is sequential, one table at a time, on purpose**:
+    writing four at once would need four connections and four sets of blocks in flight, and it would
+    make the progress line's `3 of 12` a lie about what is happening — a folder export is disk-bound
+    at the end anyway. The per-file tallies are folded with `ExportTally::absorb`, the same fold the
+    single file uses, so one sentence can name what none of them could carry. `FilesOutcome` is its
+    own type rather than `DumpOutcome` because all three of its endings count **files in a folder**,
+    which is the one thing the dump's three never have to say.
   - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
     adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
     system allocator. It exists to answer one question the OS can't: whether memory growth is a
@@ -8637,7 +8819,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   it. It is deliberately weak in the way its three siblings are — files, not counts,
   because a count fails on an innocent refactor and a gate that cries wolf gets deleted, while the
   failure worth catching is a backdrop appearing somewhere *new*, and a new place is nearly always a
-  new file. A second test pins the other direction on the *returned closure* rather than the
+  new file. That weakness has since taken a shape worth naming: `dump_view.rs` paints **two**
+  backdrops now — the dump modal, and the grid export's progress modal built beside it —
+  and because the file was already on the list, the second arrived with nothing checking it. A
+  file-granular gate cannot see a second overlay added to a file it already knows, which is the price
+  of not counting. A second test pins the other direction on the *returned closure* rather than the
   function — binding a predicate and then not `||`-ing it in is precisely the mistake, and it leaves
   the binding's name in the body, so scanning the function would pass — asserting the terms are in
   the answer: the three grouped predicates (`ddl`/`workspace`/`settings`) and the three open
@@ -8768,6 +8954,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   multiplied by `level_indent()` *inside* each style closure, and a count cannot be frozen at a scale
   because it does not know about one. The grid's stored column widths are the same fact where the
   fix has to be an effect instead — see `rescale_widths` under *Data grid*.
+  **The opposite error costs as much and reads as tidier**: a key narrower than what the child
+  renders never rebuilds it at all. `dump_view::export_progress_overlay` keys on
+  `(target, done, error)` for exactly that reason — keyed on `target` alone, which is the one signal
+  that says whether the modal is up, a finished export went on showing a red Stop over a file that
+  was already written.
 - **An effect that writes the signals it reads must read them untracked — and an outside write to
   them is then invisible, so it needs a generation counter.** The schema tree's size-column effect
   scans every `ConnNode::stats` slot for `Idle` and writes `Loading` into each one it fetches;
@@ -9645,6 +9836,14 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   ordering keeps off the cursor, and the position that does matter is still pinned by
   `drop_is_the_last_entry_before_ai_explain`. The skip is a `continue` on that one label inside the
   test, not a lenient `group` — an unknown label still fails, which is the part that stops drift.
+  **A skip is only honest while the scan can still see the thing it is skipping**, and that stopped
+  being free the day `Export` became a submenu built by `overlays::export_submenu`: the constructor
+  moved into the helper, so without a branch of its own `built_entries` finds no `Export` in any menu
+  at all, the `continue` never runs, the comment above it describes nothing, and the day someone
+  gives `Export` a group there is no entry to check it against — a dead branch that still reads as
+  live coverage. `the_scan_sees_the_export_submenu_in_all_three_arms` pins that seam by asserting the
+  three arms it is found in, which is the assertion a test written against the scanner alone would
+  have missed.
   Four things the scan has to get right, each of which made it wrong first: comments are cut out of a
   constructor's span (one entry explains its own label with `"(0)" reads as a broken count` two lines
   above the label, and the scan read the comment as the name); a label is read only from the span
@@ -9653,7 +9852,8 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   `Favorite` and the key row's `Edit` from the group check; and only entries pushed into `entries`
   count, because the colour swatches are `MenuEntry`s too — with `entries.extend(create_submenu(…))`
   counted as the `Create ▸` entry it is, or the two arms that write through it would look as though
-  they stop at the read group.
+  they stop at the read group, and `entries.push(export_submenu(…))` counted the same way for the
+  same reason.
   The Table arm's `Truncate`/`Drop` name the **scale** of what they delete when a row figure is
   already in `ConnNode::stats` (`stats::truncate_prompt`/`drop_prompt` decide the words and whether
   a figure is worth naming). It is read, never fetched: the menu is built on the right-click, so a
@@ -10430,20 +10630,22 @@ for keyboard nav.
   a batch landing, a pin, a filter re-run restating its panel — reaches that container, and
   `QueryState` has no `PartialEq` to dedup on. Keyed on the state it rebuilt the bar on all of them,
   including on every keystroke, since typing clears a stale error through the same signal.
-- **That bar has four states on two surfaces, and the surface is the message.** The red fill means
+- **That bar has three states on two surfaces, and the surface is the message.** The red fill means
   an error; the ordinary chrome carries the wait note (a write taking long enough to explain, with
-  its one-click `Rollback`), a plain **note** — something worth saying about an operation that
-  *worked* — and the running export above. The note exists because there was no non-red channel: a
+  its one-click `Rollback`) and a plain **note** — something worth saying about an operation that
+  *worked*. There was a fourth, a running export, and it has gone with the whole of the bar's export
+  state — see the export bullet below. The note exists because there was no non-red channel: a
   partial paste used `commit_err`, so an ordinary success was drawn in the colour that means a
-  write-back failed. The six signals travel as one `BarSignals`, whose `any_up` is asked by the
+  write-back failed. The four signals travel as one `BarSignals`, whose `any_up` is asked by the
   bar's own style **and** by the selection summary that lifts itself above it — two hand-written
   copies of the same `is_some` chain before, which a new surface would have had to be added to
   twice, and a bar that is up while the summary thinks it isn't is the two of them drawn on top of
-  each other. **What travels in `BarSignals` is state, never an action**: `export_cancel` is an
-  `Rc<dyn Fn()>` parameter of `grid_error_bar` beside `rollback_tx`, because the struct is
+  each other. **What travels in `BarSignals` is state, never an action**: `rollback_tx` is an
+  `Rc<dyn Fn(usize)>` parameter of `grid_error_bar` rather than a field, because the struct is
   `#[derive(Clone, Copy)]` and an `Rc` in it would cost every reader of `any_up` a clone.
-  `results_section` reads the flag and the action off `GridCtx`, so `GridState` keeps no copy of the
-  latter. On the writing side, `GridState::clear_bar` is the one way the bar comes down: seven
+  `export_cancel` was the second such parameter until the export's Stop moved to the modal, which
+  reaches it on `TabsActions` directly. `results_section` reads the action off `GridCtx`, so
+  `GridState` keeps no copy of it. On the writing side, `GridState::clear_bar` is the one way the bar comes down: seven
   identical copies of `if commit_err.is_some() { … }` were what a second signal would otherwise have
   had to be added to seven times. **`discard_edits` takes the whole bar down, not just its error
   surface** — Discard means "none of that is true any more", and the *note* surface is the one that
@@ -10533,57 +10735,57 @@ for keyboard nav.
   its `~` belong to the stats line's vocabulary rather than to this decision; `sorted` comes in as a
   parameter of `export_menu` rather than off `GridState`, because the sort does not
   live there — it is `grid_view`'s, threaded to the header and the toolbar — and `manual_tx` reaches
-  it through the `tx_mode` signal `GridCtx`/`GridState` gained for exactly this.
-- **A running export is the bottom bar's fourth state, and its Cancel outlives the result.** Only a
-  *streamed* export raises it — a snapshot of rows already in memory is written faster than a notice
-  about it would be read — and `BarState::Exporting` draws `Exporting… Cancel` (`export_bar`) on the
-  note's own fill, with **Cancel** at the right in `theme::err_fix_btn()`, the bar's action colour
-  that the error surface's **View** and the wait note's **Rollback** already use. **It began on the
-  stats line and moved**, which is worth writing down because it is the kind of thing that gets
-  tidied back: that line is the result's own and is the crowded end of the panel — a capped result
-  already spends it on `db · 1k of ~16k rows · read 5k rows`, and a fourth clause pushed the whole
-  line toward the toolbar icons. The bar is empty almost always, is the full width of the grid, and
-  **already owns the report this turns into**: the same strip now says `Exporting… Cancel` and then
-  `Exported 16k rows to employees.csv`, so one operation occupies one place from beginning to end
-  instead of announcing itself in one surface and reporting in another. It sits **above `Note` and
-  below `Error`/`Wait`** in `grid_error_bar`'s chain — a running export is not a problem, so an error
-  or a stalled write outranks it, but it *is* live where the note it will become is not, and a
-  leftover note must not sit on top of a Cancel the user may still need. The same ordering is why
-  `save_export` takes down the bar's *stale* messages before setting the flag: `Exporting` outranks a
-  note but not an error, and a failure left standing would otherwise hide the Cancel for as long as
-  the export ran. That is **two clears, not one** — `GridState::clear_bar` covers the commit pair,
-  and the filter/sort error is the third dismissible message and needs saying separately under its
-  own `is_some` guard, exactly the way `dismiss_overlays` already pairs the two. `clear_bar` is
-  deliberately not widened to swallow `view_err`: its contract is the commit pair and it runs on the
-  keystroke paths, where the guard exists to keep a bar that is already down from invalidating its
-  container. The other two bar states are left standing on purpose, and that is the interesting
-  half. A stalled write's note (`commit_wait`) is **live, not stale** — the Rollback it offers is the
-  more urgent action, so it may sit on top of a running export for as long as the write is out. A
-  statement's own failure means **no grid is mounted** to export from, so it cannot coincide —
-  and it is not this bar's message any more anyway: `batch_err` is gone, and a statement failure
+  it through the `tx_mode` signal `GridCtx`/`GridState` gained for exactly this. **The estimate
+  travels with the choice**: `export_menu` hands the same figure to `save_export`, which puts it on
+  `ExportTarget::total`, so the number the user chose from and the number they then watch tick up are
+  one read of the catalogue rather than two taken minutes apart.
+- **The grid export has no bottom-bar state at all: the modal is its single affordance, from launch
+  to dismissal.** The bar used to carry both halves — `BarState::Exporting` drawing `Exporting…
+  Cancel` (`export_bar`) while the write ran, then the outcome sentence in the same strip, so one
+  operation occupied one place from beginning to end instead of announcing itself in one surface and
+  reporting in another. That was the right answer while the bar was the only surface, and the
+  progress modal ended it: with a modal covering the window for every grid export, both scopes, the
+  strip was a second place saying the same thing to nobody, behind a backdrop. Whether the running
+  half should go was posed here as an open question; **it has gone, at the user's direction, and the
+  outcome went with it.** Deleted with it: `grid::ExportRun`, `grid::export_finished`,
+  `BarSignals::exporting` / `tab_id` / `exporting_here()`, `GridState::exporting` / `tab_id`,
+  `GridCtx::exporting` / `tab_id` / `export_cancel`, and the window-scoped `exporting` signal in
+  `lib.rs`; `BarSignals::any_up` lost its `exporting_here()` term, and `grid_error_bar` its
+  `export_cancel` parameter — the modal reaches `ui.tab_actions.export_cancel` directly. **The
+  fourth arm is worth a line on its way out**: `Exporting` was the only state standing for an
+  operation *in progress* rather than for its result, and so the only one carrying a control that
+  stopped something. What is left is uniformly the tail of something that has already happened —
+  which is why `save_export` no longer takes the bar's stale messages down before it starts, there
+  being no export state left for a leftover error to outrank, and why
+  `the_bar_is_down_when_nothing_has_happened` pins that a bar holding none of the three is down:
+  `any_up` also decides whether the selection summary lifts itself, so a bar that thought it was up
+  for the length of a write would dim that summary throughout an operation it no longer reports.
+  `GridState::clear_bar` keeps its contract unchanged — the commit pair, with the filter/sort error
+  said separately under its own `is_some` guard, the way `dismiss_overlays` pairs the two — and is
+  still deliberately not widened to swallow `view_err`, because it runs on the keystroke paths where
+  the guard exists to keep a bar that is already down from invalidating its container.
+  **Of the two questions the deleted `ExportRun { id, tab }` answered, one went and one survived.**
+  `tab` was why the flag could outlive a tab switch, and it existed to keep `Exporting… Cancel` off a
+  tab that had nothing to do with the export; with no bar state there was no reader left for it.
+  `id` survives as `grid::next_export_id() -> u64`, monotonic per process and a counter rather than a
+  token clone because comparison is all that is wanted; the question it answers did not go away:
+  **which run owns the modal.** The lifetime lesson that moved the flag to the window survives
+  too, one surface over — the export's cancellation token is app-global (`main::export_token`), so
+  state with a shorter life than the token is a Stop that can vanish while the thing it stops runs
+  on. The modal's signals are window-scoped where the bar's were built per active-tab render, which
+  is a real gain rather than an accident of where they live: an export outlives the result that
+  launched it, so a report arriving after a re-run used to land on a disposed signal and be lost
+  entirely. The states that remain are unaffected by any of this. A stalled write's note
+  (`commit_wait`) is **live, not stale** — the Rollback it offers is the most urgent thing on that
+  strip. A statement's own failure means **no grid is mounted** to export from, so it never had to
+  share the strip with one — and it is not this bar's message any more anyway: `batch_err` is gone,
+  and a statement failure
   goes to the editor's error bar, under the SQL that produced it and beside the Explain and AI fix
   that act on it. (Which is why a failure now *un-collapses* the editor: `Collapse the editor` is a
   button in the RESULTS pane and it sets that pane to height 0, so the message, **View**, **AI
   fix** and **Explain** were all unreachable for exactly the run that needed them. Revealing the
   bar in place is not available — a child overflowing out of a zero-height parent is painted and
-  never hit-tested.) `GridCtx::exporting` / `GridState::exporting` is `Option<grid::ExportRun>` —
-  `{ id, tab }` — and it answers two questions that used to be one `bool`, each of which had its own
-  failure. **`tab` is why the flag may outlive a tab switch.** The export's cancellation token is
-  app-global (`main::export_token`), so a flag with a shorter life than the token is a Cancel that
-  can vanish while the thing it stops is still running: created per active-tab render, it was
-  disposed on switching away and rebuilt empty on switching back, and the stream ran on for minutes
-  with no control bound to it and every further `All rows` request refused. The signal is created
-  **once for the window, in `center` beside `export_cancel`**, the action that stops it, and the
-  launching tab rides *in* the value, which is what keeps the bar off a tab that had nothing to do
-  with it: `BarSignals` carries `tab_id` and every reader asks `exporting_here()` rather than asking
-  the window. **`id` is why only the export that raised the flag may lower it.** The tail of a
-  finished request used to clear it under the same `streaming` test that decides whether to raise
-  one — which is true of a second `All rows` request, the only kind the app refuses, so asking for
-  one while a stream ran tore down the running export's Cancel. `grid::export_finished(current,
-  finished)` clears only when the run reporting *is* the run the flag holds and otherwise leaves it
-  exactly as it was, which covers that case and the `Fetched` save that raised no flag at all. The
-  ids are monotonic per process, and a counter rather than a token clone because comparison is all
-  that is wanted and `ExportRun` has to stay `Copy` for `BarSignals`' sake.
+  never hit-tested.)
   `export_cancel` is a `TabsActions` action; the app owns the
   token, as it does for query runs and imports. The report
   is an `ExportOutcome` — `Done(export::ExportTally)`, `Cancelled`, `Failed { message, partial }` —
@@ -10595,14 +10797,19 @@ for keyboard nav.
   written as data (empty for Markdown and HTML, which keep it deliberately) and `blanked` is
   `ResultSet::capped_columns`, the cells past a column's 512 MiB text arena, which read back as the
   empty string. Nothing had ever read that flag, so a streamed chunk that overran the arena wrote a
-  file with holes in it and reported a full row count. The sentence on the bar is
-  `export::export_note(tally, name, streaming)`, whose rule is that **silence is the default and a
-  caveat overrides it**: a clean `Fetched` save says nothing, since the screen already shows what it
-  wrote and a note on every save is a note nobody reads; a streamed one always announces its count;
-  and a *loss* speaks in either scope, naming the columns, because a user comparing the file to the
-  screen needs to know which part of it to distrust. The count is printed through
+  file with holes in it and reported a full row count. The success sentence is
+  `export::export_note(&tally, &name, true)` and it goes into the modal's `done`. **The `true` is a
+  change of mind about who is reporting**, that argument having been `streaming`: the rule was that
+  silence is the default and a caveat overrides it, so a clean `Fetched` save said nothing, the
+  screen already showing what it wrote and a note on every save being a note nobody reads. A modal
+  that stays up until it is dismissed *is* the confirmation, and one that said nothing after a
+  fetched export would be a dialog reporting silence. What is unchanged underneath is that a *loss*
+  speaks in either scope, naming the columns, because a user comparing the file to the screen needs
+  to know which part of it to distrust; and the callback carries an `unwrap_or_else` fallback
+  (`Exported to <name>`) for the `None` that arm can no longer return. The count is printed through
   `text::human_count`, the same row-count printer the
-  stats line uses, so the figure in the report agrees with the `1k of ~16k rows` directly above it —
+  stats line and the modal's own progress line use, so the figure in the report agrees with the
+  `1k of ~16k rows` it replaces and with the stats line behind the backdrop —
   and the note shipped once as `Exported rows to employees.csv`, with no count at all, because
   `text::plural` returns the noun and nothing else and this call site simply never rendered the
   number. **The destination is not opened until the export has succeeded.** Both scopes write a
@@ -10634,6 +10841,69 @@ for keyboard nav.
   saying `Exporting…` and a Cancel that had already been pressed. Raising it at the pull returns
   `stream_to` at the next chunk instead, which is where the five incremental formats already stop;
   `a_cancelled_export_tells_the_writer_it_stopped` is the live-tier pin.
+- **Every grid export raises a progress modal, and it stays up to say how the export ended.** The
+  bar's `Exporting… Cancel` was static: nothing reported rows, so a large export and a stalled one
+  looked the same for as long as either ran. `dump_view::export_progress_overlay`
+  (there because it is the dump modal's twin — see that entry) shows the rows written and a red Stop
+  while the write runs, then the outcome and a neutral **Close**, over
+  `ExportUi { target, done, error, progress }` on `Ui`. **It reported progress only, and the exports
+  that made that wrong were the fast ones**: the argument was that the bar told the whole story in
+  one strip and a second reporter would be two places to keep in agreement, but a modal that closes
+  itself when the write ends is raised *invisibly* by an export finishing in a frame or two — which
+  is how the user found the uncapped path and read it as having no modal at all. So `target` stays
+  `Some` after the write ends, which is what makes this a confirmation rather than a progress bar,
+  and `done` / `error` carry the sentence; `Some` on either is what the footer reads to become Close
+  instead of Stop, and only Close (or Escape) clears the four signals. **A cancel lands in
+  `error`, not `done`** — stopping was the user's own doing and is neither success nor failure, but
+  its sentence is about a file that is *not* what was asked for, and a green tick over it is the one
+  reading it must not get. There is still no ✕, and **both exits run one `exit` closure**, the
+  footer's button and Escape, which is `dump_overlay`'s rule that no two exits may disagree. It
+  matters more here, because by state the two mean *opposite* things: an Escape wired straight to
+  `target.set(None)` would silently abandon a running export, leaving a stream writing its `.part`
+  sibling with its Stop nowhere on screen. **Both scopes raise it, with no size threshold.** It was
+  `ExportScope::AllRows`' alone, on
+  the reasoning that a `Fetched` save renders rows already in memory in one chunk with nothing to
+  report from — sound about the code as it stood, and it still produced a feature the user could not
+  find: that scope exists only when a result is *row-capped and re-runnable*, so an ordinary save
+  showed nothing at all. The fault was justifying a limit by an implementation detail instead of
+  changing the detail, and the detail changed: the `Fetched` arm renders through
+  `export::SliceChunks` now, so it has a count and a Stop like the other. There is deliberately no
+  row count to gate on either, though **not for the reason first written here**: "a small export
+  closes the modal within a frame or two, which makes it self-regulating" described a modal that
+  closed itself, and that self-regulation is precisely what made a fast export look like no modal.
+  The reason left is simpler — the modal is the confirmation, so no export is too brief for it to
+  serve, and any threshold would be a number nothing could justify.
+  **`ExportTarget::total` is the denominator each scope can honestly give, and `approx` says which
+  it is.** A `Fetched` export knows exactly how many rows it holds, so `1,234 of 5,000 rows` is a
+  promise it keeps and carries no `~`; an `AllRows` export is re-reading the server and has only the
+  catalogue's guess — the figure the `~All rows (M)` entry was named after, threaded from
+  `export_menu` through `save_export` — so it reads `40k of ~180k rows`, is never divided by, and is
+  not a ceiling: a real count larger than it is ordinary. `save_export` sets `total` as
+  `if streaming { estimate } else { Some(order.len()) }` and `approx` as `streaming`, and `approx`
+  is **carried rather than inferred from the scope** because by the time the modal draws the scope is
+  gone. Both sit on the *target* rather than on each progress message because the writer that counts
+  rows has never heard of the catalogue, so a message carrying the field would carry `None` and wipe
+  the estimate on the first block. `progress` is
+  `None` until the first block, which the modal draws as an animated `Starting` rather than as
+  `0 rows`, a stalled export and one that has genuinely written nothing being indistinguishable
+  otherwise. **Only the export that raised the modal may write into it** —
+  `grid::export_modal_closes(current, finished)`, comparing `ExportTarget::run` against the reporting
+  run's `u64`. It took an `ExportRun` and asked only about *closing*; **reporting** is the operation
+  that needs guarding now that the modal outlives the run, so `save_export`'s outcome callback asks
+  it first and returns early. The failure is a second export request, refused synchronously by the
+  app's single cancel slot: its tail arrives while the first export is still writing, and without the
+  guard it would overwrite the running export's progress line with its own refusal and take that
+  export's Stop off the screen for exactly as long as it mattered. `None` — no modal up — is `false`,
+  there being nothing to own. `only_the_export_that_raised_the_modal_can_report_into_it` pins it, and
+  `export_ids_never_repeat` pins what it rests on: a counter that repeated would hand one export
+  another's modal. **The count is
+  emitted from the writer, not the reader** — both of `main.rs`'s scope arms, over one
+  unbounded crossbeam channel into `export_progress`, a channel rather than a callback for the reason
+  the dump's and the AI stream's are (`create_ext_action` is one-shot and built on the UI thread,
+  this fires once per block). In the streamed arm that is a decision: counted where the rows are
+  *written* because the channel between reader
+  and writer is bounded, so a reader-side count would run two blocks ahead of the file, reporting
+  rows that are not in it yet and being two blocks wrong about what survived a cancel.
 - **The results strip shrinks its prose, never its controls.** It is one flex row — stats, the
   read-more offer, the two red notes, a spacer, then the commit/row/AI/copy/save cluster — and a
   flex row squeezes its children before it overflows, so whichever child refuses to shrink is the

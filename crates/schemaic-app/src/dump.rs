@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use schemaic_core::dump::{DumpStep, DumpVerdict, ReadEnd, WriteEnd, dump_verdict, plan};
 use schemaic_core::export::{ExportFormat, ExportTally, PullChunks};
 use schemaic_db::{Db, DbError, ExportChunk};
-use schemaic_ui::{DumpOutcome, DumpProgress, DumpRequest};
+use schemaic_ui::{DumpOutcome, DumpProgress, DumpRequest, FilesOutcome, FilesRequest};
 use tokio_util::sync::CancellationToken;
 
 /// What the writer task is fed, in file order.
@@ -203,6 +203,244 @@ pub(crate) async fn run(
             missing: dump.missing,
         },
     }
+}
+
+/// Run a **folder** export to completion, reporting each table on `progress`.
+///
+/// The sibling of [`run`] for the picker's five non-SQL formats: one file per
+/// table instead of one file for the set. Every guarantee the dump makes is kept
+/// per file — a freshly introspected schema, rows streamed rather than gathered,
+/// a `.part` sibling renamed over the destination only once the table is whole —
+/// and the one thing that changes is what "finished" means, so the outcome
+/// counts files rather than describing a single one.
+///
+/// **The loop is sequential, one table at a time, and that is deliberate.**
+/// Writing four files at once would need four connections and four in-flight
+/// blocks each, and it would make the progress line ("3 of 12") a lie about what
+/// is happening. A folder export is disk-bound at the end anyway.
+pub(crate) async fn run_files(
+    db: Db,
+    req: FilesRequest,
+    handle: tokio::runtime::Handle,
+    token: CancellationToken,
+    progress: crossbeam_channel::Sender<DumpProgress>,
+    chunk_rows: usize,
+) -> FilesOutcome {
+    // Freshly introspected, never the tree's cache — [`run`]'s rule, for the same
+    // reason: the file names and the `SELECT`s both come off this schema, and a
+    // stale one exports a table that is no longer there.
+    let schema = match db.fetch_schema(&req.database, token.clone()).await {
+        Ok(s) => s,
+        // Nothing is planned yet, so nothing is known to be missing either —
+        // `missing` is the *plan's* answer and the plan needs this schema.
+        Err(DbError::Cancelled) => {
+            return FilesOutcome::Cancelled {
+                files: 0,
+                missing: Vec::new(),
+            };
+        }
+        Err(e) => {
+            return FilesOutcome::Failed {
+                message: format!("Export failed: {e}"),
+                files: 0,
+                missing: Vec::new(),
+            };
+        }
+    };
+    let plan = schemaic_core::dump::file_plan(
+        &schema,
+        &req.database,
+        &req.tables,
+        req.format,
+        req.dialect,
+    );
+    if plan.files.is_empty() {
+        return FilesOutcome::Failed {
+            message: "Nothing to export — no table matched the selection.".to_string(),
+            files: 0,
+            // The interesting case for this arm: every ticked table went missing
+            // between the picker and the launch, so "no table matched" is true
+            // and useless on its own — the names are what says why.
+            missing: plan.missing,
+        };
+    }
+
+    let total = plan.files.len();
+    let mut done = 0usize;
+    let mut rows_so_far = 0u64;
+    let mut tally = ExportTally::default();
+
+    // Reported by every arm below, not just the happy one: a folder that is two
+    // files short of what was ticked looks exactly like a complete one, and a
+    // stopped export is *more* likely to be inspected than a finished one, not
+    // less. `FilePlan::missing` used to reach only `Done`.
+    let missing = plan.missing.clone();
+
+    for (i, step) in plan.files.iter().enumerate() {
+        // **Asked before the table is begun**, so a Stop that landed between two
+        // tables does not open the next one's `.part` before the read it is
+        // waiting on returns `Cancelled`. Without this the folder gained an empty
+        // fragment for a table the export never started reading.
+        if token.is_cancelled() {
+            return FilesOutcome::Cancelled {
+                files: done,
+                missing,
+            };
+        }
+        // Best-effort, exactly as the dump's: a full progress channel must never
+        // hold up a write.
+        let _ = progress.send(DumpProgress {
+            index: i + 1,
+            total,
+            table: step.table.clone(),
+            rows: rows_so_far,
+        });
+        let path = req.folder.join(&step.file);
+        let part = part_of(&path);
+        let (row_tx, row_rx) = tokio::sync::mpsc::channel::<ExportChunk>(2);
+        let w_token = token.clone();
+        let (format, dialect) = (req.format, req.dialect);
+        // The **source**, so a format that names its origin gets the right one:
+        // `ExportFormat::Xlsx` titles the worksheet from it (`export::sheet_name`),
+        // and a workbook of twelve tables all called "Result" is not a folder
+        // anyone can read back.
+        let source = (
+            req.database.clone(),
+            step.schema.clone(),
+            step.table.clone(),
+        );
+        let (w_path, w_part) = (path.clone(), part.clone());
+        let writer = handle.spawn_blocking(move || {
+            write_one(&w_part, &w_path, row_rx, format, dialect, source, w_token)
+        });
+        let read = db
+            .stream_query(
+                Some(&req.database),
+                &step.select,
+                chunk_rows,
+                token.clone(),
+                row_tx,
+            )
+            .await;
+        let written = writer.await;
+
+        // **Cancel is the reader's to declare; every other failure is the
+        // writer's to describe.** The streamed export's rule, and it is here for
+        // the reasons stated there: a cancelled read closes the channel, which
+        // the writer would otherwise see as an ordinary end of stream, while a
+        // full disk fails the *writer* and only then fails the reader's next
+        // send — so asking the reader first reports the symptom.
+        // **The fragment of the table that did not finish is swept, always.**
+        //
+        // This is where a folder export parts company with the single-file one.
+        // There, the `.part` is the only trace of the rows that arrived and
+        // `export_cancel_note` points the user straight at it, so removing it
+        // would destroy the one thing they might still want. Here the finished
+        // files *are* that trace: they are whole, they are published, and
+        // `files_cancel_note` and `files_failure_note` promise exactly them —
+        // "the table in progress was left unwritten". A fragment left beside
+        // them makes both sentences false and drops an unreadable
+        // `orders.csv.part` into a directory the user chose for output and is
+        // about to go looking through.
+        let sweep = || {
+            let _ = std::fs::remove_file(&part);
+        };
+        let failed = |message: String| {
+            sweep();
+            FilesOutcome::Failed {
+                message,
+                files: done,
+                missing: missing.clone(),
+            }
+        };
+        let cancelled = || {
+            sweep();
+            FilesOutcome::Cancelled {
+                files: done,
+                missing: missing.clone(),
+            }
+        };
+        match (read, written) {
+            (Err(DbError::Cancelled), _) => return cancelled(),
+            // The writer's own refusal to publish a truncated file. It is a
+            // cancel, not a failure, and the token is the only witness — a stop
+            // that landed between the last chunk and the rename never reaches the
+            // reader at all.
+            (_, Ok(Err(_))) if token.is_cancelled() => return cancelled(),
+            (_, Ok(Err(e))) => return failed(format!("Export failed: {e}")),
+            (_, Err(e)) => return failed(format!("Export failed: worker died: {e}")),
+            (Err(e), _) => return failed(format!("Export failed: {e}")),
+            (Ok(n), Ok(Ok(t))) => {
+                rows_so_far += n;
+                // One fold across every file, so one sentence can name what none
+                // of them could carry — `ExportTally::absorb`'s reason.
+                tally.absorb(t);
+                done += 1;
+            }
+        }
+    }
+
+    FilesOutcome::Done {
+        files: done,
+        tally,
+        missing,
+    }
+}
+
+/// The blocking writer for **one table's file**: stream it, then the atomic
+/// publish. [`write()`]'s guarantees for a single table.
+#[allow(clippy::too_many_arguments)]
+fn write_one(
+    part: &Path,
+    path: &Path,
+    mut rows: tokio::sync::mpsc::Receiver<ExportChunk>,
+    format: ExportFormat,
+    dialect: schemaic_core::intel::SqlDialect,
+    source: (String, Option<String>, String),
+    token: CancellationToken,
+) -> Result<ExportTally, String> {
+    use std::io::Write as _;
+
+    let mut w = std::fs::File::create(part)
+        .map(std::io::BufWriter::new)
+        .map_err(|e| format!("Export failed: {e}"))?;
+    let src_token = token.clone();
+    let mut src = PullChunks::new(move || match rows.blocking_recv() {
+        // **A cancelled read is an error, not an end of stream** — the streamed
+        // export's rule. Without it a buffered format assembles and compresses
+        // the whole discarded workbook before anyone notices the Stop.
+        None if src_token.is_cancelled() => Err(std::io::Error::other("export cancelled")),
+        None => Ok(None),
+        Some(Ok(rs)) => Ok(Some(rs)),
+        // The reader's own reason, carried across so a half-written table is
+        // never mistaken for a finished one.
+        Some(Err(e)) => Err(std::io::Error::other(e)),
+    });
+    let tally = format
+        .stream_to(
+            &mut w,
+            &mut src,
+            Some((source.0.as_str(), source.1.as_deref(), source.2.as_str())),
+            dialect,
+        )
+        .map_err(|e| format!("Export failed: {e}"))?;
+    w.flush().map_err(|e| format!("Export failed: {e}"))?;
+    drop(w);
+    // **Only now** does the file appear under its real name — and not at all if
+    // this was cancelled. See `write`: a cancel reaches here as an ordinary end
+    // of stream, so publishing first and declaring the cancel afterwards would
+    // leave a truncated table looking exactly like a finished one.
+    if token.is_cancelled() {
+        return Err("Export cancelled.".to_string());
+    }
+    std::fs::rename(part, path).map_err(|e| {
+        format!(
+            "The export wrote {} but could not rename it to {}: {e}",
+            part.display(),
+            path.display()
+        )
+    })?;
+    Ok(tally)
 }
 
 /// The blocking writer: one file, every step, then the atomic publish.

@@ -141,6 +141,22 @@ pub struct ExportRequest {
     pub dialect: schemaic_core::intel::SqlDialect,
     /// Which rows to write — the ones on screen, or every row the statement has.
     pub scope: ExportScope,
+    /// Will the caller show a **Stop** for this run?
+    ///
+    /// **The question the app's single cancel slot really asks.** That slot
+    /// exists so one Stop always reaches the run it is pointed at, and it refuses
+    /// a second export to keep it that way — but only a run someone can stop
+    /// needs to be in it. The grid raises the progress modal and so answers
+    /// `true`; the Live Monitor's log export shows nothing and answers `false`,
+    /// which is what keeps it out of the slot.
+    ///
+    /// Without this the two would contend: both write `Fetched` rows, so a log
+    /// export begun while a grid export ran would be refused with
+    /// *"An export is already running"* — a message about a window the user
+    /// cannot see, for a save that has nothing to do with theirs. That is a
+    /// regression this field exists to prevent, and it appeared the moment the
+    /// `Fetched` path started taking a token at all.
+    pub stoppable: bool,
 }
 
 /// How much of a result an export covers.
@@ -223,6 +239,76 @@ pub struct DumpRequest {
     pub opts: schemaic_core::dump::DumpOptions,
     pub dialect: SqlDialect,
 }
+
+/// What a **folder** export writes, and where — the file-per-table sibling of
+/// [`DumpRequest`], behind the schema tree's `Export ▸ CSV` and its four
+/// non-SQL siblings.
+///
+/// The plan is built in the app from a freshly introspected schema, exactly as a
+/// dump's is and for the same reason; this carries only what the user chose.
+/// `folder` is a directory that already exists — the dialog that produced it
+/// only offers directories — and each table's file name is decided by
+/// [`schemaic_core::dump::file_plan`], never here.
+pub struct FilesRequest {
+    pub folder: std::path::PathBuf,
+    pub conn_id: u64,
+    pub database: String,
+    /// The chosen tables, by display name — [`DumpRequest::tables`]' spelling,
+    /// because it is the same picker.
+    pub tables: Vec<String>,
+    /// Never [`schemaic_core::export::ExportFormat::Sql`]: that format is what
+    /// the dump path is, and offering it here would be a second writer for one
+    /// file format.
+    pub format: schemaic_core::export::ExportFormat,
+    pub dialect: SqlDialect,
+}
+
+/// How a folder export ended.
+///
+/// **Its own type rather than [`DumpOutcome`]**, because all three sentences it
+/// has to produce are about a *folder* and none of `DumpOutcome`'s are. A
+/// stopped dump leaves one `.part` sibling beside a destination it never
+/// touched; a stopped folder export leaves the files that finished plus a
+/// fragment of the one that did not — so borrowing the dump's wording would name
+/// a file the user never asked for and say nothing about the ones they got.
+/// `files` is what makes each honest: how many were completed and published.
+pub enum FilesOutcome {
+    /// Written. `files` is how many the folder gained, `tally` is every table's
+    /// [`ExportTally`](schemaic_core::export::ExportTally) folded into one (see
+    /// `ExportTally::absorb`) so one sentence can carry what the files could not
+    /// hold, and `missing` is the ticked tables this run's own introspection
+    /// could not find — the same guarantee [`DumpOutcome::Done`] makes.
+    ///
+    /// **All three arms carry `missing`**, not just this one. A folder two files
+    /// short of what was ticked looks exactly like a complete one, and a stopped
+    /// or failed export is *more* likely to be inspected than a finished one —
+    /// so the arm least likely to be read was the one that used to drop it.
+    Done {
+        files: usize,
+        tally: schemaic_core::export::ExportTally,
+        missing: Vec<String>,
+    },
+    /// Stopped by the user. The completed files stay: they are whole, they are
+    /// what the user asked for, and each was published by the same rename a
+    /// dump's is.
+    Cancelled { files: usize, missing: Vec<String> },
+    /// Failed. `files` counts the ones already published, which is what makes
+    /// this different from an export that failed outright — the folder is not
+    /// empty, and a message that did not say so would send the user looking for
+    /// nothing.
+    Failed {
+        message: String,
+        files: usize,
+        missing: Vec<String>,
+    },
+}
+
+pub type FilesDoneFn = Rc<dyn Fn(FilesOutcome)>;
+/// Introspect and write one file per table **off the UI thread**, reporting each
+/// table through [`DumpUi::progress`] — the same channel a dump uses, because it
+/// is the same modal and the same "3 of 12" — and the end through
+/// [`FilesDoneFn`].
+pub type FilesFn = Rc<dyn Fn(FilesRequest, FilesDoneFn)>;
 
 /// The database a script modal is open on — the load half of [`DumpTarget`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,6 +409,100 @@ pub struct ScriptProgress {
     /// `0` when the file's length could not be read, which the label must treat
     /// as "unknown" rather than dividing by.
     pub bytes_total: u64,
+}
+
+/// The file a grid export is writing, captured when it starts.
+///
+/// `Some` on [`ExportUi::target`] ⇒ the modal is up. Held rather than re-read
+/// because the export outlives the grid that launched it — a re-run replaces the
+/// `GridState` while the write goes on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportTarget {
+    /// The destination's file name, for the modal's one line.
+    pub name: String,
+    /// The denominator, when the export has an honest one.
+    ///
+    /// **On the target and not on each progress message**, because it is a
+    /// property of the export rather than of a moment in it: the writer that
+    /// reports the rows has never heard of it, so a message carrying the field
+    /// would carry `None` and overwrite it on the first block.
+    pub total: Option<u64>,
+    /// Is [`Self::total`] an *estimate*?
+    ///
+    /// The two scopes differ, and saying so is the whole point. A `Fetched`
+    /// export knows exactly how many rows it holds, so `1,234 of 5,000` is a
+    /// promise it keeps. An `AllRows` export is re-reading the server, and its
+    /// figure is the catalogue's guess — the same one the `~All rows (M)` entry
+    /// was named after — so it is shown as `~180k`, a real count larger than it
+    /// is ordinary, and nothing may divide by it or treat it as a ceiling.
+    ///
+    /// Carried rather than inferred from the scope, because by the time the
+    /// modal draws, the scope is gone.
+    pub approx: bool,
+    /// Which export raised this modal — `grid::next_export_id`'s.
+    ///
+    /// **Only the export that raised the modal may report into it or close it**
+    /// (`grid::export_modal_closes`). Without it the tail of *any* finished
+    /// export writes here: a second request is refused synchronously by the
+    /// app's single cancel slot, and its refusal would overwrite the running
+    /// export's progress line and take its Stop off the screen for exactly as
+    /// long as it mattered.
+    pub run: u64,
+}
+
+/// The grid export's modal — **the single affordance** a grid export has, from
+/// the moment it starts to the moment the user dismisses it.
+///
+/// It is raised by **every** grid export, both scopes, and it does not close
+/// itself. While the write runs it shows the row count and a **Stop**; when the
+/// write ends it shows how it ended and a **Close**. One surface, two states.
+///
+/// **Both halves of that are corrections, and the same one twice.** The modal
+/// began as the streamed scope's alone, on the reasoning that a `Fetched` export
+/// renders rows already in memory and has nothing to report — true only because
+/// that path rendered in one block, which is now `SliceChunks`' job to fix. And
+/// once every export raised it, the ones that finish in a frame or two raised it
+/// *invisibly*: a modal that closes itself the instant the write ends cannot
+/// confirm anything about a write that was never slow enough to watch. Reporting
+/// the outcome here is what makes a fast export and a slow one look the same to
+/// the person doing it.
+///
+/// So the outcome is **no longer on the grid's bar**. It was there because the
+/// bar could say `Exporting…` and then `Exported 16k rows to employees.csv` in
+/// one strip, which was the right answer while the bar was the only surface;
+/// with a modal in front of it that strip is a second place saying the same
+/// thing to nobody, behind a backdrop. One affordance says all of it.
+#[derive(Clone, Copy)]
+pub struct ExportUi {
+    /// The file being written; `Some` ⇒ the modal is up.
+    ///
+    /// It stays `Some` after the write ends — that is what makes this a
+    /// confirmation and not just a progress bar. Only the footer's Close clears
+    /// it.
+    pub target: RwSignal<Option<ExportTarget>>,
+    /// The finished sentence, once an export succeeds — `export_note`'s, the
+    /// same one the bar used to show.
+    ///
+    /// `Some` on either this or [`Self::error`] is what the footer reads to
+    /// become **Close** instead of **Stop**: the run is over, so there is
+    /// nothing left to stop.
+    pub done: RwSignal<Option<String>>,
+    /// How it failed, or that it was stopped.
+    ///
+    /// **A cancel lands here, not in `done`.** Stopping was the user's own
+    /// doing, so it is neither a success nor a failure — but the sentence it
+    /// carries is about a file that is *not* what was asked for, and putting
+    /// that under a green tick is the one reading it must not get.
+    pub error: RwSignal<Option<String>>,
+    /// Rows written so far. `None` until the first block lands, which the modal
+    /// shows as an animated "Starting" rather than as zero — a stalled export
+    /// and one that has genuinely written no rows look identical otherwise.
+    ///
+    /// **Rows and not bytes**, the opposite of [`ScriptProgress`]'s choice and
+    /// for the same underlying reason: report what you can honestly count. A
+    /// script's statement total cannot be known without reading the file, so it
+    /// counts bytes; an export's rows are exactly what it is producing.
+    pub progress: RwSignal<Option<u64>>,
 }
 
 /// How far a running dump has got — one message per table, as it starts.
@@ -2074,6 +2254,28 @@ pub struct DumpTarget {
     /// database's.
     pub schema: Option<String>,
     pub dialect: SqlDialect,
+    /// Which format the menu entry asked for — the modal is one panel serving
+    /// six, and this is the whole of the difference between them.
+    ///
+    /// [`ExportFormat::Sql`](schemaic_core::export::ExportFormat::Sql) is the
+    /// dump: one `.sql` file, and the six content and replay options that decide
+    /// what goes in it. Every other format writes **one file per table into a
+    /// folder**, and those options have nothing to say about it — a CSV has no
+    /// `CREATE TABLE` to drop first and no transaction to wrap — so the modal
+    /// hides them rather than showing controls the file cannot honour.
+    pub format: schemaic_core::export::ExportFormat,
+}
+
+impl DumpTarget {
+    /// Does this target write a folder of files rather than one `.sql`?
+    ///
+    /// **Asked as a capability, never as `format == Sql` at the six places that
+    /// want it** — the modal branches on this for its title, its options, its
+    /// dialog, its launch, its progress and its report, and a comparison spelled
+    /// out six times is six chances for one of them to disagree with the others.
+    pub fn writes_folder(&self) -> bool {
+        !matches!(self.format, schemaic_core::export::ExportFormat::Sql)
+    }
 }
 
 /// The script modal's state — the same Copy-bundle shape [`DumpUi`] uses, and
@@ -3295,9 +3497,18 @@ pub struct SchemaActions {
     pub dump_tables: DumpTablesFn,
     /// Introspect, plan and write a schema + data dump.
     pub dump_run: DumpFn,
-    /// Stop the dump [`SchemaActions::dump_run`] is writing. A no-op when nothing
-    /// is running; the partial file is left as a `.part` sibling, never renamed
-    /// over the destination.
+    /// Introspect, plan and write one file per table into a folder — the same
+    /// picker's other five formats.
+    pub files_run: FilesFn,
+    /// Stop the dump [`SchemaActions::dump_run`] is writing, **or the folder
+    /// export [`SchemaActions::files_run`] is writing**. A no-op when nothing is
+    /// running; the partial file is left as a `.part` sibling, never renamed over
+    /// the destination.
+    ///
+    /// One stop for both because there is one modal: it refuses a second launch
+    /// while either runs, so the two can never be in flight together — and giving
+    /// them separate slots would only create the case where the footer's Stop
+    /// reaches the wrong one.
     pub dump_cancel: Rc<dyn Fn()>,
     /// Stop the import [`SchemaActions::import_run`] is running, rolling it back.
     /// A no-op when nothing is running.
@@ -4166,6 +4377,9 @@ pub struct Ui {
     pub import: ImportUi,
     /// The schema + data dump modal (opened from a database's context menu).
     pub dump: DumpUi,
+    /// The grid export's progress modal — the one surface that says how far an
+    /// export has got, for both scopes.
+    pub export: ExportUi,
     /// The script-load modal — **Import** on a database or namespace node, the
     /// inverse of the *Export* directly above it in the same menu.
     pub script: ScriptUi,
@@ -5974,17 +6188,6 @@ fn center(ui: Ui) -> impl IntoView {
     let dismiss_menus: Rc<dyn Fn()> = Rc::new(move || all_menus.close_except(None));
     let commit_edits = ui.tab_actions.commit_edits.clone();
     let export_file = ui.tab_actions.export_file.clone();
-    let export_cancel = ui.tab_actions.export_cancel.clone();
-    // **Created here, beside the action that cancels it, and not inside the
-    // per-active-tab render below.** The export's token is app-global, so a flag
-    // with a shorter life than the token is a Cancel that can vanish while the
-    // thing it stops is still running: switching tabs mid-export disposed this
-    // signal, switching back built a fresh empty one, and the stream went on for
-    // minutes with no control bound to it and every further `All rows` request
-    // refused. The tab that launched it rides *in* the value
-    // (`grid::ExportRun`), which is what keeps the bar off a tab that had
-    // nothing to do with it.
-    let exporting = RwSignal::new(None);
     let apply_view = ui.tab_actions.apply_view.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
@@ -6188,7 +6391,6 @@ fn center(ui: Ui) -> impl IntoView {
                     dismiss: dismiss_menus.clone(),
                     commit: commit_edits.clone(),
                     export_file: export_file.clone(),
-                    export_cancel: export_cancel.clone(),
                     // Two of the panel-scoped fields are filled in by the results
                     // body, which is the only place that knows *which* panel is
                     // being drawn — see `results_multi`.
@@ -6224,19 +6426,12 @@ fn center(ui: Ui) -> impl IntoView {
                     commit_err: RwSignal::new(None),
                     commit_note: RwSignal::new(None),
                     commit_wait: RwSignal::new(None),
-                    // **Beside the two it turns into, not above them.** A
-                    // streamed export raises this flag and then reports through
-                    // `commit_note`, so the two must share a lifetime: created
-                    // once for the whole window, the flag was global while the
-                    // note was per-tab-render, and switching tabs mid-export drew
-                    // `Exporting… Cancel` on a tab that had nothing to do with it
-                    // while the report landed on a disposed signal and was lost.
-                    // Here the bar belongs to the result that started it, and an
-                    // export the user has navigated away from simply reports
-                    // nowhere — the same thing a commit does, and the bar's
-                    // established behaviour.
-                    exporting,
-                    tab_id: tab.id,
+                    // **Window-scoped, unlike the three bar signals above it.**
+                    // The bar's export flag used to sit beside them and needed a
+                    // tab id to survive a tab switch mid-export; the modal has no
+                    // such problem, and an export the user navigates away from
+                    // still reports into it rather than onto a disposed signal.
+                    export_modal: ui.export,
                     tx_holders: {
                         // Answered when a write has been waiting a while, not at
                         // build time: the user can open (or end) a transaction in
@@ -6345,8 +6540,6 @@ fn results_section(
     let error_fixable = gctx.error_fixable;
     let commit_note = gctx.commit_note;
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
-    let (exporting, export_cancel) = (gctx.exporting, gctx.export_cancel.clone());
-    let tab_id = gctx.tab_id;
     let view_err = gctx.view_err;
     let (result_tabs, active_result) = (tab.result_tabs, tab.active_result);
     // Everything the bottom bar can show, as one value — see `grid::BarSignals`.
@@ -6359,8 +6552,6 @@ fn results_section(
         commit_note,
         view_err,
         commit_wait,
-        exporting,
-        tab_id,
     };
     // **The panel-level bars must not outlive the grid they describe.** All three
     // are mounted here, outside `body`, while their only writer lives inside
@@ -6489,14 +6680,7 @@ fn results_section(
             find_open, find_query, find_step, find_total, find_pos, find_more,
         ),
         grid_goto_bar(goto_open, goto_query, goto_step),
-        grid_error_bar(
-            bars,
-            rollback_tx,
-            export_cancel.clone(),
-            error_open,
-            error_text,
-            error_fixable,
-        ),
+        grid_error_bar(bars, rollback_tx, error_open, error_text, error_fixable),
         // Last, so it paints over the panel — and it lifts itself above the
         // bottom bar when that one is up, through the **same** predicate
         // `grid_error_bar` decides its own visibility with. It used to be a
@@ -10287,6 +10471,48 @@ mod script_launch_gate {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod export_target_tests {
+    use super::*;
+    use schemaic_core::export::ExportFormat;
+
+    fn target(format: ExportFormat) -> DumpTarget {
+        DumpTarget {
+            conn_id: 1,
+            database: "sakila".to_string(),
+            schema: None,
+            dialect: SqlDialect::MySql,
+            format,
+        }
+    }
+
+    /// The one question the Export modal asks about itself, and it decides six
+    /// things — the title, whether the dump's options are built, which dialog
+    /// opens, which writer launches, and how the outcome is worded. It is a
+    /// predicate rather than a `format == Sql` at each of those, because six
+    /// spellings of one comparison are six chances for one to disagree.
+    ///
+    /// Stated over **every** format rather than over a sample, so a seventh has
+    /// to answer it: the failure mode is a new format silently falling onto
+    /// whichever side of a comparison it happens to land on, which is the same
+    /// hazard CLAUDE.md's "ask a capability, never an engine" rule names.
+    #[test]
+    fn only_sql_writes_a_single_file() {
+        for f in ExportFormat::ALL {
+            assert_eq!(
+                target(f).writes_folder(),
+                f != ExportFormat::Sql,
+                "{} is on the wrong side of the split",
+                f.label()
+            );
+        }
+        // Spelled out, because these two are the whole point: SQL is the dump,
+        // and the rest are folders.
+        assert!(!target(ExportFormat::Sql).writes_folder());
+        assert!(target(ExportFormat::Csv).writes_folder());
     }
 }
 

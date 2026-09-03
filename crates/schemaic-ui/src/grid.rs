@@ -328,16 +328,12 @@ struct GridState {
     /// the two have to agree or the export runs a statement against a server
     /// that never saw it.
     conn_at_load: u64,
-    /// True while a **streamed** export is running — the affordance that offers
-    /// to stop it. Panel-level rather than per-result: an export outlives the
-    /// grid it was started from (a re-run replaces the `GridState`), and a Cancel
-    /// that vanished the moment the rows refreshed would be a Cancel the user
-    /// cannot reach for exactly as long as it matters.
-    exporting: RwSignal<Option<ExportRun>>,
-    /// The tab this grid belongs to — the other half of [`ExportRun`], and the
-    /// only thing that tells "an export is running" from "an export is running
-    /// *here*".
-    tab_id: usize,
+    /// The modal **every** grid export raises, both scopes — see
+    /// [`GridCtx::export_modal`]. Window-scoped, which is what the bar's old
+    /// `exporting` flag needed a per-tab id to fake: an export outlives the grid
+    /// it was started from (a re-run replaces the `GridState`), so a surface
+    /// owned by the result would take its Stop away exactly when it mattered.
+    export_modal: crate::ExportUi,
     /// Update the tab's *canonical* result set after a splice, so a later grid
     /// rebuild (tab switch away/back) reflects the committed values. `None` for the
     /// multi-result path, which stays on the full-re-run commit flow. Present ⇒ the
@@ -447,60 +443,57 @@ struct GridState {
     edit_row_saving: RwSignal<bool>,
 }
 
-/// Which streamed export is running, and which tab launched it.
+/// A fresh id for one export, monotonic per process.
 ///
-/// Two questions that used to be one `bool`, and each of them had a failure.
-///
-/// **`tab`** is why the flag can outlive a tab switch. The export's cancellation
-/// token is app-global (`main::export_token`), and the flag was created inside the
-/// per-active-tab-render `GridCtx`: switching away disposed it, switching back
-/// built a fresh `false`, and the running export was left with no Cancel anywhere
-/// on screen while the token stayed occupied — so it could be neither stopped nor
-/// replaced, for as long as the stream ran. The signal is created once for the
-/// window now, and the tab it names is what decides whose bar draws the Cancel.
-///
-/// **`id`** is why only the export that raised the flag can lower it. The tail of
-/// a finished request cleared the flag whenever *its own* scope was streamed —
-/// which is true of a second `All rows` request, the only kind the app refuses.
-/// Asking for one while a stream was running therefore tore down the running
-/// export's Cancel, which is the same failure the `streaming` guard had been added
-/// to fix, one case out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ExportRun {
-    id: u64,
-    tab: usize,
+/// **All that is left of `ExportRun`**, which paired this id with the tab that
+/// launched an export so the bottom bar could draw `Exporting… Cancel` on that
+/// tab and no other. The bar no longer has an export state — the modal is the
+/// export's single affordance now — so the tab half had no reader left. The id
+/// stays, because the question it answers did not go away: which run owns the
+/// modal.
+fn next_export_id() -> u64 {
+    thread_local! {
+        static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    }
+    NEXT.with(|n| {
+        let v = n.get();
+        n.set(v + 1);
+        v
+    })
 }
 
-impl ExportRun {
-    /// A fresh run for `tab`. The id is monotonic per process, so no two requests
-    /// can claim each other's flag — and it is a counter rather than a token
-    /// clone because the comparison is all that is wanted, and `ExportRun` has to
-    /// stay `Copy` for `BarSignals`' sake.
-    fn new(tab: usize) -> ExportRun {
-        thread_local! {
-            static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-        }
-        let id = NEXT.with(|n| {
-            let v = n.get();
-            n.set(v + 1);
-            v
-        });
-        ExportRun { id, tab }
-    }
+/// May a save dialog that has just named a file raise the export modal?
+///
+/// **`false` while an export is still writing**, and that is the whole of it:
+/// floem's save dialog is *not* window-modal, so two can stand open at once —
+/// open the Download menu, pick a format, then do it again before answering
+/// either. Answering the second one used to overwrite the running export's
+/// modal with its own run before the app had even accepted the launch, and the
+/// app then refused it for the cancel slot. The running export's report was
+/// afterwards discarded by [`export_modal_closes`] (its run no longer owns the
+/// modal), so the window showed the *refusal* with a Close that dismissed it
+/// while a real export went on writing with its Stop nowhere on screen.
+///
+/// This is `dump_view`'s `accept_dialog_launch` for the surface that had none.
+///
+/// A modal still up on a **finished** export is not busy: it is a report the
+/// user has not dismissed, and starting another export is a perfectly good way
+/// to dismiss it.
+fn export_may_launch(modal_up: bool, done: bool, error: bool) -> bool {
+    !modal_up || done || error
 }
 
-/// What the flag should read once `finished` has reported.
+/// May the run that just reported write into the export modal?
 ///
-/// `None` only when the run that reported is the run the flag is holding. Every
-/// other case leaves it exactly as it was — which covers both of the failures
-/// this replaced: a `Fetched` save (which raised no flag, so it matches nothing)
-/// and a second `All rows` request refused synchronously (which is `streaming`,
-/// and so cleared the flag under the export that was actually running).
-fn export_finished(current: Option<ExportRun>, finished: ExportRun) -> Option<ExportRun> {
-    match current {
-        Some(run) if run == finished => None,
-        other => other,
-    }
+/// **Only the export that raised it may report into it or close it.** The case
+/// is a second request refused synchronously by the app's single cancel slot:
+/// its tail arrives while the *first* export is still writing, and without this
+/// it would overwrite the running export's progress line with its own refusal
+/// and take that export's Stop off the screen for as long as it mattered.
+///
+/// `None` — no modal up — is `false`: there is nothing to own.
+fn export_modal_closes(current: Option<&crate::ExportTarget>, finished: u64) -> bool {
+    current.is_some_and(|t| t.run == finished)
 }
 
 impl GridState {
@@ -594,8 +587,7 @@ impl GridState {
             commit: RwSignal::new(Some(gctx.commit.clone())),
             export_file: RwSignal::new(Some(gctx.export_file.clone())),
             conn_at_load: conn,
-            exporting: gctx.exporting,
-            tab_id: gctx.tab_id,
+            export_modal: gctx.export_modal,
             sync_canonical: RwSignal::new(gctx.sync_canonical.clone()),
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
@@ -1969,10 +1961,15 @@ fn export_menu(
     // and the toolbar.
     sorted: bool,
 ) -> Vec<MenuEntry> {
-    let per_format = |scope_all: bool| -> Vec<MenuEntry> {
+    // The estimate travels with the choice: it is what the `~All rows (M)` entry
+    // below is named after, and it becomes the progress modal's denominator — so
+    // the figure the user chose from and the one they then watch are the same
+    // figure, rather than two reads of the catalogue taken minutes apart.
+    let estimate = row_total.map(|n| n.value());
+    let per_format = move |scope_all: bool| -> Vec<MenuEntry> {
         ExportFormat::ALL
             .iter()
-            .map(|&f| MenuEntry::action(f.label(), move || save_export(gs, f, scope_all)))
+            .map(|&f| MenuEntry::action(f.label(), move || save_export(gs, f, scope_all, estimate)))
             .collect()
     };
     let truncated = gs.rs.with_untracked(|rs| rs.truncated);
@@ -2033,7 +2030,11 @@ fn export_menu(
     ]
 }
 
-fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
+/// `estimate` is the catalogue's row count for the statement, when the menu had
+/// one — the progress modal's denominator, and nothing else. See
+/// [`crate::ExportTarget::total`], which is why it is an `Option` shown with a
+/// `~` and never divided by.
+fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Option<u64>) {
     let default_name = suggested_filename(
         gs.source
             .get_untracked()
@@ -2083,26 +2084,61 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
         let streaming = matches!(scope, crate::ExportScope::AllRows { .. });
         // Claimed before the flag goes up, so the closure below can compare
         // against it rather than against its own scope.
-        let run = ExportRun::new(gs.tab_id);
-        if streaming {
-            // Clear the bar's *stale* messages first: `Exporting` outranks a
-            // note but not an error, so a failure left standing from an earlier
-            // commit or filter would hide the Cancel for as long as the export
-            // ran. `clear_bar` covers the commit pair; the filter/sort error is
-            // the third dismissible message and needs saying separately, the way
-            // `dismiss_overlays` says it.
-            //
-            // A stalled write's note (`commit_wait`) and a batch statement's own
-            // failure are deliberately *not* cleared: neither is stale — the
-            // first is live and offers a Rollback more urgent than this Cancel,
-            // and the second means no grid is mounted to export from.
-            gs.clear_bar();
-            if gs.view_err.get_untracked().is_some() {
-                gs.view_err.set(None);
-            }
-            gs.exporting.set(Some(run));
+        // **Refuse before touching anything**, in the same synchronous step as
+        // the raise below — `widgets::accept_launch`'s rule, and `run_files`
+        // already follows its dialog-flavoured sibling. floem's save dialog is
+        // not window-modal, so a second one can be answered while an export is
+        // still writing; without this, answering it destroyed that export's
+        // modal and left it running with no Stop. See `export_may_launch`.
+        //
+        // Silent rather than reported: the app would refuse this launch a moment
+        // later anyway (one export at a time), and there is nowhere to report it
+        // that is not the modal this must not disturb.
+        let m = gs.export_modal;
+        if !export_may_launch(
+            m.target.with_untracked(Option::is_some),
+            m.done.with_untracked(Option::is_some),
+            m.error.with_untracked(Option::is_some),
+        ) {
+            return;
         }
+        let run = next_export_id();
         let shown = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        // **Raised by every export, both scopes, and it does not close itself.**
+        //
+        // Two corrections live in that sentence. It was the streamed scope's
+        // alone, on the reasoning that a `Fetched` save had nothing to report —
+        // true only while that path rendered in a single block, which
+        // `SliceChunks` fixed. And once every export raised it, the ones that
+        // finish in a frame or two raised it *invisibly*, so a modal that closed
+        // itself confirmed nothing about them at all. Holding it open until the
+        // user dismisses it is what makes a fast export and a slow one look the
+        // same to the person doing it — and is why no size threshold is wanted
+        // here: there is no longer a case this is too brief to serve.
+        //
+        // The three signals are cleared together, because a modal reopened on a
+        // stale outcome would announce the *previous* export's file.
+        //
+        // `progress` is cleared rather than zeroed, so the modal opens on its
+        // animated "Starting" line: before the first block there is nothing to
+        // count, and a static `0 rows` is indistinguishable from a stall.
+        gs.export_modal.progress.set(None);
+        gs.export_modal.done.set(None);
+        gs.export_modal.error.set(None);
+        gs.export_modal.target.set(Some(crate::ExportTarget {
+            name: shown.clone().unwrap_or_else(|| "the file".to_string()),
+            // **The denominator each scope can honestly give.** A fetched export
+            // knows exactly what it holds; a streamed one is re-reading the
+            // server and has only the catalogue's guess, which is the figure the
+            // `~All rows (M)` entry was named after.
+            total: if streaming {
+                estimate
+            } else {
+                Some(order.len() as u64)
+            },
+            approx: streaming,
+            run,
+        }));
         // `save_as` takes an `Fn`, so the snapshot is cloned rather than moved —
         // two `Arc` bumps and a small `Option<TableSource>`, not the rows.
         (export)(
@@ -2113,42 +2149,61 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
                 order: order.clone(),
                 source: source.clone(),
                 dialect,
+                // The modal above carries a Stop for every grid export, both
+                // scopes — so every one of them belongs in the cancel slot.
+                stoppable: true,
                 scope,
             },
-            // `try_update`: the result-set scope may have been disposed while the
-            // dialog was open or the write ran — a plain `set` would panic on the
-            // freed signal.
+            // **The whole report goes to the modal**, which is the export's one
+            // affordance from launch to dismissal. It used to go to the grid's
+            // bar; with a modal in front of it that strip was a second place
+            // saying the same thing to nobody, behind a backdrop.
+            //
+            // The modal's signals are **window-scoped**, unlike the bar's, which
+            // is a real gain rather than an accident of where they live: an
+            // export outlives the result that launched it, so a report arriving
+            // after a re-run used to land on a disposed signal and be lost
+            // entirely. Here it cannot be.
             Rc::new(move |outcome| {
                 let name = shown.clone().unwrap_or_else(|| "the file".to_string());
-                // **The message goes up before the flag comes down**, and the
-                // order is the whole reason the bar reads as one strip. Signal
-                // writes take effect one at a time, so clearing `exporting`
-                // first leaves a moment with no state at all — `any_up` false —
-                // and the bar collapses and reopens, which reads as two
-                // unrelated messages rather than an operation told in two
-                // tenses.
+                let e = gs.export_modal;
+                // **Only the export that raised the modal may write into it.**
+                // The case is a second request refused synchronously by the
+                // app's single cancel slot: its tail must not overwrite the
+                // running export's progress line with its own refusal, nor take
+                // that export's Stop off the screen.
+                if !e
+                    .target
+                    .try_with(|t| t.is_some_and(|v| export_modal_closes(v.as_ref(), run)))
+                {
+                    return;
+                }
                 match outcome {
-                    // **Which sentence, and whether there is one at all, is
-                    // `export_note`'s** — in `core::export` where it is tested.
-                    // Only the streamed scope announces a row count (a snapshot
-                    // of what is already on screen has nothing to report that
-                    // the screen doesn't show), but a *loss* is announced in
-                    // either scope: a CSV that blanked a blob column looked
-                    // exactly like one that had nothing to blank.
+                    // **The sentence is `export_note`'s**, in `core::export`
+                    // where it is tested — and asked with `true`, so it always
+                    // states the row count. That argument used to be `streaming`,
+                    // because a bar had nothing to add about a snapshot the
+                    // screen was already showing; a modal that stays up *is* the
+                    // confirmation, and one that said nothing after a fetched
+                    // export would be a dialog reporting silence.
                     crate::ExportOutcome::Done(tally) => {
-                        if let Some(msg) =
-                            schemaic_core::export::export_note(&tally, &name, streaming)
-                        {
-                            gs.commit_note.try_update(|v| *v = Some(msg));
-                        }
+                        // `expect`, not a second sentence behind `unwrap_or_else`:
+                        // `export_note` returns `None` only for `streaming: false`
+                        // with no caveat, and this asks with `true`. A fallback
+                        // here would be a success message no input can reach and
+                        // no test can cover, left to drift from the real one.
+                        let msg = schemaic_core::export::export_note(&tally, &name, true)
+                            .expect("export_note always speaks when asked with `true`");
+                        e.done.try_update(|v| *v = Some(msg));
                     }
-                    // A note, not an error: stopping was the user's own doing.
-                    // The sentence is `core::export`'s, where it is tested, and it
-                    // says two things: the destination was **not** changed (a
-                    // streamed export writes a `.part` sibling and renames it over
-                    // the target only on success), and the rows that did arrive are
-                    // in that sibling. Deleting it is still not ours to do — it is
-                    // the one thing the user may still want.
+                    // **Into `error`, not `done`** — stopping was the user's own
+                    // doing and is neither a success nor a failure, but the
+                    // sentence is about a file that is *not* what was asked for,
+                    // and a green tick over it is the one reading it must not
+                    // get. It says two things: the destination was **not**
+                    // changed (the rename happens only on success), and the rows
+                    // that did arrive are in the `.part` sibling. Deleting that
+                    // is still not ours to do.
                     //
                     // **Unless the format buffers**, in which case the sibling
                     // holds nothing and the sentence would point at an empty
@@ -2158,29 +2213,20 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool) {
                             &name,
                             format.writes_incrementally(),
                         );
-                        gs.commit_note.try_update(|v| *v = Some(msg));
+                        e.error.try_update(|v| *v = Some(msg));
                     }
-                    // The same two facts the Cancel arm above states, for the
-                    // same reason, whenever the write had begun — a failure is
-                    // the case where the user is least likely to look.
+                    // The same two facts the Cancel arm states, for the same
+                    // reason, whenever the write had begun — a failure is the
+                    // case where the user is least likely to look, which is
+                    // exactly why it now holds the window until dismissed.
                     crate::ExportOutcome::Failed { message, partial } => {
                         let msg = schemaic_core::export::export_failure_note(
                             &message,
                             partial.then_some(name.as_str()),
                         );
-                        gs.commit_err.try_update(|v| *v = Some(msg));
+                        e.error.try_update(|v| *v = Some(msg));
                     }
                 }
-                // **Only the export that raised the flag may lower it** — and
-                // now that is what the code does rather than what the comment
-                // said. Testing `streaming` tests *this request's* scope, which
-                // is `true` for a second `All rows` request too: the app refuses
-                // that one synchronously, and the refusal's own tail then cleared
-                // the **running** export's flag and took its Cancel away. The
-                // `Fetched` case the guard was added for is covered by the same
-                // comparison, since a `Fetched` request never raised a flag to
-                // match.
-                gs.exporting.try_update(|v| *v = export_finished(*v, run));
             }),
         );
     });
@@ -2594,15 +2640,14 @@ pub(crate) struct GridCtx {
     pub(crate) commit: crate::CommitFn,
     /// Write an export to disk off the UI thread (see [`crate::ExportFn`]).
     pub(crate) export_file: crate::ExportFn,
-    /// The streamed export running in this window, if any — see [`ExportRun`].
+    /// The modal **every** grid export raises, both scopes — the export's single
+    /// affordance from launch to dismissal.
+    ///
     /// **Window-scoped**, so it outlives a tab switch the way its cancellation
-    /// token does.
-    pub(crate) exporting: RwSignal<Option<ExportRun>>,
-    /// Which tab this context belongs to, so an export can be told from an export
-    /// *here*.
-    pub(crate) tab_id: usize,
-    /// Stop the running export (the app owns the cancellation token).
-    pub(crate) export_cancel: Rc<dyn Fn()>,
+    /// token does. That is what the bottom bar's old `exporting` flag needed an
+    /// `ExportRun { id, tab }` to approximate, and why removing that flag cost
+    /// nothing: a modal owned by the window has no tab to lose.
+    pub(crate) export_modal: crate::ExportUi,
     /// Splice sink: replace the shown panel's result set in place (so a later
     /// rebuild is fresh). `None` where there is nothing loaded to splice into.
     pub(crate) sync_canonical: Option<SyncCanonicalFn>,
@@ -2738,7 +2783,6 @@ pub(crate) struct GridCtx {
 pub(crate) fn grid_error_bar(
     bars: BarSignals,
     rollback_tx: Rc<dyn Fn(usize)>,
-    export_cancel: Rc<dyn Fn()>,
     error_open: RwSignal<bool>,
     error_text: RwSignal<Option<String>>,
     error_fixable: RwSignal<bool>,
@@ -2766,11 +2810,6 @@ pub(crate) fn grid_error_bar(
             .map(|m| BarState::Error(m, false))
             .or_else(|| view_err.get().map(|m| BarState::Error(m, false)))
             .or_else(|| commit_wait.get().map(BarState::Wait))
-            // Above the note and below the two problems. A running export is not
-            // a problem, so an error or a stalled write outranks it; but it is
-            // *live*, and the note it will itself be replaced by is not, so a
-            // leftover note must not sit on top of a Cancel the user may need.
-            .or_else(|| bars.exporting_here().then_some(BarState::Exporting))
             .or_else(|| commit_note.get().map(BarState::Note))
     };
     dyn_container(current, move |state| {
@@ -2778,9 +2817,6 @@ pub(crate) fn grid_error_bar(
             None => return empty().into_any(),
             Some(BarState::Wait(note)) => return wait_bar(note, rollback_tx.clone()).into_any(),
             Some(BarState::Note(m)) => return note_bar(m).into_any(),
-            Some(BarState::Exporting) => {
-                return export_bar(export_cancel.clone()).into_any();
-            }
             Some(BarState::Error(msg, fixable)) => (msg, fixable),
         };
         let (msg, fixable) = msg;
@@ -2852,20 +2888,21 @@ pub(crate) fn grid_error_bar(
     })
 }
 
-/// Which of the four the bar is showing. An enum rather than the
+/// Which of the three the bar is showing. An enum rather than the
 /// `Result<WaitNote, String>` this was, because a third arm arrived and
-/// `Ok`/`Err` had already stopped meaning success and failure — and a fourth has
-/// since, so the shape has earned itself twice.
+/// `Ok`/`Err` had already stopped meaning success and failure.
 ///
-/// Four *states*, on two surfaces: `Exporting` and `Note` share the ordinary
-/// chrome (`export_bar` draws `note_bar`'s exact fill), because they are one
-/// operation told in two tenses.
+/// There was a fourth, `Exporting`, and its going is worth a line: it was the
+/// only state that stood for an operation *in progress* rather than its result,
+/// and so the only one carrying a control that stopped something. The export
+/// modal is that control's home now — a single affordance from launch to
+/// dismissal — and what is left here is uniformly the tail of something that
+/// has already happened.
 enum BarState {
     /// The message, and whether it is a **statement** failure — the batch arm —
     /// which is what decides whether the modal behind "View" may offer a fix.
     Error(String, bool),
     Wait(WaitNote),
-    Exporting,
     Note(String),
 }
 
@@ -2884,87 +2921,22 @@ pub(crate) struct BarSignals {
     pub(crate) commit_note: RwSignal<Option<String>>,
     pub(crate) view_err: RwSignal<Option<String>>,
     pub(crate) commit_wait: RwSignal<Option<WaitNote>>,
-    /// True while a streamed export is running. The bar's fourth state, and the
-    /// only one that is *not* the tail of an operation: it stands for the whole
-    /// length of one, which is why it is the only state here carrying a control
-    /// that stops something rather than explaining it. The action itself is a
-    /// parameter of [`grid_error_bar`] beside `rollback_tx`, for the reason this
-    /// struct is `Copy`: an `Rc` in here would cost every reader of `any_up` a
-    /// clone.
-    pub(crate) exporting: RwSignal<Option<ExportRun>>,
-    /// Which tab this bar belongs to, so [`BarSignals::exporting_here`] can tell
-    /// an export running *here* from one running in another tab. The signal is
-    /// window-wide; the bar is not.
-    pub(crate) tab_id: usize,
 }
 
 impl BarSignals {
     /// Is the bar up at all? **The one predicate.**
+    ///
+    /// Three states, all of them the *tail* of an operation. There was a fourth —
+    /// a running export — and it was the only one that stood for the whole length
+    /// of one rather than its result, which is why it was the only state here
+    /// carrying a control that stopped something. The export modal carries that
+    /// now, and the bar is back to reporting only what has already happened.
     pub(crate) fn any_up(&self) -> bool {
         self.commit_err.with(Option::is_some)
             || self.commit_note.with(Option::is_some)
             || self.view_err.with(Option::is_some)
             || self.commit_wait.with(Option::is_some)
-            || self.exporting_here()
     }
-
-    /// Is a streamed export running **in this tab**?
-    ///
-    /// The signal outlives a tab switch on purpose — that is what keeps the Cancel
-    /// reachable — so every reader has to ask about its own tab rather than about
-    /// the window. Reading it any other way is how the flag came to be drawn on a
-    /// tab that had nothing to do with the export.
-    pub(crate) fn exporting_here(&self) -> bool {
-        let tab = self.tab_id;
-        self.exporting.with(|e| e.is_some_and(|r| r.tab == tab))
-    }
-}
-
-/// The bar while a streamed export runs: `Exporting…` on the note's surface,
-/// with **Cancel** at the right where the error bar puts **View** and the wait
-/// note puts **Rollback**.
-///
-/// **On the bar rather than on the stats line**, which is where it started. That
-/// line is the result's own, and it is the crowded end of the panel — a capped
-/// result already spends it on `db · 1k of ~16k rows · read 5k rows`, and a
-/// fourth clause pushed the whole thing toward the icons. The bar is empty
-/// almost always, is the width of the grid, and already owns the report this
-/// turns into: the same strip says `Exporting… Cancel` and then
-/// `Exported 16k rows to employees.csv`, so the export occupies one place from
-/// beginning to end instead of announcing itself in one and reporting in
-/// another.
-fn export_bar(cancel: Rc<dyn Fn()>) -> impl IntoView {
-    h_stack((
-        text("Exporting…").style(|s| {
-            s.color(theme::text())
-                .font_size(theme::font_body())
-                .margin_left(theme::scaled(8.0))
-        }),
-        empty().style(|s| s.flex_grow(1.0_f32)),
-        // `err_fix_btn` is the bar's own action colour — what **View** uses two
-        // arms up. Cancel is the same kind of thing in the same place, and a
-        // second accent here would read as a different class of control.
-        text("Cancel")
-            .on_click_stop(move |_| (cancel)())
-            .style(|s| {
-                s.color(theme::err_fix_btn())
-                    .font_size(theme::font_body())
-                    .margin_right(theme::scaled(8.0))
-            }),
-    ))
-    .style(|s| {
-        s.flex_row()
-            .items_center()
-            .width_full()
-            .height_full()
-            // The note's surface, because this *is* the note — one operation
-            // told in two tenses, and a different fill for the first half would
-            // read as two unrelated messages.
-            .background(theme::bg_deepest())
-            .border(1.0)
-            .border_color(theme::border())
-            .border_radius(5.0)
-    })
 }
 
 /// The note half of [`grid_error_bar`]: one line on the ordinary chrome, no
@@ -9025,60 +8997,91 @@ mod tests {
         }
     }
 
-    /// **A tab switch must not be able to lose a running export's Cancel, and a
-    /// second request must not be able to take it away.**
+    /// **Only the export that raised the modal may report into it or close it.**
     ///
-    /// Both used to be one `bool`. The flag lived in the per-active-tab-render
-    /// context while the export's cancellation token is app-global, so switching
-    /// tabs disposed it and switching back built a fresh `false` — the stream ran
-    /// on for minutes with no control bound to it and every further `All rows`
-    /// request refused. And the tail of a finished request cleared the flag
-    /// whenever *its own* scope was streamed, which is true of the second `All
-    /// rows` request the app refuses synchronously, so asking for one tore down
-    /// the running export's Cancel.
+    /// The modal is the export's single affordance now, so this one comparison
+    /// carries what two used to: the bottom bar had an `Exporting… Cancel` state
+    /// with its own `ExportRun { id, tab }` flag, and both surfaces had to agree
+    /// about whose run was whose. The bar's export state is gone — the tab half
+    /// of that id had no reader left — and the id that decides ownership is all
+    /// that survived.
+    ///
+    /// The failure it forecloses is unchanged: a second request is refused
+    /// synchronously by the app's single cancel slot, and its tail arrives while
+    /// the *first* export is still writing. Without this it would overwrite the
+    /// running export's progress line with its own refusal and take that
+    /// export's Stop off the screen for exactly as long as it mattered.
+    /// **The half `export_modal_closes` cannot cover**, and the reason the pair
+    /// has to be tested together rather than each on its own.
+    ///
+    /// That predicate guards the *report*, which arrives long after the launch.
+    /// Nothing guarded the **raise**, and the raise is what destroys state: a
+    /// second save dialog answered while an export ran overwrote the running
+    /// export's modal before the app had accepted the launch, so the guarded
+    /// report then found a modal it no longer owned and dropped itself. Every
+    /// test of the guard alone passed throughout — the defect was at the seam
+    /// between it and the thing that set the state it reads.
     #[test]
-    fn only_the_export_that_raised_the_flag_can_lower_it() {
-        let a = ExportRun::new(7);
-        let b = ExportRun::new(7);
-        assert_ne!(a, b, "two runs in one tab are still two runs");
-
-        // The run that reported is the one holding the flag: it comes down.
-        assert_eq!(export_finished(Some(a), a), None);
-        // A different run reported — including a later one in the same tab, which
-        // is the refused second `All rows` request. The flag stays up.
-        assert_eq!(export_finished(Some(a), b), Some(a));
-        assert_eq!(export_finished(Some(b), a), Some(b));
-        // Nothing was running: a `Fetched` save's tail, which raised no flag.
-        assert_eq!(export_finished(None, a), None);
+    fn a_second_dialog_cannot_take_the_modal_from_a_running_export() {
+        // Nothing on screen: the ordinary launch.
+        assert!(export_may_launch(false, false, false));
+        // An export is writing, its modal up with neither report set. A second
+        // dialog answered now must not touch it.
+        assert!(!export_may_launch(true, false, false));
+        // A finished report the user has not dismissed is not busy — starting
+        // another export is a fine way to dismiss it.
+        assert!(export_may_launch(true, true, false));
+        assert!(export_may_launch(true, false, true));
     }
 
-    /// And the bar asks about *its own* tab, because the signal is window-wide on
-    /// purpose — reading it as a bare "is an export running" is how the Cancel got
-    /// drawn on a tab that had nothing to do with it.
     #[test]
-    fn the_export_bar_belongs_to_the_tab_that_started_it() {
-        let exporting = RwSignal::new(None);
-        let bars = |tab_id: usize| BarSignals {
+    fn only_the_export_that_raised_the_modal_can_report_into_it() {
+        let (a, b) = (next_export_id(), next_export_id());
+        assert_ne!(a, b, "two launches are two runs");
+        let modal = |run: u64| crate::ExportTarget {
+            name: "orders.csv".to_string(),
+            total: None,
+            approx: false,
+            run,
+        };
+
+        // The run that reported owns the modal.
+        assert!(export_modal_closes(Some(&modal(a)), a));
+        // A different run reported — the refused second request. The modal, its
+        // progress line and its Stop stay exactly where they are.
+        assert!(!export_modal_closes(Some(&modal(a)), b));
+        assert!(!export_modal_closes(Some(&modal(b)), a));
+        // No modal up at all: nothing to own, nothing to close.
+        assert!(!export_modal_closes(None, a));
+    }
+
+    /// Ids are unique per process, which is the whole basis of the check above —
+    /// a counter that repeated would hand one export another's modal.
+    #[test]
+    fn export_ids_never_repeat() {
+        let ids: Vec<u64> = (0..64).map(|_| next_export_id()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "an id was handed out twice");
+    }
+
+    /// **The bar is now only ever the tail of an operation.** Its fourth state
+    /// stood for one *in progress* and carried the only control that stopped
+    /// something; that is the export modal's job, and a bar that still claimed to
+    /// be up during an export would dim the selection summary above it for the
+    /// whole length of a write it no longer reports.
+    #[test]
+    fn the_bar_is_down_when_nothing_has_happened() {
+        let bars = BarSignals {
             commit_err: RwSignal::new(None),
             commit_note: RwSignal::new(None),
             view_err: RwSignal::new(None),
             commit_wait: RwSignal::new(None),
-            exporting,
-            tab_id,
         };
-        let here = bars(3);
-        let elsewhere = bars(4);
-        assert!(!here.exporting_here());
-        assert!(!here.any_up());
-
-        exporting.set(Some(ExportRun::new(3)));
-        assert!(here.exporting_here(), "the tab that started it");
-        assert!(here.any_up());
-        assert!(
-            !elsewhere.exporting_here(),
-            "a tab that had nothing to do with it"
-        );
-        assert!(!elsewhere.any_up());
+        assert!(!bars.any_up());
+        bars.commit_note.set(Some("Exported 16k rows".to_string()));
+        assert!(bars.any_up(), "a note still raises it");
     }
 
     /// Run `f` at `scale`, then put the scale back — the registry is a
