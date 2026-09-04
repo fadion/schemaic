@@ -1877,8 +1877,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     block's own. It is refused in the modal rather than at Apply because the `DROP` has already run
     by the time the `CREATE` fails.
   - `compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
-    one migration. The pure half of schema compare: no DB, no UI, nothing here runs anything (51
-    unit tests).
+    one migration. The pure half of schema compare (the UI half is `ui/compare_view.rs`): no DB, no
+    view code, nothing here runs anything (76 unit tests).
     **The differ is the comparator.** An object is `ObjectStatus::Differing` precisely when
     `ddl::diff` — or `diff_view`/`diff_trigger`/`diff_routine`/`diff_event`/`diff_enum`/
     `diff_domain`/`diff_sequence` — hands back a non-empty `ChangeSet` for it, and `status_of` reads
@@ -1905,19 +1905,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     disagree with it (only `flavour`). That single parameter is the honest encoding of a real limit
     rather than a missing feature — type names, defaults and index shapes do not map between
     engines, so a MySQL-to-PostgreSQL plan would be confidently wrong exactly where it mattered —
-    and the caller pairing two connections refuses the mismatch before it reaches here.
+    and the caller pairing two connections refuses the mismatch before it reaches here, through
+    `comparable`. That refusal is **by dialect and not by engine**: MySQL and MariaDB speak one
+    dialect and compare perfectly well, the difference between them riding on the schema's
+    `ServerFlavour`, while the three dialects do not map onto one another at all. It is asked before
+    either schema is read, since two full round trips to then say the pair can't be compared would
+    be the same answer, slower.
     **`SchemaPlan` is a `Vec<ChangeSet>`, not a wider `ChangeSet`.** A set carries one
     `table`/`schema`/`dialect` and most `Change` variants are addressed at that one name instead of
     carrying their own, so a single set *cannot* hold edits to two objects. Widening `Change` would
     put a second notion of "which object" beside the one every emitter already reads, so the
-    aggregate stays a list of single-object sets and `emit`/`destructive`/`unsupported`/`summaries`
-    are the concatenation of what each set answers — no statement is built here
-    (`the_plans_statements_are_exactly_its_sets_statements_in_order`). A `Same` entry is never
+    aggregate stays a list of single-object sets and **no statement is built here** — `emit` is
+    exactly its sets' statements in order, and the three script forms are that same list under a
+    header (`the_plans_statements_are_exactly_its_sets_statements_in_order`). A `Same` entry is never
     planned however permissive the `include` predicate is, its set holding nothing to run. For the
     UI stage: `ui::DdlPreview` is already flat (`statements`/`destructive`/`withheld`/`script`), so
     it can take a whole plan and the plan answers every field of one — `ddl_preview::preview_of` is
     the single-`ChangeSet` shape that would have to grow.
-    **Three of those answers are not a plain concatenation, and each is load-bearing.** `script`
+    **The answers that are more than a concatenation are each load-bearing.** `script`
     puts `ddl::withheld_header` above the statements, over the **union** of its sets' omissions: a
     `join("\n\n")` dropped the "INCOMPLETE" preamble a single set's `ChangeSet::script` carries, so
     a copied plan read as complete while `emit` was silently leaving a lossy index's `UNIQUE` out of
@@ -1926,16 +1931,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ddl.rs` over any `&[String]` — `ChangeSet::withheld_header` delegates to it — because a second
     copy of that sentence is a second thing to keep true. `editor_script` is the same header over
     `ddl::client_script`, so a MySQL trigger or routine body survives the app's `;` splitter, and
-    several such bodies in one plan is exactly this module's case; there is no password to scrub the
-    way `ChangeSet::export_script` must, since no builder it calls produces an account change. The
-    engine it asks is `SchemaPlan`'s own `dialect` field rather than the first set's, so an empty
-    plan still answers as the engine it was built for.
+    several such bodies in one plan is exactly this module's case. The engine it asks is
+    `SchemaPlan`'s own `dialect` field rather than the first set's, so an empty plan still answers as
+    the engine it was built for.
+    `export_script` is `ChangeSet::export_script`'s counterpart and is what a preview's `script`
+    field must be given: it returns `editor_script` unless some set holds a `ddl::is_account_change`,
+    in which case each set writes its own redaction notice beside its own statements under the one
+    withheld header. For a comparison the two are byte-identical, no builder it calls producing an
+    account change — which is exactly why it exists as a function rather than as a sentence saying
+    so. The property is "no plaintext password leaves this modal", and a builder that one day puts
+    an account change in a plan should inherit it instead of having to notice the prose.
     `risk_heading` takes the **stronger** of its sets' answers by asking `ChangeSet::risk_reversible`
     — extracted `pub` for this caller rather than having the aggregate compare headings as strings,
     which would agree with every set the day one is reworded. It only titles a non-empty
     `destructive()` list, so a create-only plan's heading is never read at all, and since
     `Change::risk_is_reversible` is true of the three account changes alone, a compare plan with a
     risk block to head always reads "This can't be undone".
+    **`summaries`, `destructive` and `unsupported` name the object on every line**, prefixing each
+    with `schema.object` through the private `SchemaPlan::subject_of` — the three answers that are
+    prose rather than SQL. A single set's lines are read under a title naming that one table, so
+    `Change::DropTable` says "Drops the table and every row in it" and leaves the *which* to the
+    heading; a plan's title is a **count**, so eight dropped tables produced that identical sentence
+    eight times over "12 objects", on the one surface standing between someone and an irreversible
+    `DROP`. `unsupported` is qualified for a related reason: a non-empty list disables Apply for the
+    *whole* plan, so over two hundred objects the line has to say which tick to clear before Apply
+    comes back.
     **Entries come back from `of` already in plan order**, so group by `CompareEntry::kind` for
     display rather than re-sorting in place. `phase` maps (status, kind) onto one number:
     dependents dropped first, then types created or altered, then table creates, alters and drops in
@@ -1953,9 +1973,48 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `view:` for the same reason (`a_new_domain_is_created_after_the_enum_it_names` and
     `a_new_view_is_created_before_the_trigger_that_names_it`, both failing before the ordinal went
     in; `a_dropped_enum_goes_after_the_domain_that_names_it` guards the negation, where alphabetical
-    happened to coincide with the right answer). A cycle is reported through
-    `SchemaComparison::cycles` the way `DumpPlan::cycles` is: the plan still holds every object, and
-    the flag is what says the order alone can't be trusted.
+    happened to coincide with the right answer). A cycle is reported rather than resolved — no
+    creation order satisfies one — and it travels from `SchemaComparison::cycles` onto
+    `SchemaPlan::cycles` **narrowed by what the plan does**: `plan` sets it as `self.cycles && a set
+    creates a table`, that being the statement carrying an inline foreign key with nothing to point
+    at yet, so a plan of pure alters or drops is unaffected however tangled the schema is. It is
+    reported through `destructive()`, a warning above Apply, and forces `risk_heading()` to "This
+    can't be undone" — and deliberately **not** through `unsupported()`: the statements are all
+    there and one of them will be refused, so withholding a plan the user may still want to copy and
+    reorder would be the wrong call, which is the call `DumpPlan` makes too. The flag errs toward
+    warning, because `dump::order_tables` reports *that* there is a cycle and not which edge, so
+    whether the selected tables are the ones in it cannot be answered from a `ChangeSet`;
+    over-reporting costs one line in a risk block, and the flag is a warning and never a refusal.
+    **Display order is a second order, and it is deliberately not the plan's.** `rows(filter,
+    expanded)` is what a tree renders: groups in `CompareKind`'s own order, objects **alphabetical by
+    `label` within a group**, because a tree is read by looking a name up — while the order the
+    statements must run in stays in `entries` and reaches SQL only through `plan`, and nothing
+    derives one from the other. A `CompareRow` is either a kind's `Group`, carrying the tally of what
+    is *visible* beneath it (`CompareCounts::total` is the figure a heading prints), or an `Object`,
+    present only while its heading is expanded; a group whose entries are all filtered out is omitted
+    rather than drawn empty, and `default_expanded` seeds the open set with every kind that has a
+    difference in it, a kind holding nothing but agreement being the answer "nothing to see here".
+    `RowFilter::query` matches through **`schema::object_name_matches`** — the one search predicate —
+    over `CompareEntry::label`, so typing a table's name also finds the triggers hanging off it, and
+    `show_same` is off by default as a reading decision rather than a performance one: two hundred
+    identical tables put the four that matter below the fold.
+    **`label` carries a routine's signature** — `app.area(integer)` — because the compare tree is the
+    first surface in this app to list two PostgreSQL overloads side by side, and without it they drew
+    as two identical rows: the same text, the same heading over the diff pane, and a filter matching
+    on `label` that could not separate them, so ticking one while reading the other was invisible.
+    Their keys always differed; only what a reader could see did not. `rows` sorts on `label`, so
+    this orders overloads as well as distinguishing them.
+    **`selectable_keys(filter)` is what "Select all" means**, and it is filtered on purpose. It was
+    `differences().filter(|e| !e.needs_source())` over the whole comparison, never intersected with
+    the filter — so narrowing four hundred objects to three and pressing the link that sits *in the
+    same bar as the filter box* took the footer to 312, every one of them a tick nobody had looked at.
+    The view's **None** link reads the same keys, so the pair is symmetric: it clears only what is
+    shown, and a filtered-out selection is not silently discarded either. A `needs_source` body is
+    left out for the reason its row has no tick at all.
+    **`left_ddl`/`right_ddl` are the two `CREATE` texts captured at comparison time**, so a view
+    showing both sides is one `diff::line_diff` over two strings. Handing a renderer the two
+    `TableInfo`s and letting it ask would put a second opinion about what an object *is* in a view;
+    this text is only ever read and never emitted — the statements come from `changes`.
     **Identity is a key per kind, each as wide as its engine needs.** Tables and views pair on
     `(is_view, qualified name)`, so a name that is a table here and a view there is a drop plus a
     create rather than an unmigratable "differing table" — no `ALTER` turns one into the other.
@@ -4981,6 +5040,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     always-full-window failure as above, arrived at through a member that is open but invisible
     rather than through a group that is closed. `users_view::users_overlay` asks the identical three
     signals, and the two must not be able to disagree.
+    **Schema compare, the group's sixth member, takes the same `preview_open` clause — and there for
+    the rule rather than for a case.** It raises the DDL preview too, painted in the earlier DDL
+    group, so a wrapper that went on filling the layer would sit on top of it exactly as above. What
+    is different is that `compare_view::open_plan_preview` closes the comparison on its way to the
+    preview, so the clause guards nothing that arises today; it is written down anyway, because the
+    alternative is a member of this group whose correctness rests on a caller remembering to close
+    itself first.
   - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). A code
     block carries a **standing** 24px header — the language on the left, `Copy` and (for SQL only)
     `Insert` / `Run` on the right, as words rather than icons, since a permanent icon row over every
@@ -5815,7 +5881,36 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     both engines — was titled `shop.app@%`, which reads as scoped and is not. `preview_title` is a
     free function so that sentence has a test; it was a `match` inside a `dyn_container` child.
     `risk_heading` rides on the preview beside it, from `ChangeSet::risk_heading` — a heading that
-    contradicts the sentence beneath it costs the sentence its weight.
+    contradicts the sentence beneath it costs the sentence its weight. A multi-object plan is
+    `qualified`'s one exception to being derived at all — the entry below says why.
+    **`preview_of_plan` is `preview_of`'s multi-object counterpart**, for a schema comparison's
+    `compare::SchemaPlan`, and `DdlPreview` needed **nothing added** to carry one: every field it
+    holds was already flat text, and a plan answers each of them — the statements as its sets'
+    statements in order, the prose lists with the object named per line. So a twelve-object migration
+    reaches the same modal, the same Apply and the same `Db::run_ddl` as one table's designer edit —
+    a second apply path being precisely what the DDL invariant forbids.
+    `scope` is read off **every** set's changes rather than the first set's or the caller's, for the
+    reason `preview_of` gives; a comparison produces no server-level change today, and asking the
+    plan rather than assuming that is what keeps the answer right if it ever grows one.
+    **`qualified` is `false` unconditionally**, and it is the one field this counterpart does not
+    derive. Deriving it the way `preview_of` does answered `true`, and `preview_title` then wrote
+    `Apply changes to My MariaDB · shop.12 objects` — every input to it true and the result nonsense,
+    because a plan's subject is a **count**, not an object that lives in a database. Nothing is lost
+    by the title declining to qualify it: each statement is still qualified and `summaries()` names
+    the object per line. `preview_of_plan` has four unit tests of its own, two of which fail against
+    the old derivation — `a_plan_is_never_qualified_by_the_database_it_runs_in`, and
+    `an_empty_plan_previews_as_empty_and_unqualified`, where `all()` over no changes was vacuously
+    true and flipped the answer for a reason that had nothing to do with accounts. It had none while
+    `preview_of` had them, which is how the nonsense title shipped.
+    `withheld` is `SchemaPlan::unsupported()`, so the "not applied in part" refusal fires on the
+    button *and* inside `apply()` on this path too, and `script` is
+    `SchemaPlan::export_script()` — the same field `preview_of` fills that way, and for the same
+    reason: Copy and Open in editor both put the text somewhere durable. It happens to equal
+    `editor_script()` byte for byte for a comparison, which produces no account change, but the rule
+    is enforced by *calling* the scrubbing function rather than by a comment observing there is
+    nothing to scrub today. `subject` names the plan ("12 objects") rather than an object,
+    there being no single object to name, and the post-apply `refresh_db` already re-introspects a
+    whole database, which is the right refresh for a plan that touched many of its objects.
     **`preview_account` takes an `AccountPlanTarget` captured where the plan was raised**, not the
     live `edit_ctx`. `conn_id`, `dialect` and `read_only` come off the `AccountTarget`/`GrantTarget`
     the form was opened with — which is what those fields are *for*, and they were carried and never
@@ -7315,6 +7410,117 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     cancel exists to avoid. The new token also has to *replace* the stored one rather than only
     cancel it: keeping the stale token there pointed the new panel's Escape at a read that was
     already over.
+  - `compare_view.rs` — the **schema-compare** overlay (`compare_overlay`), over `core::compare`:
+    two databases side by side, and the migration between them. Not a tab — there is no tab kind in
+    this app, `Tab`/`SavedTab` being query tabs — so it is the sixth entry of the modal layer's
+    **workspace** group, beside the ERD and the binary-cell panel, and counted by
+    `workspace_modals_up`. `open_compare(ui, conn_id, database)` is the way in, from a database row's
+    **Compare with** (beside ER Diagram in `overlays.rs`): it returns every signal the modal owns to
+    its opening value through `reset` — the one door `close` goes through too, since two paths
+    writing their own subsets is what left `show_same` cleared on open and not on close — and fixes
+    the **left** side, the right one being the question the modal is open to ask. It decides nothing
+    about what differs, in what order the statements run, or what a plan withholds — the tree's rows,
+    each heading's tally, the diff pane's two sides and the plan the footer previews are all reads of
+    one `SchemaComparison`, and an opinion of its own here would be the second differ the DDL
+    invariant exists to prevent.
+    **It has its own fetch, and that is the deliberate divergence from `erd_overlay`.**
+    `SchemaActions::compare_fetch` (implemented in `main.rs` beside `table_stats`) calls
+    `Db::fetch_schema` on *both* sides. The diagram instead reads whatever the schema tree already
+    loaded and says "not loaded yet" otherwise, which would rule this feature out entirely: the
+    right-hand side is routinely a database on another connection the tree has never introspected.
+    There is no `CancellationToken` — there is no Stop to offer, `start_fetch`'s reason — so
+    staleness is handled the properties fetch's way, by dropping the landing unless `overlay.compare`
+    still equals the target it was asked for. The dialect refusal happens **before either round
+    trip**, through `compare::comparable` (see its entry for why that is by dialect and not by
+    engine).
+    **The five view-state signals are kept apart from the comparison, for the properties modal's
+    reason** — `compare_selected` (ticked entry keys), `compare_expanded` (open group labels),
+    `compare_focus` (whose text the diff pane shows), `compare_query`, `compare_show_same`. They
+    change without the comparison changing, and re-fetching two schemas because someone opened a
+    group would be the same failure as a failed row count replacing statistics that loaded fine.
+    `CompareState::Ready` holds an `Rc<SchemaComparison>` for the reason `SchemaState` holds an
+    `Arc`: a comparison carries a `ChangeSet` per object, and both the tree and the pane read the
+    signal per render. Two of the five are seeded by the **landing** rather than by the open —
+    `default_expanded()` opens every kind that differs, and every difference that *can* be applied
+    arrives ticked, a comparison being opened to migrate the difference rather than to admire it. A
+    side is a **connection plus a database** (`CompareSide`/`CompareTarget`), because the two halves
+    may live on different servers — which is why **the picker asks in two steps, connection then
+    database**, and that is not decoration. The one-step version is every connection crossed with
+    `schema.db_nodes`, and it is wrong in both directions: `db_nodes` only ever holds the *active*
+    connection's list, so the cross product offers another server databases it may not hold and
+    cannot offer one only that server has, which is the comparison this feature exists for. Picking
+    a connection asks *it* what it has instead — `SchemaActions::compare_list_dbs` →
+    `Db::fetch_databases`, filtered through `schema::db_visible` against
+    **`db_hidden::names_for(rules, conn_id)`**, because a database the user hid has no more business
+    in a picker than in the tree — and the answer lands in
+    `compare_dbs`/`compare_dbs_err`, held apart from `compare_state` for the same reason the five
+    above are: a picker whose list failed must not blank a comparison that loaded fine. Step two
+    carries a `‹ another connection` link back, and `db_nodes` is not read by this module at all.
+    **Whose hidden set that is, is the whole point of the spelling.** `ui.schema.hidden_dbs` is a
+    memo over the **active** connection, so filtering another server's list through it hid databases
+    that server really has, offered ones the user had hidden on it, and — on SQLite, where the list
+    is the single `main` — emptied every other SQLite connection's list outright. `names_for` is
+    handed the rules and the id of the connection being *listed*, which is the same distinction
+    `db_hidden`'s own entry exists to keep.
+    That listing is deliberately **unguarded against two clicks landing out of order**, and what
+    makes it safe is load-bearing: the connection id travels *with the list* — `compare_dbs` holds
+    `(u64, Vec<String>)` and step two builds its `CompareSide` from that pair, not from whichever row
+    was clicked — so the worst case is reading the earlier click's databases, and picking one still
+    compares against the connection they came from. Capturing the clicked id in the row's closure
+    instead would cost nothing visible and turn a stale list into a comparison run against the wrong
+    server.
+    **The MySQL bodies are shown, readable, and cannot be ticked**, which is the limitation most
+    worth knowing here. `CompareEntry::needs_source` is true of a trigger, routine or event whose
+    body the eager `fetch_schema` read out of `information_schema` with its escapes already
+    resolved — so the *verdict* is right and a `CREATE` built from it is not. Such a row carries a
+    warning triangle where its tick would be, plus the sentence "body must be re-read before this can
+    be applied"; **Select all** goes through `SchemaComparison::selectable_keys`, which filters the
+    same way (and by the query too — see its entry), the app's seed above filters the same way, and
+    **`plan_of`** — `c.plan(|e| selected.contains(&e.key()) && !e.needs_source())` — keeps a tick
+    that arrived by some other route (a comparison replaced under a stale selection, a future
+    "invert") from reaching `emit`. The three spell the same rule at three sites, and it has to stay
+    the same rule: counting over a laxer predicate than the one that builds the plan is how a
+    confident "1 object" comes to sit over a button that builds an empty plan and returns. Lifting
+    the block means re-reading each body through `Db::{trigger,routine,event}_source` first — open
+    work, not something to fake in the meantime.
+    **Preview never applies.** `open_plan_preview` builds the `SchemaPlan`, reads the left
+    connection's `read_only` off the connection list, names it "N objects" and hands it to
+    `ddl_preview::preview_of_plan` — the same modal, the same Apply and the same `Db::run_ddl` a
+    one-table designer edit takes. The comparison closes on the way there, so the plan is a snapshot
+    rather than a selection the preview no longer reflects.
+    **The footer counts objects, not statements, and it never builds a plan to do it.** The memo ran
+    `plan_of` and then `emit()` on every checkbox tick — cloning a `ChangeSet` per selected object
+    and rendering the whole migration's SQL synchronously on the UI thread to display a number. It
+    now counts the entries the predicate accepts, reading the selection with `with` so the `HashSet`
+    is not cloned, and the status reads "N objects selected"; the statement count lives in the
+    preview, which is the only place it can be had without emitting. The button is keyed on a
+    separate `Memo<bool>` rather than on the count, because `dyn_container` has no equality check of
+    its own and was tearing the button — and with it its focus-ring registration — down on every tick
+    instead of on the two transitions that matter. It registers in **`ACTION_TAB`**, the band every
+    modal's footer actions take, so a body that later grows `VALUE_TAB`-based rows cannot overtake it.
+    **A foreign-key cycle is said twice on purpose.** A warning strip sits above the tree as well as
+    reaching the preview's risk block through `SchemaPlan::cycles`, because the tree is where someone
+    decides what to tick and the risk block is read after that decision is made. The strip asks
+    `SchemaComparison::cycles`, not the plan's narrowed copy — it is drawn before there is a selection
+    to narrow by.
+    **The chrome is this module's own.** `schema_tree`'s `tree_row`/`chevron`/`tree_row_min_w` are
+    module-private and nothing was promoted to share them. Status is one glyph per row (`+` arrives,
+    `−` goes, `~` changes, `=` agrees) so a long list reads down a column instead of as a wall of
+    words, and the diff pane is one `diff::line_diff` over `CompareEntry::{left_ddl,right_ddl}`. The
+    right-side picker is an **inline expand-in-place list rather than the popup menu**, because
+    `menu_panel` anchors itself to a measured rect and this control sits in a fixed header — the
+    import modal's sheet picker is the precedent.
+    **An empty tree says *which* emptiness it is, and it is chosen inside the container that tracks
+    the filter** rather than once above it. Three cases are reachable and they read differently — a
+    filter that matched nothing, two schemas that agree, and two databases with nothing in them —
+    and "nothing matches that filter" over an unfiltered identical pair is the wrong answer to the
+    question asked, while "these match" over a failed filter is worse: it claims agreement the
+    comparison never checked. The message was an early return *outside* that container, which also
+    made **Identical too** dead in an all-identical comparison, the tick having nothing left to
+    re-render. The picker's failure line is the same lesson one level up: it renders **above**
+    whichever step is showing rather than instead of one, because an error arm of its own replaced
+    the connection rows that were the only control able to clear `compare_dbs_err` — a listing that
+    failed could then be escaped only by closing the whole modal.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
     surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
     `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
@@ -8713,9 +8919,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   **`core::compare` is on the differ side of the rule, and it is the only aggregate.** A schema
   comparison decides what differs by asking `ddl::diff` and its per-kind siblings — there is no
   field-by-field comparison in that module — and its `SchemaPlan` is a list of single-object
-  `ChangeSet`s whose `emit`/`destructive`/`unsupported` are the concatenation of theirs, so it adds
-  neither a differ nor an emitter. Nothing runs it today; there is no UI over it, and a compare that
-  grew one and applied its own plan without the preview would be the path this rule forbids.
+  `ChangeSet`s whose `emit` is exactly theirs in order, so it adds neither a differ nor an emitter.
+  Its prose answers (`summaries`/`destructive`/`unsupported`) do prefix each line with the object it
+  belongs to, a plan's title being a count rather than a name, but no *statement* is built there. **And the UI it has now is on the written side of the rule too**:
+  `ui/compare_view.rs` builds a `SchemaPlan` from what is ticked and hands it to
+  `ddl_preview::preview_of_plan`, which fills the same `DdlPreview` a one-table designer edit fills —
+  so a compare plan takes the same preview, the same Apply and the same `Db::run_ddl`, and reads its
+  `scope` off every set's changes rather than letting the caller pick a runner. A compare that
+  applied its own plan without the preview would be the path this rule forbids, and the aggregate is
+  where doing so would be cheapest: it already holds every statement in order.
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. The "INCOMPLETE" preamble that carries the same omission *out* through Copy and

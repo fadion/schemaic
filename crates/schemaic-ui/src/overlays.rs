@@ -1419,6 +1419,22 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             seed: schemaic_core::erd::DiagramSeed::Database,
                         }));
                     }));
+                    // Compare this database against another. Beside the ER
+                    // diagram because both are whole-database readings rather
+                    // than edits, and this one writes nothing itself — it hands
+                    // a plan to the DDL preview, where Apply and the write
+                    // guard already live.
+                    {
+                        let ui = ui.clone();
+                        let cdb = menu.name.clone();
+                        entries.push(MenuEntry::action("Compare with", move || {
+                            crate::compare_view::open_compare(
+                                &ui,
+                                active_conn.get_untracked(),
+                                &cdb,
+                            );
+                        }));
+                    }
                     let rf = refresh_db.clone();
                     let dn = menu.name.clone();
                     entries.push(MenuEntry::action("Refresh", move || (rf)(dn.clone())));
@@ -6561,6 +6577,13 @@ mod menu_order_gate {
             | "Properties"
             | "Live monitor"
             | "ER Diagram"
+            // **Group 2, beside the ER diagram, and not the writing group.** A
+            // comparison reads two databases and emits nothing: the plan it
+            // builds goes to the DDL preview, where Apply lives and where the
+            // write guard is. Putting it in group 4 would place a read above
+            // `Drop` and misfile the one entry whose whole point is that it
+            // changes nothing by itself.
+            | "Compare with"
             // One node, two spellings, same slot: a table has four things to
             // generate and gets the submenu, a view has one and keeps the flat
             // entry rather than spending a hover on a lone child.

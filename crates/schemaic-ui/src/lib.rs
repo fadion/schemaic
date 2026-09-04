@@ -13,6 +13,7 @@ mod blob_view;
 pub use ai_panel::mark_messages_seen;
 pub use blob_view::{BlobPane, BlobState, BlobTarget, BlobUi};
 mod cell_editors;
+mod compare_view;
 mod completion;
 mod connection_form;
 mod connection_import;
@@ -3077,6 +3078,50 @@ pub struct ErdTarget {
     pub seed: schemaic_core::erd::DiagramSeed,
 }
 
+/// One side of a schema comparison: which connection, and which database on it.
+///
+/// A side is a *connection plus a database* rather than a database name, because
+/// the whole point of comparing is that the two may live on different servers —
+/// staging against production being the case the feature exists for. On MySQL
+/// one `Db` reads any database it has rights to, on PostgreSQL a second database
+/// means a second connection, and on SQLite a second file is a second
+/// connection outright; none of that is this type's business, only the pair.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompareSide {
+    pub conn_id: u64,
+    pub database: String,
+}
+
+/// What a schema comparison is comparing.
+///
+/// `OverlayUi::compare` being `Some` means the overlay is open. `right` is
+/// `None` until a side is picked, which is the overlay's opening state: it is
+/// raised from one database's context menu, so the left is always known and the
+/// right is the question being asked.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompareTarget {
+    pub left: CompareSide,
+    pub right: Option<CompareSide>,
+}
+
+/// Where a schema comparison has got to.
+///
+/// `Ready` holds an [`Rc`], not the comparison itself: every row of
+/// the tree and the diff pane beside it read this signal, and a `SchemaComparison`
+/// carries a `ChangeSet` per object — cloning that out of the signal per render
+/// is the cost `SchemaState`'s own `Arc` exists to avoid.
+#[derive(Clone, Default)]
+pub enum CompareState {
+    /// No right-hand side chosen yet — nothing has been asked for.
+    #[default]
+    Idle,
+    Loading,
+    Ready(std::rc::Rc<schemaic_core::compare::SchemaComparison>),
+    /// Either a fetch failed or the pair was refused (two engines don't
+    /// compare — `compare::comparable` writes that sentence).
+    Failed(String),
+}
+
 /// An open schema context menu: what was clicked, its display name (for "Copy
 /// name"), and a ready-to-send AI prompt. It's anchored at the last mouse
 /// position (tracked in window coords at the root).
@@ -3645,6 +3690,18 @@ pub struct SchemaActions {
     /// Fetch table statistics for the properties modal (whole database, one
     /// round trip) and drop the result into `overlay.properties_state`.
     pub table_stats: Rc<dyn Fn(PropertiesTarget)>,
+    /// Introspect **both** sides of a schema comparison and land the result in
+    /// `overlay.compare_state`.
+    ///
+    /// Its own fetch rather than the schema tree's, which is what the ER diagram
+    /// reads: a comparison's two sides are chosen freely and the right-hand one
+    /// is routinely a database on *another* connection that the tree has never
+    /// introspected and has no node for. Refusing to compare anything the tree
+    /// hadn't already loaded would rule out the case the feature is for.
+    pub compare_fetch: Rc<dyn Fn(CompareTarget)>,
+    /// List one connection's databases, for the compare picker's second step —
+    /// see [`OverlayUi::compare_dbs`] for why it is asked per connection.
+    pub compare_list_dbs: Rc<dyn Fn(u64)>,
     /// Run the exact `SELECT COUNT(*)` behind the properties modal's **Count
     /// rows**. Separate from [`SchemaActions::table_stats`] because it is a full
     /// scan the user asked for, not part of opening the panel.
@@ -4362,6 +4419,44 @@ pub struct OverlayUi {
     pub monitor_dropped: RwSignal<usize>,
     /// ER-diagram modal: `Some(target)` opens it for that database/seed.
     pub erd: RwSignal<Option<ErdTarget>>,
+    /// Schema-compare modal: `Some(target)` opens it, and choosing the right
+    /// side kicks off the fetch that lands in `compare_state`.
+    ///
+    /// The five signals beside it are all *view* state over one comparison, kept
+    /// apart from `compare_state` for the reason the properties modal's exact
+    /// count is: they change without the comparison changing. A tick, a
+    /// keystroke in the filter or a collapsed group must not touch the
+    /// comparison, and re-fetching two schemas because someone opened a group
+    /// would be the same failure as a failed row count replacing statistics
+    /// that loaded perfectly well.
+    pub compare: RwSignal<Option<CompareTarget>>,
+    pub compare_state: RwSignal<CompareState>,
+    /// The [`schemaic_core::compare::CompareEntry::key`] of every object ticked
+    /// for the plan. Seeded from the comparison when it lands.
+    pub compare_selected: RwSignal<std::collections::HashSet<String>>,
+    /// The [`schemaic_core::compare::CompareKind::label`] of every open group.
+    pub compare_expanded: RwSignal<std::collections::HashSet<String>>,
+    /// Which object's two sides the diff pane is showing, by entry key.
+    pub compare_focus: RwSignal<Option<String>>,
+    /// The databases on one connection, for the right-hand side's picker:
+    /// `Some((conn_id, names))` once that connection has been asked.
+    ///
+    /// Asked per connection rather than read out of `schema.db_nodes`, because
+    /// that list is **always the active connection's** — pairing it with every
+    /// connection offers databases the other server may not hold, and cannot
+    /// offer one only the other server has, which is the comparison this
+    /// feature exists for.
+    pub compare_dbs: RwSignal<Option<(u64, Vec<String>)>>,
+    /// Why the database list couldn't be read, when it couldn't. Kept apart
+    /// from `compare_state` so a picker that failed doesn't blank a comparison
+    /// that loaded perfectly well.
+    pub compare_dbs_err: RwSignal<Option<String>>,
+    /// The filter box's text. Not persisted, for the reason `users_filter`
+    /// isn't: a filter is about the question being asked right now.
+    pub compare_query: RwSignal<String>,
+    /// Show the objects both sides agree about. Off by default — see
+    /// [`schemaic_core::compare::RowFilter::show_same`].
+    pub compare_show_same: RwSignal<bool>,
     /// Table-properties modal: `Some(target)` opens it for that object, and the
     /// statistics fetch it kicks off lands in `properties_state`.
     ///

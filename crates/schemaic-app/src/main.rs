@@ -7029,6 +7029,175 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // this is a fresh connection and a slow-ish catalogue read, so the user can
     // close the panel or open another table while it is in flight, and a late
     // reply must not overwrite the newer one.
+    // Schema compare's signals. Declared here, not inline in the `OverlayUi`
+    // literal the way `erd` is, because the two actions below write them and
+    // the staleness check reads them back.
+    let compare: RwSignal<Option<schemaic_ui::CompareTarget>> = RwSignal::new(None);
+    let compare_state: RwSignal<schemaic_ui::CompareState> =
+        RwSignal::new(schemaic_ui::CompareState::Idle);
+    // The reading state the fetch seeds when a comparison lands, and the
+    // overlay owns from then on.
+    let compare_selected = RwSignal::new(std::collections::HashSet::<String>::new());
+    let compare_expanded = RwSignal::new(std::collections::HashSet::<String>::new());
+    let compare_dbs: RwSignal<Option<(u64, Vec<String>)>> = RwSignal::new(None);
+    let compare_dbs_err: RwSignal<Option<String>> = RwSignal::new(None);
+
+    // One connection's databases, for the compare picker's second step. Asked
+    // of the server rather than read off `db_nodes`, which only ever holds the
+    // *active* connection's list — see `OverlayUi::compare_dbs`.
+    let compare_list_dbs: Rc<dyn Fn(u64)> = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(move |conn_id: u64| {
+            // **Guarded, because `set` never dedups.** The modal's body is a
+            // `dyn_container` keyed partly on this signal, so writing `None`
+            // over `None` disposed and rebuilt the filter bar, the whole row
+            // tree and the diff pane — losing the tree's scroll position for a
+            // listing that had not even been sent yet.
+            if compare_dbs_err.get_untracked().is_some() {
+                compare_dbs_err.set(None);
+            }
+            let db = match db_for(conn_id) {
+                Ok(db) => db,
+                Err(e) => {
+                    compare_dbs_err.set(Some(e));
+                    return;
+                }
+            };
+            // **This connection's hide rules, not the active connection's.**
+            // `hidden_dbs` is a memo over `active_conn`, so filtering another
+            // server's list through it hid a database that server really has
+            // and offered one the user had hidden on it. On SQLite, where the
+            // list is the single `main`, hiding `main` on the active connection
+            // emptied every other SQLite connection's list outright.
+            let hidden = hidden_db_rules
+                .with_untracked(|rules| schemaic_core::db_hidden::names_for(rules, conn_id));
+            let report = create_ext_action(cx, move |res: Result<Vec<String>, String>| match res {
+                // Hidden databases are left out for the reason every other
+                // database list leaves them out: the user said they didn't want
+                // to see that one, and a picker is a list.
+                Ok(names) => compare_dbs.set(Some((
+                    conn_id,
+                    names
+                        .into_iter()
+                        .filter(|n| schemaic_core::schema::db_visible(&hidden, n))
+                        .collect(),
+                ))),
+                Err(e) => compare_dbs_err.set(Some(e)),
+            });
+            handle.spawn(async move {
+                report(db.fetch_databases().await.map_err(|e| e.to_string()));
+            });
+        })
+    };
+
+    // Introspect both sides and compare them.
+    //
+    // **Its own fetch, not the tree's.** The ER diagram reads whatever the tree
+    // has already loaded and says "not loaded yet" otherwise; that would rule
+    // out this feature's whole point, since the right-hand side is routinely a
+    // database on another connection the tree has never touched.
+    //
+    // No `CancellationToken`: there is no Stop to offer here, which is the
+    // reason `start_fetch` has none either. Two schemas landing out of order is
+    // handled the way the properties fetch handles it — the answer is dropped
+    // unless the target it was asked for is still the one on screen.
+    let compare_fetch: Rc<dyn Fn(schemaic_ui::CompareTarget)> = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(move |target: schemaic_ui::CompareTarget| {
+            let Some(right) = target.right.clone() else {
+                compare_state.set(schemaic_ui::CompareState::Idle);
+                return;
+            };
+            let (left_db, right_db) = match (db_for(target.left.conn_id), db_for(right.conn_id)) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => {
+                    compare_state.set(schemaic_ui::CompareState::Failed(e));
+                    return;
+                }
+            };
+            // Refused before either round trip, and by **dialect** rather than
+            // engine: MySQL and MariaDB compare perfectly well, three different
+            // dialects do not map onto each other at all. Two full schema reads
+            // to then say "these can't be compared" would be the same answer,
+            // slower.
+            let (ld, rd) = (left_db.engine().dialect(), right_db.engine().dialect());
+            if let Err(why) = schemaic_core::compare::comparable(ld, rd) {
+                compare_state.set(schemaic_ui::CompareState::Failed(why));
+                return;
+            }
+
+            compare_state.set(schemaic_ui::CompareState::Loading);
+            let want = target.clone();
+            let report = create_ext_action(
+                cx,
+                move |res: Result<
+                    (
+                        Box<schemaic_core::schema::DbSchema>,
+                        Box<schemaic_core::schema::DbSchema>,
+                    ),
+                    String,
+                >| {
+                    // The pair on screen changed while these were in flight —
+                    // someone picked a different right-hand side, or closed the
+                    // modal. The landing is for a question nobody is asking.
+                    if compare.with_untracked(|t| t.as_ref() != Some(&want)) {
+                        return;
+                    }
+                    match res {
+                        Ok((l, r)) => {
+                            let c = schemaic_core::compare::SchemaComparison::of(&l, &r, ld);
+                            // Seed the reading: every kind that differs opens,
+                            // and everything that *can* be applied arrives
+                            // ticked — a comparison is opened to migrate the
+                            // difference, so making the common case the default
+                            // beats an empty tree with a dead button under it.
+                            // The bodies MySQL mangles are left out, because
+                            // they cannot be emitted faithfully yet.
+                            compare_expanded.set(c.default_expanded());
+                            compare_selected.set(
+                                c.differences()
+                                    .filter(|e| !e.needs_source())
+                                    .map(|e| e.key())
+                                    .collect(),
+                            );
+                            compare_state
+                                .set(schemaic_ui::CompareState::Ready(std::rc::Rc::new(c)));
+                        }
+                        Err(e) => compare_state.set(schemaic_ui::CompareState::Failed(e)),
+                    }
+                },
+            );
+            let (ldb, rdb) = (target.left.database.clone(), right.database.clone());
+            handle.spawn(async move {
+                // **Concurrently.** The two reads are independent — one `Db`
+                // handle each, one connection per operation, routinely on two
+                // different servers — so nothing orders them, and awaiting in
+                // sequence made the user wait left *plus* right for a catalogue
+                // read that is seconds on a large database. Each error keeps
+                // its own "Reading {db}" prefix, so a failure still says which
+                // side could not be read.
+                let left = async {
+                    left_db
+                        .fetch_schema(&ldb, CancellationToken::new())
+                        .await
+                        .map_err(|e| format!("Reading {ldb}: {e}"))
+                };
+                let right = async {
+                    right_db
+                        .fetch_schema(&rdb, CancellationToken::new())
+                        .await
+                        .map_err(|e| format!("Reading {rdb}: {e}"))
+                };
+                match tokio::try_join!(left, right) {
+                    Ok((l, r)) => report(Ok((Box::new(l), Box::new(r)))),
+                    Err(e) => report(Err(e)),
+                }
+            });
+        })
+    };
+
     let table_stats: Rc<dyn Fn(schemaic_ui::PropertiesTarget)> = {
         let handle = handle.clone();
         let db_for = db_for.clone();
@@ -9726,6 +9895,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             monitor_exported,
             monitor_dropped,
             erd: RwSignal::new(None),
+            compare,
+            compare_state,
+            compare_selected,
+            compare_expanded,
+            compare_focus: RwSignal::new(None),
+            compare_dbs,
+            compare_dbs_err,
+            compare_query: RwSignal::new(String::new()),
+            compare_show_same: RwSignal::new(false),
             properties,
             properties_state,
             properties_counting,
@@ -9784,6 +9962,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             routine_source,
             event_source,
             table_stats,
+            compare_fetch,
+            compare_list_dbs,
             count_rows,
             count_cancel,
             principals,

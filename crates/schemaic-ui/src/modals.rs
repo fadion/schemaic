@@ -232,6 +232,12 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             // result on screen* rather than about the schema tree, and it is
             // raised from the grid's own cell menu.
             crate::blob_view::blob_overlay(ui.clone()),
+            // Schema compare belongs here for the reason the ER diagram does:
+            // it is a full-window reading of a database raised from the tree,
+            // and it hands off to the DDL preview rather than writing anything
+            // itself — so it sits *under* the preview's own group, which is
+            // what lets Apply appear over it.
+            crate::compare_view::compare_overlay(ui.clone()),
         ))
         .style(move |s| {
             if workspace_modals_up() {
@@ -376,14 +382,17 @@ pub(crate) fn ddl_editors_up(d: DdlUi) -> impl Fn() -> bool + Copy + 'static {
 }
 
 /// The workspace group's modals — Live Monitor, the ER diagram, Properties, the
-/// binary-cell panel, and the Users and privileges browser, which is the one
-/// that is not simply open or closed. See the note in the body.
+/// binary-cell panel, and the two that are not simply open or closed: the Users
+/// and privileges browser, and schema compare. Both of those raise something
+/// painted in an earlier group and so stop counting while it is up. See the
+/// note in the body.
 fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let mon_open = ui.overlay.monitor_open;
     let erd_open = ui.overlay.erd;
     let props_open = ui.overlay.properties;
     let users_open = ui.overlay.users;
     let blob_open = ui.blob.target;
+    let compare_open = ui.overlay.compare;
     // **The browser counts only while it is the thing on screen.** It renders
     // nothing while one of the account forms or the DDL preview is up — those
     // are raised from it and painted in an earlier group — and a wrapper that
@@ -401,6 +410,13 @@ fn workspace_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
                 && account_open.get().is_none()
                 && grant_open.get().is_none()
                 && preview_open.get().is_none())
+            // Compare takes the browser's `preview_open` clause for the same
+            // reason: it raises the DDL preview, which is painted in an earlier
+            // group. It closes itself on the way there today — a comparison
+            // outlives the schema it describes by no more than one apply — so
+            // this is the rule stated rather than a case that arises, and it is
+            // here so that stops being load-bearing.
+            || (compare_open.get().is_some() && preview_open.get().is_none())
     }
 }
 
@@ -489,6 +505,9 @@ mod modal_backdrop_gate {
         // In the layer's workspace group, beside `properties.rs`, raised by
         // `workspace_modals_up`'s `blob_open.get().is_some()` arm.
         "blob_view.rs",
+        // In the layer's workspace group, beside `erd_view.rs`, raised by
+        // `workspace_modals_up`'s `compare_open.get().is_some()` arm.
+        "compare_view.rs",
         "connection_form.rs",
         // A loose child of the layer, directly above `connection_form.rs`'s
         // modal, which is what raises it.
