@@ -11,6 +11,7 @@ pub mod aggregate;
 pub mod blob;
 pub mod celledit;
 pub mod chat;
+pub mod compare;
 pub mod conn_import;
 pub mod connection;
 pub mod date;

@@ -3737,26 +3737,38 @@ impl ChangeSet {
     /// text rather than the button being taken away, and a six-statement rebuild
     /// that quietly has no `UNIQUE` index in it says so at the top.
     fn withheld_header(&self) -> String {
-        let withheld = self.unsupported();
-        if withheld.is_empty() {
-            return String::new();
-        }
-        let mut out = String::from(
-            "-- INCOMPLETE. Schemaic could not express part of this plan, and refuses\n\
-             -- to apply it while that is true. Running the statements below anyway\n\
-             -- would leave out:\n",
-        );
-        for w in &withheld {
-            for (i, line) in w.lines().enumerate() {
-                out.push_str(if i == 0 { "--   - " } else { "--     " });
-                out.push_str(line.trim());
-                out.push('\n');
-            }
-        }
-        out.push('\n');
-        out
+        withheld_header(&self.unsupported())
     }
+}
 
+/// [`ChangeSet::script`]'s "INCOMPLETE" preamble, over any list of withheld
+/// items — empty when nothing was withheld.
+///
+/// A free function because a multi-object plan
+/// ([`crate::compare::SchemaPlan::script`]) has to say the same thing over the
+/// union of its sets' omissions, and a second copy of this sentence is a second
+/// thing to keep true.
+pub fn withheld_header(withheld: &[String]) -> String {
+    if withheld.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "-- INCOMPLETE. Schemaic could not express part of this plan, and refuses\n\
+         -- to apply it while that is true. Running the statements below anyway\n\
+         -- would leave out:\n",
+    );
+    for w in withheld {
+        for (i, line) in w.lines().enumerate() {
+            out.push_str(if i == 0 { "--   - " } else { "--     " });
+            out.push_str(line.trim());
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out
+}
+
+impl ChangeSet {
     /// The same script, but runnable by a **client** that splits on `;`.
     ///
     /// `run_ddl` hands each statement to the wire whole, so it never needs this;
@@ -3788,11 +3800,22 @@ impl ChangeSet {
     /// there because it is a claim about the changes, and because a heading that
     /// contradicts the sentence beneath it costs the sentence its weight.
     pub fn risk_heading(&self) -> &'static str {
-        if self.changes.iter().all(Change::risk_is_reversible) {
+        if self.risk_reversible() {
             "Before you apply"
         } else {
             "This can't be undone"
         }
+    }
+
+    /// Is every consequence in this set reversible? What
+    /// [`ChangeSet::risk_heading`] reads.
+    ///
+    /// Public so an aggregate — [`crate::compare::SchemaPlan`] — can take the
+    /// stronger of several sets' answers by asking the question, rather than by
+    /// comparing headings as strings and silently agreeing with all of them the
+    /// day one is reworded.
+    pub fn risk_reversible(&self) -> bool {
+        self.changes.iter().all(Change::risk_is_reversible)
     }
 
     /// The script as it may **leave** the preview — for the clipboard, and for
