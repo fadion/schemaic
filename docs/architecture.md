@@ -1876,6 +1876,116 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `starts_with`, since a body may open with a comment and a `BEGIN` inside a string is not the
     block's own. It is refused in the modal rather than at Apply because the `DROP` has already run
     by the time the `CREATE` fails.
+  - `compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
+    one migration. The pure half of schema compare: no DB, no UI, nothing here runs anything (51
+    unit tests).
+    **The differ is the comparator.** An object is `ObjectStatus::Differing` precisely when
+    `ddl::diff` — or `diff_view`/`diff_trigger`/`diff_routine`/`diff_event`/`diff_enum`/
+    `diff_domain`/`diff_sequence` — hands back a non-empty `ChangeSet` for it, and `status_of` reads
+    that set rather than comparing fields beside it. That is what keeps a tree's verdict and the
+    plan's contents one fact: a release that teaches `diff` about a column attribute teaches this
+    module in the same commit, an object called *differing* can never plan nothing, and — the worse
+    half — nothing can be called identical while a difference the differ can already see is left
+    out of the migration. `the_status_is_the_differs_verdict_and_nothing_else` asserts
+    `changes.is_empty() == (status == Same)` over **every** entry of a mixed comparison rather than
+    over one, because the failure it guards is a status computed next to the differ instead of from
+    it. `counts` is the per-status tally a header would read; `differences` is the entries that
+    would contribute statements, in plan order.
+    **Right is the source of truth, left is where the DDL runs**, and that fixes every direction in
+    the module: an object only the left side holds is a `DROP`, one only the right holds is a
+    `CREATE`, and the `Target` the table differ takes is built from the **left** schema's
+    `ServerFlavour` — MariaDB's `MODIFY COLUMN` destroys a column's own `CHECK`, and it is the left
+    server that will read the statements (`the_left_sides_flavour_is_what_the_plan_targets`). That
+    is the only path carrying a flavour; every other builder takes the dialect alone and leaves
+    `ChangeSet::flavour` `Unknown`, which is the reading the single-object editors already get and
+    costs nothing here because the divergence is `ALTER TABLE`'s. Swapping the pair is the caller's
+    job and reverses all of it.
+    **One dialect, so one engine.** `SchemaComparison::of(left, right, dialect)` takes a single
+    `SqlDialect` because a `ChangeSet` carries one, and a `DbSchema` has no dialect of its own to
+    disagree with it (only `flavour`). That single parameter is the honest encoding of a real limit
+    rather than a missing feature — type names, defaults and index shapes do not map between
+    engines, so a MySQL-to-PostgreSQL plan would be confidently wrong exactly where it mattered —
+    and the caller pairing two connections refuses the mismatch before it reaches here.
+    **`SchemaPlan` is a `Vec<ChangeSet>`, not a wider `ChangeSet`.** A set carries one
+    `table`/`schema`/`dialect` and most `Change` variants are addressed at that one name instead of
+    carrying their own, so a single set *cannot* hold edits to two objects. Widening `Change` would
+    put a second notion of "which object" beside the one every emitter already reads, so the
+    aggregate stays a list of single-object sets and `emit`/`destructive`/`unsupported`/`summaries`
+    are the concatenation of what each set answers — no statement is built here
+    (`the_plans_statements_are_exactly_its_sets_statements_in_order`). A `Same` entry is never
+    planned however permissive the `include` predicate is, its set holding nothing to run. For the
+    UI stage: `ui::DdlPreview` is already flat (`statements`/`destructive`/`withheld`/`script`), so
+    it can take a whole plan and the plan answers every field of one — `ddl_preview::preview_of` is
+    the single-`ChangeSet` shape that would have to grow.
+    **Three of those answers are not a plain concatenation, and each is load-bearing.** `script`
+    puts `ddl::withheld_header` above the statements, over the **union** of its sets' omissions: a
+    `join("\n\n")` dropped the "INCOMPLETE" preamble a single set's `ChangeSet::script` carries, so
+    a copied plan read as complete while `emit` was silently leaving a lossy index's `UNIQUE` out of
+    a SQLite rebuild (`a_plan_that_withholds_a_statement_says_so_above_its_script`,
+    `a_plan_that_withholds_nothing_has_no_header`). That header is a `pub` free function in
+    `ddl.rs` over any `&[String]` — `ChangeSet::withheld_header` delegates to it — because a second
+    copy of that sentence is a second thing to keep true. `editor_script` is the same header over
+    `ddl::client_script`, so a MySQL trigger or routine body survives the app's `;` splitter, and
+    several such bodies in one plan is exactly this module's case; there is no password to scrub the
+    way `ChangeSet::export_script` must, since no builder it calls produces an account change. The
+    engine it asks is `SchemaPlan`'s own `dialect` field rather than the first set's, so an empty
+    plan still answers as the engine it was built for.
+    `risk_heading` takes the **stronger** of its sets' answers by asking `ChangeSet::risk_reversible`
+    — extracted `pub` for this caller rather than having the aggregate compare headings as strings,
+    which would agree with every set the day one is reworded. It only titles a non-empty
+    `destructive()` list, so a create-only plan's heading is never read at all, and since
+    `Change::risk_is_reversible` is true of the three account changes alone, a compare plan with a
+    risk block to head always reads "This can't be undone".
+    **Entries come back from `of` already in plan order**, so group by `CompareEntry::kind` for
+    display rather than re-sorting in place. `phase` maps (status, kind) onto one number:
+    dependents dropped first, then types created or altered, then table creates, alters and drops in
+    that order, then dependents created or altered, then types dropped — and `Same` sorts past every
+    difference, so a hundred untouched tables cannot land between two statements that depend on each
+    other (`untouched_objects_do_not_disturb_the_order_of_the_differences`). **Inside a phase the
+    order is `CompareKind`'s declaration order** — `kind_rank` is that ordinal, **negated for a
+    drop**, because dropping runs the dependency order backwards — then, for the two pure table
+    phases only, a foreign-key rank from **`dump::order_tables`** (`fk_rank`, with `reverse`
+    inverting the ranks for the drop phase) rather than a second topological sort over the same
+    edges, then `CompareEntry::key` as the last tie-break so two runs of one comparison read the
+    same. The ordinal is in the sort key because the alphabetical fallback **is not a dependency
+    order**: sorting a phase on `key` alone put `domain:` ahead of `enum:` and emitted
+    `CREATE DOMAIN … AS app.mood` above the statement creating `mood`, and `trigger:` ahead of
+    `view:` for the same reason (`a_new_domain_is_created_after_the_enum_it_names` and
+    `a_new_view_is_created_before_the_trigger_that_names_it`, both failing before the ordinal went
+    in; `a_dropped_enum_goes_after_the_domain_that_names_it` guards the negation, where alphabetical
+    happened to coincide with the right answer). A cycle is reported through
+    `SchemaComparison::cycles` the way `DumpPlan::cycles` is: the plan still holds every object, and
+    the flag is what says the order alone can't be trusted.
+    **Identity is a key per kind, each as wide as its engine needs.** Tables and views pair on
+    `(is_view, qualified name)`, so a name that is a table here and a view there is a drop plus a
+    create rather than an unmigratable "differing table" — no `ALTER` turns one into the other.
+    Triggers pair on the qualified table *and* the name, because MySQL scopes a trigger name to the
+    schema and PostgreSQL to the table and the wider key is right under both; routines on kind,
+    qualified name and `identity_arguments`, because PostgreSQL overloads on the arguments and a key
+    without them pairs the wrong two functions in silence. `CompareEntry::key` is the stable string
+    form a selection set stores, and it reads through `schema::display_name`, which leaves
+    PostgreSQL's default `public` off — so a key is `enum:mood`, not `enum:public.mood`, and a
+    caller matching on one won't miss it. A trigger's key qualifies its **table**, the namespace
+    being the table's: `trigger:app.city.t_ins`, which is the order a caller composing a key by hand
+    would write, where qualifying the name instead read `trigger:city.app.t_ins`
+    (`a_namespaced_triggers_key_qualifies_its_table`). **A sequence a column owns is not an object
+    of its own**: a `serial` or identity column's sequence is created by the column, so comparing it
+    separately proposes a `CREATE SEQUENCE` the `CREATE TABLE` already makes, and a drop the table's
+    own drop already performs. An enum's or a domain's dependents come off the **left** schema
+    (`ddl::type_dependents`) — they are the columns the change has to re-cast, and they live where
+    the DDL runs; asking the right side would list columns that aren't there.
+    **Three flags say what a comparison cannot vouch for, and all three are *emitting* limits rather
+    than comparing ones** — the verdict is right, and it is the generated SQL that suffers.
+    `CompareEntry::needs_source` is MySQL's: an eager `Db::fetch_schema` reads a trigger's, a
+    routine's or an event's body out of `information_schema` with the escapes already resolved, so
+    two mangled bodies still compare equal and the status stands while the emitted `CREATE` is wrong
+    until the caller has refreshed the body through the lazy `Db::{trigger,routine,event}_source`.
+    It is false for a drop, which names the object and nothing else, and for every engine but MySQL,
+    so nobody is sent after a body they have no use for. `CompareEntry::uncertain` is a match over
+    an `IndexInfo::lossy` index — a PostgreSQL index whose expression keys or opclasses the model
+    never read, so two of them compare equal whatever the server holds; the verdict stands as the
+    best the model can do, and a tree drawing it like a fully-read match would be overclaiming.
+    `cycles` is the third.
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
     introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
@@ -8600,9 +8710,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   `TriggerInfo::create_sql` and `ChangeSet::emit` for the closing foreign keys — and `app::dump`
   writes it to disk; nothing on that path can execute it, which is exactly the standing Copy DDL has.
   A second emitter would be the regression here, not the missing preview.
+  **`core::compare` is on the differ side of the rule, and it is the only aggregate.** A schema
+  comparison decides what differs by asking `ddl::diff` and its per-kind siblings — there is no
+  field-by-field comparison in that module — and its `SchemaPlan` is a list of single-object
+  `ChangeSet`s whose `emit`/`destructive`/`unsupported` are the concatenation of theirs, so it adds
+  neither a differ nor an emitter. Nothing runs it today; there is no UI over it, and a compare that
+  grew one and applied its own plan without the preview would be the path this rule forbids.
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
-  disabled button. **`supports_change` has to be as narrow as the change is**, or `unsupported()`
+  disabled button. The "INCOMPLETE" preamble that carries the same omission *out* through Copy and
+  Open in editor is **`ddl::withheld_header`**, one `pub` free function over any list of withheld
+  items, which `ChangeSet::script` and `compare::SchemaPlan::script` both delegate to; a second copy
+  of that sentence would be a second thing to keep true, and the aggregate that joined statements
+  without it produced a script that read as complete. **`supports_change` has to be as narrow as the change is**, or `unsupported()`
   is blind: its account arm answered for all six variants on "does this engine have accounts",
   which is true of `GRANT … ON *.*` on PostgreSQL and of `ON SCHEMA` on MySQL, neither of which has
   a grammar there — so there was no INCOMPLETE header and Apply was enabled over a statement the
