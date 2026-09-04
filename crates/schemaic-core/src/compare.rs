@@ -54,7 +54,7 @@
 //! [`ServerFlavour`]: crate::schema::ServerFlavour
 //! [`IndexInfo::lossy`]: crate::schema::IndexInfo::lossy
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::ddl::{
     self, Change, ChangeSet, DomainDraft, EnumDraft, EventDraft, ObjectKind, RoutineDraft,
@@ -192,6 +192,18 @@ pub struct CompareEntry {
     /// stands, being the best the model can do; a tree that drew it the same as
     /// a fully-read match would be overclaiming.
     pub uncertain: bool,
+    /// The object's `CREATE` as the **left** side has it, and empty when only
+    /// the right side does.
+    ///
+    /// Captured here rather than derived on demand so a view showing the two
+    /// sides side by side is [`crate::diff::line_diff`] over two strings and
+    /// nothing else. The alternative — handing the view the two `TableInfo`s
+    /// and letting it ask — is how a second opinion about what an object *is*
+    /// ends up in a renderer, and this text is only ever read, never emitted:
+    /// the statements come from `changes`.
+    pub left_ddl: String,
+    /// The same, as the **right** side has it. Empty when only the left does.
+    pub right_ddl: String,
 }
 
 impl CompareEntry {
@@ -221,12 +233,27 @@ impl CompareEntry {
     }
 
     /// What the tree shows: the qualified name, with a trigger's table in front
-    /// of it because a bare trigger name says nothing about where it lives.
+    /// of it because a bare trigger name says nothing about where it lives, and
+    /// a routine's argument types after it because they are the rest of its
+    /// name where the engine overloads on them.
+    ///
+    /// **The signature is not optional decoration.** A comparison is the first
+    /// surface in this app to list two overloads of one PostgreSQL function
+    /// side by side, and without it they draw as two identical rows: same text
+    /// in the tree, same heading over the diff pane, and a filter that cannot
+    /// tell them apart. Their keys differ, so ticking one and reading the other
+    /// is a plan the user cannot see is not the one they meant.
     pub fn label(&self) -> String {
-        match &self.table {
+        let mut out = match &self.table {
             Some(t) => format!("{t}.{}", self.name),
             None => display_name(self.schema.as_deref(), &self.name),
+        };
+        if let Some(sig) = &self.signature {
+            out.push('(');
+            out.push_str(sig);
+            out.push(')');
         }
+        out
     }
 
     /// Must the caller refresh this object's body from the lazy
@@ -258,6 +285,69 @@ impl CompareCounts {
     pub fn differences(&self) -> usize {
         self.differing + self.only_left + self.only_right
     }
+
+    /// Every object counted, agreed or not.
+    pub fn total(&self) -> usize {
+        self.same + self.differences()
+    }
+}
+
+/// Can two sources be compared at all, and what to say when they can't.
+///
+/// **The dialect is the test, not the engine.** MySQL and MariaDB speak one
+/// dialect and compare perfectly well — the difference between them rides on
+/// the schema's [`ServerFlavour`] and reaches the emitter from there — while the
+/// three dialects do not map onto one another at all: a type name, a default and
+/// an index shape each mean something different across them, so the plan would
+/// be wrong precisely where someone trusted it. A [`ChangeSet`] carries one
+/// dialect for the same reason, which is why [`SchemaComparison::of`] takes one
+/// and this refusal happens before it is called.
+///
+/// [`ServerFlavour`]: crate::schema::ServerFlavour
+pub fn comparable(left: SqlDialect, right: SqlDialect) -> Result<(), String> {
+    if left == right {
+        return Ok(());
+    }
+    Err(format!(
+        "{} and {} can't be compared. Type names, defaults and index shapes \
+         don't carry across engines, so any migration generated from the \
+         difference would be wrong.",
+        left.engine_label(),
+        right.engine_label()
+    ))
+}
+
+/// One row of the compare tree, in display order.
+#[derive(Clone, Debug)]
+pub enum CompareRow<'a> {
+    /// A kind's heading, with the tally of what is visible beneath it. A kind
+    /// showing nothing has no heading at all.
+    Group {
+        kind: CompareKind,
+        counts: CompareCounts,
+        expanded: bool,
+    },
+    /// One object, belonging to the heading above it. Present only while that
+    /// heading is expanded.
+    Object(&'a CompareEntry),
+}
+
+/// What the tree is currently showing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowFilter<'a> {
+    /// A name fragment. Matched through [`schema::object_name_matches`] — the
+    /// one predicate every schema-search surface in this app matches on — over
+    /// [`CompareEntry::label`], so typing a table's name finds the triggers
+    /// hanging off it and not just the table. Empty shows everything.
+    ///
+    /// [`schema::object_name_matches`]: crate::schema::object_name_matches
+    pub query: &'a str,
+    /// Show the objects the two sides agree about.
+    ///
+    /// Off by default, and that is a reading decision rather than a performance
+    /// one: a comparison is opened to find what differs, and two hundred
+    /// identical tables put the four that matter below the fold.
+    pub show_same: bool,
 }
 
 /// Two databases, paired object by object.
@@ -448,19 +538,131 @@ impl SchemaComparison {
         self.differences().any(CompareEntry::needs_source)
     }
 
+    /// The tree's rows, grouped by kind and filtered.
+    ///
+    /// **Display order, which is deliberately not plan order.** Groups run in
+    /// [`CompareKind`]'s own order and objects within one run **alphabetically
+    /// by label**, because a tree is read by looking a name up. The order the
+    /// statements must run in lives in [`SchemaComparison::entries`] and reaches
+    /// SQL through [`SchemaComparison::plan`]; nothing should derive one from the
+    /// other. A group whose entries are all filtered out is omitted rather than
+    /// shown empty.
+    ///
+    /// `expanded` holds the [`CompareKind::label`] of each open group — see
+    /// [`SchemaComparison::default_expanded`] for what to seed it with.
+    pub fn rows<'a>(
+        &'a self,
+        filter: RowFilter<'_>,
+        expanded: &HashSet<String>,
+    ) -> Vec<CompareRow<'a>> {
+        let needle = filter.query.trim().to_lowercase();
+        let mut visible: Vec<&CompareEntry> = self
+            .entries
+            .iter()
+            .filter(|e| filter.show_same || e.status.is_difference())
+            .filter(|e| {
+                needle.is_empty() || crate::schema::object_name_matches(&e.label(), &needle)
+            })
+            .collect();
+        // Kind first so the groups come out in order, then the label a reader is
+        // scanning for.
+        visible.sort_by_cached_key(|e| (e.kind, e.label()));
+
+        let mut out: Vec<CompareRow<'a>> = Vec::new();
+        let mut i = 0;
+        while i < visible.len() {
+            let kind = visible[i].kind;
+            let end = visible[i..]
+                .iter()
+                .position(|e| e.kind != kind)
+                .map_or(visible.len(), |n| i + n);
+            let mut counts = CompareCounts::default();
+            for e in &visible[i..end] {
+                match e.status {
+                    ObjectStatus::Same => counts.same += 1,
+                    ObjectStatus::Differing => counts.differing += 1,
+                    ObjectStatus::OnlyLeft => counts.only_left += 1,
+                    ObjectStatus::OnlyRight => counts.only_right += 1,
+                }
+            }
+            let open = expanded.contains(kind.label());
+            out.push(CompareRow::Group {
+                kind,
+                counts,
+                expanded: open,
+            });
+            if open {
+                out.extend(visible[i..end].iter().copied().map(CompareRow::Object));
+            }
+            i = end;
+        }
+        out
+    }
+
+    /// The keys of every object the filter is **showing** that a plan could
+    /// also include — what "Select all" means while a filter is narrowing the
+    /// list.
+    ///
+    /// **Filtered, deliberately.** A "Select all" that reached past the filter
+    /// ticks objects the user has not seen, and it sits in the same bar as the
+    /// filter box: narrow four hundred objects to three, press it, and the
+    /// footer jumps to three hundred. The two controls have to agree about what
+    /// "all" is.
+    ///
+    /// A body [`CompareEntry::needs_source`] flags is left out for the reason it
+    /// has no tick-box at all.
+    pub fn selectable_keys(&self, filter: RowFilter<'_>) -> Vec<String> {
+        let needle = filter.query.trim().to_lowercase();
+        self.differences()
+            .filter(|e| !e.needs_source())
+            .filter(|e| {
+                needle.is_empty() || crate::schema::object_name_matches(&e.label(), &needle)
+            })
+            .map(|e| e.key())
+            .collect()
+    }
+
+    /// The groups to open when a comparison is first shown: every kind that has
+    /// a difference in it.
+    ///
+    /// A kind holding nothing but agreement stays shut — it is the answer
+    /// "nothing to see here", and opening it buries the kinds that do differ.
+    pub fn default_expanded(&self) -> HashSet<String> {
+        self.differences()
+            .map(|e| e.kind.label().to_string())
+            .collect()
+    }
+
     /// One plan over the entries `include` accepts, in the order they must run.
     ///
     /// [`ObjectStatus::Same`] entries are never included whatever `include`
     /// says — they hold an empty change set, and a plan listing them would
     /// claim work that isn't there.
     pub fn plan(&self, include: impl Fn(&CompareEntry) -> bool) -> SchemaPlan {
+        let sets: Vec<ChangeSet> = self
+            .differences()
+            .filter(|e| include(e))
+            .map(|e| e.changes.clone())
+            .collect();
+        // A cycle only breaks a plan that **creates** a table: that is the
+        // statement carrying the inline foreign key with nothing to point at
+        // yet. A plan of pure alters or drops is unaffected however tangled the
+        // schema is.
+        //
+        // It errs toward warning: the cycle is a fact about the whole
+        // comparison's foreign keys, and whether the *selected* tables are the
+        // ones in it can't be answered from a set (`dump::order_tables` reports
+        // a cycle, not which edge). Over-reporting costs a sentence in the risk
+        // block, which is the cheap side — the flag is a warning and never a
+        // refusal.
+        let creates_a_table = sets
+            .iter()
+            .flat_map(|s| s.changes.iter())
+            .any(|c| matches!(c, Change::CreateTable(_)));
         SchemaPlan {
-            sets: self
-                .differences()
-                .filter(|e| include(e))
-                .map(|e| e.changes.clone())
-                .collect(),
+            sets,
             dialect: self.dialect,
+            cycles: self.cycles && creates_a_table,
         }
     }
 }
@@ -482,11 +684,25 @@ pub struct SchemaPlan {
     /// the first set, so an empty plan still answers
     /// [`SchemaPlan::editor_script`] as the engine it was built for.
     pub dialect: SqlDialect,
+    /// A foreign-key cycle in the comparison this plan came from, meaning no
+    /// creation order satisfies every reference. Reported through
+    /// [`SchemaPlan::destructive`] rather than [`SchemaPlan::unsupported`],
+    /// which is the same call [`crate::dump::DumpPlan`] makes: the statements
+    /// are all there and one of them will be refused, so the honest thing is to
+    /// say so above the Apply button rather than to withhold a plan the user
+    /// may still want to copy and reorder.
+    pub cycles: bool,
 }
 
 impl SchemaPlan {
     pub fn is_empty(&self) -> bool {
         self.sets.iter().all(ChangeSet::is_empty)
+    }
+
+    /// `schema.object` for one of this plan's sets — what puts the object's
+    /// name on a line that would otherwise be about no object in particular.
+    fn subject_of(set: &ChangeSet) -> String {
+        display_name(set.schema.as_deref(), &set.table)
     }
 
     /// How many objects this plan touches.
@@ -520,9 +736,7 @@ impl SchemaPlan {
     ///
     /// [`ddl::client_script`] is what makes a MySQL routine or trigger body
     /// survive that split, and a compare plan is the most likely thing to carry
-    /// several of them. There is no password to scrub here the way
-    /// [`ChangeSet::export_script`] must: no builder this module calls produces
-    /// an account change.
+    /// several of them.
     pub fn editor_script(&self) -> String {
         format!(
             "{}{}",
@@ -531,32 +745,111 @@ impl SchemaPlan {
         )
     }
 
+    /// The script as it leaves the preview through **Copy** or **Open in
+    /// editor** — [`ChangeSet::export_script`]'s counterpart, and what
+    /// `DdlPreview::script` must be given.
+    ///
+    /// Both of those exits put the text somewhere durable: the clipboard, and a
+    /// query tab whose text `tabs.json` writes in the clear. A comparison
+    /// produces no account change today, so this is byte-for-byte
+    /// [`SchemaPlan::editor_script`] — which is exactly why it exists as a
+    /// function rather than as a sentence in a comment saying so. The property
+    /// that must hold is "no plaintext password leaves this modal", and a
+    /// builder that one day puts an account change in a plan should inherit it
+    /// instead of having to notice the prose.
+    pub fn export_script(&self) -> String {
+        if !self
+            .sets
+            .iter()
+            .flat_map(|s| s.changes.iter())
+            .any(ddl::is_account_change)
+        {
+            return self.editor_script();
+        }
+        // Per set, so each one's own redaction notice travels with its
+        // statements — the aggregate has no scrubber of its own to add.
+        format!(
+            "{}{}",
+            ddl::withheld_header(&self.unsupported()),
+            self.sets
+                .iter()
+                .map(ChangeSet::export_script)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        )
+    }
+
     /// What a preview's risk block calls itself — the stronger of its sets'
     /// answers, since one irreversible statement makes the whole plan one.
     pub fn risk_heading(&self) -> &'static str {
-        if self.sets.iter().all(ChangeSet::risk_reversible) {
+        if self.sets.iter().all(ChangeSet::risk_reversible) && !self.cycles {
             "Before you apply"
         } else {
             "This can't be undone"
         }
     }
 
-    /// Every destructive consequence, in plan order.
+    /// Every destructive consequence, in plan order, **each named for the
+    /// object it happens to**.
+    ///
+    /// A single set's risks are read under a title naming that one table, so
+    /// they say "Drops the table and every row in it" and leave the *which* to
+    /// the heading. A plan has no such heading: eight dropped tables produced
+    /// that same sentence eight times over a title reading "12 objects", on the
+    /// one surface standing between someone and an irreversible `DROP`.
+    ///
+    /// A foreign-key cycle is reported here too — see [`SchemaPlan::cycles`].
     pub fn destructive(&self) -> Vec<String> {
-        self.sets.iter().flat_map(ChangeSet::destructive).collect()
+        let mut out: Vec<String> = self
+            .sets
+            .iter()
+            .flat_map(|s| {
+                let subject = Self::subject_of(s);
+                s.destructive()
+                    .into_iter()
+                    .map(move |r| format!("{subject} — {r}"))
+            })
+            .collect();
+        if self.cycles {
+            out.push(
+                "The foreign keys between these tables form a cycle, so no creation \
+                 order satisfies all of them. One statement will be refused for \
+                 referencing a table that does not exist yet, and neither MySQL nor \
+                 MariaDB rolls DDL back."
+                    .to_string(),
+            );
+        }
+        out
     }
 
-    /// Everything the engine can't express, in plan order. Non-empty means
-    /// [`SchemaPlan::emit`] is writing less than the plan asks for.
+    /// Everything the engine can't express, in plan order, each named for its
+    /// object. Non-empty means [`SchemaPlan::emit`] is writing less than the
+    /// plan asks for — and Apply is refused while it does, which for a plan
+    /// over many objects is why the line has to say *which* tick to clear.
     pub fn unsupported(&self) -> Vec<String> {
-        self.sets.iter().flat_map(ChangeSet::unsupported).collect()
+        self.sets
+            .iter()
+            .flat_map(|s| {
+                let subject = Self::subject_of(s);
+                s.unsupported()
+                    .into_iter()
+                    .map(move |w| format!("{subject} — {w}"))
+            })
+            .collect()
     }
 
-    /// One line per change, for the preview modal's summary list.
+    /// One line per change, for the preview modal's summary list, each named
+    /// for its object — see [`SchemaPlan::destructive`] for why.
     pub fn summaries(&self) -> Vec<String> {
         self.sets
             .iter()
-            .flat_map(|s| s.changes.iter().map(Change::summary))
+            .flat_map(|s| {
+                let subject = Self::subject_of(s);
+                s.changes
+                    .iter()
+                    .map(Change::summary)
+                    .map(move |c| format!("{subject} — {c}"))
+            })
             .collect()
     }
 }
@@ -720,7 +1013,14 @@ fn table_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain,
+        left_ddl: side_ddl(l, |t| t.create_ddl(dialect)),
+        right_ddl: side_ddl(r, |t| t.create_ddl(dialect)),
     }
+}
+
+/// One side's `CREATE` text, or empty when that side doesn't hold the object.
+fn side_ddl<T>(side: Option<&T>, ddl: impl Fn(&T) -> String) -> String {
+    side.map(ddl).unwrap_or_default()
 }
 
 fn trigger_entry(
@@ -744,6 +1044,8 @@ fn trigger_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        left_ddl: side_ddl(l, |t| t.create_sql(dialect)),
+        right_ddl: side_ddl(r, |t| t.create_sql(dialect)),
     }
 }
 
@@ -771,6 +1073,11 @@ fn routine_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        // `replace: false` — this text is read, never run, and a reader wants to
+        // see the object as it stands rather than as a statement that would
+        // overwrite it.
+        left_ddl: side_ddl(l, |f| f.create_sql(dialect, false)),
+        right_ddl: side_ddl(r, |f| f.create_sql(dialect, false)),
     }
 }
 
@@ -791,6 +1098,8 @@ fn event_entry(l: Option<&EventInfo>, r: Option<&EventInfo>, dialect: SqlDialect
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        left_ddl: side_ddl(l, |e| e.create_sql(dialect)),
+        right_ddl: side_ddl(r, |e| e.create_sql(dialect)),
     }
 }
 
@@ -824,6 +1133,8 @@ fn enum_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        left_ddl: side_ddl(l, |e| e.create_sql(dialect)),
+        right_ddl: side_ddl(r, |e| e.create_sql(dialect)),
     }
 }
 
@@ -854,6 +1165,8 @@ fn domain_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        left_ddl: side_ddl(l, |d| d.create_sql(dialect)),
+        right_ddl: side_ddl(r, |d| d.create_sql(dialect)),
     }
 }
 
@@ -880,6 +1193,8 @@ fn sequence_entry(
         status: status_of(l.is_some(), r.is_some(), &changes),
         changes,
         uncertain: false,
+        left_ddl: side_ddl(l, |s| s.create_sql(dialect)),
+        right_ddl: side_ddl(r, |s| s.create_sql(dialect)),
     }
 }
 
@@ -1352,6 +1667,235 @@ mod tests {
         assert!(!plan.summaries().is_empty());
     }
 
+    #[test]
+    fn every_line_a_plan_shows_names_the_object_it_is_about() {
+        // A single set's lines are read under a title naming that one table. A
+        // plan has no such title — its subject is a count — so eight dropped
+        // tables produced one sentence eight times over "12 objects", on the
+        // surface standing between someone and an irreversible DROP.
+        let c = mysql(
+            schema_of(vec![
+                table("gone_a", &[("id", "int")]),
+                table("gone_b", &[("id", "int")]),
+            ]),
+            schema_of(vec![]),
+        );
+        let plan = c.plan(|_| true);
+        let summaries = plan.summaries();
+        assert!(
+            summaries.iter().any(|s| s.starts_with("gone_a — ")),
+            "{summaries:?}"
+        );
+        assert!(
+            summaries.iter().any(|s| s.starts_with("gone_b — ")),
+            "{summaries:?}"
+        );
+        // And the risks, which are the half that matters most.
+        let risks = plan.destructive();
+        assert_eq!(risks.len(), 2, "{risks:?}");
+        assert!(
+            risks.iter().any(|r| r.starts_with("gone_a — ")),
+            "{risks:?}"
+        );
+        assert!(
+            risks.iter().any(|r| r.starts_with("gone_b — ")),
+            "{risks:?}"
+        );
+        // Two objects, two *distinguishable* lines — the failure was that they
+        // were byte-identical.
+        assert_ne!(risks[0], risks[1]);
+    }
+
+    #[test]
+    fn a_namespaced_object_is_named_with_its_namespace_in_a_plans_lines() {
+        let t = |ns: &str| TableInfo {
+            name: "city".to_string(),
+            schema: Some(ns.to_string()),
+            columns: vec![col("id", "int")],
+            ..Default::default()
+        };
+        let c = SchemaComparison::of(
+            &schema_of(vec![t("app")]),
+            &DbSchema::default(),
+            SqlDialect::Postgres,
+        );
+        let risks = c.plan(|_| true).destructive();
+        assert!(
+            risks.iter().all(|r| r.starts_with("app.city — ")),
+            "{risks:?}"
+        );
+    }
+
+    #[test]
+    fn a_withheld_line_names_the_object_whose_tick_has_to_be_cleared() {
+        // Apply is refused while anything is withheld. Over one object that is
+        // "don't apply half an edit"; over two hundred it is "one of these is
+        // blocking the rest", and a bare summary doesn't say which.
+        let mut left = table("city", &[("id", "int")]);
+        left.indexes = vec![crate::schema::IndexInfo {
+            name: "ix_expr".to_string(),
+            lossy: true,
+            ..Default::default()
+        }];
+        let mut right = table("city", &[("id", "int"), ("name", "text")]);
+        right.indexes = vec![crate::schema::IndexInfo {
+            name: "ix_expr".to_string(),
+            lossy: true,
+            ..Default::default()
+        }];
+        let c = SchemaComparison::of(
+            &schema_of(vec![left]),
+            &schema_of(vec![right]),
+            SqlDialect::Sqlite,
+        );
+        let withheld = c.plan(|_| true).unsupported();
+        assert!(!withheld.is_empty());
+        assert!(
+            withheld.iter().all(|w| w.starts_with("city — ")),
+            "{withheld:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_reported_above_apply_when_the_plan_creates_a_table() {
+        let fk = |to: &str| ForeignKeyInfo {
+            name: format!("fk_{to}"),
+            columns: vec!["other".to_string()],
+            ref_table: to.to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let mut a = table("a", &[("id", "int"), ("other", "int")]);
+        a.foreign_keys = vec![fk("b")];
+        let mut b = table("b", &[("id", "int"), ("other", "int")]);
+        b.foreign_keys = vec![fk("a")];
+        let c = mysql(schema_of(vec![]), schema_of(vec![a, b]));
+        assert!(c.cycles);
+        let plan = c.plan(|_| true);
+        assert!(plan.cycles);
+        assert!(
+            plan.destructive().iter().any(|r| r.contains("cycle")),
+            "{:?}",
+            plan.destructive()
+        );
+        // A cycle is a statement the server will refuse, so the plan cannot
+        // call itself reversible.
+        assert_eq!(plan.risk_heading(), "This can't be undone");
+        // But it is a warning, not a refusal: the statements are all there.
+        assert!(plan.unsupported().is_empty());
+        assert!(!plan.emit().is_empty());
+    }
+
+    #[test]
+    fn a_cycle_is_not_reported_for_a_plan_that_creates_no_table() {
+        // The inline foreign key in a CREATE is what a cycle breaks. A plan of
+        // pure alters is unaffected however tangled the schema is.
+        let fk = |to: &str| ForeignKeyInfo {
+            name: format!("fk_{to}"),
+            columns: vec!["other".to_string()],
+            ref_table: to.to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let mut a = table("a", &[("id", "int"), ("other", "int")]);
+        a.foreign_keys = vec![fk("b")];
+        let mut b = table("b", &[("id", "int"), ("other", "int")]);
+        b.foreign_keys = vec![fk("a")];
+        let mut a2 = a.clone();
+        a2.columns.push(col("extra", "int"));
+        let c = mysql(schema_of(vec![a, b.clone()]), schema_of(vec![a2, b]));
+        assert!(c.cycles, "the schema still has the cycle");
+        let plan = c.plan(|_| true);
+        assert!(!plan.cycles, "but this plan only alters");
+        assert!(!plan.destructive().iter().any(|r| r.contains("cycle")));
+    }
+
+    #[test]
+    fn a_plan_with_no_account_change_exports_exactly_what_the_editor_gets() {
+        // The property is "no plaintext password leaves this modal". A
+        // comparison produces no account change, so the two are byte-identical
+        // — which is why `export_script` exists as a function rather than as a
+        // comment claiming the two are interchangeable here.
+        let c = mysql(
+            schema_of(vec![]),
+            schema_of(vec![table("fresh", &[("id", "int")])]),
+        );
+        let plan = c.plan(|_| true);
+        assert_eq!(plan.export_script(), plan.editor_script());
+        assert!(!plan.export_script().is_empty());
+    }
+
+    // ── what "select all" means ──────────────────────────────────────────────
+
+    #[test]
+    fn select_all_covers_only_what_the_filter_is_showing() {
+        let c = mysql(
+            schema_of(vec![]),
+            schema_of(vec![
+                table("user_role", &[("id", "int")]),
+                table("user_group", &[("id", "int")]),
+                table("invoice", &[("id", "int")]),
+            ]),
+        );
+        let all = c.selectable_keys(RowFilter::default());
+        assert_eq!(all.len(), 3);
+        let narrowed = c.selectable_keys(RowFilter {
+            query: "user_",
+            show_same: false,
+        });
+        assert_eq!(narrowed.len(), 2, "{narrowed:?}");
+        assert!(narrowed.iter().all(|k| k.contains("user_")), "{narrowed:?}");
+    }
+
+    #[test]
+    fn select_all_never_covers_a_body_that_has_to_be_re_read() {
+        let mut t = table("city", &[("id", "int")]);
+        t.triggers = vec![trigger("t_ins", "city", "SET @a = 1")];
+        let c = mysql(schema_of(vec![]), schema_of(vec![t]));
+        let keys = c.selectable_keys(RowFilter::default());
+        assert!(keys.iter().any(|k| k.starts_with("table:")), "{keys:?}");
+        assert!(
+            !keys.iter().any(|k| k.starts_with("trigger:")),
+            "a blocked body has no tick to select: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_routines_label_carries_its_signature_so_two_overloads_read_apart() {
+        // The tree draws `label()`, sorts on it and filters on it. Without the
+        // signature two overloads are two identical rows, and ticking one while
+        // reading the other is a plan the user cannot see is wrong.
+        let f = |args: &str| RoutineInfo {
+            name: "area".to_string(),
+            schema: Some("app".to_string()),
+            kind: RoutineKind::Function,
+            identity_arguments: args.to_string(),
+            body: "SELECT 1".to_string(),
+            ..Default::default()
+        };
+        let right = DbSchema {
+            routines: vec![
+                std::sync::Arc::new(f("integer")),
+                std::sync::Arc::new(f("text")),
+            ],
+            ..Default::default()
+        };
+        let c = SchemaComparison::of(&DbSchema::default(), &right, SqlDialect::Postgres);
+        let labels: Vec<String> = c.differences().map(|e| e.label()).collect();
+        assert_eq!(labels.len(), 2);
+        assert_ne!(labels[0], labels[1], "{labels:?}");
+        assert!(
+            labels.contains(&"app.area(integer)".to_string()),
+            "{labels:?}"
+        );
+        // And the filter can now separate them, since it matches on the label.
+        let narrowed = c.selectable_keys(RowFilter {
+            query: "(text)",
+            show_same: false,
+        });
+        assert_eq!(narrowed.len(), 1, "{narrowed:?}");
+    }
+
     // ── ordering ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1786,6 +2330,352 @@ mod tests {
         let plan = c.plan(|_| true);
         assert!(plan.is_empty());
         assert_eq!(plan.dialect, SqlDialect::Sqlite);
+    }
+
+    // ── the side-by-side text ────────────────────────────────────────────────
+
+    #[test]
+    fn a_differing_object_carries_both_sides_ddl() {
+        let c = mysql(
+            schema_of(vec![table("city", &[("id", "int")])]),
+            schema_of(vec![table("city", &[("id", "int"), ("name", "text")])]),
+        );
+        let e = find(&c, "table:city");
+        assert!(e.left_ddl.contains("`id`"), "{}", e.left_ddl);
+        assert!(!e.left_ddl.contains("`name`"), "{}", e.left_ddl);
+        assert!(e.right_ddl.contains("`name`"), "{}", e.right_ddl);
+    }
+
+    #[test]
+    fn a_one_sided_object_leaves_the_other_sides_ddl_empty() {
+        // What makes the diff pane read as a whole-object add or remove without
+        // the view needing to know which case it is looking at.
+        let c = mysql(
+            schema_of(vec![table("gone", &[("id", "int")])]),
+            schema_of(vec![table("fresh", &[("id", "int")])]),
+        );
+        let gone = find(&c, "table:gone");
+        assert!(!gone.left_ddl.is_empty());
+        assert!(gone.right_ddl.is_empty());
+        let fresh = find(&c, "table:fresh");
+        assert!(fresh.left_ddl.is_empty());
+        assert!(!fresh.right_ddl.is_empty());
+    }
+
+    #[test]
+    fn every_kind_captures_a_ddl_for_the_side_that_holds_it() {
+        // The pane is one `line_diff` over these two strings, so a kind whose
+        // builder was never wired would show an empty diff and read as
+        // "identical" — the failure this covers, over every kind at once.
+        let mut t = table("city", &[("id", "int")]);
+        t.triggers = vec![trigger("t_ins", "city", "SET @a = 1")];
+        let right = DbSchema {
+            tables: vec![t, view("v", "select 1")],
+            enums: vec![EnumInfo {
+                name: "mood".to_string(),
+                values: vec!["ok".to_string()],
+                ..Default::default()
+            }],
+            domains: vec![DomainInfo {
+                name: "feeling".to_string(),
+                base_type: "text".to_string(),
+                ..Default::default()
+            }],
+            sequences: vec![SequenceInfo {
+                name: "counter".to_string(),
+                ..Default::default()
+            }],
+            routines: vec![std::sync::Arc::new(RoutineInfo {
+                name: "fn_thing".to_string(),
+                kind: RoutineKind::Function,
+                body: "SELECT 1".to_string(),
+                ..Default::default()
+            })],
+            events: vec![std::sync::Arc::new(EventInfo {
+                name: "nightly".to_string(),
+                body: "DO SET @a = 1".to_string(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let c = SchemaComparison::of(&DbSchema::default(), &right, SqlDialect::Postgres);
+        assert!(c.entries.len() >= 7, "{:?}", keys(&c));
+        for e in &c.entries {
+            assert!(
+                !e.right_ddl.trim().is_empty(),
+                "{} ({:?}) captured no DDL for the side that holds it",
+                e.key(),
+                e.kind
+            );
+        }
+    }
+
+    // ── comparability ────────────────────────────────────────────────────────
+
+    #[test]
+    fn one_dialect_compares_with_itself() {
+        assert!(comparable(SqlDialect::MySql, SqlDialect::MySql).is_ok());
+        assert!(comparable(SqlDialect::Postgres, SqlDialect::Postgres).is_ok());
+        assert!(comparable(SqlDialect::Sqlite, SqlDialect::Sqlite).is_ok());
+    }
+
+    #[test]
+    fn two_dialects_are_refused_by_name() {
+        let e = comparable(SqlDialect::MySql, SqlDialect::Postgres).unwrap_err();
+        assert!(e.contains("MySQL/MariaDB"), "{e}");
+        assert!(e.contains("PostgreSQL"), "{e}");
+        // Refused every way round, not just the one the picker happens to build.
+        assert!(comparable(SqlDialect::Postgres, SqlDialect::MySql).is_err());
+        assert!(comparable(SqlDialect::Sqlite, SqlDialect::MySql).is_err());
+        assert!(comparable(SqlDialect::Postgres, SqlDialect::Sqlite).is_err());
+    }
+
+    // ── the tree's rows ──────────────────────────────────────────────────────
+
+    fn open(kinds: &[CompareKind]) -> HashSet<String> {
+        kinds.iter().map(|k| k.label().to_string()).collect()
+    }
+
+    fn mixed() -> SchemaComparison {
+        mysql(
+            schema_of(vec![
+                table("agreed", &[("id", "int")]),
+                table("changed", &[("id", "int")]),
+                table("gone", &[("id", "int")]),
+                view("v_gone", "select 1"),
+            ]),
+            schema_of(vec![
+                table("agreed", &[("id", "int")]),
+                table("changed", &[("id", "int"), ("extra", "int")]),
+                table("fresh", &[("id", "int")]),
+            ]),
+        )
+    }
+
+    #[test]
+    fn a_collapsed_group_shows_its_heading_and_none_of_its_objects() {
+        let c = mixed();
+        let rows = c.rows(RowFilter::default(), &HashSet::new());
+        assert!(rows.iter().all(|r| matches!(r, CompareRow::Group { .. })));
+        // Tables and the one view — two headings, no objects.
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn an_expanded_group_lists_its_objects_under_it() {
+        let c = mixed();
+        let rows = c.rows(RowFilter::default(), &open(&[CompareKind::Table]));
+        let mut it = rows.iter();
+        assert!(matches!(
+            it.next(),
+            Some(CompareRow::Group {
+                kind: CompareKind::Table,
+                ..
+            })
+        ));
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                CompareRow::Object(e) => Some(e.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Alphabetical, and without the table both sides agree about.
+        assert_eq!(names, vec!["changed", "fresh", "gone"]);
+    }
+
+    #[test]
+    fn the_display_order_is_alphabetical_while_the_plan_stays_in_dependency_order() {
+        // The two orders are different answers to different questions, and this
+        // is the test that keeps anyone from deriving one from the other.
+        let parent = table("parent", &[("id", "int")]);
+        let mut child = table("child", &[("id", "int"), ("parent_id", "int")]);
+        child.foreign_keys = vec![ForeignKeyInfo {
+            name: "fk_parent".to_string(),
+            columns: vec!["parent_id".to_string()],
+            ref_table: "parent".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let c = mysql(schema_of(vec![]), schema_of(vec![child, parent]));
+
+        let shown: Vec<&str> = c
+            .rows(RowFilter::default(), &open(&[CompareKind::Table]))
+            .iter()
+            .filter_map(|r| match r {
+                CompareRow::Object(e) => Some(e.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["child", "parent"],
+            "the tree reads alphabetically"
+        );
+
+        let planned: Vec<&str> = c.differences().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            planned,
+            vec!["parent", "child"],
+            "the plan still creates the referenced table first"
+        );
+    }
+
+    #[test]
+    fn show_same_is_what_brings_the_agreed_objects_in() {
+        let c = mixed();
+        let with = c.rows(
+            RowFilter {
+                query: "",
+                show_same: true,
+            },
+            &open(&[CompareKind::Table]),
+        );
+        let names: Vec<&str> = with
+            .iter()
+            .filter_map(|r| match r {
+                CompareRow::Object(e) => Some(e.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["agreed", "changed", "fresh", "gone"]);
+    }
+
+    #[test]
+    fn a_groups_counts_tally_only_what_is_visible_beneath_it() {
+        let c = mixed();
+        let rows = c.rows(RowFilter::default(), &HashSet::new());
+        let tables = rows
+            .iter()
+            .find_map(|r| match r {
+                CompareRow::Group {
+                    kind: CompareKind::Table,
+                    counts,
+                    ..
+                } => Some(*counts),
+                _ => None,
+            })
+            .expect("a table group");
+        // The agreed table is filtered out, so it is not in the heading either —
+        // a count that included it would contradict the rows below it.
+        assert_eq!(
+            tables,
+            CompareCounts {
+                same: 0,
+                differing: 1,
+                only_left: 1,
+                only_right: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_query_matches_a_triggers_table_as_well_as_its_own_name() {
+        // The label is what is matched, so looking up a table finds what hangs
+        // off it. Searching the bare object name would hide the trigger.
+        let mut r = table("city", &[("id", "int")]);
+        r.triggers = vec![trigger("audit_row", "city", "SET @a = 1")];
+        let c = mysql(
+            schema_of(vec![table("city", &[("id", "int")])]),
+            schema_of(vec![r]),
+        );
+        let rows = c.rows(
+            RowFilter {
+                query: "city",
+                show_same: true,
+            },
+            &open(&[CompareKind::Table, CompareKind::Trigger]),
+        );
+        let labels: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r {
+                CompareRow::Object(e) => Some(e.label()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"city".to_string()), "{labels:?}");
+        assert!(labels.contains(&"city.audit_row".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn a_query_matching_nothing_leaves_no_headings_behind() {
+        let c = mixed();
+        let rows = c.rows(
+            RowFilter {
+                query: "no_such_object",
+                show_same: true,
+            },
+            &open(&[CompareKind::Table]),
+        );
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn a_query_is_trimmed_and_case_insensitive() {
+        let c = mixed();
+        let hits = |q: &str| {
+            c.rows(
+                RowFilter {
+                    query: q,
+                    show_same: false,
+                },
+                &open(&[CompareKind::Table]),
+            )
+            .iter()
+            .filter(|r| matches!(r, CompareRow::Object(_)))
+            .count()
+        };
+        assert_eq!(hits("CHANGED"), 1);
+        assert_eq!(hits("  changed  "), 1);
+    }
+
+    #[test]
+    fn the_default_expansion_opens_every_kind_that_differs_and_no_other() {
+        let mut left = schema_of(vec![
+            table("changed", &[("id", "int")]),
+            view("agreed_view", "select 1"),
+        ]);
+        let right = schema_of(vec![
+            table("changed", &[("id", "int"), ("extra", "int")]),
+            view("agreed_view", "select 1"),
+        ]);
+        left.enums = vec![];
+        let c = SchemaComparison::of(&left, &right, SqlDialect::MySql);
+        let seed = c.default_expanded();
+        assert!(seed.contains("table"), "{seed:?}");
+        assert!(
+            !seed.contains("view"),
+            "a kind that only agrees stays shut: {seed:?}"
+        );
+    }
+
+    #[test]
+    fn an_all_same_comparison_has_no_rows_to_show_by_default() {
+        let t = || schema_of(vec![table("city", &[("id", "int")])]);
+        let c = mysql(t(), t());
+        assert!(
+            c.rows(RowFilter::default(), &c.default_expanded())
+                .is_empty()
+        );
+        // The objects are still there to be shown on request.
+        assert_eq!(
+            c.rows(
+                RowFilter {
+                    query: "",
+                    show_same: true
+                },
+                &open(&[CompareKind::Table])
+            )
+            .len(),
+            2,
+            "one heading and one object"
+        );
+    }
+
+    #[test]
+    fn the_counts_total_everything_either_side_holds() {
+        let c = mixed();
+        assert_eq!(c.counts().total(), c.entries.len());
     }
 
     #[test]

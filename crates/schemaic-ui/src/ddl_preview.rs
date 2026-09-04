@@ -183,6 +183,76 @@ pub(crate) fn preview_of(
     }
 }
 
+/// Build a preview from a whole **multi-object plan** — [`preview_of`]'s
+/// counterpart for a schema comparison, which is about many objects at once.
+///
+/// [`DdlPreview`] needed nothing added for this: every field it holds was
+/// already flat text, and [`SchemaPlan`] answers each one as the concatenation
+/// of its sets' answers. So the plan reaches the same modal, the same Apply and
+/// the same `Db::run_ddl` as one table's designer edit, which is the point — a
+/// second apply path is the thing the DDL invariant exists to prevent.
+///
+/// **`scope` and `qualified` are read off every set's changes**, not the first
+/// one's and not the caller's, for the reason [`preview_of`] gives: the path
+/// that had to remember is the path that forgets. A comparison produces neither
+/// a server-level nor an account change today — it compares objects *within* a
+/// database — but asking the plan rather than assuming that is what keeps the
+/// answer right if it ever grows one.
+///
+/// `subject` names the plan rather than an object, since there is no single
+/// object to name; the caller passes something like "12 objects".
+///
+/// [`SchemaPlan`]: schemaic_core::compare::SchemaPlan
+pub(crate) fn preview_of_plan(
+    conn_id: u64,
+    database: &str,
+    subject: impl Into<String>,
+    plan: &schemaic_core::compare::SchemaPlan,
+    read_only: bool,
+) -> DdlPreview {
+    let server_level = plan
+        .sets
+        .iter()
+        .flat_map(|s| s.changes.iter())
+        .any(schemaic_core::ddl::is_server_level);
+    DdlPreview {
+        conn_id,
+        database: database.to_string(),
+        scope: if server_level {
+            crate::DdlScope::Server
+        } else {
+            crate::DdlScope::Database
+        },
+        subject: subject.into(),
+        // **Never qualified.** `qualified` asks "does `subject` live *in*
+        // `database`, so the title may write `database.subject`?" — and a
+        // plan's subject is a count, not an object name, so the answer is no
+        // whatever the changes are. Reading it off the changes the way
+        // `preview_of` does produced `Apply changes to My MariaDB · shop.12
+        // objects`: true of every field it was derived from, and nonsense.
+        // Each *statement* is still qualified, and `summaries` names the object
+        // per line.
+        qualified: false,
+        changes: plan.summaries(),
+        destructive: plan.destructive(),
+        risk_heading: plan.risk_heading(),
+        // The same refusal a single set gets: non-empty disables Apply and is
+        // re-checked inside `apply`, so a plan that can't be expressed in full
+        // is not applied in part.
+        withheld: plan.unsupported(),
+        statements: plan.emit(),
+        // **`export_script`, the same field `preview_of` fills that way**, and
+        // for the same reason: this is what Copy and Open in editor hand over,
+        // and both put it somewhere durable. It happens to equal
+        // `editor_script` for a comparison, which produces no account change —
+        // but the rule is enforced by calling the scrubbing function, not by a
+        // comment observing that today there is nothing to scrub.
+        script: plan.export_script(),
+        read_only,
+        dialect: plan.dialect,
+    }
+}
+
 /// Send a **container** change — a database or a namespace — to the preview.
 ///
 /// The counterpart of [`preview_change`] for the four changes that have no
@@ -1396,6 +1466,106 @@ mod tests {
             preview_title("My MariaDB", &p),
             "Apply changes to My MariaDB · shop"
         );
+    }
+
+    /// A schema comparison's whole plan, through the same modal.
+    fn compare_plan(
+        left: schemaic_core::schema::DbSchema,
+        right: schemaic_core::schema::DbSchema,
+    ) -> schemaic_core::compare::SchemaPlan {
+        schemaic_core::compare::SchemaComparison::of(&left, &right, SqlDialect::MySql)
+            .plan(|_| true)
+    }
+
+    fn one_table(name: &str, cols: &[&str]) -> schemaic_core::schema::DbSchema {
+        schemaic_core::schema::DbSchema {
+            tables: vec![schemaic_core::schema::TableInfo {
+                name: name.to_string(),
+                columns: cols
+                    .iter()
+                    .map(|c| schemaic_core::schema::ColumnInfo {
+                        name: c.to_string(),
+                        type_name: "int".to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// **A plan's subject is a count, not an object**, so no database qualifies
+    /// it. Derived from the changes the way `preview_of` does it, the answer was
+    /// `true` — every input true, the title nonsense: `shop.12 objects`.
+    #[test]
+    fn a_plan_is_never_qualified_by_the_database_it_runs_in() {
+        let plan = compare_plan(one_table("gone", &["id"]), Default::default());
+        let p = preview_of_plan(1, "shop", "1 object", &plan, false);
+        assert!(!p.qualified);
+        assert_eq!(
+            preview_title("My MariaDB", &p),
+            "Apply changes to My MariaDB · 1 object"
+        );
+        // The runner is still the in-database one: a comparison compares
+        // objects *within* a database and produces no server-level change.
+        assert_eq!(p.scope, crate::DdlScope::Database);
+    }
+
+    /// Every field of the preview comes off the plan, and the two text lists
+    /// name their objects — the modal's own title cannot, so they must.
+    #[test]
+    fn a_plans_preview_reads_every_field_off_the_plan() {
+        let plan = compare_plan(one_table("gone", &["id"]), one_table("fresh", &["id"]));
+        let p = preview_of_plan(7, "shop", "2 objects", &plan, false);
+        assert_eq!(p.conn_id, 7);
+        assert_eq!(p.database, "shop");
+        assert_eq!(p.statements, plan.emit());
+        assert_eq!(p.script, plan.export_script());
+        assert_eq!(p.withheld, plan.unsupported());
+        assert_eq!(p.dialect, SqlDialect::MySql);
+        assert!(!p.read_only);
+        // A drop and a create, each line saying which object it is about.
+        assert!(
+            p.changes.iter().any(|c| c.starts_with("gone — ")),
+            "{:?}",
+            p.changes
+        );
+        assert!(
+            p.changes.iter().any(|c| c.starts_with("fresh — ")),
+            "{:?}",
+            p.changes
+        );
+        assert!(
+            p.destructive.iter().all(|d| d.starts_with("gone — ")),
+            "only the drop is destructive, and it says so by name: {:?}",
+            p.destructive
+        );
+        assert_eq!(p.risk_heading, "This can't be undone");
+    }
+
+    /// An empty plan asks the modal for nothing, and must not answer `true` to
+    /// a question about accounts by accident — `all()` over no changes is
+    /// vacuously true, which is what made the old `qualified` derivation flip
+    /// for a reason that had nothing to do with accounts.
+    #[test]
+    fn an_empty_plan_previews_as_empty_and_unqualified() {
+        let plan = schemaic_core::compare::SchemaPlan::default();
+        let p = preview_of_plan(1, "shop", "0 objects", &plan, false);
+        assert!(!p.qualified);
+        assert_eq!(p.scope, crate::DdlScope::Database);
+        assert!(p.statements.is_empty());
+        assert!(p.changes.is_empty());
+        assert!(p.destructive.is_empty());
+        assert!(p.withheld.is_empty());
+    }
+
+    /// Read-only travels through unchanged: it is what disables Apply, and
+    /// `apply` re-reads the live flag on top of it.
+    #[test]
+    fn a_plans_preview_carries_read_only_through() {
+        let plan = compare_plan(one_table("gone", &["id"]), Default::default());
+        assert!(preview_of_plan(1, "shop", "1 object", &plan, true).read_only);
     }
 
     /// **Whether the preview's exits may stop an apply is the engine's
