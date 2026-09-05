@@ -980,8 +980,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     dump's writer loop for the reason `dump_verdict` does: written out at the call site it is a fold
     nothing can test, the caller needing a `Db`, a runtime handle and two channels to reach.
     None of the three is an error — the file is written and the rows in it are real — so the one
-    thing that must not happen is the caveat going unsaid, which is `export_note(tally, name,
-    streaming)`'s job: silent for a clean non-streamed save, and never silent when there is a caveat.
+    thing that must not happen is a *surprise* going unsaid, which is `export_note(tally, name,
+    streaming)`'s job: silent for a clean non-streamed save, and never silent about `blanked` or
+    `cut`. **Two of the three losses override that silence and the third no longer does.** A blanked
+    or cut column is a surprise — the value was there, the file holds less of it than the screen
+    does, and nothing on screen says so — while a withheld binary column is one the grid already
+    renders as `<7 bytes>`, so *"a text export cannot hold raw bytes"* restated what the user could
+    see, at a length that painted past the export modal it lands in. That clause is gone, and the
+    silence gate at the top of the function reads `blanked` and `cut` directly instead of
+    `has_caveat()`: a withheld-only tally now returns `None` on a non-streamed save and a bare
+    `Exported N rows to X` on a streamed one, and the `" — "` / `"; "` seam before the `cut` clause
+    is computed from `blanked` alone. **The tally itself is unchanged** — `withheld` is still
+    populated, `has_caveat` still counts it and the SQL writer's `-- NOTE: binary column … exported
+    as NULL` still reads it — only the sentence dropped it.
     **Nothing in production passes `false` any more.** The grid export reports into a modal that
     stays up until it is dismissed, and a confirmation saying nothing about a clean save would be a
     dialog reporting silence, so both call sites — the grid's and the dump's — and `files_note` ask
@@ -1003,7 +1014,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     inside a `create_ext_action` is a decision the suite cannot reach. `files_note(files, tally,
     folder, missing, replaced)` **delegates the caveat half to `export_note`** rather than restating
     it — a
-    folder loses exactly what a single file does, and the wording of a loss belongs in one place —
+    folder loses exactly what a single file does, and the wording of a loss belongs in one place, so
+    it inherits that function's silence about a withheld binary column along with everything it says —
     and asks it with `streaming: true`, since a folder has no other way to say how much arrived and
     `export_note` is otherwise silent on a clean write. It then **terminates that sentence itself**:
     `export_note` does not end its own, its single-file caller being the last clause of one, and here
@@ -5691,8 +5703,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     both kills live in the right-click menu (with *Cancel query* dimmed rather than absent on a
     session with nothing running, so the menu keeps one shape), and the confirm is raised by the
     *app*, not here, so no route to a kill can skip it. **The lock-wait banner's Kill is the one that
-    answers the keyboard**, through `widgets::key_pressable` — navigable, Enter and Space press it —
-    because it is built by hand rather than through `widgets::action_button`, whose family is the
+    answers the keyboard**, through `widgets::key_pressable` — navigable, Enter and Space press it,
+    and the pointer too, which it lost for a spell when adopting that helper *replaced* its
+    `on_click_stop` and nothing put the mouse half back (the helper binds both listeners itself now;
+    *Floem 0.2 gotchas*) — because it is built by hand rather than through `widgets::action_button`, whose family is the
     modal-footer one and needs a `FocusRing` this panel has none of. It carries the id it will kill in
     its label: a button reading just *Kill* on a panel where several sessions are killable is the one
     misread that cannot be undone. The **per-row** Kill and Cancel hang off a right-click menu with no
@@ -6070,8 +6084,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`widgets::loading_dots`) before the first table, where there is nothing to count yet and a
     static label and a hung one look identical. The **outcome** replaces it in that slot: the green
     `Wrote 5 tables.` followed by `export::export_note` — the grid's own caveat wording, reused
-    rather than restated, so a file whose every blob went out as `NULL` says so instead of reading as
-    a clean success — and the red failure or cancel sentence. A ticked table the run's **own** fresh
+    rather than restated, so a file that lost a column at the text arena's cap says so instead of
+    reading as a clean success — and the red failure or cancel sentence. **What that wording no
+    longer carries is the withheld half**: the clause naming binary columns a text export could not
+    hold was dropped for the grid's reason, that the cell on screen already reads `<7 bytes>`, and a
+    dump's reader is not looking at a grid — so for a dump the only place it is said is the file's own
+    `-- NOTE: binary column … exported as NULL`, and for a folder export of CSVs, nowhere
+    (*core::export*). A ticked table the run's **own** fresh
     introspection could not find (`DumpPlan::missing`) is named in that same green sentence rather
     than only in the file's header, for the reason the tally is named there: a file one table short
     of what was ticked looks exactly like a complete one. `DumpUi::done` is therefore the
@@ -10078,6 +10097,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   otherwise sizes to its content and overflows the box meant to bound it, `min_width(0)` because
   without it the label refuses to shrink below that content width. `placeholder_right_inset` is where
   `edit_field` decides how much room the in-flow trailing action needs.
+  **A centred column is the same trap in flow, with a different fix.** `items_center()` sizes a child
+  to its own content rather than stretching it, so a label in one is as unbounded as an absolute
+  child is: the export progress modal's result sentence and its `File: <name>` line each carried
+  `min_width(0)` and nothing bounding the other end, and a long caveat or a long file name laid out
+  at its natural width and painted across the panel's borders. `max_width_pct(100)` is the bound
+  there, and deliberately not `width_full()` — floem's default `TextOverflow` is `Wrap`, so bounding
+  the box *is* the wrap, and a one-line note stays centred under `items_center()` where
+  `width_full()` would have left-aligned it.
 - **A row's right edge is not the panel's, and an absolute inset is measured from the *border* box.**
   Two facts that only bite together. Rows inside a horizontal scroll stretch to the **widest** row,
   not to the viewport — the SCHEMA tree is deliberately not `width_full` so it can scroll — so a
@@ -10677,6 +10704,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   listener, its tooltip) and never applies `button_focus_ring` itself;
   `widgets::a_ring_button_registers_a_wrapper_not_the_face_it_was_given` pins which of the two views
   is the one registered.
+  **Its ring-less sibling `widgets::key_pressable` splits that same pair the other way, and has to** —
+  worth knowing before adding a click listener near either. It builds its own container, so a
+  caller's `on_click_stop` would sit *inside* the focus ring rather than on it; it therefore binds
+  the click as well as the KeyDown arm, over one `Rc`'d action. Leaving the pointer to the caller
+  here is what shipped the row panel's *Set NULL* and the activity panel's lock-wait Kill dead to a
+  mouse click, and `widgets::key_pressable_gate` now holds the helper to both listeners and rejects a
+  caller that binds the click a second time (one press, two actions).
   Order is `NAV_TAB` → `LIST_TAB` → the form (10, 20, … within a section, by 100 between them, up
   to `FIXED_TAB_END`) → `VALUE_TAB` + `i * ROW_TAB_STRIDE` for a growing list → `ACTION_TAB` for
   the footer → `TITLE_CLOSE_TAB` for the title bar's ✕ (last, since
@@ -11807,7 +11841,13 @@ for keyboard nav.
   exactly as it did before: the count, and no button. The word is *Edit* where the cell takes a
   write and *View* where it does not, the cell menu's pair shortened because the row is already
   headed by the column's name and *Edit binary* would say it twice. The button is that column's
-  editor, in the place every other column's editor is.
+  editor, in the place every other column's editor is — and it is `field_mini_btn`, the same
+  borderless dim text button *Set NULL* / *Set value* / *Unset* use, rather than the bordered pill it
+  first shipped as: the pill was the only one in the panel, so what is the same kind of act read as a
+  different *kind* of control. Going through `field_mini_btn` also hands this branch the panel's
+  `autofocus`, which the pill dropped — a blob column that is the first editable one takes the caret
+  on mount instead of leaving the arrow keys moving the grid's selection behind an open panel, the
+  way the NULL branch already does (`row_panel_null_gate`).
   **A blob column has to count toward the ✓ as well**, and `any_editable` is where that was missed.
   It gates the Save icon, and `ColSpec::editable` is `text_editable` — so a row whose only writable
   column is binary (a SQLite `BLOB` in a rowid-keyed table, where the rowid is an implicit key and
@@ -11932,10 +11972,20 @@ for keyboard nav.
     pins both, a source scan in the family with `popup_anchor_gate` and `menu_trigger_gate` and for
     the same reason: what went wrong was not a calculation but a parameter that never arrived.
     `key_pressable` is `in_ring_button`'s no-`FocusRing` sibling — the row panel and the activity
-    panel join floem's own traversal, so the difference is only `keyboard_navigable` in place of
+    panel join floem's own traversal, so the registration is `keyboard_navigable` in place of
     `in_focus_ring` — and Enter and Space press it while **every other key carries on**, so Tab still
-    walks past and the panel's Escape still reaches the panel. `focus_on_mount` is `pub(crate)` for
-    the same sharing.
+    walks past and the panel's Escape still reaches the panel. **The registration is not the only
+    difference between the two helpers: this one binds the pointer itself.** `in_ring_button` splits
+    the pair, its callers wrapping the *view* they hand it in their own `on_click_stop`;
+    `key_pressable` builds the container it wraps, so a caller's click listener would sit inside the
+    focus ring rather than on it, and leaving that half to the caller shipped **both** of its callers
+    dead to a mouse click — this button and the activity panel's lock-wait Kill, each of which
+    *replaced* an existing `on_click_stop` with the helper to gain the keyboard and lost the mouse in
+    the same line. It wires `.on_click_stop` on that container now, sharing one `Rc`'d action with
+    the KeyDown arm, and `widgets::key_pressable_gate` holds it to both listeners and checks no
+    caller binds the click a second time — one press running the action twice is invisible for an
+    idempotent *Set NULL* and is not for a Kill. `focus_on_mount` is `pub(crate)` for the same
+    sharing.
   - **Dates keep the text input** in both places, with the calendar beside it: typing a date is
     often faster, a `TIMESTAMP`'s time of day has no calendar to come from, and a value no picker
     can represent still has to be editable (`0000-00-00` gets a plain field and no panel at all).
@@ -12219,9 +12269,13 @@ for keyboard nav.
   silence is the default and a caveat overrides it, so a clean `Fetched` save said nothing, the
   screen already showing what it wrote and a note on every save being a note nobody reads. A modal
   that stays up until it is dismissed *is* the confirmation, and one that said nothing after a
-  fetched export would be a dialog reporting silence. What is unchanged underneath is that a *loss*
-  speaks in either scope, naming the columns, because a user comparing the file to the screen needs
-  to know which part of it to distrust; and the callback carries an `unwrap_or_else` fallback
+  fetched export would be a dialog reporting silence. What is unchanged underneath is that a
+  **blanked or cut** column speaks in either scope, naming the columns, because a user comparing the
+  file to the screen needs to know which part of it to distrust. **`withheld` no longer speaks at
+  all**: this grid already draws that cell as `<7 bytes>`, and the clause explaining that a text file
+  cannot hold raw bytes restated it at a length that painted past the borders of this very modal
+  (*core::export* has the rule, and what still reads the flag); and the callback carries an
+  `unwrap_or_else` fallback
   (`Exported to <name>`) for the `None` that arm can no longer return. The count is printed through
   `text::human_count`, the same row-count printer the
   stats line and the modal's own progress line use, so the figure in the report agrees with the
