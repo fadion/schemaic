@@ -30,7 +30,8 @@ use schemaic_core::blob::BlobRef;
 use schemaic_core::celledit::{self, CellEditor};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::edit::{
-    self, DirtyCells, EditModel, analyze_edit, refetch_key, refetch_template, row_key,
+    self, CellActivation, DirtyCells, EditModel, analyze_edit, refetch_key, refetch_template,
+    row_key,
 };
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition, rerun_of};
@@ -940,9 +941,10 @@ impl GridState {
         if !self.alive() {
             return false;
         }
-        if !self.edit_model.get_untracked().editable(ci)
-            || self.del_rows.with_untracked(|d| d.contains(&di))
-        {
+        // `takes_bytes`, which `blob_launch`'s offer asks too — one gate, so the
+        // offer and this re-ask of it cannot come to differ.
+        let deleted = self.del_rows.with_untracked(|d| d.contains(&di));
+        if !self.edit_model.get_untracked().takes_bytes(ci, deleted) {
             return false;
         }
         self.dirty.update(|d| {
@@ -960,7 +962,9 @@ impl GridState {
         if !self.alive() {
             return false;
         }
-        if !self.edit_model.get_untracked().editable(ci) {
+        // `false`: a pending row has no committed row to mark for deletion. That
+        // its skeleton is still there is the *next* check, below.
+        if !self.edit_model.get_untracked().takes_bytes(ci, false) {
             return false;
         }
         let staged = self.new_rows.try_update(|rows| match rows.get_mut(pidx) {
@@ -4540,6 +4544,40 @@ fn source_table(gs: GridState) -> Option<String> {
         .map(|src| format!("{}.{}", src.database, src.display()))
 }
 
+/// Aim the binary panel at a cell — **the one spelling**, called by the
+/// pointer's double-click and the keyboard's Enter so the two gestures cannot
+/// come to differ about what sits behind a cell.
+///
+/// Silent when [`blob_launch`] refuses: there is nothing to read and nowhere to
+/// put anything, which is the same nothing the gesture does on every other
+/// read-only cell. The refusal stays there rather than moving up here, because
+/// it is about the *row* — a NULL cell, a pending row, a row marked for
+/// deletion — and this is reached from two places that hold that state
+/// differently.
+fn open_cell_panel(gs: GridState, data_idx: usize, ci: usize, pending: Option<usize>) {
+    let rs = gs.rs.get_untracked();
+    if let Some(launch) = blob_launch(gs, &rs, data_idx, ci, pending) {
+        open_blob(gs, launch);
+    }
+}
+
+/// Split a **display** row into the result row it names and, for one of the
+/// pending new rows drawn below them, its pending index.
+///
+/// The cell builders are handed both (`data_row` → `cell_at` → `data_cell`);
+/// the key handler works in display coordinates only, so it has to make the
+/// mapping itself. `0` for a pending row's data index is what `data_row` passes
+/// for the same reason — there is no result row behind one, and every consumer
+/// reads `pending` first.
+fn row_at(gs: GridState, i: usize) -> (usize, Option<usize>) {
+    let nrows = gs.rs.get_untracked().row_count();
+    if i >= nrows {
+        (0, Some(i - nrows))
+    } else {
+        (gs.order.get_untracked().get(i).copied().unwrap_or(i), None)
+    }
+}
+
 /// Open the inline editor on the cell at display `(i, ci)`, seeding the buffer
 /// with its current value (a staged edit if present, else the original).
 ///
@@ -6777,10 +6815,25 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         }
         Key::Named(NamedKey::Enter) if ctrl => commit_grid(gs),
         Key::Named(NamedKey::Enter) => {
-            // Enter edits the active cell when it's editable; on a read-only
-            // cell it does nothing (viewing is via the right-click View item).
-            if gs.edit_model.get_untracked().text_editable(c) {
-                start_edit(gs, r, c);
+            // Enter **opens** the active cell — the in-cell editor on one that
+            // takes text, the binary panel on one that holds bytes, nothing on
+            // anything else. It used to ask `text_editable` and stop, which was
+            // the honest answer while a blob column was not writable at all and
+            // stopped being one when it became the grid's *only* byte-write
+            // surface: the panel behind that cell was then reachable by
+            // double-click alone, and there is no context-menu key binding to
+            // reach *Edit binary* with either. This arm is the whole of the
+            // keyboard's route to it.
+            //
+            // `activation` is the same answer the double-click reads, so the two
+            // gestures cannot come to disagree about which cells open onto what.
+            match gs.edit_model.get_untracked().activation(c) {
+                CellActivation::TextEdit => start_edit(gs, r, c),
+                CellActivation::OpenPanel => {
+                    let (data_idx, pending) = row_at(gs, r);
+                    open_cell_panel(gs, data_idx, c, pending);
+                }
+                CellActivation::Nothing => {}
             }
         }
         Key::Character(s) if ctrl && matches!(s.as_str(), "c" | "C") => copy_selection(gs),
@@ -8111,7 +8164,7 @@ fn blob_launch(
     // state and is handed to a window-scoped signal, so `BlobStage::is_live` is
     // what lets both defences work without either side comparing identities —
     // see that method.
-    let stage: Option<crate::BlobStage> = match model.editable(ci) && !deleted {
+    let stage: Option<crate::BlobStage> = match model.takes_bytes(ci, deleted) {
         true => Some(match pending {
             Some(p) => crate::BlobStage::new(
                 move |bytes: Vec<u8>| gs.stage_new_bytes(p, ci, bytes),
@@ -9146,14 +9199,17 @@ fn data_cell(
             // gesture reaches it whether the column is writable or not. Every
             // other read-only cell still does nothing but select (viewing a whole
             // row is the right-click menu's Edit row).
-            if gs.edit_model.get_untracked().text_editable(ci) {
-                start_edit(gs, i, ci);
-            } else {
-                gs.active.set(Some((i, ci)));
-                gs.anchor.set(Some((i, ci)));
-                let rs = gs.rs.get_untracked();
-                if let Some(launch) = blob_launch(gs, &rs, data_idx, ci, pending) {
-                    open_blob(gs, launch);
+            match gs.edit_model.get_untracked().activation(ci) {
+                CellActivation::TextEdit => start_edit(gs, i, ci),
+                // The pointer's own half: a double-click that opens nothing
+                // still selects what it landed on. `start_edit` sets the same
+                // pair itself, so only the two arms that don't need this.
+                other => {
+                    gs.active.set(Some((i, ci)));
+                    gs.anchor.set(Some((i, ci)));
+                    if other == CellActivation::OpenPanel {
+                        open_cell_panel(gs, data_idx, ci, pending);
+                    }
                 }
             }
         })
