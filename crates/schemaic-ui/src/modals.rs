@@ -106,7 +106,6 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let grant_open = ui.ddl.grant;
             let dump_open = ui.dump.target;
             let script_open = ui.script.target;
-            let export_open = ui.export.target;
             stack((
                 error_modal_overlay(ui.clone()),
                 crate::snippet_edit::snippet_edit_overlay(ui.clone()),
@@ -129,20 +128,9 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 stack((
                     crate::dump_view::dump_overlay(ui.clone()),
                     crate::script_view::script_overlay(ui.clone()),
-                    // The grid export's progress modal joins this element rather
-                    // than claiming one of its own — the stack is at Floem's
-                    // 16-arity limit, and it belongs here on the merits: it is
-                    // the dump modal's twin (same footer, same Stop, built beside
-                    // it in `dump_view`), and the two cannot be up together,
-                    // since a grid export and a schema-tree export are launched
-                    // from different surfaces and each refuses a second run.
-                    crate::dump_view::export_progress_overlay(ui.clone()),
                 ))
                 .style(move |s| {
-                    if dump_open.get().is_some()
-                        || script_open.get().is_some()
-                        || export_open.get().is_some()
-                    {
+                    if dump_open.get().is_some() || script_open.get().is_some() {
                         s.absolute().inset(0.0)
                     } else {
                         s
@@ -265,6 +253,34 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 s
             }
         }),
+        // **The grid export's progress modal, its own entry above every group —
+        // and it is the confirm's argument, not the confirm's exception.**
+        //
+        // It used to be the third member of the dump/script tuple element down in
+        // the DDL group, on the claim that it and the dump modal "cannot be up
+        // together". Nothing enforced that: its two neighbours clear each other's
+        // target on every `open` and **nothing anywhere clears `export.target`**,
+        // because nothing may — clearing it would take a *running* export's Stop
+        // off the screen, which is the one thing `export_may_launch` exists to
+        // prevent. So the claim was unenforceable by construction, and the modal
+        // was in a group four entries below the workspace one: Properties, the
+        // ER diagram or the binary-cell panel opened while an export ran painted
+        // straight over it, Stop included. Reachable because the save dialog is
+        // not window-modal, so the schema tree is live for as long as the user
+        // spends choosing a file.
+        //
+        // A progress modal is the one surface that stands for the whole *length*
+        // of an operation rather than its result, and it carries the only control
+        // that ends one — so "whatever can raise a question comes first" applies
+        // to it exactly as it does to the confirm, and has the same answer: its
+        // own entry, above every group. Reordering the two groups would only move
+        // which modal covers it (the rule the confirm's own note states).
+        //
+        // No wrapper, unlike the confirm below: this overlay already carries its
+        // own `absolute().inset(0)` gated on `target`, the way `manage_modal`,
+        // `plan_overlay` and `find_overlay` do — so it is a loose child that
+        // sizes itself, and `ddl_modals_up` no longer speaks for it.
+        crate::dump_view::export_progress_overlay(ui.clone()),
         // **The shared confirm, last, above every group.**
         //
         // A confirm is by definition raised *by* something already on screen, so
@@ -321,7 +337,6 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     let import_open = ui.import.target;
     let dump_open = ui.dump.target;
     let script_open = ui.script.target;
-    let export_open = ui.export.target;
     let snippet_edit = ui.overlay.snippet_edit;
     let editors = ddl_editors_up(ui.ddl);
     move || {
@@ -337,12 +352,12 @@ fn ddl_modals_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
             // and it is the *second* signal in that element, which is the shape
             // most likely to be forgotten.
             || script_open.get().is_some()
-            // The grid export's progress modal is the *third* signal in that
-            // same tuple element, painted in this group — so it is in this list
-            // for the reason the two above are, and it is the shape most likely
-            // to be forgotten of all: a modal nobody opens deliberately, raised
-            // by an export the user started somewhere else entirely.
-            || export_open.get().is_some()
+            // **The grid export's progress modal is deliberately not here.** It
+            // is its own entry at the end of the layer now, above every group,
+            // and so has its own term in `modal_backdrop_up` exactly as `find`,
+            // `manage`, `plan` and the confirm do. Leaving it in would give this
+            // group a full-window box with nothing in it for the length of every
+            // export — a transparent sheet over the app, eating clicks.
             // The snippet editor is painted in this group, so it has to be in
             // this list — the event editor shipped missing from exactly here and
             // rendered nothing at all, because the wrapper's `inset(0)` resolved
@@ -460,6 +475,13 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
     // same way `find`, `manage` and `plan` each have one. It used to be counted
     // by `ddl_modals_up`, which is now only about that group's own box.
     let confirm = ui.overlay.confirm;
+    // The same, for the same reason: the export progress modal moved out of the
+    // DDL group to its own entry above every group, so the aggregate that was
+    // speaking for it no longer does. Without this term the title bar stays live
+    // and undimmed over a running export's modal — the exact failure this
+    // predicate's doc names, and the one a modal leaving a group is most likely
+    // to cause, since nothing about the move is visible from here.
+    let export_open = ui.export.target;
     let ddl = ddl_modals_up(ui);
     let workspace = workspace_modals_up(ui);
     let settings = settings_modals_up(ui);
@@ -469,6 +491,7 @@ pub(crate) fn modal_backdrop_up(ui: &Ui) -> impl Fn() -> bool + Copy + 'static {
             || conn_import_open.get()
             || plan_open.get()
             || confirm.get().is_some()
+            || export_open.get().is_some()
             || ddl()
             || workspace()
             || settings()
@@ -517,12 +540,14 @@ mod modal_backdrop_gate {
         // together), raised by `ddl_editors_up`'s `d.database` arm.
         "database_editor.rs",
         "ddl_preview.rs",
-        // In the layer's DDL group — **one file, two overlays**, sharing one
-        // tuple element with `script_view.rs`: the Export panel, raised by
-        // `ddl_modals_up`'s `dump_open` arm, and the grid export's
-        // progress modal beside it, raised by its `export_open` arm. The second
-        // is the shape this gate is weakest against, since the file was already
-        // on the list before it existed.
+        // **One file, two overlays, and since the export modal moved they are no
+        // longer even in the same group** — which is exactly the shape this
+        // file-granular gate is weakest against, and the reason to spell it out
+        // here. The Export panel is in the DDL group sharing `script_view.rs`'s
+        // tuple element, raised by `ddl_modals_up`'s `dump_open` arm; the grid
+        // export's progress modal is its own entry above every group, raised by
+        // its own term in `modal_backdrop_up`. Neither move can fail this gate,
+        // because the file was already on the list before either existed.
         "dump_view.rs",
         "erd_view.rs",
         "event_editor.rs",
@@ -638,15 +663,19 @@ mod modal_backdrop_gate {
     /// And the other direction, which `07bda98`'s "loud failure" argument covers
     /// and which is worth pinning next to it: every term of `modal_backdrop_up` is
     /// a predicate the layer also uses to size itself, so a modal in the layer with
-    /// no term gets a zero box. All seven terms are named here — the three grouped
-    /// predicates and the four signals the layer raises directly — so an eighth
+    /// no term gets a zero box. All nine terms are named here — the three grouped
+    /// predicates and the six signals the layer raises directly — so a tenth
     /// added without joining `modal_backdrop_up` fails.
     ///
-    /// `confirm` is the seventh, and it arrived here late: hoisting the shared
-    /// confirm out of the DDL group gave it its own entry in the layer and its
-    /// own term in the predicate, and the array below was not extended with it —
-    /// which is precisely the drift the paragraph above claims to catch. The list
-    /// only guards what it names.
+    /// **Both of the loose entries arrived here late, and the second proves the
+    /// first was not a one-off.** Hoisting the shared confirm out of the DDL
+    /// group gave it its own entry in the layer and its own term in the
+    /// predicate, and this array was not extended with it. Moving the grid
+    /// export's progress modal out of the same group, for the same reason, did
+    /// the same thing again. Both are named now, because the list only guards
+    /// what it names — and the shape to watch for is exactly this one: a modal
+    /// leaving a group is invisible from here, since the group predicate it left
+    /// still exists and still passes.
     #[test]
     fn the_predicate_names_every_group_the_layer_raises() {
         let src = std::fs::read_to_string(src_dir().join("modals.rs")).expect("modals.rs");
@@ -672,6 +701,7 @@ mod modal_backdrop_gate {
             "conn_import_open.get()",
             "plan_open.get()",
             "confirm.get()",
+            "export_open.get()",
         ] {
             assert!(
                 closure.contains(term),
