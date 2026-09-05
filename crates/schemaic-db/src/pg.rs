@@ -104,9 +104,16 @@ async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool
         // exactly while `standard_conforming_strings` is on, which is the
         // default and is settable per database and per role. With it off a
         // backslash in a row's own text data ends the literal, and the rest of
-        // that value is parsed as SQL: on `blob_on`'s `simple_query`, which
-        // accepts several statements, that is a second statement running from a
-        // single click on a connection marked read-only.
+        // that value is parsed as SQL.
+        //
+        // `blob_on` used to be the sharpest edge of that — the simple protocol
+        // accepts several statements, and it is the one grid path reachable from
+        // a single click with no write verdict on a connection marked read-only.
+        // It speaks the **extended** protocol now, where `Parse` refuses a
+        // second statement outright, so that particular reach is closed
+        // structurally as well. This pin still stands for every other literal
+        // the module inlines, on the paths that are still the simple protocol
+        // by design.
         //
         // Pinning it is the belt, not the fix — the values still reach the
         // server inside statement text — but it removes the dependency the same
@@ -3536,12 +3543,36 @@ pub(crate) async fn fetch_blob(
 /// [`fetch_blob`]'s body on an already-open client, so a manual-transaction
 /// tab's pinned connection can read bytes it has written but not committed.
 ///
-/// **The bytes arrive as text and are decoded here**, because this path speaks
-/// the simple-query protocol like every other read in this module: a `bytea`
-/// comes over as `\x89504e47…`, which is what [`bytea_hex_bytes`] turns back
-/// into the value. That is also why the length is taken from `octet_length` and
-/// not from the hex string — they agree for a whole value and deliberately do
-/// not for a capped one.
+/// **The one read in this module on the extended protocol, and both halves of
+/// that are deliberate.**
+///
+/// *The bytes come back in binary.* Every other read here speaks the simple
+/// (text) protocol on purpose — `NUMERIC`, `UUID`, arrays and every exotic type
+/// round-trip losslessly through their textual form with no per-type decoder,
+/// which is the module doc's opening argument. This read is the one that argues
+/// the other way: it selects exactly two values of known type, and `bytea`'s
+/// textual form is `\x` followed by **two characters per byte**, so at the 64 MiB
+/// cap the text protocol built a ~128 MiB `String` and then decoded it into the
+/// `Vec` — a quarter of a gigabyte in flight for one cell. Binary is the value
+/// itself, once. It also retires an entire failure mode: `bytea_output = escape`
+/// sends a form the hex decoder had to refuse, and in binary there is no
+/// encoding to be wrong about.
+///
+/// *And a Parse takes one statement.* `simple_query` speaks the protocol that
+/// accepts several statements in one message, and this is the only grid path
+/// reachable from a single click with no write verdict, on a connection the user
+/// marked read-only — so it was the widest reach the key-in-statement-text shape
+/// had. The key is still built into the text here (binding it generically would
+/// break every key type outside `Value`'s four — a `uuid`, `date` or `numeric`
+/// key is a `Value::Str` today and reaches the server as a literal it coerces),
+/// but a second statement can no longer follow it: `Parse` refuses one outright,
+/// where `simple_query` would have run it. That is structural rather than a
+/// setting, and it holds even if the pinned `standard_conforming_strings` ever
+/// stops holding.
+///
+/// The length still comes from `octet_length` rather than from the buffer:
+/// they agree for a whole value and deliberately do not for a capped one, which
+/// is what tells the panel a value is truncated.
 pub(crate) async fn blob_on(client: &Client, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
     let col = pg_ident(&r.column);
     let sql = format!(
@@ -3549,66 +3580,30 @@ pub(crate) async fn blob_on(client: &Client, r: &BlobRef) -> Result<Option<BlobV
         pg_qname(r.schema.as_deref(), &r.table),
         where_key(&r.key),
     );
-    let msgs = client
-        .simple_query(&sql)
+    let rows = client
+        .query(&sql, &[])
         .await
         .map_err(|e| DbError::Query(e.to_string()))?;
-    for m in msgs {
-        let SimpleQueryMessage::Row(row) = m else {
-            continue;
-        };
-        // A NULL cell makes `octet_length` NULL too, which `get` reports as
-        // `None` — the same "no bytes to show" as a row that is gone.
-        let Some(len) = row.get(0).and_then(|s| s.parse::<u64>().ok()) else {
-            return Ok(None);
-        };
-        // **A value this cannot decode is an error, not an empty one.** The
-        // decoder refuses anything that is not the `\x…` hex form — a server
-        // with `bytea_output = escape` sends the other one — and substituting
-        // an empty buffer here would pair *no bytes* with the real
-        // `octet_length`: the panel would report 35.5 KB over an empty dump and
-        // call the value truncated, which is the "looks like data" failure
-        // `bytea_hex_bytes`' own doc refuses to commit. Naming the setting is
-        // the only part of this the user can act on.
-        let bytes = match row.get(1) {
-            // A zero-length `bytea` is `\x`, which decodes to an empty vec —
-            // distinct from a column that decoded to nothing.
-            Some(text) => bytea_hex_bytes(text).ok_or_else(|| {
-                DbError::Query(
-                    "this server sends bytea in a format Schemaic cannot decode \
-                     (expected the hex form `\\x…`); set `bytea_output = hex` on \
-                     the server or the session to read binary values"
-                        .to_string(),
-                )
-            })?,
-            // The length was not NULL but the value was: impossible from one
-            // row, and not something to invent bytes for.
-            None => return Ok(None),
-        };
-        return Ok(Some(BlobValue { bytes, len }));
-    }
-    Ok(None)
-}
-
-/// Decode the text protocol's `\x…` `bytea` form into the bytes it stands for.
-///
-/// The byte-counting half of this is [`bytea_hex_len`], and both are deliberate
-/// about rejecting rather than salvaging: a `bytea` whose text is not the hex
-/// form (a server with `bytea_output = escape`) must not be *half* decoded into
-/// something that looks like data, for the same reason `binary_display`
-/// replaced MySQL's `from_utf8_lossy`.
-fn bytea_hex_bytes(text: &str) -> Option<Vec<u8>> {
-    let hex = text.strip_prefix("\\x")?;
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-    }
-    Some(out)
+    let Some(row) = rows.first() else {
+        return Ok(None); // no such row
+    };
+    // A NULL cell makes `octet_length` NULL too — the same "no bytes to show"
+    // as a row that is gone. `octet_length` is `int4`, so `i32` is its type on
+    // the wire and the cast up is the lossless direction.
+    let len: Option<i32> = row.try_get(0).map_err(|e| DbError::Query(e.to_string()))?;
+    let Some(len) = len else {
+        return Ok(None);
+    };
+    // The length was not NULL but the value was: impossible from one row, and
+    // not something to invent bytes for.
+    let bytes: Option<Vec<u8>> = row.try_get(1).map_err(|e| DbError::Query(e.to_string()))?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    Ok(Some(BlobValue {
+        bytes,
+        len: len.max(0) as u64,
+    }))
 }
 
 /// Re-`SELECT` the given just-edited rows by their (post-edit) key, so the grid
@@ -4328,31 +4323,26 @@ mod tests {
         assert_eq!(bytea_hex_len("48656c"), None);
     }
 
-    /// **The decoder and the counter agree on what is hex output.** They are the
-    /// two halves of one `bytea` text form — one runs on every loaded cell, the
-    /// other only when the panel fetches — and a value either has this encoding
-    /// or does not. A decoder that salvaged what the counter rejects would put
-    /// bytes on screen that are not the value.
+    /// **What the counter accepts is exactly the hex output form.** It runs on
+    /// every loaded `bytea` cell to turn it into a `<n bytes>` placeholder, so a
+    /// counter that salvaged a length out of some *other* encoding would put a
+    /// size on screen that is not the value's.
+    ///
+    /// This used to assert the counter against a decoder beside it —
+    /// `bytea_hex_bytes`, which turned the same text back into bytes for the
+    /// binary panel's fetch. That decoder is **gone**: `blob_on` reads on the
+    /// extended protocol now and `bytea` arrives as itself, so there is no text
+    /// form to decode and no second answer to agree with. The counter stays
+    /// because the *result-set* path is still the text protocol, deliberately.
     #[test]
-    fn bytea_hex_decodes_to_the_bytes_it_counts() {
-        assert_eq!(bytea_hex_bytes("\\x48656c6c6f"), Some(b"Hello".to_vec()));
-        assert_eq!(bytea_hex_bytes("\\x"), Some(Vec::new()));
+    fn bytea_hex_counts_only_what_is_hex_output() {
+        assert_eq!(bytea_hex_len("\\x48656c6c6f"), Some(5));
+        // An empty bytea is `\x` — a value with a length, not an absence.
+        assert_eq!(bytea_hex_len("\\x"), Some(0));
         // Case-insensitive, and the high bytes a text path would have mangled.
-        assert_eq!(
-            bytea_hex_bytes("\\x89504E470D0a1A0a"),
-            Some(b"\x89PNG\r\n\x1a\n".to_vec())
-        );
+        assert_eq!(bytea_hex_len("\\x89504E470D0a1A0a"), Some(8));
         for bad in ["\\x4", "\\xzz", "48656c", "Hello\\000", ""] {
-            assert_eq!(bytea_hex_bytes(bad), None, "{bad:?} should not decode");
             assert_eq!(bytea_hex_len(bad), None, "{bad:?} should not count");
-        }
-        // And where it does decode, the two answers are the same length.
-        for good in ["\\x", "\\x00", "\\xdeadbeef"] {
-            assert_eq!(
-                bytea_hex_bytes(good).map(|b| b.len()),
-                bytea_hex_len(good),
-                "{good:?}"
-            );
         }
     }
 
