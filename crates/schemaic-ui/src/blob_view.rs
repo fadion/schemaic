@@ -515,14 +515,16 @@ fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
         .into_any(),
         PreviewVerdict::TooLarge { width, height } => note_view(
             format!(
-                "This image is {width} × {height} — too large to preview here.                  The bytes are intact: read them as Hex, or save them to a file."
+                "This image is {width} × {height} — too large to preview here. \
+                 The bytes are intact: read them as Hex, or save them to a file."
             ),
             false,
         )
         .into_any(),
         PreviewVerdict::Unmeasurable => note_view(
             format!(
-                "These bytes begin like a {} but cannot be read as one.                  Read them as Hex, or save them to a file.",
+                "These bytes begin like a {} but cannot be read as one. \
+                 Read them as Hex, or save them to a file.",
                 kind.label()
             ),
             false,
