@@ -26,9 +26,11 @@ production data, or any data you care about.
   language — before it runs.
 - **Local** — no account, no telemetry, no cloud service. The only things that
   leave your machine are your database traffic and, if you turn the assistant on,
-  the prompts you send through your own `claude` CLI. Credentials go to the OS
-  keyring — never a URL, never a command line — falling back to the config file
-  only on a machine with no keyring at all.
+  the prompts you send through your own agent CLI — whichever one you point it
+  at, under that CLI's own account and its own terms. Schemaic itself has no API
+  key and talks to no model provider. Credentials go to the OS keyring — never a
+  URL, never a command line — falling back to the config file only on a machine
+  with no keyring at all.
 - **Every engine, properly** — MySQL/MariaDB, PostgreSQL and SQLite are separate
   dialects all the way down: quoting, DDL, completion and diagnostics follow what
   you're actually connected to, not a shared lowest common denominator. Where an
@@ -81,15 +83,23 @@ production data, or any data you care about.
   there is one, with the password passed by environment rather than on the command
   line, and for SQLite starting in the database file's own directory so `.output`
   and `.read` land where you'd expect.
-- **AI assistant** — a `claude` CLI session wired into the app rather than bolted
-  beside it: **AI Fix** on a failed query, which hands it the error and the query
+- **AI assistant** — an agent-CLI session wired into the app rather than bolted
+  beside it, driving **your own** installed CLI: Claude Code, Codex or
+  Antigravity, picked in Settings → AI along with the model id, which is a free
+  text field rather than a list this build happens to know. What each one is
+  allowed to do differs and the panel says so — only Claude Code can be given no
+  built-in tools at all; the others run read-only, and Schemaic will not start a
+  session on a binary it could not confirm it can restrict. Then: **AI Fix** on a
+  failed query, which hands it the error and the query
   and offers you the corrected SQL as a diff; rewrite the statement
   under the caret and accept or reject that diff yourself (Ctrl+K); explain or
   optimize it from the right-click menu; ask about an `EXPLAIN` plan without
   retyping it; summarize a column or a single value; or generate realistic rows
   for a table from the shape of the data already in it. A built-in MCP server
   lets it read your schema and query the database, so answers are about your data
-  rather than a generic guess.
+  rather than a generic guess — on every harness, and never beyond what that
+  connection's data-access setting allows. The one-shot generators (Ctrl+K, AI
+  Fill, AI Seed) run Claude Code whichever harness the chat panel is using.
 - **Themeable** — dark / light UI themes, multiple editor color schemes, and an
   interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
 

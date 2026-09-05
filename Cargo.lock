@@ -4987,6 +4987,7 @@ dependencies = [
  "image",
  "pulldown-cmark",
  "resvg",
+ "schemaic-ai",
  "schemaic-core",
  "schemaic-term",
  "serde_json",

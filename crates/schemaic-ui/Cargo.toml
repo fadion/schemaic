@@ -7,6 +7,17 @@ license.workspace = true
 [dependencies]
 schemaic-core = { workspace = true }
 schemaic-term = { workspace = true }
+# The AI harness identity and its capability predicates, so the settings modal
+# can offer the harnesses and hide the controls a given one has no flag for.
+#
+# **One `Harness`, not a UI-side mirror of it.** The alternative — a parallel
+# enum here, converted at the app boundary the way `AiModel`/`AiEffort` are — is
+# two definitions free to drift, and that pattern has already cost this app once:
+# `AiModel::from_cli` silently coerced any unrecognised model to Haiku, so a
+# settings file naming a real model ran a different one with nothing on screen to
+# say so. The crate is pure (`serde_json` + `schemaic-core`), so it costs the UI
+# no new transitive dependency.
+schemaic-ai = { workspace = true }
 floem = { workspace = true }
 # The `Renderer` trait (stroke/fill in a custom view's `paint`) isn't re-exported
 # by `floem`; pull it directly. Already in the tree via floem — same version.

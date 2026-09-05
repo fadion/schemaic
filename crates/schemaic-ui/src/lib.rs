@@ -75,6 +75,7 @@ use grid::{
     phase_of, running_view,
 };
 use history_panel::history_panel;
+pub use schemaic_ai::harness::{Constraint, Harness};
 // The modal overlays are imported by `modals`, which is the only thing that
 // mounts them — the root tuple below carries one entry for the whole layer.
 use overlays::{
@@ -3315,10 +3316,31 @@ pub struct AiUi {
     pub busy: RwSignal<bool>,
     /// Whether the AI settings modal is open.
     pub settings_open: RwSignal<bool>,
-    /// Override path to the `claude` CLI (empty = auto-detect `detected_path`).
+    /// Which agent CLI drives the panel.
+    ///
+    /// The other AI settings are read *through* it: `cli_path` points at this
+    /// harness's binary, and the effort row is shown only where
+    /// [`Harness::supports_effort`] holds. Changing it replaces the live session
+    /// (`ai::needs_respawn`), so it is a settings-modal control rather than
+    /// something the panel switches mid-conversation.
+    pub harness: RwSignal<Harness>,
+    /// Override path to the selected harness's CLI (empty = auto-detect, via
+    /// [`AiActions::detect_path`]).
+    ///
+    /// Cleared when [`AiUi::harness`] changes: one field serves every harness,
+    /// so a path left behind would point the new CLI's spawn at the old CLI's
+    /// binary.
     pub cli_path: RwSignal<String>,
-    /// Selected model / reasoning effort.
-    pub model: RwSignal<AiModel>,
+    /// The model id passed to the harness's `--model`, verbatim.
+    ///
+    /// **A free string, not a closed set.** It was a three-variant enum, which
+    /// meant a model released after the build could not be selected at all, and
+    /// — worse, because it was silent — a settings file naming one ran Haiku
+    /// instead, with the dropdown reading "Haiku" as though the file had been
+    /// wrong rather than ignored. `Harness::suggested_models` supplies the menu;
+    /// anything else the user types is passed through untouched. Empty means the
+    /// harness's own default, which is a setting and not a missing value.
+    pub model: RwSignal<String>,
     pub effort: RwSignal<AiEffort>,
     /// Extra instructions appended to the assistant's system prompt.
     pub instructions: RwSignal<String>,
@@ -3358,8 +3380,19 @@ pub struct AiActions {
     pub inline_run: Rc<dyn Fn(InlineAiRequest)>,
     /// Cancel an in-flight inline generation (no-op when idle).
     pub inline_cancel: Rc<dyn Fn()>,
-    /// Auto-detected `claude` path (`None` = detection failed), the green hint.
-    pub detected_path: Option<String>,
+    /// Auto-detect the selected harness's binary (`None` = detection failed) —
+    /// the green hint under an empty path field.
+    ///
+    /// **A closure, not a value.** It was computed once at startup, which meant
+    /// that after switching harness the hint reported the *previous* CLI's
+    /// binary underneath a field captioned for the new one. Detection touches
+    /// the filesystem, so it stays at the app boundary; the view calls it.
+    pub detect_path: Rc<dyn Fn() -> Option<String>>,
+    /// Why the selected harness's session would be weaker or refused, if it
+    /// would — [`Constraint::notice`] for the binary that is actually resolved.
+    ///
+    /// `None` on the strongest grade, so the common case shows no banner at all.
+    pub constraint_notice: Rc<dyn Fn() -> Option<String>>,
 }
 
 /// Tabs / query signals (Copy bundle).
@@ -4783,42 +4816,14 @@ impl From<RightPanel> for schemaic_core::persist::RightPanelState {
     }
 }
 
-/// AI model choice → Claude CLI `--model` alias.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AiModel {
-    Haiku,
-    Sonnet,
-    Opus,
-}
-impl AiModel {
-    pub const ALL: [AiModel; 3] = [AiModel::Haiku, AiModel::Sonnet, AiModel::Opus];
-    /// CLI alias passed to `--model`.
-    pub fn cli(self) -> &'static str {
-        match self {
-            AiModel::Haiku => "haiku",
-            AiModel::Sonnet => "sonnet",
-            AiModel::Opus => "opus",
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            AiModel::Haiku => "Haiku",
-            AiModel::Sonnet => "Sonnet",
-            AiModel::Opus => "Opus",
-        }
-    }
-    /// Parse a persisted alias; anything unknown falls back to the default (Haiku).
-    pub fn from_cli(s: &str) -> AiModel {
-        match s {
-            "sonnet" => AiModel::Sonnet,
-            "opus" => AiModel::Opus,
-            _ => AiModel::Haiku,
-        }
-    }
-}
+// `AiModel` was here: a closed `Haiku | Sonnet | Opus`, whose `from_cli` mapped
+// every unrecognised string to Haiku. It sat in the middle of a pipeline that was
+// already `String` at both ends — `UiState::ai_model` on one side and
+// `build_session_args(.., model: Option<&str>, ..)` on the other — so it added
+// nothing but the narrowing. See `AiUi::model` and `Harness::suggested_models`.
 
 /// AI reasoning effort → Claude CLI `--effort` level (Extra = `xhigh`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AiEffort {
     Low,
     Medium,
@@ -4855,6 +4860,29 @@ impl AiEffort {
             "xhigh" | "max" => AiEffort::Extra,
             _ => AiEffort::Medium,
         }
+    }
+
+    /// This level if `levels` contains it, else the highest one that does.
+    ///
+    /// **What the settings box shows must be a level the harness takes.** The
+    /// argv is clamped by `Harness::effort_arg`, so a stale selection sends
+    /// nothing wrong — but the closed dropdown renders `label(active)`
+    /// unconditionally, so `Extra` chosen on Claude still read "Extra" after a
+    /// switch to Antigravity, naming a level that was neither offered in the
+    /// list below it nor sent. Clamping *down* rather than resetting to a
+    /// constant is the honest answer to "the level you asked for is out of this
+    /// CLI's range": `ALL` is ordered low→high, so the last surviving entry is
+    /// the closest this harness can reach.
+    ///
+    /// `None` when the harness has no effort flag at all — there is no level to
+    /// show, and the row is hidden.
+    pub fn clamped_to(self, levels: &[&str]) -> Option<AiEffort> {
+        if levels.contains(&self.cli()) {
+            return Some(self);
+        }
+        AiEffort::ALL
+            .into_iter()
+            .rfind(|e| levels.contains(&e.cli()))
     }
 }
 
@@ -9381,8 +9409,6 @@ fn footer(ui: Ui) -> impl IntoView {
     let popup_width = ui.overlay.popup_width;
     let toggle_read_only = ui.conn_actions.toggle_read_only.clone();
     let resources = ui.resources;
-    let ai_model = ui.ai.model;
-    let ai_effort = ui.ai.effort;
 
     // ── Reactive state for the left status cluster ──
     // Caret Ln/Col of the active tab (1-based). Reads the tab's `query` +
@@ -9882,53 +9908,14 @@ fn footer(ui: Ui) -> impl IntoView {
         rollback_tx,
     );
 
-    // AI model + effort: click each to pick from the AI-panel options; the active
-    // one is tinted the chip accent. Opens the AI section 40px after the
-    // transaction controls, with CPU then RAM after (40px from effort).
-    let model_seg = status_menu_seg(
-        move || ai_model.get().label().to_string(),
-        move || {
-            let cur = ai_model.get_untracked().cli();
-            AiModel::ALL
-                .into_iter()
-                .map(|m| {
-                    if m.cli() == cur {
-                        MenuEntry::action_colored(m.label(), theme::chip_active, move || {
-                            ai_model.set(m)
-                        })
-                    } else {
-                        MenuEntry::action(m.label(), move || ai_model.set(m))
-                    }
-                })
-                .collect()
-        },
-        popup_menu,
-        popup_anchor,
-        popup_width,
-        40.0,
-    );
-    let effort_seg = status_menu_seg(
-        move || ai_effort.get().label().to_string(),
-        move || {
-            let cur = ai_effort.get_untracked().cli();
-            AiEffort::ALL
-                .into_iter()
-                .map(|e| {
-                    if e.cli() == cur {
-                        MenuEntry::action_colored(e.label(), theme::chip_active, move || {
-                            ai_effort.set(e)
-                        })
-                    } else {
-                        MenuEntry::action(e.label(), move || ai_effort.set(e))
-                    }
-                })
-                .collect()
-        },
-        popup_menu,
-        popup_anchor,
-        popup_width,
-        15.0,
-    );
+    // **No model or effort chip here.** Both were status-bar menus duplicating a
+    // control in the AI settings modal, and the duplication was the problem: two
+    // views of one setting each had to re-derive the same per-harness filter (a
+    // model chip could only offer the *suggestions*, never the free id the field
+    // takes, and the effort chip had to hide itself on a harness with no flag),
+    // so every harness capability was answered twice with two chances to
+    // disagree. The settings modal is where both are set now, and the 40px break
+    // that opened the AI group belongs to the resource segments below.
     let cpu_seg = dyn_container(
         move || resources.get().cpu_label(),
         move |c| footer_text(format!("CPU: {c}")),
@@ -9953,8 +9940,6 @@ fn footer(ui: Ui) -> impl IntoView {
         collapsing_seg(tx_pill, ai_x),
         collapsing_seg(commit_seg, ai_x),
         collapsing_seg(rollback_seg, ai_x),
-        collapsing_seg(model_seg, ai_x),
-        collapsing_seg(effort_seg, ai_x),
         collapsing_seg(cpu_seg, ai_x),
         collapsing_seg(ram_seg, ai_x),
     ))
@@ -10027,6 +10012,51 @@ pub(crate) fn search_box(
         },
     )
     .style(|s| s.width_full())
+}
+
+#[cfg(test)]
+mod effort_clamp_tests {
+    use super::AiEffort;
+    use crate::Harness;
+
+    /// Against the harnesses' **own** level lists rather than literals, so this
+    /// follows a harness that changes its flag instead of pinning today's answer
+    /// twice.
+    #[test]
+    fn a_level_out_of_range_clamps_down_to_the_highest_the_harness_takes() {
+        let claude = Harness::Claude.effort_levels();
+        let agy = Harness::Antigravity.effort_levels();
+        // The case that was live: chosen on Claude, still displayed on a harness
+        // whose flag stops one level short.
+        assert_eq!(AiEffort::Extra.clamped_to(claude), Some(AiEffort::Extra));
+        assert_eq!(AiEffort::Extra.clamped_to(agy), Some(AiEffort::High));
+        // A level both take is never moved.
+        for e in [AiEffort::Low, AiEffort::Medium, AiEffort::High] {
+            assert_eq!(e.clamped_to(claude), Some(e));
+            assert_eq!(e.clamped_to(agy), Some(e));
+        }
+        // No flag at all: nothing to show, rather than a level nobody sends.
+        assert_eq!(
+            AiEffort::High.clamped_to(Harness::Codex.effort_levels()),
+            None
+        );
+        assert_eq!(AiEffort::High.clamped_to(&[]), None);
+    }
+
+    /// The property the display depends on: whatever comes back is a level this
+    /// harness actually advertises, for every starting point.
+    #[test]
+    fn a_clamped_level_is_always_one_the_harness_advertises() {
+        for h in Harness::ALL {
+            let levels = h.effort_levels();
+            for e in AiEffort::ALL {
+                match e.clamped_to(levels) {
+                    Some(out) => assert!(levels.contains(&out.cli()), "{h:?} showed {out:?}"),
+                    None => assert!(levels.is_empty(), "{h:?} showed nothing but has {levels:?}"),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
