@@ -5123,7 +5123,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   session is started, and in what `spawn_refusal` prints when the session is refused outright. It
   does not reach the AI panel itself, so a *runnable but weaker* session that was configured in an
   earlier sitting carries no reminder. Inline generation (Ctrl+K, AI Fill, AI Seed) stays Claude-only
-  through `inline_claude_bin` whatever the picker says, because that argv is `inline_args`. A
+  through `inline_claude_bin` **and `inline_claude_model`** whatever the picker says, because that
+  argv is `inline_args` — the binary and the model id are the two halves of one rule, and for a
+  while only the first half existed. A
   harness key `main.rs` does not recognise is `tracing::warn!`ed and falls back to Claude.
   **Getting the tools to each harness is three different mechanisms, and only Claude's is per
   invocation.** Claude gets a temp `--mcp-config` file; Codex gets `-c` overrides on its own command
@@ -5135,6 +5137,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   to end against the real binary, with the four rules in place the same prompt returned real rows,
   and `run_command` was never granted — which is what makes the CLI's own suggestion of
   `--dangerously-skip-permissions` unnecessary rather than merely unattractive.
+  **The isolation is not symmetric either, and Antigravity has none at all** — the one asymmetry the
+  list above would otherwise pass over while naming every other. Claude gets `--strict-mcp-config`
+  and Codex has its whole `mcp_servers` table assigned out from under it, and both of those
+  *displace* whatever servers the user has registered globally. `agy mcp add` appends to the user's
+  own MCP config, and no flag was found that scopes a registration to one invocation, so an
+  Antigravity session sees every server they have registered alongside ours. The per-tool
+  `permissions.allow` rules cover only the four `mcp(schemaic/<tool>)` names, so a user whose own
+  settings already allow their own servers' tools has those live inside Schemaic's SQL assistant.
+  Written down rather than fixed, because an undocumented gap is the one that gets assumed shut.
   **The spawned session is sealed to what Schemaic hands it, and that is `build_session_args`'s
   three flags rather than `DISALLOWED_TOOLS`.** That statement is now *graded* rather than boolean,
   because only `claude` can honour it in full — `harness::Constraint` is the grade, and reporting
@@ -5254,7 +5265,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   anywhere in the text, prose included, so a help that merely *discusses* `--tools` in another
   flag's description reads as advertising it — an imprecision kept because it errs towards sealing,
   which is the direction every other choice here errs in too. The
-  probe costs **~140 ms measured**, so `probe` caches the answer per `(harness, resolved path)` and
+  probe costs **~140 ms measured**, so `probe` caches the answer per `(harness, resolved path)` —
+  every outcome but a spawn that never ran, which is a property of the moment rather than of the
+  file (see `agent_cli.rs`) — and
   `main.rs` calls `warm_probe_cache` on a background thread; without it that wait
   sits on the UI thread ahead of every AI action. **What it warms must be what the spawn will
   resolve** — `harness_bin(h, &ai_cli_path)`, not `detect_bin(h)`: the cache is keyed by the
@@ -5290,10 +5303,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     because Claude was the only harness there was
     (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`). Everything else is asked as a
     **capability** and never as a variant
-    (`supports_effort`, `supports_resume`, `is_persistent`, `streams_deltas`,
-    `supports_model_choice`, `suggested_models`) — the same reason the engine predicates exist:
+    (`supports_effort`, `effort_levels`, `effort_arg`, `supports_resume`, `is_persistent`,
+    `streams_deltas`, `supports_model_choice`, `suggested_models`) — the same reason the engine
+    predicates exist:
     `== Harness::Claude` compiles cleanly while sorting a fourth CLI onto whichever side it happens
-    to fall.
+    to fall. There is one deliberate exception, `Constraint::notice`, and it states its reason where
+    it is described below.
     **`suggested_models` is a menu, never a permitted set**, and the distinction is the whole reason
     it returns a slice rather than the field being a dropdown: the model id is a free string, so a
     list here is the aliases each CLI documents as stable and anything dated, private or newer than
@@ -5305,6 +5320,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     field regardless. That is the failure this API is shaped against: the app shipped a closed
     three-variant `AiModel` for a year, and its `from_cli` coerced every unrecognised id to Haiku, so
     a settings file naming a real model ran a different one with nothing on screen to say so.
+    **A capability that is a `bool` can still be too coarse, and `supports_effort` is where that
+    showed.** It is true for Claude *and* Antigravity, so a site asking only it treated the two as
+    interchangeable — and their `--effort` vocabularies are not: Claude takes a fourth level,
+    `xhigh`, where `agy`'s flag documents `low|medium|high`. Effort is kept across a harness switch
+    rather than cleared as the path and the model are, so choosing `xhigh` under Claude and
+    switching sent `agy --effort xhigh`: one CLI's vocabulary applied to another, the
+    closed-model-list bug in a second dress. `effort_levels` is the list and `supports_effort` now
+    *computes* itself from `!is_empty()` so the two cannot disagree, while the argv sites ask
+    `effort_arg(requested)`, which answers `Option<&'static str>` **taken from that harness's own
+    list** rather than echoing the caller's string — so what is sent cannot be a level the harness
+    never advertised, whatever is passed in
+    (`a_level_one_harness_takes_is_not_sent_to_another_that_does_not`,
+    `each_harness_offers_only_the_effort_levels_its_own_flag_takes`). The settings modal clamps the
+    *selection* as well (`AiEffort::clamped_to`, under `settings.rs`), but that is about what the
+    box shows; this is the one that decides the command line.
     **The seal is graded here, because the three do not answer it equally well.** `Constraint` is
     ordered `Unknown < Restricted < Sealed`, and only Claude reaches the top, because only
     `--tools ""` empties the *built-in* set outright and leaves nothing but the allow-listed MCP
@@ -5326,6 +5356,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     harness the user had just declined, printed in the one place they were exercising the choice.
     `the_weaker_grades_say_so_and_the_strongest_stays_quiet` pins both halves, the second over every
     harness × every non-`Sealed` grade: a notice may name Claude only when the harness *is* Claude.
+    **And `Restricted` does not mean one thing, so the sentence is asked per *harness*.** For Codex
+    and Antigravity the grade is a real sandbox and *"cannot write files or run commands"* is a claim
+    the OS is enforcing. For Claude it means only that `--help` did not list `--tools`, so the seal
+    fell back to `DISALLOWED_TOOLS` — the denylist this section opens by describing as the guard that
+    looked total and left nineteen built-ins live, several of which ran with no permission request at
+    all. Printing the sandbox sentence there would be the comfortable lie one grade down, shown to
+    the user as a positive assurance, so Claude gets its own line naming the denylist and pointing at
+    a CLI update (`a_denylisted_claude_is_not_described_as_unable_to_write_or_run`). This is the one
+    place the ask-a-capability rule is deliberately not followed, and the reason is that *this is* a
+    harness question: two different mechanisms arrive at one grade, and the difference between them
+    is the whole content of the sentence.
     **`Constraint::Unknown` refuses the spawn** (`is_runnable` is false), which is the opposite
     failure direction from `CliSeal`/`seal_from_help` above, and both are right for the same
     underlying fact: an unknown flag *kills* the child. An unreadable Claude probe therefore yields
@@ -5374,6 +5415,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `bare_tool_name` derives one from the other rather than a second hand-written list, which would
     be one rename away from approving a tool that no longer exists while refusing one that does.
     (`--ignore-user-config` does not discard these overrides — confirmed against the binary.)
+    **When the endpoint file cannot be written the override becomes `mcp_servers={}`, not nothing.**
+    That is `codex_isolation_only`, taken by `ai.rs`'s `(Harness::Codex, None)` arm: the session
+    loses its database tools either way, but assigning the whole table is the only thing that
+    displaces the user's own servers, so dropping the override entirely dropped the *isolation* with
+    it and left every server in `~/.codex/config.toml` loaded into an assistant that had
+    allow-listed none of them — reachable by the route `codex exec`'s approval policy does not
+    cover. An empty table is the honest version of "no database tools": ours absent, and nobody
+    else's in its place (`losing_our_server_does_not_hand_the_session_somebody_elses`, which holds
+    both overrides to assigning the table rather than to two hand-copied strings).
     **Antigravity's two pieces of global state are shaped here and written by `app/antigravity.rs`.**
     `antigravity_allow_rules` builds one `mcp(schemaic/<tool>)` rule per tool from the same
     connection allow-list, through the same `bare_tool_name`; `antigravity_settings_with_rules` and
@@ -5396,7 +5446,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `build_session_args`: it is spawned once per *conversation* with its prompt arriving on stdin,
     where the other two are spawned per turn. **Where the prompt sits differs and is not a detail
     to generalise from one of them**: Codex takes it as the last *positional*, last on purpose since
-    a flag after it reads as part of it; Antigravity's is `-p`'s value and therefore first. **Every flag in the Codex argv was verified
+    a flag after it reads as part of it; Antigravity's is `-p`'s value and therefore first.
+    **The system context rides the first turn of a thread and none of the rest**, which is
+    `turn_system`. Neither of these two has an `--append-system-prompt`, so `prefixed_prompt` folds
+    the schema outline into the prompt itself (with a blank line between, or the outline's last table
+    name reads as the first word of the question) — and a resumed turn makes the CLI replay the whole
+    prior thread, every turn of which already carries its own copy. Sent every time, turn N put the
+    outline into the model's context N times: a ten-turn conversation against a large catalogue paid
+    for it ten times, and the panel's own input-token count would show it climbing against a
+    catalogue that never changed. The rule lives here beside the argv rather than at the call site
+    that fills in `TurnSpec`, so the caller cannot forget it, and the tests run the composition
+    rather than the predicate
+    (`the_schema_outline_rides_the_first_turn_of_a_thread_and_not_the_rest`; an empty
+    `resume` is not a resume and still carries the outline —
+    `an_empty_resume_id_still_carries_the_outline`). **Every flag in the Codex argv was verified
     against the installed binary's `codex exec --help`**: `exec`, `--json`, `-s/--sandbox` with
     `read-only|workspace-write|danger-full-access`, `--skip-git-repo-check` (Codex wants a git repo
     and the session cwd is a private app directory that is not one), `-m/--model`, `-c/--config`,
@@ -5423,8 +5486,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     precisely because it was passed in those runs that the 56-tool `init` listing is evidence of a
     ceiling rather than of a flag nobody set. The second is passed because print mode expands slash
     commands and skills by default, and a prompt is *user text* that must not be able to invoke
-    either. `--model`, `--effort` (`low|medium|high`, which is what `supports_effort` answers for
-    this harness) and `--conversation <ID>` (*"Resume a previous conversation by ID"*, with
+    either. `--model`, `--effort` (`low|medium|high`, which is this harness's `effort_levels`, and a
+    level only Claude takes is dropped by `effort_arg` before it reaches here) and
+    `--conversation <ID>` (*"Resume a previous conversation by ID"*, with
     `-c/--continue` beside it for the most recent) are **help only — never passed in a live run**.
     For the resume that leaves three things unverified at once: the argv position, whether it
     composes with `-p`, and whether the id we would feed it — the top-level `conversation_id` off
@@ -5444,7 +5508,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     nothing at all, which is why that is pinned rather than assumed
     (`an_antigravity_event_is_keyed_on_event_not_type`) — and it is what the binary emitted, not
     what its changelog implied.
-    **One dialect needs state, which is why decoding is a `StreamParser` and not a function.**
+    **Decoding needs state, which is why it is a `StreamParser` and not a function — and there are
+    two pieces of it.** The first is prose.
     Claude and Antigravity stream *deltas* — each line carries only the text new since the last one,
     so a stateless `line -> events` map is exact, and `parse_stream_line` is kept and delegated to
     rather than generalised. Antigravity's half of that is measured rather than assumed: a captured
@@ -5459,6 +5524,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     with. It is keyed by ids unique only within one stream, so a parser must not be shared between
     two concurrent ones — one per turn for the process-per-turn harnesses, one per session for
     Claude.
+    **There are two pieces of that state now, and the second is `seen_tools`.** Both per-turn
+    dialects restate a tool call while it is still running, neither marking the repeat — Codex on
+    every `item.updated` for the item id, Antigravity on every `state: "ACTIVE"` for the
+    `step_index` — while `TurnState::apply` pushes a chip for every `ToolUse` it is handed and
+    attaches a `ToolResult` to the *last* pending one. So a restated call left the earlier chip
+    spinning for the rest of the transcript. The set holds whatever id that dialect gives the call,
+    and only the first sighting announces a chip (`a_restated_tool_call_does_not_add_a_second_chip`,
+    `a_restated_agy_tool_step_does_not_add_a_second_chip`, and
+    `two_distinct_tool_calls_still_get_a_chip_each` for the direction that would break by
+    over-suppressing). **An Antigravity step with no `step_index` is announced anyway**: every
+    measured step carried one, and silently dropping a call is the worse of the two failures.
     **Codex's session model differs in kind, not in field names** — one process per *turn*, resumed
     by id (`codex exec resume <id>`), against Claude's one persistent bidirectional process per
     conversation. `StreamEvent::SessionStarted { id }` exists to carry the `thread.started`/`init`
@@ -5720,15 +5796,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     bug in the modal rather than as a note about the field.
     `AiEffort` **stays** a closed enum, and that is not an inconsistency: its
     vocabulary is defined by the flag (`low|medium|high|xhigh`), not by a vendor's model catalogue.
-    **The Effort row is hidden, not disabled, where `supports_effort` is false** (Codex). A
+    **The Effort row is hidden, not disabled, where the harness has no such flag** (Codex). A
     greyed control still claims *this exists for you and is off*, which is a different statement and
-    a false one. The row builds its dropdown **inside** a `dyn_container` keyed on the capability,
-    because a floem view is not `Clone` and each keyed rebuild has to construct its own. That
-    container also carries `Display::None` in the unsupported case, for the reason the harness
-    notice does: an empty container sitting between two 25px section gaps reads as one 50px hole,
-    which is what Codex showed between Model and Custom instructions. Three containers in this modal
-    are hidden that way now rather than rendered empty — the harness notice, the model suggestions
-    and this row — and they are one rule with three instances, not three local fixes.
+    a false one. The row builds its dropdown **inside** a `dyn_container` because a floem view is not
+    `Clone` and each keyed rebuild has to construct its own — and the key is **`effort_levels()`,
+    not `supports_effort()`**. The capability is a `bool`, and it is true for both Claude and
+    Antigravity, so switching between those two never flipped the key: the child was never rebuilt,
+    the level list captured at build time stayed Claude's, and the box went on offering `xhigh`
+    under a harness whose flag does not take it. A key has to be as fine-grained as what the child
+    reads. That container also carries `Display::None` in the unsupported case, for the reason the
+    harness notice does: an empty container sitting between two 25px section gaps reads as one 50px
+    hole, which is what Codex showed between Model and Custom instructions. Three containers in this
+    modal are hidden that way now rather than rendered empty — the harness notice, the model
+    suggestions and this row — and they are one rule with three instances, not three local fixes.
     **The modal is the only place either model or effort is set.** The status bar carried a model
     menu and an effort chip until both were deleted, and the *duplication* was the cost rather than
     the space they took: each was a second view of one setting that had to re-derive the same
@@ -5738,8 +5818,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     chances to disagree. `lib.rs`'s `effort_seg_for` went with them, and the 40px break that used to
     open the AI group in the bar is carried by `cpu_seg`'s own `margin_left(40)`, so the bar's
     spacing is unchanged.
-    **The CLI-path caption follows the harness, and switching it clears both the path and the
-    model.** The label is `format!("{} path", harness.label())`, and the clearing is not tidiness:
+    **The CLI-path caption follows the harness, and switching it clears both the path and the model
+    and clamps the effort.** The label is `format!("{} path", harness.label())`, and the clearing is
+    not tidiness:
     `ai_cli_path` is one field shared by every harness, so a Claude path left behind across a switch
     is resolved by `harness_bin(Codex, …)` and spawns *Claude* with Codex's argv, dying on the first
     unknown flag and reporting it as an installation problem — the one thing that is not wrong with
@@ -5748,10 +5829,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     every harness and no CLI's `--model` accepts another CLI's ids, so picking Codex while the field
     said `haiku` configured the session with a value last chosen for a different program and it died
     on an unknown model. Empty already means "the harness's default" and omits the flag entirely —
-    `turn_args` pushes `--model` only when the id is non-empty
-    (`an_empty_model_lets_the_harness_keep_its_own_default`) — so clearing lands on the one value
+    but on **two** argv builders, and only one of them was covered. `turn_args` skips an empty id for
+    the per-turn harnesses (`an_empty_model_lets_the_harness_keep_its_own_default`, which loops
+    `Harness::ALL` — and whose Claude arm asserts nothing at all, because `turn_args` returns
+    `Vec::new()` for the one harness whose argv is `build_session_args`). That builder passed
+    `Some(&model)` straight through, so the clear this paragraph describes spawned
+    `claude … --model ""`, killed on a rejected id and reported as an installation problem. Both
+    `--model` and `--effort` are now filtered there through
+    `.map(str::trim).filter(|m| !m.is_empty())`, and
+    `an_empty_model_or_effort_is_omitted_rather_than_passed_as_an_empty_flag` is the pin for that
+    path — so clearing lands on the one value
     every harness is guaranteed to take. It is a *clear*, not a per-harness memory: switching back
-    does not restore the old id. The effect returns the **previous** harness rather than reading the
+    does not restore the old id.
+    **Effort is clamped down rather than cleared**, because unlike the other two it has no "the
+    harness's default" value: `AiEffort` is a closed enum and every level in it means something.
+    `Extra` is Claude's `xhigh` and Antigravity's flag stops at `high`, so the switch moves the
+    selection to the highest level the new harness advertises — `AiEffort::clamped_to`, whose `ALL`
+    is ordered low→high so the last surviving entry is the closest this CLI can reach, and which
+    answers `None` when the harness has no effort flag at all and the row is hidden. The argv is
+    already clamped by `Harness::effort_arg`, so this is about what the modal *shows*: the closed
+    dropdown renders the selected level unconditionally, so a box reading "Extra" under a harness
+    that neither offers it in the list below nor sends it is a caption for a level that exists
+    nowhere else on screen (`a_level_out_of_range_clamps_down_to_the_highest_the_harness_takes`,
+    `a_clamped_level_is_always_one_the_harness_advertises`).
+    The effect returns the **previous** harness rather than reading the
     signal twice: on the first run there is none, and clearing then would throw away the override
     just restored from `ui_state.json`.
     **The hint lines under the path field carry `width_full`, and that is what makes them wrap.** A
@@ -7053,6 +7154,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `RwSignal::new(false)` is a *new* signal after each rebuild, so a card the reader had opened to
     check what was sent snapped shut the moment the answer landed. That scope outlives the rebuilds
     and dies with the message.
+    **The panel's own words name the selected harness, or nobody.** The empty state reads
+    *"`<Harness>` not connected."*: `available` has answered per harness since the picker existed
+    while that string stayed literal, so Codex selected with no `codex` on `PATH` read "Claude not
+    connected." and sent the user to check an installation that was not the one in question — the
+    settings modal was fixed for exactly this and the panel was left behind. Where there is no
+    harness to hand, the words name none: `markdown.rs`'s parse-failure line says *"The assistant
+    proposed a change that couldn't be read"*, and the AI settings' gutter toggle describes *"the
+    assistant's replies"*, because that renderer and that setting are about replies rather than
+    about any one vendor's.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, the date picker's calendar (`date_pick_overlay`, whose panel is
     `cell_editors::calendar_panel` — up here because the field it drops from sits inside a scrolling
@@ -9064,6 +9174,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     states the reasoning at each end. The cache is keyed by **(harness, resolved path)** and not by
     path alone, because the same binary answers different questions for different harnesses and
     switching harness must not read the previous one's answer.
+    **A spawn that never ran is the one outcome not cached.** Every other answer here is a property
+    of a file that will not change while the app runs, which is what makes memoising it sound; a
+    failed spawn is not — an antivirus lock, an in-place upgrade of the CLI, or a moment of resource
+    exhaustion during the startup `warm_probe_cache` each produce one, and each lands on
+    `Constraint::Unknown`, which *refuses* the session. Remembered, one such moment disabled the
+    assistant for the rest of the run, saying the constraint could not be confirmed and offering no
+    retry path anywhere. `probe` now returns that answer early without inserting it, so the next
+    attempt is free to ask again.
     **Inline generation is Claude-only, and `inline_claude_bin` is where that is enforced.** Ctrl+K,
     AI Fill and AI Seed build their argv with `schemaic_ai::inline_args`, which is Claude's flag set,
     so all three spawn Claude whatever drives the chat panel. The override is honoured **only when
@@ -9072,6 +9190,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     never heard of (`the_inline_paths_never_spawn_another_harnesss_binary`). With another harness
     selected it auto-detects Claude and fails with the ordinary "not installed" message, which is the
     truth: those three features need Claude and it is not there.
+    **`inline_claude_model` is the other half of that rule, and for a while only the first half
+    existed.** `ai_model` follows the selection as well — under Codex the suggestion chips are
+    `gpt-5.4`, `gpt-5.4-codex`, `o3` — so the binary was guarded against another harness while the
+    model id travelled anyway, and Ctrl+K after picking one spawned `claude` with
+    `--model gpt-5.4-codex`, dying on an unknown model under the same "check your installation"
+    message covering the same wrong cause. It answers empty unless Claude is the selected harness, and
+    `inline_args` omits an empty `--model`, so the generation falls back to Claude's own default;
+    guessing a Claude equivalent for the id the user picked would be inventing a mapping between two
+    vendors' catalogues (`the_inline_paths_never_pass_another_harnesss_model_id`, and
+    `the_inline_binary_and_the_inline_model_agree_on_who_is_selected`, which holds the two
+    functions to one answer about who is selected rather than testing each alone).
   - `antigravity.rs` — the two pieces of that CLI's **global** state a Schemaic session needs, owned
     for the life of the session and taken back out again. Every other harness is configured per
     invocation; Antigravity is configured by writing into the user's own files, which is why this is
@@ -9086,17 +9215,46 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     allow-list, so a schema-only connection never grants `run_query` and `run_command` is never
     granted at all; the surgery itself is `schemaic_ai::harness`'s pure, tested half and this module
     only does the IO.
+    **`install` runs on a blocking thread; `Drop` deliberately does not.** It is two `agy`
+    invocations and a settings rewrite — a Node CLI start, a config parse and a write back, seconds
+    rather than milliseconds — and `ai::start_ai_session` runs on the Floem UI thread, so doing it
+    inline froze the window for all of it, on top of the `probe` immediately above. Only the
+    *arguments* are gathered at that call site now; the work happens in a
+    `tokio::task::spawn_blocking` inside the session task, ahead of its first `rx.recv()`, so
+    nothing races the registration the first turn needs.
+    `Drop` stays blocking on purpose and the reason is stated on the impl: it runs
+    on a runtime worker with nobody waiting on that thread, and handing the removal to a detached
+    thread races process exit with the one piece of work that must not be skipped — a standing
+    permission grant left behind in the user's own config.
     **`sweep` runs at startup, off-thread, because a crash leaves both behind and neither expires.**
     It clears the full tool set rather than the current connection's, since a crashed session may
     have granted more than this one will
     (`the_sweep_targets_every_tool_not_just_the_current_level`), and it removes the rules even with
     no `agy` on the machine — that half is our own file surgery, while the `agy mcp remove` half is
     skipped unless the binary is actually there, rather than shelling out on every launch to clean
-    up state that cannot exist. **The known limit is stated rather than hidden**: it cannot tell a
+    up state that cannot exist.
+    **And withdrawing never creates the file it withdraws from**, which is what
+    `settings_to_edit(create, existing)` decides for `edit_settings`. Granting passes `create: true`
+    — a fresh Antigravity install has no settings file yet and the rules are what its tools need to
+    run at all — while withdrawing, meaning both the `Drop` and this sweep, passes `false`. The
+    sweep ran unconditionally at every launch, and for everyone who has never installed that CLI the
+    sequence was: the read fails, the pure layer takes an empty string as an empty document,
+    removing nothing from it yields `{}`, that differs from what was read, and Schemaic writes `{}`
+    into a directory it creates inside Google's config tree. An app that has never run that CLI has
+    no business leaving a file where it keeps its settings.
+    `withdrawing_rules_from_a_file_that_is_not_there_writes_nothing` drives the composition rather
+    than the predicate, because the composition is what bit. **The known limit is stated rather than hidden**: it cannot tell a
     crash's leftovers from a second running Schemaic, so starting a second instance removes the
     first's rules until that session next installs them. The alternative — leaving them on the
     chance somebody is using them — is a permission nobody remembers granting, outliving the process
     that needed it, which is the worse of the two failures.
+    **A second limit, recorded rather than guarded: the server name is not ours to reserve.**
+    `agy mcp add` is an upsert and `agy mcp remove` is unconditional, so a user who has registered
+    their *own* MCP server under the name `schemaic` — or one pointing at a different Schemaic build
+    — has it replaced on the first AI turn and deleted by the next `sweep`. Telling ours from theirs
+    needs a read of that CLI's registry (`agy mcp list`) whose output nobody has measured, and
+    guessing at a format in order to decide whether to delete somebody's configuration is worse than
+    the collision. The name is a single `SERVER` constant, so a future check has one place to hook.
     The settings file's location is `~/.gemini/antigravity-cli/settings.json`, and **the `.gemini`
     is not a leftover from the harness that was removed**: `agy` is Google's and keeps its own
     settings under the same home-directory root the Gemini CLI used, which the function's own doc
