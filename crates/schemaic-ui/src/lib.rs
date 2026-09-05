@@ -286,15 +286,28 @@ pub enum FilesOutcome {
     /// short of what was ticked looks exactly like a complete one, and a stopped
     /// or failed export is *more* likely to be inspected than a finished one —
     /// so the arm least likely to be read was the one that used to drop it.
+    ///
+    /// **And all three carry `replaced`**, for a sharper version of the same
+    /// reason. A directory picker has no overwrite dialog, so where the
+    /// single-file export's guard against destroying the user's work is the save
+    /// dialog's "replace?", the folder form had none — the files it overwrote in
+    /// the folder the user picked were replaced in silence and named nowhere.
+    /// It is the file names that existed *before* the export began, not the ones
+    /// it wrote.
     Done {
         files: usize,
         tally: schemaic_core::export::ExportTally,
         missing: Vec<String>,
+        replaced: Vec<String>,
     },
     /// Stopped by the user. The completed files stay: they are whole, they are
     /// what the user asked for, and each was published by the same rename a
     /// dump's is.
-    Cancelled { files: usize, missing: Vec<String> },
+    Cancelled {
+        files: usize,
+        missing: Vec<String>,
+        replaced: Vec<String>,
+    },
     /// Failed. `files` counts the ones already published, which is what makes
     /// this different from an export that failed outright — the folder is not
     /// empty, and a message that did not say so would send the user looking for
@@ -303,6 +316,7 @@ pub enum FilesOutcome {
         message: String,
         files: usize,
         missing: Vec<String>,
+        replaced: Vec<String>,
     },
 }
 

@@ -3528,8 +3528,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             message: format!("Export failed: {e}"),
                             files: 0,
                             // Refused before a plan existed, so nothing is known
-                            // to be missing — `missing` is the plan's answer.
+                            // to be missing — `missing` is the plan's answer —
+                            // and nothing in the folder was touched.
                             missing: Vec::new(),
+                            replaced: Vec::new(),
                         });
                     }
                 };

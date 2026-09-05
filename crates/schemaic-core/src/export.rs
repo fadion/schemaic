@@ -1807,7 +1807,13 @@ pub fn export_cancel_note(name: &str, partial: bool) -> String {
 /// `missing` is [`crate::dump::FilePlan::missing`] — ticked tables this run's own
 /// introspection could not find. Named here as well as counted, because a folder
 /// one file short of what was asked for looks exactly like a complete one.
-pub fn files_note(files: usize, tally: &ExportTally, folder: &str, missing: &[String]) -> String {
+pub fn files_note(
+    files: usize,
+    tally: &ExportTally,
+    folder: &str,
+    missing: &[String],
+    replaced: &[String],
+) -> String {
     // **The count first, the destination in the second clause** — the shape the
     // dump's own report has (`Wrote 5 tables. Exported 115k rows to shop.sql`),
     // and the reason to follow it rather than say "12 files to out" here is that
@@ -1823,9 +1829,39 @@ pub fn files_note(files: usize, tally: &ExportTally, folder: &str, missing: &[St
     if let Some(note) = export_note(tally, folder, true) {
         s.push(' ');
         s.push_str(&note);
+        // **`export_note` does not end its own sentence**, because its single-file
+        // caller is the last clause of one. Here it is not: `missing_clause`
+        // follows, and the two ran together into "…Exported 115k rows to
+        // sakila-csv 1 ticked table not found and was no file: ghost."
+        s.push('.');
     }
+    s.push_str(&replaced_clause(replaced));
     s.push_str(&missing_clause(missing));
     s
+}
+
+/// The files a folder export **overwrote**, as a sentence — or nothing at all
+/// when the folder held none of them.
+///
+/// **Shared by all three of the folder export's reports, for the reason
+/// [`missing_clause`] is.** A directory picker has no overwrite dialog, so the
+/// same product gesture that a single-file export guards with the save dialog's
+/// "replace?" had, in the folder form, no guard and no mention: files the user
+/// had in the folder they picked were replaced in silence, and a stopped or
+/// failed export is *more* likely to be inspected than a finished one.
+///
+/// It names them rather than counting them. The count answers "did I lose
+/// anything"; only the names answer "what".
+fn replaced_clause(replaced: &[String]) -> String {
+    if replaced.is_empty() {
+        return String::new();
+    }
+    format!(
+        " {} existing {} replaced: {}.",
+        replaced.len(),
+        crate::text::plural(replaced.len(), "file was", "files were"),
+        replaced.join(", "),
+    )
 }
 
 /// The tables a folder export was asked for and could not find, as a sentence —
@@ -1857,7 +1893,12 @@ fn missing_clause(missing: &[String]) -> String {
 /// renamed into place only once its table was complete. The fragment of the table
 /// that was in flight is mentioned second, and not at all when there is no file
 /// to be proud of yet.
-pub fn files_cancel_note(files: usize, folder: &str, missing: &[String]) -> String {
+pub fn files_cancel_note(
+    files: usize,
+    folder: &str,
+    missing: &[String],
+    replaced: &[String],
+) -> String {
     let mut s = if files == 0 {
         format!("Export cancelled — no file was finished, so nothing was written to {folder}.")
     } else {
@@ -1867,6 +1908,7 @@ pub fn files_cancel_note(files: usize, folder: &str, missing: &[String]) -> Stri
             crate::text::plural(files, "file was", "files were")
         )
     };
+    s.push_str(&replaced_clause(replaced));
     s.push_str(&missing_clause(missing));
     s
 }
@@ -1883,7 +1925,13 @@ pub fn files_cancel_note(files: usize, folder: &str, missing: &[String]) -> Stri
 /// `files == 0` is the refused-before-anything-landed case, and it must not
 /// mention a folder at all — the same rule [`export_failure_note`]'s `None` arm
 /// follows.
-pub fn files_failure_note(message: &str, files: usize, folder: &str, missing: &[String]) -> String {
+pub fn files_failure_note(
+    message: &str,
+    files: usize,
+    folder: &str,
+    missing: &[String],
+    replaced: &[String],
+) -> String {
     let mut s = if files == 0 {
         message.to_string()
     } else {
@@ -1893,6 +1941,7 @@ pub fn files_failure_note(message: &str, files: usize, folder: &str, missing: &[
             crate::text::plural(files, "is", "are"),
         )
     };
+    s.push_str(&replaced_clause(replaced));
     s.push_str(&missing_clause(missing));
     s
 }
@@ -3405,7 +3454,7 @@ mod tests {
             rows: 115_000,
             ..Default::default()
         };
-        let msg = files_note(12, &t, "sakila-csv", &[]);
+        let msg = files_note(12, &t, "sakila-csv", &[], &[]);
         assert!(msg.starts_with("Wrote 12 files."), "{msg}");
         assert!(msg.contains("115k rows"), "{msg}");
         // The destination is stated once, by `export_note` — naming it in both
@@ -3420,9 +3469,9 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            files_note(1, &t, "out", &[]).starts_with("Wrote 1 file."),
+            files_note(1, &t, "out", &[], &[]).starts_with("Wrote 1 file."),
             "{}",
-            files_note(1, &t, "out", &[])
+            files_note(1, &t, "out", &[], &[])
         );
     }
 
@@ -3436,9 +3485,65 @@ mod tests {
             withheld: vec!["photo".to_string()],
             ..Default::default()
         };
-        let msg = files_note(12, &t, "out", &[]);
+        let msg = files_note(12, &t, "out", &[], &[]);
         assert!(msg.contains("photo"), "{msg}");
         assert!(msg.contains("cannot hold raw bytes"), "{msg}");
+    }
+
+    /// **The two clauses have to be one readable sentence.** `export_note` does
+    /// not end its own — its single-file caller is the last clause of one — and
+    /// `missing_clause` opens with a space and a digit, so the two ran together
+    /// into "…Exported 115k rows to sakila-csv 1 ticked table not found and was
+    /// no file: ghost." Six tests asserted fragments of each half and none the
+    /// join, which is the whole shape of how it shipped.
+    #[test]
+    fn the_row_count_and_the_missing_tables_do_not_run_into_one_sentence() {
+        let t = ExportTally {
+            rows: 115_000,
+            ..Default::default()
+        };
+        let msg = files_note(11, &t, "sakila-csv", &["ghost".to_string()], &[]);
+        assert!(
+            msg.contains("to sakila-csv. 1 ticked table"),
+            "the row count's sentence has to end before the next one starts: {msg}"
+        );
+    }
+
+    /// **A folder export overwrites without asking, so it has to say so.**
+    /// `select_directories()` has no "replace?" — the guard the single-file
+    /// export gets from the save dialog — and nothing between the picker and the
+    /// `rename` looked, so files in the folder the user chose were replaced in
+    /// silence and named nowhere.
+    #[test]
+    fn a_folder_export_names_the_files_it_replaced() {
+        let t = ExportTally::default();
+        let replaced = ["orders.csv".to_string(), "staff.csv".to_string()];
+        let msg = files_note(4, &t, "out", &[], &replaced);
+        assert!(msg.contains("2 existing files were replaced"), "{msg}");
+        assert!(msg.contains("orders.csv, staff.csv"), "{msg}");
+        // Singular reads as one file, not "1 files".
+        let one = files_note(1, &t, "out", &[], &replaced[..1]);
+        assert!(one.contains("1 existing file was replaced"), "{one}");
+    }
+
+    /// And all three arms carry it, for `missing_clause`'s reason turned up one
+    /// notch: a stopped or failed export is *more* likely to be inspected than a
+    /// finished one, and it has already replaced whatever it got to.
+    #[test]
+    fn every_folder_outcome_says_what_it_replaced() {
+        let t = ExportTally::default();
+        let gone = ["orders.csv".to_string()];
+        for msg in [
+            files_note(3, &t, "out", &[], &gone),
+            files_cancel_note(2, "out", &[], &gone),
+            files_cancel_note(0, "out", &[], &gone),
+            files_failure_note("Export failed: disk", 1, "out", &[], &gone),
+        ] {
+            assert!(msg.contains("orders.csv"), "{msg}");
+        }
+        // And none of them invents one when the folder was empty.
+        assert!(!files_note(3, &t, "out", &[], &[]).contains("replaced"));
+        assert!(!files_cancel_note(2, "out", &[], &[]).contains("replaced"));
     }
 
     #[test]
@@ -3446,7 +3551,13 @@ mod tests {
         // A folder one file short of what was ticked looks exactly like a
         // complete one, so the shortfall goes in the same sentence as the count.
         let t = ExportTally::default();
-        let msg = files_note(2, &t, "out", &["ghost".to_string(), "gone".to_string()]);
+        let msg = files_note(
+            2,
+            &t,
+            "out",
+            &["ghost".to_string(), "gone".to_string()],
+            &[],
+        );
         assert!(msg.contains("ghost, gone"), "{msg}");
         assert!(msg.contains("not found"), "{msg}");
     }
@@ -3455,13 +3566,13 @@ mod tests {
     fn a_stopped_folder_export_says_what_it_kept() {
         // The completed files are whole and are what the user asked for, so the
         // sentence leads with them rather than with the fragment.
-        let msg = files_cancel_note(7, "out", &[]);
+        let msg = files_cancel_note(7, "out", &[], &[]);
         assert!(msg.starts_with("Export cancelled"), "{msg}");
         assert!(msg.contains("7 files"), "{msg}");
         assert!(msg.contains("out"), "{msg}");
         // Nothing was written yet: the sentence must not claim files that are
         // not there.
-        let none = files_cancel_note(0, "out", &[]);
+        let none = files_cancel_note(0, "out", &[], &[]);
         assert!(!none.contains("0 files"), "{none}");
         assert!(none.contains("no file"), "{none}");
     }
@@ -3474,29 +3585,29 @@ mod tests {
     fn a_stopped_or_failed_folder_export_still_names_what_went_missing() {
         let gone = vec!["ghost".to_string(), "gone".to_string()];
         for msg in [
-            files_cancel_note(7, "out", &gone),
-            files_cancel_note(0, "out", &gone),
-            files_failure_note("Export failed: disk", 3, "out", &gone),
-            files_failure_note("Export failed: no connection", 0, "out", &gone),
+            files_cancel_note(7, "out", &gone, &[]),
+            files_cancel_note(0, "out", &gone, &[]),
+            files_failure_note("Export failed: disk", 3, "out", &gone, &[]),
+            files_failure_note("Export failed: no connection", 0, "out", &gone, &[]),
         ] {
             assert!(msg.contains("ghost, gone"), "{msg}");
             assert!(msg.contains("not found"), "{msg}");
         }
         // And nothing is appended when nothing went missing — the common case
         // must not grow a clause about an empty set.
-        assert!(!files_cancel_note(7, "out", &[]).contains("not found"));
+        assert!(!files_cancel_note(7, "out", &[], &[]).contains("not found"));
     }
 
     #[test]
     fn a_failed_folder_export_still_names_the_files_that_landed() {
         // The difference from `export_failure_note`: the folder is not empty, and
         // a message that did not say so sends the user looking for nothing.
-        let msg = files_failure_note("Export failed: No space left on device", 3, "out", &[]);
+        let msg = files_failure_note("Export failed: No space left on device", 3, "out", &[], &[]);
         assert!(msg.starts_with("Export failed: No space left"), "{msg}");
         assert!(msg.contains("3 files"), "{msg}");
         // Failed before anything landed — no count to report, and no folder to
         // send anyone to.
-        let none = files_failure_note("Export failed: no connection", 0, "out", &[]);
+        let none = files_failure_note("Export failed: no connection", 0, "out", &[], &[]);
         assert_eq!(none, "Export failed: no connection");
     }
 
