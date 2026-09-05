@@ -1013,6 +1013,29 @@ fn diff_pane(e: &CompareEntry) -> impl IntoView {
     }))
     .style(|s| s.flex_col().width_full());
 
+    // **A `Same` row with a red-and-green pane under it needs a sentence.** On
+    // SQLite the pane's text is `sqlite_master.sql` verbatim while the status
+    // comes from the structured differ, so two tables that really do agree can
+    // carry different whitespace, quoting or clause order — and every one of
+    // those draws as a change under a row labelled identical. Nothing is hidden:
+    // the difference is real and worth seeing. What was missing is the reading.
+    let note: AnyView = if e.text_differs_though_same() {
+        text(
+            "These agree structurally — the difference below is in how the engine \
+             stores the statement, and there is nothing to migrate.",
+        )
+        .style(|s| {
+            s.font_size(theme::font_hint())
+                .color(theme::text_muted())
+                .width_full()
+                .padding_horiz(theme::scaled(8.0))
+                .padding_bottom(theme::scaled(6.0))
+        })
+        .into_any()
+    } else {
+        empty().into_any()
+    };
+
     v_stack((
         text(heading).style(|s| {
             s.font_size(theme::font_label())
@@ -1020,6 +1043,7 @@ fn diff_pane(e: &CompareEntry) -> impl IntoView {
                 .padding_horiz(theme::scaled(8.0))
                 .padding_vert(theme::scaled(6.0))
         }),
+        note,
         rows,
     ))
     .style(|s| s.flex_col().width_full().padding_bottom(theme::scaled(8.0)))

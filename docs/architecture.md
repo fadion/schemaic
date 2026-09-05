@@ -972,16 +972,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     here rather than in the modal's callback for the reason `absorb` is here: a report with arms
     (nothing finished, some finished, a table ticked and never found) is a decision, and one written
     inside a `create_ext_action` is a decision the suite cannot reach. `files_note(files, tally,
-    folder, missing)` **delegates the caveat half to `export_note`** rather than restating it — a
+    folder, missing, replaced)` **delegates the caveat half to `export_note`** rather than restating
+    it — a
     folder loses exactly what a single file does, and the wording of a loss belongs in one place —
     and asks it with `streaming: true`, since a folder has no other way to say how much arrived and
-    `export_note` is otherwise silent on a clean write. What it adds is the count, a folder's
-    completeness not being visible at a glance, and the `missing` tables named last for the reason
-    `DumpPlan::missing` is named at all. `files_cancel_note(files, folder)` parts company with
+    `export_note` is otherwise silent on a clean write. It then **terminates that sentence itself**:
+    `export_note` does not end its own, its single-file caller being the last clause of one, and here
+    it is not — `missing_clause` follows, and the two ran together into *"…Exported 115k rows to
+    sakila-csv 1 ticked table not found and was no file: ghost."* What it adds is the count, a
+    folder's completeness not being visible at a glance, and the `missing` tables named last for the
+    reason `DumpPlan::missing` is named at all. **`replaced` is the third clause and all three arms
+    carry it**, through the shared `replaced_clause`: `select_directories()` has no overwrite prompt,
+    so the guard a single-file export gets free from the save dialog's "replace?" had no equivalent
+    here and nothing named the files afterwards either — they were replaced in silence. It names them
+    rather than counting them, the count answering "did I lose anything" and only the names answering
+    "what", and a stopped or failed export is *more* likely to be inspected than a finished one,
+    which is why it is not the happy arm's alone. `files_cancel_note(files, folder, missing,
+    replaced)` parts company with
     `export_cancel_note` on purpose: a stopped single-file export has nothing but a fragment to talk
     about, while this one leaves **whole, published files** behind — each renamed into place only
     once its table was complete — so it leads with what the user kept and mentions the unwritten
-    table second, or not at all when no file finished. `files_failure_note(message, files, folder)`
+    table second, or not at all when no file finished. `files_failure_note(message, files, folder,
+    missing, replaced)`
     follows `export_failure_note`'s `None` rule through `files == 0`: an export refused before the
     first file lands must not send the user to a folder nothing was written to.
     **`export_file_names(tables, format)` is what names those files**, and what it adds over
@@ -1305,6 +1317,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     sequence that explicit inserts leave where it was — while MySQL's `AUTO_INCREMENT` and SQLite's
     `rowid` both advance from the data already in the table, so there is nothing to resync;
     `dump::sequence_resync_sql` is the one caller, and this replaced the `!= Postgres` it shipped as.
+    **Two more answer for things outside the designer entirely.** `enforces_declared_byte_length`
+    asks whether a column's *declared* type binds how many bytes a value in it may hold: MySQL's is a
+    promise, enforced with `ERROR 1406: Data too long`; PostgreSQL's `bytea` declares no length to
+    read, which is the same answer from the other side; and SQLite's is a **note**, that engine
+    typing values rather than columns, so `VARBINARY(16)` there stores a megabyte happily and `BLOB`
+    is bounded only by `SQLITE_MAX_LENGTH`. `blob::column_byte_cap` has to ask it *before* it reads a
+    type name — its table is MySQL's four blob families, and applied to SQLite it capped a `BLOB` at
+    65,535 bytes and a `VARBINARY(16)` at sixteen. `schema_body_is_emittable` asks whether a routine,
+    trigger or event body that an **eager** `fetch_schema` read can be re-emitted verbatim: no on
+    MySQL, whose `information_schema` resolves the escapes, yes on PostgreSQL (`pg_get_*`) and SQLite
+    (`sqlite_master.sql`), where the eager read is the authority. `compare::CompareEntry::needs_source`
+    is its one caller, and it replaced the `dialect == SqlDialect::MySql` that question was spelled as.
     `supports_database_editing` and `supports_namespace_editing` are the newest pair, for the
     **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL and
     PostgreSQL, and PostgreSQL's `CREATE`/`DROP SCHEMA`. They are two predicates rather than one
@@ -1927,7 +1951,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     by the time the `CREATE` fails.
   - `compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
     one migration. The pure half of schema compare (the UI half is `ui/compare_view.rs`): no DB, no
-    view code, nothing here runs anything (76 unit tests).
+    view code, nothing here runs anything (98 unit tests).
     **The differ is the comparator.** An object is `ObjectStatus::Differing` precisely when
     `ddl::diff` — or `diff_view`/`diff_trigger`/`diff_routine`/`diff_event`/`diff_enum`/
     `diff_domain`/`diff_sequence` — hands back a non-empty `ChangeSet` for it, and `status_of` reads
@@ -1968,9 +1992,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     exactly its sets' statements in order, and the three script forms are that same list under a
     header (`the_plans_statements_are_exactly_its_sets_statements_in_order`). A `Same` entry is never
     planned however permissive the `include` predicate is, its set holding nothing to run. For the
-    UI stage: `ui::DdlPreview` is already flat (`statements`/`destructive`/`withheld`/`script`), so
+    UI stage: `ui::DdlPreview` is already flat
+    (`statements`/`destructive`/`withheld`/`omitted`/`script`), so
     it can take a whole plan and the plan answers every field of one — `ddl_preview::preview_of` is
-    the single-`ChangeSet` shape that would have to grow.
+    the single-`ChangeSet` shape that would have to grow, and it fills `omitted` with an empty vec:
+    a designer edit is about one object it either can or cannot change, so nothing can be left out
+    of it.
     **The answers that are more than a concatenation are each load-bearing.** `script`
     puts `ddl::withheld_header` above the statements, over the **union** of its sets' omissions: a
     `join("\n\n")` dropped the "INCOMPLETE" preamble a single set's `ChangeSet::script` carries, so
@@ -2007,26 +2034,55 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     comes back.
     **Entries come back from `of` already in plan order**, so group by `CompareEntry::kind` for
     display rather than re-sorting in place. `phase` maps (status, kind) onto one number:
-    dependents dropped first, then types created or altered, then table creates, alters and drops in
-    that order, then dependents created or altered, then types dropped — and `Same` sorts past every
-    difference, so a hundred untouched tables cannot land between two statements that depend on each
-    other (`untouched_objects_do_not_disturb_the_order_of_the_differences`). **Inside a phase the
+    dependents dropped first, then types created or altered, then tables created **and altered in one
+    phase**, then tables dropped, then dependents created or altered, then types dropped — and `Same`
+    sorts past every difference, so a hundred untouched tables cannot land between two statements
+    that depend on each other (`untouched_objects_do_not_disturb_the_order_of_the_differences`).
+    **The creates and the alters share a phase because neither order between them is right.** Split,
+    every `CREATE TABLE` ran ahead of every `ALTER`, so
+    `CREATE TABLE child (… REFERENCES parent(code))` was emitted before the
+    `ALTER TABLE parent ADD code` it names — refused by the server, with the statements before it
+    already applied and no DDL rollback on MySQL — and swapping the two phases only moves the failure
+    to the other shape, an `ALTER` adding a foreign key onto a table the plan is about to create.
+    There is no need to pick one: `fk_rank` over the **right** schema answers both, that being the
+    schema a create and an alter are equally moving toward
+    (`an_alter_that_a_create_depends_on_runs_before_it`,
+    `a_create_that_an_alter_depends_on_runs_before_it`), and the alter side gains a foreign-key order
+    it previously had none of at all
+    (`two_altered_tables_are_ordered_by_their_foreign_keys_not_their_names`).
+    **Inside a phase the
     order is `CompareKind`'s declaration order** — `kind_rank` is that ordinal, **negated for a
-    drop**, because dropping runs the dependency order backwards — then, for the two pure table
-    phases only, a foreign-key rank from **`dump::order_tables`** (`fk_rank`, with `reverse`
+    drop**, because dropping runs the dependency order backwards — then a foreign-key rank from
+    **`dump::order_tables`** (`fk_rank`, with `reverse`
     inverting the ranks for the drop phase) rather than a second topological sort over the same
     edges, then `CompareEntry::key` as the last tie-break so two runs of one comparison read the
-    same. The ordinal is in the sort key because the alphabetical fallback **is not a dependency
+    same. **`fk_rank` ranks views as well as tables**, which it did not: `chosen` filtered them out,
+    so the half of `order_tables` written for view dependencies never ran and two created views fell
+    through to their names — `CREATE VIEW a_totals AS … FROM z_detail` above the statement creating
+    `z_detail`, which is the ERROR 1146 that half exists to prevent
+    (`a_view_is_created_after_the_view_its_body_selects_from`). The rank lookup covers
+    `CompareKind::Table | View` across `OnlyRight | Differing | OnlyLeft`; every other kind ties at
+    zero and falls through to the name. The ordinal is in the sort key because the alphabetical fallback **is not a dependency
     order**: sorting a phase on `key` alone put `domain:` ahead of `enum:` and emitted
     `CREATE DOMAIN … AS app.mood` above the statement creating `mood`, and `trigger:` ahead of
     `view:` for the same reason (`a_new_domain_is_created_after_the_enum_it_names` and
     `a_new_view_is_created_before_the_trigger_that_names_it`, both failing before the ordinal went
     in; `a_dropped_enum_goes_after_the_domain_that_names_it` guards the negation, where alphabetical
     happened to coincide with the right answer). A cycle is reported rather than resolved — no
-    creation order satisfies one — and it travels from `SchemaComparison::cycles` onto
-    `SchemaPlan::cycles` **narrowed by what the plan does**: `plan` sets it as `self.cycles && a set
-    creates a table`, that being the statement carrying an inline foreign key with nothing to point
-    at yet, so a plan of pure alters or drops is unaffected however tangled the schema is. It is
+    creation order satisfies one — and it is **two facts about two schemas, not one**.
+    `SchemaComparison::cycles_create` is a tangle among the **right** schema's tables and
+    `cycles_drop` one among the **left**'s; the `cycles()` method is the comparison-level "either",
+    for a header that is about the two schemas rather than about a plan. `plan` pairs each half with
+    the kind of statement it can actually break — `(cycles_create && a set creates a table) ||
+    (cycles_drop && a set drops one)` — a `CREATE` being the statement that carries an inline foreign
+    key with nothing to point at yet, a `DROP` the one refused while anything still references the
+    table, and a plan doing neither unaffected however tangled either schema is. The old spelling got
+    both halves wrong at once: `cycles` was `c1 || c2`, so a tangle among the *left* schema's tables
+    raised the *create*-order warning over a plan that created one unreferenced table; and the whole
+    flag was gated on `creates_a_table`, under a comment asserting that a plan of pure alters **or
+    drops** is unaffected — false of drops, which left `DROP TABLE b; DROP TABLE a;` to be refused at
+    statement 1 with no warning at all (`a_drop_only_plan_reports_its_cycle`,
+    `a_left_side_cycle_does_not_warn_a_plan_that_only_creates`). It is
     reported through `destructive()`, a warning above Apply, and forces `risk_heading()` to "This
     can't be undone" — and deliberately **not** through `unsupported()`: the statements are all
     there and one of them will be refused, so withholding a plan the user may still want to copy and
@@ -2034,6 +2090,44 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     warning, because `dump::order_tables` reports *that* there is a cycle and not which edge, so
     whether the selected tables are the ones in it cannot be answered from a `ChangeSet`;
     over-reporting costs one line in a risk block, and the flag is a warning and never a refusal.
+    **`SchemaPlan::omitted` is what no plan built from this comparison can carry**, one line per
+    object naming it and why — and `plan()` applies that exclusion **itself** rather than trusting
+    the caller's `include` predicate. On MySQL every routine, trigger and event difference is kept
+    out of a plan, `information_schema` handing their bodies back with the escapes already resolved,
+    and past the tree nothing said so: `unsupported()` was empty so the withheld block stayed hidden,
+    Apply stayed enabled, the preview's subject counted only what *was* included, and success read
+    "Applied N statements to 1 object" over a three-difference comparison.
+    `SchemaComparison::needs_source`, written to disclose exactly this, had **no production caller** —
+    its only three call sites were its own asserts. It is a second list rather than more lines in
+    `unsupported()` because the two ask different things of the reader: `unsupported` means this plan
+    writes less than its own change list promises, so Apply is refused until the offending tick is
+    cleared, while this means a difference is not in the plan at all — what is there is complete and
+    these objects have no tick to clear. `ddl_preview::omitted_block` therefore **discloses and does
+    not refuse** (`a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it`,
+    `a_blocked_body_cannot_be_planned_however_the_predicate_answers`).
+    **`SchemaComparison::new_namespaces` is the prerequisite a migration had no way to state.** A
+    namespace is not an object this comparison pairs — nothing introspects an empty one, and there is
+    nothing in it to diff — so a right-only PostgreSQL namespace meant `CREATE TABLE reporting.sales`
+    against a database with no `reporting` in it, which PostgreSQL refuses and with it the transaction
+    the whole migration runs in, while `unsupported()` was empty and Apply was live. `plan()`
+    prepends a `CREATE SCHEMA` for each one a set **in that plan** actually names, rather than for
+    every one the comparison found: the comparison's list is about the two schemas, and a plan over
+    one ticked table has no business creating a namespace for an object the user left out
+    (`a_table_in_a_new_namespace_gets_its_create_schema_first`,
+    `an_unticked_objects_namespace_is_not_created`). It is read off the entries' own statuses,
+    `DbSchema` holding no list of namespaces, and is empty on MySQL and SQLite by construction rather
+    than by a dialect test — neither has a level between the database and the table, so every object's
+    namespace there is `None` (`an_engine_with_no_namespaces_never_creates_one`).
+    **`is_planned`, `selection_note` and `SchemaPlan::subject` are decisions, and they were in the
+    view.** `is_planned(entry, selected)` — `selected.contains(key) && !entry.needs_source()` — is the
+    single predicate deciding which objects reach an irreversible `Db::run_ddl`, and it was written
+    inside a 1,135-line Floem module with no test module at all while `plan` already took it as a
+    parameter. The footer's count, the button's enabled state and the statements that get built must
+    ask the *same* question, the two having already disagreed once: a confident "1 object" over a
+    button that built an empty plan and returned. `selection_note(planned)` is the footer's sentence
+    and `subject()` the preview's, both "N objects", replacing two hand-rolled plurals a hundred lines
+    apart beside `preview_title` — which was extracted precisely so a modal's words could be tested
+    (`a_plans_subject_and_the_footers_count_agree_and_read_as_english`).
     **Display order is a second order, and it is deliberately not the plan's.** `rows(filter,
     expanded)` is what a tree renders: groups in `CompareKind`'s own order, objects **alphabetical by
     `label` within a group**, because a tree is read by looking a name up — while the order the
@@ -2047,12 +2141,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     over `CompareEntry::label`, so typing a table's name also finds the triggers hanging off it, and
     `show_same` is off by default as a reading decision rather than a performance one: two hundred
     identical tables put the four that matter below the fold.
+    **Why there are *no* rows is its own four-armed answer.** `empty_reason(filter)` returns
+    `EmptyRows` — `NothingToCompare`, `EverythingAgrees`, `NoMatch`, `OnlyIdenticalMatched` — each
+    with its own `message()`, and it takes the same `RowFilter` so it and `rows` cannot disagree
+    about which emptiness this is. Four arms and not three: "nothing matched" and "what matched, you
+    asked not to see" are different answers, and giving the second the first's sentence tells the
+    user their filter is wrong when it is the toggle beside it. It was three arms inline in a
+    `dyn_container`'s child closure where nothing could reach them, and one of the three was exactly
+    that mistake (`a_filter_that_matched_only_agreements_says_so_rather_than_blaming_itself`,
+    `the_other_three_emptinesses_read_as_themselves`, `each_emptiness_says_something_different`).
     **`label` carries a routine's signature** — `app.area(integer)` — because the compare tree is the
     first surface in this app to list two PostgreSQL overloads side by side, and without it they drew
     as two identical rows: the same text, the same heading over the diff pane, and a filter matching
     on `label` that could not separate them, so ticking one while reading the other was invisible.
     Their keys always differed; only what a reader could see did not. `rows` sorts on `label`, so
     this orders overloads as well as distinguishing them.
+    **The namespace is in it on both arms**, for the same reason and with a sharper consequence. A
+    trigger's arm read `format!("{table}.{name}")` and dropped the schema its own `key` keeps, so two
+    triggers named `t` on `city` in two PostgreSQL namespaces drew as two identical rows — and worse
+    than looking alike, `selectable_keys` filters on this text, so typing `archive` matched neither
+    and returned an empty set: the one object that differed was invisible *and* unselectable, and
+    *Select all* was a silent no-op over it (`a_trigger_label_says_which_namespace_its_table_is_in`).
+    The qualifier goes on the **table**, as in `key` — `app.city.t_ins`, never `city.app.t_ins`.
     **`selectable_keys(filter)` is what "Select all" means**, and it is filtered on purpose. It was
     `differences().filter(|e| !e.needs_source())` over the whole comparison, never intersected with
     the filter — so narrowing four hundred objects to three and pressing the link that sits *in the
@@ -2088,11 +2198,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     routine's or an event's body out of `information_schema` with the escapes already resolved, so
     two mangled bodies still compare equal and the status stands while the emitted `CREATE` is wrong
     until the caller has refreshed the body through the lazy `Db::{trigger,routine,event}_source`.
-    It is false for a drop, which names the object and nothing else, and for every engine but MySQL,
-    so nobody is sent after a body they have no use for. `CompareEntry::uncertain` is a match over
+    It is false for a drop, which names the object and nothing else, and it asks the capability
+    `ddl::schema_body_is_emittable` rather than `dialect == SqlDialect::MySql`, so nobody is sent
+    after a body they have no use for and a fourth engine has to be answered for rather than sorted
+    silently onto one side. `CompareEntry::uncertain` is a match over
     an `IndexInfo::lossy` index — a PostgreSQL index whose expression keys or opclasses the model
     never read, so two of them compare equal whatever the server holds; the verdict stands as the
-    best the model can do, and a tree drawing it like a fully-read match would be overclaiming.
+    best the model can do, and a tree drawing it like a fully-read match would be overclaiming. It is
+    **counted as well as drawn**, in `CompareCounts::uncertain`, which overlaps the four statuses
+    rather than replacing one of them: the flag was a per-row hint only, and an uncertain match is
+    overwhelmingly an object that comes out `Same` — which the default `show_same: false` hides — so
+    the one case the flag exists to disclose was the one case nothing disclosed
+    (`an_uncertain_match_is_counted_even_though_its_row_is_hidden`,
+    `the_uncertain_tally_does_not_come_out_of_the_status_tallies`).
     `cycles` is the third.
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
     introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
@@ -2694,7 +2812,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `not_sent_message` is what such a run says instead, and its load-bearing half is that the
     transaction is untouched. `StmtOutcome::FailedIsolated` is what a `SAVEPOINT`-wrapped grid
     write reports, and it must not poison PostgreSQL, or one bad cell edit would tell the user their whole
-    transaction died. `pill_text` is the status-bar string. It also owns what the user is told
+    transaction died. **`StmtOutcome::CancelledIsolated` is its twin, and it exists for the *reads*.**
+    On PostgreSQL a cancelled statement aborts the enclosing transaction exactly as a failed one
+    does, so dismissing the binary-cell panel mid-read discarded every uncommitted statement a
+    Manual-mode tab had built up — and the pill was not wrong about it. A read has nothing of its own
+    to lose by being rolled back, which is what makes fencing one and reporting this both safe and
+    true; both isolated outcomes fold to `Open { stmts }` on either engine, the enclosing transaction
+    being untouched but gaining no statement. It is reported **only** where a savepoint rollback was
+    issued and accepted (`Session::classify_fenced`) — a cancellation with no fence around it is
+    still `Cancelled`, because nothing then guarantees the transaction survived.
+    `pill_text` is the status-bar string. It also owns what the user is told
     while a write **waits**: `write_blocking_tabs` (which of our own tabs' transactions a grid
     write could be queued behind — same connection scope as `ddl_blocking_tabs`, but excluding
     the writer's own tab, whose write runs *inside* that transaction) and `write_wait_note` →
@@ -2727,6 +2854,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     because the binary-cell panel says the same sentence about a blob that `ColumnFormat::Bytes`
     says about a number in a cell, and two spellings of `1.5 MB` in one application is the kind of
     drift only a screenshot ever catches.
+    **`contrasting_bytes(a, b)` is the same function for a sentence whose whole content is that the
+    two numbers differ.** `human_bytes` keeps one decimal, which is right for a size shown on its own
+    and wrong here: a 65,536-byte file refused by a MySQL `BLOB` (65,535) read *"That file is
+    64.0 KB — this column holds at most 64.0 KB."*, and the same collision spans a ~51 KB window at
+    the 64 MiB load cap. Where the rounded forms collide it falls back to exact grouped bytes on
+    **both** sides, and where they don't it keeps the readable form; it never checks which argument
+    is larger, because the caller's sentence says that and a pair that is genuinely equal is a
+    caller's bug this must not hide. Both over-cap refusals use it — the binary panel's column cap
+    and the app's `LOAD_CAP`.
   - `conn_import.rs` — reading connections **out of other tools**: a pasted URL/DSN, DBeaver's
     `data-sources.json`, DataGrip's (or any JetBrains IDE's) `dataSources.xml`, and the three
     plain-text files the command-line clients read — `~/.my.cnf`, `~/.pgpass`,
@@ -3968,6 +4104,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   folds its `Outcome::stmt` into `TxState::on_statement`: a read is still a statement, and one that
   loses the connection has to reach the tab or the footer pill goes on claiming a live transaction
   over a dead socket.
+  **Both reads on the pinned connection are fenced by a savepoint, and that is not symmetry for its
+  own sake.** `Session::fence_read` puts a `SAVEPOINT` in front of `fetch_blob` and `refetch_rows`
+  and `Session::classify_fenced` takes it back out — released on success, rolled back *and* released
+  on failure or cancellation, upgrading the outcome to `FailedIsolated`/`CancelledIsolated` only if
+  the server accepted the rollback (the same "confirmed, not assumed" rule `classify_isolated`
+  follows; `ROLLBACK TO SAVEPOINT` does not release, and a transaction can hold a great many blob
+  reads). On PostgreSQL a cancelled statement aborts the enclosing transaction exactly as a failed
+  one does, and every way of dismissing the binary-cell panel cancels — Escape, the ✕, the footer,
+  clicking a second binary cell — so closing it mid-read discarded every uncommitted statement of a
+  Manual-mode tab, on the least consequential thing that connection does; `refetch_rows` runs
+  immediately after a `commit_writes` the user has just watched succeed, so what it would discard is
+  work they were told they had. `commit_writes` has had a savepoint and `classify_isolated` since it
+  was written and the reads had neither. Reproduced live on PostgreSQL 16.15. A server that refuses
+  the `SAVEPOINT` gets the old, honest classification rather than a claim the fence cannot back, and
+  `fetch_blob` also gained `fetch_query`'s pre-dispatch `cancel.is_cancelled()` check on **both**
+  sides of the connection lock: the overwhelmingly common cancellation there is the panel being
+  dismissed, and `NotSent` is the one outcome that leaves the transaction alone with no bookkeeping
+  at all.
   **Writing one back is three bindings, one per engine, and each is a decision about the wire rather
   than a spelling.** MySQL's `cell_param` sends `MyValue::Bytes` for both `CellEdit::Text` and
   `CellEdit::Bytes` — the protocol has one length-prefixed octet string and the server coerces it to
@@ -3991,6 +4145,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   lower-case and zero-padded to two digits per byte
   (`bytea_hex_is_zero_padded_two_digits_per_byte`), because an odd-length string shifts every byte
   after the short one and `decode` rejects it — a failure that would appear on some blobs only.
+  **That setting is now pinned rather than assumed, for the module's other literals.** `pg_str_lit`
+  doubles quotes and nothing else, which is correct under `standard_conforming_strings = on` and
+  only there: with it off PostgreSQL reads a literal as an escape string, `\'` is an escaped quote
+  rather than a backslash and a quote, and a row's **own text data** ends the literal — after which
+  the rest of that value is parsed as SQL. On `blob_on`, which speaks the multi-statement simple
+  protocol, that is a second statement running from one click on a connection marked read-only. The
+  setting is `USERSET` and settable per database and per role, so the default is no guarantee:
+  `connect_probe` sends `-c standard_conforming_strings=on` in the connection's `options`, on the
+  **startup packet**, so it is in force before the first statement and cannot be undone by anything
+  the app runs. It is the belt and not the fix — the values still reach the server inside statement
+  text, and binding them is open work — but it removes a dependency this module already refuses to
+  take twice, in `roles`' prefix comparison and in `pg_cell_lit`'s argument for `decode`.
   The live tier's `staged_bytes_reach_the_column_as_bytes` runs the whole chain — stage, commit,
   re-read — on all three servers, and it is what proves the MySQL binding; it does **not** pin the
   PostgreSQL choice, because a server with the default setting takes both forms, which is precisely
@@ -7362,7 +7528,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     input on the way to an allocation: a 70-byte PNG can declare 65535 x 65535 and ask for 17 GB.
     `blob_view::image_dims` reads the header and stops (`ImageReader::into_dimensions`, never a
     decode) and `core::blob::preview_verdict` rules on it against `PREVIEW_PIXEL_CAP`, 32 megapixels
-    — ~128 MB of RGBA, above any image a cell realistically holds. Both of its refusals *say so*
+    — ~128 MB of RGBA, above any image a cell realistically holds.
+    **There are two caps, they bound different quantities, and the renderer's real constraint is the
+    second one.** `PREVIEW_EDGE_CAP` is 4096 along *either* edge, asked **before** the area and
+    folded into the same `TooLarge { width, height }` arm, since the panel says the same sentence
+    either way and the dimensions are what a reader can act on. The area cap bounds what the decode
+    allocates; the edge bounds what the GPU can be asked for — floem's images live in the same atlas
+    as its glyphs, that atlas grows to `2 × max(width, height)` with no clamp of its own, wgpu's
+    default `max_texture_dimension_2d` is 8192, and no floem crate installs an `on_uncaptured_error`
+    handler, so a `create_texture` that fails validation ends the **process** rather than the
+    preview. An ordinary 6000 × 4000 photograph is 24 megapixels — comfortably *inside* the pixel cap
+    and 12000 past the atlas limit — so an image can pass either cap and fail the other, and both are
+    checked. 4096 and not 8192 because the atlas doubles the larger edge, and adapters reporting less
+    than the default limit exist. At 4096 the area cap is unreachable behind the edge cap, and that
+    is **asserted rather than commented** —
+    `the_area_cap_sits_behind_the_edge_cap_at_these_numbers` — so an edge cap raised to 5,657 or
+    beyond, where its square first exceeds 32 megapixels, fails a test rather than quietly bringing
+    the second check back to life unread. Both of its refusals *say so*
     rather than leaving an empty box, and `Unmeasurable` is one of them: `sniff` matches magic bytes
     and stops, so a truncated PNG still reads as a PNG, and floem would decode nothing and draw
     nothing under a caption naming the format. The measurement is the UI's because it needs a
@@ -9493,6 +9675,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   the header's declared width x height x 4, and a small blob can be an enormous allocation. That is
   why the binary-cell panel measures before it builds one (`blob::preview_verdict`), and why the
   view is built once and hidden rather than rebuilt per pane switch.
+  **And the RAM is not the fatal limit — the texture is.** floem's images live in the same atlas as
+  its glyphs, and that atlas grows to `2 × max(width, height)` with no clamp of its own; wgpu's
+  default `max_texture_dimension_2d` is 8192, and no floem crate installs an `on_uncaptured_error`
+  handler, so a `create_texture` that fails validation takes the **process** down rather than the
+  image. So the number that has to be inside the GPU's limit is a *dimension*, not an area, and an
+  ordinary 6000 × 4000 photograph — 24 megapixels, well inside any sane RAM budget — is 12000 past
+  it. `blob::PREVIEW_EDGE_CAP` (4096) is that second gate, and it is why the panel checks two caps
+  and not one.
 - **A view must not subscribe to a signal that changes as part of unmounting it** — the change and
   the teardown land in the same update pass, and whichever order they run in, a nested
   `dyn_container` inside the doomed view rebuilds a child whose style/effect closures then read

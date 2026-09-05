@@ -283,6 +283,25 @@ impl CompareEntry {
             )
     }
 
+    /// Do the two sides' **texts** differ while the structured comparison says
+    /// they agree?
+    ///
+    /// A row marked `Same` with a full red-and-green pane under it is a
+    /// contradiction the reader cannot resolve, and it is reachable on SQLite:
+    /// `status` comes from [`crate::ddl::diff`] over the model, while
+    /// `left_ddl`/`right_ddl` come from [`crate::schema::TableInfo::create_ddl`],
+    /// which on that engine returns `sqlite_master.sql` **verbatim** — a
+    /// deliberate fidelity decision. Two tables the differ calls identical can
+    /// therefore carry different whitespace, quoting or clause order, and the
+    /// pane draws every one of those as a change.
+    ///
+    /// Nothing is hidden on the strength of this: the pane still shows both
+    /// texts, because they really do differ and the user may want to see how.
+    /// What it adds is the sentence saying the difference is not a migration.
+    pub fn text_differs_though_same(&self) -> bool {
+        self.status == ObjectStatus::Same && self.left_ddl != self.right_ddl
+    }
+
     /// The one-line disclosure for an entry [`CompareEntry::needs_source`] keeps
     /// out of a plan — see [`SchemaPlan::omitted`].
     fn omission_note(&self) -> String {
@@ -1594,6 +1613,141 @@ mod tests {
 
     fn mysql(left: DbSchema, right: DbSchema) -> SchemaComparison {
         SchemaComparison::of(&left, &right, SqlDialect::MySql)
+    }
+
+    /// **A `Same` row can still have two different texts under it.** On SQLite
+    /// `create_ddl` returns `sqlite_master.sql` verbatim — a deliberate fidelity
+    /// decision — while `status` comes from the structured differ over the
+    /// model, so two tables the differ calls identical can carry different
+    /// whitespace, quoting or clause order. Every one of those draws as a
+    /// red-and-green change under a row labelled identical, which is a
+    /// contradiction the reader cannot resolve.
+    #[test]
+    fn a_same_entry_can_still_hold_two_different_texts_on_sqlite() {
+        let side = |sql: &str| TableInfo {
+            name: "city".to_string(),
+            columns: vec![col("id", "int")],
+            create_sql: Some(sql.to_string()),
+            ..Default::default()
+        };
+        let c = SchemaComparison::of(
+            &schema_of(vec![side("CREATE TABLE city (id int)")]),
+            &schema_of(vec![side(
+                "CREATE TABLE \"city\" (
+  id int
+)",
+            )]),
+            SqlDialect::Sqlite,
+        );
+        let e = find(&c, "table:city");
+        assert_eq!(e.status, ObjectStatus::Same, "the model says they agree");
+        assert_ne!(e.left_ddl, e.right_ddl, "and the stored text does not");
+        assert!(e.text_differs_though_same());
+    }
+
+    /// It is only ever about a `Same` row — a differing one's pane is a diff and
+    /// needs no excuse — and it stays quiet when the two texts really are equal.
+    #[test]
+    fn the_text_note_is_quiet_where_there_is_nothing_to_explain() {
+        let same = || schema_of(vec![table("city", &[("id", "int")])]);
+        let c = mysql(same(), same());
+        assert!(!find(&c, "table:city").text_differs_though_same());
+
+        let d = mysql(
+            schema_of(vec![table("city", &[("id", "int")])]),
+            schema_of(vec![table("city", &[("id", "int"), ("name", "text")])]),
+        );
+        let e = find(&d, "table:city");
+        assert_eq!(e.status, ObjectStatus::Differing);
+        assert!(
+            !e.text_differs_though_same(),
+            "a differing row's pane is a diff and needs no explanation"
+        );
+    }
+
+    // ── an enum's dependents come off the side the DDL runs on ───────────────
+
+    /// **Four lines of rationale, load-bearing through `RecreateEnum`, and
+    /// nothing reached it.** `type_dependents` was never called with a schema
+    /// that produced a non-empty result in this module's suite: every enum
+    /// fixture stood on its own, so the argument was always `[]` and the
+    /// sentence about *which side* it is read from could not have been wrong in
+    /// a way a test would notice.
+    ///
+    /// PostgreSQL has no `ALTER TYPE … DROP VALUE`, so narrowing an enum is a
+    /// recreate: every column declared with the type has to be re-cast around
+    /// the swap. Those columns are the **left** side's — they are what the
+    /// statements will run against — and reading the right side's would list
+    /// columns that are not there to cast.
+    #[test]
+    fn an_enums_dependents_are_the_left_sides_columns() {
+        let mood = |vals: &[&str]| EnumInfo {
+            name: "mood".to_string(),
+            schema: Some("public".to_string()),
+            values: vals.iter().map(|v| v.to_string()).collect(),
+            comment: None,
+        };
+        // A column of that type on each side, under *different* table names, so
+        // "which side" is a question with two visible answers.
+        let user_of = |table: &str| TableInfo {
+            name: table.to_string(),
+            schema: Some("public".to_string()),
+            columns: vec![ColumnInfo {
+                name: "m".to_string(),
+                type_name: "mood".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let left = DbSchema {
+            tables: vec![user_of("left_only")],
+            enums: vec![mood(&["sad", "ok", "glad"])],
+            ..Default::default()
+        };
+        let right = DbSchema {
+            tables: vec![user_of("right_only")],
+            // Narrowed: `glad` is gone, so this is a recreate rather than an
+            // `ADD VALUE`.
+            enums: vec![mood(&["sad", "ok"])],
+            ..Default::default()
+        };
+
+        let c = SchemaComparison::of(&left, &right, SqlDialect::Postgres);
+        let e = find(&c, "enum:mood");
+        assert_eq!(e.status, ObjectStatus::Differing);
+        let sql = e.changes.emit().join("\n");
+        assert!(
+            sql.contains("left_only"),
+            "the columns to re-cast are the ones the statements will run against: {sql}"
+        );
+        assert!(
+            !sql.contains("right_only"),
+            "the right side's columns are not there to cast: {sql}"
+        );
+    }
+
+    /// And a widened enum is not a recreate at all — `ADD VALUE` needs no
+    /// dependents, which is the arm the test above must not be confused with.
+    #[test]
+    fn a_widened_enum_needs_no_dependents() {
+        let mood = |vals: &[&str]| EnumInfo {
+            name: "mood".to_string(),
+            schema: Some("public".to_string()),
+            values: vals.iter().map(|v| v.to_string()).collect(),
+            comment: None,
+        };
+        let side = |vals: &[&str]| DbSchema {
+            enums: vec![mood(vals)],
+            ..Default::default()
+        };
+        let c = SchemaComparison::of(
+            &side(&["sad"]),
+            &side(&["sad", "glad"]),
+            SqlDialect::Postgres,
+        );
+        let sql = find(&c, "enum:mood").changes.emit().join("\n");
+        assert!(sql.contains("ADD VALUE"), "{sql}");
     }
 
     // ── a match the comparison cannot vouch for ──────────────────────────────
