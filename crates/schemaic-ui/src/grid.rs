@@ -903,6 +903,16 @@ impl GridState {
     /// Returns whether it staged, because the panel reports either way — see
     /// [`crate::BlobStageFn`].
     fn stage_bytes(&self, di: usize, ci: usize, bytes: Vec<u8>) -> bool {
+        // **`alive`, and it is the first line for a reason.** This runs from the
+        // binary-cell panel, whose sink is an `Rc` over this state on a
+        // *window*-scoped signal — so the grid can be gone while the sink is
+        // not. floem's `get_untracked` is `try_get_untracked().unwrap()`, so the
+        // next line over a disposed scope is a panic that takes the window and
+        // every tab's uncommitted edits. Refusing is the right answer anyway:
+        // there is no table left to stage into, and the panel reports it.
+        if !self.alive() {
+            return false;
+        }
         if !self.edit_model.get_untracked().editable(ci)
             || self.del_rows.with_untracked(|d| d.contains(&di))
         {
@@ -919,6 +929,10 @@ impl GridState {
     /// has to still be there: `new_rows` can shrink between the dialog opening
     /// and the file arriving (Discard, a commit, a removed skeleton row).
     fn stage_new_bytes(&self, pidx: usize, ci: usize, bytes: Vec<u8>) -> bool {
+        // See `stage_bytes`: a window-scoped sink over a grid-scoped state.
+        if !self.alive() {
+            return false;
+        }
         if !self.edit_model.get_untracked().editable(ci) {
             return false;
         }
@@ -2731,6 +2745,16 @@ pub(crate) struct GridCtx {
     /// Raise the binary-cell panel on one cell and fetch its bytes — the grid
     /// holds none, so the panel's content is a second query the app runs.
     pub(crate) view_blob: crate::ViewBlobFn,
+    /// The window's binary-cell panel sink (`BlobUi::stage`), so a grid can take
+    /// its own sink back out when it is disposed.
+    ///
+    /// **The signal is window-scoped and the sink it holds closes over a grid**,
+    /// so the two do not die together — `docs/architecture.md` names both
+    /// defences and neither was here. The other is
+    /// [`crate::BlobStage::is_live`], which is also what makes this one safe
+    /// with several grids alive: the cleanup clears a sink only if it answers
+    /// `false`, and only a dead grid's own sink does.
+    pub(crate) blob_stage: floem::reactive::RwSignal<Option<crate::BlobStage>>,
     /// AI-fill a single cell (sample base table → one-shot AI → stage the result).
     pub(crate) ai_fill: crate::AiFillFn,
     /// AI-generate seed rows (Insert Row / Seed Table) → stage pending rows.
@@ -3404,6 +3428,10 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // is a promise on MySQL and a note on SQLite, so a type name cannot be read
     // as a cap without it.
     let model_dialect = gs.dialect;
+
+    // The window's binary-cell sink, for the `on_cleanup` at the end of this
+    // function — see there.
+    let blob_stage = gctx.blob_stage;
     create_effect(move |_| {
         // A frozen (pinned) result is read-only for a stronger reason than a
         // read-only connection is: the rows on screen are a *snapshot*, and a
@@ -4262,6 +4290,29 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         seed_popover(gs),
         edit_row_panel(gs, edit_row_max),
     ))
+    // **Take this grid's binary-cell sink back out when the grid goes.**
+    // `BlobUi::stage` is window-scoped and the sink closes over `GridState`, so
+    // a re-run, a closed panel or a closed tab leaves the panel offering *Load
+    // from file* into a scope that no longer exists. `BlobStage::is_live` is the
+    // other half of the pair (and what keeps `stage_bytes` from panicking on
+    // one); this is what stops the button being *offered*, which the guard on
+    // the effect never could — the user waited out a file dialog and a read of
+    // up to 64 MiB to be told the cell could not be written.
+    //
+    // Cleared only when the installed sink answers `false`, which is what makes
+    // it right with several grids alive: only a dead grid's cleanup runs, and
+    // only that grid's sink is dead — so a panel opened from a *different*,
+    // living grid keeps its offer, with no identity comparison anywhere.
+    //
+    // `try_get_untracked`, because the window can be closing too and this signal
+    // is not this scope's to assume.
+    .on_cleanup(move || {
+        if let Some(Some(sink)) = blob_stage.try_get_untracked()
+            && !sink.is_live()
+        {
+            blob_stage.set(None);
+        }
+    })
     .on_resize(move |r| {
         // The row panel may cover up to 70% of the results area, then its field
         // list scrolls. Floored so a short window still shows a few fields, and
@@ -7928,7 +7979,7 @@ fn open_blob(gs: GridState, launch: BlobLaunch) {
 struct BlobLaunch {
     bref: Option<BlobRef>,
     target: BlobTarget,
-    stage: Option<crate::BlobStageFn>,
+    stage: Option<crate::BlobStage>,
 }
 
 impl BlobLaunch {
@@ -8001,11 +8052,20 @@ fn blob_launch(
     };
     // Writable: the column takes a write and this row is not on its way out.
     let deleted = pending.is_none() && gs.del_rows.with_untracked(|d| d.contains(&data_idx));
-    let stage: Option<crate::BlobStageFn> = match model.editable(ci) && !deleted {
+    // **The sink says whether it is still there.** It closes over this grid's
+    // state and is handed to a window-scoped signal, so `BlobStage::is_live` is
+    // what lets both defences work without either side comparing identities —
+    // see that method.
+    let stage: Option<crate::BlobStage> = match model.editable(ci) && !deleted {
         true => Some(match pending {
-            Some(p) => Rc::new(move |bytes: Vec<u8>| gs.stage_new_bytes(p, ci, bytes))
-                as crate::BlobStageFn,
-            None => Rc::new(move |bytes: Vec<u8>| gs.stage_bytes(data_idx, ci, bytes)),
+            Some(p) => crate::BlobStage::new(
+                move |bytes: Vec<u8>| gs.stage_new_bytes(p, ci, bytes),
+                move || gs.alive(),
+            ),
+            None => crate::BlobStage::new(
+                move |bytes: Vec<u8>| gs.stage_bytes(data_idx, ci, bytes),
+                move || gs.alive(),
+            ),
         }),
         false => None,
     };

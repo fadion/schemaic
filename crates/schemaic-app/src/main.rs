@@ -3716,7 +3716,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             move |conn_id: u64,
                   r: Option<schemaic_core::blob::BlobRef>,
                   target: schemaic_ui::BlobTarget,
-                  stage: Option<schemaic_ui::BlobStageFn>| {
+                  stage: Option<schemaic_ui::BlobStage>| {
                 // **Supersede the previous read first, whatever this opening
                 // turns out to be.** The panel shows one cell, so an earlier
                 // fetch has no reader the moment this one opens — and the
