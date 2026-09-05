@@ -5101,9 +5101,45 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (generous against a cold service container — the whole tier runs in ~10 s locally). The lint job
   compiles it via `--features schemaic-db/live-tests`, since otherwise it
   would be the one code in the repository no push compiles.
-- `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
+- `schemaic-ai` — agent-CLI sessions (stream-json) and turn parsing, for whichever CLI the user has
+  installed. `harness.rs` and `stream.rs` model three of them (`claude`, `codex`, `antigravity`),
+  and **all three are driven, with database tools**. Each is selectable from the settings modal's
+  *Agent CLI* dropdown, persisted as `UiState::ai_harness`, carried on `AiSettings::harness`,
+  resolved and interrogated by `app/agent_cli.rs`, and spawned by `app/ai.rs` — Claude as one
+  persistent child per conversation, the other two as one process per turn.
+  **A fourth, `gemini`, was modelled here and refused, and it has now been deleted rather than left
+  as a menu entry that says no.** Google withdrew OAuth for personal accounts, so `gemini` needs an
+  API key to authenticate at all, and the CLI's own sign-in points at Antigravity as its successor —
+  which is a harness this crate does drive. Because the adapter was already refused rather than
+  driven, removing it costs no working session: the variant and its arms, `gemini_settings_json`,
+  the `stream.rs` dialect and every test of them are gone. It is written down because this is the
+  kind of decision that gets re-litigated by whoever next wonders why Google's CLI is not in the
+  picker. **The migration needed no code**, which is the whole point of the shape `from_key` already
+  had: it returns `None` for a key this build does not know, and `main.rs` warns and falls back to
+  Claude rather than coercing, so a `ui_state.json` still saying `"gemini"` takes the path that was
+  built for exactly this (`gemini_is_gone_and_its_persisted_key_resolves_to_nothing`).
+  `Constraint::notice` reaches the user in two places and no third: under the settings modal's
+  *Agent CLI* dropdown, where it describes the grade the selected binary would run at before a
+  session is started, and in what `spawn_refusal` prints when the session is refused outright. It
+  does not reach the AI panel itself, so a *runnable but weaker* session that was configured in an
+  earlier sitting carries no reminder. Inline generation (Ctrl+K, AI Fill, AI Seed) stays Claude-only
+  through `inline_claude_bin` whatever the picker says, because that argv is `inline_args`. A
+  harness key `main.rs` does not recognise is `tracing::warn!`ed and falls back to Claude.
+  **Getting the tools to each harness is three different mechanisms, and only Claude's is per
+  invocation.** Claude gets a temp `--mcp-config` file; Codex gets `-c` overrides on its own command
+  line; Antigravity has no per-invocation configuration at all and needs **two pieces of its own
+  global state** written instead — an `agy mcp add` registration *and* a per-tool
+  `permissions.allow` rule in its `settings.json` — which is what `app/antigravity.rs` owns and
+  removes. Headless mode cannot prompt, so a tool with no standing rule is auto-denied and the turn
+  still reports `"status":"SUCCESS"` with an empty response: a failure with no symptom. Measured end
+  to end against the real binary, with the four rules in place the same prompt returned real rows,
+  and `run_command` was never granted — which is what makes the CLI's own suggestion of
+  `--dangerously-skip-permissions` unnecessary rather than merely unattractive.
   **The spawned session is sealed to what Schemaic hands it, and that is `build_session_args`'s
-  three flags rather than `DISALLOWED_TOOLS`.** The denylist named ten built-in tools and read like
+  three flags rather than `DISALLOWED_TOOLS`.** That statement is now *graded* rather than boolean,
+  because only `claude` can honour it in full — `harness::Constraint` is the grade, and reporting
+  "sealed" for all three harnesses would be the denylist-era bug a second time: a guard that reads
+  as total over a set nobody measured. The denylist named ten built-in tools and read like
   the guard; measured against the shipped CLI by reading the `system`/`init` event's own `tools`
   array, the old flag set left **nineteen** more live in the AI panel that it had never heard of —
   `Artifact`, `CronCreate`, `CronDelete`, `CronList`, `DesignSync`, `EnterWorktree`, `ExitWorktree`,
@@ -5166,7 +5202,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   than of a version number.** Schemaic spawns whatever `claude` the user has and pins no version,
   and a flag an older CLI does not know does not degrade the session, it kills it — the child exits
   with `error: unknown option '--tools'` before the first turn and the AI panel is gone until the
-  user upgrades. So `claude_cli::claude_seal` runs `<bin> --help` and hands the **whole probe** —
+  user upgrades. So `agent_cli::probe` runs `<bin> --help` and hands the **whole probe** —
   the exit status and both streams — to `schemaic_ai::seal_from_probe`, which reads a
   `CliSeal` out of it, one `bool` per flag. The status is half the answer and the caller must not
   decide it alone: a `--help` that fails loudly still prints something, and that something is a
@@ -5218,14 +5254,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   anywhere in the text, prose included, so a help that merely *discusses* `--tools` in another
   flag's description reads as advertising it — an imprecision kept because it errs towards sealing,
   which is the direction every other choice here errs in too. The
-  probe costs **~140 ms measured**, so `claude_seal` caches the answer per resolved binary path and
-  `main.rs` calls `warm_seal_cache` on a background thread; without it that wait
+  probe costs **~140 ms measured**, so `probe` caches the answer per `(harness, resolved path)` and
+  `main.rs` calls `warm_probe_cache` on a background thread; without it that wait
   sits on the UI thread ahead of every AI action. **What it warms must be what the spawn will
-  resolve** — `claude_bin(&ai_cli_path)`, not `detect_claude_bin()`: the cache is keyed by the
+  resolve** — `harness_bin(h, &ai_cli_path)`, not `detect_bin(h)`: the cache is keyed by the
   resolved path, and an AI CLI override makes those two different keys, so warming the auto-detected
   one warmed an entry nothing ever read and left all four AI entry points paying a blocking `--help`
-  on the UI thread. It is therefore called from an **effect on `claude_bin(&ai_cli_path)`** rather
-  than once at startup, so changing the override re-warms the key that will actually be used.
+  on the UI thread. It is therefore called from an **effect on `harness_bin(h, &ai_cli_path)`**
+  rather than once at startup, so changing the override re-warms the key that will actually be
+  used — and the effect reads the **harness** signal as well, since that is the other half of the
+  key and a second way to warm an entry nobody reads.
   **`inline_args` is sealed the same way, and its case is sharper.** Ctrl+K, AI Fill and AI Seed
   each want one string back that a parser then reads, and none of them has a surface that could
   render a tool call — so where the chat panel merely stalls on a tool it cannot prompt for, those
@@ -5233,6 +5271,238 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   leaves them with no servers, which is correct: the whole request is in the prompt
   (`a_one_shot_generation_is_given_no_tools_and_no_servers`, and `inline_args_flags_in_order` holds
   the exact argv).
+  - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
+    `Harness` (`Claude`/`Codex`/`Antigravity`) is **a dialect rather than a vendor**: the
+    variant names the wire format a binary speaks, which is the only thing decoding needs to know,
+    so a fork that still speaks its parent's JSONL is that parent here. `key`/`label`/`bin` are the
+    value `UiState::ai_harness` persists, the settings label and the name looked for on `PATH` —
+    three separate strings on purpose, since Antigravity's executable is `agy` and a detector keyed
+    on the label finds nothing (`each_harness_looks_for_its_own_binary_name`); `from_key` returns an
+    `Option` and
+    deliberately does **not** coerce an unknown key to a working harness, because a persisted key
+    this build no longer knows has to be *reported* and a silent substitution is invisible by
+    construction. **The reporting is now somebody's job rather than an intention**: `persist` keeps
+    the raw string (see `UiState::ai_harness`) and `main.rs` is where the `None` is answered — a
+    `tracing::warn!` naming the value, then Claude. The key round-trips **verbatim**, never mapped
+    onto the known set at the persistence layer, which is precisely what leaves the app something to
+    report (`an_unknown_harness_survives_the_round_trip_rather_than_being_corrected`); and a
+    settings file written before the field existed carries no key at all and loads as Claude,
+    because Claude was the only harness there was
+    (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`). Everything else is asked as a
+    **capability** and never as a variant
+    (`supports_effort`, `supports_resume`, `is_persistent`, `streams_deltas`,
+    `supports_model_choice`, `suggested_models`) — the same reason the engine predicates exist:
+    `== Harness::Claude` compiles cleanly while sorting a fourth CLI onto whichever side it happens
+    to fall.
+    **`suggested_models` is a menu, never a permitted set**, and the distinction is the whole reason
+    it returns a slice rather than the field being a dropdown: the model id is a free string, so a
+    list here is the aliases each CLI documents as stable and anything dated, private or newer than
+    this build is typed in and passed through untouched
+    (`suggestions_are_a_menu_and_never_a_permitted_set`,
+    `a_model_id_no_build_has_heard_of_still_reaches_the_command_line`). Antigravity's list is
+    deliberately **empty**, because its model names were never measured — and an empty list means
+    "nothing useful to suggest, let them type", not "no models allowed", so a caller must render the
+    field regardless. That is the failure this API is shaped against: the app shipped a closed
+    three-variant `AiModel` for a year, and its `from_cli` coerced every unrecognised id to Haiku, so
+    a settings file naming a real model ran a different one with nothing on screen to say so.
+    **The seal is graded here, because the three do not answer it equally well.** `Constraint` is
+    ordered `Unknown < Restricted < Sealed`, and only Claude reaches the top, because only
+    `--tools ""` empties the *built-in* set outright and leaves nothing but the allow-listed MCP
+    tools. The other two are both `Restricted`, each by its own lever: Codex by
+    `sandbox_mode="read-only"`, Antigravity by `--sandbox`. Both
+    stop writes and command side effects and both leave built-in tools that can still *read*
+    the machine the child was launched on — and Antigravity is the one where that is measured rather
+    than inferred, since a print-mode session lists **56** built-in tools with `--sandbox` passed
+    (`run_command`, `write_to_file` and `execute_browser_javascript` among them), gated by nothing
+    but a permission mode, and a measured turn ran `list_dir` and `view_file` with no prompt at all.
+    There is no flag that empties that set, which is why the grade is a ceiling and not a
+    to-do. So `Constraint::notice` states that to the user in one line, and
+    returns `None` for `Sealed` — a banner on every Claude session is how a user learns to ignore
+    the two grades that mean something.
+    **A notice says what *this* harness gives you and stops there.** `Restricted` reads
+    *"`<Harness>` runs read-only: it cannot write files or run commands, but its built-in tools can
+    still read this machine"*, and it used to close with *"Only Claude Code can be given no built-in
+    tools at all"* — a statement about the grade turned into an advertisement for the
+    harness the user had just declined, printed in the one place they were exercising the choice.
+    `the_weaker_grades_say_so_and_the_strongest_stays_quiet` pins both halves, the second over every
+    harness × every non-`Sealed` grade: a notice may name Claude only when the harness *is* Claude.
+    **`Constraint::Unknown` refuses the spawn** (`is_runnable` is false), which is the opposite
+    failure direction from `CliSeal`/`seal_from_help` above, and both are right for the same
+    underlying fact: an unknown flag *kills* the child. An unreadable Claude probe therefore yields
+    `CliSeal::ALL`, since the worst case there is a loud death rather than a quiet unsealed session —
+    but passing `--sandbox` to a binary that never heard of it *is* that loud death, so for a
+    non-Claude harness the conservative answer is refusal rather than assumption
+    (`an_unreadable_probe_refuses_rather_than_assuming`,
+    `a_harness_missing_its_constraining_flag_is_not_runnable`,
+    `only_claude_can_reach_the_sealed_grade`).
+    **Codex's isolation is conditional and does not decide the grade.** `--ignore-user-config` is
+    that CLI's `--strict-mcp-config` and `--setting-sources user` rolled into one — its own help text
+    says *"Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`"*, so it drops the
+    user's MCP servers and their hooks while keeping them logged in. It is passed only when the
+    probe saw it (`codex_isolates_config`), exactly as Claude's two isolating flags are, and like
+    Claude's it leaves the grade to `--sandbox`/`--tools` alone
+    (`isolation_does_not_decide_the_grade`). Note the two probes answer an absent flag in opposite
+    directions on purpose: a missing isolation flag is a known, lesser, still-runnable state, while
+    a missing *grade* means nobody knows whether side effects are blocked at all.
+    **The endpoint never reaches argv, and that forced a new mechanism.** Codex's only configuration
+    lever is `-c key=value`, and those *are* argv — readable by every process listing on the
+    machine — so the DB endpoint could not travel that way without undoing review C6. The override
+    names an endpoint *file* instead: `schemaic --mcp-serve --endpoint-file <path>`, where the path
+    is not the credential and what it points at is
+    (`the_endpoint_never_reaches_a_codex_command_line` drives a real `mysql://root:hunter2@…`
+    through it). **Claude is the only harness left in the other camp** — it is configured by a file
+    Schemaic writes, so its endpoint still travels in that file's `env` map, in
+    `$SCHEMAIC_MCP_ENDPOINT`, exactly as before. Antigravity takes `--endpoint-file` too, in the
+    argv `agy mcp add` registers, so the split is one file-configured harness against two that read
+    the path off their own command line (`main.rs`'s comment beside `--mcp-serve` says the same, and
+    it named Gemini on the file side until that harness went).
+    `codex_mcp_overrides` **replaces the whole `mcp_servers` table** (`mcp_servers={schemaic={…}}`)
+    rather than setting `mcp_servers.schemaic.command`, because `-c` merges: the user's own servers
+    would otherwise join Schemaic's SQL assistant with nobody here having allow-listed them.
+    Its values go through a private TOML string escaper, since every separator in
+    `C:\Users\…\schemaic.exe` is a TOML escape introducer and an unescaped one is either a parse
+    error or, worse, a different path (`a_windows_path_survives_the_toml_override_intact` walks the
+    output and asserts no lone backslash survives). Registering the server is **not** enough to make
+    it callable: measured, with the server registered and no approval set, `codex exec` refuses
+    every call with *"MCP tool call requires approval, but approval policy is never"* — `exec` has
+    nobody to prompt, so the default `auto` denies. So the override carries
+    `tools.<name>.approval_mode = "approve"` per tool, built from the **connection's own**
+    allow-list, which is what keeps it safe: a schema-only connection approves `list_schema` and
+    `describe_table` and leaves `run_query` unapproved rather than trusting the server alone to
+    refuse it — the same rule Claude's `--allowedTools` states. Codex keys that config by the
+    *bare* name the server advertises while the app's list holds the qualified one, so
+    `bare_tool_name` derives one from the other rather than a second hand-written list, which would
+    be one rename away from approving a tool that no longer exists while refusing one that does.
+    (`--ignore-user-config` does not discard these overrides — confirmed against the binary.)
+    **Antigravity's two pieces of global state are shaped here and written by `app/antigravity.rs`.**
+    `antigravity_allow_rules` builds one `mcp(schemaic/<tool>)` rule per tool from the same
+    connection allow-list, through the same `bare_tool_name`; `antigravity_settings_with_rules` and
+    `_without_rules` are the `settings.json` surgery, pure so that the part that can destroy a
+    user's file is the part that is unit-tested. **Merged, never rewritten**: it is the user's file,
+    it holds their `trustedWorkspaces`, and that CLI rewrites it itself, so the document is parsed,
+    the rules are unioned in, and every other key is handed back untouched. Adding is idempotent, so
+    a crashed session's leftovers do not accumulate; removing prunes the containers it emptied, so
+    the file returns to its prior shape rather than keeping scaffolding; and an **unparseable
+    document is declined** rather than overwritten — the cost of that is one session without
+    database tools, and the cost of the alternative is the user's file. An empty or missing file is
+    an empty document, because that is what a fresh install looks like and refusing it would deny
+    tools to exactly the people who have configured nothing. One limit stated rather than hidden:
+    removal matches by value, so a rule the *user* added by hand for the same tool is
+    indistinguishable from ours and goes with it — the alternative is a standing grant nobody
+    remembers making.
+    `TurnSpec` and `turn_args` build one turn's command line — one struct rather than eight
+    positional arguments, because the harnesses draw on overlapping subsets of it and a positional
+    list is how `--model`'s value ends up in `--effort`'s slot. Claude's argv stays
+    `build_session_args`: it is spawned once per *conversation* with its prompt arriving on stdin,
+    where the other two are spawned per turn. **Where the prompt sits differs and is not a detail
+    to generalise from one of them**: Codex takes it as the last *positional*, last on purpose since
+    a flag after it reads as part of it; Antigravity's is `-p`'s value and therefore first. **Every flag in the Codex argv was verified
+    against the installed binary's `codex exec --help`**: `exec`, `--json`, `-s/--sandbox` with
+    `read-only|workspace-write|danger-full-access`, `--skip-git-repo-check` (Codex wants a git repo
+    and the session cwd is a private app directory that is not one), `-m/--model`, `-c/--config`,
+    `--ignore-user-config`, and the `resume` sub-subcommand, which must follow `exec` immediately
+    (`codex_resume_follows_exec_immediately`). `-p` on `codex` is **`--profile`, not a prompt
+    flag** — the one name that reads like Claude's and means something else.
+    **Codex's constraint travels as a config key rather than as the flag**, and the flag is defence
+    in depth on the one path that takes it: `--sandbox` exists on `codex exec` but **not** on
+    `codex exec resume` (measured against the installed binary), so a flag-only constraint would
+    either kill every resumed turn on an unknown option or leave every turn after the first
+    unconstrained. `-c sandbox_mode="read-only"` is accepted on both paths, so it is the primary
+    mechanism and `--sandbox read-only` is added only when not resuming. **It is emitted last among
+    the `-c`s**, because `-c` precedence is positional in the direction that surprises: Codex
+    splices root overrides to the front expressly *"so they have lower precedence than
+    command-specific flags parsed after a subcommand"*, which is to say a **later** `-c` wins. Put
+    before `mcp_overrides`, a caller passing its own `sandbox_mode` would silently outrank the
+    constraint.
+    **The Antigravity argv is two flags of evidence and three of documentation**, and the difference
+    is the same one the dialects have. `--sandbox` (*"Run in a sandbox with terminal restrictions
+    enabled"*) and `--disable-slash-commands` (*"Disable slash command and skill expansion in print
+    mode"*) are both verbatim in the captured `agy --help` **and** were passed in every live run,
+    including the two that produced the stream fixtures — each exited 0 and returned normal output,
+    so they are accepted rather than merely advertised. That matters twice for `--sandbox`: it is
+    precisely because it was passed in those runs that the 56-tool `init` listing is evidence of a
+    ceiling rather than of a flag nobody set. The second is passed because print mode expands slash
+    commands and skills by default, and a prompt is *user text* that must not be able to invoke
+    either. `--model`, `--effort` (`low|medium|high`, which is what `supports_effort` answers for
+    this harness) and `--conversation <ID>` (*"Resume a previous conversation by ID"*, with
+    `-c/--continue` beside it for the most recent) are **help only — never passed in a live run**.
+    For the resume that leaves three things unverified at once: the argv position, whether it
+    composes with `-p`, and whether the id we would feed it — the top-level `conversation_id` off
+    `init` — is the id it wants. That is documentation-only status, and not Codex's, whose every
+    flag was checked against the installed binary. And the help itself is read
+    off **stderr**, where `agy` writes it while exiting 0 — a stdout-only probe finds it empty and
+    refuses a working install, which is why `agent_cli::probe` folds both streams.
+    With the Gemini adapter deleted, `claude`, `codex` and `agy` are the three, and every argv here
+    is for a binary somebody has run: what remains unverified is a *flag* on a driven harness — the
+    Antigravity resume above — rather than a whole harness nobody could sign in to.
+  - `stream.rs` — one transcript vocabulary, three CLI dialects. Every harness decodes into the same
+    `StreamEvent`s the panel already renders, so the dialect stops at this module and nothing
+    downstream learns which CLI produced a turn. **They do not even agree on where the discriminator
+    lives**: Claude and Codex tag a line with `type`, while Antigravity tags it with `event`
+    and nests the payload under a key of the same name (`{"event":"init","init":{…}}`,
+    `{"event":"step_update","step_update":{…}}`). A line shaped like the other three decodes to
+    nothing at all, which is why that is pinned rather than assumed
+    (`an_antigravity_event_is_keyed_on_event_not_type`) — and it is what the binary emitted, not
+    what its changelog implied.
+    **One dialect needs state, which is why decoding is a `StreamParser` and not a function.**
+    Claude and Antigravity stream *deltas* — each line carries only the text new since the last one,
+    so a stateless `line -> events` map is exact, and `parse_stream_line` is kept and delegated to
+    rather than generalised. Antigravity's half of that is measured rather than assumed: a captured
+    answer split **mid-word** across two `text_delta`s (`"orders\nwidge"`, then `"ts\n"`), which is
+    what a partial chunk looks like and a cumulative restatement never does
+    (`real_antigravity_deltas_are_partial_chunks_and_append`). Codex re-sends a message's whole text
+    on every `item.updated` for the
+    same item id. Appended as they arrive, a three-chunk reply renders as
+    "Hi" + "Hi there" + "Hi there!"; the private `Coalescer` emits only the unseen suffix instead,
+    and falls back to the whole string when the text is *not* an extension of what came before, so a
+    rewritten message loses nothing rather than being diffed against a string it shares no prefix
+    with. It is keyed by ids unique only within one stream, so a parser must not be shared between
+    two concurrent ones — one per turn for the process-per-turn harnesses, one per session for
+    Claude.
+    **Codex's session model differs in kind, not in field names** — one process per *turn*, resumed
+    by id (`codex exec resume <id>`), against Claude's one persistent bidirectional process per
+    conversation. `StreamEvent::SessionStarted { id }` exists to carry the `thread.started`/`init`
+    id a resume needs; it holds no transcript content and `TurnState` ignores it.
+    **A side-effecting Codex item is surfaced, never dropped.** `command_execution` and `file_change`
+    become tool chips even though the read-only sandbox should make them impossible, and the
+    temptation is to treat them as noise from a path we do not use: rendering them means a
+    constraint that fails to hold is watched in the transcript rather than found on the filesystem
+    (`codex_a_side_effecting_item_is_shown_not_swallowed`). Codex `reasoning` items *are* dropped —
+    the panel has no place for them and Claude's dialect never surfaced them either. And Codex
+    reports no wall time, so `TurnStats::duration_ms` stays `None` rather than being invented: the
+    panel's live counter already shows elapsed time, and a fabricated total would disagree with what
+    the user just watched (`codex_turn_completed_carries_usage_and_no_invented_duration`).
+    **Antigravity's `status` is not the verdict, and that is the load-bearing one.** A measured turn
+    whose only tool call was *refused* still reported `"status":"SUCCESS"` with an empty `response`,
+    recording the refusal nowhere but in a `denied_actions` array — read on `status` alone, a turn
+    that did nothing renders as a silent success and the user is left asking why the assistant
+    ignored them. So `is_error` is `status != SUCCESS` **or** a non-empty `denied_actions`, and the
+    refusal is also emitted as prose, because the body it would otherwise be explained in was empty.
+    The rest of the dialect: `conversation_id` sits at the **top level**, not inside `init`, and is
+    what `SessionStarted` carries here; wall time is `duration_seconds`, a **float**, where every
+    other dialect reports whole milliseconds or nothing, so `antigravity_stats` **rounds** rather
+    than truncating (a 2.9985 s turn reads `3.0s`, not `2.9s`); and a tool step is
+    `step_type: "tool"` with states `ACTIVE`/`DONE`/`ERROR`. **The tool that matters is nested**: an
+    MCP call arrives as the *built-in* `call_mcp_tool` with the real identity in
+    `tool_info.parameters.{ServerName,ToolName}`, so the qualified `mcp__schemaic__<tool>` name is
+    rebuilt — exactly as the Codex dialect rebuilds one from its own `server`/`tool` — because a chip
+    built from `tool_name` alone labels every database call "call_mcp_tool" and the transcript
+    cannot tell `run_query` from `propose_table_change`. Built-in tools are reported under their own
+    names rather than dropped, for the same reason Codex's side-effecting items are, and here it is
+    not hypothetical: a measured turn ran `list_dir` and `view_file` unprompted, because
+    Antigravity's filesystem readers are auto-approved in headless mode.
+    **Which dialects are measured and which are read is the real confidence boundary.** Codex and
+    Antigravity are pinned by fixtures captured **verbatim** from the installed binaries
+    (`codex exec --json`, `agy -p --output-format stream-json`) — including a matched Antigravity
+    pair where the harness and the prompt are identical and permission is the only difference
+    (`a_real_denied_antigravity_tool_call_names_the_tool_and_fails_the_turn`,
+    `a_real_completed_antigravity_tool_call_fills_its_chip_and_succeeds`), which is what makes the
+    `"status":"SUCCESS"` refusal above evidence rather than a story. Each capture also has a second
+    test driving the same bytes through `TurnState`, so the *composition* is covered and not only the
+    parser. Keep them byte-for-byte: tidying an id or a usage key turns evidence back into a fixture
+    that agrees with the code that produced it. The one dialect no binary had ever produced was
+    Gemini's, and deleting that harness took it with it, so nothing decoded here is now read off
+    documentation alone.
 - `schemaic-term` — terminal panel + shell (`shell.rs`).
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
@@ -5420,6 +5690,83 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Spawning a file manager is a process launch, so it is the app boundary's `open_config_dir` and
     not a `Command` in a view; a machine with no config directory gets the path-less hint and a
     disabled button rather than a control that silently does nothing.
+    **The AI modal is where the harness is chosen, and half its controls follow that choice.** The
+    *Agent CLI* dropdown is `focusable_dropdown(harness, Harness::ALL, Harness::label, …)` over the
+    workspace's **one** `Harness` — `schemaic-ui` depends on `schemaic-ai` for it, deliberately, and
+    the Cargo.toml comment carries the reason: a UI-side mirror converted at the app boundary is two
+    definitions free to drift, which is precisely what `AiModel::from_cli` was. `Harness` is `Copy`
+    and `label` is a plain `fn(Harness) -> &'static str`, so it meets the widget's bounds with no
+    wrapper.
+    **The grade notice under it is hidden, not merely empty, when there is nothing to say.**
+    `Constraint::notice` is `None` on `Sealed`, and a `dyn_container` rendering `empty()` is still a
+    flex child, so it collected the group's 6px gap on *both* sides — which meant Claude Code, the
+    one harness silent here, showed the widest gap between the dropdown and the path field below it.
+    The container carries `Display::None` on that arm instead, and taffy filters such a child out
+    before the gaps are distributed (the mechanism `erd_view::toolbar_metrics` leans on), so hiding
+    costs nothing. The notice is held in a `create_memo` keyed on `(harness, cli_path)` rather than
+    computed inside the container, because the *style* has to ask the same question the child does.
+    **Model is a *field* with suggestion chips under it, not a dropdown**, because any id the CLI
+    accepts is valid — an alias, or a dated snapshot pinned across upgrades — and the closed
+    three-variant `AiModel` this replaced could not name a model released after the build. The chips
+    are `Harness::suggested_models` and fill the field on click; an empty list (Antigravity) leaves
+    the field itself untouched and takes both the chips and the sentence about them with it. The
+    chip row carries `Display::None` when the list is empty, for the harness notice's reason — an
+    empty row is still a flex child, so it kept the group's 6px gap and pushed the hint away from
+    the field, which is the extra space Antigravity showed under the Model box. The hint is the
+    other half, and is a `label` keyed on the harness rather than a constant: *"Any id this CLI
+    accepts — an alias, or a dated snapshot to pin one across upgrades"* is about the field and
+    always shows, while *"The buttons are shortcuts, not the whole list"* is about the chips and is
+    appended only when there are some. A hint describing a control that is not on screen reads as a
+    bug in the modal rather than as a note about the field.
+    `AiEffort` **stays** a closed enum, and that is not an inconsistency: its
+    vocabulary is defined by the flag (`low|medium|high|xhigh`), not by a vendor's model catalogue.
+    **The Effort row is hidden, not disabled, where `supports_effort` is false** (Codex). A
+    greyed control still claims *this exists for you and is off*, which is a different statement and
+    a false one. The row builds its dropdown **inside** a `dyn_container` keyed on the capability,
+    because a floem view is not `Clone` and each keyed rebuild has to construct its own. That
+    container also carries `Display::None` in the unsupported case, for the reason the harness
+    notice does: an empty container sitting between two 25px section gaps reads as one 50px hole,
+    which is what Codex showed between Model and Custom instructions. Three containers in this modal
+    are hidden that way now rather than rendered empty — the harness notice, the model suggestions
+    and this row — and they are one rule with three instances, not three local fixes.
+    **The modal is the only place either model or effort is set.** The status bar carried a model
+    menu and an effort chip until both were deleted, and the *duplication* was the cost rather than
+    the space they took: each was a second view of one setting that had to re-derive the same
+    per-harness capability, and the model chip could only ever offer `suggested_models` — never the
+    free id the field takes — so it presented an open field as a closed menu, while the effort chip
+    had to hide itself on a harness with no `--effort` flag. Two answers to one capability with two
+    chances to disagree. `lib.rs`'s `effort_seg_for` went with them, and the 40px break that used to
+    open the AI group in the bar is carried by `cpu_seg`'s own `margin_left(40)`, so the bar's
+    spacing is unchanged.
+    **The CLI-path caption follows the harness, and switching it clears both the path and the
+    model.** The label is `format!("{} path", harness.label())`, and the clearing is not tidiness:
+    `ai_cli_path` is one field shared by every harness, so a Claude path left behind across a switch
+    is resolved by `harness_bin(Codex, …)` and spawns *Claude* with Codex's argv, dying on the first
+    unknown flag and reporting it as an installation problem — the one thing that is not wrong with
+    it. Empty already means auto-detect for the new harness, so clearing is also the right value.
+    `ai_model` goes the same way for the same reason, with a quieter failure: it too is shared by
+    every harness and no CLI's `--model` accepts another CLI's ids, so picking Codex while the field
+    said `haiku` configured the session with a value last chosen for a different program and it died
+    on an unknown model. Empty already means "the harness's default" and omits the flag entirely —
+    `turn_args` pushes `--model` only when the id is non-empty
+    (`an_empty_model_lets_the_harness_keep_its_own_default`) — so clearing lands on the one value
+    every harness is guaranteed to take. It is a *clear*, not a per-harness memory: switching back
+    does not restore the old id. The effect returns the **previous** harness rather than reading the
+    signal twice: on the first run there is none, and clearing then would throw away the override
+    just restored from `ui_state.json`.
+    **The hint lines under the path field carry `width_full`, and that is what makes them wrap.** A
+    floem label sets its own taffy node width to the measured text, so the green *"Auto-detected:
+    `<path>`"* line and both red ones overflowed the 460px panel rather than stretching to it — and
+    an auto-detected path is long and has no spaces (Codex resolves to
+    `C:\Users\…\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe`). Bounded to the panel,
+    cosmic-text's default `Wrap::WordOrGlyph` falls back to glyph-level breaks, which is what a path
+    wants anyway.
+    **All three modal bodies scroll the same way, and the AI one joined them last.** Each body is
+    `autohide(scroll(body))` under `max_height(widgets::modal_body_h(560.0))`. The AI modal's eight
+    groups at 25px apart had outgrown the window, and a modal taller than the screen loses its
+    *bottom* groups with no affordance saying they exist — which is the failure the General Settings
+    and Shortcuts modals were already wrapped against. The cap is a `modal_body_h` rather than a
+    constant precisely so it shrinks with a small window instead of being right at one size only.
   - `shortcuts.rs` — the app's keyboard shortcuts as **one table** (`SHORTCUTS`), which
     `settings::help_overlay` renders straight from — plus the tests that keep it honest. This list
     is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance of any
@@ -8482,20 +8829,34 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   a second, blunter rule quietly carrying the case the tested one declined, holding only as long as
   no control outside that modal writes them. A premise, not a design. A different connection is
   always a new session, since the level, the hidden set and the `Db` handle all belong to it.
-  **`cli_path` is the one exception, and it is why the rule takes a `cli_usable` argument.** Every
-  other setting is a value the app can act on the moment it changes; this one names a *binary*, and
-  adopting a name that resolves to nothing trades a working conversation for one that cannot start.
-  So the path counts only when it is spawnable — `claude_cli::claude_reachable`: an override that
-  resolves, or an empty value whose auto-detect succeeds. Two corollaries, both easy to get wrong in
+  **`cli_path` and `harness` are the two exceptions, and they are why the rule takes a `cli_usable`
+  argument.** Every other setting is a value the app can act on the moment it changes; these two
+  name a *binary*, and adopting a name that resolves to nothing trades a working conversation for
+  one that cannot start. So they count only when the result is spawnable —
+  `agent_cli::harness_reachable`, asked of the **new** settings: an override that resolves, or an
+  empty value whose auto-detect succeeds for that harness. Choosing a harness that is not installed
+  therefore keeps the live conversation instead of trading it for a binary nothing can spawn, and
+  the AI settings modal is where the user finds out it is unreachable — its `cli_ok` reads the
+  harness *signal* rather than closing over a value, so the hint follows the selection rather than
+  validating against whichever CLI was chosen when the closure was built. Two corollaries, both
+  easy to get wrong in
   the other direction: **manual → empty respawns**, because empty is *auto-detect* rather than
   "unset" and resolves to a binary the session was not started from; and a broken path is **not** a
-  licence to ignore the rest, the gate sitting on the `cli_path` comparison alone. The filesystem
+  licence to ignore the rest, the gate sitting on the `cli_path`/`harness` comparisons alone. The
+  filesystem
   question belongs to the caller because the function is pure — the reason it lives in `ai.rs` at
   all. Both call sites ask it: `ai_send` before a turn, and `ai_apply` when the settings modal
   closes. `ai_apply` used to compare the whole `AiSettings` with `!=` instead, which is a second
   rule for one question and had already drifted — `!=` counts `cli_path` unconditionally, so typing
   a path that resolves to nothing (the state the field's own red hint is for) threw the live
   conversation away.
+  **The function enumerates its comparisons rather than deriving them, and that shape has one
+  failure mode worth knowing before you add a field**: a field added to `AiSettings` and not added
+  here is ignored in silence — nothing fails to compile, and the symptom is a session that goes on
+  running with a setting the user changed. That is exactly what happened when `harness` was added,
+  and the test is what noticed
+  (`a_cli_path_that_cannot_spawn_leaves_the_live_session_alone`, which carries the harness
+  assertions beside the path ones because both turn on `cli_usable`).
   **A respawn
   that can't happen refuses the turn** rather than falling through to the old session: with no
   `Db` (a tunnel still coming up) the previous session is dropped and the panel says the database
@@ -8503,12 +8864,68 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   failing open. The grid
   asks `ai_data_of` (the *result's* connection, not the active one) and checks it at each action as
   well as when building the menu.
+  **A session may only start on a binary the probe established can be restricted, and that gate is
+  the first thing `start_ai_session` does** — ahead of the MCP config being written and ahead of the
+  oversize check. `ai::spawn_refusal` is the rule: a `Constraint` that is not runnable is refused
+  with `Constraint::notice`. It used to have a second arm — a harness this build did not drive,
+  which was Gemini and only Gemini — and with that harness deleted every variant the enum names is
+  driven, so the unestablished constraint is the only refusal left. **The arm was rewritten rather
+  than removed**: it is now an exhaustive `match harness { Claude | Codex | Antigravity => None }`,
+  so the *next* harness added to the enum lands here as a non-exhaustive-match error and has to be
+  decided. A `None` fall-through would instead spawn it on an argv read off documentation, which
+  dies on its first unknown flag and gets reported as an installation problem — the one thing that
+  would not be wrong with it. The refusal sends its line to the panel over `ai_tx` and returns a **live sender
+  with no process behind it**, the same shape the oversize arm below it uses, so the next question
+  re-enters here and meets the same check. It lives on the one function that spawns an agent for the
+  same reason the write guard lives on the run action: a gate a caller has to remember is one
+  `return` from not existing. And it **reuses the binary and the `Probe` it checked** for the spawn
+  and for `build_session_args`'s seal — re-resolving would let the thing checked and the thing run
+  diverge the moment `harness_bin` gains a reason to answer differently on a second call. The rule
+  itself is pure and tested separately (`spawn_refusal` is reachable in a test where the spawn is
+  not): `the_driven_harnesses_run_and_the_rest_say_so`, which now loops `Harness::ALL` and asserts
+  both halves — a runnable grade refuses nobody, and `Unknown` refuses everybody — rather than
+  naming the harnesses by hand, so a fourth added to the enum is covered the moment it compiles.
+  **There are two session models behind one channel, and the seam is `SessionMsg`.**
+  `start_ai_session` branches on `harness.is_persistent()`: Claude keeps its one bidirectional child
+  per conversation, while Codex and Antigravity spawn **one process per turn**, continuity coming
+  from an id captured off `StreamEvent::SessionStarted` (`thread.started`/`init`) and handed to the
+  next turn as `TurnSpec::resume`. **The interface upstream did not change**, and that is the point:
+  `AiSession::stdin_tx` carries a typed `SessionMsg::{Turn, Interrupt}` rather than the raw stdin
+  JSON line `main.rs` used to build, because that made the app's send path fluent in one CLI's wire
+  protocol — and a process-per-turn harness has no such protocol at all. The encoding now belongs to
+  whichever task owns the child. `Interrupt` mid-turn kills it and the turn is closed by the
+  not-`ended` arm; between turns it is a no-op, because nothing is running to stop. **The child's
+  stdin is `Stdio::null()`, never piped**: measured, `codex exec` prints *"Reading additional input
+  from stdin…"* and appends piped stdin to the prompt as a `<stdin>` block, so a pipe we never wrote
+  to would silently append itself to every turn. And every harness folds its events through **one**
+  `TurnPump` — prose and chips accumulate, a snapshot goes out when anything changed, `TurnDone`
+  closes the turn and resets, and `fail()` always sends so the panel cannot spin. Claude was
+  refactored onto it rather than left alongside: it briefly had its own copy, and two copies drift
+  on exactly the details a user notices — whether a half-finished turn renders, whether stats reach
+  the footer, whether the accumulator is reset at the boundary.
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session temp `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
-  to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
-  discovery — PATH/PATHEXT/override — plus the one part of it that is *not* pure, `claude_seal`,
-  which spawns `<bin> --help` and caches the `CliSeal` it reads per resolved path; see
-  `schemaic-ai`) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
+  to other same-user processes. **A harness Schemaic cannot hand a config file gets a *path*
+  instead of the blob, and still never the credential.** Codex's only configuration lever is
+  `-c key=value` and those are argv, so `mcp_endpoint_from_env` now prefers the file named by
+  `--endpoint-file <path>` and falls back to `$SCHEMAIC_MCP_ENDPOINT`; the path is not the secret,
+  what it points at is (`harness::codex_mcp_overrides` builds that override, and `main.rs`'s
+  `--mcp-serve` comment block states both routes and why neither is a plain argument).
+  `endpoint_file_arg` is the pure half, split out and tested because "the flag came last with
+  nothing after it" is the case that would otherwise read as a path and leave the server pointed at
+  a null endpoint (`the_endpoint_file_flag_is_read_only_when_it_has_a_value`, plus
+  `the_codex_override_names_the_file_and_never_the_endpoint`, which puts a real password through the
+  override on the app's side of the seam). **Antigravity takes the same route by a longer road**:
+  its server is registered *globally* with `agy mcp add`, so the command line holding
+  `--endpoint-file <path>` is written into that CLI's own config rather than passed per invocation —
+  still the path and never the endpoint, and `write_endpoint_file` puts the file in the same
+  directory, with the same prefix, as the Claude config so `sweep_stale_mcp_configs` already
+  collects it. It holds the same secret and must not outlive its session any longer. Pure clusters
+  split out: `agent_cli.rs` (agent-CLI
+  discovery — env override / known install locations / PATH+PATHEXT — plus the one part of it that
+  is *not* pure, `probe`, which spawns `<bin> --help` and caches what it reads per
+  `(harness, path)`; its own entry is below), `antigravity.rs` (that CLI's two pieces of global
+  state, also below) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
   stays in `main.rs`.
   **Every prompt's database list comes out of one funnel**, `snapshot_databases`: it reads the
@@ -8583,7 +9000,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   list, so the assistant's check of a proposed change against the live table was denied every time,
   invisibly, since the model then writes the fenced block from the schema it already has and the
   user sees a preview either way. `every_offered_tool_is_allow_listed_at_its_level` holds the two
-  sides equal per engine and per level. Everything dialect-shaped here reads `dialect_of` →
+  sides equal per engine and per level. **That one list now feeds three different permission
+  mechanisms** — Claude's `--allowedTools`, Codex's `tools.<name>.approval_mode` overrides and
+  Antigravity's `permissions.allow` rules — each deriving the bare name it needs through
+  `harness::bare_tool_name` rather than restating the set, so a connection's access level cannot
+  mean one thing on one harness and another on the next. Everything dialect-shaped here reads `dialect_of` →
   `Engine::dialect()`, whose match is exhaustive, and so does `main.rs`'s namesake (via
   `dialect_for`). Both were `if engine == Postgres { Postgres } else { MySql }`, which compiled
   cleanly when SQLite arrived and sorted it onto the MySQL side: the read-only gate lexed AI-issued
@@ -8612,6 +9033,80 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   one is a change the user was promised and wouldn't get. The tag is advertised from the constant
   the app extracts on (`the_proposal_tool_advertises_the_tag_the_app_looks_for`), so the two can't
   drift into a block nothing picks up.
+  - `agent_cli.rs` — finding the agent CLI, and asking it what it accepts. It was `claude_cli.rs`
+    until the settings gained a harness, and the rename is not cosmetic: the module now looks for
+    three binaries and interrogates whichever one is selected, so leaving it named for one of them
+    while it probes the other two is the drift this document exists to catch.
+    `detect_bin(h)` asks three sources in order — `$SCHEMAIC_<HARNESS>_BIN` (Claude keeps
+    `SCHEMAIC_CLAUDE_BIN`, which shipped before any other harness existed and someone's launcher may
+    still set it), then that harness's **known install locations**, then a `PATH` search honouring
+    Windows `PATHEXT`. The middle step is not belt-and-braces. On the machine this was written
+    against, `codex` and `agy` were both installed and working while absent from the `PATH` a child
+    process inherits, so a `PATH`-only search reported two working CLIs as not installed and the
+    panel would have said so. The locations are Claude `~/.local/bin`, Codex
+    `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` and `~/.codex/bin`, Antigravity
+    `%LOCALAPPDATA%\agy\bin` and `~/.local/bin` — and each candidate ends in that harness's own
+    executable (`a_known_location_ends_in_the_harnesss_own_executable`, which also holds the Windows
+    extension on). `harness_bin(h, override)` and `harness_reachable(h, path)` are the former
+    `claude_bin`/`claude_reachable` with the harness passed in rather than assumed — the first
+    resolves what to spawn, the second answers the settings modal's "is this reachable".
+    **One `--help`, three answers.** `probe(h, bin)` returns a `Probe { seal, constraint,
+    isolate_config }` rather than the old bare `CliSeal`, because all three come out of the same help
+    text and spawning it three times is three times the ~140 ms nobody has. It folds **stdout and
+    stderr** together: `agy --help` writes to *stderr* and exits 0, so reading stdout alone found an
+    empty help and refused a working binary. A non-zero exit yields `Constraint::Unknown` without
+    consulting the text at all — a `--help` that failed printed a diagnostic, not a help text. And a
+    spawn that fails outright yields `seal: CliSeal::ALL` **and** `constraint: Unknown`, which point
+    in opposite directions on purpose: for Claude the dangerous guess is that a sealing flag is
+    absent, so an unread probe passes all three and risks a loud death instead of a quiet unsealed
+    session; for the others there is no safe "pass everything", since `--sandbox` on a binary that
+    never heard of it *is* that death, so nothing established means do not spawn. `schemaic-ai`
+    states the reasoning at each end. The cache is keyed by **(harness, resolved path)** and not by
+    path alone, because the same binary answers different questions for different harnesses and
+    switching harness must not read the previous one's answer.
+    **Inline generation is Claude-only, and `inline_claude_bin` is where that is enforced.** Ctrl+K,
+    AI Fill and AI Seed build their argv with `schemaic_ai::inline_args`, which is Claude's flag set,
+    so all three spawn Claude whatever drives the chat panel. The override is honoured **only when
+    Claude is the selected harness**: `ai_cli_path` follows the selection, so on Codex it is a path
+    to `codex`, and handing that to a Claude-flagged spawn runs the wrong binary with flags it has
+    never heard of (`the_inline_paths_never_spawn_another_harnesss_binary`). With another harness
+    selected it auto-detects Claude and fails with the ordinary "not installed" message, which is the
+    truth: those three features need Claude and it is not there.
+  - `antigravity.rs` — the two pieces of that CLI's **global** state a Schemaic session needs, owned
+    for the life of the session and taken back out again. Every other harness is configured per
+    invocation; Antigravity is configured by writing into the user's own files, which is why this is
+    a module rather than four lines in `ai.rs`. `AgyRegistration::install` runs `agy mcp add` and
+    merges the connection's `permissions.allow` rules into `settings.json`, and its `Drop` removes
+    both. The `--` ahead of the command is load-bearing rather than punctuation: the arguments being
+    registered start with `-`, and `agy mcp add` rejects a flag placed after the server name. **Both, together, in both directions** — a registration without rules is a server whose
+    every call is refused, and rules without a registration are a standing grant for a server that
+    is not there. A failed install removes **nothing** on drop, since tearing down a registration
+    this session never added would take out a working one belonging to somebody else
+    (`a_failed_registration_removes_nothing_on_drop`). The rules come from the connection's own
+    allow-list, so a schema-only connection never grants `run_query` and `run_command` is never
+    granted at all; the surgery itself is `schemaic_ai::harness`'s pure, tested half and this module
+    only does the IO.
+    **`sweep` runs at startup, off-thread, because a crash leaves both behind and neither expires.**
+    It clears the full tool set rather than the current connection's, since a crashed session may
+    have granted more than this one will
+    (`the_sweep_targets_every_tool_not_just_the_current_level`), and it removes the rules even with
+    no `agy` on the machine — that half is our own file surgery, while the `agy mcp remove` half is
+    skipped unless the binary is actually there, rather than shelling out on every launch to clean
+    up state that cannot exist. **The known limit is stated rather than hidden**: it cannot tell a
+    crash's leftovers from a second running Schemaic, so starting a second instance removes the
+    first's rules until that session next installs them. The alternative — leaving them on the
+    chance somebody is using them — is a permission nobody remembers granting, outliving the process
+    that needed it, which is the worse of the two failures.
+    The settings file's location is `~/.gemini/antigravity-cli/settings.json`, and **the `.gemini`
+    is not a leftover from the harness that was removed**: `agy` is Google's and keeps its own
+    settings under the same home-directory root the Gemini CLI used, which the function's own doc
+    comment now says so nobody tidies it into `~/.antigravity`. The path was **observed, not
+    documented**, so `$SCHEMAIC_AGY_SETTINGS` overrides it: if that CLI moves the file, the failure
+    should be "no database tools" and not "wrote into the wrong file"
+    (`the_settings_path_is_overridable_for_a_cli_that_moves_it`). `agy mcp` calls are best-effort by
+    design — a missing or refusing binary costs the session its database tools, which the failing
+    tool call already reports, where failing the whole session over a config write would be worse;
+    a registration that did not take is `tracing::warn!`ed rather than left to be discovered.
   - `conn_sources.rs` — the I/O half of connection import: which paths on *this* machine are worth
     opening, and reading them. Deliberately only that half — nothing here interprets the bytes,
     which is what keeps `core::conn_import` unit-tested and leaves the part that cannot be (a walk
@@ -9258,7 +9753,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   `db::lock_wait_sql` so a lock nobody could ask about comes back as an error instead of never.
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
-  endpoint via a temp `--mcp-config` file, not argv. Don't add new plaintext-secret surfaces.
+  endpoint via a temp `--mcp-config` file, not argv — or, for a harness whose only configuration
+  lever *is* argv, via a private file whose **path** rides in `--endpoint-file` while the endpoint
+  itself never leaves the file (`harness::codex_mcp_overrides`, `ai::endpoint_file_arg`). The same
+  `--endpoint-file` route carries Antigravity, whose registration writes that command line into the
+  CLI's **own config**: a path there outlives the process, which is one of the two reasons
+  `antigravity::sweep` exists. Don't add new plaintext-secret surfaces.
   **"Never in a log" includes a log the environment asked for.** `app::logging`'s
   `log_directives`/`filter_for` append `russh=warn`, `russh_cryptovec=warn` and `russh_util=warn`
   *after* whatever `RUST_LOG` said, because `RUST_LOG` **replaces** the default filter rather than

@@ -107,7 +107,10 @@ fn default_editor_h() -> f64 {
     248.0
 }
 
-// AI Assistant defaults. Empty CLI path = auto-detect the `claude` binary.
+// AI Assistant defaults. Empty CLI path = auto-detect the harness's binary.
+fn default_ai_harness() -> String {
+    "claude".to_string()
+}
 fn default_ai_model() -> String {
     "haiku".to_string()
 }
@@ -193,7 +196,23 @@ pub struct UiState {
     /// Query-editor height (px); the results grid takes the rest.
     #[serde(default = "default_editor_h")]
     pub editor_h: f64,
-    /// AI Assistant — override path to the `claude` CLI. Empty = auto-detect.
+    /// AI Assistant — which agent CLI drives the panel: `claude` / `codex` /
+    /// `antigravity`.
+    ///
+    /// `gemini` was a fourth and is gone; a settings file still naming it takes
+    /// the unrecognised-value path below rather than a migration of its own.
+    ///
+    /// Defaults to `claude`, which is what every settings file written before
+    /// this field existed meant — the app drove that CLI and nothing else. An
+    /// unrecognised value is **not** silently replaced with the default; the app
+    /// reports it, because substituting a different CLI than the file names is
+    /// invisible to the person reading the panel.
+    #[serde(default = "default_ai_harness")]
+    pub ai_harness: String,
+    /// AI Assistant — override path to the agent CLI binary. Empty = auto-detect.
+    ///
+    /// Keyed to whichever harness is selected: switching harness and leaving a
+    /// path behind would point the new CLI's spawn at the old CLI's binary.
     #[serde(default)]
     pub ai_cli_path: String,
     /// AI Assistant — model alias: `haiku` / `sonnet` / `opus`.
@@ -319,6 +338,7 @@ impl Default for UiState {
             schema_w: default_schema_w(),
             right_w: default_right_w(),
             editor_h: default_editor_h(),
+            ai_harness: default_ai_harness(),
             ai_cli_path: String::new(),
             ai_model: default_ai_model(),
             ai_effort: default_ai_effort(),
@@ -1107,6 +1127,33 @@ mod tests {
         let state: UiState = serde_json::from_str(old).expect("older files still parse");
         assert_eq!(state.statement_timeout_secs, 0);
         assert_eq!(state.row_limit, 1000);
+    }
+
+    /// Every `ui_state.json` written before Schemaic drove more than one agent
+    /// CLI has no `ai_harness` key, and it means Claude — that was the only
+    /// harness there was. Defaulting to anything else would silently move a
+    /// working AI panel onto a CLI the user has never installed.
+    #[test]
+    fn a_ui_state_from_before_multiple_harnesses_loads_as_claude() {
+        let old = r#"{"ai_model": "opus", "ai_cli_path": ""}"#;
+        let state: UiState = serde_json::from_str(old).expect("older files still parse");
+        assert_eq!(state.ai_harness, "claude");
+        // …and the settings that lived beside it are untouched.
+        assert_eq!(state.ai_model, "opus");
+    }
+
+    /// The value round-trips verbatim. Nothing here maps it onto a known set:
+    /// an unrecognised harness has to survive the file so the app can *report*
+    /// it, which it cannot do if the parse quietly replaced it.
+    #[test]
+    fn an_unknown_harness_survives_the_round_trip_rather_than_being_corrected() {
+        let raw = r#"{"ai_harness": "some-future-cli"}"#;
+        let state: UiState = serde_json::from_str(raw).expect("parses");
+        assert_eq!(state.ai_harness, "some-future-cli");
+        let back: UiState =
+            serde_json::from_str(&serde_json::to_string(&state).expect("serializes"))
+                .expect("re-parses");
+        assert_eq!(back.ai_harness, "some-future-cli");
     }
 
     // ── The save/load composition ─────────────────────────────────────────

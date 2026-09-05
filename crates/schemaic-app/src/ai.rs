@@ -19,6 +19,7 @@ use floem::reactive::{Memo, RwSignal, SignalGet, SignalWith};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use schemaic_ai::harness::{Constraint, Harness};
 use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist;
@@ -26,9 +27,9 @@ use schemaic_core::prompt::{UNTRUSTED_NOTE, inline_datum};
 use schemaic_core::schema::{DbSchema, SchemaState};
 use schemaic_core::transcript::{ChatMessage, Role};
 use schemaic_db::Db;
-use schemaic_ui::{AiEffort, AiModel, ConnNode, InlineAiRequest, SchemaScope, Tab};
+use schemaic_ui::{AiEffort, ConnNode, InlineAiRequest, SchemaScope, Tab};
 
-use crate::claude_cli::{claude_bin, claude_seal};
+use crate::agent_cli::{harness_bin, probe};
 
 // ===== moved from main.rs (AI session + context) =====
 // The `claude` CLI runs non-interactively, so an **MCP** tool that isn't named
@@ -41,7 +42,7 @@ use crate::claude_cli::{claude_bin, claude_seal};
 // so it cannot name a built-in even in principle. Nothing here ever governed the
 // CLI's own tools — that is why nineteen of them were reachable, and why the
 // guard on them is `--tools ""` rather than this list.
-const AI_TOOLS_WITH_QUERY: &[&str] = &[
+pub(crate) const AI_TOOLS_WITH_QUERY: &[&str] = &[
     "mcp__schemaic__run_query",
     "mcp__schemaic__list_schema",
     "mcp__schemaic__describe_table",
@@ -54,7 +55,7 @@ const AI_TOOLS_WITH_QUERY: &[&str] = &[
 // a tool it would only be denied on (see `mcp::tools_list`).
 // `propose_table_change` is on both lists: it reads the table's *structure* and
 // runs nothing, which is not the access `AiData` gates.
-const AI_TOOLS_READ_ONLY: &[&str] = &[
+pub(crate) const AI_TOOLS_READ_ONLY: &[&str] = &[
     "mcp__schemaic__list_schema",
     "mcp__schemaic__describe_table",
     "mcp__schemaic__propose_table_change",
@@ -65,7 +66,7 @@ const AI_TOOLS_READ_ONLY: &[&str] = &[
 /// kills the child; the temp MCP-config file (if any) is removed on drop too.
 pub(crate) struct AiSession {
     pub(crate) conn_id: u64,
-    pub(crate) stdin_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    pub(crate) stdin_tx: tokio::sync::mpsc::UnboundedSender<SessionMsg>,
     /// The per-session MCP config file (holds the DB endpoint out of the command
     /// line — review C6). Removed when the session ends.
     pub(crate) mcp_cfg: Option<PathBuf>,
@@ -84,11 +85,20 @@ pub(crate) struct AiSession {
     pub(crate) mcp_database: Option<String>,
 }
 
-/// Snapshot of the AI settings that require respawning the `claude` session
+/// Snapshot of the AI settings that require respawning the agent session
 /// (process args + the system context / MCP config sent at session start).
 #[derive(Clone, PartialEq)]
 pub(crate) struct AiSettings {
-    pub(crate) model: AiModel,
+    /// Which agent CLI drives this session.
+    ///
+    /// The most respawn-forcing setting there is: a different harness is a
+    /// different binary, a different argv, a different stream dialect and a
+    /// different MCP mechanism. Nothing about a live session survives changing
+    /// it, which is exactly why it belongs in the snapshot `needs_respawn`
+    /// compares rather than being read fresh at each turn.
+    pub(crate) harness: Harness,
+    /// The model id, verbatim. Empty = the harness's own default.
+    pub(crate) model: String,
     pub(crate) effort: AiEffort,
     /// The active connection's data-access level. It sits with the *session*
     /// settings because it is fixed at spawn — the tools list and the MCP blob
@@ -149,11 +159,28 @@ pub(crate) struct McpEndpoint {
 /// Parse the MCP DB endpoint from `$SCHEMAIC_MCP_ENDPOINT` (the JSON the app
 /// writes into the MCP config file). Falls back to an empty local endpoint.
 pub(crate) fn mcp_endpoint_from_env() -> McpEndpoint {
-    let v = std::env::var("SCHEMAIC_MCP_ENDPOINT")
-        .ok()
+    // A harness whose MCP config is a *file* we write puts the endpoint in that
+    // file's `env` map. Codex's only lever is `-c` overrides, which are argv —
+    // world-readable — so it gets a path instead and the endpoint stays in a
+    // file of its own. The path is not a secret; what it points at is.
+    let from_file = endpoint_file_arg(&std::env::args().collect::<Vec<_>>())
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let raw = from_file.or_else(|| std::env::var("SCHEMAIC_MCP_ENDPOINT").ok());
+    let v = raw
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or(serde_json::Value::Null);
     endpoint_from_value(&v)
+}
+
+/// The path given as `--endpoint-file <path>`, if any.
+///
+/// Pure so the flag's parsing is unit-tested without an environment: this is the
+/// seam that decides whether a credential is read from a private file or not at
+/// all, and "the flag was last and had no value" is exactly the case that would
+/// otherwise silently fall back to a null endpoint.
+fn endpoint_file_arg(args: &[String]) -> Option<String> {
+    let i = args.iter().position(|a| a == "--endpoint-file")?;
+    args.get(i + 1).filter(|p| !p.is_empty()).cloned()
 }
 
 /// Parse a DB endpoint from the MCP-config JSON value: host defaults to
@@ -377,6 +404,56 @@ fn mcp_config_json(exe: &str, endpoint: &str) -> String {
     .to_string()
 }
 
+/// The endpoint file a Codex session's MCP server reads its DB endpoint from.
+///
+/// **Codex's only configuration lever is `-c key=value`, and that is argv.**
+/// Putting the endpoint there would publish the database credentials to every
+/// process listing on the machine (review C6), so the override carries a *path*
+/// and the endpoint stays in this file. Same directory, prefix and `.json`
+/// suffix as [`write_mcp_config`], so [`sweep_stale_mcp_configs`] already
+/// collects it — it holds exactly the same secret and must not outlive its
+/// session any longer.
+///
+/// **The temp dir here, though [`session_cwd`] was moved out of it — and the two
+/// are not in tension.** That move answered a different threat: the child's
+/// *working directory* is scanned for directory-relative settings files, so a
+/// world-writable cwd lets any local user grant the session permissions. Nothing
+/// scans this path; it is only ever read by name, is created `O_EXCL` with
+/// owner-only permissions (`persist::create_private_new`, which refuses an
+/// existing path and refuses to follow a symlink), and carries the same secret
+/// the Claude config beside it already does. Moving it would buy nothing and
+/// would put it outside the sweeper that collects the other.
+///
+/// **One caveat that is Antigravity's alone**: its registration writes this path
+/// into that CLI's *own* config, so unlike a `-c` override it survives our
+/// process. `crate::antigravity::sweep` exists partly for that.
+fn write_endpoint_file(endpoint: &str) -> Option<PathBuf> {
+    sweep_stale_mcp_configs();
+    let dir = std::env::temp_dir();
+    for _ in 0..8 {
+        let path = dir.join(format!("{MCP_FILE_PREFIX}ep-{}.json", random_tag()));
+        if persist::create_private_new(&path, endpoint.as_bytes()).is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// What the app asks of a live session.
+///
+/// **Typed, rather than the wire bytes.** This used to be the raw JSON line
+/// `claude` expects on stdin, built in `main.rs` — which meant the app's send
+/// path knew one CLI's stdin protocol, and there is no such protocol for a
+/// harness that is a fresh process per turn. The encoding now belongs to
+/// whichever task owns the child.
+pub(crate) enum SessionMsg {
+    /// The user's next question.
+    Turn(String),
+    /// Stop whatever is running. A no-op between turns on the
+    /// process-per-turn harnesses, where nothing is running to stop.
+    Interrupt,
+}
+
 /// A streamed transcript snapshot pushed from the reader task to the UI.
 #[derive(Clone)]
 pub(crate) struct AiStreamMsg {
@@ -397,6 +474,8 @@ pub(crate) struct StartAiParams {
     pub db: Db,
     pub database: Option<String>,
     pub ai_tx: crossbeam_channel::Sender<AiStreamMsg>,
+    /// Which agent CLI to drive.
+    pub harness: Harness,
     pub model: String,
     pub effort: String,
     /// What this connection lets the assistant read ([`AiData`]) — decides both
@@ -412,15 +491,128 @@ pub(crate) struct StartAiParams {
     pub schema_scope: SchemaScope,
 }
 
+/// Folds decoded events into a turn and pushes snapshots to the panel.
+///
+/// **One implementation for every harness.** The persistent Claude task and the
+/// process-per-turn tasks accumulate identically — prose and tool chips build up,
+/// a snapshot goes out whenever they change, and `TurnDone` closes the turn — and
+/// the only thing they disagree about is where the lines come from. Duplicated,
+/// the two copies would drift on exactly the details a user notices: whether a
+/// half-finished turn renders, whether stats reach the footer, whether the
+/// accumulator is reset at the boundary.
+struct TurnPump {
+    turn: schemaic_ai::TurnState,
+    ai_tx: crossbeam_channel::Sender<AiStreamMsg>,
+}
+
+impl TurnPump {
+    fn new(ai_tx: crossbeam_channel::Sender<AiStreamMsg>) -> Self {
+        Self {
+            turn: schemaic_ai::TurnState::default(),
+            ai_tx,
+        }
+    }
+
+    /// Apply `events`, emitting a snapshot when anything changed. Returns `true`
+    /// once the turn has ended (a final snapshot has already been sent).
+    ///
+    /// `SessionStarted` is *not* handled here: it is plumbing for the caller
+    /// that has to remember the id, and it renders nothing.
+    fn push(&mut self, events: Vec<schemaic_ai::StreamEvent>) -> bool {
+        let mut changed = false;
+        let mut done: Option<(bool, schemaic_core::transcript::TurnStats)> = None;
+        for ev in events {
+            match ev {
+                schemaic_ai::StreamEvent::TurnDone { is_error, stats } => {
+                    done = Some((is_error, stats))
+                }
+                schemaic_ai::StreamEvent::SessionStarted { .. } => {}
+                other => {
+                    self.turn.apply(&other);
+                    changed = true;
+                }
+            }
+        }
+        match done {
+            Some((is_error, stats)) => {
+                let _ = self.ai_tx.send(AiStreamMsg {
+                    segs: self.turn.segments(),
+                    done: true,
+                    is_error,
+                    stats: (!stats.is_empty()).then_some(stats),
+                });
+                self.turn = schemaic_ai::TurnState::default();
+                true
+            }
+            None => {
+                if changed {
+                    let _ = self.ai_tx.send(AiStreamMsg {
+                        segs: self.turn.segments(),
+                        done: false,
+                        is_error: false,
+                        stats: None,
+                    });
+                }
+                false
+            }
+        }
+    }
+
+    /// End the turn with a message of our own — a spawn that failed, a child
+    /// that died, a refusal. Always sends, so the panel never keeps spinning.
+    fn fail(&mut self, why: String) {
+        let _ = self.ai_tx.send(AiStreamMsg {
+            segs: vec![schemaic_core::transcript::Seg::Text(why)],
+            done: true,
+            is_error: true,
+            stats: None,
+        });
+        self.turn = schemaic_ai::TurnState::default();
+    }
+}
+
+/// Why a session must not start on this harness, or `None` to go ahead.
+///
+/// Pure, and separate from [`start_ai_session`] for the reason the rest of the
+/// decisions in this crate are: the gate itself is reachable only by spawning a
+/// process, so the *rule* it applies would otherwise have no test at all. Order
+/// matters — an unestablished constraint is reported before "not driven yet",
+/// because a binary we could not restrict is the more important thing to say
+/// about it.
+fn spawn_refusal(harness: Harness, constraint: Constraint) -> Option<String> {
+    if !constraint.is_runnable() {
+        return constraint.notice(harness);
+    }
+    // **Exhaustive on purpose, though every arm answers the same today.** This
+    // used to turn Gemini away — a harness the pure layer decoded but nothing
+    // had ever run against — and that harness is gone: Google withdrew OAuth for
+    // personal accounts, so the CLI needs an API key to authenticate at all and
+    // points at Antigravity as its successor. Every harness the enum still names
+    // is driven, so there is no refusal left to make.
+    //
+    // Written as a `match` rather than deleted, because the next harness added
+    // to the enum lands here as a non-exhaustive-match error and has to be
+    // *decided*. A `None` fall-through would instead spawn it on an argv read
+    // off documentation, which dies on its first unknown flag and is reported as
+    // an installation problem — the one thing that would not be wrong with it.
+    match harness {
+        Harness::Claude | Harness::Codex | Harness::Antigravity => None,
+    }
+}
+
 pub(crate) fn start_ai_session(
     handle: &tokio::runtime::Handle,
     p: StartAiParams,
-) -> (tokio::sync::mpsc::UnboundedSender<String>, Option<PathBuf>) {
+) -> (
+    tokio::sync::mpsc::UnboundedSender<SessionMsg>,
+    Option<PathBuf>,
+) {
     let StartAiParams {
         system_context,
         db,
         database,
         ai_tx,
+        harness,
         model,
         effort,
         data,
@@ -428,7 +620,268 @@ pub(crate) fn start_ai_session(
         hidden,
         schema_scope,
     } = p;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SessionMsg>();
+
+    // **The constraint gate, ahead of everything.** A session may only start on
+    // a binary we established can be restricted; `Constraint::Unknown` means the
+    // probe could not tell us that, and the answer is to refuse rather than to
+    // hope. Placed here — in the one function that spawns an agent — for the
+    // same reason the write guard lives on the run action: a gate the *caller*
+    // has to remember is one `return` away from not existing.
+    let bin = harness_bin(harness, &cli_path);
+    let checked = probe(harness, &bin);
+    if let Some(why) = spawn_refusal(harness, checked.constraint) {
+        let _ = ai_tx.send(AiStreamMsg {
+            segs: vec![schemaic_core::transcript::Seg::Text(why)],
+            done: true,
+            is_error: true,
+            stats: None,
+        });
+        // A live sender with no process behind it, exactly as the oversize arm
+        // below does: the panel shows the reason and the next question re-enters
+        // here, where the same check applies.
+        return (tx, None);
+    }
+
+    let endpoint = endpoint_json(
+        &db,
+        database.as_deref(),
+        data.may_query(),
+        schema_scope != SchemaScope::None,
+        &hidden,
+    );
+
+    // **Codex is a process per turn, not a process per conversation.** It has no
+    // bidirectional stdin protocol: continuity comes from `codex exec resume
+    // <thread-id>`, and the id arrives as the first event of the first turn. The
+    // channel interface is identical to Claude's, so nothing upstream of here
+    // changes — only what this task does with each message.
+    if !harness.is_persistent() {
+        let ep_file = write_endpoint_file(&endpoint);
+        // **The same list Claude's `--allowedTools` gets**, so no two harnesses
+        // can disagree about what this connection's access level offers.
+        let allowed: &[&str] = if data.may_query() {
+            AI_TOOLS_WITH_QUERY
+        } else {
+            AI_TOOLS_READ_ONLY
+        };
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "schemaic".to_string());
+        // Codex is configured entirely on its own command line; Antigravity has
+        // no per-invocation configuration at all and needs two pieces of its
+        // global state written instead, which `AgyRegistration` owns and removes.
+        let mut overrides = Vec::new();
+        let mut agy_install: Option<(String, String)> = None;
+        match (harness, ep_file.as_ref()) {
+            (Harness::Codex, Some(p)) => {
+                overrides =
+                    schemaic_ai::harness::codex_mcp_overrides(&exe, &p.to_string_lossy(), allowed);
+            }
+            // **Deferred, not done here.** `install` shells out to `agy mcp add`
+            // twice and rewrites a settings file — a Node CLI start, a config
+            // parse and a write back, seconds rather than milliseconds — and
+            // this function runs on the Floem UI thread, from the send action.
+            // Doing it inline froze the window for that whole time, on top of
+            // the `probe` immediately above. Only the *arguments* are gathered
+            // here; the work happens on a blocking thread inside the session
+            // task.
+            (Harness::Antigravity, Some(p)) => {
+                agy_install = Some((exe.clone(), p.to_string_lossy().into_owned()));
+            }
+            // No endpoint file → no database tools, rather than a server that
+            // would come up pointed at nothing.
+            //
+            // **Codex still gets the isolation**, because the two ride in the
+            // same override and only one of them is optional. Assigning the
+            // whole `mcp_servers` table is what displaces the user's own — drop
+            // the override entirely and the fallback is not "no database tools"
+            // but "someone else's", every server in `~/.codex/config.toml`
+            // loaded into an assistant that never allow-listed them. The other
+            // harnesses need no counterpart here: Claude's isolation is
+            // `--strict-mcp-config`, which `build_session_args` passes
+            // unconditionally, and Antigravity has none to lose.
+            (Harness::Codex, None) => {
+                overrides = schemaic_ai::harness::codex_isolation_only();
+            }
+            _ => {}
+        }
+        let isolate = checked.isolate_config;
+        // **The level, not just the capability.** `supports_effort()` is true for
+        // both Claude and Antigravity, so asking only that sent Claude's `xhigh`
+        // to `agy`, which documents `low|medium|high` — the setting survives a
+        // harness switch, unlike the path and the model. `effort_arg` answers
+        // with one of *this* harness's own levels or with nothing.
+        let effort_arg = harness.effort_arg(&effort).unwrap_or_default().to_string();
+        let agy_bin = bin.clone();
+        handle.spawn(async move {
+            // Held for the life of the session: dropping it removes the MCP
+            // registration and the allow-rules together.
+            //
+            // Registered here rather than before the spawn, on a blocking thread
+            // rather than a worker: it is two `agy` invocations and a settings
+            // rewrite, and both the UI thread and an async worker are the wrong
+            // place to wait for them. The first turn's `rx.recv()` has not been
+            // reached yet, so nothing races the registration the session needs.
+            let _registration = match agy_install {
+                None => None,
+                Some((exe, ep)) => {
+                    let reg = tokio::task::spawn_blocking(move || {
+                        crate::antigravity::AgyRegistration::install(&agy_bin, &exe, &ep, allowed)
+                    })
+                    .await
+                    .ok();
+                    if !reg.as_ref().is_some_and(|r| r.is_installed()) {
+                        // Said out loud rather than discovered: the session still
+                        // runs, but every database tool call in it will be
+                        // refused, and the transcript alone would not say why.
+                        tracing::warn!(
+                            "could not register the Schemaic MCP server with Antigravity; \
+                             this session has no database tools"
+                        );
+                    }
+                    reg
+                }
+            };
+            let mut pump = TurnPump::new(ai_tx);
+            let mut thread: Option<String> = None;
+            while let Some(msg) = rx.recv().await {
+                let prompt = match msg {
+                    SessionMsg::Turn(t) => t,
+                    // Nothing is running between turns, so there is nothing to
+                    // stop. Silently ignored rather than reported: the user
+                    // pressed stop on an idle panel.
+                    SessionMsg::Interrupt => continue,
+                };
+                let spec = schemaic_ai::harness::TurnSpec {
+                    prompt,
+                    // Sent on every turn and dropped by `turn_args` on the
+                    // resumed ones — the rule lives with the argv it shapes.
+                    system: system_context.clone(),
+                    model: model.clone(),
+                    effort: effort_arg.clone(),
+                    resume: thread.clone(),
+                    // Antigravity's server is registered globally rather than
+                    // named per invocation, so neither of these carries a path
+                    // for it — see `crate::antigravity`.
+                    mcp_config: None,
+                    mcp_overrides: overrides.clone(),
+                    isolate_config: isolate,
+                };
+                let args = schemaic_ai::harness::turn_args(harness, &spec);
+                if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
+                    pump.fail(why);
+                    continue;
+                }
+                let child = Command::new(&bin)
+                    .args(&args)
+                    .current_dir(session_cwd())
+                    // **Never piped.** `codex exec` reads stdin when it is a
+                    // pipe and appends it to the prompt as a `<stdin>` block —
+                    // measured: a run with stdin at EOF still printed "Reading
+                    // additional input from stdin…". Piping it would silently
+                    // append whatever we never wrote to every turn.
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn();
+                let mut child = match child {
+                    Ok(c) => c,
+                    Err(e) => {
+                        pump.fail(format!(
+                            "Couldn't launch the `{}` CLI ({e}). Ensure {} is installed, \
+                             or give it a path in Settings → AI.",
+                            harness.bin(),
+                            harness.label()
+                        ));
+                        continue;
+                    }
+                };
+                let mut reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
+                let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                if let Some(se) = child.stderr.take() {
+                    let buf = stderr_buf.clone();
+                    tokio::spawn(async move {
+                        let mut lines = BufReader::new(se).lines();
+                        while let Ok(Some(l)) = lines.next_line().await {
+                            if let Ok(mut b) = buf.lock() {
+                                b.push_str(&l);
+                                b.push('\n');
+                            }
+                        }
+                    });
+                }
+                let mut parser = schemaic_ai::stream::StreamParser::new(harness);
+                let mut raw: Vec<String> = Vec::new();
+                let mut ended = false;
+                // A turn the *user* stopped is not a turn that went wrong, and
+                // must not be reported with the CLI's exit status as its reason.
+                let mut stopped = false;
+                loop {
+                    tokio::select! {
+                        // An interrupt mid-turn kills the child; the turn is
+                        // closed below by the `ended == false` arm.
+                        maybe = rx.recv() => match maybe {
+                            Some(SessionMsg::Interrupt) | None => {
+                                let _ = child.kill().await;
+                                stopped = true;
+                                break;
+                            }
+                            // A question asked while one is still running is
+                            // dropped rather than queued: the panel disables the
+                            // composer during a turn, so this is not reachable
+                            // from the UI, and silently running it later against
+                            // a different transcript would be worse.
+                            Some(SessionMsg::Turn(_)) => {}
+                        },
+                        line = reader.next_line() => match line {
+                            Ok(Some(l)) => {
+                                let events = parser.push(&l);
+                                if events.is_empty()
+                                    && !l.trim().is_empty()
+                                    && serde_json::from_str::<serde_json::Value>(l.trim()).is_err()
+                                {
+                                    raw.push(l.trim().to_string());
+                                }
+                                for ev in &events {
+                                    if let schemaic_ai::StreamEvent::SessionStarted { id } = ev {
+                                        // Kept for the next turn's `resume`.
+                                        thread = Some(id.clone());
+                                    }
+                                }
+                                if pump.push(events) {
+                                    ended = true;
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        },
+                    }
+                }
+                let code = child.wait().await.ok().and_then(|s| s.code());
+                if !ended {
+                    // The panel is still waiting either way, so the turn has to
+                    // be closed here or it spins forever — but *why* it ended
+                    // decides what to say. A turn the user stopped is reported as
+                    // stopped; reaching for the exit status there would blame the
+                    // CLI for doing exactly what it was told.
+                    if stopped {
+                        pump.fail("Stopped.".to_string());
+                    } else {
+                        let stderr_text = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+                        let joined = raw.join("\n");
+                        let why = schemaic_ai::cli_failure_message(code, &joined, &stderr_text);
+                        pump.fail(format!(
+                            "The {} turn ended unexpectedly: {why}",
+                            harness.label()
+                        ));
+                    }
+                }
+            }
+        });
+        return (tx, ep_file);
+    }
 
     // MCP config: launch THIS binary in `--mcp-serve` mode, handing it the
     // (already-tunnelled) DB endpoint via env — written to a temp file so the
@@ -449,10 +902,17 @@ pub(crate) fn start_ai_session(
     let args = schemaic_ai::build_session_args(
         &system_context,
         Some(&model),
-        Some(&effort),
+        // Claude's own four, asked the same way the per-turn harnesses ask —
+        // this arm cannot leak another CLI's vocabulary today, and it goes
+        // through the predicate so it still cannot if a level is ever added to
+        // one harness and not another.
+        Some(harness.effort_arg(&effort).unwrap_or_default()),
         mcp_cfg_arg.as_deref(),
         tools,
-        claude_seal(&claude_bin(&cli_path)),
+        // The seal for the binary the gate above actually checked. Re-resolving
+        // here would let the two disagree the moment `harness_bin` gains a
+        // reason to answer differently on a second call.
+        checked.seal,
     );
 
     // Before the spawn, because afterwards it is unrecognisable: the OS returns
@@ -470,7 +930,7 @@ pub(crate) fn start_ai_session(
     }
 
     handle.spawn(async move {
-        let mut child = match Command::new(claude_bin(&cli_path))
+        let mut child = match Command::new(&bin)
             .args(&args)
             .current_dir(session_cwd())
             .stdin(Stdio::piped())
@@ -498,7 +958,8 @@ pub(crate) fn start_ai_session(
         };
         let mut stdin = child.stdin.take().expect("stdin piped");
         let mut reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
-        let mut turn = schemaic_ai::TurnState::default();
+        // The same accumulator the process-per-turn tasks use — see `TurnPump`.
+        let mut pump = TurnPump::new(ai_tx.clone());
 
         // Drain stderr concurrently into a shared buffer so it's available if the
         // session dies (reading it only on exit could deadlock a full pipe).
@@ -522,7 +983,13 @@ pub(crate) fn start_ai_session(
         loop {
             tokio::select! {
                 maybe = rx.recv() => match maybe {
-                    Some(line) => {
+                    Some(msg) => {
+                        // The wire encoding lives here, with the task that owns
+                        // the child, rather than in the app's send path.
+                        let line = match msg {
+                            SessionMsg::Turn(t) => schemaic_ai::user_message_line(&t),
+                            SessionMsg::Interrupt => schemaic_ai::interrupt_line("stop"),
+                        };
                         if stdin.write_all(line.as_bytes()).await.is_err() {
                             break;
                         }
@@ -541,35 +1008,8 @@ pub(crate) fn start_ai_session(
                         {
                             raw_output.push(l.trim().to_string());
                         }
-                        let mut changed = false;
-                        let mut done: Option<(bool, schemaic_core::transcript::TurnStats)> = None;
-                        for ev in events {
-                            match ev {
-                                schemaic_ai::StreamEvent::TurnDone { is_error, stats } => {
-                                    done = Some((is_error, stats))
-                                }
-                                other => {
-                                    turn.apply(&other);
-                                    changed = true;
-                                }
-                            }
-                        }
-                        if let Some((is_error, stats)) = done {
-                            let _ = ai_tx.send(AiStreamMsg {
-                                segs: turn.segments(),
-                                done: true,
-                                is_error,
-                                stats: (!stats.is_empty()).then_some(stats),
-                            });
-                            turn = schemaic_ai::TurnState::default();
+                        if pump.push(events) {
                             raw_output.clear(); // a clean turn boundary — drop stale diagnostics
-                        } else if changed {
-                            let _ = ai_tx.send(AiStreamMsg {
-                                segs: turn.segments(),
-                                done: false,
-                                is_error: false,
-                                stats: None,
-                            });
                         }
                     }
                     // stdout closed → `claude` exited on its own (crash / auth failure
@@ -1125,7 +1565,7 @@ fn visible_snapshot(
 /// changes. This one names a *binary*, and adopting a name that resolves to
 /// nothing buys nothing — it trades a working conversation for one that cannot
 /// start. So the path counts only when it is spawnable, which is
-/// `claude_cli::claude_reachable`: an override that resolves, or an empty value
+/// [`crate::agent_cli::harness_reachable`]: an override that resolves, or an empty value
 /// whose auto-detect succeeds. Two consequences worth stating, because both are
 /// easy to get wrong in the other direction:
 ///
@@ -1158,6 +1598,12 @@ pub(crate) fn needs_respawn(
         || prev.model != now.model
         || prev.effort != now.effort
         || prev.instructions != now.instructions
+        // Gated on reachability for exactly the reason `cli_path` is, one line
+        // down: `cli_usable` is computed from the *new* settings, so choosing a
+        // harness that is not installed keeps the working conversation instead
+        // of trading it for a binary that cannot be spawned. The settings modal
+        // shows that harness as unreachable, which is where the user finds out.
+        || (prev.harness != now.harness && cli_usable)
         || (prev.cli_path != now.cli_path && cli_usable)
 }
 
@@ -1636,6 +2082,56 @@ mod tests {
         // An older blob with no flag → samples on (nothing then read rows).
         let v = serde_json::json!({ "host": "h" });
         assert!(endpoint_from_value(&v).samples);
+    }
+
+    #[test]
+    fn the_endpoint_file_flag_is_read_only_when_it_has_a_value() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            endpoint_file_arg(&v(&[
+                "schemaic",
+                "--mcp-serve",
+                "--endpoint-file",
+                "/tmp/e.json"
+            ])),
+            Some("/tmp/e.json".to_string())
+        );
+        // Trailing flag with nothing after it: no path, so the caller falls back
+        // to the environment rather than reading an argument that isn't there.
+        assert_eq!(
+            endpoint_file_arg(&v(&["schemaic", "--mcp-serve", "--endpoint-file"])),
+            None
+        );
+        assert_eq!(
+            endpoint_file_arg(&v(&["schemaic", "--mcp-serve", "--endpoint-file", ""])),
+            None
+        );
+        assert_eq!(endpoint_file_arg(&v(&["schemaic", "--mcp-serve"])), None);
+    }
+
+    #[test]
+    fn the_codex_override_names_the_file_and_never_the_endpoint() {
+        // The app-side half of the pure guarantee in `harness::codex_mcp_overrides`:
+        // whatever we hand Codex on its command line, the credentials are not in it.
+        let db = Db::from_parts(
+            schemaic_db::Engine::MySql,
+            "h".into(),
+            3306,
+            "root".into(),
+            "hunter2".into(),
+            String::new(),
+        );
+        let endpoint = endpoint_json(&db, Some("shop"), false, true, &HashSet::new());
+        let overrides = schemaic_ai::harness::codex_mcp_overrides(
+            "/usr/bin/schemaic",
+            "/tmp/ep.json",
+            AI_TOOLS_WITH_QUERY,
+        );
+        for o in &overrides {
+            assert!(!o.contains("hunter2"), "{o}");
+            assert!(!o.contains(&endpoint), "{o}");
+        }
+        assert!(overrides[0].contains("--endpoint-file"));
     }
 
     #[test]
@@ -2355,9 +2851,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_harness_we_could_not_restrict_is_refused_before_anything_else() {
+        // Every harness, including the one the app actually drives: an
+        // unestablished constraint is not a Claude-only concern, and the
+        // "not driven yet" message must not mask it.
+        for h in Harness::ALL {
+            let why = spawn_refusal(h, Constraint::Unknown).expect("a refusal");
+            assert!(
+                why.contains("disabled") || why.contains("could not confirm"),
+                "{h:?}: {why}"
+            );
+            assert!(
+                !why.contains("not driven by this build"),
+                "{h:?} reported the lesser problem: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_driven_harnesses_run_and_the_rest_say_so() {
+        assert_eq!(spawn_refusal(Harness::Claude, Constraint::Sealed), None);
+        // A Claude that could not be fully sealed still runs — `Restricted` is
+        // runnable, and refusing it would disable the panel on an older CLI.
+        assert_eq!(spawn_refusal(Harness::Claude, Constraint::Restricted), None);
+        // Codex is driven now, and `Restricted` is the best grade it can reach,
+        // so refusing that grade would refuse the harness entirely.
+        assert_eq!(spawn_refusal(Harness::Codex, Constraint::Restricted), None);
+
+        assert_eq!(
+            spawn_refusal(Harness::Antigravity, Constraint::Restricted),
+            None
+        );
+
+        // Nothing is left out any more: Gemini was the one undriven harness and
+        // it has been removed rather than kept as a menu entry that refuses. So
+        // a runnable grade is a green light on **every** harness the enum names,
+        // and the only refusal left is the unestablished constraint above.
+        for h in Harness::ALL {
+            assert_eq!(spawn_refusal(h, Constraint::Restricted), None, "{h:?}");
+            assert!(spawn_refusal(h, Constraint::Unknown).is_some(), "{h:?}");
+        }
+    }
+
     fn settings() -> AiSettings {
         AiSettings {
-            model: AiModel::Haiku,
+            harness: Harness::Claude,
+            model: "haiku".to_string(),
             effort: AiEffort::Medium,
             data: AiData::OnRequest,
             cli_path: String::new(),
@@ -2429,7 +2969,7 @@ mod tests {
             (
                 "model",
                 AiSettings {
-                    model: AiModel::Opus,
+                    model: "opus".to_string(),
                     ..settings()
                 },
             ),
@@ -2475,6 +3015,29 @@ mod tests {
             "a path that resolves is a different `claude`"
         );
 
+        // **Changing harness is the same shape of decision.** Nothing about a
+        // live session survives it — a different binary, argv, stream dialect
+        // and MCP mechanism — so a reachable one must replace the session. An
+        // unreachable one must not, or picking a CLI you have not installed
+        // costs you the conversation you already had.
+        //
+        // The field also has to be *named* in `needs_respawn`: that function
+        // enumerates its comparisons rather than deriving them, so a field added
+        // to `AiSettings` and not added there is ignored in silence. This test
+        // is what noticed.
+        let other_harness = AiSettings {
+            harness: Harness::Codex,
+            ..settings()
+        };
+        assert!(
+            needs_respawn(Some((7, &live)), 7, &other_harness, true),
+            "a reachable new harness is a different process entirely"
+        );
+        assert!(
+            !needs_respawn(Some((7, &live)), 7, &other_harness, false),
+            "a harness that is not installed must not cost the user their session"
+        );
+
         // **Manual → empty is a change like any other**, and the easy way to get
         // this wrong is to read "empty" as "nothing set" and skip it. Empty
         // means *auto-detect*, which resolves to a binary the live session was
@@ -2497,7 +3060,7 @@ mod tests {
         // And an unusable path is not a licence to ignore the rest: a model
         // change still replaces the session while the path stays broken.
         let both = AiSettings {
-            model: AiModel::Opus,
+            model: "opus".to_string(),
             ..manual.clone()
         };
         assert!(needs_respawn(Some((7, &live)), 7, &both, false));

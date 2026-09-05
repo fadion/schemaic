@@ -1,11 +1,21 @@
-//! Claude Code CLI integration for Schemaic's AI panel.
+//! Agent-CLI integration for Schemaic's AI panel.
 //!
-//! We drive one long-lived `claude` process per conversation in streaming mode
-//! (`-p --input-format stream-json --output-format stream-json --include-partial-messages`):
-//! user turns are written to stdin as JSON lines and the response streams back
-//! as JSONL events. This crate is pure — arg building, the stdin encoder, and
+//! Schemaic drives whichever agent CLI the user has installed. For `claude` that
+//! is one long-lived process per conversation in streaming mode (`-p
+//! --input-format stream-json --output-format stream-json
+//! --include-partial-messages`): user turns are written to stdin as JSON lines
+//! and the response streams back as JSONL events. The other harnesses have no
+//! such bidirectional protocol and run one process per turn, resuming the last
+//! by id. This crate is pure — arg building, the stdin encoder, and
 //! parsing/accumulating the event stream into a renderable transcript. The app
 //! owns the subprocess and the async→UI marshalling.
+//!
+//! [`harness`] holds the harness identity, its capabilities and the constraint
+//! each one is launched under; [`stream`] holds the per-dialect decoding. What
+//! is left here is Claude's own dialect and the pieces common to all of them.
+
+pub mod harness;
+pub mod stream;
 
 use schemaic_core::transcript::{Seg, ToolCall, TurnStats};
 
@@ -147,7 +157,7 @@ pub fn seal_from_help(help: &str) -> CliSeal {
 /// had. Deliberately *not* the three sealing flags — their absence is the
 /// answer this function is qualifying, so testing for them would make the gate
 /// circular and it could never seal.
-fn looks_like_help(help: &str) -> bool {
+pub(crate) fn looks_like_help(help: &str) -> bool {
     ["--help", "--print", "--model", "--version"]
         .iter()
         .any(|f| mentions_flag(help, f))
@@ -159,7 +169,7 @@ fn looks_like_help(help: &str) -> bool {
 /// `--disallowedTools` are near enough that a bare `contains` is the kind of
 /// match that starts passing for the wrong reason after a rename. The character
 /// after the flag has to end it.
-fn mentions_flag(help: &str, flag: &str) -> bool {
+pub(crate) fn mentions_flag(help: &str, flag: &str) -> bool {
     help.match_indices(flag).any(|(i, _)| {
         help[i + flag.len()..]
             .chars()
@@ -251,11 +261,16 @@ pub fn build_session_args(
     // All three ahead of the variadic --allowedTools/--disallowedTools, which
     // would read a later flag's name as a tool name.
     a.extend(seal_args(seal));
-    if let Some(m) = model {
+    // **Empty is a value, and it means "the CLI's own default".** The settings
+    // field is clearable and a harness switch clears it outright, so `Some("")`
+    // arrives here on ordinary paths; passing `--model ""` kills the spawn on a
+    // rejected id and the panel reports it as an installation problem.
+    // `harness::turn_args` skips an empty id for the same reason.
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         a.push("--model".into());
         a.push(m.into());
     }
-    if let Some(e) = effort {
+    if let Some(e) = effort.map(str::trim).filter(|e| !e.is_empty()) {
         a.push("--effort".into());
         a.push(e.into());
     }
@@ -298,9 +313,15 @@ pub fn inline_args(intent: &str, system: &str, model: &str, seal: CliSeal) -> Ve
         intent.into(),
         "--append-system-prompt".into(),
         system.into(),
-        "--model".into(),
-        model.into(),
     ];
+    // Empty means Claude's own default — see [`build_session_args`]. It arrives
+    // here whenever another harness drives the chat panel, because the model the
+    // user picked there is that harness's and `agent_cli::inline_claude_model`
+    // declines to hand it to a Claude spawn.
+    if !model.trim().is_empty() {
+        a.push("--model".into());
+        a.push(model.into());
+    }
     a.extend(seal_args(seal));
     a
 }
@@ -396,6 +417,13 @@ pub enum StreamEvent {
     ToolResult { text: String, is_error: bool },
     /// The turn finished, with its cost/usage summary.
     TurnDone { is_error: bool, stats: TurnStats },
+    /// The harness named the session/thread it just opened.
+    ///
+    /// Carries no transcript content — it exists because the one-process-per-turn
+    /// harnesses have no persistent pipe to hold a conversation open, and resume
+    /// the previous turn by id instead. The app keeps the last id it saw and
+    /// hands it back on the next turn; [`TurnState`] ignores it.
+    SessionStarted { id: String },
 }
 
 /// Parse one output line into zero or more [`StreamEvent`]s.
@@ -535,7 +563,9 @@ impl TurnState {
                     tc.is_error = *is_error;
                 }
             }
-            StreamEvent::TurnDone { .. } => {}
+            // Neither ends or renders anything: the turn footer is built from
+            // the `TurnDone` stats by the caller, and a session id is plumbing.
+            StreamEvent::TurnDone { .. } | StreamEvent::SessionStarted { .. } => {}
         }
     }
 
@@ -730,6 +760,36 @@ mod tests {
         assert!(a[d + 1..].contains(&"Bash".to_string()));
         assert!(a[d + 1..].contains(&"WebSearch".to_string()));
         assert_eq!(a[d + 1..].len(), DISALLOWED_TOOLS.len());
+    }
+
+    /// **The empty string is a value the app produces, not a hypothetical.** The
+    /// settings field is clearable, its placeholder says *"Leave empty for the
+    /// harness's default"*, and the harness-switch effect sets it to `""`
+    /// outright — so `Some("")` reaches here on any of those paths and
+    /// `--model ""` is rejected by the CLI, killing the panel with a generic
+    /// launch error.
+    ///
+    /// `turn_args` has always skipped an empty id, and the test that was meant to
+    /// pin this looped `Harness::ALL` against *that* function — where the Claude
+    /// arm returns `Vec::new()` and the assertion passed vacuously. Claude's argv
+    /// is built here instead, which is the seam that was never covered.
+    #[test]
+    fn an_empty_model_or_effort_is_omitted_rather_than_passed_as_an_empty_flag() {
+        let a = build_session_args("ctx", Some(""), Some(""), None, &[], CliSeal::ALL);
+        assert!(!a.contains(&"--model".to_string()), "{a:?}");
+        assert!(!a.contains(&"--effort".to_string()), "{a:?}");
+        // Whitespace is the same non-answer: a field holding " " is empty to the
+        // user, and `" "` is not a model id to any CLI.
+        let b = build_session_args("ctx", Some("  "), Some(" "), None, &[], CliSeal::ALL);
+        assert!(!b.contains(&"--model".to_string()), "{b:?}");
+        assert!(!b.contains(&"--effort".to_string()), "{b:?}");
+        // A real id still travels, and untrimmed values are not silently edited
+        // beyond the emptiness question.
+        let c = build_session_args("ctx", Some("opus"), Some("high"), None, &[], CliSeal::ALL);
+        let m = c.iter().position(|x| x == "--model").expect("--model");
+        assert_eq!(c[m + 1], "opus");
+        let e = c.iter().position(|x| x == "--effort").expect("--effort");
+        assert_eq!(c[e + 1], "high");
     }
 
     #[test]
@@ -929,7 +989,7 @@ mod tests {
         assert_eq!(seal_from_help(old), CliSeal::NONE);
     }
 
-    /// The exit status is part of the answer, and `claude_seal` was holding it
+    /// The exit status is part of the answer, and the app's probe was holding it
     /// and throwing it away: a `--help` that fails loudly is not a help text,
     /// whatever it managed to print first.
     #[test]

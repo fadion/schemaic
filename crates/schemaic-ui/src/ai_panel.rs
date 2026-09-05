@@ -77,6 +77,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let gutter = ui.ai.gutter;
     let cli_path = ui.ai.cli_path;
     let cli_ok = ui.ai_actions.cli_ok.clone();
+    let panel_harness = ui.ai.harness;
     // Actions for code-block bars: insert into a new query tab, and run.
     //
     // The chat is about the tab the user is looking at, so a code block from it
@@ -245,15 +246,23 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             if is_empty {
                 ai_seen().set(0); // new/cleared conversation → next messages pop in
                 // Left-aligned placeholder: 10px below the title, 15px from the
-                // left, 14px. Flips to "Claude not connected." when Claude isn't
-                // reachable (auto-detect failed, or a bad manual path).
+                // left, 14px. Flips to "<Harness> not connected." when the
+                // selected CLI isn't reachable (auto-detect failed, or a bad
+                // manual path).
+                //
+                // **It names the harness the user chose**, because `available`
+                // has answered per-harness since the picker existed while this
+                // string stayed literal: with Codex selected and no `codex` on
+                // PATH it read "Claude not connected.", sending the user to check
+                // an installation that was not the one in question. The settings
+                // modal was fixed for this exact reason; the panel was left
+                // behind.
                 return dyn_container(
-                    move || available.get(),
-                    move |ok| {
-                        let msg = if ok {
-                            "Ask about your SQL..."
-                        } else {
-                            "Claude not connected."
+                    move || (available.get(), panel_harness.get()),
+                    move |(ok, h)| {
+                        let msg = match ok {
+                            true => "Ask about your SQL...".to_string(),
+                            false => format!("{} not connected.", h.label()),
                         };
                         text(msg)
                             .style(|s| {

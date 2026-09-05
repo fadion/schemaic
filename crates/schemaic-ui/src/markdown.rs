@@ -562,8 +562,11 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
         // wrote — which is what they need to tell it what went wrong.
         Err(e) => {
             return v_stack((
+                // "The assistant", not "Claude": this renderer has no harness to
+                // hand and the panel is driven by whichever CLI the user picked,
+                // so naming one vendor here would be wrong for two of the three.
                 text(format!(
-                    "Claude proposed a change that couldn't be read — {e}"
+                    "The assistant proposed a change that couldn't be read — {e}"
                 ))
                 .style(|s| {
                     s.width_full()

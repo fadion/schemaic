@@ -11,8 +11,9 @@
 //! active connection's databases. DB IO runs on the tokio runtime and results
 //! are marshalled back through Floem's async→UI seam.
 
+mod agent_cli;
 mod ai;
-mod claude_cli;
+mod antigravity;
 mod conn_sources;
 mod dump;
 mod heap;
@@ -28,12 +29,12 @@ mod update;
 #[global_allocator]
 static GLOBAL: heap::Tracking = heap::Tracking;
 
+use agent_cli::{detect_bin, harness_bin, harness_reachable, probe};
 use ai::{
     AiContextParams, AiSession, AiSettings, AiStreamMsg, RECAP_QUESTIONS, StartAiParams,
     active_tab_database, ai_context, apply_turn_delta, extract_sql, inline_system_prompt,
     mcp_endpoint_from_env, needs_respawn, render_recap, start_ai_session, turn_context,
 };
-use claude_cli::{claude_bin, claude_reachable, claude_seal, detect_claude_bin};
 use schemaic_core::tabsel::scoped_database;
 
 use std::cell::{Cell, RefCell};
@@ -139,6 +140,7 @@ type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
 ///
 /// One call for the whole slice, and one file write for both halves.
 type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)], &[u64])>;
+use schemaic_ai::harness::Harness;
 use schemaic_core::filter::{BrowseKey, Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::params;
@@ -151,21 +153,29 @@ use schemaic_core::tx::{
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiScale, UiThemeKind};
 use schemaic_ui::{
-    ActivityActions, ActivityState, ActivityUi, AiActions, AiEffort, AiModel, AiUi, ChatMessage,
-    Confirm, ConnActions, ConnImportUi, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals,
-    HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry, OverlayUi,
-    PendingRun, PlanState, RightPanel, Role, RunGuard, SchemaActions, SchemaScope, SchemaUi,
-    SnippetActions, SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi,
-    TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
+    ActivityActions, ActivityState, ActivityUi, AiActions, AiEffort, AiUi, ChatMessage, Confirm,
+    ConnActions, ConnImportUi, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals, HistoryActions,
+    HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry, OverlayUi, PendingRun,
+    PlanState, RightPanel, Role, RunGuard, SchemaActions, SchemaScope, SchemaUi, SnippetActions,
+    SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, TxChoice,
+    TxPrompt, Ui, pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 fn main() {
-    // MCP stdio server mode (launched by the `claude` CLI for the AI panel).
-    // Runs the JSON-RPC loop and exits — no GUI. The (already-tunnelled) endpoint
-    // arrives as a JSON blob in `$SCHEMAIC_MCP_ENDPOINT` (set via the MCP config
-    // file, never a command-line arg — review C6). No credential URL is involved.
+    // MCP stdio server mode (launched by whichever agent CLI drives the AI
+    // panel). Runs the JSON-RPC loop and exits — no GUI.
+    //
+    // The (already-tunnelled) endpoint reaches us two ways, and **neither is a
+    // command-line argument** (review C6): as a JSON blob in
+    // `$SCHEMAIC_MCP_ENDPOINT`, which is what a harness configured by a file we
+    // write sets for us (Claude); or read from the path given as
+    // `--endpoint-file`, for Codex, whose only configuration lever is `-c`
+    // overrides and those *are* argv, and for Antigravity, whose `agy mcp add`
+    // takes the child's argv the same way. The path is not a credential; what it
+    // points at is, which is the whole reason it is not inlined. No credential
+    // URL is involved either way.
     if std::env::args().any(|a| a == "--mcp-serve") {
         let endpoint = mcp_endpoint_from_env();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1344,8 +1354,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let editor_collapsed: RwSignal<bool> = RwSignal::new(false);
     // AI Assistant settings (gear → modal), restored from disk.
     let ai_settings_open = RwSignal::new(false);
+    // Which agent CLI drives the panel. An unrecognised persisted key falls back
+    // to Claude *and says so* — `Harness::from_key` refuses to guess precisely so
+    // this decision is made where there is a UI to report it.
+    if Harness::from_key(&ui_state.ai_harness).is_none() {
+        // Said out loud rather than swallowed. The substitution is otherwise
+        // invisible: the panel would drive Claude while `ui_state.json` names
+        // something else, and the only symptom is an assistant behaving unlike
+        // the CLI the user believes they picked.
+        tracing::warn!(
+            harness = %ui_state.ai_harness,
+            "unknown AI harness in ui_state.json; falling back to Claude Code"
+        );
+    }
+    let ai_harness =
+        RwSignal::new(Harness::from_key(&ui_state.ai_harness).unwrap_or(Harness::Claude));
     let ai_cli_path = RwSignal::new(ui_state.ai_cli_path.clone());
-    let ai_model = RwSignal::new(AiModel::from_cli(&ui_state.ai_model));
+    // Verbatim from disk. No `from_cli` narrowing any more — the value the file
+    // names is the value that runs, including one this build has never heard of.
+    let ai_model = RwSignal::new(ui_state.ai_model.clone());
     let ai_effort = RwSignal::new(AiEffort::from_cli(&ui_state.ai_effort));
     let ai_instructions = RwSignal::new(ui_state.ai_instructions.clone());
     let ai_schema_scope = RwSignal::new(SchemaScope::from_key(&ui_state.ai_schema_scope));
@@ -1393,18 +1420,74 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     create_effect(move |_| schemaic_ui::theme::set_editor_tab_width(tab_width.get()));
     create_effect(move |_| schemaic_ui::theme::set_editor_soft_tabs(soft_tabs.get()));
     create_effect(move |_| schemaic_ui::theme::set_editor_word_wrap(word_wrap.get()));
-    let ai_detected_path = detect_claude_bin();
-    // Probe what sealing flags this CLI takes now, off-thread, so the first AI
-    // action doesn't pay for it — see `claude_cli::claude_seal`.
+    // Probe what this CLI takes now, off-thread, so the first AI action doesn't
+    // pay for it — see `agent_cli::probe`.
     //
     // **Warmed on the path the spawn will actually use**, which is
-    // `claude_bin(&ai_cli_path)` — the same expression every AI action resolves.
-    // Warming the *auto-detected* path instead keyed the cache differently from
-    // every reader whenever the user set an AI CLI override, so each of the four
-    // AI entry points paid a blocking, timeout-free `--help` on the UI thread.
-    // The effect re-warms when the setting changes, for the same reason.
+    // `harness_bin(h, &ai_cli_path)` — the same expression every AI action
+    // resolves. Warming the *auto-detected* path instead keyed the cache
+    // differently from every reader whenever the user set an AI CLI override, so
+    // each of the four AI entry points paid a blocking, timeout-free `--help` on
+    // the UI thread. The effect re-warms when the setting changes, for the same
+    // reason — and now on the **harness** too, which is a second key into the
+    // same cache and a second way to warm an entry nobody reads.
     create_effect(move |_| {
-        claude_cli::warm_seal_cache(claude_bin(&ai_cli_path.get()));
+        let h = ai_harness.get();
+        agent_cli::warm_probe_cache(h, harness_bin(h, &ai_cli_path.get()));
+    });
+    // Antigravity is the one harness Schemaic configures by writing into the
+    // *user's* files, so a session that never ran its cleanup leaves an MCP
+    // registration and a set of tool permissions behind. Neither expires, and a
+    // standing grant nobody remembers making is exactly what must not outlive
+    // the process that needed it — so any are removed at startup, off-thread
+    // because it shells out. See `antigravity::sweep` for the one case this
+    // cannot distinguish (a second running Schemaic).
+    {
+        let agy = detect_bin(Harness::Antigravity);
+        std::thread::spawn(move || antigravity::sweep(agy.as_deref()));
+    }
+    // **A path override belongs to the harness it was typed for.** `ai_cli_path`
+    // is one field shared by every harness, so leaving it behind across a switch
+    // points the new CLI's spawn at the old CLI's binary — pick Codex after
+    // setting a Claude path and `harness_bin` resolves it, spawning *Claude*
+    // with Codex's argv. It dies on the first unknown flag and reports it as an
+    // installation problem, which is the one thing that is not wrong with it.
+    //
+    // **And so does the model id**, for the same reason and with a quieter
+    // failure: `ai_model` is one field too, and no CLI's `--model` accepts
+    // another CLI's ids — pick Codex while the field says `haiku` and the
+    // session dies on an unknown model, having been configured by a value the
+    // user last chose for a different program. Empty already means "the
+    // harness's default" and omits the flag entirely, so clearing lands on the
+    // one id every harness is guaranteed to take.
+    //
+    // **Effort is clamped rather than cleared**, because unlike the other two it
+    // has no "the harness's default" value — the setting is a closed enum and
+    // every level in it means something. `Extra` is Claude's `xhigh` and
+    // Antigravity's flag stops at `high`, so the switch moves the selection down
+    // to the highest level the new harness advertises. The argv is already
+    // clamped by `Harness::effort_arg`, so this is about what the modal *shows*:
+    // the closed dropdown renders the selected level unconditionally, and a box
+    // reading "Extra" over a harness that neither offers nor sends it is the
+    // stale caption this effect exists to prevent.
+    //
+    // Clearing falls back to auto-detect for the new harness, which is both
+    // right and what the empty value already means. The effect's return value is
+    // the previous harness: on the first run there is none, and clearing then
+    // would discard the override restored from `ui_state.json` before the user
+    // has touched anything.
+    create_effect(move |prev: Option<Harness>| {
+        let now = ai_harness.get();
+        if let Some(prev) = prev
+            && prev != now
+        {
+            ai_cli_path.set(String::new());
+            ai_model.set(String::new());
+            if let Some(e) = ai_effort.get_untracked().clamped_to(now.effort_levels()) {
+                ai_effort.set(e);
+            }
+        }
+        now
     });
     let db_menu_open = RwSignal::new(false);
     let schema_menu_open = RwSignal::new(false);
@@ -6130,8 +6213,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             schema_w: schema_w.get_untracked(),
             right_w: right_w.get_untracked(),
             editor_h: editor_h.get_untracked(),
+            ai_harness: ai_harness.get_untracked().key().to_string(),
             ai_cli_path: ai_cli_path.get_untracked(),
-            ai_model: ai_model.get_untracked().cli().to_string(),
+            ai_model: ai_model.get_untracked(),
             ai_effort: ai_effort.get_untracked().cli().to_string(),
             ai_instructions: ai_instructions.get_untracked(),
             ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
@@ -8768,6 +8852,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             .unwrap_or_default()
     };
     let ai_settings_now = move || AiSettings {
+        harness: ai_harness.get_untracked(),
         model: ai_model.get_untracked(),
         effort: ai_effort.get_untracked(),
         data: conn_ai_data(),
@@ -8806,7 +8891,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .map(|s| (s.conn_id, &s.settings)),
                 active_id,
                 &settings_now,
-                claude_reachable(&settings_now.cli_path),
+                harness_reachable(settings_now.harness, &settings_now.cli_path),
             );
             // The live context as it stands *now* — the system prompt is written
             // once at spawn, so every later turn carries the delta (see
@@ -8851,7 +8936,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             db,
                             database,
                             ai_tx: ai_tx.clone(),
-                            model: ai_model.get_untracked().cli().to_string(),
+                            harness: ai_harness.get_untracked(),
+                            model: ai_model.get_untracked(),
                             effort: ai_effort.get_untracked().cli().to_string(),
                             data: data_now,
                             cli_path: ai_cli_path.get_untracked(),
@@ -8957,7 +9043,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     &asked,
                 );
                 s.last_context = context_now;
-                let _ = s.stdin_tx.send(schemaic_ai::user_message_line(&turn));
+                let _ = s.stdin_tx.send(ai::SessionMsg::Turn(turn));
             } else {
                 // Unreachable by construction (`need_new` either spawned one or
                 // returned above), but the cost of being wrong is a spinner that
@@ -8989,7 +9075,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let sent = ai_session
                 .borrow()
                 .as_ref()
-                .map(|s| s.stdin_tx.send(schemaic_ai::interrupt_line("stop")).is_ok())
+                .map(|s| s.stdin_tx.send(ai::SessionMsg::Interrupt).is_ok())
                 .unwrap_or(false);
             if !sent {
                 // No live session (or its channel is gone) — fall back to the
@@ -9103,7 +9189,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // only place that path is typed, so this call site was the only one
             // where that could happen.
             let current = ai_settings_now();
-            let usable = claude_reachable(&current.cli_path);
+            let usable = harness_reachable(current.harness, &current.cli_path);
             let conn_now = active_conn.get_untracked();
             let changed = ai_session.borrow().as_ref().is_some_and(|s| {
                 needs_respawn(Some((s.conn_id, &s.settings)), conn_now, &current, usable)
@@ -9164,16 +9250,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 ai_schema_scope.get_untracked(),
             );
             let intent = req.intent.clone();
-            let bin = claude_bin(&ai_cli_path.get_untracked());
-            // Follow the AI panel's model choice (one place to change it).
-            let model = ai_model.get_untracked().cli().to_string();
+            // Claude-only: this argv is `inline_args`. See `inline_claude_bin`.
+            let bin = agent_cli::inline_claude_bin(
+                ai_harness.get_untracked(),
+                &ai_cli_path.get_untracked(),
+            );
+            // Follow the AI panel's model choice, but only when that choice is
+            // one Claude can take — see `inline_claude_model`, which is
+            // `inline_claude_bin`'s counterpart for the id.
+            let model = agent_cli::inline_claude_model(
+                ai_harness.get_untracked(),
+                &ai_model.get_untracked(),
+            );
             let send = create_ext_action(cx, move |state: InlineAiState| inline_ai.set(state));
             // **The same pre-spawn check the chat panel makes**, because it is
             // the same argv entry and the same platform limit. Without it an
             // oversize prompt surfaced as `os error 206`, which names the one
             // cause that isn't the problem — and Ctrl+K on a large catalogue was
             // simply broken with nothing on screen to say why.
-            let args = schemaic_ai::inline_args(&intent, &system, &model, claude_seal(&bin));
+            let args = schemaic_ai::inline_args(
+                &intent,
+                &system,
+                &model,
+                probe(Harness::Claude, &bin).seal,
+            );
             if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
                 inline_ai.set(InlineAiState::Failed(why));
                 return;
@@ -9261,8 +9361,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // introspection hasn't run — the sample still carries conventions).
                 // The implicit row key is dropped: `sample_sql` doesn't project one.
                 let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
-                let bin = claude_bin(&ai_cli_path.get_untracked());
-                let model = ai_model.get_untracked().cli().to_string();
+                // Claude-only: this argv is `inline_args`. See `inline_claude_bin`.
+                let bin = agent_cli::inline_claude_bin(
+                    ai_harness.get_untracked(),
+                    &ai_cli_path.get_untracked(),
+                );
+                let model = agent_cli::inline_claude_model(
+                    ai_harness.get_untracked(),
+                    &ai_model.get_untracked(),
+                );
                 let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
                 let schemaic_ui::AiFillRequest {
                     source,
@@ -9290,8 +9397,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let system = "You output only the requested raw value — no quotes, \
                                   no markdown, no prose.";
                     // Before the move into `Command::new`, and normally a cache
-                    // hit — `warm_seal_cache` ran at startup.
-                    let seal = claude_seal(&bin);
+                    // hit — `warm_probe_cache` ran at startup.
+                    let seal = probe(Harness::Claude, &bin).seal;
                     let out = Command::new(bin)
                         .args(schemaic_ai::inline_args(&prompt, system, &model, seal))
                         // Close stdin so `claude -p` doesn't stall ~3s waiting for
@@ -9344,8 +9451,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 // The implicit row key is dropped: `sample_sql` doesn't project one.
                 let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
-                let bin = claude_bin(&ai_cli_path.get_untracked());
-                let model = ai_model.get_untracked().cli().to_string();
+                // Claude-only: this argv is `inline_args`. See `inline_claude_bin`.
+                let bin = agent_cli::inline_claude_bin(
+                    ai_harness.get_untracked(),
+                    &ai_cli_path.get_untracked(),
+                );
+                let model = agent_cli::inline_claude_model(
+                    ai_harness.get_untracked(),
+                    &ai_model.get_untracked(),
+                );
                 let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));
                 let schemaic_ui::AiSeedRequest {
                     source,
@@ -9372,8 +9486,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let system = "You output only a JSON array of row objects — no \
                                   markdown, no prose.";
                     // Before the move into `Command::new`, and normally a cache
-                    // hit — `warm_seal_cache` ran at startup.
-                    let seal = claude_seal(&bin);
+                    // hit — `warm_probe_cache` ran at startup.
+                    let seal = probe(Harness::Claude, &bin).seal;
                     let out = Command::new(bin)
                         .args(schemaic_ai::inline_args(&prompt, system, &model, seal))
                         // Close stdin so `claude -p` doesn't stall ~3s waiting for
@@ -10223,6 +10337,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             input: ai_input,
             busy: ai_busy,
             settings_open: ai_settings_open,
+            harness: ai_harness,
             cli_path: ai_cli_path,
             model: ai_model,
             effort: ai_effort,
@@ -10240,10 +10355,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             new_chat: ai_new_chat,
             regenerate: ai_regenerate,
             apply: ai_apply,
-            cli_ok: Rc::new(|p: String| claude_reachable(&p)),
+            // Reads the harness signal rather than closing over a value: the
+            // modal's red hint must follow the dropdown the user is changing in
+            // the same modal, and a captured harness would validate the path
+            // against whichever CLI was selected when the closure was built.
+            cli_ok: Rc::new(move |p: String| harness_reachable(ai_harness.get_untracked(), &p)),
             inline_run: inline_ai_run,
             inline_cancel: inline_ai_cancel,
-            detected_path: ai_detected_path,
+            // Both read the harness signal at call time rather than closing over
+            // a value: the modal asks them again on every harness change, and a
+            // captured answer would describe whichever CLI was selected when the
+            // closure was built.
+            detect_path: Rc::new(move || detect_bin(ai_harness.get_untracked())),
+            constraint_notice: Rc::new(move || {
+                let h = ai_harness.get_untracked();
+                let bin = harness_bin(h, &ai_cli_path.get_untracked());
+                // The same probe the spawn gate consults, so the modal cannot
+                // promise a grade the session then refuses. Cached per
+                // (harness, path), so this is not a spawn per keystroke.
+                probe(h, &bin).constraint.notice(h)
+            }),
         }),
         history: HistoryUi {
             entries: history_entries,
