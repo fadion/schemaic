@@ -8837,6 +8837,38 @@ fn cell_calendar_editor(
         .into_any()
 }
 
+/// A staged cell as the drawn cell compares it — everything `data_cell`'s
+/// content reads, with a blob's **bytes** kept out of the comparison.
+///
+/// This exists only so `data_cell`'s memo can dedup. `CellEdit` derives
+/// `PartialEq`, so comparing two `Bytes` compares the buffers — a `memcmp`
+/// bounded only by what the panel will load, which `blob::LOAD_CAP` puts at
+/// 64 MiB — on a value whose whole reason for being an `Arc` is that it is
+/// cloned far more often than it is written. The memo would have paid that on
+/// every notification of `dirty`, which is exactly the cost it was added to
+/// remove.
+///
+/// `Arc::ptr_eq` is the comparison, and it is the safe direction of wrong: two
+/// different `Arc`s over identical bytes compare unequal and cost one needless
+/// rebuild of one cell — the behaviour before the memo existed — while nothing
+/// can ever be called equal that is not. (Equal-by-length would also be sound
+/// here, since a blob draws as `<n bytes>` and two blobs of a size are drawn
+/// identically, but it is a claim about the painter that would quietly become
+/// false the day a cell shows anything else about a value.)
+#[derive(Clone, Debug)]
+struct StagedFace(Option<CellEdit>);
+
+impl PartialEq for StagedFace {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(CellEdit::Bytes(a)), Some(CellEdit::Bytes(b))) => Arc::ptr_eq(a, b),
+            (a, b) => a == b,
+        }
+    }
+}
+
+impl Eq for StagedFace {}
+
 fn data_cell(
     gs: GridState,
     i: usize,
@@ -8871,263 +8903,280 @@ fn data_cell(
     // (possibly edited) value. The original value is read from `gs.rs` here so a
     // post-commit splice (which updates `gs.rs`) refreshes the cell in place;
     // dirty values show the pending edit.
-    let content = dyn_container(
-        move || {
-            // `None` = not staged; `Some(..)` is the staged `CellEdit`.
-            // A pending new row reads from `new_rows` (no original); real rows read
-            // the staged edit from `dirty` and the original from `rs`.
-            let fmt = gs
-                .formats
-                .with(|f| f.get(ci).copied().unwrap_or(ColumnFormat::None));
-            let (staged, orig, orig_null): (Option<CellEdit>, String, bool) = match pending {
-                Some(p) => {
-                    let staged = gs
-                        .new_rows
-                        .with(|rows| rows.get(p).and_then(|r| r.get(&ci).cloned()));
-                    (staged, String::new(), false)
+    // **A memo, not a bare key closure, and that distinction is the whole fix.**
+    // Every signal read below is *grid-wide* — `formats`, `dirty`/`new_rows`,
+    // `rs`, `edit_cell` — while what it computes is about one cell. A
+    // `dyn_container` key has no equality of its own (`create_updater` fires
+    // `on_change` on every re-run and `swap_val` disposes the child scope and
+    // rebuilds it unconditionally), so one notification of `dirty` rebuilt the
+    // content view of *every mounted cell*: at a maximised window's ~40 × 25
+    // that is ~1,000 rebuilds, and one Tab-hop during data entry writes `dirty`
+    // once and `edit_cell` twice, so ~3,000. `create_memo` dedups on `PartialEq`
+    // and notifies only when the value differs, so a write about another cell
+    // now stops here.
+    //
+    // The same device the column window (`win`) uses a few thousand lines up,
+    // for the same reason and with the same caveat: computing the tuple in the
+    // key closure does **not** help — the Ctrl+K popup tried exactly that — the
+    // dedup has to be a memo.
+    //
+    // `StagedFace` rather than `Option<CellEdit>` so the dedup cannot turn into
+    // a `memcmp` over a staged blob; see its doc.
+    let key = create_memo(move |_| {
+        // `None` = not staged; `Some(..)` is the staged `CellEdit`.
+        // A pending new row reads from `new_rows` (no original); real rows read
+        // the staged edit from `dirty` and the original from `rs`.
+        let fmt = gs
+            .formats
+            .with(|f| f.get(ci).copied().unwrap_or(ColumnFormat::None));
+        let (staged, orig, orig_null): (Option<CellEdit>, String, bool) = match pending {
+            Some(p) => {
+                let staged = gs
+                    .new_rows
+                    .with(|rows| rows.get(p).and_then(|r| r.get(&ci).cloned()));
+                (staged, String::new(), false)
+            }
+            None => {
+                let staged = gs.dirty.with(|d| d.get(&dkey).cloned());
+                let (orig, orig_null) = gs.rs.with(|rs| match rs.cell(data_idx, ci) {
+                    Some(c) => (format::apply(fmt, &c.to_value()), c.is_null()),
+                    None => (String::new(), true),
+                });
+                (staged, orig, orig_null)
+            }
+        };
+        (
+            gs.edit_cell.get() == Some((i, ci)),
+            StagedFace(staged),
+            orig,
+            orig_null,
+        )
+    });
+    let content = dyn_container(move || key.get(), {
+        move |(is_editing, StagedFace(staged), orig, is_null): (bool, StagedFace, String, bool)| {
+            if is_editing {
+                // A column whose values are already written down edits with
+                // its own control rather than a text field. A picker replaces
+                // the field outright; a date keeps it (typing a date is often
+                // faster, and a `DATETIME`'s time of day has no calendar to
+                // come from) and drops the calendar over the grid beside it.
+                let shape = open_cell_shape(gs, ci);
+                if let CellShape::Pick(e) = shape {
+                    return cell_pick_editor(gs, i, data_idx, ci, pending, e);
                 }
-                None => {
-                    let staged = gs.dirty.with(|d| d.get(&dkey).cloned());
-                    let (orig, orig_null) = gs.rs.with(|rs| match rs.cell(data_idx, ci) {
-                        Some(c) => (format::apply(fmt, &c.to_value()), c.is_null()),
-                        None => (String::new(), true),
-                    });
-                    (staged, orig, orig_null)
-                }
-            };
-            (gs.edit_cell.get() == Some((i, ci)), staged, orig, orig_null)
-        },
-        {
-            move |(is_editing, staged, orig, is_null): (bool, Option<CellEdit>, String, bool)| {
-                if is_editing {
-                    // A column whose values are already written down edits with
-                    // its own control rather than a text field. A picker replaces
-                    // the field outright; a date keeps it (typing a date is often
-                    // faster, and a `DATETIME`'s time of day has no calendar to
-                    // come from) and drops the calendar over the grid beside it.
-                    let shape = open_cell_shape(gs, ci);
-                    if let CellShape::Pick(e) = shape {
-                        return cell_pick_editor(gs, i, data_idx, ci, pending, e);
-                    }
-                    // The field's own id, so the `FocusLost` guard below can hand
-                    // the caret back to it. Filled once the view exists — the
-                    // handler only ever reads it at event time.
-                    let field_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
-                    let field = floem::views::text_input(gs.edit_buf)
-                        .on_event(EventListener::KeyDown, move |e| {
-                            if let Event::KeyDown(ke) = e {
-                                match &ke.key.logical_key {
-                                    Key::Named(NamedKey::Enter) => {
-                                        // Stage the current cell. In a pending new row
-                                        // Enter hops to the next editable cell (fast
-                                        // data entry); in a real row it just closes.
-                                        if pending.is_some() {
-                                            advance_edit(gs, i, ci, pending, true);
-                                        } else {
-                                            gs.stage(
-                                                data_idx,
-                                                ci,
-                                                Some(gs.edit_buf.get_untracked()),
-                                            );
-                                            gs.edit_cell.set(None);
-                                            refocus_grid(gs);
-                                        }
-                                        return EventPropagation::Stop;
+                // The field's own id, so the `FocusLost` guard below can hand
+                // the caret back to it. Filled once the view exists — the
+                // handler only ever reads it at event time.
+                let field_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+                let field = floem::views::text_input(gs.edit_buf)
+                    .on_event(EventListener::KeyDown, move |e| {
+                        if let Event::KeyDown(ke) = e {
+                            match &ke.key.logical_key {
+                                Key::Named(NamedKey::Enter) => {
+                                    // Stage the current cell. In a pending new row
+                                    // Enter hops to the next editable cell (fast
+                                    // data entry); in a real row it just closes.
+                                    if pending.is_some() {
+                                        advance_edit(gs, i, ci, pending, true);
+                                    } else {
+                                        gs.stage(data_idx, ci, Some(gs.edit_buf.get_untracked()));
+                                        gs.edit_cell.set(None);
+                                        refocus_grid(gs);
                                     }
-                                    Key::Named(NamedKey::Tab) => {
-                                        // Tab / Shift+Tab hop to the next / previous
-                                        // editable cell (staging the current one).
-                                        // Intercepted so it doesn't move window focus.
-                                        advance_edit(gs, i, ci, pending, !ke.modifiers.shift());
-                                        return EventPropagation::Stop;
-                                    }
-                                    // **Escape is not here**, and cannot be:
-                                    // floem's `text_input` handles it in
-                                    // `event_before_children` (clearing the
-                                    // window focus) and reports it processed, so
-                                    // no listener of ours runs. What that leaves
-                                    // behind is picked up by `FocusLost` below.
-                                    _ => {}
+                                    return EventPropagation::Stop;
                                 }
-                            }
-                            EventPropagation::Continue
-                        })
-                        // Losing focus (Esc, clicking elsewhere, etc.) discards —
-                        // only Enter keeps the value. Guard: close only if THIS cell
-                        // is still the open editor — a Tab/Enter hop has already
-                        // repointed `edit_cell` to the next cell, and this input's
-                        // focus-loss must not clobber that.
-                        .on_event(EventListener::FocusLost, move |_| {
-                            // **A press inside this cell's own calendar is not
-                            // the user leaving.** Floem takes the window focus on
-                            // *every* pointer-down and hands it back only to a
-                            // focusable view under the cursor — and a day, a month
-                            // arrow and the Now button are none of them. So the
-                            // first click in the panel arrived here as a focus
-                            // loss, closed the editor, and the pick it was about
-                            // to make landed on a cell that was no longer being
-                            // edited. What closes the editor in that case is the
-                            // panel itself (`cell_calendar_editor`).
-                            //
-                            // **The press, not the panel, is the question.**
-                            // Standing down whenever a panel was merely *open*
-                            // meant Escape — which reaches this handler and
-                            // nothing else, `text_input` having answered it by
-                            // dropping the window focus — closed neither the
-                            // editor nor the panel, and left the grid with no
-                            // keyboard and no way back but the mouse.
-                            if cell_calendar_up(gs) && cell_editors::take_calendar_press() {
-                                // **And hand the caret straight back**, or the
-                                // field survives the click without the keyboard:
-                                // paging a month would leave a `DATETIME`'s time
-                                // of day untypable and Enter/Tab going to the
-                                // window root, which is the one thing keeping the
-                                // field beside the panel was for. Floem gives the
-                                // focus back only to a focusable view under the
-                                // cursor, and a month arrow is not one — so it has
-                                // to be asked for here. (The caret lands at the end
-                                // of the value: `text_input` drops its selection
-                                // and moves the cursor there on regaining focus.)
-                                if let Some(id) = field_id.get_untracked() {
-                                    id.request_focus();
+                                Key::Named(NamedKey::Tab) => {
+                                    // Tab / Shift+Tab hop to the next / previous
+                                    // editable cell (staging the current one).
+                                    // Intercepted so it doesn't move window focus.
+                                    advance_edit(gs, i, ci, pending, !ke.modifiers.shift());
+                                    return EventPropagation::Stop;
                                 }
-                                return EventPropagation::Continue;
+                                // **Escape is not here**, and cannot be:
+                                // floem's `text_input` handles it in
+                                // `event_before_children` (clearing the
+                                // window focus) and reports it processed, so
+                                // no listener of ours runs. What that leaves
+                                // behind is picked up by `FocusLost` below.
+                                _ => {}
                             }
-                            if gs.edit_cell.get_untracked() == Some((i, ci)) {
-                                gs.edit_cell.set(None);
-                                // Escape came through here rather than through a
-                                // key handler, and took the keyboard with it —
-                                // see `reclaim_keyboard` for why the pointer is
-                                // what decides whether to take it back.
-                                let over = gs
-                                    .focus_id
-                                    .get_untracked()
-                                    .map(|f| f.layout_rect())
-                                    .is_some_and(|r| {
-                                        reclaim_keyboard(gs.last_mouse.get_untracked(), r)
-                                    });
-                                if over {
-                                    refocus_grid(gs);
-                                }
+                        }
+                        EventPropagation::Continue
+                    })
+                    // Losing focus (Esc, clicking elsewhere, etc.) discards —
+                    // only Enter keeps the value. Guard: close only if THIS cell
+                    // is still the open editor — a Tab/Enter hop has already
+                    // repointed `edit_cell` to the next cell, and this input's
+                    // focus-loss must not clobber that.
+                    .on_event(EventListener::FocusLost, move |_| {
+                        // **A press inside this cell's own calendar is not
+                        // the user leaving.** Floem takes the window focus on
+                        // *every* pointer-down and hands it back only to a
+                        // focusable view under the cursor — and a day, a month
+                        // arrow and the Now button are none of them. So the
+                        // first click in the panel arrived here as a focus
+                        // loss, closed the editor, and the pick it was about
+                        // to make landed on a cell that was no longer being
+                        // edited. What closes the editor in that case is the
+                        // panel itself (`cell_calendar_editor`).
+                        //
+                        // **The press, not the panel, is the question.**
+                        // Standing down whenever a panel was merely *open*
+                        // meant Escape — which reaches this handler and
+                        // nothing else, `text_input` having answered it by
+                        // dropping the window focus — closed neither the
+                        // editor nor the panel, and left the grid with no
+                        // keyboard and no way back but the mouse.
+                        if cell_calendar_up(gs) && cell_editors::take_calendar_press() {
+                            // **And hand the caret straight back**, or the
+                            // field survives the click without the keyboard:
+                            // paging a month would leave a `DATETIME`'s time
+                            // of day untypable and Enter/Tab going to the
+                            // window root, which is the one thing keeping the
+                            // field beside the panel was for. Floem gives the
+                            // focus back only to a focusable view under the
+                            // cursor, and a month arrow is not one — so it has
+                            // to be asked for here. (The caret lands at the end
+                            // of the value: `text_input` drops its selection
+                            // and moves the cursor there on regaining focus.)
+                            if let Some(id) = field_id.get_untracked() {
+                                id.request_focus();
                             }
-                            EventPropagation::Continue
-                        })
-                        .request_focus(|| {})
-                        // Fill the whole cell (its own `dyn_container` is set to
-                        // fill while editing) with no field chrome, so it reads as
-                        // editing the cell in place rather than a nested input.
-                        // The global `TextInputClass` paints inputs `bg_deepest`
-                        // in every state (incl. `:focus`, which is always on while
-                        // editing), so we must clear the background per-state too.
-                        .style(move |s| {
-                            let clear = floem::peniko::Color::TRANSPARENT;
-                            let s = s
-                                .width_full()
-                                .height_full()
-                                .items_center()
-                                .font_size(theme::font_body())
-                                .color(theme::text())
-                                .background(clear)
-                                .border(0.0)
-                                .border_radius(0.0)
-                                .padding(0.0)
-                                .hover(|s| s.background(clear).border(0.0))
-                                .active(|s| s.background(clear).border(0.0))
-                                .focus(|s| {
-                                    s.background(clear)
-                                        .border(0.0)
-                                        .hover(|s| s.background(clear))
+                            return EventPropagation::Continue;
+                        }
+                        if gs.edit_cell.get_untracked() == Some((i, ci)) {
+                            gs.edit_cell.set(None);
+                            // Escape came through here rather than through a
+                            // key handler, and took the keyboard with it —
+                            // see `reclaim_keyboard` for why the pointer is
+                            // what decides whether to take it back.
+                            let over = gs
+                                .focus_id
+                                .get_untracked()
+                                .map(|f| f.layout_rect())
+                                .is_some_and(|r| {
+                                    reclaim_keyboard(gs.last_mouse.get_untracked(), r)
                                 });
-                            if numeric {
-                                // Right-align the editor to match the right-aligned
-                                // numeric display, so entering edit mode doesn't jump
-                                // the value to the left. Floem's text_input has no
-                                // text-align, so pad the left by the free space — the
-                                // buffer's *measured* width (re-runs as the buffer
-                                // changes, keeping it right-anchored while typing). A
-                                // value wider than the column clamps to `pad_left = 0`
-                                // (full width, left-aligned + clip) like the display.
-                                let w =
-                                    gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
-                                let text_px = gs.edit_buf.with(|b| measure_text_px(b));
-                                s.padding_left(numeric_edit_pad_left(w, text_px))
-                            } else {
-                                s
+                            if over {
+                                refocus_grid(gs);
                             }
-                        })
-                        .into_any();
-                    field_id.set(Some(field.id()));
-                    return match shape {
-                        CellShape::Calendar(e) => {
-                            cell_calendar_editor(gs, i, data_idx, ci, pending, e, field)
                         }
-                        _ => field,
-                    };
-                }
-                let edited = staged.is_some();
-                // A pending new row's unset editable cell shows a placeholder for
-                // what it'll do if left blank. `<required>` (NOT NULL, no default)
-                // is tinted with the error colour — leaving it blank fails the
-                // INSERT; `<auto>` / `<default>` are faint (the server fills them).
-                let placeholder = !edited && pending.is_some() && (col_editable || auto_inc);
-                // How the text is *weighted* — and the reason it is a decision
-                // rather than a chain of `if`s in the closure below. See
-                // [`cell_ink`].
-                let ink = cell_ink(staged.as_ref(), is_null, placeholder, is_fk);
-                let src = match &staged {
-                    // Staged text, staged SQL NULL, or a staged blob's
-                    // `<n bytes>` — one resolution, `CellEdit::display`, shared
-                    // with `edit::GridCells::text` so the clipboard and the AI
-                    // attachment read what the cell paints.
-                    Some(v) => v.display(),
-                    None if placeholder => {
-                        if auto_inc {
-                            "<auto>".to_string()
-                        } else if no_default {
-                            "<required>".to_string()
-                        } else if !not_null {
-                            "<null>".to_string()
-                        } else {
-                            "<default>".to_string()
-                        }
-                    }
-                    None => orig.clone(), // original (live from `rs`)
-                };
-                // Preview only: flatten newlines/tabs to spaces so a multiline
-                // value stays a single grid row (the viewer shows it verbatim).
-                let src = src.replace(['\r', '\n', '\t'], " ");
-                let shown = truncate(&src, 200);
-                text(shown)
+                        EventPropagation::Continue
+                    })
+                    .request_focus(|| {})
+                    // Fill the whole cell (its own `dyn_container` is set to
+                    // fill while editing) with no field chrome, so it reads as
+                    // editing the cell in place rather than a nested input.
+                    // The global `TextInputClass` paints inputs `bg_deepest`
+                    // in every state (incl. `:focus`, which is always on while
+                    // editing), so we must clear the background per-state too.
                     .style(move |s| {
-                        let s = s.font_size(theme::font_body());
-                        match ink {
-                            // Staged edit: white text over the green cell fill.
-                            CellInk::Staged => s.color(floem::peniko::Color::WHITE),
-                            // A staged **SQL NULL**, in the same italic the grid
-                            // has always used for "there is no value here" — the
-                            // one thing that tells it apart from a staged
-                            // four-character string reading `NULL`.
-                            CellInk::StagedNull => s
-                                .color(floem::peniko::Color::WHITE)
-                                .font_style(floem::text::Style::Italic),
-                            // NULL originals + all pending-row placeholders
-                            // (`<auto>`/`<required>`/`<null>`/`<default>`) render faint.
-                            CellInk::Absent => s
-                                .color(theme::text_faint())
-                                .font_style(floem::text::Style::Italic),
-                            // Foreign-key value: underline it (in the text colour) as
-                            // a "followable relation" affordance (Ctrl-click follows).
-                            CellInk::Fk => s
-                                .color(theme::text())
-                                .border_bottom(1.0)
-                                .border_color(theme::text()),
-                            CellInk::Plain => s.color(theme::text()),
+                        let clear = floem::peniko::Color::TRANSPARENT;
+                        let s = s
+                            .width_full()
+                            .height_full()
+                            .items_center()
+                            .font_size(theme::font_body())
+                            .color(theme::text())
+                            .background(clear)
+                            .border(0.0)
+                            .border_radius(0.0)
+                            .padding(0.0)
+                            .hover(|s| s.background(clear).border(0.0))
+                            .active(|s| s.background(clear).border(0.0))
+                            .focus(|s| {
+                                s.background(clear)
+                                    .border(0.0)
+                                    .hover(|s| s.background(clear))
+                            });
+                        if numeric {
+                            // Right-align the editor to match the right-aligned
+                            // numeric display, so entering edit mode doesn't jump
+                            // the value to the left. Floem's text_input has no
+                            // text-align, so pad the left by the free space — the
+                            // buffer's *measured* width (re-runs as the buffer
+                            // changes, keeping it right-anchored while typing). A
+                            // value wider than the column clamps to `pad_left = 0`
+                            // (full width, left-aligned + clip) like the display.
+                            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(cell_w()));
+                            let text_px = gs.edit_buf.with(|b| measure_text_px(b));
+                            s.padding_left(numeric_edit_pad_left(w, text_px))
+                        } else {
+                            s
                         }
                     })
-                    .into_any()
+                    .into_any();
+                field_id.set(Some(field.id()));
+                return match shape {
+                    CellShape::Calendar(e) => {
+                        cell_calendar_editor(gs, i, data_idx, ci, pending, e, field)
+                    }
+                    _ => field,
+                };
             }
-        },
-    )
+            let edited = staged.is_some();
+            // A pending new row's unset editable cell shows a placeholder for
+            // what it'll do if left blank. `<required>` (NOT NULL, no default)
+            // is tinted with the error colour — leaving it blank fails the
+            // INSERT; `<auto>` / `<default>` are faint (the server fills them).
+            let placeholder = !edited && pending.is_some() && (col_editable || auto_inc);
+            // How the text is *weighted* — and the reason it is a decision
+            // rather than a chain of `if`s in the closure below. See
+            // [`cell_ink`].
+            let ink = cell_ink(staged.as_ref(), is_null, placeholder, is_fk);
+            let src = match &staged {
+                // Staged text, staged SQL NULL, or a staged blob's
+                // `<n bytes>` — one resolution, `CellEdit::display`, shared
+                // with `edit::GridCells::text` so the clipboard and the AI
+                // attachment read what the cell paints.
+                Some(v) => v.display(),
+                None if placeholder => {
+                    if auto_inc {
+                        "<auto>".to_string()
+                    } else if no_default {
+                        "<required>".to_string()
+                    } else if !not_null {
+                        "<null>".to_string()
+                    } else {
+                        "<default>".to_string()
+                    }
+                }
+                None => orig.clone(), // original (live from `rs`)
+            };
+            // Preview only: flatten newlines/tabs to spaces so a multiline
+            // value stays a single grid row (the viewer shows it verbatim).
+            let src = src.replace(['\r', '\n', '\t'], " ");
+            let shown = truncate(&src, 200);
+            text(shown)
+                .style(move |s| {
+                    let s = s.font_size(theme::font_body());
+                    match ink {
+                        // Staged edit: white text over the green cell fill.
+                        CellInk::Staged => s.color(floem::peniko::Color::WHITE),
+                        // A staged **SQL NULL**, in the same italic the grid
+                        // has always used for "there is no value here" — the
+                        // one thing that tells it apart from a staged
+                        // four-character string reading `NULL`.
+                        CellInk::StagedNull => s
+                            .color(floem::peniko::Color::WHITE)
+                            .font_style(floem::text::Style::Italic),
+                        // NULL originals + all pending-row placeholders
+                        // (`<auto>`/`<required>`/`<null>`/`<default>`) render faint.
+                        CellInk::Absent => s
+                            .color(theme::text_faint())
+                            .font_style(floem::text::Style::Italic),
+                        // Foreign-key value: underline it (in the text colour) as
+                        // a "followable relation" affordance (Ctrl-click follows).
+                        CellInk::Fk => s
+                            .color(theme::text())
+                            .border_bottom(1.0)
+                            .border_color(theme::text()),
+                        CellInk::Plain => s.color(theme::text()),
+                    }
+                })
+                .into_any()
+        }
+    })
     // While editing this cell, fill it so the in-place editor's `width_full`/
     // `height_full` resolves against a definite box (otherwise it collapses to
     // ~0). Non-editing cells stay content-sized so numeric right-align works.
