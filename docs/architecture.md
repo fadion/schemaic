@@ -511,9 +511,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     replaced it: the grid asks it wherever text would land in the cell (`plan_paste`'s predicate,
     `start_edit`, the Tab/Enter hop `next_editable_col`, the row panel's `ColSpec::editable`, AI
     Fill Value and the AI seed, `add_cloned_rows`, the *Edit field* and *Paste* cell-menu entries,
-    the Enter key and the double-click). *Set to NULL* deliberately still asks `editable`, because
+    and — through `activation`, below — the Enter key and the double-click). *Set to NULL*
+    deliberately still asks `editable`, because
     emptying a blob writes no text. `resolve_key`'s half is unchanged — a binary column is still no
     WHERE key, where the lossiness really is fatal and there is no byte-shaped way round it.
+    **`activation(ci)` is where the two *open what I am on* gestures meet, and it exists because
+    they had drifted apart.** A double-click has always fallen through to the binary panel on a cell
+    that takes no text, but the Enter arm asked `text_editable` and stopped there — so on a
+    `photo BLOB` Enter did nothing, and since there is no context-menu key binding either, the
+    grid's one byte-write surface was reachable by pointer alone. `CellActivation`
+    (`TextEdit` / `OpenPanel` / `Nothing`) is the single answer both gestures read now
+    (`enter_and_a_double_click_aim_at_the_same_surface`). `OpenPanel` means *aim the panel at this
+    cell*, not *the panel will open*: the row-level refusals — a NULL cell, a pending row, a row
+    marked for deletion — stay in `grid::blob_launch`, which is what keeps this answer free of the
+    state only the caller holds. A binary column answers `OpenPanel` **whether or not it can be
+    written**, because the panel is the viewer too.
     **`binary(ci)` is a recorded `col_binary` vector, and it asks two signals where editing used to
     ask one**: `holds_bytes` is `Column::is_binary` **or** `ResultSet::binary_columns`. SQLite types
     values rather than columns, so a blob living in a column declared `TEXT` has neither a wire flag
@@ -530,8 +542,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     found nothing either. It is recorded on
     the model rather than re-derived at each call because "editable" and "editable *as text*" are
     two different questions once a blob can be written, and the callers still asking the first are
-    the two that write no text: `blob_launch`, the surface that puts bytes in a cell, and
-    *Set to NULL*.
+    the two that write no text: `blob_launch`, the surface that puts bytes in a cell (through
+    `takes_bytes`, below), and *Set to NULL*.
+    **`takes_bytes(ci, row_deleted)` — `editable(ci) && !row_deleted` — is the blob write's gate,
+    and it is one function because it is asked twice.** The grid offers *Load from file* through it
+    and asks it again when the bytes come back from the file dialog
+    (`GridState::stage_bytes`/`stage_new_bytes`); the two are separated by however long the user
+    spends choosing a file, and they were two hand-written spellings of one rule with no test over
+    either. The `del_rows` half is the load-bearing one: staging into a row already marked for
+    deletion builds a commit carrying a `RowDelete` **and** a `RowEdit` for one row, the update then
+    matches nothing, and the 1-row safety net rolls the whole batch back over an edit the user could
+    not see. A pending row passes `false` — it has no committed row to mark, and that its skeleton
+    still exists is a different check, belonging where the rows are.
     **`byte_cap(ci)` is a third recorded vector (`col_cap`), filled where the schema is already in
     hand.** `analyze_edit` resolves each table group's schema **once** and both readers take that one
     answer: it records `blob::column_byte_cap` of each binary column's declared type, and hands the
@@ -673,7 +695,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`a_dynamically_asserted_binary_column_resolves_a_source`); an implicit key is not, being no
     column of the table to `SELECT`.
     `FETCH_CAP` is 64 MiB, and it is enforced **in the `SELECT`** — a `SUBSTRING` of that many
-    bytes taken beside the whole value's `OCTET_LENGTH`, in one row of one statement. `BlobValue`
+    bytes taken beside the whole value's `OCTET_LENGTH`, in one row of one statement. On MySQL it is
+    not the only cap in that `SUBSTRING`: the server's own `max_allowed_packet` is read into the
+    same expression and the smaller wins, for a reason that is under `schemaic-db`. `BlobValue`
     keeps `bytes` and `len` apart because they disagree exactly when it matters, and `truncated()`
     is read off the server's length rather than off the buffer: a value that happens to be exactly
     the cap is otherwise indistinguishable from a cut one, and a truncated value refuses a save,
@@ -4091,20 +4115,51 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   and both are "there are no bytes to show" rather than an error the panel would have to phrase.
   The statement is built per backend beside `build_update` and *not* in `core::blob`, for the same
   reason that one is not: MySQL and SQLite bind the WHERE key as parameters where PostgreSQL
-  inlines it. `build_blob_select` is MySQL's — `SELECT OCTET_LENGTH(c), SUBSTRING(c, 1, ?) … WHERE
-  k <=> ? LIMIT 1`, the NULL-safe `<=>` included, because the identity of a row is one thing here
-  whether it is being written or read, and `SUBSTRING` on a *binary* string is byte-indexed so the
-  cap really is `FETCH_CAP` octets. `pg::blob_on` is `octet_length` + `substring … from 1 for N`,
-  whose bytes arrive as the simple-query protocol's `\x…` text and are decoded by `bytea_hex_bytes`
-  — the twin of `bytea_hex_len`, and it **rejects** rather than half-decodes a server with
-  `bytea_output = escape`, for the reason `binary_display` replaced `from_utf8_lossy`.
+  inlines it. `build_blob_select` is MySQL's — `SELECT OCTET_LENGTH(c), SUBSTRING(c, 1,
+  LEAST(?, PACKET_ROOM)) … WHERE k <=> ? LIMIT 1`, the NULL-safe `<=>` included, because the
+  identity of a row is one thing here whether it is being written or read, and `SUBSTRING` on a
+  *binary* string is byte-indexed so the caps really are octets. **Two caps, and the smaller
+  wins**: ours (`FETCH_CAP`, bound as a parameter so the statement carries no second literal) and
+  the server's (`PACKET_ROOM` — `GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576)`,
+  read live *inside* the same statement). Neither subsumes the other, and the server's is not
+  theoretical: a row has to fit in one `max_allowed_packet`, and on MySQL the blob really does cross
+  the wire where PostgreSQL's and SQLite's do not. MariaDB ships that setting at 16 MiB, a
+  **quarter** of `FETCH_CAP`, and asking for the full 64 MiB did not fail politely — measured
+  against MariaDB 10.11, a 20 MiB `LONGBLOB` dropped the connection mid-row (`ERROR 2013` at the
+  client), which on a manual-transaction tab's pinned session takes the uncommitted work with it.
+  Capped, the same read returns 15 MiB of bytes beside the true `OCTET_LENGTH` of 20 MiB, so
+  `BlobValue::truncated()` answers `true` and the panel shows the prefix and refuses to save it —
+  which is the behaviour the truncation design already had. The setting is read inside the statement
+  rather than in a round trip of its own, so there is no window for it to change between the asking
+  and the reading and no second query on a path that is one click; the 1 MiB of headroom is for the
+  rest of the packet and is deliberately generous, because being 100 bytes over costs the whole
+  connection while being 1 MiB under costs a truncation the panel already knows how to describe.
+  `pg::blob_on` is `octet_length` + `substring … from 1 for N`, and it is **the one read in that
+  module on the extended protocol** (`client.query`, not `simple_query`) — two decisions at once,
+  both verified live against PostgreSQL 16.15. The bytes come back **binary**: `bytea`'s textual
+  form is `\x` and then two characters per byte, so at the 64 MiB cap the text path built a ~128 MiB
+  `String` and decoded it into the `Vec` after, a quarter of a gigabyte in flight for one cell. And
+  a `Parse` takes **one** statement where `simple_query` speaks the protocol that accepts several:
+  this is the only grid path reachable from a single click with no write verdict on a connection the
+  user marked read-only, so it was the widest reach the key-in-statement-text shape had —
+  `client.query("SELECT 1; DROP TABLE …")` is refused and the table survives, where `simple_query`
+  runs both. The key is **still** built into the statement text, because binding it generically
+  would break every key type outside `Value`'s four variants: `col IS NOT DISTINCT FROM $1` infers
+  `uuid`, `date` and `numeric` from the column (confirmed on PG 16.15) and such keys are
+  `Value::Str` today, reaching the server as literals it coerces. So the pinned
+  `standard_conforming_strings` is still what closes the escape, and the extended protocol is a
+  second, structural line behind it. `bytea_hex_bytes` is **gone** with its only caller;
+  `bytea_hex_len` stays, because the *result-set* path is the text protocol by design, and its test
+  was rewritten to pin the counter alone rather than against the departed decoder.
   `sqlite::fetch_blob` is `length` + `substr`, both byte-wise only *because* the **value** really
   is a blob — the per-value half of `blob_source`'s two signals, not the column's, since a SQLite
   `BLOB` is an affinity and a text row in such a column would be counted in characters here.
-  PostgreSQL's decoder is also the one place a fetch can fail on the *encoding* rather than the
-  row: a server with `bytea_output = escape` sends a form `bytea_hex_bytes` refuses, and that is
-  raised as an error naming the setting rather than substituted with an empty buffer — pairing no
-  bytes with a real `octet_length` would report 35.5 KB over an empty dump and call it truncated. **The length and
+  **Reading in binary also retired the one place a fetch could fail on the *encoding* rather than
+  the row.** A server with `bytea_output = escape` sent a form `bytea_hex_bytes` refused, raised as
+  an error naming the setting rather than substituted with an empty buffer — pairing no bytes with a
+  real `octet_length` would report 35.5 KB over an empty dump and call it truncated. There is no
+  text encoding left on this path to be wrong about, so that error is gone rather than merely
+  unlikely. **The length and
   the bytes come out of one row of one statement**, never two queries: asked separately they can
   straddle another session's `UPDATE`, and the pair is what `BlobValue::truncated` reads to decide
   whether a save would write a file that is not the data. `Session::fetch_blob` (MySQL and
@@ -4159,8 +4214,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   doubles quotes and nothing else, which is correct under `standard_conforming_strings = on` and
   only there: with it off PostgreSQL reads a literal as an escape string, `\'` is an escaped quote
   rather than a backslash and a quote, and a row's **own text data** ends the literal — after which
-  the rest of that value is parsed as SQL. On `blob_on`, which speaks the multi-statement simple
-  protocol, that is a second statement running from one click on a connection marked read-only. The
+  the rest of that value is parsed as SQL. `blob_on` was the sharpest of those — a second statement
+  running from one click on a connection marked read-only — and it is the one that has since moved
+  to the extended protocol, where `Parse` refuses a second statement outright; the pin still stands
+  for every other literal this module inlines, which is why it is written down as the belt and not
+  as the thing that was fixed. The
   setting is `USERSET` and settable per database and per role, so the default is no guarantee:
   `connect_probe` sends `-c standard_conforming_strings=on` in the connection's `options`, on the
   **startup packet**, so it is in force before the first statement and cannot be undone by anything
@@ -5266,6 +5324,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     reordering those two groups only moves which modal has the problem. Being its own entry, it needs
     its own term in `modal_backdrop_up` exactly as `find`, `manage` and `plan` do — `ddl_modals_up`
     counted it while it was painted there, and that predicate is now only about that group's own box.
+    **The grid export's progress modal is the second entry of that shape, and it is the confirm's
+    argument rather than an exception to it.** It was the *third* member of the tuple element
+    `dump_overlay` and `script_overlay` share, down in the DDL group, on the stated claim that a
+    dump and a grid export cannot be up together — and nothing enforced that claim. Those two
+    neighbours clear each other's target on every `open`, while **nothing anywhere clears
+    `ui.export.target`**, because nothing may: clearing it would take a running export's Stop off the
+    screen. So a modal four entries below the workspace group was painted over by Properties, the ER
+    diagram or the binary-cell panel opened while an export ran — Stop included, and reachable
+    because the save dialog is not window-modal, so the schema tree stays live for as long as the
+    user spends choosing a file. A surface that stands for the whole *length* of an operation and
+    carries the only control that ends it is something anything can be up over, so it takes the
+    confirm's answer: its own entry, above every group, directly below the confirm. It needs no
+    wrapper, unlike the confirm, because it already carries its own `absolute().inset(0)` gated on
+    `target` the way `manage_modal`, `plan_overlay` and `find_overlay` do. `export_open` therefore
+    came **out** of `ddl_modals_up` — left there, that group's wrapper would be a full-window box
+    with nothing in it for the length of every export, eating every click beneath it — and **into
+    `modal_backdrop_up` as its own term**, exactly as `find`, `manage`, `plan` and the confirm each
+    have one.
     `modal_up` is a *parameter*
     rather than a local, because `workspace` needs the identical answer for the band and the two
     must not be able to disagree. The group wrappers exist to fit floem's 16-arity `ViewTuple` limit
@@ -6027,10 +6103,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     footer with nothing above it: the same running line, the same red Stop in the same fixed slot,
     the same backdrop. Someone who exports a database from the tree and a result from the grid meets
     one thing twice, and keeping the two side by side in one file is what makes that survive the next
-    change to either. It is mounted in the **third** slot of the tuple element `dump_overlay` and
-    `script_overlay` already share — the stack is at floem's 16-arity limit, and the three can never
-    be up together — so it has to be named in `modals::ddl_modals_up` for the reason the other two
-    are, and it is the shape most likely to be forgotten of the three: a modal nobody opens
+    change to either. **Living in this file is not living in this group**: it is its own entry in
+    `modal_layer`, above every group and directly below the shared confirm, and it takes its own
+    term in `modals::modal_backdrop_up` rather than being spoken for by `ddl_modals_up`. It was the
+    third slot of the tuple element `dump_overlay` and `script_overlay` share — the stack is at
+    floem's 16-arity limit — on the claim that the three can never be up together, and that claim
+    was unenforceable by construction; *modals.rs* has the whole argument and what it cost. It is
+    still the shape most likely to be forgotten of the three: a modal nobody opens
     deliberately, raised by an export started somewhere else entirely. Its one line counts against
     `ExportTarget::total`, and **the `~` on that figure is conditional**: it is drawn only where
     `approx` says the denominator is the catalogue's guess, because a `Fetched` export knows exactly
@@ -7554,6 +7633,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     each way would decode the whole image again for a view whose bytes have not moved, and taffy
     filters `Display::None` out before layout so the hidden one costs nothing to keep — which is
     also why `pane` is not a term in the panel's rebuild key.
+    **The preview's container needs `min_size_full`, and the centring on it does nothing without
+    that.** A `scroll` measures its child against unbounded space, so the container inside it hugged
+    the image and `items_center().justify_center()` had nothing to distribute: a 16 × 16 favicon sat
+    in the top-left corner of a 420 px pane. The *minimum* and not `size_full`, because the pane
+    shows an image at its natural size — a minimum fills the viewport while the image is smaller
+    than it and grows past it when the image is larger, where a fitted `size_full` would cap the
+    child at the viewport and leave nothing to scroll. `hex_view` one pane over has carried
+    `min_width_full` for the same reason all along.
     **Nothing reaches `img()` unmeasured.** The renderer decodes to RGBA, so a preview costs
     width x height x 4 — driven by what the *header claims*, not by what the blob weighs, and
     `FETCH_CAP` bounds neither term. These bytes came out of a database, so that claim is untrusted
@@ -9803,6 +9890,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   the header's declared width x height x 4, and a small blob can be an enormous allocation. That is
   why the binary-cell panel measures before it builds one (`blob::preview_verdict`), and why the
   view is built once and hidden rather than rebuilt per pane switch.
+  **And that decode cannot be moved off the UI thread while floem 0.2.0 is the dependency**, which
+  is why the binary panel's preview still blocks the thread that opens it. `img(impl Fn() ->
+  Vec<u8>)` is the only public entry point and it runs `image::load_from_memory` and `into_rgba8`
+  inline on the calling thread; the variant that would take an already-decoded image,
+  `img_dynamic(impl Fn() -> peniko::Image)`, is `pub(crate)` and used only by floem's own inspector,
+  and the SHA-256 in `Img::update` is floem's too, over the decoded RGBA. So what is left is a
+  bounded, one-off, panel-open cost — `PREVIEW_EDGE_CAP` holds either edge to 4096, so the decode it
+  admits is at most ~16.8 megapixels of RGBA — and closing it needs an upstream API rather than a
+  change here.
   **And the RAM is not the fatal limit — the texture is.** floem's images live in the same atlas as
   its glyphs, and that atlas grows to `2 × max(width, height)` with no clamp of its own; wgpu's
   default `max_texture_dimension_2d` is 8192, and no floem crate installs an `on_uncaptured_error`
@@ -9957,11 +10053,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   of not counting. A second test pins the other direction on the *returned closure* rather than the
   function — binding a predicate and then not `||`-ing it in is precisely the mistake, and it leaves
   the binding's name in the body, so scanning the function would pass — asserting the terms are in
-  the answer: the three grouped predicates (`ddl`/`workspace`/`settings`) and the three open
-  signals. A group added without joining it fails there instead of opening into a zero-sized box.
-  **That gate's own list has to be kept current, and currently is not**: the shared confirm became
-  the layer's last entry and took a seventh term in `modal_backdrop_up`, but the array in the test
-  still names six, so that term is the one thing here nothing pins. **The event editor shipped absent from the
+  the answer: the three grouped predicates (`ddl`/`workspace`/`settings`) and the open signals the
+  layer raises directly — five of the six there now are. A group added without joining it fails
+  there instead of opening into a zero-sized box.
+  **That gate's own list has to be kept current, and it goes stale exactly when a modal leaves a
+  group**: the shared confirm became the layer's last entry and took its own term in
+  `modal_backdrop_up`, and the array in the test was extended with it only afterwards. The grid
+  export's progress modal has since made the same move, and its `export_open` term is **not** in
+  that array — so that term is now the one thing here nothing pins. The list only guards what it
+  names. **The event editor shipped absent from the
   predicate** and painted nothing at all, so the schema-editing half of that list is now
   `ddl_editors_up(DdlUi)`, split out of `ddl_modals_up(&Ui)` for the one reason that matters here:
   it can be tested. `ddl_preview::tests::every_editor_raises_the_group_that_gives_it_a_box` raises
@@ -10092,6 +10192,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   a pure *shape* function (`account_editor::{account_form_shape, grant_form_shape}`) rather than
   `overlay_open_key`, because what must not rebuild them is a value **inside** the form rather than
   a patch arriving from outside it.
+  **The grid's cells are the same fact at the other scale, and there the fix has a second half.**
+  `data_cell`'s content key reads four **grid-wide** signals — `formats`, `dirty`/`new_rows`, `rs`,
+  `edit_cell` — to compute something about **one** cell, so before it was a memo one notification of
+  `dirty` rebuilt the content view of every mounted cell: ~1,000 at a maximised window's ~40 × 25,
+  and a Tab-hop during data entry writes `dirty` once and `edit_cell` twice, so ~3,000. Computing
+  the tuple inside the key closure does not help — the Ctrl+K popup tried exactly that — the dedup
+  has to be a `create_memo`, the same device the column window (`win`) uses. The second half is that
+  **the tuple must not carry a `CellEdit` directly**: its derived `PartialEq` compares the buffers,
+  so a memo over a staged blob would `memcmp` as much as the 64 MiB `blob::LOAD_CAP` allows one to
+  hold, on every equality check — precisely the cost the memo was added to remove. `grid::StagedFace`
+  is the private newtype that stands in its place, with a hand-written `PartialEq` comparing two
+  `CellEdit::Bytes` by `Arc::ptr_eq` and delegating everything else to the derive. `Arc::ptr_eq` is
+  the safe direction of wrong: two `Arc`s over identical bytes compare unequal and cost one needless
+  rebuild of one cell — the behaviour before the memo — and nothing unequal can ever be called
+  equal.
   **And only the key closure is wrapped in an effect — the *builder* is called outside it**, so a
   scaled metric read there subscribes nothing and freezes at the scale the view was built at. Two
   sites paid for that. `schema_tree`'s `SchemaTreeCtx` therefore carries `indent_levels: u32`, a
@@ -11563,7 +11678,10 @@ for keyboard nav.
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
   `data_cell`'s content `dyn_container` runs per cell per frame reading the signals one at a time,
   so it is the reference implementation `GridCells::text` is written against — the two must be
-  changed together, and neither `grid_cells` nor its callers may become a per-frame path. Ctrl+C
+  changed together, and neither `grid_cells` nor its callers may become a per-frame path. Those
+  reads sit in a `create_memo` rather than in the `dyn_container` key itself, and what the memo
+  carries is a `StagedFace` and not a raw `CellEdit`; both halves are load-bearing and the
+  `dyn_container` gotcha says why. Ctrl+C
   passes `formatted = false` and an attachment passes `true`, which is the *Copy formatted* entry's
   reason for existing. **How a cell is *weighted* is a decision too**, and it is `grid::cell_ink` →
   `CellInk` (`Staged`, `StagedNull`, `Absent`, `Fk`, `Plain`) rather than an `if` chain inside the
@@ -11596,18 +11714,22 @@ for keyboard nav.
   marked for deletion. With both `None` there is no entry at all: **every reason it cannot open is a
   reason it is absent rather than dimmed**, because the entry is the only signal the app gives that
   a `<n bytes>` cell has anything behind it, so one that opened a panel saying "nothing here" would
-  be worse than no entry. `blob_launch` asks `editable` and deliberately not `text_editable` — this
+  be worse than no entry. `blob_launch` asks `EditModel::takes_bytes`, so `editable` and
+  deliberately not `text_editable` — this
   is the one surface that puts bytes in a cell, and `text_editable` is precisely what keeps
   everything *else* out of a binary column. Where the file lands is `GridState::stage_bytes` /
   `stage_new_bytes`, and neither carries the revert-to-original rule a typed edit gets from
   `edit::staged_cell`: the grid holds a placeholder and not the stored bytes, so there is nothing to
   compare a loaded file against and a load always stages. **Both re-ask the write gate and return
   whether they staged**, because the path from `blob_launch`'s answer to this write runs through a
-  file dialog and a worker thread, and the grid is free to move in between. `stage_bytes` asks
-  `del_rows` as well as `editable`: `toggle_delete` purges a marked row from `dirty`, so a file
+  file dialog and a worker thread, and the grid is free to move in between. **The gate they re-ask
+  is the offer's own**, `EditModel::takes_bytes(ci, row_deleted)`, which the offer and the two sinks
+  used to spell for themselves with nothing testing any of the three. Its `del_rows` half is the
+  load-bearing one: `toggle_delete` purges a marked row from `dirty`, so a file
   staged afterwards puts it back, and the commit then carries a `RowDelete` *and* a `RowEdit` for one
   row — `GridWrite::plan` runs the deletes first, the update matches nothing, and `one_row_verdict`
-  rolls the whole batch back over an edit the user could never see. `stage_new_bytes` re-checks that
+  rolls the whole batch back over an edit the user could never see. `stage_new_bytes` passes
+  `row_deleted: false` — a pending row has no committed row to mark — and re-checks that
   the pending row is still there, `new_rows` being free to shrink under an open dialog (Discard, a
   commit, a removed skeleton row). The `bool` is what the panel reports — see `blob_view.rs`.
   **Both open with `GridState::alive()`**, because the grid can be gone rather than merely changed:
@@ -11734,7 +11856,17 @@ for keyboard nav.
   the binary-cell panel (`open_blob`, the same call the cell menu's entry makes). C2 — now
   `EditModel::text_editable` — keeps the inline editor off that column whether or not the column
   itself is writable, so the gesture was free there, and "open the thing I clicked" is what a
-  double-click means everywhere else in the app.
+  double-click means everywhere else in the app. **Enter does the same thing now, and it did not
+  before**: both gestures read `EditModel::activation` (see `core::edit`), where the key handler
+  asked `text_editable` and stopped — so Enter did nothing at all on a blob cell, and the panel,
+  which is the grid's only byte-write surface and has no context-menu key binding, was pointer-only.
+  `open_cell_panel` is the one spelling of *aim the panel*, called by both so they cannot come to
+  differ, and it stays silent when `blob_launch` refuses because that refusal is about the row.
+  `row_at` is what the key handler needs to get there: the cell builders are handed a result index
+  and a pending index already, while the key handler works in display coordinates and has to split
+  one itself — passing `0` as the data index for a pending row, which is what `data_row` passes and
+  for the same reason, there being no result row behind one and every consumer reading `pending`
+  first.
 - **A column whose legal values are written down doesn't edit as text.** Booleans, `ENUM`s, `SET`s
   and dates get their own control, in the grid *and* in the row panel, over
   `core::celledit` + `core::date` (the rules) and `ui::cell_editors` (the widgets) — both of which
