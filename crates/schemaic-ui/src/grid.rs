@@ -485,6 +485,33 @@ fn next_export_id() -> u64 {
 /// names a *table*, whose row count nothing on screen has read — a greyed entry
 /// there would be a question the user cannot answer by looking, where here the
 /// stats line one row above already says `0 rows`.
+/// One action behind one **live** gate, as a single `Rc` — the shape a toolbar
+/// button that can be unavailable has to have.
+///
+/// Two things have to be true at once and neither is visible at a call site that
+/// spells them out by hand:
+///
+/// - **The gate is on the action, not on the face.** `in_ring_button` needs the
+///   pointer's `on_click_stop` and the ring's Enter/Space to be *separate*
+///   listeners, so a gate written on the icon's style leaves the keyboard path
+///   opening a menu that is drawn as unavailable. Handing both the same `Rc`
+///   built here is what makes them incapable of disagreeing.
+/// - **The gate is asked at press time.** A `bool` captured while the toolbar is
+///   built answers for the result that was on screen then; `order` is rewritten
+///   by a filter, a sort and a commit splice without rebuilding this strip.
+///
+/// The behaviour was right at both call sites and nothing pinned either half —
+/// the only test asserted `results_offer_export(0) == false`, which cannot fail
+/// against the pre-fix tree because that function is not what was fixed.
+fn gated_action(gate: impl Fn() -> bool + 'static, act: impl Fn() + 'static) -> Rc<dyn Fn()> {
+    Rc::new(move || {
+        if !gate() {
+            return;
+        }
+        act();
+    })
+}
+
 fn results_offer_export(rows: usize) -> bool {
     rows > 0
 }
@@ -2206,15 +2233,22 @@ fn save_export(gs: GridState, format: ExportFormat, all_rows: bool, estimate: Op
         // still writing; without this, answering it destroyed that export's
         // modal and left it running with no Stop. See `export_may_launch`.
         //
-        // Silent rather than reported: the app would refuse this launch a moment
-        // later anyway (one export at a time), and there is nowhere to report it
-        // that is not the modal this must not disturb.
+        // **Reported, not silent.** The old rationale was that there is nowhere
+        // to say it that is not the modal this must not disturb — which the same
+        // commit made untrue: `commit_note` is the grid's own non-red bar, and
+        // it no longer carries an export's progress, so it is free and it is
+        // exactly the surface for "that didn't happen". A save dialog the user
+        // answered and that produced no file, with nothing anywhere saying so,
+        // is indistinguishable from an export that silently failed.
         let m = gs.export_modal;
         if !export_may_launch(
             m.target.with_untracked(Option::is_some),
             m.done.with_untracked(Option::is_some),
             m.error.with_untracked(Option::is_some),
         ) {
+            gs.commit_note.set(Some(
+                "An export is already running — nothing was written.".to_string(),
+            ));
             return;
         }
         let run = next_export_id();
@@ -7489,14 +7523,9 @@ fn grid_toolbar(
     // `Rc`, not a bare closure: it captures the ring (not `Copy`) and is used
     // twice — the face's click listener and the ring's Enter/Space arm, which
     // `in_ring_button` requires to be separate listeners.
-    let open_copy: Rc<dyn Fn()> = Rc::new(move || {
-        // **The gate is on the action, not on the face.** The pointer and the
-        // ring's Enter/Space both arrive here, and only here — dimming the icon
-        // alone would leave the keyboard path opening a menu that is drawn as
-        // unavailable.
-        if !has_rows() {
-            return;
-        }
+    // **The gate is on the action, not on the face** — see `gated_action`, which
+    // is where that composition is stated and tested.
+    let open_copy: Rc<dyn Fn()> = gated_action(has_rows, move || {
         // A second press closes what the first opened.
         if menu_is_mine(copy_origin) {
             close_mine(TB_COPY, &strip_copy);
@@ -7583,11 +7612,8 @@ fn grid_toolbar(
     let save_origin = RwSignal::new(Point::ZERO);
     let save_hov = RwSignal::new(false);
     let strip_save = strip.clone();
-    let open_save: Rc<dyn Fn()> = Rc::new(move || {
-        // Its twin's gate, for its twin's reason — see `open_copy`.
-        if !has_rows() {
-            return;
-        }
+    // Its twin's gate, through the same builder — see `gated_action`.
+    let open_save: Rc<dyn Fn()> = gated_action(has_rows, move || {
         if menu_is_mine(save_origin) {
             close_mine(TB_SAVE, &strip_save);
             return;
@@ -9667,6 +9693,71 @@ mod tests {
         assert!(!results_offer_export(0));
         assert!(results_offer_export(1));
         assert!(results_offer_export(200_000));
+    }
+
+    /// **The predicate was never what was broken, and this is the composition
+    /// that was.** `78da949`'s only test asserted `results_offer_export(0) ==
+    /// false`, which is green against the pre-fix tree — the fix was that the
+    /// gate moved *inside* the action closure and that the closure asks it at
+    /// press time. Both are `gated_action`'s now, so both can be stated.
+    ///
+    /// The gate is asked **on every press**, not captured. `order` is rewritten
+    /// by a filter, a sort and a commit splice without rebuilding the toolbar,
+    /// so a `bool` read while the strip was built answers for a result that is
+    /// no longer on screen.
+    #[test]
+    fn a_gated_action_asks_its_gate_at_press_time_not_at_build_time() {
+        let rows = Rc::new(std::cell::Cell::new(0usize));
+        let ran = Rc::new(std::cell::Cell::new(0u32));
+        let act = {
+            let (rows, ran) = (rows.clone(), ran.clone());
+            gated_action(
+                move || results_offer_export(rows.get()),
+                move || ran.set(ran.get() + 1),
+            )
+        };
+
+        // Built while the result is empty …
+        act();
+        assert_eq!(ran.get(), 0, "an empty result opens nothing");
+
+        // … and the very same closure works once rows arrive. A captured `bool`
+        // would still be refusing here.
+        rows.set(12);
+        act();
+        assert_eq!(ran.get(), 1);
+
+        // And stops again when a filter empties it.
+        rows.set(0);
+        act();
+        assert_eq!(ran.get(), 1, "the gate is live in both directions");
+    }
+
+    /// **One `Rc`, two listeners, one answer.** `in_ring_button` requires the
+    /// pointer's `on_click_stop` and the ring's Enter/Space to be *separate*
+    /// listeners, so a gate written on the icon's style leaves the keyboard path
+    /// opening a menu that is drawn as unavailable. Handing both the same `Rc`
+    /// is what makes them incapable of diverging — which is a property of the
+    /// value, and testable as one.
+    #[test]
+    fn the_pointer_and_the_keyboard_share_one_gated_action() {
+        let open = Rc::new(std::cell::Cell::new(false));
+        let ran = Rc::new(std::cell::Cell::new(0u32));
+        let act = {
+            let (open, ran) = (open.clone(), ran.clone());
+            gated_action(move || open.get(), move || ran.set(ran.get() + 1))
+        };
+        // The two listeners, as the toolbar builds them: the same `Rc`, cloned.
+        let (pointer, keyboard) = (act.clone(), act);
+
+        pointer();
+        keyboard();
+        assert_eq!(ran.get(), 0, "neither path opens a closed gate");
+
+        open.set(true);
+        pointer();
+        keyboard();
+        assert_eq!(ran.get(), 2, "and neither is refused once it opens");
     }
 
     /// **The bar is now only ever the tail of an operation.** Its fourth state

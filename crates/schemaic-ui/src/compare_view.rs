@@ -1120,7 +1120,10 @@ fn open_plan_preview(ui: &Ui, close: Rc<dyn Fn()>) {
     let preview = crate::ddl_preview::preview_of_plan(
         t.left.conn_id,
         &t.left.database,
-        plan.subject(),
+        // Named for the database it lands in, not just the connection: the
+        // left-hand side is what these statements change, and this modal is the
+        // last thing the user sees before they run.
+        plan.subject_in(&t.left.database),
         &plan,
         read_only,
     );
