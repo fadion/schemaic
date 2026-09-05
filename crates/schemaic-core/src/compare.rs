@@ -54,7 +54,7 @@
 //! [`ServerFlavour`]: crate::schema::ServerFlavour
 //! [`IndexInfo::lossy`]: crate::schema::IndexInfo::lossy
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::ddl::{
     self, Change, ChangeSet, DomainDraft, EnumDraft, EventDraft, ObjectKind, RoutineDraft,
@@ -301,6 +301,17 @@ pub struct CompareCounts {
     pub differing: usize,
     pub only_left: usize,
     pub only_right: usize,
+    /// Objects whose match this comparison **cannot vouch for** — see
+    /// [`CompareEntry::uncertain`]. Counted across every status, and overlapping
+    /// them: an uncertain object is also one of the four above.
+    ///
+    /// **It is here because it was nowhere else.** The flag was drawn only as a
+    /// per-row hint, and an uncertain match is overwhelmingly an object that
+    /// came out `Same` — which `show_same: false`, the default, hides. So the
+    /// one case the flag exists to disclose was the one case nothing disclosed:
+    /// a lossy PostgreSQL index compares equal whatever the server holds, and
+    /// the tree said the two agreed.
+    pub uncertain: usize,
 }
 
 impl CompareCounts {
@@ -396,6 +407,21 @@ pub struct SchemaComparison {
     /// referencing table has to be dropped before the table it references, and
     /// a cycle means no order does that either.
     pub cycles_drop: bool,
+    /// PostgreSQL namespaces the **right** side's objects live in that the left
+    /// side has none of — the prerequisite a migration into them needs and had
+    /// no way to state.
+    ///
+    /// A namespace is not an object this comparison pairs (nothing introspects
+    /// an empty one, and there is nothing in it to diff), so `CREATE TABLE
+    /// reporting.sales` was emitted against a database with no `reporting` in
+    /// it: PostgreSQL refuses that statement, and with it the transaction the
+    /// whole migration runs in. [`SchemaComparison::plan`] turns the ones a plan
+    /// actually needs into `CREATE SCHEMA` statements ahead of everything else.
+    ///
+    /// Empty on MySQL and SQLite by construction rather than by a dialect test:
+    /// neither has a level between the database and the table, so every
+    /// object's namespace there is `None`.
+    pub new_namespaces: Vec<String>,
 }
 
 /// Why a comparison's tree is empty — see [`SchemaComparison::empty_reason`].
@@ -575,11 +601,42 @@ impl SchemaComparison {
             (ph, kind_rank(e.kind, e.status), rank, e.key())
         });
 
+        // ── namespaces ──────────────────────────────────────────────────────
+        //
+        // Read off the entries rather than off `DbSchema`, which holds no list
+        // of them: an entry's status says which sides it is on, and a namespace
+        // matters here exactly when an object lives in it.
+        let namespaces = |on: fn(ObjectStatus) -> bool| -> BTreeSet<String> {
+            entries
+                .iter()
+                .filter(|e| on(e.status))
+                .filter_map(|e| e.schema.clone())
+                .collect()
+        };
+        let on_left = |st| {
+            matches!(
+                st,
+                ObjectStatus::OnlyLeft | ObjectStatus::Differing | ObjectStatus::Same
+            )
+        };
+        let on_right = |st| {
+            matches!(
+                st,
+                ObjectStatus::OnlyRight | ObjectStatus::Differing | ObjectStatus::Same
+            )
+        };
+        let left_ns = namespaces(on_left);
+        let new_namespaces: Vec<String> = namespaces(on_right)
+            .into_iter()
+            .filter(|ns| !left_ns.contains(ns))
+            .collect();
+
         SchemaComparison {
             entries,
             dialect,
             cycles_create: c1,
             cycles_drop: c2,
+            new_namespaces,
         }
     }
 
@@ -597,6 +654,11 @@ impl SchemaComparison {
                 ObjectStatus::Differing => c.differing += 1,
                 ObjectStatus::OnlyLeft => c.only_left += 1,
                 ObjectStatus::OnlyRight => c.only_right += 1,
+            }
+            // Deliberately not an arm of the match: an uncertain object is also
+            // one of the four, and the summary line says both things about it.
+            if e.uncertain {
+                c.uncertain += 1;
             }
         }
         c
@@ -758,11 +820,42 @@ impl SchemaComparison {
     /// predicate cannot route an untrustworthy body into `emit`. What it *does*
     /// do is record them — see [`SchemaPlan::omitted`].
     pub fn plan(&self, include: impl Fn(&CompareEntry) -> bool) -> SchemaPlan {
-        let sets: Vec<ChangeSet> = self
+        let chosen: Vec<ChangeSet> = self
             .differences()
             .filter(|e| include(e) && !e.needs_source())
             .map(|e| e.changes.clone())
             .collect();
+        // **The namespaces this plan needs, ahead of everything that names
+        // them.** A namespace is not an object the comparison pairs, so a table
+        // ticked into a namespace the left side does not have emitted
+        // `CREATE TABLE reporting.sales` against a database with no `reporting`
+        // — which PostgreSQL refuses, and with it the transaction the whole
+        // migration runs in. `unsupported()` was empty and Apply was live.
+        //
+        // Only the ones a *set in this plan* actually names: the comparison's
+        // list is about the two schemas, and a plan over one ticked table has no
+        // business creating a namespace for an object the user left out.
+        let mut sets: Vec<ChangeSet> = self
+            .new_namespaces
+            .iter()
+            .filter(|ns| {
+                chosen
+                    .iter()
+                    .any(|s| s.schema.as_deref() == Some(ns.as_str()))
+            })
+            .map(|ns| {
+                ddl::single(
+                    ns,
+                    None,
+                    self.dialect,
+                    Change::CreateSchema {
+                        name: ns.clone(),
+                        owner: None,
+                    },
+                )
+            })
+            .collect();
+        sets.extend(chosen);
         // **What this plan cannot carry, in the plan itself.** These entries
         // have no tick-box, so nothing the user does adds them — and until this
         // field existed nothing said so past the tree either: the footer counted
@@ -1482,6 +1575,156 @@ mod tests {
 
     fn mysql(left: DbSchema, right: DbSchema) -> SchemaComparison {
         SchemaComparison::of(&left, &right, SqlDialect::MySql)
+    }
+
+    // ── a match the comparison cannot vouch for ──────────────────────────────
+
+    /// **The flag's own case was the one nothing disclosed.** A lossy index —
+    /// a PostgreSQL expression index whose keys the model never read — compares
+    /// equal whatever the server holds, so the object it is on comes out
+    /// `Same`. `uncertain` was drawn only as a per-row hint, and `show_same:
+    /// false` (the default) hides that row: the tree said the two schemas
+    /// agreed about something it had never fully read.
+    ///
+    /// The tally is over the whole comparison, which is the one surface that is
+    /// about the whole comparison rather than about a row.
+    #[test]
+    fn an_uncertain_match_is_counted_even_though_its_row_is_hidden() {
+        let lossy = || crate::schema::IndexInfo {
+            name: "ix_expr".to_string(),
+            lossy: true,
+            ..Default::default()
+        };
+        let mut side = table("city", &[("id", "int")]);
+        side.indexes = vec![lossy()];
+        let c = mysql(schema_of(vec![side.clone()]), schema_of(vec![side]));
+
+        assert_eq!(c.counts().same, 1, "the two agree, as far as it can tell");
+        assert_eq!(c.counts().uncertain, 1, "and it cannot tell far enough");
+        // The row itself is hidden by default, which is the whole point.
+        assert!(
+            c.rows(
+                RowFilter {
+                    query: "",
+                    show_same: false
+                },
+                &c.default_expanded()
+            )
+            .is_empty()
+        );
+    }
+
+    /// It overlaps the four statuses rather than being a fifth: an uncertain
+    /// object is still `Same` or `Differing`, and the summary line says both
+    /// things about it.
+    #[test]
+    fn the_uncertain_tally_does_not_come_out_of_the_status_tallies() {
+        let lossy = || crate::schema::IndexInfo {
+            name: "ix_expr".to_string(),
+            lossy: true,
+            ..Default::default()
+        };
+        let mut left = table("city", &[("id", "int")]);
+        left.indexes = vec![lossy()];
+        let mut right = table("city", &[("id", "int"), ("name", "text")]);
+        right.indexes = vec![lossy()];
+        let c = mysql(schema_of(vec![left]), schema_of(vec![right]));
+        let n = c.counts();
+        assert_eq!(n.differing, 1);
+        assert_eq!(n.uncertain, 1);
+        assert_eq!(
+            n.total(),
+            1,
+            "one object, counted once — `uncertain` is a second fact about it"
+        );
+    }
+
+    // ── namespaces the migration has to make first ───────────────────────────
+
+    /// **A table cannot be created in a namespace that is not there.** A
+    /// namespace is not an object this comparison pairs — nothing introspects an
+    /// empty one and there is nothing in it to diff — so a right-only
+    /// `reporting.sales` emitted `CREATE TABLE reporting.sales` against a
+    /// database with no `reporting` in it. PostgreSQL refuses that statement and
+    /// with it the transaction the whole migration runs in, while
+    /// `unsupported()` was empty and Apply was live.
+    #[test]
+    fn a_table_in_a_new_namespace_gets_its_create_schema_first() {
+        let in_ns = |ns: &str, name: &str| TableInfo {
+            name: name.to_string(),
+            schema: Some(ns.to_string()),
+            columns: vec![col("id", "int")],
+            ..Default::default()
+        };
+        let c = SchemaComparison::of(
+            &schema_of(vec![in_ns("public", "city")]),
+            &schema_of(vec![in_ns("public", "city"), in_ns("reporting", "sales")]),
+            SqlDialect::Postgres,
+        );
+        assert_eq!(c.new_namespaces, vec!["reporting".to_string()]);
+
+        let plan = c.plan(|_| true);
+        let stmts = plan.emit();
+        let schema = stmts.iter().position(|s| s.contains("CREATE SCHEMA"));
+        let table = stmts.iter().position(|s| s.contains("sales"));
+        assert!(
+            schema.is_some() && schema < table,
+            "the namespace has to exist before the table in it: {stmts:?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .all(|s| !s.contains("CREATE SCHEMA \"public\"")),
+            "a namespace both sides already have is not created: {stmts:?}"
+        );
+    }
+
+    /// And only for a namespace the plan actually reaches into. The
+    /// comparison's list is about the two schemas; a plan over one ticked table
+    /// has no business creating a namespace for an object the user left out.
+    #[test]
+    fn an_unticked_objects_namespace_is_not_created() {
+        let in_ns = |ns: &str, name: &str| TableInfo {
+            name: name.to_string(),
+            schema: Some(ns.to_string()),
+            columns: vec![col("id", "int")],
+            ..Default::default()
+        };
+        let c = SchemaComparison::of(
+            &schema_of(vec![in_ns("public", "city")]),
+            &schema_of(vec![
+                in_ns("public", "city"),
+                in_ns("reporting", "sales"),
+                in_ns("audit", "log"),
+            ]),
+            SqlDialect::Postgres,
+        );
+        assert_eq!(c.new_namespaces.len(), 2, "{:?}", c.new_namespaces);
+        let plan = c.plan(|e| e.name == "sales");
+        let stmts = plan.emit();
+        assert!(stmts.iter().any(|s| s.contains("reporting")), "{stmts:?}");
+        assert!(
+            stmts.iter().all(|s| !s.contains("audit")),
+            "nothing here is going into `audit`: {stmts:?}"
+        );
+    }
+
+    /// MySQL and SQLite have no level between the database and the table, so
+    /// every object's namespace there is `None` and the list is empty by
+    /// construction rather than by a dialect test.
+    #[test]
+    fn an_engine_with_no_namespaces_never_creates_one() {
+        let c = mysql(
+            schema_of(vec![]),
+            schema_of(vec![table("fresh", &[("id", "int")])]),
+        );
+        assert!(c.new_namespaces.is_empty());
+        assert!(
+            c.plan(|_| true)
+                .emit()
+                .iter()
+                .all(|s| !s.contains("CREATE SCHEMA"))
+        );
     }
 
     // ── the two sentences about a count ──────────────────────────────────────
@@ -3228,6 +3471,7 @@ mod tests {
                 differing: 1,
                 only_left: 1,
                 only_right: 1,
+                uncertain: 0,
             }
         );
     }
