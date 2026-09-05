@@ -320,11 +320,67 @@ impl Session {
     /// Roll back to the write savepoint, reporting whether the server accepted
     /// it — which is the direct evidence that the transaction is alive.
     async fn undo_savepoint(guard: &mut Backend) -> bool {
-        let sql = TxScope::Savepoint.rollback_sql();
+        Session::run_scope_sql(guard, TxScope::Savepoint.rollback_sql()).await
+    }
+
+    /// One statement of transaction bookkeeping, on either backend, reporting
+    /// whether the server took it.
+    async fn run_scope_sql(guard: &mut Backend, sql: &str) -> bool {
         match guard {
             Backend::MySql { conn, .. } => conn.query_drop(sql).await.is_ok(),
             Backend::Postgres { client } => client.batch_execute(sql).await.is_ok(),
         }
+    }
+
+    /// Put a savepoint in front of a **read** that runs on the pinned
+    /// connection, so a cancellation of it can be undone.
+    ///
+    /// **Why a read needs one at all.** On PostgreSQL a cancelled statement
+    /// aborts the enclosing transaction exactly as a failed one does, and
+    /// nothing distinguishes the two afterwards: the server rejects everything
+    /// until `ROLLBACK`, and a Manual-mode tab's `COMMIT` then acts as one. So
+    /// dismissing the binary-cell panel mid-read — Escape, the ✕, the footer, or
+    /// clicking a second binary cell, all of which cancel — discarded every
+    /// uncommitted statement the user had built up, on the least consequential
+    /// thing that connection does. `commit_writes` has had a savepoint and
+    /// `classify_isolated` for exactly this since it was written; the reads had
+    /// neither.
+    ///
+    /// A read has nothing of its own to lose by being rolled back, which is what
+    /// makes this cheap: on success the savepoint is released, on cancellation
+    /// it is rolled back and released, and either way the transaction is where
+    /// it was. Returns whether the fence is actually there — a server that
+    /// refused the `SAVEPOINT` gets the old, honest classification.
+    async fn fence_read(guard: &mut Backend) -> bool {
+        Session::run_scope_sql(guard, TxScope::Savepoint.begin_sql()).await
+    }
+
+    /// Classify a read that ran behind [`Session::fence_read`].
+    ///
+    /// The savepoint is released on the way out in every arm, because the name
+    /// is fixed (`schemaic_w`) and a transaction can hold a great many blob
+    /// reads: `ROLLBACK TO SAVEPOINT` does **not** release, so without this each
+    /// dismissed panel would leave one behind.
+    async fn classify_fenced<T>(guard: &mut Backend, result: Result<T, DbError>) -> Outcome<T> {
+        let mut out = Session::classify(guard, result).await;
+        match out.stmt {
+            StmtOutcome::Ok => {
+                let _ = Session::run_scope_sql(guard, TxScope::Savepoint.commit_sql()).await;
+            }
+            // **Confirmed, not assumed** — `classify_isolated`'s rule. The
+            // upgrade is claimed only if the server accepted the rollback, which
+            // is the direct evidence that the transaction is alive.
+            StmtOutcome::Failed if Session::undo_savepoint(guard).await => {
+                out.stmt = StmtOutcome::FailedIsolated;
+                let _ = Session::run_scope_sql(guard, TxScope::Savepoint.commit_sql()).await;
+            }
+            StmtOutcome::Cancelled if Session::undo_savepoint(guard).await => {
+                out.stmt = StmtOutcome::CancelledIsolated;
+                let _ = Session::run_scope_sql(guard, TxScope::Savepoint.commit_sql()).await;
+            }
+            _ => {}
+        }
+        out
     }
 
     /// Run one statement on the pinned connection, inside the open transaction.
@@ -565,7 +621,28 @@ impl Session {
         r: &BlobRef,
         cancel: CancellationToken,
     ) -> Outcome<Option<BlobValue>> {
+        // Nothing dispatched yet — `fetch_query`'s guard, for its reasons, and
+        // for one more that is specific to this call: the overwhelmingly common
+        // cancellation here is the panel being dismissed, which happens far more
+        // often than a read is genuinely interrupted mid-flight, and `NotSent`
+        // is the one outcome that leaves the transaction alone with no
+        // bookkeeping at all.
+        if cancel.is_cancelled() {
+            return Outcome {
+                result: Err(DbError::Cancelled),
+                stmt: StmtOutcome::NotSent,
+            };
+        }
         let mut guard = self.inner.lock().await;
+        if cancel.is_cancelled() {
+            return Outcome {
+                result: Err(DbError::Cancelled),
+                stmt: StmtOutcome::NotSent,
+            };
+        }
+        // See `fence_read`: a cancelled read on this connection would otherwise
+        // abort the user's transaction on PostgreSQL.
+        let fenced = Session::fence_read(&mut guard).await;
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
@@ -589,7 +666,11 @@ impl Session {
                 }
             }
         };
-        Session::classify(&mut guard, result).await
+        if fenced {
+            Session::classify_fenced(&mut guard, result).await
+        } else {
+            Session::classify(&mut guard, result).await
+        }
     }
 
     /// Re-read just-edited rows **on this connection** — the only one that can
@@ -604,6 +685,12 @@ impl Session {
             return Outcome::ok(Vec::new());
         }
         let mut guard = self.inner.lock().await;
+        // Fenced like `fetch_blob`, and for the same reason: this is a **read**
+        // on the pinned connection, and on PostgreSQL a cancelled one aborts the
+        // transaction it runs inside. It runs immediately after a `commit_writes`
+        // the user has just watched succeed, so the work it would discard is
+        // work they were told they had.
+        let fenced = Session::fence_read(&mut guard).await;
         let result = match &mut *guard {
             Backend::MySql { conn, conn_id } => {
                 let conn_id = *conn_id;
@@ -627,7 +714,11 @@ impl Session {
                 }
             }
         };
-        Session::classify(&mut guard, result).await
+        if fenced {
+            Session::classify_fenced(&mut guard, result).await
+        } else {
+            Session::classify(&mut guard, result).await
+        }
     }
 }
 

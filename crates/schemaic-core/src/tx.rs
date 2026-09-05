@@ -71,6 +71,23 @@ pub enum StmtOutcome {
     FailedIsolated,
     /// The user cancelled it (`KILL QUERY` / PG cancel request).
     Cancelled,
+    /// The user cancelled it, but it ran inside its own `SAVEPOINT` and that
+    /// savepoint has since been rolled back — so the enclosing transaction is
+    /// untouched and still committable.
+    ///
+    /// [`StmtOutcome::FailedIsolated`]'s twin, and it exists for the same reason
+    /// with a sharper edge: on PostgreSQL a cancellation aborts the transaction
+    /// exactly as an error does, so a **read** the user dismissed — a blob panel
+    /// closed with Escape while its `SELECT` was still running — discarded every
+    /// uncommitted statement of a Manual-mode tab, and the pill was not wrong
+    /// about it. A read has nothing of its own to lose by being rolled back,
+    /// which is what makes fencing one and reporting this both safe and true.
+    ///
+    /// Only ever reported where the rollback was **issued and accepted** — see
+    /// `Session::classify_fenced`. A cancellation with no fence around it is
+    /// still [`StmtOutcome::Cancelled`], because nothing then guarantees the
+    /// transaction survived.
+    CancelledIsolated,
     /// It failed or was cancelled, **and the transaction it was inside is gone**:
     /// MySQL performs its implicit commit *before* a DDL statement runs, so an
     /// `ALTER` the server rejected — or one a statement timeout killed halfway
@@ -209,7 +226,9 @@ impl TxState {
                     // Its savepoint already absorbed the abort, so the enclosing
                     // transaction is untouched on either engine — it just gains
                     // no statement.
-                    StmtOutcome::FailedIsolated => TxState::Open { stmts },
+                    StmtOutcome::FailedIsolated | StmtOutcome::CancelledIsolated => {
+                        TxState::Open { stmts }
+                    }
                     // Nothing was sent, so nothing happened to the transaction on
                     // either engine — and there *is* one, because the session
                     // opens it before the statement is attempted. `Open` rather
@@ -677,6 +696,61 @@ mod tests {
         assert_eq!(
             s.on_statement(MY, "UPDATE t SET a = 1", StmtOutcome::FailedIsolated),
             TxState::Open { stmts: 20 }
+        );
+    }
+
+    /// **A dismissed read is not a lost transaction.** On PostgreSQL a
+    /// cancellation aborts the enclosing transaction exactly as an error does,
+    /// so closing the binary-cell panel while its `SELECT` was still running —
+    /// Escape, the ✕, the footer, or clicking a second binary cell, all of which
+    /// cancel — poisoned a Manual-mode tab and discarded every uncommitted
+    /// statement in it. The pill was not wrong, which is what made it data loss.
+    ///
+    /// The read is fenced by a savepoint now, and this is what the fence means
+    /// once the server has accepted the rollback.
+    #[test]
+    fn a_savepoint_isolated_cancellation_leaves_the_transaction_usable() {
+        let s = TxState::Open { stmts: 20 };
+        let after = s.on_statement(PG, "SELECT data FROM blobs", StmtOutcome::CancelledIsolated);
+        assert_eq!(
+            after,
+            TxState::Open { stmts: 20 },
+            "a read that was undone changed nothing"
+        );
+        assert!(after.can_commit(), "the user's work is still committable");
+        assert_eq!(
+            s.on_statement(MY, "SELECT data FROM blobs", StmtOutcome::CancelledIsolated),
+            TxState::Open { stmts: 20 }
+        );
+    }
+
+    /// And the contrast, which is what keeps the fence honest: an *unfenced*
+    /// cancellation — a run the user stopped, with no savepoint around it —
+    /// still poisons. The isolated variant is only ever reported where the
+    /// rollback was issued and accepted.
+    #[test]
+    fn a_bare_cancellation_still_poisons_postgres() {
+        let s = TxState::Open { stmts: 20 };
+        assert_eq!(
+            s.on_statement(PG, "SELECT pg_sleep(60)", StmtOutcome::Cancelled),
+            TxState::Poisoned { stmts: 20 }
+        );
+    }
+
+    /// Nor can it revive a transaction that is already gone.
+    #[test]
+    fn a_savepoint_isolated_cancellation_does_not_revive_a_dead_transaction() {
+        assert_eq!(
+            TxState::Poisoned { stmts: 3 }.on_statement(
+                PG,
+                "SELECT 1",
+                StmtOutcome::CancelledIsolated
+            ),
+            TxState::Poisoned { stmts: 3 }
+        );
+        assert_eq!(
+            TxState::Lost.on_statement(PG, "SELECT 1", StmtOutcome::CancelledIsolated),
+            TxState::Lost
         );
     }
 
