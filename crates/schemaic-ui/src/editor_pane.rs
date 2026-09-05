@@ -805,7 +805,8 @@ fn cmdk_popup(
 /// What "Optimize" actually asks the model, as opposed to the two-word label the
 /// prompt box shows. One constant, because the launch and a **retry** of it have
 /// to send the same thing — see [`CmdK::intent`].
-const OPTIMIZE_INTENT: &str = "Rewrite this SQL query to be more efficient and readable while      preserving its exact result set. Return only the SQL.";
+const OPTIMIZE_INTENT: &str = "Rewrite this SQL query to be more efficient and readable while \
+                               preserving its exact result set. Return only the SQL.";
 
 /// Editor-local state for the inline (Ctrl+K) AI prompt popup. `start`/`end` are
 /// the doc byte-range captured at trigger time — equal ⇒ generate/insert at the

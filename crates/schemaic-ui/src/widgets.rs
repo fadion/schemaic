@@ -6312,7 +6312,8 @@ mod menu_placement_tests {
             let floor = theme::scaled(170.0); // what the flip used to test
             assert!(
                 drawn > floor,
-                "{}: the panel draws {drawn} but the flip tested {floor} — the                  overhang is what ran off the window",
+                "{}: the panel draws {drawn} but the flip tested {floor} — the \
+                 overhang is what ran off the window",
                 scale.label()
             );
         }
