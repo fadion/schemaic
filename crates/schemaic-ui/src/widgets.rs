@@ -1952,12 +1952,23 @@ pub(crate) fn modal_footer(actions: impl IntoView + 'static) -> impl IntoView {
 /// status may shrink to nothing, the actions never shrink at all, and a caller
 /// whose sentence can run long adds `text_ellipsis` to end it in a `…` rather
 /// than in a clipped word.
+///
+/// **`min_width(0)` is on the status *and* on the wrapper around it**, because
+/// the wrapper alone does not meet that contract. `min-width: auto` applies to
+/// every flex item, so relaxing it on the container still left the status inside
+/// with taffy's automatic minimum — it never compressed, so `text_ellipsis`
+/// never had a narrower box to end a line in and the caller's half of the
+/// contract could not be kept. Ten of the twelve callers had noticed and were
+/// spelling `status.style(|s| s.min_width(0.0))` themselves; six were not, and
+/// a helper whose documented contract only works if the caller repeats half of
+/// it is a helper that will keep being called wrong.
 pub(crate) fn modal_footer_split(
     status: impl IntoView + 'static,
     actions: impl IntoView + 'static,
 ) -> impl IntoView {
     h_stack((
-        container(status).style(|s| s.min_width(0.0).flex_shrink(1.0_f32)),
+        container(status.style(|s| s.min_width(0.0)))
+            .style(|s| s.min_width(0.0).flex_shrink(1.0_f32)),
         empty().style(|s| s.flex_grow(1.0_f32).min_width(10.0).flex_shrink(1.0_f32)),
         container(actions).style(|s| s.flex_shrink(0.0_f32)),
     ))

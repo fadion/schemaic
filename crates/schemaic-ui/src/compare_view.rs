@@ -518,22 +518,21 @@ fn ready_body(c: Rc<SchemaComparison>, ui: &Ui, ring: FocusRing) -> impl IntoVie
                     &expanded,
                 );
                 if rows.is_empty() {
-                    // **Which emptiness this is.** "Nothing matches that
-                    // filter" over an unfiltered comparison of two identical
-                    // schemas is the wrong answer to the question that was
-                    // asked, and "these match" over a filter that found
-                    // nothing is worse — it claims agreement the comparison
-                    // never checked. Both cases are reachable and they read
-                    // differently, so the message is chosen here rather than
-                    // once outside this container, where it could not see the
-                    // filter change.
-                    return note(if !query.trim().is_empty() {
-                        "Nothing matches that filter."
-                    } else if c.counts().total() == 0 {
-                        "Neither database holds anything to compare."
-                    } else {
-                        "These two schemas match, object for object."
-                    })
+                    // **Which emptiness this is** — `SchemaComparison::rows`'
+                    // own question, asked of the same filter so the two cannot
+                    // disagree. It lived here as three inline arms nothing could
+                    // reach, and one of them was wrong: a filter that *matched*,
+                    // but matched only objects the two schemas agree on with
+                    // *Include identical* off, was reported as "Nothing matches
+                    // that filter" — a claim about the filter over a result the
+                    // toggle beside it produced.
+                    return note(
+                        c.empty_reason(RowFilter {
+                            query: &query,
+                            show_same,
+                        })
+                        .message(),
+                    )
                     .into_any();
                 }
                 v_stack_from_iter(rows.into_iter().map(|r| row_view(r, o)))
@@ -746,7 +745,7 @@ fn group_row(
     let label = format!(
         "{}{} ({})",
         kind.label(),
-        if counts.total() == 1 { "" } else { "s" },
+        schemaic_core::text::plural(counts.total(), "", "s"),
         counts.total()
     );
     let key = kind.label().to_string();
@@ -891,7 +890,19 @@ fn object_row(e: &CompareEntry, o: crate::OverlayUi) -> impl IntoView {
     };
 
     v_stack((row, hint_row))
-        .on_click_stop(move |_| o.compare_focus.set(Some(focus_key.clone())))
+        // **Guarded, because `set` never dedups.** Re-clicking the row that is
+        // already selected notified without changing anything: the diff pane is
+        // a `dyn_container` keyed on this signal, so it was torn down and
+        // rebuilt — a fresh `line_diff` over both sides' DDL — and every row in
+        // the tree restyled. The same feature guards its sibling signal in
+        // `compare_list_dbs` for the same reason.
+        .on_click_stop(move |_| {
+            if o.compare_focus
+                .with_untracked(|f| f.as_deref() != Some(focus_key.as_str()))
+            {
+                o.compare_focus.set(Some(focus_key.clone()));
+            }
+        })
         .style(move |s| {
             let s = s
                 .flex_col()
@@ -1037,11 +1048,8 @@ fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
             .with(|sel| c.differences().filter(|e| is_planned(e, sel)).count())
     });
 
-    let status = label(move || match planned.get() {
-        0 => "Nothing selected.".to_string(),
-        n => format!("{n} object{} selected", if n == 1 { "" } else { "s" }),
-    })
-    .style(|s| s.font_size(theme::font_hint()).color(theme::text_muted()));
+    let status = label(move || schemaic_core::compare::selection_note(planned.get()))
+        .style(|s| s.font_size(theme::font_hint()).color(theme::text_muted()));
 
     let preview = {
         let ui = ui.clone();
@@ -1096,15 +1104,10 @@ fn open_plan_preview(ui: &Ui, close: Rc<dyn Fn()>) {
             .find(|c| c.id == t.left.conn_id)
             .is_some_and(|c| c.read_only)
     });
-    let subject = format!(
-        "{} object{}",
-        plan.len(),
-        if plan.len() == 1 { "" } else { "s" }
-    );
     let preview = crate::ddl_preview::preview_of_plan(
         t.left.conn_id,
         &t.left.database,
-        subject,
+        plan.subject(),
         &plan,
         read_only,
     );

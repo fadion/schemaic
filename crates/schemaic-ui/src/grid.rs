@@ -2915,24 +2915,32 @@ pub(crate) fn grid_error_bar(
     error_text: RwSignal<Option<String>>,
     error_fixable: RwSignal<bool>,
 ) -> impl IntoView {
+    // Destructured **exhaustively**, with no `..`: the struct's own doc says
+    // that is what it is for, and a rest pattern re-opens the exact failure it
+    // was written against — a field added here and bound nowhere, so a bar the
+    // rest of the app is filling never appears. The `..` became vestigial when
+    // the export state left this bar, and a vestigial rest pattern is
+    // indistinguishable from a deliberate one.
     let BarSignals {
         commit_err,
         commit_note,
         view_err,
         commit_wait,
-        ..
     } = bars;
     // **A statement's own failure is not here** — it goes to the editor's error
     // bar, under the SQL that produced it and beside the Explain and AI-fix that
     // act on it, which is where a single run's has always gone. This bar reports
-    // on what the *grid* did: a commit, a filter re-run, an export. An error over
+    // on what the *grid* did: a commit or a filter re-run. **Not an export** —
+    // that state moved to the export modal, and it was the only one here that
+    // stood for the whole length of an operation rather than its result, which
+    // is why it was the only one carrying a control that stopped something. An error over
     // the wait note — it describes a write that is already over, while the note
     // describes one still in flight (and every path clears the note before
     // reporting a failure anyway).
     let current = move || {
-        // None of these is a *statement* error, so none is fixable: `error_fix_range`
-        // scopes a fix to a statement in the buffer, and a commit, a filter re-run
-        // and a failed export are none of them that.
+        // Neither of these is a *statement* error, so neither is fixable:
+        // `error_fix_range` scopes a fix to a statement in the buffer, and a
+        // commit and a filter re-run are neither of them that.
         commit_err
             .get()
             .map(|m| BarState::Error(m, false))
