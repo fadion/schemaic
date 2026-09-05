@@ -3400,6 +3400,10 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let read_only = gctx.read_only;
     let rs_model = rs.clone();
     let frozen_panel = gctx.panel_frozen;
+    // The tab's engine, for `EditModel::byte_cap` alone: a declared byte length
+    // is a promise on MySQL and a note on SQLite, so a type name cannot be read
+    // as a cap without it.
+    let model_dialect = gs.dialect;
     create_effect(move |_| {
         // A frozen (pinned) result is read-only for a stronger reason than a
         // read-only connection is: the rows on screen are a *snapshot*, and a
@@ -3409,7 +3413,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         let model = if read_only.get() || frozen_panel.get() {
             EditModel::default()
         } else {
-            analyze_edit(&rs_model, |db, ns, table| {
+            analyze_edit(&rs_model, model_dialect, |db, ns, table| {
                 db_nodes.with_untracked(|nodes| {
                     nodes.iter().find(|n| n.database == db).and_then(|n| {
                         match n.schema.get_untracked() {

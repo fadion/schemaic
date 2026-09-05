@@ -22,6 +22,7 @@
 //! `LIMIT 1` over an ambiguous row.
 
 use crate::edit::{EditModel, row_key};
+use crate::intel::SqlDialect;
 use crate::model::{ResultSet, Value};
 
 /// Most bytes read into memory for one cell.
@@ -400,7 +401,19 @@ pub fn hex_line(bytes: &[u8], row: usize) -> String {
 /// hits from a file picker (1 GB and `SQLITE_MAX_LENGTH`), and an unloaded
 /// schema or an unknown type name gives the same `None` — after which the server
 /// is still the authority it always was.
-pub fn column_byte_cap(type_name: &str) -> Option<u64> {
+///
+/// **The dialect is asked first, and it is not decoration.** The table below is
+/// MySQL's, and a type name alone cannot say whose it is: `BLOB` and
+/// `VARBINARY(16)` are legal SQLite declarations too, where the parameter is
+/// ignored and the family means nothing. Applied there, this function capped a
+/// `BLOB` at 65,535 bytes and a `VARBINARY(16)` at **sixteen** — so *Load from
+/// file* refused files the engine would have stored without complaint. The
+/// question is a capability, [`crate::ddl::enforces_declared_byte_length`], and
+/// never `dialect == MySql` in place of one.
+pub fn column_byte_cap(dialect: SqlDialect, type_name: &str) -> Option<u64> {
+    if !crate::ddl::enforces_declared_byte_length(dialect) {
+        return None;
+    }
     let head = type_name
         .split(|c: char| c == '(' || c.is_whitespace())
         .next()
@@ -464,7 +477,7 @@ pub fn column_byte_cap(type_name: &str) -> Option<u64> {
 /// rendered.
 pub fn blob_source(model: &EditModel, rs: &ResultSet, di: usize, ci: usize) -> Option<BlobRef> {
     let col = rs.columns.get(ci)?;
-    if !col.is_binary() && !rs.binary_columns.contains(&ci) {
+    if !crate::edit::holds_bytes(rs, ci) {
         return None;
     }
     // The per-value half. A NULL cell fails it too — its stored text is empty —
@@ -933,7 +946,7 @@ mod tests {
     #[test]
     fn a_binary_column_resolves_a_source_and_a_bytes_only_write() {
         let rs = staff_rs();
-        let model = crate::edit::analyze_edit(&rs, staff_schema);
+        let model = crate::edit::analyze_edit(&rs, SqlDialect::MySql, staff_schema);
         assert!(model.editable(1), "the picture column takes a write");
         assert!(
             !model.text_editable(1),
@@ -976,14 +989,26 @@ mod tests {
     /// lets through 65 KiB the server rejects at commit.
     #[test]
     fn each_blob_family_carries_its_own_cap() {
-        assert_eq!(column_byte_cap("tinyblob"), Some(255));
-        assert_eq!(column_byte_cap("blob"), Some(65_535));
-        assert_eq!(column_byte_cap("mediumblob"), Some(16_777_215));
-        assert_eq!(column_byte_cap("longblob"), Some(4_294_967_295));
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "tinyblob"), Some(255));
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "blob"), Some(65_535));
+        assert_eq!(
+            column_byte_cap(SqlDialect::MySql, "mediumblob"),
+            Some(16_777_215)
+        );
+        assert_eq!(
+            column_byte_cap(SqlDialect::MySql, "longblob"),
+            Some(4_294_967_295)
+        );
         // Case is the server's business, not ours — MySQL's information_schema
         // reports lower-case, the DDL a user typed may not.
-        assert_eq!(column_byte_cap("MEDIUMBLOB"), Some(16_777_215));
-        assert_eq!(column_byte_cap("MediumBlob"), Some(16_777_215));
+        assert_eq!(
+            column_byte_cap(SqlDialect::MySql, "MEDIUMBLOB"),
+            Some(16_777_215)
+        );
+        assert_eq!(
+            column_byte_cap(SqlDialect::MySql, "MediumBlob"),
+            Some(16_777_215)
+        );
     }
 
     /// The leading token decides, so `longblob` is never read as `blob` with a
@@ -991,8 +1016,14 @@ mod tests {
     /// reason both split on `(` and whitespace rather than comparing substrings.
     #[test]
     fn a_longer_family_name_is_not_read_as_a_shorter_one() {
-        assert_ne!(column_byte_cap("longblob"), column_byte_cap("blob"));
-        assert_ne!(column_byte_cap("tinyblob"), column_byte_cap("blob"));
+        assert_ne!(
+            column_byte_cap(SqlDialect::MySql, "longblob"),
+            column_byte_cap(SqlDialect::MySql, "blob")
+        );
+        assert_ne!(
+            column_byte_cap(SqlDialect::MySql, "tinyblob"),
+            column_byte_cap(SqlDialect::MySql, "blob")
+        );
     }
 
     /// `BINARY(n)`/`VARBINARY(n)` take their bound from the parameter, which is
@@ -1000,10 +1031,16 @@ mod tests {
     /// `VARBINARY` with the length stripped off.
     #[test]
     fn a_fixed_width_binary_column_takes_its_cap_from_its_parameter() {
-        assert_eq!(column_byte_cap("varbinary(4)"), Some(4));
-        assert_eq!(column_byte_cap("binary(16)"), Some(16));
-        assert_eq!(column_byte_cap("varbinary(65535)"), Some(65_535));
-        assert_eq!(column_byte_cap("VARBINARY( 8 )"), Some(8));
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "varbinary(4)"), Some(4));
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "binary(16)"), Some(16));
+        assert_eq!(
+            column_byte_cap(SqlDialect::MySql, "varbinary(65535)"),
+            Some(65_535)
+        );
+        assert_eq!(
+            column_byte_cap(SqlDialect::MySql, "VARBINARY( 8 )"),
+            Some(8)
+        );
     }
 
     /// **`None` means "no answer", and the two sources of it are different
@@ -1013,30 +1050,100 @@ mod tests {
     /// only safe way for this to be wrong.
     #[test]
     fn an_unbounded_or_unreadable_type_answers_no_cap() {
-        assert_eq!(column_byte_cap("bytea"), None);
-        assert_eq!(column_byte_cap("BYTEA"), None);
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "bytea"), None);
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "BYTEA"), None);
         // SQLite's declared types, including the untyped column.
-        assert_eq!(column_byte_cap(""), None);
-        assert_eq!(column_byte_cap("text"), None);
+        assert_eq!(column_byte_cap(SqlDialect::MySql, ""), None);
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "text"), None);
         // A bare `VARBINARY` is the wire name, not a declaration — unknown, not
         // `VARBINARY(1)`, because guessing 1 would refuse every file.
-        assert_eq!(column_byte_cap("varbinary"), None);
-        assert_eq!(column_byte_cap("binary"), None);
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "varbinary"), None);
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "binary"), None);
         // And a parameter that is not a number is not a cap.
-        assert_eq!(column_byte_cap("varbinary(max)"), None);
+        assert_eq!(column_byte_cap(SqlDialect::MySql, "varbinary(max)"), None);
+    }
+
+    /// **A type name cannot say whose type it is, and this is the whole seam
+    /// `R1-L2-02` lived at.** `BLOB` and `VARBINARY(16)` are legal SQLite
+    /// declarations, where the family means nothing and the parameter is
+    /// ignored outright — that engine types *values*, not columns, and stores a
+    /// megabyte in either. Read as MySQL's, they capped the cell at 65,535 and
+    /// **16** bytes, so *Load from file* refused files SQLite would have taken.
+    #[test]
+    fn a_sqlite_column_declares_no_byte_cap_whatever_it_is_called() {
+        for ty in [
+            "BLOB",
+            "blob",
+            "tinyblob",
+            "mediumblob",
+            "longblob",
+            "varbinary(16)",
+            "binary(4)",
+        ] {
+            assert_eq!(
+                column_byte_cap(SqlDialect::Sqlite, ty),
+                None,
+                "SQLite's `{ty}` is an affinity, not a bound"
+            );
+        }
+    }
+
+    /// PostgreSQL reaches the same answer from the other side: `bytea` declares
+    /// no length at all, so there is nothing to read even before the capability
+    /// is asked. The two are not the same fact and both are `None`.
+    #[test]
+    fn postgres_declares_no_byte_cap_either() {
+        assert_eq!(column_byte_cap(SqlDialect::Postgres, "bytea"), None);
+        assert_eq!(column_byte_cap(SqlDialect::Postgres, "blob"), None);
+    }
+
+    /// **The seam, composed: `analyze_edit` -> `col_cap` -> `byte_cap`.**
+    ///
+    /// `column_byte_cap` had fourteen unit tests and every one of them named a
+    /// MySQL type, so nothing ever asked which engine's table was being read —
+    /// and the answer only becomes wrong once a *schema* on a *dialect* flows
+    /// through `analyze_edit`'s cap fill into the single consumer, the blob
+    /// panel's over-cap refusal. Both legs here, on one fixture, because a test
+    /// of either alone is what let this ship.
+    #[test]
+    fn the_declared_cap_reaches_the_edit_model_only_where_the_engine_keeps_it() {
+        let rs = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "files", true, false),
+                col("data", "BLOB", "files", false, true),
+            ],
+            vec![vec![
+                Value::UInt(1),
+                Value::Str(crate::model::binary_display(9)),
+            ]],
+        );
+        let schema = |_d: &str, _s: Option<&str>, t: &str| {
+            (t == "files")
+                .then(|| table_info("files", &["id"], &[("id", "int"), ("data", "mediumblob")]))
+        };
+        assert_eq!(
+            crate::edit::analyze_edit(&rs, SqlDialect::MySql, schema).byte_cap(1),
+            Some(16_777_215),
+            "MySQL answers an overrun with ERROR 1406, so the cap is worth having"
+        );
+        assert_eq!(
+            crate::edit::analyze_edit(&rs, SqlDialect::Sqlite, schema).byte_cap(1),
+            None,
+            "SQLite would have stored the file; refusing it is our bug, not its"
+        );
     }
 
     #[test]
     fn a_non_binary_column_has_no_blob_source() {
         let rs = staff_rs();
-        let model = crate::edit::analyze_edit(&rs, staff_schema);
+        let model = crate::edit::analyze_edit(&rs, SqlDialect::MySql, staff_schema);
         assert_eq!(blob_source(&model, &rs, 0, 0), None);
     }
 
     #[test]
     fn a_column_index_past_the_end_answers_none() {
         let rs = staff_rs();
-        let model = crate::edit::analyze_edit(&rs, staff_schema);
+        let model = crate::edit::analyze_edit(&rs, SqlDialect::MySql, staff_schema);
         assert_eq!(blob_source(&model, &rs, 0, 99), None);
     }
 
@@ -1051,9 +1158,13 @@ mod tests {
             ],
             vec![vec![Value::UInt(1), Value::Str("<8 bytes>".to_string())]],
         );
-        let model = crate::edit::analyze_edit(&rs, |_d: &str, _s: Option<&str>, t: &str| {
-            (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
-        });
+        let model = crate::edit::analyze_edit(
+            &rs,
+            SqlDialect::MySql,
+            |_d: &str, _s: Option<&str>, t: &str| {
+                (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
+            },
+        );
         assert!(rs.columns[1].is_binary(), "fixture must be a binary column");
         assert_eq!(blob_source(&model, &rs, 0, 1), None);
     }
@@ -1065,10 +1176,14 @@ mod tests {
     fn a_table_with_no_usable_key_has_no_source() {
         let rs = staff_rs();
         // Same result set, but the schema reports no primary key.
-        let model = crate::edit::analyze_edit(&rs, |_d: &str, _s: Option<&str>, t: &str| {
-            (t == "staff")
-                .then(|| table_info("staff", &[], &[("staff_id", "int"), ("picture", "blob")]))
-        });
+        let model = crate::edit::analyze_edit(
+            &rs,
+            SqlDialect::MySql,
+            |_d: &str, _s: Option<&str>, t: &str| {
+                (t == "staff")
+                    .then(|| table_info("staff", &[], &[("staff_id", "int"), ("picture", "blob")]))
+            },
+        );
         assert_eq!(blob_source(&model, &rs, 0, 1), None);
     }
 
@@ -1085,15 +1200,19 @@ mod tests {
             vec![id, picture],
             vec![vec![Value::UInt(1), Value::Str("<9 bytes>".to_string())]],
         );
-        let model = crate::edit::analyze_edit(&rs, |_d: &str, _s: Option<&str>, t: &str| {
-            (t == "staff").then(|| {
-                table_info(
-                    "staff",
-                    &["staff_id"],
-                    &[("staff_id", "int"), ("picture", "bytea")],
-                )
-            })
-        });
+        let model = crate::edit::analyze_edit(
+            &rs,
+            SqlDialect::MySql,
+            |_d: &str, _s: Option<&str>, t: &str| {
+                (t == "staff").then(|| {
+                    table_info(
+                        "staff",
+                        &["staff_id"],
+                        &[("staff_id", "int"), ("picture", "bytea")],
+                    )
+                })
+            },
+        );
         assert_eq!(
             blob_source(&model, &rs, 0, 1),
             None,
@@ -1111,9 +1230,13 @@ mod tests {
             vec![col("id", "INT", "t", true, false), c],
             vec![vec![Value::UInt(1), Value::Str("<4 bytes>".to_string())]],
         );
-        let model = crate::edit::analyze_edit(&rs, |_d: &str, _s: Option<&str>, t: &str| {
-            (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
-        });
+        let model = crate::edit::analyze_edit(
+            &rs,
+            SqlDialect::MySql,
+            |_d: &str, _s: Option<&str>, t: &str| {
+                (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
+            },
+        );
         assert_eq!(blob_source(&model, &rs, 0, 1), None);
     }
 
@@ -1138,9 +1261,13 @@ mod tests {
                 vec![Value::UInt(2), Value::Str("hello".to_string())],
             ],
         );
-        let model = crate::edit::analyze_edit(&rs, |_d: &str, _s: Option<&str>, t: &str| {
-            (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
-        });
+        let model = crate::edit::analyze_edit(
+            &rs,
+            SqlDialect::MySql,
+            |_d: &str, _s: Option<&str>, t: &str| {
+                (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
+            },
+        );
         assert!(
             blob_source(&model, &rs, 0, 1).is_some(),
             "the row that really is bytes must still be fetchable"
@@ -1163,9 +1290,13 @@ mod tests {
             ],
             vec![vec![Value::UInt(1), Value::Null]],
         );
-        let model = crate::edit::analyze_edit(&rs, |_d: &str, _s: Option<&str>, t: &str| {
-            (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
-        });
+        let model = crate::edit::analyze_edit(
+            &rs,
+            SqlDialect::MySql,
+            |_d: &str, _s: Option<&str>, t: &str| {
+                (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
+            },
+        );
         assert_eq!(blob_source(&model, &rs, 0, 1), None);
     }
 
@@ -1173,7 +1304,7 @@ mod tests {
     #[test]
     fn a_row_index_past_the_end_answers_none() {
         let rs = staff_rs();
-        let model = crate::edit::analyze_edit(&rs, staff_schema);
+        let model = crate::edit::analyze_edit(&rs, SqlDialect::MySql, staff_schema);
         assert_eq!(blob_source(&model, &rs, 99, 1), None);
     }
 
@@ -1194,9 +1325,13 @@ mod tests {
         assert!(!rs.columns[1].is_binary(), "fixture: no static signal");
         let mut rs = rs;
         rs.binary_columns = vec![1];
-        let model = crate::edit::analyze_edit(&rs, |_d: &str, _s: Option<&str>, t: &str| {
-            (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
-        });
+        let model = crate::edit::analyze_edit(
+            &rs,
+            SqlDialect::MySql,
+            |_d: &str, _s: Option<&str>, t: &str| {
+                (t == "t").then(|| table_info("t", &["id"], &[("id", "int")]))
+            },
+        );
         let got = blob_source(&model, &rs, 0, 1).expect("dynamic signal should be honoured");
         assert_eq!(got.column, "payload");
         assert_eq!(got.key, vec![("id".to_string(), Value::UInt(7))]);

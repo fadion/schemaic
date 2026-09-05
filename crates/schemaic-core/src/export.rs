@@ -1637,7 +1637,7 @@ pub fn qualified_table(
 fn dropped_binary_columns(rs: &ResultSet, order: &[usize]) -> Vec<usize> {
     (0..rs.columns.len())
         .filter(|&ci| {
-            (rs.columns[ci].is_binary() || rs.binary_columns.contains(&ci))
+            crate::edit::holds_bytes(rs, ci)
                 && order.iter().any(|&di| {
                     di < rs.row_count()
                         && rs

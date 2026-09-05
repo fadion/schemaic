@@ -41,7 +41,7 @@ use schemaic_core::blob::{
     BlobKind, BlobValue, FETCH_CAP, HEX_COLS, PreviewVerdict, hex_line, hex_row_count,
     preview_verdict,
 };
-use schemaic_core::format::human_bytes;
+use schemaic_core::format::{contrasting_bytes, human_bytes};
 
 use crate::theme;
 use crate::widgets::{
@@ -300,10 +300,12 @@ impl BlobUi {
             .with_untracked(|t| t.as_ref().and_then(|t| t.cap))
             && bytes.len() as u64 > cap
         {
+            // `contrasting_bytes`, not `human_bytes` twice: the two numbers
+            // being *different* is the whole message, and one decimal place
+            // rounds 65,536 and a `BLOB`'s 65,535 to the same `64.0 KB`.
+            let (got, most) = contrasting_bytes(bytes.len() as u64, cap);
             self.note.set(Some(Err(format!(
-                "That file is {} — this column holds at most {}.",
-                human_bytes(bytes.len() as i64),
-                human_bytes(cap as i64)
+                "That file is {got} — this column holds at most {most}."
             ))));
             return;
         }

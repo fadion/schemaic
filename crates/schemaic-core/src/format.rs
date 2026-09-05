@@ -254,6 +254,35 @@ pub fn human_bytes(n: i64) -> String {
     }
 }
 
+/// Two byte counts for one sentence that **contrasts** them — "that file is X,
+/// the most is Y" — rendered so the sentence cannot say the same thing twice.
+///
+/// [`human_bytes`] keeps one decimal, so any two sizes within ~0.05 of a unit of
+/// each other collapse to the same string. That is the right trade for a size
+/// shown on its own and the wrong one here, because the numbers being *unequal*
+/// is the entire content of the message: a 65,536-byte file refused by a MySQL
+/// `BLOB` (65,535) read *"That file is 64.0 KB — this column holds at most
+/// 64.0 KB."*, and the same collision spans a ~51 KB window at the 64 MiB load
+/// cap. Where the rounded forms collide, both fall back to exact grouped bytes;
+/// where they don't, the readable form is kept.
+///
+/// Nothing checks which argument is larger — the caller's sentence says that,
+/// and a pair that happens to be equal is a caller's bug this must not hide.
+pub fn contrasting_bytes(a: u64, b: u64) -> (String, String) {
+    let (ha, hb) = (human_bytes(a as i64), human_bytes(b as i64));
+    if ha != hb {
+        return (ha, hb);
+    }
+    (exact_bytes(a), exact_bytes(b))
+}
+
+/// `65536` → `65,536 bytes`. The unrounded form, for when a rounded one would
+/// be ambiguous — see [`contrasting_bytes`].
+fn exact_bytes(n: u64) -> String {
+    let grouped = group_number(&n.to_string()).unwrap_or_else(|| n.to_string());
+    format!("{grouped} bytes")
+}
+
 /// `true` / `false` for a value's truthiness (0 / empty / `false` are false).
 fn bool_glyph(v: &Value) -> String {
     let falsey = match v {
@@ -300,6 +329,49 @@ mod clear_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A refusal that prints the same size twice explains nothing.** 65,536
+    /// bytes into a MySQL `BLOB` (65,535) is the tightest real case, and
+    /// `human_bytes` rounds both to `64.0 KB`; a 16 MiB file into a
+    /// `MEDIUMBLOB` is the same collision one family up, and there is a ~51 KB
+    /// window of it at the 64 MiB load cap.
+    #[test]
+    fn a_size_pair_that_rounds_together_falls_back_to_exact_bytes() {
+        assert_eq!(
+            contrasting_bytes(65_536, 65_535),
+            ("65,536 bytes".to_string(), "65,535 bytes".to_string())
+        );
+        assert_eq!(
+            contrasting_bytes(16 * 1024 * 1024, 16_777_215),
+            (
+                "16,777,216 bytes".to_string(),
+                "16,777,215 bytes".to_string()
+            )
+        );
+        // The load cap's window: one byte over 64 MiB.
+        let cap = 64u64 * 1024 * 1024;
+        assert_eq!(
+            contrasting_bytes(cap + 1, cap),
+            (
+                "67,108,865 bytes".to_string(),
+                "67,108,864 bytes".to_string()
+            )
+        );
+    }
+
+    /// And where the readable forms already differ, they are kept — the
+    /// fallback is for the collision, not a replacement for the unit.
+    #[test]
+    fn a_size_pair_that_reads_apart_keeps_the_readable_form() {
+        assert_eq!(
+            contrasting_bytes(5 * 1024 * 1024, 65_535),
+            ("5.0 MB".to_string(), "64.0 KB".to_string())
+        );
+        assert_eq!(
+            contrasting_bytes(300, 255),
+            ("300 B".to_string(), "255 B".to_string())
+        );
+    }
     use super::*;
 
     #[test]
