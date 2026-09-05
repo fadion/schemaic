@@ -98,6 +98,23 @@ async fn connect_probe(db: &Db, database: &str) -> Result<Client, (DbError, bool
         .user(&db.user)
         .password(&db.pass)
         .dbname(database)
+        // **The one session setting this module's SQL depends on, pinned rather
+        // than assumed.** `pg_str_lit` doubles quotes and nothing else, and
+        // `pg_cell_lit` sends bytes as `decode('…','hex')` — both are safe
+        // exactly while `standard_conforming_strings` is on, which is the
+        // default and is settable per database and per role. With it off a
+        // backslash in a row's own text data ends the literal, and the rest of
+        // that value is parsed as SQL: on `blob_on`'s `simple_query`, which
+        // accepts several statements, that is a second statement running from a
+        // single click on a connection marked read-only.
+        //
+        // Pinning it is the belt, not the fix — the values still reach the
+        // server inside statement text — but it removes the dependency the same
+        // module already refuses to take twice, in `roles`' prefix comparison
+        // and in `pg_cell_lit`'s own seventeen-line argument for `decode`.
+        // Sent on the startup packet, so it is in force before the first
+        // statement and cannot be undone by anything the app runs.
+        .options("-c standard_conforming_strings=on")
         // `Prefer` here is what implements the mode of the same name: unlike
         // MySQL, the Postgres driver negotiates the downgrade itself, so no
         // retry of ours is involved and `require` upward cannot fall back.
@@ -4400,6 +4417,33 @@ mod tests {
         assert_eq!(
             pg_str_lit("x'; DROP TABLE t; --"),
             "'x''; DROP TABLE t; --'"
+        );
+    }
+
+    /// **What the doubling does not do, stated so the dependency is not
+    /// forgotten again.** `pg_str_lit` leaves a backslash alone, which is
+    /// correct under `standard_conforming_strings = on` and only there: with it
+    /// off, PostgreSQL reads the literal as an escape string, `\'` is an escaped
+    /// quote rather than a backslash and a quote, and a row's own text data ends
+    /// the literal — after which the rest of that value is parsed as SQL. On
+    /// `blob_on`, which speaks the multi-statement simple protocol, that is a
+    /// second statement running from a single click on a connection marked
+    /// read-only.
+    ///
+    /// The setting is `USERSET` and settable per database and per role, so the
+    /// default is not a guarantee. `connect_probe` pins it on the startup packet
+    /// — in force before the first statement and not undoable by anything the
+    /// app runs — which is the same dependency this module already refuses to
+    /// take in `roles`' prefix comparison and in `pg_cell_lit`'s argument for
+    /// `decode(…,'hex')`.
+    #[test]
+    fn pg_str_lit_leaves_a_backslash_alone_which_is_why_the_setting_is_pinned() {
+        assert_eq!(pg_str_lit("a\\b"), "'a\\b'");
+        // The shape that escapes when the setting is off: the backslash claims
+        // the quote after it, so the literal runs on into the `;`.
+        assert_eq!(
+            pg_str_lit("x\\'; DROP TABLE t; --"),
+            "'x\\''; DROP TABLE t; --'"
         );
     }
 
