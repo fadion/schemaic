@@ -3114,7 +3114,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let (report, died) = (ext(), ext());
                         let (rs, order) = (req.rs.clone(), req.order.clone());
                         let progress = export_tx.clone();
-                        let reports = req.stoppable;
+                        // Named, not a bare field read — see `reports_progress`.
+                        let reports = req.reports_progress();
                         let sweep_part = part_of(&path);
                         let incremental = format.writes_incrementally();
                         // **The handle is awaited, not dropped.** This arm's

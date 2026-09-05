@@ -162,6 +162,28 @@ pub struct ExportRequest {
     pub stoppable: bool,
 }
 
+impl ExportRequest {
+    /// May this run drive the export modal's **row counter**?
+    ///
+    /// `ExportUi::progress` is one signal for the window and the messages carry
+    /// no run id, so a run with no modal on screen — the Live Monitor's log
+    /// export, which by design stays out of the cancel slot and can therefore
+    /// overlap a grid export — would drive the grid modal's counter with its own
+    /// row count. `ExportTarget::run` guards the *outcome* against exactly this,
+    /// and nothing guarded the count.
+    ///
+    /// The same question [`ExportRequest::stoppable`] answers, and deliberately
+    /// spelled as a second one: raising a modal is what makes a run stoppable and
+    /// what gives it a counter to drive, so the two are one fact today — but
+    /// they are two *questions*, and a named predicate is what makes the second
+    /// one greppable when a run appears that has a Stop and no counter, or the
+    /// reverse. Its sibling `export_modal_closes` is a tested predicate; this was
+    /// a bare `if` on a field read three lines from where it is used.
+    pub fn reports_progress(&self) -> bool {
+        self.stoppable
+    }
+}
+
 /// How much of a result an export covers.
 ///
 /// The distinction exists because a grid is capped and a file is not. The row

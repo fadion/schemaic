@@ -302,14 +302,33 @@ impl CompareEntry {
         self.status == ObjectStatus::Same && self.left_ddl != self.right_ddl
     }
 
-    /// The one-line disclosure for an entry [`CompareEntry::needs_source`] keeps
-    /// out of a plan — see [`SchemaPlan::omitted`].
+    /// A difference this comparison **has no statement for** — it is on one
+    /// side only, or the two sides differ, and the change set is empty.
+    ///
+    /// One case reaches it today: a view whose model says it is not one, which
+    /// is what a view definition the connecting role cannot read looks like
+    /// (`empty_set` builds the set for it). `status_of` reads the change set
+    /// only on a *two*-sided pair, so a one-sided one keeps `OnlyLeft` /
+    /// `OnlyRight` however empty its set is — the row was a difference, the plan
+    /// counted it, and `emit()` wrote nothing for it: "Applied 0 statements to 1
+    /// object".
+    ///
+    /// Kept out of a plan and disclosed by it, exactly as
+    /// [`CompareEntry::needs_source`] is — the two are the same shape of
+    /// problem, an object the tree can show and the migration cannot carry.
+    pub fn unplannable(&self) -> bool {
+        self.status.is_difference() && self.changes.is_empty()
+    }
+
+    /// The one-line disclosure for an entry a plan cannot carry — see
+    /// [`SchemaPlan::omitted`].
     fn omission_note(&self) -> String {
-        format!(
-            "{} {} — its body must be re-read from the server before it can be applied",
-            self.kind.label(),
-            self.label()
-        )
+        let why = if self.needs_source() {
+            "its body must be re-read from the server before it can be applied"
+        } else {
+            "this comparison has no statement for it — its definition could not be read"
+        };
+        format!("{} {} — {why}", self.kind.label(), self.label())
     }
 }
 
@@ -810,7 +829,7 @@ impl SchemaComparison {
     pub fn selectable_keys(&self, filter: RowFilter<'_>) -> Vec<String> {
         let needle = filter.query.trim().to_lowercase();
         self.differences()
-            .filter(|e| !e.needs_source())
+            .filter(|e| !e.needs_source() && !e.unplannable())
             .filter(|e| {
                 needle.is_empty() || crate::schema::object_name_matches(&e.label(), &needle)
             })
@@ -841,7 +860,7 @@ impl SchemaComparison {
     pub fn plan(&self, include: impl Fn(&CompareEntry) -> bool) -> SchemaPlan {
         let chosen: Vec<ChangeSet> = self
             .differences()
-            .filter(|e| include(e) && !e.needs_source())
+            .filter(|e| include(e) && !e.needs_source() && !e.unplannable())
             .map(|e| e.changes.clone())
             .collect();
         // **The namespaces this plan needs, ahead of everything that names
@@ -885,7 +904,7 @@ impl SchemaComparison {
         // to disclose exactly this, had no production caller at all.
         let omitted: Vec<String> = self
             .differences()
-            .filter(|e| e.needs_source())
+            .filter(|e| e.needs_source() || e.unplannable())
             .map(CompareEntry::omission_note)
             .collect();
         // **A cycle breaks a plan that creates a table and one that drops
@@ -944,7 +963,7 @@ impl SchemaComparison {
 /// `SchemaComparison::plan` already took it as a parameter — so the decision was
 /// untestable for no reason but where it sat.
 pub fn is_planned(e: &CompareEntry, selected: &HashSet<String>) -> bool {
-    selected.contains(&e.key()) && !e.needs_source()
+    selected.contains(&e.key()) && !e.needs_source() && !e.unplannable()
 }
 
 /// What the compare footer says about the tick set — the sentence that stands
@@ -1306,8 +1325,25 @@ fn fk_rank(
 // ── per-kind entries ────────────────────────────────────────────────────────
 
 /// An empty set addressed at an object, for the one case a builder can't answer
-/// (a view whose model says it isn't one). It reads as [`ObjectStatus::Same`],
-/// which is the truthful answer: nothing here can state a change.
+/// (a view whose model says it isn't one — which is what a definition the
+/// connecting role cannot read looks like).
+///
+/// **On a two-sided pair it reads as [`ObjectStatus::Same`]** — `status_of`
+/// asks the change set there, and "nothing here can state a change" is the
+/// truthful answer. On a *one*-sided pair it does not: `status_of` reads only
+/// which sides are present, so the entry would keep `OnlyLeft` / `OnlyRight`
+/// and be a difference with no statement behind it. That is what
+/// [`CompareEntry::unplannable`] is for; this function's doc used to claim the
+/// `Same` reading for both.
+///
+/// **And no call site reaches it today.** [`table_entry`] guards each of its
+/// arms on `is_view`, and [`ViewDraft::from_table`] returns `None` only for a
+/// table that is *not* a view — so the two conditions cannot both hold. It is
+/// kept as the answer for a builder that one day can't draft an object it was
+/// handed, which is why `unplannable` exists on the reading side rather than an
+/// `unreachable!()` here: a set that says nothing is a safe value, and an entry
+/// that is a difference with nothing behind it is not something a plan should
+/// count either way.
 fn empty_set(name: &str, schema: Option<&str>, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
         table: name.to_string(),
@@ -1662,6 +1698,88 @@ mod tests {
         assert!(
             !e.text_differs_though_same(),
             "a differing row's pane is a diff and needs no explanation"
+        );
+    }
+
+    // ── a difference with no statement behind it ─────────────────────────────
+
+    /// **A difference with no statement behind it must not be counted as one
+    /// the plan carries.** `status_of` reads the change set only on a *two*-
+    /// sided pair, so a one-sided entry keeps `OnlyLeft` / `OnlyRight` however
+    /// empty its set is — the row is a difference, the plan counts it as an
+    /// object, and `emit()` writes nothing for it: "Applied 0 statements to 1
+    /// object". `empty_set`'s own doc claimed the `Same` reading for both arms,
+    /// which is where the belief that this could not happen came from.
+    ///
+    /// **Built by hand, because no schema can currently produce it.**
+    /// `table_entry` guards its arms on `is_view` and `ViewDraft::from_table`
+    /// refuses only a non-view, so the two conditions `empty_set` sits behind
+    /// cannot both hold — the review found it unreachable and it still is. The
+    /// property is about the reading, not about that one builder, so it is
+    /// stated over the value.
+    #[test]
+    fn a_difference_with_no_statement_is_disclosed_rather_than_counted() {
+        let orphan = |status: ObjectStatus| CompareEntry {
+            kind: CompareKind::View,
+            schema: None,
+            name: "secret_v".to_string(),
+            table: None,
+            signature: None,
+            status,
+            changes: empty_set("secret_v", None, SqlDialect::MySql),
+            uncertain: false,
+            left_ddl: String::new(),
+            right_ddl: String::new(),
+        };
+
+        let only_right = orphan(ObjectStatus::OnlyRight);
+        assert!(only_right.changes.is_empty());
+        assert!(only_right.unplannable(), "a difference it cannot express");
+        assert!(
+            !is_planned(&only_right, &HashSet::from([only_right.key()])),
+            "and no selection can put it in a plan"
+        );
+
+        // `Same` is not a difference, so there is nothing to carry and nothing
+        // to disclose — the arm `empty_set`'s doc was actually describing.
+        let agreed = orphan(ObjectStatus::Same);
+        assert!(!agreed.unplannable());
+    }
+
+    /// And through a comparison: such an entry is not an object the preview
+    /// counts, and the plan says what it left behind.
+    #[test]
+    fn an_unplannable_entry_reaches_the_plans_omitted_list() {
+        let c = SchemaComparison {
+            entries: vec![CompareEntry {
+                kind: CompareKind::View,
+                schema: None,
+                name: "secret_v".to_string(),
+                table: None,
+                signature: None,
+                status: ObjectStatus::OnlyRight,
+                changes: empty_set("secret_v", None, SqlDialect::MySql),
+                uncertain: false,
+                left_ddl: String::new(),
+                right_ddl: String::new(),
+            }],
+            dialect: SqlDialect::MySql,
+            cycles_create: false,
+            cycles_drop: false,
+            new_namespaces: Vec::new(),
+        };
+        let plan = c.plan(|_| true);
+        assert_eq!(plan.len(), 0, "nothing to apply");
+        assert!(plan.emit().is_empty());
+        assert_eq!(plan.omitted.len(), 1, "{:?}", plan.omitted);
+        assert!(plan.omitted[0].contains("secret_v"), "{:?}", plan.omitted);
+        // No tick-box either, for `needs_source`'s reason.
+        assert!(
+            c.selectable_keys(RowFilter {
+                query: "",
+                show_same: false
+            })
+            .is_empty()
         );
     }
 
