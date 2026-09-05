@@ -5160,12 +5160,24 @@ impl Db {
     /// Read one binary cell's bytes — the query behind the grid's binary-cell
     /// panel.
     ///
-    /// The bytes of a `BLOB` are dropped at the wire on every engine (see
+    /// The bytes of a `BLOB` never reach a `ResultSet` on any engine (see
     /// [`schemaic_core::blob`]), so looking at one is a second, *targeted* query
     /// rather than a lookup in the loaded result. It is aimed by the same row
     /// identity a write of that row would carry, which is why a result whose
     /// binary column has no keyed base table never gets here at all —
     /// `blob_source` answers `None` and the panel is not offered.
+    ///
+    /// **"Never reach a `ResultSet`" is not "dropped at the wire", and the
+    /// difference is a MySQL limit worth knowing.** PostgreSQL and SQLite really
+    /// do leave the bytes on the server — the `SELECT` behind a grid asks for a
+    /// placeholder. MySQL's does not: `convert_row` receives the whole value and
+    /// *then* substitutes [`binary_display`], so the row still has to cross the
+    /// wire whole. A row whose blob exceeds the server's `max_allowed_packet`
+    /// (16 MiB by default on MariaDB — a **quarter** of
+    /// [`schemaic_core::blob::FETCH_CAP`]) therefore fails the ordinary grid
+    /// read, and this panel's 64 MiB promise is unreachable on that engine
+    /// however large the cap here is. The bound is the server's setting, not
+    /// ours, and nothing here can raise it.
     ///
     /// `Ok(None)` means the cell is SQL `NULL` **or** the row is gone (someone
     /// else deleted it since the result loaded); both are "there are no bytes to

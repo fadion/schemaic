@@ -42,9 +42,11 @@ goes in `TODO.md`.
 
 ## Delegate the reading (`.claude/agents/`)
 
-`docs/architecture.md` is ~3.4k lines and several modules are thousands each (`ui/grid.rs` ~6.3k,
-`ui/lib.rs` ~5.6k, `app/main.rs`), so paging them into the main context is what runs a session out
-of room. Three subagents exist to do that reading in their own windows:
+`docs/architecture.md` runs to several thousand lines, and so do the crate's largest modules
+(`ui/grid.rs`, `ui/lib.rs`, `app/main.rs`), so paging them into the main context is what runs a
+session out of room. **No figures here on purpose** — they were 40–70% under the real ones by the
+time anyone checked, and the rule they support does not depend on the value. Three subagents exist
+to do that reading in their own windows:
 
 - **`scout`** — "where is X wired", "how does feature Y flow across the crates", "what does the
   architecture doc say about Z". Read-only; returns `file:line` citations and a conclusion, never a

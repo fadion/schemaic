@@ -1958,10 +1958,10 @@ pub(crate) fn modal_footer(actions: impl IntoView + 'static) -> impl IntoView {
 /// every flex item, so relaxing it on the container still left the status inside
 /// with taffy's automatic minimum — it never compressed, so `text_ellipsis`
 /// never had a narrower box to end a line in and the caller's half of the
-/// contract could not be kept. Ten of the twelve callers had noticed and were
-/// spelling `status.style(|s| s.min_width(0.0))` themselves; six were not, and
-/// a helper whose documented contract only works if the caller repeats half of
-/// it is a helper that will keep being called wrong.
+/// contract could not be kept. Eight of the seventeen call sites had noticed
+/// and were spelling `status.style(|s| s.min_width(0.0))` themselves; the other
+/// nine were not, and a helper whose documented contract only works if the
+/// caller repeats half of it is a helper that will keep being called wrong.
 pub(crate) fn modal_footer_split(
     status: impl IntoView + 'static,
     actions: impl IntoView + 'static,

@@ -928,7 +928,7 @@ impl GridState {
     /// rolls the whole batch back over an edit the user could not see.
     ///
     /// Returns whether it staged, because the panel reports either way — see
-    /// [`crate::BlobStageFn`].
+    /// [`crate::BlobStage`].
     fn stage_bytes(&self, di: usize, ci: usize, bytes: Vec<u8>) -> bool {
         // **`alive`, and it is the first line for a reason.** This runs from the
         // binary-cell panel, whose sink is an `Rc` over this state on a
