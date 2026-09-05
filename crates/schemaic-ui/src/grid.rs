@@ -4131,13 +4131,34 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 // same five rows reported 5 and 3.
                 gs.dirty.with_untracked(|dirty| {
                     gs.new_rows.with_untracked(|pending| {
+                        // **A staged blob is a value, and it is counted as the
+                        // grid draws it.** `CellEdit::as_text` answers `None`
+                        // for `Bytes`, which every *text* caller wants — the
+                        // re-fetch key, the paste round-trip, the clipboard —
+                        // and which this one read as NULL: loading a file into a
+                        // selected cell turned `3 rows` into `3 rows · 1 null`,
+                        // while the *stored* blob it replaced counted as a value
+                        // (the grid holds `<n bytes>` for it, and that is a
+                        // text). Two spellings of the same cell, one summary.
+                        //
+                        // Materialised here rather than in the pass below so
+                        // that pass stays lazy: `dirty` holds only what the user
+                        // has staged, so this is a handful of short strings, and
+                        // the span may be a whole column.
+                        let byte_texts: std::collections::HashMap<usize, String> = dirty
+                            .iter()
+                            .filter(|((_, c), _)| *c == ci)
+                            .filter_map(|((di, _), v)| {
+                                v.as_bytes()
+                                    .map(|b| (*di, schemaic_core::model::binary_display(b.len())))
+                            })
+                            .collect();
                         let cells = (r0..=r1).map(|d| match order.get(d).copied() {
                             Some(di) => match dirty.get(&(di, ci)) {
-                                // `as_text`, so a staged blob counts as no
-                                // value — the same as a NULL. There is no
-                                // aggregate of a byte string, and its display
-                                // is a placeholder rather than data.
-                                Some(staged) => staged.as_text(),
+                                Some(staged) => match staged.as_bytes() {
+                                    Some(_) => byte_texts.get(&di).map(String::as_str),
+                                    None => staged.as_text(),
+                                },
                                 None => rs
                                     .cell(di, ci)
                                     .and_then(|c| (!c.is_null()).then(|| c.text())),
