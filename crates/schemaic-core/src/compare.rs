@@ -1012,6 +1012,25 @@ impl SchemaPlan {
         format!("{n} {}", crate::text::plural(n, "object", "objects"))
     }
 
+    /// [`SchemaPlan::subject`] with the database it lands in named beside it —
+    /// `2 objects in shop`.
+    ///
+    /// **The one surface authorising this has to say which database it changes.**
+    /// The preview modal's title qualifies its subject with the database only
+    /// when the subject is an *object name* (`DdlPreview::qualified`), and a
+    /// plan's subject is a count, so `shop.2 objects` is nonsense and the title
+    /// fell back to naming the connection alone: *"Apply changes to My MariaDB ·
+    /// 2 objects"*, on a feature whose whole subject is **two databases on one
+    /// connection**, with the comparison deliberately closed behind it. Beside
+    /// rather than in front, because it is not a qualifier — it is the other
+    /// half of the address.
+    ///
+    /// It travels into the success line too (`Applied N statements to …`), which
+    /// is the other place that had no way to say where the statements went.
+    pub fn subject_in(&self, database: &str) -> String {
+        format!("{} in {database}", self.subject())
+    }
+
     /// Every statement, in the order they must run.
     pub fn emit(&self) -> Vec<String> {
         self.sets.iter().flat_map(ChangeSet::emit).collect()
@@ -1755,6 +1774,25 @@ mod tests {
         // is no button to press, so the sentence is not a count at all.
         assert_eq!(SchemaPlan::default().subject(), "0 objects");
         assert_eq!(selection_note(0), "Nothing selected.");
+    }
+
+    /// **And the preview names the database, not just the connection.** The
+    /// title qualifies its subject with the database only when the subject is an
+    /// object *name*, and a plan's is a count — so it fell back to the
+    /// connection alone, on a feature whose whole subject is two databases on
+    /// one connection, with the comparison closed behind the modal.
+    #[test]
+    fn a_plans_subject_names_the_database_it_lands_in() {
+        let plan = mysql(
+            schema_of(vec![]),
+            schema_of(vec![table("fresh", &[("id", "int")])]),
+        )
+        .plan(|_| true);
+        assert_eq!(plan.subject_in("shop"), "1 object in shop");
+        assert_eq!(
+            SchemaPlan::default().subject_in("shop"),
+            "0 objects in shop"
+        );
     }
 
     // ── why the tree is empty ────────────────────────────────────────────────
