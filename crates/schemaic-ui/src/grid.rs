@@ -6270,21 +6270,17 @@ fn field_row(
         // The value and its own way in, on one line: the `<n bytes>` count (or
         // `<null>`, which is where a *first* file goes) beside the button that
         // opens it.
+        // **The same text button the other affordances use.** This was a bordered
+        // pill, the only one in the panel: every other per-field way in — Set
+        // NULL, Set value, Unset — is `field_mini_btn`, so the pill read as a
+        // different *kind* of control for what is the same kind of act. Going
+        // through `field_mini_btn` also hands this branch the keyboard, which the
+        // pill never had: a blob column that is the first editable one now takes
+        // the caret on mount instead of leaving the arrows on the grid behind the
+        // panel, the way the NULL branch already does.
         h_stack((
             blob_value(gs, di, f),
-            container(text(label).style(|s| s.font_size(theme::scaled_font(12.0))))
-                .on_click_stop(move |_| (open)())
-                .style(|s| {
-                    s.padding_horiz(theme::scaled(8.0))
-                        .padding_vert(theme::scaled(2.0))
-                        .flex_shrink(0.0_f32)
-                        .border(1.0)
-                        .border_radius(4.0)
-                        .border_color(theme::border())
-                        .color(theme::text_dim())
-                        .cursor(CursorStyle::Pointer)
-                        .hover(|s| s.color(theme::text()).border_color(theme::text_dim()))
-                }),
+            field_mini_btn(label, autofocus, move || (open)()),
         ))
         .style(|s| {
             s.flex_row()
