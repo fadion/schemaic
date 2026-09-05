@@ -14,8 +14,8 @@ holds the *working* rules — how to build, test and commit — and points here 
 Keep the two disjoint: an instruction to the person or agent doing the work belongs there, a fact
 about the system belongs here.
 
-**Prefer reading this through a subagent.** It is ~3.4k lines; paging it into a session wholesale
-is what runs that session out of context. `scout` (in `.claude/agents/`) answers "where/how"
+**Prefer reading this through a subagent.** It is several thousand lines; paging it into a session
+wholesale is what runs that session out of context. `scout` (in `.claude/agents/`) answers "where/how"
 questions against this document *and* the code and reports back a conclusion rather than a
 transcript, and `arch-scribe` makes the edits a finished change requires. Read a section here by
 hand when you are about to edit it, or when a citation is not enough.
@@ -136,7 +136,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ColumnFlags::primary_key` already carries, and `false` on MySQL and PostgreSQL. It is a key
     that is never *editable*, which is why it is a flag and not simply another key column. The
     write path's shared decisions live here so the
-    two engines can't drift: `GridWrite::plan` (the deletes → updates → inserts order),
+    three engines can't drift: `GridWrite::plan` (the deletes → updates → inserts order),
     `one_row_verdict` (the 1-row safety net's verdict *and* its message),
     `Rollback`/`engine_is_transactional` (what a rollback actually achieved — see the invariant
     below), and `drop_committed` (which staged edits a commit un-stages).
@@ -479,6 +479,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `a_real_key_still_wins_over_a_projected_implicit_one` and
     `refetch_template_keys_on_the_implicit_key` — the last because a read-only key column is still
     part of the row the splice re-reads.
+    **And an implicit key nothing can confirm is a refusal, not a bare `rowid = ?`.**
+    `confirm_columns` answers `Option<Vec<usize>>` — `Some(vec![])` for every real key on every
+    engine, `None` when the key is implicit and the candidate set comes out *empty* — and
+    `analyze_edit` treats `None` exactly as it treats an unresolvable key: the table is never pushed,
+    so the result is read-only. `EditTable::confirm_cols` states the premise the 1-row safety net
+    rests on — a stale key matches zero rows — and with nothing to compare, the `WHERE` is the rowid
+    alone and that premise is false: a rowid reassigned by a `VACUUM`, a delete-then-insert or the
+    twelve-step rebuild lands the `UPDATE` on a *different* row, affects exactly 1, and is reported
+    as a success. `blobs(data BLOB)` — a rowid table whose every non-key column holds bytes — is
+    precisely that shape, so this **takes the blob write back off that one table shape**, which is
+    what it was before the panel could write at all.
     **`EditModel::table_for_origin` is the lookup that does not go through `col_table`**, and it
     exists because a *read* can be aimed at a column a write may not touch. A binary column **was**
     the case it was written for: it was excluded from the map outright, so `table_index` answered
@@ -509,7 +520,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     nor a type-name signal, and only the backend's own `ValueRef::Blob` assertion — the second
     signal the export has always asked — can answer for it. `resolve_key` was moved onto the same
     function, because C2's two halves have to agree on the word: a column one of them calls binary
-    and the other does not is either a lossy `WHERE` or a writable placeholder. It is recorded on
+    and the other does not is either a lossy `WHERE` or a writable placeholder. **It is `pub(crate)`
+    and it is now the one definition of the word**, because two more readers were spelling the same
+    pair by hand — `blob::blob_source` and `export::dropped_binary_columns` — while
+    `confirm_columns` asked the wire flag alone and so disagreed with all three: a blob stored in a
+    SQLite `TEXT`-declared column is legal, reads back as `<n bytes>`, and entered the confirming
+    `WHERE` as that literal placeholder text, so **every** edit to such a table matched zero rows and
+    rolled back — and since `blob_source` builds its `BlobRef` key from the same `row_key`, the read
+    found nothing either. It is recorded on
     the model rather than re-derived at each call because "editable" and "editable *as text*" are
     two different questions once a blob can be written, and the callers still asking the first are
     the two that write no text: `blob_launch`, the surface that puts bytes in a cell, and
@@ -524,7 +542,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     *schema* and not from `rs`, because a result column's type name has had its length stripped and
     its family flattened (see `column_byte_cap` for why only the schema can answer). Only binary columns are
     asked, since only they have a surface that can overrun a limit, and a table with no loaded
-    schema simply has no caps: `None` is "no answer" here too. The answer rides to the panel on
+    schema simply has no caps: `None` is "no answer" here too. **That vector is why `analyze_edit`
+    takes a `SqlDialect` as its second parameter**, and it is the only field the dialect reaches: a
+    declared byte length is a promise on one engine and a note on another, so a type name cannot be
+    read without knowing whose it is (`blob::column_byte_cap`, below). Two call sites pass it — the
+    grid's model effect, off `GridState::dialect`, and the Live Monitor's baseline poll, off the new
+    `MonitorCtx::dialect`, carried on the context rather than re-resolved because `monitor_apply`
+    runs on the UI thread with no `Db` in hand and the key it resolves must not depend on connecting
+    again. The unit tests go through a local shim that
+    fixes MySQL, so a test that means a *cap* has to name its engine and call `super::analyze_edit`
+    outright rather than inherit one by default. The answer rides to the panel on
     `BlobTarget::cap` rather than being asked for when the file comes back, because by then the grid
     it was read from may have been re-run underneath.
     `refetch_key` reads a `Bytes` edit's **original** value rather than guessing at a text form for
@@ -665,8 +692,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Everything that is not a plain filename character becomes `_`, because a key value is server
     data on its way to a save dialog — a separator, a `..` or an NTFS stream colon must not steer
     where the file lands (`the_save_stem_cannot_escape_into_a_path`).
-    **`column_byte_cap(type_name)` is the write's one pure question: how much does this column
-    actually hold?** It exists so an oversized file is refused where the user picked it. The other
+    **`column_byte_cap(dialect, type_name)` is the write's one pure question: how much does this
+    column actually hold?** It exists so an oversized file is refused where the user picked it. The other
     place it gets refused is MySQL's `ERROR 1406: Data too long`, which arrives at the *commit*,
     names the column rather than the file, and rolls back the whole staged batch — every unrelated
     edit in it included. The four MySQL blob families answer from the family alone (TINYBLOB 255,
@@ -685,6 +712,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`a_longer_family_name_is_not_read_as_a_shorter_one`, beside
     `each_blob_family_carries_its_own_cap` and
     `a_fixed_width_binary_column_takes_its_cap_from_its_parameter`).
+    **The dialect is asked first, and it is not decoration**: the table above is MySQL's, and a type
+    name alone cannot say whose it is — `BLOB` and `VARBINARY(16)` are legal SQLite declarations too,
+    where the parameter is ignored outright and the family means nothing. Read for all three engines
+    it capped a SQLite `BLOB` at 65,535 bytes and a `VARBINARY(16)` at **sixteen**, so *Load from
+    file* refused files that engine would have stored without complaint, at the one gesture the cap
+    exists to make pleasant. The question is the capability `ddl::enforces_declared_byte_length` and
+    never a `dialect == MySql` standing in for one, and `None` comes back before the type name is
+    even split. Fourteen unit tests had covered this function and every one of them named a MySQL
+    type, so nothing ever asked whose table was being read — which is why the pin is the composed
+    one, a schema and a dialect through `analyze_edit`'s cap fill into `byte_cap`.
     **`None` is "no answer", never "no limit"**, and every caller must treat it so: `bytea`, SQLite,
     an unknown type name, an unloaded schema and a bare `VARBINARY` all give it
     (`an_unbounded_or_unreadable_type_answers_no_cap`), and after one the server is the authority it
@@ -728,10 +765,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     time — what the app's `Fetched` export renders through, so that a save of rows already in hand
     has a count to report and a Stop that lands between blocks. **Nothing is copied**: a chunk is
     the same `&ResultSet` plus a *slice* of the same order vector, so it is a cursor over one
-    allocation rather than a partition of the rows. It parts company with `OneChunk` at exactly the
-    place that matters — **exhaustion is `Ok(None)`, never one empty chunk** — because five
-    renderers write their header on the first chunk they see, so an empty result would gain a header
-    through this path and have none through `render_to`. A `size` of `0` is clamped to the whole
+    allocation rather than a partition of the rows. It follows `OneChunk` at exactly the place that
+    matters — **an empty order still yields one empty chunk, and only then `Ok(None)`** (that is
+    what the `started` flag is for). Five renderers write their header on the *first chunk they
+    see*, so ending the stream before any chunk writes no header at all: the rule that reads as
+    safe here is the one that lost the file, and a `SELECT` matching nothing exported a **0-byte
+    file** where `render_to` wrote `id,name\n`.
+    `an_empty_result_writes_the_same_bytes_through_either_path` is what holds the two paths
+    together, and it checks the equality is not vacuous by asserting CSV still carries its header.
+    A release-review pass measured the pair over an empty order for **all six** formats and found
+    them byte-identical — JSON `[]` 2 B, CSV header 8 B, SQL 0 B (its column list lives on each
+    `INSERT`, so no rows means no output), Markdown 28 B, HTML 108 B, Xlsx 5,218 B — while that
+    test and `chunking_a_fetched_result_cannot_change_the_bytes` both cover the five text formats
+    only, Excel's empty-source question being asked of a workbook in
+    `an_empty_xlsx_export_still_carries_its_header`. A source that ends *before* its first chunk is
+    still a different thing and still writes nothing; that is `PullChunks`' shape, not this one.
+    A `size` of `0` is clamped to the whole
     slice rather than rejected: the figure comes from a tuning constant, and an export that spins
     handing out empty chunks forever is a worse answer than one that writes a single block. Its one
     hook is `SliceChunks::watching(f)`, `f: FnMut(u64) -> bool`, called as each chunk is handed out
@@ -4695,7 +4744,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   what a PNG header looks like and the SQLite suite can round-trip a blob through a file-less
   database, but only a server answers whether MySQL's `SUBSTRING` is byte-indexed on a binary
   string and whether a `bytea` survives the simple-query protocol's hex text intact — both were
-  assumptions when it was written. Five cases per leg, over the same `DEADBEEF` bytes `cases.rs`
+  assumptions when it was written. Six cases per leg, over the same `DEADBEEF` bytes `cases.rs`
   already spells for each dialect, every one of them outside ASCII because that is the exact class
   of value the `<n bytes>` placeholder exists to stop being rendered as mojibake: a byte-for-byte
   read back, the key landing on the row it names (three rows of one distinguishable byte each,
@@ -4704,7 +4753,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   one afterwards, and `a_binary_cell_in_a_real_result_resolves_and_fetches`, which is the
   composition the two halves' own tests cannot reach — it runs a real query, asserts the grid holds
   `<4 bytes>` and that the write model still refuses the column, then derives the `BlobRef` from
-  that result's own provenance and fetches with it.
+  that result's own provenance and fetches with it. The sixth is the only **write** here —
+  `staged_bytes_reach_the_column_as_bytes`, stage → commit → re-read on all three servers, which is
+  what proves each engine's `cell_param` binding (see `schemaic-db`'s entry for what it deliberately
+  does not pin).
   **In `users.rs` the reads are of accounts that were already there and the writes make their own.**
   An account is server-wide — it is not inside the scratch database and would not go away with it —
   so the read half asks about the account the suite **connected as** (`Target::user()`), that being
@@ -7577,7 +7629,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     *Body*, being the panel's real body text. The active theme is process state, so the loop restores
     it through a `Drop` guard: a panic inside it would otherwise leave the thread on Light + Latte
     and surface as some unrelated later test failing.
-  - `lib.rs` (~7.6k lines; `grid.rs` at ~10.2k is the crate's largest) — the `Ui` struct + bundles,
+  - `lib.rs` (with `grid.rs`, one of the crate's two largest modules) — the `Ui` struct + bundles,
     shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, `edit_field`/`FieldCfg`,
     terminal panel.

@@ -416,6 +416,37 @@ fn summary_line(value: &BlobValue, kind: BlobKind) -> String {
     s
 }
 
+/// Whether **Save to file** is offered, and the sentence that says why it is
+/// not — one answer, because the button and the line beside it are about the
+/// same fact and had two spellings of it.
+///
+/// Save writes exactly what the panel is showing, so it is offered only when
+/// that is the whole value: a truncated buffer would write a file that is the
+/// front of a blob and looks like the blob. The verdict reads the **server's**
+/// length rather than the buffer's, which is what keeps it right for a value
+/// that happens to be exactly [`FETCH_CAP`] long.
+///
+/// Pure and here rather than inline in the footer, because the composition it
+/// stands on cannot be reached from a test any other way: `FETCH_CAP` is a
+/// `const` read straight into all three backends' `SELECT`, so no engine can be
+/// made to hand back a truncated value in the suite, and the pairing this
+/// refusal rests on had nothing pinning it at all.
+fn save_offer(value: Option<&BlobValue>) -> (bool, Option<String>) {
+    match value {
+        // Nothing read yet, or nothing there: no button, and no explanation
+        // owed — the panel's body already says what state it is in.
+        None => (false, None),
+        Some(v) if v.truncated() => (
+            false,
+            Some(format!(
+                "Too large to save from here — over {}.",
+                human_bytes(FETCH_CAP as i64)
+            )),
+        ),
+        Some(_) => (true, None),
+    }
+}
+
 /// What each pane is called, in the switch and nowhere else.
 fn pane_label(pane: BlobPane) -> &'static str {
     match pane {
@@ -711,17 +742,7 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
                 BlobState::Ready { value, .. } => hex_view(value.clone()).into_any(),
             };
 
-            // Save writes exactly what the panel is showing, so it is offered
-            // only when that is the whole value. A truncated buffer would write
-            // a file that is the front of a blob and looks like the blob.
-            let saveable = ready.as_ref().map(|(v, _)| !v.truncated()).unwrap_or(false);
-            let save_hint = match &ready {
-                Some((v, _)) if v.truncated() => Some(format!(
-                    "Too large to save from here — over {}.",
-                    human_bytes(FETCH_CAP as i64)
-                )),
-                _ => None,
-            };
+            let (saveable, save_hint) = save_offer(ready.as_ref().map(|(v, _)| v.as_ref()));
 
             // **Its own container, so a finished save does not rebuild the
             // panel.** This line is the one part that changes without the shape
@@ -1225,6 +1246,76 @@ mod tests {
         );
         ui.loaded_file(epoch, Ok(vec![0u8; 5_000_000]));
         assert_eq!(staged.borrow().len(), 1);
+    }
+
+    // ── the save refusal, which no engine can be made to trigger ─────────────
+
+    /// **The pairing the refusal rests on, finally reachable.** `FETCH_CAP` is a
+    /// `const` read straight into all three backends' `SELECT`, so no engine can
+    /// be made to hand back a truncated value inside the suite — no test in the
+    /// tree has ever seen `truncated() == true` from a real read, and the
+    /// button, the hint and the click guard were three spellings of a fact
+    /// nothing pinned.
+    ///
+    /// The verdict is the **server's** length against the buffer's, which is
+    /// what keeps it right for a value that is exactly the cap long: that one is
+    /// whole, and refusing it would be a save the user cannot make of a value
+    /// this app can otherwise show and export.
+    #[test]
+    fn a_truncated_read_refuses_the_save_and_says_why() {
+        use schemaic_core::blob::{BlobValue, FETCH_CAP};
+
+        let cut = BlobValue {
+            bytes: vec![0u8; 16],
+            len: FETCH_CAP as u64 + 1,
+        };
+        let (saveable, hint) = save_offer(Some(&cut));
+        assert!(
+            !saveable,
+            "the buffer is the front of the value, not the value"
+        );
+        let hint = hint.expect("a disabled button owes a reason");
+        assert!(hint.contains("Too large to save"), "{hint}");
+        assert!(hint.contains("64.0 MB"), "it names the cap: {hint}");
+    }
+
+    /// The boundary, which is the case a buffer-length check would get wrong: a
+    /// value of exactly the cap came back whole.
+    #[test]
+    fn a_value_exactly_the_cap_long_is_whole_and_saveable() {
+        use schemaic_core::blob::{BlobValue, FETCH_CAP};
+
+        let whole = BlobValue {
+            bytes: vec![0u8; 8],
+            len: 8,
+        };
+        assert_eq!(save_offer(Some(&whole)), (true, None));
+
+        // A value that arrived short of what the server says it is: cut,
+        // however plausible the buffer looks on its own.
+        let at_cap = BlobValue {
+            bytes: vec![0u8; 4],
+            len: FETCH_CAP as u64,
+        };
+        assert!(!save_offer(Some(&at_cap)).0, "this one really was cut");
+        // And the shape a real cap-sized read has — both lengths equal, so
+        // nothing was cut and the save is offered. Asserted through `truncated`'s
+        // own arithmetic rather than by allocating 64 MiB to say it.
+        assert!(
+            !BlobValue {
+                bytes: vec![0u8; 4],
+                len: 4
+            }
+            .truncated()
+        );
+    }
+
+    /// Nothing read yet is not a refusal to explain: the panel's body already
+    /// says what state it is in, and a hint under it would be a second sentence
+    /// about the same emptiness.
+    #[test]
+    fn no_value_offers_no_save_and_owes_no_sentence() {
+        assert_eq!(save_offer(None), (false, None));
     }
 
     /// **A dead sink takes nothing, whatever its `put` would have done.** The
