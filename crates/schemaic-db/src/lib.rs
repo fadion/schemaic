@@ -5175,9 +5175,13 @@ impl Db {
     /// wire whole. A row whose blob exceeds the server's `max_allowed_packet`
     /// (16 MiB by default on MariaDB — a **quarter** of
     /// [`schemaic_core::blob::FETCH_CAP`]) therefore fails the ordinary grid
-    /// read, and this panel's 64 MiB promise is unreachable on that engine
-    /// however large the cap here is. The bound is the server's setting, not
-    /// ours, and nothing here can raise it.
+    /// read, and this panel's 64 MiB promise is still unreachable on that engine
+    /// however large the cap here is: the bound is the server's setting, not
+    /// ours, and nothing here can raise it. What it is no longer is a *failure*.
+    /// `PACKET_ROOM` caps this panel's own `SUBSTRING` at what one packet
+    /// holds, so a value over that arrives truncated beside its true
+    /// `OCTET_LENGTH` — which [`BlobValue::truncated`] already knows how to
+    /// describe — rather than dropping the connection mid-row.
     ///
     /// `Ok(None)` means the cell is SQL `NULL` **or** the row is gone (someone
     /// else deleted it since the result loaded); both are "there are no bytes to
@@ -5231,8 +5235,32 @@ pub(crate) async fn blob_on(conn: &mut Conn, r: &BlobRef) -> Result<Option<BlobV
     Ok(Some(BlobValue { bytes, len }))
 }
 
-/// Build the `SELECT OCTET_LENGTH(c), SUBSTRING(c, 1, ?) … WHERE <key> <=> ? …
-/// LIMIT 1` behind [`blob_on`].
+/// The most this connection can be asked for, in the server's own words.
+///
+/// **A row has to fit in one `max_allowed_packet`, and on MySQL the blob really
+/// does cross the wire** — the row is not spared the way PostgreSQL's and
+/// SQLite's are. MariaDB ships that setting at 16 MiB, a **quarter** of
+/// [`FETCH_CAP`], so asking for the full 64 MiB of a large value did not fail
+/// politely: measured against MariaDB 10.11 with a 20 MiB `LONGBLOB`, the
+/// server dropped the connection mid-row (`ERROR 2013`), taking a
+/// manual-transaction tab's pinned session and its uncommitted work with it.
+///
+/// Read from `@@max_allowed_packet` **inside the statement** rather than in a
+/// round trip of its own, so there is no window for the setting to change
+/// between the asking and the reading, and no second query on a path that is
+/// one click.
+///
+/// The 1 MiB of headroom is for everything else in the packet — the
+/// `OCTET_LENGTH` column, the row and column framing, the protocol's own
+/// bookkeeping — and is deliberately generous, because being 100 bytes over
+/// costs the whole connection while being 1 MiB under costs a truncation the
+/// panel already knows how to describe. `GREATEST` keeps the arithmetic
+/// positive on a server configured below the headroom (MariaDB's floor is
+/// 1 KiB), and the `CAST` keeps the subtraction from wrapping in unsigned.
+const PACKET_ROOM: &str = "GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576)";
+
+/// Build the `SELECT OCTET_LENGTH(c), SUBSTRING(c, 1, LEAST(?, …)) … WHERE
+/// <key> <=> ? … LIMIT 1` behind [`blob_on`].
 ///
 /// **The length and the bytes come from one row of one statement**, not two
 /// queries: asked separately they can straddle another session's `UPDATE`, and
@@ -5240,10 +5268,18 @@ pub(crate) async fn blob_on(conn: &mut Conn, r: &BlobRef) -> Result<Option<BlobV
 /// buffer would write a file that is not the data.
 ///
 /// `SUBSTRING` on a binary string is byte-indexed in MySQL (it is
-/// character-indexed only for a character string), so the cap really is
-/// [`FETCH_CAP`] octets. The WHERE is `build_update`'s, NULL-safe `<=>` and all
-/// — the identity of a row is one thing on this path, whether it is being
-/// written or read.
+/// character-indexed only for a character string), so the cap really is octets.
+/// **Two caps, and the smaller wins**: ours ([`FETCH_CAP`], bound) and the
+/// server's ([`PACKET_ROOM`], read live). Neither subsumes the other — a small
+/// `max_allowed_packet` bounds a large blob, and a large one leaves `FETCH_CAP`
+/// the operative limit — and a value cut by either arrives with its true
+/// `OCTET_LENGTH` beside it, so [`BlobValue::truncated`] answers `true` and the
+/// panel shows the prefix and refuses to save it. That is the whole point of
+/// capping rather than erroring: 16 MiB of a 20 MiB value, honestly labelled,
+/// beats a dropped connection.
+///
+/// The WHERE is `build_update`'s, NULL-safe `<=>` and all — the identity of a
+/// row is one thing on this path, whether it is being written or read.
 fn build_blob_select(r: &BlobRef) -> (String, Params) {
     let mut params: Vec<MyValue> = Vec::with_capacity(r.key.len() + 1);
     params.push(MyValue::UInt(FETCH_CAP as u64));
@@ -5258,7 +5294,8 @@ fn build_blob_select(r: &BlobRef) -> (String, Params) {
         .join(" AND ");
     let col = ident(&r.column);
     let sql = format!(
-        "SELECT OCTET_LENGTH({col}), SUBSTRING({col}, 1, ?) FROM {}.{} WHERE {where_sql} LIMIT 1",
+        "SELECT OCTET_LENGTH({col}), SUBSTRING({col}, 1, LEAST(?, {PACKET_ROOM})) \
+         FROM {}.{} WHERE {where_sql} LIMIT 1",
         ident(&r.database),
         ident(&r.table),
     );
@@ -6264,7 +6301,8 @@ mod tests {
         let (sql, params) = build_blob_select(&blob_ref(&[("staff_id", Value::UInt(1))]));
         assert_eq!(
             sql,
-            "SELECT OCTET_LENGTH(`picture`), SUBSTRING(`picture`, 1, ?) \
+            "SELECT OCTET_LENGTH(`picture`), SUBSTRING(`picture`, 1, \
+             LEAST(?, GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576))) \
              FROM `db`.`staff` WHERE `staff_id` <=> ? LIMIT 1"
         );
         let Params::Positional(p) = params else {
@@ -6313,8 +6351,42 @@ mod tests {
         let (sql, _) = build_blob_select(&r);
         assert_eq!(
             sql,
-            "SELECT OCTET_LENGTH(`c``c`), SUBSTRING(`c``c`, 1, ?) \
+            "SELECT OCTET_LENGTH(`c``c`), SUBSTRING(`c``c`, 1, \
+             LEAST(?, GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576))) \
              FROM `d``b`.`t``t` WHERE `k``k` <=> ? LIMIT 1"
+        );
+    }
+
+    /// **The server's limit is the other cap, and the smaller of the two wins.**
+    /// `FETCH_CAP` stays bound as a parameter — the statement must not carry a
+    /// second literal — while `max_allowed_packet` is read live inside the
+    /// statement, because it is the server's answer and it can change under a
+    /// long-lived connection.
+    ///
+    /// Asking for the full 64 MiB unconditionally is not a polite failure on
+    /// MySQL: measured against MariaDB 10.11 (`max_allowed_packet` = 16 MiB) a
+    /// 20 MiB `LONGBLOB` dropped the connection mid-row. The cap turns that into
+    /// a truncated read the panel already describes.
+    #[test]
+    fn build_blob_select_bounds_the_read_by_the_servers_packet_limit() {
+        let (sql, params) = build_blob_select(&blob_ref(&[("id", Value::Int(1))]));
+        assert!(
+            sql.contains(
+                "LEAST(?, GREATEST(1024, CAST(@@max_allowed_packet AS SIGNED) - 1048576))"
+            ),
+            "the two caps must both be in the length, smaller winning: {sql}"
+        );
+        assert!(
+            !sql.contains(&FETCH_CAP.to_string()),
+            "our cap is bound, not written into the statement: {sql}"
+        );
+        let Params::Positional(p) = params else {
+            panic!("positional params expected");
+        };
+        assert_eq!(
+            p[0],
+            MyValue::UInt(FETCH_CAP as u64),
+            "and it is still the first parameter, ahead of the key"
         );
     }
 
