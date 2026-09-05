@@ -3686,7 +3686,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, t| Some(table_info_of(&conn, t)),
+        );
         assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![0]));
         assert!(m.editable(1) && m.editable(2));
         assert!(!m.editable(0), "the key is a handle, not the table's data");
@@ -3703,7 +3707,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, t| Some(table_info_of(&conn, t)),
+        );
         assert!(!m.editable(0));
         assert!(m.insert_target().is_none());
     }
@@ -3746,7 +3754,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, t| Some(table_info_of(&conn, t)),
+        );
         assert!(m.insert_target().is_none(), "no row can be identified");
         for ci in 0..3 {
             assert!(!m.editable(ci), "column {ci} must stay read-only");
@@ -3767,7 +3779,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, t| Some(table_info_of(&conn, t)),
+        );
         assert_eq!(
             m.table(0).map(|t| t.key_cols.clone()),
             Some(vec![1]),
@@ -4887,7 +4903,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .expect("select");
-        let model = analyze_edit(&rs, |_db, _s, t| Some(table_info_of(&keeper, t)));
+        let model = analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_db, _s, t| Some(table_info_of(&keeper, t)),
+        );
 
         let payload = 2usize;
         assert!(model.binary(payload), "declared BLOB");
@@ -4952,8 +4972,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m =
-            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
         let tbl = m.insert_target().expect("a single writable table");
         assert_eq!(tbl.key_cols, vec![0]);
         let key_of = |row: usize| schemaic_core::edit::row_key(&rs, tbl, row);
@@ -5022,8 +5045,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m =
-            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
         let tbl = m.insert_target().expect("writable");
 
         // A designer edit on the same table, through the real path.
@@ -5104,8 +5130,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m =
-            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
         let tbl = m.insert_target().expect("writable");
         let stale = schemaic_core::edit::row_key(&rs, tbl, 2); // rowid 3 = 'r3'
 
@@ -5312,8 +5341,11 @@ mod tests {
             &mut crate::RowDest::Capped(100),
         )
         .unwrap();
-        let m =
-            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
         let template =
             schemaic_core::edit::refetch_template(&rs, &m).expect("a keyless table is spliceable");
         assert_eq!(template.columns, ["rowid", "a", "b"]);

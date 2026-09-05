@@ -15,6 +15,7 @@
 //! (a wrong key misdirects an UPDATE), so it lives here with tests rather than
 //! welded to Floem signals in the UI.
 
+use crate::intel::SqlDialect;
 use crate::model::{CellEdit, Column, RefetchTemplate, ResultSet, RowEdit, Value};
 use crate::schema::TableInfo;
 use std::collections::HashMap;
@@ -242,11 +243,16 @@ pub fn refetch_key(
 /// predicate is the whole of what keeps a `<n bytes>` placeholder from being
 /// typed back over the bytes it stands for.
 ///
-/// One function because C2's two halves must agree on the word: the edit gate
-/// ([`EditModel::text_editable`]) and the key gate ([`resolve_key`]) both ask
-/// it, and a column one of them calls binary and the other does not is either a
-/// lossy `WHERE` or a writable placeholder.
-fn holds_bytes(rs: &ResultSet, ci: usize) -> bool {
+/// One function because every half must agree on the word: the edit gate
+/// ([`EditModel::text_editable`]), the key gate ([`resolve_key`]), the
+/// confirmation gate ([`confirm_columns`]), the blob panel's source
+/// ([`crate::blob::blob_source`]) and the export's placeholder sweep
+/// ([`crate::export`]) all ask it. A column one of them calls binary and
+/// another does not is either a lossy `WHERE` or a writable placeholder — and
+/// `confirm_columns` is where that already happened: it asked the wire flag
+/// alone and put a blob stored in a `TEXT`-declared column into the confirming
+/// `WHERE` as the literal text `<n bytes>`, which matches zero rows.
+pub(crate) fn holds_bytes(rs: &ResultSet, ci: usize) -> bool {
     rs.columns.get(ci).is_some_and(Column::is_binary) || rs.binary_columns.contains(&ci)
 }
 
@@ -254,8 +260,14 @@ fn holds_bytes(rs: &ResultSet, ci: usize) -> bool {
 /// loaded schema for a base table (or `None` if unknown) — the UI supplies a
 /// closure that reads its schema signals; tests supply a plain map. `schema` is
 /// the PostgreSQL namespace, `None` on MySQL.
+///
+/// `dialect` is the tab's connection engine, and reaches only
+/// [`EditModel::byte_cap`]: a declared byte length is a promise on one engine
+/// and a note on another, so a type name cannot be read without knowing whose
+/// it is — see [`crate::blob::column_byte_cap`].
 pub fn analyze_edit(
     rs: &ResultSet,
+    dialect: SqlDialect,
     schema_for: impl Fn(&str, Option<&str>, &str) -> Option<TableInfo>,
 ) -> EditModel {
     let ncols = rs.columns.len();
@@ -304,12 +316,13 @@ pub fn analyze_edit(
                     .columns
                     .iter()
                     .find(|c| c.name == name)
-                    .and_then(|c| crate::blob::column_byte_cap(&c.type_name));
+                    .and_then(|c| crate::blob::column_byte_cap(dialect, &c.type_name));
             }
         }
-        if let Some(key_cols) = resolve_key(info.as_ref(), cis, rs) {
+        if let Some(key_cols) = resolve_key(info.as_ref(), cis, rs)
+            && let Some(confirm_cols) = confirm_columns(&key_cols, cis, rs)
+        {
             let idx = tables.len();
-            let confirm_cols = confirm_columns(&key_cols, cis, rs);
             tables.push(EditTable {
                 database: db.clone(),
                 schema: schema.clone(),
@@ -461,14 +474,28 @@ pub fn build_edits(model: &EditModel, rs: &ResultSet, dirty: &DirtyCells) -> Vec
 }
 
 /// The result columns whose original values must confirm an **implicit** key —
-/// see [`EditTable::confirm_cols`]. Empty for every real key, on every engine.
+/// see [`EditTable::confirm_cols`]. `Some(vec![])` for every real key, on every
+/// engine; `None` when the key is implicit and **nothing** can confirm it, which
+/// is a refusal of the whole table.
 ///
-/// A binary column is left out: its cell is a placeholder, not the value, so
-/// comparing it would refuse every write to the table rather than only the
-/// misdirected ones. Everything else the grid read goes in, including a column
-/// the user is editing — the value compared is the one that was *read*, which is
-/// what the row was when its rowid was.
-fn confirm_columns(key_cols: &[usize], cis: &[usize], rs: &ResultSet) -> Vec<usize> {
+/// A column holding bytes is left out: its cell is a
+/// [`crate::model::binary_display`] placeholder, not the value, so comparing it
+/// would refuse every write to the table rather than only the misdirected ones.
+/// [`holds_bytes`], not the wire flag — a blob stored in a `TEXT`-declared
+/// column is legal on SQLite and reads back as `<n bytes>` just the same.
+/// Everything else the grid read goes in, including a column the user is
+/// editing: the value compared is the one that was *read*, which is what the row
+/// was when its rowid was.
+///
+/// **And an empty set is a refusal, not a widening.** [`EditTable::confirm_cols`]
+/// states the premise the 1-row safety net rests on — *a stale key matches zero
+/// rows* — and with nothing to compare, the `WHERE` is `rowid = ?` alone and
+/// that premise is false: a reassigned rowid matches a *different* row, affects
+/// exactly 1, and is reported as a success. On `blobs(data BLOB)` — a rowid
+/// table whose only column holds bytes — every candidate is excluded, so the
+/// table goes back to being read-only, which is what it was before the blob
+/// write existed.
+fn confirm_columns(key_cols: &[usize], cis: &[usize], rs: &ResultSet) -> Option<Vec<usize>> {
     let implicit = key_cols.iter().any(|&kci| {
         rs.columns[kci]
             .origin
@@ -476,18 +503,21 @@ fn confirm_columns(key_cols: &[usize], cis: &[usize], rs: &ResultSet) -> Vec<usi
             .is_some_and(|o| o.implicit_key)
     });
     if !implicit {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    cis.iter()
+    let cols: Vec<usize> = cis
+        .iter()
         .copied()
         .filter(|ci| !key_cols.contains(ci))
+        .filter(|&ci| !holds_bytes(rs, ci))
         .filter(|&ci| {
             rs.columns[ci]
                 .origin
                 .as_ref()
-                .is_some_and(|o| !o.binary && !o.implicit_key)
+                .is_some_and(|o| !o.implicit_key)
         })
-        .collect()
+        .collect();
+    (!cols.is_empty()).then_some(cols)
 }
 
 /// Find the result-column indices forming a usable row key for one base table,
@@ -1337,6 +1367,20 @@ mod tests {
     use crate::model::{Column, ColumnFlags, ColumnOrigin};
     use crate::schema::ColumnInfo;
 
+    /// [`analyze_edit`] on MySQL.
+    ///
+    /// The dialect reaches exactly one field — [`EditModel::col_cap`], through
+    /// [`crate::blob::column_byte_cap`] — and every fixture below is about keys,
+    /// confirmation and editability, none of which it touches. A test that means
+    /// a *cap* names its engine and calls `super::analyze_edit` outright, so the
+    /// one question this parameter answers is never answered by a default.
+    fn analyze_edit(
+        rs: &ResultSet,
+        schema_for: impl Fn(&str, Option<&str>, &str) -> Option<TableInfo>,
+    ) -> EditModel {
+        super::analyze_edit(rs, SqlDialect::MySql, schema_for)
+    }
+
     /// A result column with a base-table origin (no namespace — the MySQL shape).
     fn col(name: &str, ty: &str, table: &str, pk: bool, binary: bool) -> Column {
         col_in(None, name, ty, table, pk, binary)
@@ -1671,6 +1715,103 @@ mod tests {
         assert_eq!(
             m.insert_target().map(|t| t.confirm_cols.clone()),
             Some(vec![1])
+        );
+    }
+
+    /// **An implicit key nothing can confirm is not a key.** `confirm_cols`'
+    /// own doc states the premise the 1-row safety net rests on: *a stale key
+    /// matches zero rows*. On `CREATE TABLE blobs (data BLOB)` — a rowid table
+    /// whose every non-key column holds bytes — every candidate is excluded as
+    /// a placeholder and the set comes out **empty**, which turns the `WHERE`
+    /// back into `rowid = ?` alone. A rowid reassigned under an open tab (a
+    /// `VACUUM`, a delete-then-insert, the app's own twelve-step rebuild) then
+    /// makes the `UPDATE` land on a *different* row, affect exactly 1, and be
+    /// reported as a success while another row's blob is gone.
+    ///
+    /// So the empty set is a refusal, not a widening: the table is read-only,
+    /// which is what it was before the blob write existed.
+    #[test]
+    fn an_implicit_key_nothing_can_confirm_leaves_the_table_read_only() {
+        let r = rs(vec![
+            implicit_col("rowid", "blobs"),
+            col("data", "BLOB", "blobs", false, true),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "blobs").then(|| schema_keyless("blobs", &[("data", "blob")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(m.insert_target().is_none(), "no confirmable key, no writes");
+        assert!(!m.editable(1), "the blob cell is a viewer, not a target");
+    }
+
+    /// The same refusal, reached through the **other** half of the pair: the
+    /// column is declared `TEXT` and only the backend's `binary_columns` says
+    /// its values arrived as bytes. `ColumnOrigin::binary` is `false` here, so
+    /// the old spelling let it into `confirm_cols`; `holds_bytes` keeps it out,
+    /// and with nothing else left the table is read-only.
+    #[test]
+    fn a_text_declared_column_holding_bytes_cannot_confirm_either() {
+        let mut r = rs(vec![
+            implicit_col("rowid", "t"),
+            col("payload", "TEXT", "t", false, false),
+        ]);
+        r.binary_columns = vec![1];
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_keyless("t", &[("payload", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(m.insert_target().is_none());
+    }
+
+    /// **The placeholder must never reach the `WHERE`, through the whole
+    /// chain.** SQLite types values, not columns: `t(name TEXT, payload TEXT)`
+    /// holding `x'0102030405'` in `payload` is legal, and the grid reads that
+    /// cell as the literal text `<5 bytes>` — [`crate::model::binary_display`]'s
+    /// output, not the bytes. `ColumnOrigin::binary` is `false` (the *declared*
+    /// type is `TEXT`), so the weak predicate put `payload` in `confirm_cols`
+    /// and every `UPDATE` on the table went out as
+    /// `... WHERE rowid IS ? AND payload IS '<5 bytes>'` — matching **zero**
+    /// rows, so every edit to that table rolled back, forever.
+    ///
+    /// Composed deliberately: the bug lives at `analyze_edit` -> `build_edits`
+    /// -> `row_edit_for`'s `WHERE` key, and a test of `confirm_columns` alone
+    /// would not have seen the value the placeholder carries into the statement.
+    #[test]
+    fn a_blob_in_a_text_declared_column_never_enters_the_confirming_where() {
+        let mut r = ResultSet::from_rows(
+            vec![
+                implicit_col("rowid", "t"),
+                col("name", "TEXT", "t", false, false),
+                col("payload", "TEXT", "t", false, false),
+            ],
+            vec![vec![
+                Value::Int(7),
+                Value::Str("a".into()),
+                Value::Str(crate::model::binary_display(5)),
+            ]],
+        );
+        r.binary_columns = vec![2];
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_keyless("t", &[("name", "text"), ("payload", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+
+        // `name` still confirms, so the table stays writable.
+        let tbl = m.insert_target().expect("one confirmable column is enough");
+        assert_eq!(tbl.confirm_cols, vec![1]);
+
+        let mut dirty: DirtyCells = HashMap::new();
+        dirty.insert((0, 1), CellEdit::Text("b".into()));
+        let edits = build_edits(&m, &r, &dirty);
+        assert_eq!(edits.len(), 1);
+        let names: Vec<&str> = edits[0].key.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["rowid", "name"], "payload is not an identity");
+        assert!(
+            !edits[0]
+                .key
+                .iter()
+                .any(|(_, v)| matches!(v, Value::Str(s) if crate::model::is_binary_display(s))),
+            "a `<n bytes>` placeholder in the WHERE matches zero rows"
         );
     }
 

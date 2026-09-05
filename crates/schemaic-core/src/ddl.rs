@@ -7138,6 +7138,30 @@ pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a column's **declared type** bind how many bytes a value in it may
+/// hold — is `varbinary(16)` a promise the server keeps, or a note?
+///
+/// MySQL's is a promise, and a hard one: it answers an overrun with
+/// `ERROR 1406: Data too long`, so the size is worth checking where the user
+/// picks the file. PostgreSQL's `bytea` declares no length at all, which is the
+/// same answer arrived at from the other side — there is no declared bound to
+/// read. SQLite's is a **note**: that engine types values, not columns, and the
+/// declaration is an affinity with the parameter ignored outright — `VARBINARY(16)`
+/// there stores a megabyte happily, and `BLOB` is bounded only by
+/// `SQLITE_MAX_LENGTH` (a gigabyte by default).
+///
+/// So this is the question [`crate::blob::column_byte_cap`] has to ask before
+/// reading a type name, and asking it is not optional: that function's table is
+/// MySQL's four blob families, and applied to SQLite it caps a `BLOB` at 65,535
+/// bytes and a `VARBINARY(16)` at **sixteen** — refusing files the engine would
+/// have taken, at the one gesture the cap exists to make pleasant.
+pub fn enforces_declared_byte_length(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Does an auto-increment column on `dialect` draw from a **separate counter**
 /// that a restore has to be told about?
 ///

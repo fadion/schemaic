@@ -2408,6 +2408,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 generation: monitor_gen.clone(),
                 started: Instant::now(),
                 target: (conn_id, source),
+                dialect: connections
+                    .with_untracked(|cs| {
+                        cs.iter()
+                            .find(|c| c.id == conn_id)
+                            .map(|c| SqlDialect::from_db_type(&c.db_type))
+                    })
+                    .unwrap_or_default(),
                 interval: monitor_interval,
                 paused: monitor_paused,
                 exported: monitor_exported,
@@ -3820,12 +3827,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // one stat call and the read still bounds itself below, since a
                 // file can grow between the two.
                 let cap = schemaic_core::blob::LOAD_CAP as u64;
+                // The pair is contrasted, not formatted twice: `human_bytes`
+                // keeps one decimal, so every size in a ~51 KB window above the
+                // cap read "That file is 64.0 MB — the most that can be loaded
+                // is 64.0 MB."
                 let too_big = |n: u64| {
-                    format!(
-                        "That file is {} — the most that can be loaded is {}.",
-                        schemaic_core::format::human_bytes(n as i64),
-                        schemaic_core::format::human_bytes(cap as i64)
-                    )
+                    let (got, most) = schemaic_core::format::contrasting_bytes(n, cap);
+                    format!("That file is {got} — the most that can be loaded is {most}.")
                 };
                 match std::fs::metadata(&req.path) {
                     Ok(m) if schemaic_core::blob::load_too_large(m.len()) => {
@@ -10297,6 +10305,11 @@ struct MonitorCtx {
     /// The connection + the table being watched (namespace included, so a
     /// PostgreSQL table outside `public` is actually the one polled).
     target: (u64, TableSource),
+    /// The watched connection's SQL dialect, for the baseline poll's
+    /// `analyze_edit`. Carried rather than re-resolved: `monitor_apply` runs on
+    /// the UI thread with no `Db` in hand, and the identity key it asks for must
+    /// not depend on connecting again.
+    dialect: SqlDialect,
     /// Poll interval (seconds), read fresh on each re-arm so the popup's dropdown
     /// takes effect on the next tick.
     interval: RwSignal<u64>,
@@ -10417,7 +10430,7 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                 ctx.cols
                     .set(rs.columns.iter().map(|c| c.name.clone()).collect());
                 let db_nodes = ctx.db_nodes;
-                let model = analyze_edit(&rs, |db, ns, table| {
+                let model = analyze_edit(&rs, ctx.dialect, |db, ns, table| {
                     db_nodes.with_untracked(|nodes| {
                         nodes.iter().find(|n| n.database == db).and_then(|n| {
                             match n.schema.get_untracked() {
