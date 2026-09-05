@@ -537,8 +537,21 @@ fn image_dims(bytes: &[u8]) -> Option<(u32, u32)> {
 /// smaller cost than showing every image stretched.
 fn preview_view(value: Arc<BlobValue>, kind: BlobKind) -> impl IntoView {
     let body: floem::AnyView = match preview_verdict(image_dims(&value.bytes)) {
+        // **`min_size_full`, and the alignment below does nothing without it.**
+        // A scroll measures its child against unbounded space, so this container
+        // hugged the image: on a 16 × 16 favicon it was 40 px across inside a
+        // 420 px pane, and flexbox centring had nothing to distribute — the icon
+        // sat in the top-left corner. `hex_view` carries `min_width_full` for
+        // exactly this reason, one pane over.
+        //
+        // `min_size_full` rather than `size_full`: the minimum fills the
+        // viewport when the image is smaller than it and *grows past* it when
+        // the image is larger, which is what keeps the pane's natural-size
+        // decision (see `preview_verdict`) intact — a fitted `size_full` would
+        // cap the child at the viewport and there would be nothing to scroll.
         PreviewVerdict::Show => scroll(container(img(move || value.bytes.clone())).style(|s| {
             s.padding(theme::scaled(12.0))
+                .min_size_full()
                 .items_center()
                 .justify_center()
         }))
@@ -1526,7 +1539,8 @@ mod tests {
         assert_eq!(
             image_dims(&bomb),
             Some((65_535, 65_535)),
-            "the header must measure cleanly — a refusal for being unreadable              would pass this test without exercising the cap"
+            "the header must measure cleanly — a refusal for being unreadable \
+             would pass this test without exercising the cap"
         );
         assert_eq!(
             preview_verdict(image_dims(&bomb)),
