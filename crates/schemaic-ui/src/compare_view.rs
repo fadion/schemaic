@@ -621,10 +621,23 @@ fn ready_body(c: Rc<SchemaComparison>, ui: &Ui, ring: FocusRing) -> impl IntoVie
 fn filter_bar(ui: Ui, c: Rc<SchemaComparison>, ring: FocusRing) -> impl IntoView {
     let o = ui.overlay;
     let counts = c.counts();
-    let summary = format!(
+    let mut summary = format!(
         "{} differ · {} only here · {} only there · {} identical",
         counts.differing, counts.only_left, counts.only_right, counts.same
     );
+    // **The uncertain tally, on the one line that is about the whole
+    // comparison.** `CompareEntry::uncertain` was drawn only as a per-row hint,
+    // and an uncertain match is overwhelmingly an object that came out `Same` —
+    // which the default `show_same: false` hides. So the flag's own case was
+    // invisible: the tree said two schemas agreed about an index it had never
+    // fully read.
+    if counts.uncertain > 0 {
+        summary.push_str(&format!(
+            " · {} {} the comparison can't vouch for",
+            counts.uncertain,
+            schemaic_core::text::plural(counts.uncertain, "match", "matches")
+        ));
+    }
 
     // **`edit_field`, not a styled `text_input`.** Hand-rolling the box got the
     // app's field wrong in three ways at once — a lighter border, a hover state
