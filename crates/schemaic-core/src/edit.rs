@@ -68,6 +68,19 @@ pub struct EditModel {
     tables: Vec<EditTable>,
 }
 
+/// Which surface the *open what I am on* gesture aims at — see
+/// [`EditModel::activation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellActivation {
+    /// Open the in-cell text editor on it.
+    TextEdit,
+    /// Aim the binary panel at it. Whether the panel then has anything to show
+    /// or anywhere to write is the caller's question, not this one's.
+    OpenPanel,
+    /// Neither: a read-only cell that holds no bytes.
+    Nothing,
+}
+
 impl EditModel {
     /// Can result column `ci` be written at all — by typing, by pasting, or by
     /// loading a file into it through the blob panel?
@@ -107,6 +120,63 @@ impl EditModel {
     /// two questions asked of it.
     pub fn text_editable(&self, ci: usize) -> bool {
         self.editable(ci) && !self.binary(ci)
+    }
+
+    /// What the *open what I am on* gesture aims at for result column `ci` —
+    /// Enter from the keyboard, a double-click from the pointer.
+    ///
+    /// **The two gestures had drifted apart, and the keyboard lost.** A
+    /// double-click has always fallen through to the binary panel on a cell that
+    /// takes no text, but Enter asked [`EditModel::text_editable`] and stopped
+    /// there — so on a `photo BLOB` it did nothing, while the panel behind that
+    /// cell is the only way to read a blob's bytes and, since the column became
+    /// writable, the only way to put bytes in one. There is no context-menu key
+    /// binding either, so *Edit binary* was not a way round it: the one write
+    /// surface in the grid was reachable by pointer alone.
+    ///
+    /// [`CellActivation::OpenPanel`] means *aim the panel at this cell*, not
+    /// *the panel will open*. A binary cell can still have nothing to read and
+    /// nowhere to write — a NULL cell of a keyless table — and that refusal
+    /// stays where it already is, in the grid's own `blob_launch`, which is also
+    /// what keeps this answer free of the row state (a row marked for deletion,
+    /// a pending row with no committed value behind it) that only the caller
+    /// holds. What is decided here is which of the two surfaces the gesture is
+    /// for, and a binary column is for the panel **whether or not it can be
+    /// written**, because the panel is the viewer too.
+    pub fn activation(&self, ci: usize) -> CellActivation {
+        if self.text_editable(ci) {
+            CellActivation::TextEdit
+        } else if self.binary(ci) {
+            CellActivation::OpenPanel
+        } else {
+            CellActivation::Nothing
+        }
+    }
+
+    /// May bytes be staged into result column `ci` of a row that is (or is not)
+    /// marked for deletion?
+    ///
+    /// **The blob write's gate, asked twice and answered once.** The grid offers
+    /// *Load from file* only where this holds, and asks it again when the bytes
+    /// actually land — the two are separated by a file dialog and a worker
+    /// thread, which is however long the user spends choosing, and a schema
+    /// reload or a Delete keypress in between changes the answer. Two spellings
+    /// of one gate is how they come to disagree, and the `row_deleted` half is
+    /// the one that matters: marking a row purges it from the staged edits, so a
+    /// file staged afterwards puts it back, and the commit then carries a
+    /// `RowDelete` **and** a `RowEdit` for one row. Deletes run first, the update
+    /// matches nothing, and the 1-row safety net rolls the whole batch back over
+    /// an edit the user could not see.
+    ///
+    /// [`EditModel::editable`], not [`EditModel::text_editable`]: this is the
+    /// one path that puts bytes in a column, and `text_editable` is precisely
+    /// the gate that keeps everything else out of a binary one.
+    ///
+    /// A pending new row passes `false` — there is no committed row to mark, so
+    /// the question does not arise; that its skeleton still exists is a
+    /// different check, and it belongs where the rows are.
+    pub fn takes_bytes(&self, ci: usize, row_deleted: bool) -> bool {
+        self.editable(ci) && !row_deleted
     }
 
     /// The `tables` index that column `ci` writes to, if editable.
@@ -2015,6 +2085,107 @@ mod tests {
         assert!(!m2.editable(0));
         assert!(!m2.editable(1));
         assert!(!m2.text_editable(0) && !m2.text_editable(1));
+    }
+
+    /// **The blob write's gate had no test at all**, on either of the two sites
+    /// that ask it — the offer that puts *Load from file* on the panel and the
+    /// re-ask that runs when the bytes come back from the dialog. The arm this
+    /// pins is the `del_rows` one, which is not about permission: staging into a
+    /// row already marked for deletion builds a commit carrying a `RowDelete`
+    /// and a `RowEdit` for the same row, and the 1-row net then rolls back
+    /// *everything* the user staged over an edit they could not see.
+    ///
+    /// A binary column is deliberately in here as one that **passes**: this gate
+    /// is `editable`, not `text_editable`, and a version that reached for the
+    /// narrow one would refuse the only column the feature exists for.
+    #[test]
+    fn bytes_are_refused_into_a_doomed_row_and_a_column_that_takes_no_write() {
+        let r = rs(vec![
+            col("id", "INT", "docs", true, false),
+            col("photo", "BLOB", "docs", false, true),
+            col("computed", "INT", "", false, false), // no base table
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "docs")
+                .then(|| schema_with_pk("docs", &["id"], &[("id", "int"), ("photo", "blob")]))
+        };
+        let m = analyze_edit(&r, schema);
+
+        assert!(
+            m.takes_bytes(1, false),
+            "the blob column of a live row is the whole point of the feature"
+        );
+        assert!(
+            !m.takes_bytes(1, true),
+            "and the same column of a row on its way out takes nothing — a \
+             RowDelete beside a RowEdit rolls the whole batch back"
+        );
+        assert!(
+            !m.takes_bytes(2, false),
+            "a column with no base table takes no write, doomed row or not"
+        );
+        assert!(!m.takes_bytes(2, true));
+        assert!(
+            !m.takes_bytes(99, false),
+            "and past the end of the result is not a write either"
+        );
+    }
+
+    /// **Enter and a double-click must aim at the same surface**, which is the
+    /// whole of what `activation` is for. Enter asked `text_editable` and
+    /// stopped, so a binary cell answered *nothing* on the keyboard while the
+    /// pointer opened the panel on it — and the panel is the grid's only blob
+    /// write surface, with no context-menu key binding behind it either.
+    ///
+    /// The third column is the one that keeps this from being `text_editable`
+    /// wearing a hat: a binary column of a table with **no usable key** is not
+    /// editable at all, and it still activates the panel, because a value you
+    /// cannot write is one you can still read. Asserting only the first two
+    /// columns would pass against `if text_editable { TextEdit } else if
+    /// editable { OpenPanel } else { Nothing }`, which is the plausible wrong
+    /// version.
+    #[test]
+    fn enter_and_a_double_click_aim_at_the_same_surface() {
+        let r = rs(vec![
+            col("id", "INT", "docs", true, false),
+            col("photo", "BLOB", "docs", false, true),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "docs")
+                .then(|| schema_with_pk("docs", &["id"], &[("id", "int"), ("photo", "blob")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert_eq!(m.activation(0), CellActivation::TextEdit);
+        assert_eq!(
+            m.activation(1),
+            CellActivation::OpenPanel,
+            "the gesture that means `open this` has to reach the one surface that reads it"
+        );
+
+        // A keyless table: nothing here is writable, and the blob is still
+        // readable through the panel.
+        let r2 = rs(vec![
+            col("note", "TEXT", "k", false, false),
+            col("photo", "BLOB", "k", false, true),
+        ]);
+        let schema2 = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "k").then(|| schema_with_pk("k", &[], &[("note", "text"), ("photo", "blob")]))
+        };
+        let m2 = analyze_edit(&r2, schema2);
+        assert!(!m2.editable(1), "no key, so no write anywhere in the table");
+        assert_eq!(
+            m2.activation(0),
+            CellActivation::Nothing,
+            "a read-only text cell has no surface to open"
+        );
+        assert_eq!(
+            m2.activation(1),
+            CellActivation::OpenPanel,
+            "but a blob you cannot write is one you can still read"
+        );
+
+        // Past the end of the result: neither, and no panic.
+        assert_eq!(m.activation(99), CellActivation::Nothing);
     }
 
     /// The type name is the second signal, and on two of the three engines it is
