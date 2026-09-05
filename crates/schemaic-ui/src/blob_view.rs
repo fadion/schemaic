@@ -130,8 +130,8 @@ pub struct BlobUi {
     /// refuse is worse than none — a button in a panel already open is the
     /// opposite case, and a footer that changed shape between cells would read
     /// as the panel being a different thing each time.
-    /// See [`crate::BlobStageFn`].
-    pub stage: RwSignal<Option<crate::BlobStageFn>>,
+    /// See [`crate::BlobStage`].
+    pub stage: RwSignal<Option<crate::BlobStage>>,
     /// Which opening of the panel is the current one.
     ///
     /// **Only the opening that started a fetch may report into it.** The panel
@@ -180,7 +180,7 @@ impl BlobUi {
     pub fn open(
         self,
         target: BlobTarget,
-        stage: Option<crate::BlobStageFn>,
+        stage: Option<crate::BlobStage>,
         state: BlobState,
     ) -> u64 {
         let epoch = self.epoch.get_untracked().wrapping_add(1);
@@ -314,7 +314,7 @@ impl BlobUi {
         // been marked for deletion, the result may have been re-run read-only.
         // A refusal reported as "Loaded file." is the one outcome worse than
         // either — it looks exactly like a write that will happen and is not.
-        if !(stage)(bytes.clone()) {
+        if !stage.put(bytes.clone()) {
             self.note.set(Some(Err(
                 "That cell is no longer accepting a value — nothing was staged.".to_string(),
             )));
@@ -621,17 +621,23 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
     // `Empty`. `BlobUi::open` takes the state it is opening in for that reason —
     // there is no transition left on that path — and this reads the state anyway,
     // so the next caller to add one cannot bring the panic back.
+    //
+    // **`stage` is a term too**, which it was not: the footer's *Load from file*
+    // is built from it, and the one thing that clears it after the panel is up —
+    // the grid behind it being disposed — left the button enabled over a sink
+    // that could no longer take anything.
     let key = floem::reactive::create_memo(move |_| {
         (
             b.epoch.get(),
             b.target.with(|t| t.is_some()),
             b.state.with(phase_of),
+            b.stage.with(Option::is_some),
         )
     });
 
     dyn_container(
         move || key.get(),
-        move |(_epoch, open, _phase)| {
+        move |(_epoch, open, _phase, _stage)| {
             if !open {
                 return empty().into_any();
             }
@@ -748,7 +754,17 @@ pub(crate) fn blob_overlay(ui: Ui) -> impl IntoView {
             // depend on what was read: a cell too large to *save* whole can
             // still be replaced, and a NULL one has nothing to read and is
             // precisely where a first file goes.
-            let loadable = b.stage.with_untracked(Option::is_some);
+            // **The sink's own answer, not merely its presence.** A grid torn
+            // down under an open panel leaves this signal holding a sink that
+            // can no longer stage — and the grid's `on_cleanup` clears it, which
+            // is a change to `stage` and therefore a rebuild (the key has a term
+            // for it). Asking `is_live` as well covers the window between the
+            // two: the effect is already guarded at `load_file`, and without
+            // this the *offer* was not, so the user waited out a file dialog and
+            // a read of up to 64 MiB to be told "This cell cannot be written."
+            let loadable = b
+                .stage
+                .with_untracked(|s| s.as_ref().is_some_and(crate::BlobStage::is_live));
             let load_click = {
                 let load = load.clone();
                 let epoch = b.epoch.get_untracked();
@@ -991,12 +1007,15 @@ mod tests {
         let ui = BlobUi::new();
         let into_first: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
         let into_second: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
-        let sink = |log: &Rc<RefCell<Vec<Vec<u8>>>>| -> crate::BlobStageFn {
+        let sink = |log: &Rc<RefCell<Vec<Vec<u8>>>>| -> crate::BlobStage {
             let log = log.clone();
-            Rc::new(move |b: Vec<u8>| {
-                log.borrow_mut().push(b);
-                true
-            })
+            crate::BlobStage::new(
+                move |b: Vec<u8>| {
+                    log.borrow_mut().push(b);
+                    true
+                },
+                || true,
+            )
         };
 
         let first = ui.open(
@@ -1069,10 +1088,13 @@ mod tests {
         let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = {
             let staged = staged.clone();
-            Rc::new(move |b: Vec<u8>| {
-                staged.borrow_mut().push(b);
-                true
-            }) as crate::BlobStageFn
+            crate::BlobStage::new(
+                move |b: Vec<u8>| {
+                    staged.borrow_mut().push(b);
+                    true
+                },
+                || true,
+            )
         };
         let epoch = ui.open(
             tgt("staff.picture".into(), "staff_picture_1".into()),
@@ -1132,10 +1154,13 @@ mod tests {
         let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = {
             let staged = staged.clone();
-            Rc::new(move |b: Vec<u8>| {
-                staged.borrow_mut().push(b);
-                true
-            }) as crate::BlobStageFn
+            crate::BlobStage::new(
+                move |b: Vec<u8>| {
+                    staged.borrow_mut().push(b);
+                    true
+                },
+                || true,
+            )
         };
         let epoch = ui.open(
             BlobTarget {
@@ -1185,10 +1210,13 @@ mod tests {
         let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = {
             let staged = staged.clone();
-            Rc::new(move |b: Vec<u8>| {
-                staged.borrow_mut().push(b);
-                true
-            }) as crate::BlobStageFn
+            crate::BlobStage::new(
+                move |b: Vec<u8>| {
+                    staged.borrow_mut().push(b);
+                    true
+                },
+                || true,
+            )
         };
         let epoch = ui.open(
             tgt("t.payload".into(), "t_payload".into()),
@@ -1197,6 +1225,63 @@ mod tests {
         );
         ui.loaded_file(epoch, Ok(vec![0u8; 5_000_000]));
         assert_eq!(staged.borrow().len(), 1);
+    }
+
+    /// **A dead sink takes nothing, whatever its `put` would have done.** The
+    /// sink is an `Rc` closing over a grid's state and it is handed to a
+    /// *window*-scoped signal, so the two do not die together: a re-run, a
+    /// closed panel or a closed tab disposes the grid while the panel and its
+    /// file dialog stand open. floem's `get_untracked` is
+    /// `try_get_untracked().unwrap()`, so the write that follows is a panic that
+    /// takes the window and every tab's uncommitted edits.
+    ///
+    /// The liveness check is inside `put` rather than beside it, so no caller
+    /// can be the one that forgot.
+    #[test]
+    fn a_sink_whose_grid_is_gone_stages_nothing() {
+        use std::cell::RefCell;
+        let landed: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let alive = Rc::new(std::cell::Cell::new(true));
+        let sink = {
+            let (landed, alive) = (landed.clone(), alive.clone());
+            crate::BlobStage::new(
+                move |b: Vec<u8>| {
+                    landed.borrow_mut().push(b);
+                    true
+                },
+                move || alive.get(),
+            )
+        };
+        assert!(sink.put(vec![1, 2, 3]), "a live sink takes the bytes");
+        assert_eq!(landed.borrow().len(), 1);
+
+        alive.set(false);
+        assert!(!sink.put(vec![4, 5, 6]), "a dead one refuses");
+        assert_eq!(
+            landed.borrow().len(),
+            1,
+            "and the closure behind it was never entered"
+        );
+    }
+
+    /// And the panel reports that refusal as a refusal — the same sentence a
+    /// sink that merely declined gets, because from the user's side they are the
+    /// same event: the bytes are not in the cell.
+    #[test]
+    fn a_dead_sink_is_reported_rather_than_dressed_as_a_load() {
+        let ui = BlobUi::new();
+        let dead = crate::BlobStage::new(|_: Vec<u8>| true, || false);
+        let epoch = ui.open(
+            tgt("t.payload".into(), "t_payload".into()),
+            Some(dead),
+            BlobState::Empty,
+        );
+        ui.loaded_file(epoch, Ok(vec![1, 2, 3]));
+        assert!(
+            matches!(ui.note.get_untracked(), Some(Err(_))),
+            "{:?}",
+            ui.note.get_untracked()
+        );
     }
 
     /// **A sink that refuses is said out loud.** The file dialog stands open for
@@ -1208,7 +1293,7 @@ mod tests {
     #[test]
     fn a_sink_that_refuses_is_reported_rather_than_dressed_as_a_load() {
         let ui = BlobUi::new();
-        let refusing: crate::BlobStageFn = Rc::new(|_: Vec<u8>| false);
+        let refusing = crate::BlobStage::new(|_: Vec<u8>| false, || true);
         let epoch = ui.open(
             tgt("t.payload".into(), "t_payload".into()),
             Some(refusing),
@@ -1255,10 +1340,13 @@ mod tests {
         let staged: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = {
             let staged = staged.clone();
-            Rc::new(move |b: Vec<u8>| {
-                staged.borrow_mut().push(b);
-                true
-            }) as crate::BlobStageFn
+            crate::BlobStage::new(
+                move |b: Vec<u8>| {
+                    staged.borrow_mut().push(b);
+                    true
+                },
+                || true,
+            )
         };
         ui.open(
             tgt("a.b".into(), "a_b".into()),

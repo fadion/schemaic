@@ -675,7 +675,51 @@ pub type BlobLoadFn = Rc<dyn Fn(BlobLoadRequest)>;
 /// refuse. A sink that refused silently while the panel reported "Loaded file"
 /// would be indistinguishable from one that worked, and the difference is a
 /// column that does or does not get written.
-pub type BlobStageFn = Rc<dyn Fn(Vec<u8>) -> bool>;
+#[derive(Clone)]
+pub struct BlobStage {
+    put: Rc<dyn Fn(Vec<u8>) -> bool>,
+    live: Rc<dyn Fn() -> bool>,
+}
+
+impl BlobStage {
+    pub fn new(
+        put: impl Fn(Vec<u8>) -> bool + 'static,
+        live: impl Fn() -> bool + 'static,
+    ) -> BlobStage {
+        BlobStage {
+            put: Rc::new(put),
+            live: Rc::new(live),
+        }
+    }
+
+    /// Does the grid this sink writes into still exist?
+    ///
+    /// **The signal holding a sink is window-scoped and the sink closes over a
+    /// grid, so the two do not die together.** The panel is opened from a grid
+    /// and outlives none of its own gestures — but the file dialog is not
+    /// window-modal (floem's `open_file` is a `std::thread::spawn` with no
+    /// parent window), and a re-run, a closed panel or a closed tab disposes the
+    /// grid's scope from under it. Reading a disposed signal in floem is
+    /// `try_get_untracked().unwrap()`, which takes the window and every tab's
+    /// uncommitted edits with it.
+    ///
+    /// So there are two defences and both are needed: `GridState::stage_bytes`
+    /// asks this before touching anything (so a stale sink refuses instead of
+    /// panicking), and the grid's own `on_cleanup` clears any sink that answers
+    /// `false` (so *Load from file* stops being offered at all). Asking the sink
+    /// rather than comparing identities is what makes the second one safe with
+    /// several grids alive: only a dead grid's cleanup runs, and only that
+    /// grid's sink is dead.
+    pub fn is_live(&self) -> bool {
+        (self.live)()
+    }
+
+    /// Hand the bytes over, returning whether they were staged. The liveness
+    /// check is inside, so no caller can skip it.
+    pub fn put(&self, bytes: Vec<u8>) -> bool {
+        self.is_live() && (self.put)(bytes)
+    }
+}
 
 /// Raise the binary-cell panel on one cell, fetch its bytes, and say where a
 /// file loaded in it should go.
@@ -688,12 +732,12 @@ pub type BlobStageFn = Rc<dyn Fn(Vec<u8>) -> bool>;
 /// pending new row, and a committed row whose cell is `NULL`. The panel opens
 /// `Empty` on either and is a loader rather than a viewer; being *told* `Empty`
 /// a line after opening is what used to panic it. The
-/// `BlobStageFn` is `None` the other way round — a cell in a result nothing can
+/// `BlobStage` is `None` the other way round — a cell in a result nothing can
 /// be written to — and the panel is then a viewer with no *Load from file*.
 /// Both `None` at once cannot happen, because the grid offers no entry for a
 /// cell that can be neither read nor written.
 pub type ViewBlobFn =
-    Rc<dyn Fn(u64, Option<schemaic_core::blob::BlobRef>, BlobTarget, Option<BlobStageFn>)>;
+    Rc<dyn Fn(u64, Option<schemaic_core::blob::BlobRef>, BlobTarget, Option<BlobStage>)>;
 
 /// The table an import is loading into, captured when the modal opens so a
 /// schema refresh underneath it can't retarget the import.
@@ -6608,6 +6652,7 @@ fn center(ui: Ui) -> impl IntoView {
                     open_properties: open_properties.clone(),
                     db_stats: db_stats.clone(),
                     view_blob: view_blob.clone(),
+                    blob_stage: ui.blob.stage,
                     ai_fill: ai_fill.clone(),
                     ai_seed: ai_seed.clone(),
                     dismiss: dismiss_menus.clone(),
