@@ -410,18 +410,24 @@ fn run_files(ui: Ui, target: DumpTarget) {
                         files,
                         tally,
                         missing,
+                        replaced,
                     } => d.done.set(Some(schemaic_core::export::files_note(
-                        files, &tally, &name, &missing,
+                        files, &tally, &name, &missing, &replaced,
                     ))),
-                    FilesOutcome::Cancelled { files, missing } => d.error.set(Some(
-                        schemaic_core::export::files_cancel_note(files, &name, &missing),
-                    )),
+                    FilesOutcome::Cancelled {
+                        files,
+                        missing,
+                        replaced,
+                    } => d.error.set(Some(schemaic_core::export::files_cancel_note(
+                        files, &name, &missing, &replaced,
+                    ))),
                     FilesOutcome::Failed {
                         message,
                         files,
                         missing,
+                        replaced,
                     } => d.error.set(Some(schemaic_core::export::files_failure_note(
-                        &message, files, &name, &missing,
+                        &message, files, &name, &missing, &replaced,
                     ))),
                 }
             }),

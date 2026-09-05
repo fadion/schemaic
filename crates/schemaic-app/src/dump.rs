@@ -237,6 +237,7 @@ pub(crate) async fn run_files(
             return FilesOutcome::Cancelled {
                 files: 0,
                 missing: Vec::new(),
+                replaced: Vec::new(),
             };
         }
         Err(e) => {
@@ -244,6 +245,7 @@ pub(crate) async fn run_files(
                 message: format!("Export failed: {e}"),
                 files: 0,
                 missing: Vec::new(),
+                replaced: Vec::new(),
             };
         }
     };
@@ -258,12 +260,30 @@ pub(crate) async fn run_files(
         return FilesOutcome::Failed {
             message: "Nothing to export — no table matched the selection.".to_string(),
             files: 0,
+            replaced: Vec::new(),
             // The interesting case for this arm: every ticked table went missing
             // between the picker and the launch, so "no table matched" is true
             // and useless on its own — the names are what says why.
             missing: plan.missing,
         };
     }
+
+    // **What this export is about to destroy, read before it destroys any of
+    // it.** `select_directories()` has no overwrite prompt — the single-file
+    // export's only guard against replacing the user's work is the save dialog's
+    // own "replace?", and the folder form has no equivalent. Nothing between the
+    // picker and the `rename` checked, and no arm of `FilesOutcome` could say so
+    // afterwards.
+    //
+    // Read here, once, ahead of the loop: after the first `rename` the answer is
+    // contaminated by this export's own output, and a `Cancelled` or `Failed`
+    // arm would report whichever prefix it happened to reach.
+    let replaced: Vec<String> = plan
+        .files
+        .iter()
+        .filter(|step| req.folder.join(&step.file).is_file())
+        .map(|step| step.file.clone())
+        .collect();
 
     let total = plan.files.len();
     let mut done = 0usize;
@@ -285,6 +305,7 @@ pub(crate) async fn run_files(
             return FilesOutcome::Cancelled {
                 files: done,
                 missing,
+                replaced,
             };
         }
         // Best-effort, exactly as the dump's: a full progress channel must never
@@ -345,36 +366,54 @@ pub(crate) async fn run_files(
         let sweep = || {
             let _ = std::fs::remove_file(&part);
         };
-        let failed = |message: String| {
-            sweep();
-            FilesOutcome::Failed {
-                message,
-                files: done,
-                missing: missing.clone(),
-            }
+        // **`dump_verdict`, not a second copy of it.** These five arms were
+        // written out again here, and the copy diverged in the one arm the
+        // extraction exists to protect: `WriteEnd::Failed` carries the writer's
+        // own words, which already begin "Export failed:", and re-prefixing them
+        // produced "Export failed: Export failed: No space left on device (os
+        // error 28) — 3 files already written to out are kept."
+        //
+        // The writer's refusal to publish a truncated file is folded into the
+        // *read* end before asking, because that is what it is: a cancel, whose
+        // only witness is the token — a stop that landed between the last chunk
+        // and the rename never reaches the reader at all.
+        let stopped_at_publish = token.is_cancelled() && matches!(written, Ok(Err(_)));
+        let read_end = match &read {
+            Err(DbError::Cancelled) => ReadEnd::Cancelled,
+            _ if stopped_at_publish => ReadEnd::Cancelled,
+            Err(e) => ReadEnd::Failed(e.to_string()),
+            Ok(_) => ReadEnd::Clean,
         };
-        let cancelled = || {
-            sweep();
-            FilesOutcome::Cancelled {
-                files: done,
-                missing: missing.clone(),
-            }
+        let (write_end, tally_of) = match written {
+            Ok(Ok(t)) => (WriteEnd::Wrote, Some(t)),
+            Ok(Err(e)) => (WriteEnd::Failed(e), None),
+            Err(e) => (WriteEnd::Died(e.to_string()), None),
         };
-        match (read, written) {
-            (Err(DbError::Cancelled), _) => return cancelled(),
-            // The writer's own refusal to publish a truncated file. It is a
-            // cancel, not a failure, and the token is the only witness — a stop
-            // that landed between the last chunk and the rename never reaches the
-            // reader at all.
-            (_, Ok(Err(_))) if token.is_cancelled() => return cancelled(),
-            (_, Ok(Err(e))) => return failed(format!("Export failed: {e}")),
-            (_, Err(e)) => return failed(format!("Export failed: worker died: {e}")),
-            (Err(e), _) => return failed(format!("Export failed: {e}")),
-            (Ok(n), Ok(Ok(t))) => {
-                rows_so_far += n;
+        match schemaic_core::dump::dump_verdict(read_end, write_end) {
+            DumpVerdict::Cancelled => {
+                sweep();
+                return FilesOutcome::Cancelled {
+                    files: done,
+                    missing,
+                    replaced,
+                };
+            }
+            DumpVerdict::Failed { message, .. } => {
+                sweep();
+                return FilesOutcome::Failed {
+                    message,
+                    files: done,
+                    missing,
+                    replaced,
+                };
+            }
+            DumpVerdict::Done => {
+                rows_so_far += read.unwrap_or(0);
                 // One fold across every file, so one sentence can name what none
                 // of them could carry — `ExportTally::absorb`'s reason.
-                tally.absorb(t);
+                if let Some(t) = tally_of {
+                    tally.absorb(t);
+                }
                 done += 1;
             }
         }
@@ -384,6 +423,7 @@ pub(crate) async fn run_files(
         files: done,
         tally,
         missing,
+        replaced,
     }
 }
 
@@ -434,9 +474,13 @@ fn write_one(
         return Err("Export cancelled.".to_string());
     }
     std::fs::rename(part, path).map_err(|e| {
+        // **It must not point at the `.part`.** This message used to say "the
+        // export wrote <part> but could not rename it", and the caller's `sweep()`
+        // deletes that file three lines later — so the one sentence telling the
+        // user where their rows were named a path that no longer existed by the
+        // time they read it.
         format!(
-            "The export wrote {} but could not rename it to {}: {e}",
-            part.display(),
+            "Export failed: {} could not be published: {e}",
             path.display()
         )
     })?;
