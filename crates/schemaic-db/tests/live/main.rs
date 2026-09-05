@@ -80,6 +80,7 @@ live_suite!(
         a_blob_reads_back_byte_for_byte,
         a_blob_fetch_lands_on_the_row_its_key_names,
         a_null_blob_reports_nothing,
+        an_empty_blob_is_a_value_not_a_null,
         a_binary_cell_in_a_real_result_resolves_and_fetches,
         a_stored_png_still_sniffs_as_one_after_the_round_trip,
         staged_bytes_reach_the_column_as_bytes,
