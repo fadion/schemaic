@@ -243,9 +243,22 @@ impl CompareEntry {
     /// in the tree, same heading over the diff pane, and a filter that cannot
     /// tell them apart. Their keys differ, so ticking one and reading the other
     /// is a plan the user cannot see is not the one they meant.
+    /// **The namespace is in it, on both arms.** A trigger's arm read
+    /// `format!("{table}.{name}")` and dropped the schema its own [`key`] keeps,
+    /// so two triggers named `t` on `city` in two PostgreSQL namespaces drew as
+    /// two identical rows — same text in the tree, same heading over the diff
+    /// pane. Worse than looking alike: [`SchemaComparison::selectable_keys`]
+    /// filters on this text, so typing `archive` matched neither of them and
+    /// returned an empty set. The one object that differed was invisible *and*
+    /// unselectable, and *Select all* was a silent no-op over it.
+    ///
+    /// [`key`]: CompareEntry::key
     pub fn label(&self) -> String {
         let mut out = match &self.table {
-            Some(t) => format!("{t}.{}", self.name),
+            // The qualifier goes on the *table*, not on the trigger — a
+            // trigger's namespace is its table's, and `city.app.t` is not a name
+            // anyone would write. The same order `key` composes.
+            Some(t) => format!("{}.{}", display_name(self.schema.as_deref(), t), self.name),
             None => display_name(self.schema.as_deref(), &self.name),
         };
         if let Some(sig) = &self.signature {
@@ -383,6 +396,38 @@ pub struct SchemaComparison {
     /// referencing table has to be dropped before the table it references, and
     /// a cycle means no order does that either.
     pub cycles_drop: bool,
+}
+
+/// Why a comparison's tree is empty — see [`SchemaComparison::empty_reason`].
+///
+/// Four arms and not three: "nothing matched" and "what matched, you asked not
+/// to see" are different answers, and giving the second the first's sentence
+/// tells the user their filter is wrong when it is the toggle beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyRows {
+    /// Neither side holds a single object.
+    NothingToCompare,
+    /// There is no filter, and every object either side holds agrees.
+    EverythingAgrees,
+    /// The filter matched no object's name at all.
+    NoMatch,
+    /// The filter matched, but only objects the two schemas agree on — and
+    /// *Include identical* is off.
+    OnlyIdenticalMatched,
+}
+
+impl EmptyRows {
+    /// What the empty state says.
+    pub fn message(self) -> &'static str {
+        match self {
+            EmptyRows::NothingToCompare => "Neither database holds anything to compare.",
+            EmptyRows::EverythingAgrees => "These two schemas match, object for object.",
+            EmptyRows::NoMatch => "Nothing matches that filter.",
+            EmptyRows::OnlyIdenticalMatched => {
+                "Everything matching that filter is identical — turn on Include identical to see it."
+            }
+        }
+    }
 }
 
 impl SchemaComparison {
@@ -574,6 +619,40 @@ impl SchemaComparison {
         self.differences().any(CompareEntry::needs_source)
     }
 
+    /// Why the tree has no rows to show — the sentence the empty state owes the
+    /// reader, as a decision rather than as a string.
+    ///
+    /// **Only meaningful when [`SchemaComparison::rows`] came back empty**, and
+    /// it takes the same [`RowFilter`] so the two cannot disagree about which
+    /// emptiness this is. The view had these three arms inside a
+    /// `dyn_container`'s child closure, where nothing could reach them, and one
+    /// of the three was wrong: a filter that *matched* — but matched only
+    /// objects the two schemas agree on, with *Include identical* off — was
+    /// reported as "Nothing matches that filter", which is a claim about the
+    /// filter over a result the `show_same` toggle produced.
+    pub fn empty_reason(&self, filter: RowFilter<'_>) -> EmptyRows {
+        if self.entries.is_empty() {
+            return EmptyRows::NothingToCompare;
+        }
+        let needle = filter.query.trim().to_lowercase();
+        if needle.is_empty() {
+            // No filter, and no rows: everything either side holds agrees, and
+            // agreement is hidden by default.
+            return EmptyRows::EverythingAgrees;
+        }
+        // The name filter alone, exactly as `rows` applies it — the `show_same`
+        // half is what this arm is about, so it is deliberately not asked here.
+        let matched = self
+            .entries
+            .iter()
+            .any(|e| crate::schema::object_name_matches(&e.label(), &needle));
+        if matched {
+            EmptyRows::OnlyIdenticalMatched
+        } else {
+            EmptyRows::NoMatch
+        }
+    }
+
     /// The tree's rows, grouped by kind and filtered.
     ///
     /// **Display order, which is deliberately not plan order.** Groups run in
@@ -756,6 +835,24 @@ pub fn is_planned(e: &CompareEntry, selected: &HashSet<String>) -> bool {
     selected.contains(&e.key()) && !e.needs_source()
 }
 
+/// What the compare footer says about the tick set — the sentence that stands
+/// next to the button the plan is built from.
+///
+/// Pure and here rather than inside the footer's `label` closure, for
+/// [`SchemaPlan::subject`]'s reason: the two are the same sentence about the
+/// same number, one before the preview and one inside it, and they were two
+/// hand-rolled plurals a hundred lines apart, beside `preview_title` — which
+/// was extracted precisely so a modal's words could be tested.
+pub fn selection_note(planned: usize) -> String {
+    match planned {
+        0 => "Nothing selected.".to_string(),
+        n => format!(
+            "{n} {} selected",
+            crate::text::plural(n, "object", "objects")
+        ),
+    }
+}
+
 /// A migration as several objects' change sets, ordered.
 ///
 /// The aggregate is a list rather than one wide [`ChangeSet`] because a set
@@ -808,6 +905,18 @@ impl SchemaPlan {
     /// How many objects this plan touches.
     pub fn len(&self) -> usize {
         self.sets.len()
+    }
+
+    /// What the preview modal is **about** — its title's second half, and the
+    /// noun its success line reads "Applied N statements to …".
+    ///
+    /// A count rather than a name, because a plan has no single object to name.
+    /// Here rather than at the call site beside `preview_title`, which was
+    /// extracted precisely so a modal's words could be tested: this string was
+    /// hand-rolled inside a click closure with its own `if n == 1` beside it.
+    pub fn subject(&self) -> String {
+        let n = self.len();
+        format!("{n} {}", crate::text::plural(n, "object", "objects"))
     }
 
     /// Every statement, in the order they must run.
@@ -1373,6 +1482,172 @@ mod tests {
 
     fn mysql(left: DbSchema, right: DbSchema) -> SchemaComparison {
         SchemaComparison::of(&left, &right, SqlDialect::MySql)
+    }
+
+    // ── the two sentences about a count ──────────────────────────────────────
+
+    /// **One number, two surfaces, and they were two hand-rolled plurals a
+    /// hundred lines apart** — inside a footer's `label` closure and inside a
+    /// click closure, both beside `preview_title`, which was extracted precisely
+    /// so a modal's words could be tested.
+    #[test]
+    fn a_plans_subject_and_the_footers_count_agree_and_read_as_english() {
+        let one = mysql(
+            schema_of(vec![]),
+            schema_of(vec![table("fresh", &[("id", "int")])]),
+        )
+        .plan(|_| true);
+        assert_eq!(one.subject(), "1 object");
+        assert_eq!(selection_note(1), "1 object selected");
+
+        let two = mysql(
+            schema_of(vec![table("gone", &[("id", "int")])]),
+            schema_of(vec![table("fresh", &[("id", "int")])]),
+        )
+        .plan(|_| true);
+        assert_eq!(two.subject(), "2 objects");
+        assert_eq!(selection_note(2), "2 objects selected");
+
+        // The empty plan is the one the footer says something else about: there
+        // is no button to press, so the sentence is not a count at all.
+        assert_eq!(SchemaPlan::default().subject(), "0 objects");
+        assert_eq!(selection_note(0), "Nothing selected.");
+    }
+
+    // ── why the tree is empty ────────────────────────────────────────────────
+
+    /// **The arm that was wrong.** A filter that matched — but matched only
+    /// objects the two schemas agree on, with *Include identical* off — was
+    /// reported as "Nothing matches that filter", which is a claim about the
+    /// filter over a result the toggle beside it produced. The user retypes the
+    /// filter instead of pressing the checkbox next to it.
+    #[test]
+    fn a_filter_that_matched_only_agreements_says_so_rather_than_blaming_itself() {
+        let both = || {
+            schema_of(vec![
+                table("city", &[("id", "int")]),
+                table("country", &[("id", "int")]),
+            ])
+        };
+        let c = mysql(both(), both());
+        let f = RowFilter {
+            query: "city",
+            show_same: false,
+        };
+        assert!(c.rows(f, &c.default_expanded()).is_empty());
+        assert_eq!(c.empty_reason(f), EmptyRows::OnlyIdenticalMatched);
+        assert!(
+            c.empty_reason(f).message().contains("Include identical"),
+            "the message points at the control that would show it: {}",
+            c.empty_reason(f).message()
+        );
+    }
+
+    /// The other three arms, which the old inline form got right and which have
+    /// to keep being right now that they are one function.
+    #[test]
+    fn the_other_three_emptinesses_read_as_themselves() {
+        // Nothing either side holds.
+        let none = SchemaComparison::of(
+            &DbSchema::default(),
+            &DbSchema::default(),
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            none.empty_reason(RowFilter {
+                query: "",
+                show_same: false
+            }),
+            EmptyRows::NothingToCompare
+        );
+
+        // Two identical schemas, no filter.
+        let both = || schema_of(vec![table("city", &[("id", "int")])]);
+        let same = mysql(both(), both());
+        assert_eq!(
+            same.empty_reason(RowFilter {
+                query: "",
+                show_same: false
+            }),
+            EmptyRows::EverythingAgrees
+        );
+
+        // A filter that names nothing either side has.
+        assert_eq!(
+            same.empty_reason(RowFilter {
+                query: "zzz",
+                show_same: false
+            }),
+            EmptyRows::NoMatch
+        );
+    }
+
+    /// Every arm has its own sentence — a message table where two arms shared
+    /// one would be the bug this exists to fix, wearing a different hat.
+    #[test]
+    fn each_emptiness_says_something_different() {
+        let all = [
+            EmptyRows::NothingToCompare,
+            EmptyRows::EverythingAgrees,
+            EmptyRows::NoMatch,
+            EmptyRows::OnlyIdenticalMatched,
+        ];
+        let msgs: HashSet<&str> = all.iter().map(|r| r.message()).collect();
+        assert_eq!(msgs.len(), all.len(), "{msgs:?}");
+    }
+
+    /// **A trigger's label carries its namespace, because a filter reads it.**
+    /// Two triggers named `t` on `city`, one in each of two PostgreSQL
+    /// namespaces, drew as two identical rows — and `selectable_keys` filters on
+    /// this very text, so typing `archive` matched neither and returned an empty
+    /// set: the one object that differed was invisible *and* unselectable, and
+    /// *Select all* was a silent no-op over it. Its `key` had the namespace all
+    /// along, which is why nothing about the plan was wrong — only what the user
+    /// could see and reach.
+    #[test]
+    fn a_trigger_label_says_which_namespace_its_table_is_in() {
+        let with_trigger = |ns: &str, body: &str| {
+            let mut t = TableInfo {
+                name: "city".to_string(),
+                schema: Some(ns.to_string()),
+                columns: vec![col("id", "int")],
+                ..Default::default()
+            };
+            t.triggers = vec![TriggerInfo {
+                name: "t".to_string(),
+                schema: Some(ns.to_string()),
+                table: "city".to_string(),
+                action: TriggerAction::Body(body.to_string()),
+                ..Default::default()
+            }];
+            t
+        };
+        let c = SchemaComparison::of(
+            &schema_of(vec![
+                with_trigger("app", "BEGIN END"),
+                with_trigger("archive", "BEGIN END"),
+            ]),
+            &schema_of(vec![
+                with_trigger("app", "BEGIN END"),
+                with_trigger("archive", "SELECT 2"),
+            ]),
+            SqlDialect::Postgres,
+        );
+        let labels: Vec<String> = c.entries.iter().map(CompareEntry::label).collect();
+        assert!(
+            labels.contains(&"archive.city.t".to_string()),
+            "the namespace is on the table, not on the trigger: {labels:?}"
+        );
+        assert!(labels.contains(&"app.city.t".to_string()), "{labels:?}");
+
+        // And the filter that reads those labels can now reach the one that
+        // differs.
+        let shown = c.selectable_keys(RowFilter {
+            query: "archive",
+            show_same: false,
+        });
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(shown[0].contains("archive"), "{shown:?}");
     }
 
     /// **`phase` itself, which nothing reached.** Every ordering test in this

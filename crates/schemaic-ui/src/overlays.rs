@@ -126,27 +126,6 @@ fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal
     })
 }
 
-/// The **Create** submenu a database or namespace node offers: `Table` and
-/// `View` on both engines, plus PostgreSQL's `Type` / `Domain` / `Sequence`.
-///
-/// One submenu rather than five siblings, because the flat form put five rows
-/// that all began with the same verb into the middle of a menu whose every
-/// other entry is about the node itself — on PostgreSQL, most of the menu. The
-/// verb moves to the parent row and the labels become the nouns, which is the
-/// shape `Colour` here and `Copy` on a table node already use.
-///
-/// The three PostgreSQL objects are **absent on MySQL**, which has none of them
-/// — the same call `trigger_editor`'s form makes about what an engine can't
-/// express: hide it, rather than offer it and fail at apply. That is also why
-/// they are hidden where every other schema-editing entry is merely *dimmed* on
-/// a read-only connection: a missing entry reads as "not supported", a dimmed
-/// one as "not here", and here both readings are true of a different engine.
-///
-/// The parent row is never itself dimmed — a [`MenuEntry::Sub`] has no disabled
-/// state — so on a read-only connection it opens onto entries that are all
-/// dimmed, which is the same thing the flat form said with the group it dimmed.
-/// `None` when the engine offers nothing to create at all, so the caller leaves
-/// the row out rather than showing a submenu that opens onto nothing.
 /// The `Export ▸` submenu: one entry per
 /// [`ExportFormat`](schemaic_core::export::ExportFormat), all six opening the
 /// same modal.
@@ -198,6 +177,27 @@ fn export_submenu(
     MenuEntry::sub("Export", children)
 }
 
+/// The **Create** submenu a database or namespace node offers: `Table` and
+/// `View` on both engines, plus PostgreSQL's `Type` / `Domain` / `Sequence`.
+///
+/// One submenu rather than five siblings, because the flat form put five rows
+/// that all began with the same verb into the middle of a menu whose every
+/// other entry is about the node itself — on PostgreSQL, most of the menu. The
+/// verb moves to the parent row and the labels become the nouns, which is the
+/// shape `Colour` here and `Copy` on a table node already use.
+///
+/// The three PostgreSQL objects are **absent on MySQL**, which has none of them
+/// — the same call `trigger_editor`'s form makes about what an engine can't
+/// express: hide it, rather than offer it and fail at apply. That is also why
+/// they are hidden where every other schema-editing entry is merely *dimmed* on
+/// a read-only connection: a missing entry reads as "not supported", a dimmed
+/// one as "not here", and here both readings are true of a different engine.
+///
+/// The parent row is never itself dimmed — a [`MenuEntry::Sub`] has no disabled
+/// state — so on a read-only connection it opens onto entries that are all
+/// dimmed, which is the same thing the flat form said with the group it dimmed.
+/// `None` when the engine offers nothing to create at all, so the caller leaves
+/// the row out rather than showing a submenu that opens onto nothing.
 fn create_submenu(
     ui: &Ui,
     database: &str,
