@@ -4552,6 +4552,43 @@ mod tests {
         assert!(csv.contains("id"), "the header names the columns: {csv:?}");
     }
 
+    /// **Xlsx too, and it is the one production actually renders this way.** The
+    /// parity test above skips every non-text format and defers to their
+    /// round-trip tests — which never use `SliceChunks` and never an empty
+    /// order, while a `Fetched` export renders *every* format through it. A
+    /// workbook is a ZIP, so this compares bytes rather than text, and an empty
+    /// one is emphatically not a 0-byte file: it is a whole workbook with a
+    /// header row and no data rows.
+    #[test]
+    fn an_empty_result_writes_the_same_workbook_through_either_path() {
+        let bytes = |f: &mut dyn FnMut(&mut Vec<u8>) -> io::Result<()>| -> Vec<u8> {
+            let mut buf = Vec::new();
+            f(&mut buf).expect("the writer is a Vec");
+            buf
+        };
+        let rs = rs();
+        let order: Vec<usize> = Vec::new();
+        let whole = bytes(&mut |w| {
+            ExportFormat::Xlsx
+                .render_to(w, &rs, &order, None, MySql)
+                .map(|_| ())
+        });
+        let chunked = bytes(&mut |w| {
+            let mut src = SliceChunks::new(&rs, &order, 4);
+            ExportFormat::Xlsx
+                .stream_to(w, &mut src, None, MySql)
+                .map(|_| ())
+        });
+        assert_eq!(whole, chunked, "the two paths must write one workbook");
+        assert!(
+            whole.len() > 1000,
+            "an empty result is still a whole workbook, not a stub: {} bytes",
+            whole.len()
+        );
+        // A ZIP, so the reader that opens it can at least find the signature.
+        assert_eq!(&whole[..2], b"PK", "not a workbook at all");
+    }
+
     #[test]
     fn a_watched_slice_reports_the_running_total() {
         let (cols, rows) = awkward_rows();
