@@ -667,8 +667,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `a_binary_column_resolves_a_source_and_a_bytes_only_write` pins from both sides in one test: the
     column takes a write but not a text one (`editable` yes, `text_editable` no), and the fetch
     still finds its table. Binary columns remain barred as WHERE keys. The binary signal read
-    here is the same pair `export::dropped_binary_columns` uses, `Column::is_binary` **or**
-    `ResultSet::binary_columns`, so a SQLite blob in a column declared `TEXT` is fetchable
+    here is `edit::holds_bytes` — the one definition of the pair `Column::is_binary` **or**
+    `ResultSet::binary_columns`, which this and `export::dropped_binary_columns` used to spell
+    themselves — so a SQLite blob in a column declared `TEXT` is fetchable
     (`a_dynamically_asserted_binary_column_resolves_a_source`); an implicit key is not, being no
     column of the table to `SELECT`.
     `FETCH_CAP` is 64 MiB, and it is enforced **in the `SELECT`** — a `SUBSTRING` of that many
@@ -796,7 +797,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     cancelled-read arm. Chunking a result that used to render whole must be invisible in the file,
     and that is the whole risk of the change: `chunking_a_fetched_result_cannot_change_the_bytes`
     renders every text format at every chunk size from 1 to len+1 and compares byte for byte
-    against `render_to`, and
+    against `render_to` — the same review pass measured those boundaries for **Xlsx** as well and
+    found them byte-identical, which the test itself does not reach — and
     `a_stopped_export_writes_nothing_through_the_renderer` asks the seam question of every format —
     `stream_to` must propagate the refusal rather than treat it as a short read, since each writes a
     header on the first chunk and a swallowed error would leave a header-only file looking valid.
@@ -891,7 +893,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     signal **and** the cell's text to agree, since either alone is wrong in a way that loses
     data — and `withheld_binary` is the one per-cell test every withholding emitter shares, so the
     two-signals rule cannot be spelled differently in one of them. **The column signal is
-    `Column::is_binary` OR `ResultSet::binary_columns`**, the second being the backend's own
+    `edit::holds_bytes`** — `Column::is_binary` OR `ResultSet::binary_columns`, asked through the
+    one function that defines the pair rather than spelled here as well — the second being the backend's own
     per-value assertion that the column handed over raw bytes (`ResultBuilder::mark_binary`, set from
     `ValueRef::Blob` in SQLite's `fetch_query`). It is there because on SQLite a type name cannot
     always answer: `declares_bytes` already covers every `…BLOB…` spelling, the `BINARY` family
@@ -2068,7 +2071,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `z_detail`, which is the ERROR 1146 that half exists to prevent
     (`a_view_is_created_after_the_view_its_body_selects_from`). The rank lookup covers
     `CompareKind::Table | View` across `OnlyRight | Differing | OnlyLeft`; every other kind ties at
-    zero and falls through to the name. The ordinal is in the sort key because the alphabetical fallback **is not a dependency
+    zero and falls through to the name. The ordinal is in the sort key because the alphabetical
+    fallback **is not a dependency
     order**: sorting a phase on `key` alone put `domain:` ahead of `enum:` and emitted
     `CREATE DOMAIN … AS app.mood` above the statement creating `mood`, and `trigger:` ahead of
     `view:` for the same reason (`a_new_domain_is_created_after_the_enum_it_names` and
@@ -7799,8 +7803,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **A foreign-key cycle is said twice on purpose.** A warning strip sits above the tree as well as
     reaching the preview's risk block through `SchemaPlan::cycles`, because the tree is where someone
     decides what to tick and the risk block is read after that decision is made. The strip asks
-    `SchemaComparison::cycles`, not the plan's narrowed copy — it is drawn before there is a selection
-    to narrow by.
+    `SchemaComparison::cycles()` — the "either" of the two halves, not the plan's narrowed pairing —
+    because it is drawn before there is a selection to narrow by.
     **The chrome is this module's own.** `schema_tree`'s `tree_row`/`chevron`/`tree_row_min_w` are
     module-private and nothing was promoted to share them. Status is one glyph per row (`+` arrives,
     `−` goes, `~` changes, `=` agrees) so a long list reads down a column instead of as a wall of

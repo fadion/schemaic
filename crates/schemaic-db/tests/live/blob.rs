@@ -165,6 +165,53 @@ pub async fn a_null_blob_reports_nothing(target: &'static Target) {
     scratch.teardown().await;
 }
 
+/// **A zero-length blob is a value, and must not answer like a NULL** — on the
+/// two engines whose decode of an empty value is the non-trivial path.
+///
+/// The pure tier has this for SQLite (`sqlite::an_empty_blob_is_a_value_not_a_null`)
+/// and the live tier had the NULL half without it, which leaves the
+/// discrimination untested exactly where it is hard: PostgreSQL sends an empty
+/// `bytea` as the two characters `\x`, which the hex decoder has to read as
+/// *zero bytes* rather than as a value it could not parse — and the two failures
+/// are indistinguishable downstream, because both would arrive as an empty
+/// buffer beside a length. MySQL's `LENGTH('')` is `0` and not NULL, and the
+/// length and the buffer travel back in the same two fields a missing row uses.
+///
+/// `''` rather than a per-engine literal: an empty string literal coerces to an
+/// empty value of the column's binary type on both, so there is no engine to
+/// branch on — which is what [`binary_case`] exists to avoid doing.
+pub async fn an_empty_blob_is_a_value_not_a_null(target: &'static Target) {
+    let scratch = Scratch::create(target, "blobempty").await;
+    let (ty, _) = binary_case(target);
+    seed(&scratch, "b", ty, &[(1, "''")]).await;
+
+    let got = scratch
+        .db
+        .fetch_blob(&blob_ref(&scratch, "b", 1), CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}: the fetch failed: {e}", target.name))
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: an empty blob is a value — reporting nothing makes it a NULL",
+                target.name
+            )
+        });
+    assert!(
+        got.bytes.is_empty(),
+        "{}: an empty value decoded to {} bytes",
+        target.name,
+        got.bytes.len()
+    );
+    assert_eq!(got.len, 0, "{}: the server's own length", target.name);
+    assert!(
+        !got.truncated(),
+        "{}: nothing was cut off an empty value",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
 /// **The whole path, from the result the grid holds to the bytes behind it.**
 ///
 /// The two halves are tested apart everywhere else — `blob_source` against a

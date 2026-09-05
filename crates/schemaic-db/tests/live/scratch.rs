@@ -234,7 +234,10 @@ impl Scratch {
             loaded.push((db, schema));
         }
 
-        let model = analyze_edit(&rs, |db, ns, table| {
+        // The engine under test, for `EditModel::byte_cap`: a declared byte
+        // length is a promise on MySQL and a note on SQLite, so a type name
+        // cannot be read as a cap without knowing whose it is.
+        let model = analyze_edit(&rs, self.dialect, |db, ns, table| {
             loaded
                 .iter()
                 .find(|(name, _)| name == db)
