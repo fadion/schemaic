@@ -37,7 +37,7 @@ use floem::prelude::*;
 use floem::reactive::{create_effect, create_memo};
 
 use schemaic_core::compare::{
-    CompareEntry, CompareKind, CompareRow, ObjectStatus, RowFilter, SchemaComparison,
+    CompareEntry, CompareKind, CompareRow, ObjectStatus, RowFilter, SchemaComparison, is_planned,
 };
 use schemaic_core::diff::{DiffTag, line_diff};
 
@@ -565,7 +565,7 @@ fn ready_body(c: Rc<SchemaComparison>, ui: &Ui, ring: FocusRing) -> impl IntoVie
     // the plan below is in an order one statement will be refused for. It is
     // said here as well as in the preview's risk block, because this is where
     // someone decides what to tick.
-    let cycle_note: AnyView = if c.cycles {
+    let cycle_note: AnyView = if c.cycles() {
         h_stack((
             crate::icons::icon(crate::icons::TRIANGLE_ALERT, 12.0)
                 .style(|s| s.color(theme::plan_warn())),
@@ -1070,25 +1070,6 @@ fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
     };
 
     modal_footer_split(status, preview)
-}
-
-/// Is this object in the plan a selection describes? **The one predicate**, so
-/// the footer's count, the button's enabled state and the statements that
-/// actually get built cannot answer differently.
-///
-/// It is a function and not a closure written at each site because the two have
-/// already disagreed once: the footer counted `selected.contains(key)` while
-/// the builder also excluded a blocked body, which put a confident "1 object"
-/// over a button that built an empty plan and returned. Counting and building
-/// have to ask the same question, and the cheapest way to guarantee that is for
-/// there to be only one.
-///
-/// A blocked body is excluded here rather than only where the tick is drawn: it
-/// is the tick-box's absence that stops one being selected, and a key that
-/// arrived in the set by any other route (a comparison replaced under a stale
-/// selection, a future "invert") must still not reach `emit`.
-fn is_planned(e: &CompareEntry, selected: &HashSet<String>) -> bool {
-    selected.contains(&e.key()) && !e.needs_source()
 }
 
 /// The plan a selection describes, over [`is_planned`].

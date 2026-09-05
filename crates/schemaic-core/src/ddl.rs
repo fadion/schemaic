@@ -7162,6 +7162,30 @@ pub fn enforces_declared_byte_length(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Can a routine, trigger or event body read by an eager schema fetch be
+/// **re-emitted verbatim** on `dialect`, or must it be re-read from the lazy
+/// per-object source first?
+///
+/// MySQL's cannot: `TriggerInfo::action`, `RoutineInfo::body` and
+/// `EventInfo::body` come from `information_schema`, which hands back the body
+/// with its escapes already resolved. Two mangled bodies still compare equal to
+/// each other — so the comparison's *verdict* is right — but the `CREATE`
+/// written from one is not the routine that was there. PostgreSQL's `pg_get_*`
+/// functions and SQLite's `sqlite_master.sql` both return the original text, so
+/// on those two the eager read is the authority.
+///
+/// A capability rather than `dialect == SqlDialect::MySql`, which is how this
+/// was spelled at its one site: that comparison silently sorts a fourth engine
+/// onto MySQL's side or PostgreSQL's depending on which way it is written, and
+/// leaves nothing to grep for when someone comes looking for the engines this
+/// question has been answered for.
+pub fn schema_body_is_emittable(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql => false,
+    }
+}
+
 /// Does an auto-increment column on `dialect` draw from a **separate counter**
 /// that a restore has to be told about?
 ///
