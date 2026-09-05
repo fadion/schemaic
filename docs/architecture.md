@@ -8606,10 +8606,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     streamed rather than gathered, a `.part` sibling (`write_one`) renamed over the destination only
     once that table is whole, the token checked *before* that rename and asked again after the join
     — a stop that lands between the last chunk and the publish never reaches the reader at all, so
-    the writer's refusal would otherwise be reported as a failure — a cancelled read raised as a
-    channel *error* rather than read as end of stream, and the
-    `writes_incrementally` sweep so a failed `Xlsx` leaves no zero-byte `.part` in a folder the user
-    is about to go looking through. **The loop is sequential, one table at a time, on purpose**:
+    the writer's refusal would otherwise be reported as a failure — and a cancelled read raised as a
+    channel *error* rather than read as end of stream. **The `.part` sweep here is unconditional,
+    which is where a folder export parts company with the single-file one**: there the fragment is
+    the only trace of the rows that arrived and `export_cancel_note` points the user straight at it,
+    so removing it would destroy the one thing they might still want; here the finished files *are*
+    that trace — whole, published, and exactly what `files_cancel_note` and `files_failure_note`
+    promise — and a fragment left beside them makes both sentences false and drops an unreadable
+    `orders.csv.part` into a folder the user chose for output and is about to go looking through.
+    (The single-file paths do gate their sweep on `writes_incrementally()`, and this paragraph used
+    to claim the same for `run_files`.) **The loop is sequential, one table at a time, on purpose**:
     writing four at once would need four connections and four sets of blocks in flight, and it would
     make the progress line's `3 of 12` a lie about what is happening — a folder export is disk-bound
     at the end anyway. The per-file tallies are folded with `ExportTally::absorb`, the same fold the

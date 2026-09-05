@@ -724,9 +724,11 @@ mod tests {
     /// currently reaches the second check.
     ///
     /// That is worth an assert rather than a comment: `PREVIEW_EDGE_CAP` is a
-    /// number a hand-check against a real adapter may raise, and raising it past
-    /// 5657 makes the area cap live again. This fails then, which is the moment
-    /// to re-read both.
+    /// number a hand-check against a real adapter may raise, and **5657 is
+    /// already too far** — 5657² is 32,001,649, one square past the 32 MP cap,
+    /// so 5656 is the largest edge that keeps the area check unreachable. This
+    /// fails there, which is the moment to re-read both rather than to bring the
+    /// second one silently back to life.
     #[test]
     fn the_area_cap_sits_behind_the_edge_cap_at_these_numbers() {
         let widest = u64::from(PREVIEW_EDGE_CAP) * u64::from(PREVIEW_EDGE_CAP);
