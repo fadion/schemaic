@@ -165,6 +165,9 @@ pub(crate) fn preview_of(
         destructive: cs.destructive(),
         risk_heading: cs.risk_heading(),
         withheld: cs.unsupported(),
+        // A single object's edit is about that object: it is either in the plan
+        // or there is no plan. Nothing can be left out of it.
+        omitted: Vec::new(),
         statements: cs.emit(),
         // **`export_script`, not `editor_script`.** This field is what Copy and
         // Open in editor hand over, and both put it somewhere durable — the
@@ -240,6 +243,13 @@ pub(crate) fn preview_of_plan(
         // re-checked inside `apply`, so a plan that can't be expressed in full
         // is not applied in part.
         withheld: plan.unsupported(),
+        // **The disclosure this modal was missing.** A comparison can hold
+        // differences no plan can carry — on MySQL, every routine, trigger and
+        // event, whose bodies arrive escape-mangled — and they have no tick-box,
+        // so nothing the user does adds them. Before this, the last surface
+        // before an irreversible Apply said "1 object" over a three-difference
+        // comparison and reported "Applied N statements to 1 object".
+        omitted: plan.omitted.clone(),
         statements: plan.emit(),
         // **`export_script`, the same field `preview_of` fills that way**, and
         // for the same reason: this is what Copy and Open in editor hand over,
@@ -504,6 +514,56 @@ fn risk_block(heading: &'static str, risks: Vec<String>) -> impl IntoView {
     })
 }
 
+/// The omitted block. Present ⇒ the comparison this plan came from holds
+/// differences the plan does not carry, and never could.
+///
+/// **It discloses and does not refuse**, which is the whole difference between
+/// it and [`withheld_block`] and the reason they are two blocks. Withheld means
+/// half an edit, and half an edit is not a smaller edit — Apply refuses until
+/// the tick causing it is cleared. This means whole objects sat out: what is
+/// below is complete and correct, the user has no tick to clear (these objects
+/// have none), and refusing would make a comparison unusable on MySQL the
+/// moment one routine differs. So it is stated in the muted colour, above the
+/// statements, and Apply stays live.
+fn omitted_block(omitted: Vec<String>) -> impl IntoView {
+    let empty_block = omitted.is_empty();
+    v_stack((
+        h_stack((
+            icons::icon(icons::CIRCLE_DOT, 15.0)
+                .style(|s| s.color(theme::text_faint()).flex_shrink(0.0_f32)),
+            text("Not included in this migration").style(|s| {
+                s.color(theme::text())
+                    .font_size(theme::font_body())
+                    .font_bold()
+            }),
+        ))
+        .style(|s| {
+            s.flex_row()
+                .items_center()
+                .gap(theme::scaled(7.0))
+                .margin_bottom(theme::scaled(5.0))
+        }),
+        v_stack_from_iter(omitted.into_iter().map(|w| {
+            text(w).style(|s| {
+                s.color(theme::text())
+                    .font_size(theme::font_body())
+                    .width_full()
+                    .margin_bottom(theme::scaled(2.0))
+            })
+        })),
+        text("Applying leaves these objects as they are.").style(|s| {
+            s.color(theme::text_faint())
+                .font_size(theme::font_body())
+                .margin_top(theme::scaled(4.0))
+        }),
+    ))
+    .style(move |s| {
+        s.flex_col()
+            .width_full()
+            .apply_if(empty_block, |s| s.display(floem::style::Display::None))
+    })
+}
+
 /// The withheld block. Present ⇒ this engine has no statement for part of the
 /// plan, so the SQL below is **less** than the change list above it.
 ///
@@ -753,6 +813,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     risk_block(p.risk_heading, p.destructive.clone())
                         .style(|s| s.margin_top(theme::scaled(14.0))),
                     withheld_block(p.withheld.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
+                    omitted_block(p.omitted.clone()).style(|s| s.margin_top(theme::scaled(14.0))),
                     form_section("SQL").style(|s| s.margin_top(theme::scaled(18.0))),
                     // Read-only, but a real editor field: the script is meant to
                     // be read and selected, and it's the same widget the rest of
@@ -1542,6 +1603,113 @@ mod tests {
             p.destructive
         );
         assert_eq!(p.risk_heading, "This can't be undone");
+    }
+
+    /// **The two fields a `SchemaPlan` adds over a `ChangeSet`, exercised.**
+    /// Every other test here builds a plan whose `unsupported()` is empty and
+    /// whose `cycles` is false, so `assert_eq!(p.withheld, plan.unsupported())`
+    /// compares `[] == []` and the risk heading is never asked the question the
+    /// flag exists to answer.
+    #[test]
+    fn a_cycle_in_the_plan_reaches_the_previews_risk_block() {
+        let fk = |to: &str| schemaic_core::schema::ForeignKeyInfo {
+            name: format!("fk_{to}"),
+            columns: vec!["other".to_string()],
+            ref_table: to.to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let mut right = one_table("a", &["id", "other"]);
+        right.tables[0].foreign_keys = vec![fk("b")];
+        let mut b = one_table("b", &["id", "other"]).tables.remove(0);
+        b.foreign_keys = vec![fk("a")];
+        right.tables.push(b);
+
+        let plan = compare_plan(Default::default(), right);
+        assert!(plan.cycles, "two mutually referencing creates");
+        let p = preview_of_plan(1, "shop", "2 objects", &plan, false);
+        // A warning, not a refusal: the statements are all there.
+        assert!(p.withheld.is_empty());
+        assert!(!p.statements.is_empty());
+        assert_eq!(p.risk_heading, "This can't be undone");
+        assert!(
+            p.destructive.iter().any(|d| d.contains("cycle")),
+            "{:?}",
+            p.destructive
+        );
+    }
+
+    /// **A withheld plan reaches the block that refuses Apply**, with the line
+    /// naming the object whose tick has to be cleared. Nothing here had ever
+    /// been built with a non-empty `unsupported()`.
+    #[test]
+    fn a_withheld_plan_previews_as_withheld_and_names_its_object() {
+        let lossy = || schemaic_core::schema::IndexInfo {
+            name: "ix_expr".to_string(),
+            lossy: true,
+            ..Default::default()
+        };
+        let mut left = one_table("city", &["id"]);
+        left.tables[0].indexes = vec![lossy()];
+        let mut right = one_table("city", &["id", "name"]);
+        right.tables[0].indexes = vec![lossy()];
+        let plan = schemaic_core::compare::SchemaComparison::of(&left, &right, SqlDialect::Sqlite)
+            .plan(|_| true);
+
+        let p = preview_of_plan(1, "shop", "1 object", &plan, false);
+        assert_eq!(p.withheld, plan.unsupported());
+        assert!(!p.withheld.is_empty(), "a lossy index cannot be rebuilt");
+        assert!(
+            p.withheld.iter().all(|w| w.starts_with("city — ")),
+            "{:?}",
+            p.withheld
+        );
+    }
+
+    /// **What the plan could not carry reaches the modal separately from what
+    /// it cannot express.** A differing MySQL trigger is not in the plan and
+    /// never can be, so `withheld` stays empty and Apply stays live — and the
+    /// omitted block is the only thing between the user and an "Applied N
+    /// statements to 1 object" over a two-difference comparison.
+    #[test]
+    fn what_the_plan_left_out_is_disclosed_without_refusing_apply() {
+        let left = one_table("city", &["id"]);
+        let mut right = one_table("city", &["id", "name"]);
+        right.tables[0].triggers = vec![schemaic_core::schema::TriggerInfo {
+            name: "t_ins".to_string(),
+            table: "city".to_string(),
+            action: schemaic_core::schema::TriggerAction::Body("BEGIN SET @a = 1; END".to_string()),
+            ..Default::default()
+        }];
+        let plan = compare_plan(left, right);
+
+        let p = preview_of_plan(1, "shop", "1 object", &plan, false);
+        assert_eq!(p.omitted, plan.omitted);
+        assert!(
+            p.omitted.iter().any(|o| o.contains("t_ins")),
+            "{:?}",
+            p.omitted
+        );
+        // Not `withheld`: what *is* in the plan is complete, and there is no
+        // tick to clear — so Apply is not refused.
+        assert!(p.withheld.is_empty());
+        assert!(!p.statements.is_empty());
+    }
+
+    /// A designer edit is about one object; there is nothing it can leave out.
+    #[test]
+    fn a_single_objects_preview_has_nothing_omitted() {
+        let cs = schemaic_core::ddl::single(
+            "orders",
+            None,
+            SqlDialect::MySql,
+            schemaic_core::ddl::Change::TruncateTable,
+        );
+        assert!(
+            preview_of(1, "shop", "orders", &cs, false)
+                .omitted
+                .is_empty()
+        );
     }
 
     /// An empty plan asks the modal for nothing, and must not answer `true` to

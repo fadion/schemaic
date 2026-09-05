@@ -1166,6 +1166,18 @@ pub struct DdlPreview {
     /// names each one and Apply refuses, because `statements` is then less than
     /// the change list above it and running it would do part of an edit.
     pub withheld: Vec<String>,
+    /// Differences the plan's **source** holds that no plan built from it can
+    /// carry — see [`schemaic_core::compare::SchemaPlan::omitted`]. Empty for a
+    /// designer edit, which is about one object it either can or cannot change.
+    ///
+    /// A second list beside `withheld` because it asks something different of
+    /// the reader. `withheld` means *this* plan writes less than its own change
+    /// list promises, so Apply refuses until the offending tick is cleared; this
+    /// means an object is not in the plan at all, what is here is complete, and
+    /// there is no tick to clear. So the modal discloses it and Apply stays
+    /// live — the alternative is a feature that refuses every migration the
+    /// moment a MySQL routine differs.
+    pub omitted: Vec<String>,
     pub statements: Vec<String>,
     /// The same plan as one script a **client** can run — see
     /// [`schemaic_core::ddl::ChangeSet::export_script`]. What "Copy" and "Open in

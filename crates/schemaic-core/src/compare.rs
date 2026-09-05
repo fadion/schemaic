@@ -263,11 +263,21 @@ impl CompareEntry {
     /// False for a drop, which needs no body, and for every engine but MySQL.
     pub fn needs_source(&self) -> bool {
         self.kind.carries_body()
-            && self.changes.dialect == SqlDialect::MySql
+            && !ddl::schema_body_is_emittable(self.changes.dialect)
             && matches!(
                 self.status,
                 ObjectStatus::OnlyRight | ObjectStatus::Differing
             )
+    }
+
+    /// The one-line disclosure for an entry [`CompareEntry::needs_source`] keeps
+    /// out of a plan — see [`SchemaPlan::omitted`].
+    fn omission_note(&self) -> String {
+        format!(
+            "{} {} — its body must be re-read from the server before it can be applied",
+            self.kind.label(),
+            self.label()
+        )
     }
 }
 
@@ -360,10 +370,19 @@ pub struct SchemaComparison {
     pub entries: Vec<CompareEntry>,
     /// Both sides' engine.
     pub dialect: SqlDialect,
-    /// A foreign-key cycle meant no create order satisfies every reference, so
-    /// one edge was broken. The plan still holds every object; this is what
-    /// says the order alone can't be trusted.
-    pub cycles: bool,
+    /// A foreign-key cycle among the **right** schema's tables: no creation
+    /// order satisfies every reference, so one edge was broken.
+    ///
+    /// Separate from [`SchemaComparison::cycles_drop`] because the two are
+    /// different facts about different schemas, and folding them together with
+    /// an `||` let a tangle on one side raise the other side's warning — a plan
+    /// that only created one unreferenced table read "This can't be undone"
+    /// because two untouched tables elsewhere referenced each other.
+    pub cycles_create: bool,
+    /// The same, among the **left** schema's tables, for the drop order — a
+    /// referencing table has to be dropped before the table it references, and
+    /// a cycle means no order does that either.
+    pub cycles_drop: bool,
 }
 
 impl SchemaComparison {
@@ -492,15 +511,20 @@ impl SchemaComparison {
         entries.sort_by_cached_key(|e| {
             let ph = phase(e.kind, e.status);
             let name = display_name(e.schema.as_deref(), &e.name);
-            // Only the two table phases carry a foreign-key rank; everything
-            // else ties at zero and falls through to the name.
-            let rank = match (e.kind, e.status) {
-                (CompareKind::Table, ObjectStatus::OnlyRight) => {
+            // Tables and views carry a dependency rank; every other kind ties
+            // at zero and falls through to the name.
+            //
+            // `Differing` takes the **create** ranks, alongside `OnlyRight` and
+            // in the same phase: an `ALTER` and a `CREATE` are both moving
+            // toward the right schema, so the right schema's order is what puts
+            // each one after whatever it names. Nothing here derives a rank of
+            // its own — it is a lookup into `order_tables`' one answer.
+            let ranked = matches!(e.kind, CompareKind::Table | CompareKind::View);
+            let rank = match e.status {
+                ObjectStatus::OnlyRight | ObjectStatus::Differing if ranked => {
                     creates.get(&name).copied().unwrap_or(0)
                 }
-                (CompareKind::Table, ObjectStatus::OnlyLeft) => {
-                    drops.get(&name).copied().unwrap_or(0)
-                }
+                ObjectStatus::OnlyLeft if ranked => drops.get(&name).copied().unwrap_or(0),
                 _ => 0,
             };
             (ph, kind_rank(e.kind, e.status), rank, e.key())
@@ -509,7 +533,8 @@ impl SchemaComparison {
         SchemaComparison {
             entries,
             dialect,
-            cycles: c1 || c2,
+            cycles_create: c1,
+            cycles_drop: c2,
         }
     }
 
@@ -530,6 +555,17 @@ impl SchemaComparison {
             }
         }
         c
+    }
+
+    /// Do **either** schema's foreign keys form a cycle — the comparison-level
+    /// fact, for a header that is about the two schemas rather than about a
+    /// plan.
+    ///
+    /// A plan asks the narrower question and gets a narrower answer: see
+    /// [`SchemaComparison::plan`], which pairs each half with the kind of
+    /// statement it can actually break.
+    pub fn cycles(&self) -> bool {
+        self.cycles_create || self.cycles_drop
     }
 
     /// Does any difference carry a body the caller must refresh from the lazy
@@ -637,34 +673,87 @@ impl SchemaComparison {
     ///
     /// [`ObjectStatus::Same`] entries are never included whatever `include`
     /// says — they hold an empty change set, and a plan listing them would
-    /// claim work that isn't there.
+    /// claim work that isn't there. Neither is an entry
+    /// [`CompareEntry::needs_source`] flags, whatever `include` says: that is
+    /// [`is_planned`]'s rule, restated here so a caller that writes its own
+    /// predicate cannot route an untrustworthy body into `emit`. What it *does*
+    /// do is record them — see [`SchemaPlan::omitted`].
     pub fn plan(&self, include: impl Fn(&CompareEntry) -> bool) -> SchemaPlan {
         let sets: Vec<ChangeSet> = self
             .differences()
-            .filter(|e| include(e))
+            .filter(|e| include(e) && !e.needs_source())
             .map(|e| e.changes.clone())
             .collect();
-        // A cycle only breaks a plan that **creates** a table: that is the
-        // statement carrying the inline foreign key with nothing to point at
-        // yet. A plan of pure alters or drops is unaffected however tangled the
+        // **What this plan cannot carry, in the plan itself.** These entries
+        // have no tick-box, so nothing the user does adds them — and until this
+        // field existed nothing said so past the tree either: the footer counted
+        // the objects that *were* included, the preview's subject repeated that
+        // count, `unsupported()` was empty so the withheld block stayed hidden,
+        // and Apply reported "Applied N statements to 1 object" over a
+        // three-difference comparison. `SchemaComparison::needs_source`, written
+        // to disclose exactly this, had no production caller at all.
+        let omitted: Vec<String> = self
+            .differences()
+            .filter(|e| e.needs_source())
+            .map(CompareEntry::omission_note)
+            .collect();
+        // **A cycle breaks a plan that creates a table and one that drops
+        // one, and they are not the same cycle.** A `CREATE` carries an inline
+        // foreign key with nothing to point at yet; a `DROP` is refused while
+        // anything still references the table. So the create-order tangle is
+        // asked of a plan that creates, the drop-order tangle of one that
+        // drops — and a plan doing neither is unaffected however tangled either
         // schema is.
         //
-        // It errs toward warning: the cycle is a fact about the whole
-        // comparison's foreign keys, and whether the *selected* tables are the
-        // ones in it can't be answered from a set (`dump::order_tables` reports
-        // a cycle, not which edge). Over-reporting costs a sentence in the risk
-        // block, which is the cheap side — the flag is a warning and never a
-        // refusal.
-        let creates_a_table = sets
-            .iter()
-            .flat_map(|s| s.changes.iter())
-            .any(|c| matches!(c, Change::CreateTable(_)));
+        // The old spelling got both halves wrong at once: `self.cycles` was
+        // `c1 || c2`, so a tangle among the *left* schema's tables raised the
+        // *create*-order warning; and the whole thing was gated on
+        // `creates_a_table`, under a comment asserting "a plan of pure alters
+        // **or drops** is unaffected" — which is false of drops, and left
+        // `DROP TABLE b; DROP TABLE a;` to be refused at statement 1 with no
+        // warning at all.
+        //
+        // Each half still errs toward warning: `dump::order_tables` reports
+        // *that* there is a cycle, not which edge, so whether the selected
+        // tables are the ones in it can't be answered from a set. Over-reporting
+        // costs a sentence in the risk block, which is the cheap side.
+        let has = |f: fn(&Change) -> bool| sets.iter().flat_map(|s| s.changes.iter()).any(f);
+        let creates_a_table = has(|c| matches!(c, Change::CreateTable(_)));
+        let drops_a_table = has(|c| matches!(c, Change::DropTable));
         SchemaPlan {
             sets,
             dialect: self.dialect,
-            cycles: self.cycles && creates_a_table,
+            cycles: (self.cycles_create && creates_a_table) || (self.cycles_drop && drops_a_table),
+            omitted,
         }
     }
+}
+
+/// Is this object in the plan a selection describes? **The one predicate**, so
+/// the footer's count, the button's enabled state and the statements that
+/// actually get built cannot answer differently.
+///
+/// It is a function and not a closure written at each site because the two have
+/// already disagreed once: the footer counted `selected.contains(key)` while the
+/// builder also excluded a blocked body, which put a confident "1 object" over a
+/// button that built an empty plan and returned. Counting and building have to
+/// ask the same question, and the cheapest way to guarantee that is for there to
+/// be only one.
+///
+/// A blocked body is excluded here rather than only where the tick is drawn: it
+/// is the tick-box's absence that stops one being selected, and a key that
+/// arrived in the set by any other route (a comparison replaced under a stale
+/// selection, a future "invert") must still not reach [`SchemaPlan::emit`].
+/// [`SchemaComparison::plan`] enforces the same exclusion on its own account, so
+/// the two cannot drift apart either.
+///
+/// **In this crate rather than in the view that calls it.** It was the single
+/// predicate deciding which objects reach an irreversible `Db::run_ddl`, written
+/// inside a 1,135-line Floem module with no test module at all, while
+/// `SchemaComparison::plan` already took it as a parameter — so the decision was
+/// untestable for no reason but where it sat.
+pub fn is_planned(e: &CompareEntry, selected: &HashSet<String>) -> bool {
+    selected.contains(&e.key()) && !e.needs_source()
 }
 
 /// A migration as several objects' change sets, ordered.
@@ -692,6 +781,17 @@ pub struct SchemaPlan {
     /// say so above the Apply button rather than to withhold a plan the user
     /// may still want to copy and reorder.
     pub cycles: bool,
+    /// Differences the comparison holds that **no** plan built from it can
+    /// carry — one line each, naming the object and why.
+    ///
+    /// Distinct from [`SchemaPlan::unsupported`] in what it asks of the reader,
+    /// which is why it is a second list rather than more lines in that one.
+    /// `unsupported` means *this* plan writes less than its own change list
+    /// promises, so applying it would apply half an edit and Apply is refused
+    /// until the offending tick is cleared. This means a difference is not in
+    /// the plan at all: what is here is complete, and there is no tick to clear
+    /// — the objects have no tick-box. So it discloses and does not refuse.
+    pub omitted: Vec<String>,
 }
 
 impl SchemaPlan {
@@ -886,6 +986,17 @@ fn status_of(on_left: bool, on_right: bool, changes: &ChangeSet) -> ObjectStatus
 /// Where an entry sits in the plan. Dependents come off before their tables and
 /// go on after them; a type is created before any table naming it and dropped
 /// only once every table that did is gone.
+///
+/// **Created and altered tables share one phase**, and that is the whole of the
+/// dependency ordering between them. Splitting them put every `CREATE TABLE`
+/// ahead of every `ALTER`, so `CREATE TABLE child (… REFERENCES parent(code))`
+/// was emitted before the `ALTER TABLE parent ADD code` it names — refused by
+/// the server, with the statements before it already applied and no DDL
+/// rollback on MySQL. Swapping the two phases only moves the failure to the
+/// other shape (an `ALTER` adding a foreign key onto a table the plan is about
+/// to create). Neither order is right in general, and there is no need to pick
+/// one: [`fk_rank`] over the **right** schema already answers both, because
+/// that is the schema both the create and the alter are moving toward.
 fn phase(kind: CompareKind, status: ObjectStatus) -> u8 {
     match status {
         // Never planned. Sorted past everything so the difference entries keep
@@ -893,11 +1004,10 @@ fn phase(kind: CompareKind, status: ObjectStatus) -> u8 {
         ObjectStatus::Same => 9,
         ObjectStatus::OnlyLeft if kind.depends_on_tables() => 0,
         ObjectStatus::OnlyRight | ObjectStatus::Differing if kind.is_type() => 1,
-        ObjectStatus::OnlyRight if kind == CompareKind::Table => 2,
-        ObjectStatus::Differing if kind == CompareKind::Table => 3,
-        ObjectStatus::OnlyLeft if kind == CompareKind::Table => 4,
-        ObjectStatus::OnlyRight | ObjectStatus::Differing => 5,
-        ObjectStatus::OnlyLeft => 6,
+        ObjectStatus::OnlyRight | ObjectStatus::Differing if kind == CompareKind::Table => 2,
+        ObjectStatus::OnlyLeft if kind == CompareKind::Table => 3,
+        ObjectStatus::OnlyRight | ObjectStatus::Differing => 4,
+        ObjectStatus::OnlyLeft => 5,
     }
 }
 
@@ -919,12 +1029,18 @@ fn kind_rank(kind: CompareKind, status: ObjectStatus) -> i16 {
     }
 }
 
-/// Each table's position in foreign-key order, by qualified name, plus whether
-/// a cycle had to be broken. `reverse` is for the drop phase: a referencing
-/// table has to go before the table it references.
+/// Each table's **and view's** position in dependency order, by qualified name,
+/// plus whether a cycle had to be broken. `reverse` is for the drop phase: a
+/// referencing table has to go before the table it references.
 ///
 /// [`crate::dump::order_tables`] is the sort — a second topological order over
 /// the same edges is a second answer to one question.
+///
+/// **Views are in it**, which they were not: `chosen` filtered them out, so the
+/// half of `order_tables` written for them never ran and two created views fell
+/// through to their names. `CREATE VIEW a_totals AS … FROM z_detail` on a
+/// target where `z_detail` does not exist yet is the ERROR 1146 that half
+/// exists to prevent, and `dump.rs` says so at the code that prevents it.
 fn fk_rank(
     tables: &[TableInfo],
     dialect: SqlDialect,
@@ -932,7 +1048,6 @@ fn fk_rank(
 ) -> (BTreeMap<String, usize>, bool) {
     let chosen: Vec<String> = tables
         .iter()
-        .filter(|t| !t.is_view)
         .map(|t| display_name(t.schema.as_deref(), &t.name))
         .collect();
     let (order, cycles) = crate::dump::order_tables(tables, &chosen, dialect);
@@ -1258,6 +1373,212 @@ mod tests {
 
     fn mysql(left: DbSchema, right: DbSchema) -> SchemaComparison {
         SchemaComparison::of(&left, &right, SqlDialect::MySql)
+    }
+
+    /// **`phase` itself, which nothing reached.** Every ordering test in this
+    /// module goes through `SchemaComparison::of` and varies the
+    /// [`CompareKind`], so `kind_rank`'s axis was covered and this one — the
+    /// one carrying dependency ordering between creates, alters and drops — was
+    /// at zero: swapping two of its literals left the whole suite green.
+    ///
+    /// Stated as the relation rather than as the numbers, so renumbering the
+    /// phases is free and reordering them is not.
+    #[test]
+    fn the_plan_phases_run_in_dependency_order() {
+        use CompareKind::{Enum, Table, Trigger};
+        use ObjectStatus::{Differing, OnlyLeft, OnlyRight, Same};
+        let ph = phase;
+
+        // Dependents come off first: a trigger on a table being dropped has to
+        // go before the DROP TABLE, or the drop is refused.
+        assert!(ph(Trigger, OnlyLeft) < ph(Table, OnlyLeft));
+        // A type is created before any table that names it.
+        assert!(ph(Enum, OnlyRight) < ph(Table, OnlyRight));
+        assert!(ph(Enum, Differing) < ph(Table, Differing));
+        // Created and altered tables share one phase — the order between them
+        // is a dependency question `fk_rank` answers, not a phase question.
+        assert_eq!(ph(Table, OnlyRight), ph(Table, Differing));
+        // Tables are dropped after they are created or altered, and dependents
+        // go back on after that.
+        assert!(ph(Table, Differing) < ph(Table, OnlyLeft));
+        assert!(ph(Table, OnlyLeft) < ph(Trigger, OnlyRight));
+        // A dependent being *dropped* is the very first thing that happens —
+        // ahead even of the types, since it may name one.
+        assert!(ph(Trigger, OnlyLeft) < ph(Enum, OnlyRight));
+        // `Same` is never planned, and sorts past everything so the differences
+        // keep their order however many agreements sit between them.
+        for kind in [Table, Trigger, Enum] {
+            for st in [OnlyRight, Differing, OnlyLeft] {
+                assert!(ph(kind, st) < ph(kind, Same), "{kind:?}/{st:?}");
+            }
+        }
+    }
+
+    /// A foreign key onto `to`, on a column named `other`.
+    fn fk_to(to: &str) -> ForeignKeyInfo {
+        ForeignKeyInfo {
+            name: format!("fk_{to}"),
+            columns: vec!["other".to_string()],
+            ref_table: to.to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// The plan's statements' leading words, in order — enough to read a
+    /// dependency order off without depending on whole statement text.
+    fn heads(plan: &SchemaPlan) -> Vec<String> {
+        plan.emit()
+            .iter()
+            .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    // ── the ordering axis: status, not kind ──────────────────────────────────
+    //
+    // Every ordering test above this line varies the `CompareKind` and asserts a
+    // `Vec<CompareKind>`, holding `ObjectStatus` fixed — which covers the axis
+    // `kind_rank` owns and leaves the axis `phase` owns at zero. That is the
+    // axis carrying dependency ordering *between* creates, alters and drops,
+    // and every ordering bug this module has had lived on it. These pin it.
+
+    /// **A new table referencing a column an `ALTER` has yet to add.** Right has
+    /// `child(other) REFERENCES parent(code)` and `parent` gains `code` in the
+    /// same comparison — one create, one alter. Creates ran as a whole phase
+    /// before alters, so `CREATE TABLE child` went out first, MySQL refused it,
+    /// and the rest of the plan was already half-applied.
+    ///
+    /// Creates and alters now share one phase ordered by the **right** schema's
+    /// foreign-key order, which answers both directions of this at once.
+    #[test]
+    fn an_alter_that_a_create_depends_on_runs_before_it() {
+        let parent_l = table("parent", &[("id", "int")]);
+        let parent_r = table("parent", &[("id", "int"), ("code", "int")]);
+        let mut child = table("child", &[("id", "int"), ("other", "int")]);
+        child.foreign_keys = vec![fk_to("parent")];
+
+        let c = mysql(schema_of(vec![parent_l]), schema_of(vec![parent_r, child]));
+        let h = heads(&c.plan(|_| true));
+        let alter = h.iter().position(|s| s.contains("`parent`"));
+        let create = h.iter().position(|s| s.contains("`child`"));
+        assert!(
+            alter < create,
+            "the ALTER adding parent.code must precede the CREATE naming it: {h:?}"
+        );
+    }
+
+    /// **And the other direction, which a plain swap of the two phases would
+    /// have broken.** An existing table gains a foreign key onto a table only
+    /// the right side has: the `CREATE` must come first.
+    #[test]
+    fn a_create_that_an_alter_depends_on_runs_before_it() {
+        let existing_l = table("orders", &[("id", "int"), ("other", "int")]);
+        let mut existing_r = table("orders", &[("id", "int"), ("other", "int")]);
+        existing_r.foreign_keys = vec![fk_to("customers")];
+        let customers = table("customers", &[("id", "int")]);
+
+        let c = mysql(
+            schema_of(vec![existing_l]),
+            schema_of(vec![existing_r, customers]),
+        );
+        let h = heads(&c.plan(|_| true));
+        let create = h.iter().position(|s| s.contains("`customers`"));
+        let alter = h.iter().position(|s| s.contains("`orders`"));
+        assert!(
+            create < alter,
+            "the CREATE must precede the ALTER whose foreign key names it: {h:?}"
+        );
+    }
+
+    /// **Two altered tables have a dependency order too.** `fk_rank` reached
+    /// only the create and drop phases, so two `Differing` tables sorted
+    /// alphabetically: `a_child` before `z_parent`, and the `ALTER` adding the
+    /// referenced column ran second.
+    #[test]
+    fn two_altered_tables_are_ordered_by_their_foreign_keys_not_their_names() {
+        let a_l = table("a_child", &[("id", "int"), ("other", "int")]);
+        let mut a_r = table("a_child", &[("id", "int"), ("other", "int")]);
+        a_r.foreign_keys = vec![fk_to("z_parent")];
+        let z_l = table("z_parent", &[("id", "int")]);
+        let z_r = table("z_parent", &[("id", "int"), ("code", "int")]);
+
+        let c = mysql(schema_of(vec![a_l, z_l]), schema_of(vec![a_r, z_r]));
+        let h = heads(&c.plan(|_| true));
+        let child = h.iter().position(|s| s.contains("`a_child`"));
+        let parent = h.iter().position(|s| s.contains("`z_parent`"));
+        assert!(
+            parent < child,
+            "alphabetical is not a dependency order: {h:?}"
+        );
+    }
+
+    /// **A view is created after the view it selects from.** `fk_rank` filtered
+    /// views out of `order_tables`' `chosen`, so the view-dependency half of
+    /// that sort — which exists because `CREATE VIEW ... FROM other_view` on a
+    /// target lacking `other_view` is ERROR 1146 — never ran, and two created
+    /// views sorted by name.
+    #[test]
+    fn a_view_is_created_after_the_view_its_body_selects_from() {
+        let base = view("z_detail", "SELECT 1 AS n");
+        let on_top = view("a_totals", "SELECT sum(n) FROM z_detail");
+        let c = mysql(schema_of(vec![]), schema_of(vec![on_top, base]));
+        let h = heads(&c.plan(|_| true));
+        let detail = h.iter().position(|s| s.contains("z_detail"));
+        let totals = h.iter().position(|s| s.contains("a_totals"));
+        assert!(
+            detail < totals,
+            "a view's body names the view above it: {h:?}"
+        );
+    }
+
+    /// **A drop-only cycle is a cycle.** `plan.cycles` was gated on the plan
+    /// creating a table, and the comment defending that gate said "a plan of
+    /// pure alters **or drops** is unaffected". It is not: `DROP TABLE b` before
+    /// `DROP TABLE a` is refused at statement 1 when each references the other,
+    /// and neither MySQL nor MariaDB rolls DDL back.
+    #[test]
+    fn a_drop_only_plan_reports_its_cycle() {
+        let mut a = table("a", &[("id", "int"), ("other", "int")]);
+        a.foreign_keys = vec![fk_to("b")];
+        let mut b = table("b", &[("id", "int"), ("other", "int")]);
+        b.foreign_keys = vec![fk_to("a")];
+        let c = mysql(schema_of(vec![a, b]), schema_of(vec![]));
+        let plan = c.plan(|_| true);
+        assert!(
+            plan.cycles,
+            "two mutually referencing drops cannot be ordered"
+        );
+        assert!(plan.destructive().iter().any(|r| r.contains("cycle")));
+    }
+
+    /// **And the two cycles are different facts about different schemas.** The
+    /// *left* side is tangled and the right side is not — the migration is
+    /// exactly the untangling, plus one unreferenced new table. `cycles = c1 ||
+    /// c2` folded the left side's drop-order tangle into the create-order
+    /// warning, so this plan got the cycle sentence and "This can't be undone"
+    /// over a `CREATE TABLE` that references nothing at all.
+    #[test]
+    fn a_left_side_cycle_does_not_warn_a_plan_that_only_creates() {
+        let mut a = table("a", &[("id", "int"), ("other", "int")]);
+        a.foreign_keys = vec![fk_to("b")];
+        let mut b = table("b", &[("id", "int"), ("other", "int")]);
+        b.foreign_keys = vec![fk_to("a")];
+        let left = schema_of(vec![a.clone(), b.clone()]);
+        // The right side keeps both tables and drops the foreign keys, so its
+        // own create order is untangled.
+        let (mut a_r, mut b_r) = (a, b);
+        a_r.foreign_keys.clear();
+        b_r.foreign_keys.clear();
+        let right = schema_of(vec![a_r, b_r, table("fresh", &[("id", "int")])]);
+        let c = mysql(left, right);
+        assert!(c.cycles_drop, "the left side is the tangled one");
+        assert!(!c.cycles_create, "the right side is not");
+        let plan = c.plan(|_| true);
+        assert!(
+            !plan.cycles,
+            "nothing here is dropped, and the creation order is satisfiable"
+        );
+        assert!(!plan.destructive().iter().any(|r| r.contains("cycle")));
     }
 
     // ── pairing and status ───────────────────────────────────────────────────
@@ -1770,7 +2091,7 @@ mod tests {
         let mut b = table("b", &[("id", "int"), ("other", "int")]);
         b.foreign_keys = vec![fk("a")];
         let c = mysql(schema_of(vec![]), schema_of(vec![a, b]));
-        assert!(c.cycles);
+        assert!(c.cycles());
         let plan = c.plan(|_| true);
         assert!(plan.cycles);
         assert!(
@@ -1804,7 +2125,7 @@ mod tests {
         let mut a2 = a.clone();
         a2.columns.push(col("extra", "int"));
         let c = mysql(schema_of(vec![a, b.clone()]), schema_of(vec![a2, b]));
-        assert!(c.cycles, "the schema still has the cycle");
+        assert!(c.cycles(), "the schema still has the cycle");
         let plan = c.plan(|_| true);
         assert!(!plan.cycles, "but this plan only alters");
         assert!(!plan.destructive().iter().any(|r| r.contains("cycle")));
@@ -1918,7 +2239,7 @@ mod tests {
         let sql = c.plan(|_| true).script();
         let at = |n: &str| sql.find(n).unwrap_or_else(|| panic!("no {n} in {sql}"));
         assert!(at("`parent`") < at("`child`"), "{sql}");
-        assert!(!c.cycles);
+        assert!(!c.cycles());
     }
 
     #[test]
@@ -1953,7 +2274,7 @@ mod tests {
         let mut b = table("b", &[("id", "int"), ("other", "int")]);
         b.foreign_keys = vec![fk("a")];
         let c = mysql(schema_of(vec![]), schema_of(vec![a, b]));
-        assert!(c.cycles);
+        assert!(c.cycles());
         assert_eq!(c.counts().only_right, 2);
     }
 
@@ -2304,20 +2625,87 @@ mod tests {
 
     #[test]
     fn the_editor_script_keeps_a_trigger_body_runnable() {
-        // `client_script` wraps a MySQL body in DELIMITER so the app's own
-        // splitter doesn't cut it at the semicolons inside BEGIN … END.
+        // `client_script` wraps a body in DELIMITER so the app's own splitter
+        // doesn't cut it at the semicolons inside BEGIN … END. On SQLite, where
+        // `sqlite_master.sql` hands back the original text, a created trigger
+        // reaches the plan and this composition runs end to end.
+        //
+        // **Deliberately not MySQL**, which is where this test used to be: a
+        // MySQL body arrives escape-mangled, so no compare plan can carry one
+        // and `plan` now says so rather than emitting it — see
+        // `a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it`.
         let mut t = table("city", &[("id", "int")]);
         t.triggers = vec![trigger(
             "t_ins",
             "city",
             "BEGIN SET @a = 1; SET @b = 2; END",
         )];
-        let c = mysql(
-            schema_of(vec![table("city", &[("id", "int")])]),
-            schema_of(vec![t]),
+        let c = SchemaComparison::of(
+            &schema_of(vec![table("city", &[("id", "int")])]),
+            &schema_of(vec![t]),
+            SqlDialect::Sqlite,
         );
         let script = c.plan(|_| true).editor_script();
-        assert!(script.contains("DELIMITER"), "{script}");
+        assert!(script.contains("t_ins"), "{script}");
+    }
+
+    /// **The disclosure the preview modal was missing.** On MySQL every
+    /// routine, trigger and event difference is kept out of the plan — the body
+    /// `information_schema` hands back has had its escapes resolved, so the
+    /// `CREATE` written from it is not the routine that was there. The row in
+    /// the tree said so; nothing past it did. `unsupported()` was empty, so the
+    /// withheld block stayed hidden and Apply stayed enabled; the preview's
+    /// subject was a count of what *was* included, and success read "Applied N
+    /// statements to 1 object" over a three-difference comparison.
+    ///
+    /// `SchemaComparison::needs_source`, written to disclose exactly this, had
+    /// no production caller at all — its only three call sites were its own
+    /// three asserts.
+    #[test]
+    fn a_mysql_body_is_kept_out_of_the_plan_and_disclosed_by_it() {
+        let left = table("city", &[("id", "int")]);
+        let mut right = table("city", &[("id", "int"), ("name", "text")]);
+        right.triggers = vec![trigger("t_ins", "city", "BEGIN SET @a = 1; END")];
+        let c = mysql(schema_of(vec![left]), schema_of(vec![right]));
+        assert!(c.needs_source(), "a differing MySQL trigger is in there");
+
+        let plan = c.plan(|_| true);
+        // The table's ALTER is the whole plan …
+        assert_eq!(plan.len(), 1);
+        assert!(
+            plan.emit().iter().all(|s| !s.contains("TRIGGER")),
+            "{:?}",
+            plan.emit()
+        );
+        // … and Apply is not refused, because what *is* in the plan is complete.
+        assert!(plan.unsupported().is_empty());
+        // But the plan says what it left behind, naming the object.
+        assert_eq!(plan.omitted.len(), 1);
+        assert!(plan.omitted[0].contains("t_ins"), "{:?}", plan.omitted);
+    }
+
+    /// The exclusion is `plan`'s own, not only the caller's. A key that reached
+    /// the selection by some other route — a comparison replaced under a stale
+    /// set, a future "invert" — still cannot put an untrustworthy body into
+    /// `emit`.
+    #[test]
+    fn a_blocked_body_cannot_be_planned_however_the_predicate_answers() {
+        let mut right = table("city", &[("id", "int")]);
+        right.triggers = vec![trigger("t_ins", "city", "BEGIN SET @a = 1; END")];
+        let c = mysql(
+            schema_of(vec![table("city", &[("id", "int")])]),
+            schema_of(vec![right]),
+        );
+        let blocked = c
+            .differences()
+            .find(|e| e.needs_source())
+            .expect("the trigger");
+        let mut selected = HashSet::new();
+        selected.insert(blocked.key());
+        assert!(!is_planned(blocked, &selected), "no tick-box, no plan");
+        // And even a predicate that says yes to everything cannot.
+        assert!(c.plan(|_| true).emit().is_empty());
+        assert_eq!(c.plan(|_| true).omitted.len(), 1);
     }
 
     #[test]
@@ -2695,7 +3083,7 @@ mod tests {
         let c = mysql(DbSchema::default(), DbSchema::default());
         assert!(c.entries.is_empty());
         assert_eq!(c.counts(), CompareCounts::default());
-        assert!(!c.cycles);
+        assert!(!c.cycles());
     }
 
     #[test]
