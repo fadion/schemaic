@@ -437,14 +437,29 @@ pub(crate) fn in_ring_button<V: IntoView + 'static>(
 ///
 /// Enter and Space press it and stop there; **every other key carries on**, so Tab
 /// still walks past and the panel's Escape still reaches the panel.
+///
+/// **And the mouse presses it too — here, not at the call site.** This differs
+/// from [`in_ring_button`], whose callers wrap the *view* they pass in their own
+/// `on_click_stop`. That split cannot work for this helper: it owns the container
+/// it wraps, so a caller's click listener would sit inside the focus ring rather
+/// than on it. Leaving the pointer to the caller made both of them dead to a
+/// click — the row panel's "Set NULL" and the activity panel's lock-wait Kill,
+/// each of which *replaced* an `on_click_stop` with this helper to gain the
+/// keyboard and lost the mouse in the same line. `key_pressable_gate` holds this
+/// to both listeners, and checks no caller binds the click a second time.
 pub(crate) fn key_pressable<V: IntoView + 'static>(
     view: V,
     radius: f64,
     on_press: impl Fn() + 'static,
 ) -> AnyView {
+    // One action, two listeners: floem has no single "activate" event, and a
+    // KeyDown handler cannot see a click.
+    let on_press = Rc::new(on_press);
+    let clicked = on_press.clone();
     container(view)
         .style(move |s| button_focus_ring(s, radius).flex_shrink(0.0_f32))
         .keyboard_navigable()
+        .on_click_stop(move |_| (clicked)())
         .on_event(EventListener::KeyDown, move |e| {
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
@@ -7784,5 +7799,83 @@ mod list_skip_tests {
     fn a_fresh_list_starts_on_the_first_live_row() {
         assert_eq!(first_enabled(&[true, true]), 0);
         assert_eq!(first_enabled(&[false, false, true]), 2);
+    }
+}
+
+/// **A button contract owes the pointer and the keyboard the same answer.**
+///
+/// [`key_pressable`] and [`in_ring_button`] both bind `on_press` to KeyDown. The
+/// difference is that `in_ring_button` says so, and its callers wrap the *view*
+/// they hand it in their own `on_click_stop` (`compare_view.rs`, `properties.rs`
+/// each carry the comment explaining why). `key_pressable` owns the container it
+/// wraps, so nothing a caller passes can reach that container — and both of its
+/// callers shipped dead to a click: the row panel's "Set NULL" (`19ff42d`) and
+/// the activity panel's lock-wait Kill (`1c5ad17`). Each commit *replaced* an
+/// `on_click_stop` with this helper to gain the keyboard, and lost the mouse in
+/// the same line.
+///
+/// So this gate holds `key_pressable` to both listeners rather than holding two
+/// call sites to remembering one. It reads the source because the thing under
+/// test is which listeners a view builder registers, which no unit test of a
+/// pure function can see.
+#[cfg(test)]
+mod key_pressable_gate {
+    use crate::source_gate::production_code;
+
+    /// The body of `fn name(` up to the line that closes it at column 0.
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        // `fn name<V: IntoView>(` — the generic list sits between the name and
+        // the paren, so match on the name alone.
+        let at = src
+            .find(&format!("fn {name}"))
+            .unwrap_or_else(|| panic!("{name} is gone — this gate is stale"));
+        let end = src[at..].find("\n}\n").expect("the end of the function");
+        &src[at..at + end]
+    }
+
+    #[test]
+    fn key_pressable_answers_the_pointer_as_well_as_the_keyboard() {
+        let src = production_code(include_str!("widgets.rs"));
+        let body = body_of(&src, "key_pressable");
+        assert!(
+            body.contains("KeyDown"),
+            "key_pressable no longer answers Enter/Space — that is the whole \
+             reason it exists over a plain on_click_stop container"
+        );
+        assert!(
+            body.contains("on_click_stop"),
+            "key_pressable binds on_press to the keyboard alone, so every button \
+             built through it is dead to a mouse click. It owns the container it \
+             wraps, so no caller can add the pointer half from outside"
+        );
+    }
+
+    /// The other half, and the one a reader of the call site cannot check: if a
+    /// caller ever *also* wraps its view in `on_click_stop`, one click runs the
+    /// action twice. Neither does today, and "Set NULL" firing twice is invisible
+    /// (idempotent) while a doubled Kill is not.
+    #[test]
+    fn no_caller_double_binds_the_click() {
+        for (name, src) in crate::source_gate::crate_sources() {
+            if name.ends_with("widgets.rs") {
+                continue;
+            }
+            let src = production_code(&src);
+            let mut from = 0;
+            while let Some(at) = src[from..].find("key_pressable(") {
+                let at = from + at;
+                // The argument list ends at the closing paren of the call; scan a
+                // generous window and require the view handed in to be inert.
+                let window = &src[at..(at + 600).min(src.len())];
+                let arg_end = window.find("\n    )").unwrap_or(window.len());
+                assert!(
+                    !window[..arg_end].contains("on_click_stop"),
+                    "{name}: a key_pressable caller wraps its view in \
+                     on_click_stop, and key_pressable now binds the click too — \
+                     one press would run the action twice"
+                );
+                from = at + "key_pressable(".len();
+            }
+        }
     }
 }
