@@ -966,6 +966,18 @@ pub(crate) fn export_progress_overlay(ui: Ui) -> impl IntoView {
                         // a failure *or a cancel* — a stopped export's sentence
                         // is about a file that is not what was asked for, and a
                         // green tick over it is the one reading it must not get.
+                        // **Capped, or it paints out of the modal.** The column
+                        // in this v_stack is `items_center()`, which sizes a
+                        // child to its own content rather than stretching it —
+                        // so a sentence longer than the panel laid out at its
+                        // natural width and ran past both borders instead of
+                        // wrapping. `max_width_pct(100)` bounds it to the
+                        // content box (floem's default `TextOverflow` is `Wrap`,
+                        // so bounding it *is* the wrap) and `min_width(0)` is
+                        // what lets it shrink to that bound; the cap rather than
+                        // `width_full` because a one-line note stays centred.
+                        // The caveat clauses name columns, so there is no length
+                        // this can be trusted to stay under.
                         Some((msg, ok)) => text(msg)
                             .style(move |s| {
                                 s.color(if ok {
@@ -974,6 +986,7 @@ pub(crate) fn export_progress_overlay(ui: Ui) -> impl IntoView {
                                     theme::error()
                                 })
                                 .font_size(theme::font_label())
+                                .max_width_pct(100.0)
                                 .min_width(0.0)
                             })
                             .into_any(),
@@ -1032,9 +1045,12 @@ pub(crate) fn export_progress_overlay(ui: Ui) -> impl IntoView {
                     if finished { "File:" } else { "Writing" },
                     target.name
                 ))
+                // Bounded for the reason the sentence above it is: a long file
+                // name is as able to paint past the panel as a long caveat.
                 .style(|s| {
                     s.color(theme::text_muted())
                         .font_size(theme::font_label())
+                        .max_width_pct(100.0)
                         .min_width(0.0)
                 }),
             ))

@@ -1705,17 +1705,32 @@ fn withheld_binary(mask: &[bool], ci: usize, c: &crate::model::CellRef<'_>) -> b
 /// **Silence is the default and a caveat overrides it.** A save of what is
 /// already on screen has nothing to report that the screen doesn't show, and a
 /// note on every save is a note nobody reads — so an ordinary `Fetched` export
-/// stays quiet, and only a streamed one announces its row count. But a *loss*
-/// is not silent in either scope: the whole failure this exists to fix was a CSV
-/// of a blob column writing empty fields, reporting nothing, and being one of
-/// the two formats Schemaic itself reads back.
+/// stays quiet, and only a streamed one announces its row count.
 ///
-/// The caveats read the way the grid's own arena note does — the column names,
-/// then what happened to them — because a user comparing the file to the screen
-/// needs to know *which* part of it to distrust, and "some data was lost" tells
-/// them nothing.
+/// **Two of the three losses override that silence; the third does not.** A
+/// column *blanked* or *cut* is a surprise — the value was there, the file has
+/// less of it than the screen does, and nothing on screen says so. A **withheld**
+/// binary column is not: the grid renders that cell as `<7 bytes>`, so the user
+/// picking CSV or JSON for it can already see what they are asking a text format
+/// to carry, and "a text export cannot hold raw bytes" restated it at a length
+/// that painted past the export modal's own width. So `withheld` is tallied and
+/// not said. It is still a caveat on the tally — [`ExportTally::has_caveat`] and
+/// the SQL writer's `-- binary column` comment both read it — this function just
+/// doesn't spend a sentence on it.
+///
+/// The caveats that *are* said read the way the grid's own arena note does — the
+/// column names, then what happened to them — because a user comparing the file
+/// to the screen needs to know *which* part of it to distrust, and "some data was
+/// lost" tells them nothing.
 pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<String> {
-    if !streaming && !t.has_caveat() {
+    // **`withheld` is tallied but not said**, which is why this asks for the
+    // caveats that speak rather than `has_caveat`. A binary column the grid
+    // already renders as `<7 bytes>` gains nothing from a clause explaining that
+    // a text file cannot hold bytes — and that clause was long enough to paint
+    // past the export modal it lands in. The tally still records it: the SQL
+    // writer's `-- binary column` comment and `has_caveat` both read `withheld`,
+    // and this only decides what the *sentence* carries.
+    if !streaming && t.blanked.is_empty() && t.cut.is_empty() {
         return None;
     }
     let n = t.rows as usize;
@@ -1724,26 +1739,15 @@ pub fn export_note(t: &ExportTally, name: &str, streaming: bool) -> Option<Strin
         crate::text::human_count(n),
         crate::text::plural(n, "row", "rows")
     );
-    if !t.withheld.is_empty() {
-        s.push_str(&format!(
-            " — {} {} not carried: a text export cannot hold raw bytes",
-            crate::text::plural(t.withheld.len(), "binary column", "binary columns"),
-            t.withheld.join(", ")
-        ));
-    }
     if !t.blanked.is_empty() {
-        s.push_str(if t.withheld.is_empty() { " — " } else { "; " });
+        s.push_str(" — ");
         s.push_str(&format!(
             "{} too large to hold in full: later rows are blank",
             t.blanked.join(", ")
         ));
     }
     if !t.cut.is_empty() {
-        s.push_str(if t.withheld.is_empty() && t.blanked.is_empty() {
-            " — "
-        } else {
-            "; "
-        });
+        s.push_str(if t.blanked.is_empty() { " — " } else { "; " });
         // The exact figure, not `human_count`'s "32.77k": this is a hard limit
         // a user may want to check a column against, and a rounded one answers
         // no question they would ask it.
@@ -3352,18 +3356,23 @@ mod tests {
             Some("Exported 2 rows to docs.csv")
         );
 
+        // **A withheld binary column is tallied but not said.** The grid already
+        // shows the cell as `<7 bytes>`, so "a text export cannot hold raw bytes"
+        // told the user what the screen in front of them had already told them —
+        // and it did so in a clause long enough to overflow the export modal it
+        // was rendered in. The tally still records it (`withheld` is what the SQL
+        // writer's `-- binary column` comment and `has_caveat` read), it just no
+        // longer earns a sentence.
         let one = ExportTally {
             rows: 2,
             withheld: vec!["file".to_string()],
             ..Default::default()
         };
-        assert_eq!(
-            export_note(&one, "docs.csv", false).as_deref(),
-            Some(
-                "Exported 2 rows to docs.csv — binary column file not carried: a text export \
-                 cannot hold raw bytes"
-            )
-        );
+        // Not merely trimmed — a withheld column no longer breaks the silence of
+        // a non-streamed save at all, which is the half a caller-blind test of
+        // the string would have missed.
+        assert_eq!(export_note(&one, "docs.csv", false), None);
+        assert!(one.has_caveat(), "the loss is still recorded on the tally");
         let two = ExportTally {
             rows: 1,
             withheld: vec!["file".to_string(), "thumb".to_string()],
@@ -3371,10 +3380,7 @@ mod tests {
         };
         assert_eq!(
             export_note(&two, "docs.csv", true).as_deref(),
-            Some(
-                "Exported 1 row to docs.csv — binary columns file, thumb not carried: a text \
-                 export cannot hold raw bytes"
-            )
+            Some("Exported 1 row to docs.csv")
         );
         let blanked = ExportTally {
             rows: 2_000_000,
@@ -3387,16 +3393,22 @@ mod tests {
                 "Exported 2m rows to docs.csv — body too large to hold in full: later rows are blank"
             )
         );
-        // Both losses, one sentence.
+        // Both losses, one sentence — and the seam is now the *first* said
+        // caveat's. A withheld column beside a blanked one must not leave the
+        // stray `; ` that a dropped clause would: this is the composition the
+        // string edit could break in silence.
         let both = ExportTally {
             rows: 3,
             withheld: vec!["file".to_string()],
             blanked: vec!["body".to_string()],
             cut: Vec::new(),
         };
-        let msg = export_note(&both, "docs.csv", true).expect("a caveat is always said");
-        assert!(msg.contains("binary column file not carried"), "{msg}");
-        assert!(msg.contains("; body too large to hold in full"), "{msg}");
+        assert_eq!(
+            export_note(&both, "docs.csv", true).as_deref(),
+            Some(
+                "Exported 3 rows to docs.csv — body too large to hold in full: later rows are blank"
+            )
+        );
 
         // The truncation caveat joins the same sentence, and reads on its own
         // when it is the only loss — the `— ` / `; ` seam is per-category, so a
@@ -3420,6 +3432,21 @@ mod tests {
         };
         let msg = export_note(&all_three, "docs.xlsx", true).expect("a caveat is always said");
         assert!(msg.contains("; payload cut to Excel's"), "{msg}");
+        assert!(!msg.contains("raw bytes"), "{msg}");
+        // A withheld column alongside a *cut* one — the seam `cut` used to reach
+        // through `withheld` to compute. It must open the sentence, not join it.
+        let withheld_and_cut = ExportTally {
+            rows: 5,
+            withheld: vec!["file".to_string()],
+            cut: vec!["payload".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            export_note(&withheld_and_cut, "docs.xlsx", true).as_deref(),
+            Some(
+                "Exported 5 rows to docs.xlsx — payload cut to Excel's 32767-character cell limit"
+            )
+        );
     }
 
     /// **A failure leaves the destination alone**, which is the sentence's whole
@@ -3500,16 +3527,29 @@ mod tests {
     #[test]
     fn a_folder_export_names_what_the_files_could_not_carry() {
         // The whole reason the tally travels with the count: a green "Wrote 12
-        // files." over a folder whose every blob is a placeholder is the failure
-        // this sentence exists to prevent. Same rule as `export_note`'s.
+        // files." over a folder whose every column was truncated is the failure
+        // this sentence exists to prevent. Same rule as `export_note`'s — and the
+        // same exception, since a **withheld** binary column is no longer said
+        // there, so it is not said here either.
         let t = ExportTally {
             rows: 10,
-            withheld: vec!["photo".to_string()],
+            blanked: vec!["photo".to_string()],
             ..Default::default()
         };
         let msg = files_note(12, &t, "out", &[], &[]);
         assert!(msg.contains("photo"), "{msg}");
-        assert!(msg.contains("cannot hold raw bytes"), "{msg}");
+        assert!(msg.contains("too large to hold in full"), "{msg}");
+
+        // The folder export is `streaming: true`, so a withheld-only tally still
+        // gets its count sentence — it just carries no caveat, and above all no
+        // dangling em dash where the clause used to be.
+        let withheld_only = ExportTally {
+            rows: 10,
+            withheld: vec!["photo".to_string()],
+            ..Default::default()
+        };
+        let msg = files_note(12, &withheld_only, "out", &[], &[]);
+        assert_eq!(msg, "Wrote 12 files. Exported 10 rows to out.");
     }
 
     /// **The two clauses have to be one readable sentence.** `export_note` does
