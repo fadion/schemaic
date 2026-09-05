@@ -3084,27 +3084,47 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // `Fetched` render was chunked.
                             CancellationToken::new()
                         };
-                        let report = {
+                        // Two ext actions over one `done`, because the worker
+                        // owns the first and the task that observes the worker
+                        // needs the second — see the `job.await` below. Both
+                        // release the cancel slot, and `ExportTarget::run` drops
+                        // whichever arrives second, so a worker that reported
+                        // *and then* failed to join cannot report twice.
+                        let ext = {
                             let export_token = export_token.clone();
                             let stoppable = req.stoppable;
-                            create_ext_action(cx, move |o: ExportOutcome| {
-                                // **Only a run that took the slot may clear it**,
-                                // or an unstoppable log export finishing would
-                                // release the slot out from under the grid export
-                                // that is actually holding it — and the next
-                                // Stop would reach nothing.
-                                if stoppable {
-                                    *export_token.borrow_mut() = None;
-                                }
-                                (done)(o)
-                            })
+                            let done = done.clone();
+                            move || {
+                                let export_token = export_token.clone();
+                                let done = done.clone();
+                                create_ext_action(cx, move |o: ExportOutcome| {
+                                    // **Only a run that took the slot may clear
+                                    // it**, or an unstoppable log export
+                                    // finishing would release the slot out from
+                                    // under the grid export that is actually
+                                    // holding it — and the next Stop would reach
+                                    // nothing.
+                                    if stoppable {
+                                        *export_token.borrow_mut() = None;
+                                    }
+                                    (done)(o)
+                                })
+                            }
                         };
+                        let (report, died) = (ext(), ext());
                         let (rs, order) = (req.rs.clone(), req.order.clone());
                         let progress = export_tx.clone();
                         let reports = req.stoppable;
                         let sweep_part = part_of(&path);
                         let incremental = format.writes_incrementally();
-                        handle.spawn_blocking(move || {
+                        // **The handle is awaited, not dropped.** This arm's
+                        // only exit from the modal is an outcome, so a worker
+                        // that ended without reporting — a panic in a renderer,
+                        // a `spawn_blocking` pool shutdown — left an
+                        // undismissable modal *and* a permanently occupied cancel
+                        // slot. The `AllRows` sibling has awaited its writer and
+                        // said "worker died" since it was written.
+                        let job = handle.spawn_blocking(move || {
                             let part = part_of(&path);
                             let w_token = token.clone();
                             let write =
@@ -3169,7 +3189,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 // failure, and the token is the witness — the
                                 // error above is indistinguishable from a write
                                 // error by its text alone.
-                                Err(_) if token.is_cancelled() => ExportOutcome::Cancelled,
+                                // The `.part` is swept here for the same
+                                // reason the failure arm below sweeps it: a
+                                // buffered format has written *nothing* into the
+                                // sibling, so a stop leaves a 0-byte
+                                // `foo.xlsx.part` in the user's folder under a
+                                // message reading "foo.xlsx was not changed."
+                                // that does not mention it. An incremental
+                                // format's sibling holds the rows that arrived
+                                // and is the one thing worth keeping.
+                                Err(_) if token.is_cancelled() => {
+                                    if !incremental {
+                                        let _ = std::fs::remove_file(&sweep_part);
+                                    }
+                                    ExportOutcome::Cancelled
+                                }
                                 // `partial`: the write had begun, so the `.part`
                                 // sibling holds whatever arrived — unless the
                                 // format buffers, in which case the sibling is
@@ -3186,6 +3220,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                     }
                                 }
                             });
+                        });
+                        handle.spawn(async move {
+                            if let Err(e) = job.await {
+                                died(ExportOutcome::Failed {
+                                    message: format!("Export failed: worker died: {e}"),
+                                    partial: false,
+                                });
+                            }
                         });
                     }
                     // **Two tasks and a bounded channel.** The reader is async
@@ -3374,10 +3416,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // at. `writes_incrementally` is the capability; the
                             // empty file is swept rather than left as litter.
                             let incremental = format.writes_incrementally();
-                            let failed = move |message: String| {
-                                if !incremental {
-                                    let _ = std::fs::remove_file(&sweep_part);
+                            // **A buffered format's sibling is empty whatever
+                            // ended the export**, so both the failure and the
+                            // cancel arm sweep it — a 0-byte `foo.xlsx.part` in
+                            // the user's folder under a message that does not
+                            // mention it is litter either way. An incremental
+                            // format's sibling holds the rows that arrived and is
+                            // the one thing worth keeping.
+                            let sweep_empty = {
+                                let sweep_part = sweep_part.clone();
+                                move || {
+                                    if !incremental {
+                                        let _ = std::fs::remove_file(&sweep_part);
+                                    }
                                 }
+                            };
+                            let sweep_on_cancel = sweep_empty.clone();
+                            let failed = move |message: String| {
+                                sweep_empty();
                                 ExportOutcome::Failed {
                                     message,
                                     partial: incremental,
@@ -3385,6 +3441,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             };
                             report(match (read, written) {
                                 (Err(schemaic_db::DbError::Cancelled), _) => {
+                                    sweep_on_cancel();
                                     ExportOutcome::Cancelled
                                 }
                                 (_, Ok(Err(e))) => failed(format!("Export failed: {e}")),
@@ -7055,10 +7112,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // One connection's databases, for the compare picker's second step. Asked
     // of the server rather than read off `db_nodes`, which only ever holds the
     // *active* connection's list — see `OverlayUi::compare_dbs`.
+    //
+    // **Which listing is the current one.** Bumped on every ask, checked in
+    // both arms of the landing — see there.
+    let compare_dbs_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let compare_list_dbs: Rc<dyn Fn(u64)> = {
         let handle = handle.clone();
         let db_for = db_for.clone();
+        let compare_dbs_gen = compare_dbs_gen.clone();
         Rc::new(move |conn_id: u64| {
+            // Every ask supersedes the one before it. `compare_fetch` has this
+            // and this call had it in **neither** arm: a listing the user
+            // abandoned — they clicked a second server while the first was
+            // still out — landed late and replaced whatever was on screen. Its
+            // *success* arm replaced the picker under the pointer, so the click
+            // already on its way retargeted to a different server's database;
+            // its *failure* arm replaced a fully rendered comparison with an
+            // error about a server the user had moved on from.
+            let my_gen = compare_dbs_gen.get().wrapping_add(1);
+            compare_dbs_gen.set(my_gen);
+            let mine = compare_dbs_gen.clone();
             // **Guarded, because `set` never dedups.** The modal's body is a
             // `dyn_container` keyed partly on this signal, so writing `None`
             // over `None` disposed and rebuilt the filter bar, the whole row
@@ -7082,18 +7155,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // emptied every other SQLite connection's list outright.
             let hidden = hidden_db_rules
                 .with_untracked(|rules| schemaic_core::db_hidden::names_for(rules, conn_id));
-            let report = create_ext_action(cx, move |res: Result<Vec<String>, String>| match res {
-                // Hidden databases are left out for the reason every other
-                // database list leaves them out: the user said they didn't want
-                // to see that one, and a picker is a list.
-                Ok(names) => compare_dbs.set(Some((
-                    conn_id,
-                    names
-                        .into_iter()
-                        .filter(|n| schemaic_core::schema::db_visible(&hidden, n))
-                        .collect(),
-                ))),
-                Err(e) => compare_dbs_err.set(Some(e)),
+            let report = create_ext_action(cx, move |res: Result<Vec<String>, String>| {
+                // Superseded: the user asked for another server's databases, or
+                // closed the picker. Both arms, because both write to signals a
+                // later ask has already filled.
+                if mine.get() != my_gen {
+                    return;
+                }
+                match res {
+                    // Hidden databases are left out for the reason every other
+                    // database list leaves them out: the user said they didn't
+                    // want to see that one, and a picker is a list.
+                    Ok(names) => compare_dbs.set(Some((
+                        conn_id,
+                        names
+                            .into_iter()
+                            .filter(|n| schemaic_core::schema::db_visible(&hidden, n))
+                            .collect(),
+                    ))),
+                    Err(e) => compare_dbs_err.set(Some(e)),
+                }
             });
             handle.spawn(async move {
                 report(db.fetch_databases().await.map_err(|e| e.to_string()));
@@ -7108,14 +7189,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // out this feature's whole point, since the right-hand side is routinely a
     // database on another connection the tree has never touched.
     //
-    // No `CancellationToken`: there is no Stop to offer here, which is the
-    // reason `start_fetch` has none either. Two schemas landing out of order is
-    // handled the way the properties fetch handles it — the answer is dropped
-    // unless the target it was asked for is still the one on screen.
+    // **A token, though there is no Stop button.** Two schemas landing out of
+    // order is already handled the way the properties fetch handles it — the
+    // answer is dropped unless the target it was asked for is still the one on
+    // screen — but dropping the *answer* still pays for the *read*, and this
+    // read is two full `fetch_schema` sweeps across two servers. Picking a
+    // different right-hand side three times left three of them running to
+    // completion for nobody, on the same reasoning this range's own blob wiring
+    // records as a fixed bug.
+    let compare_token: Rc<RefCell<CancellationToken>> =
+        Rc::new(RefCell::new(CancellationToken::new()));
     let compare_fetch: Rc<dyn Fn(schemaic_ui::CompareTarget)> = {
         let handle = handle.clone();
         let db_for = db_for.clone();
+        let compare_token = compare_token.clone();
         Rc::new(move |target: schemaic_ui::CompareTarget| {
+            // Whatever was in flight is for a pair nobody is looking at.
+            let token = {
+                let mut slot = compare_token.borrow_mut();
+                slot.cancel();
+                *slot = CancellationToken::new();
+                slot.clone()
+            };
             let Some(right) = target.right.clone() else {
                 compare_state.set(schemaic_ui::CompareState::Idle);
                 return;
@@ -7190,13 +7285,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // side could not be read.
                 let left = async {
                     left_db
-                        .fetch_schema(&ldb, CancellationToken::new())
+                        .fetch_schema(&ldb, token.clone())
                         .await
                         .map_err(|e| format!("Reading {ldb}: {e}"))
                 };
                 let right = async {
                     right_db
-                        .fetch_schema(&rdb, CancellationToken::new())
+                        .fetch_schema(&rdb, token.clone())
                         .await
                         .map_err(|e| format!("Reading {rdb}: {e}"))
                 };
