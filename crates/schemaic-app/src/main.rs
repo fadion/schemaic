@@ -8244,7 +8244,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // of all of them, and a badge repeated twelve times is read zero
             // times.
             import_ui.done.set(Some(format!(
-                "{} Read-only and the environment badge are not carried over — set them                  in Manage connections for anything that matters.",
+                "{} Read-only and the environment badge are not carried over — set them \n                 in Manage connections for anything that matters.",
                 match added {
                     1 => "Added 1 connection.".to_string(),
                     n => format!("Added {n} connections."),

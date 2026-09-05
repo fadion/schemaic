@@ -7086,7 +7086,7 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
             ))
             .tooltip(|| {
                 text(
-                    "Pinned results are held in memory until you close them.                      Close the ones you are done with to give it back.",
+                    "Pinned results are held in memory until you close them. \n                     Close the ones you are done with to give it back.",
                 )
                 .style(crate::widgets::tooltip_style)
             })

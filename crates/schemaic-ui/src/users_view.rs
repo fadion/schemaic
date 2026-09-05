@@ -622,7 +622,7 @@ fn grants_section(st: GrantsState, dialect: SqlDialect) -> AnyView {
                     icons::CIRCLE_QUESTION,
                     theme::text_faint,
                     format!(
-                        "Showing the first {STATEMENT_CAP} of {} statements.                          Copy privileges takes all of them.",
+                        "Showing the first {STATEMENT_CAP} of {} statements. \n                         Copy privileges takes all of them.",
                         statements.len()
                     ),
                 ));

@@ -80,6 +80,29 @@ pub fn load_too_large(len: u64) -> bool {
 /// holds — an avatar, a logo, a scan — and below what a desktop cannot absorb.
 pub const PREVIEW_PIXEL_CAP: u64 = 32_000_000;
 
+/// Most pixels a preview may measure along **either** edge: 4096.
+///
+/// **[`PREVIEW_PIXEL_CAP`] does not bound this either, and the renderer's real
+/// constraint is this one.** floem's images live in the same atlas as its
+/// glyphs, and that atlas grows to `2 × max(width, height)` with no clamp of its
+/// own — so the number that has to be inside the GPU's limit is a *dimension*,
+/// not an area. wgpu's default `max_texture_dimension_2d` is 8192, and there is
+/// no `on_uncaptured_error` handler anywhere in the floem crates, so a
+/// `create_texture` that fails validation ends the process rather than the
+/// preview.
+///
+/// An ordinary 6000 × 4000 camera photograph is 24 megapixels — comfortably
+/// *inside* the pixel cap, and 12000 past the atlas limit. So the two caps are
+/// not one cap stated twice: an image can pass either and fail the other, and
+/// both are checked.
+///
+/// 4096 rather than 8192, which is the number measured: the atlas doubles the
+/// larger edge, so 4096 is the largest edge that fits a default-limit adapter,
+/// and adapters reporting *less* than the default exist. Above any image a cell
+/// realistically holds, and the refusal keeps the bytes readable as hex or
+/// saveable to a file.
+pub const PREVIEW_EDGE_CAP: u32 = 4096;
+
 /// Whether a preview may be built, given what the header says it would decode
 /// to.
 ///
@@ -90,7 +113,10 @@ pub const PREVIEW_PIXEL_CAP: u64 = 32_000_000;
 pub enum PreviewVerdict {
     /// Within budget — decode and draw it.
     Show,
-    /// The header parsed and declares more than [`PREVIEW_PIXEL_CAP`] pixels.
+    /// The header parsed and declares more than [`PREVIEW_PIXEL_CAP`] pixels,
+    /// or more than [`PREVIEW_EDGE_CAP`] along either edge. One arm for two
+    /// caps because the panel says the same sentence either way — it names the
+    /// dimensions, which is what the reader can act on.
     TooLarge { width: u32, height: u32 },
     /// No dimensions could be read.
     ///
@@ -115,6 +141,13 @@ pub fn preview_verdict(dims: Option<(u32, u32)>) -> PreviewVerdict {
     // this cannot use, not an image within budget.
     if width == 0 || height == 0 {
         return PreviewVerdict::Unmeasurable;
+    }
+    // Two caps, two different quantities — see `PREVIEW_EDGE_CAP`. The area
+    // bounds what the decode allocates; the edge bounds what the renderer's
+    // texture atlas can be asked for, and exceeding *that* is a process exit
+    // rather than a refused preview.
+    if width > PREVIEW_EDGE_CAP || height > PREVIEW_EDGE_CAP {
+        return PreviewVerdict::TooLarge { width, height };
     }
     if u64::from(width) * u64::from(height) > PREVIEW_PIXEL_CAP {
         return PreviewVerdict::TooLarge { width, height };
@@ -620,23 +653,87 @@ mod tests {
     fn an_ordinary_image_is_shown() {
         assert_eq!(preview_verdict(Some((1920, 1080))), PreviewVerdict::Show);
         assert_eq!(preview_verdict(Some((1, 1))), PreviewVerdict::Show);
-        // A 24-megapixel photo is large and still legitimate.
-        assert_eq!(preview_verdict(Some((6000, 4000))), PreviewVerdict::Show);
+        // The largest image that can be drawn: square at the edge cap.
+        assert_eq!(
+            preview_verdict(Some((PREVIEW_EDGE_CAP, PREVIEW_EDGE_CAP))),
+            PreviewVerdict::Show
+        );
+    }
+
+    /// **An ordinary camera photograph was inside the cap and killed the
+    /// process.** 6000 × 4000 is 24 megapixels — well under
+    /// [`PREVIEW_PIXEL_CAP`], and this test used to assert `Show` on exactly
+    /// those numbers with the comment "large and still legitimate". floem's
+    /// images share the glyph atlas, which grows to `2 × max(w, h)` with no
+    /// clamp; wgpu's default `max_texture_dimension_2d` is 8192 and no floem
+    /// crate installs an `on_uncaptured_error` handler, so the failed
+    /// `create_texture` ended the window and every tab's uncommitted edits.
+    ///
+    /// The gate bounded the area. The renderer bounds an edge.
+    #[test]
+    fn a_photograph_wider_than_the_atlas_is_refused_though_its_area_is_fine() {
+        let (w, h) = (6000, 4000);
+        assert!(
+            u64::from(w) * u64::from(h) < PREVIEW_PIXEL_CAP,
+            "the point of this test is that the area cap does not catch it"
+        );
+        assert_eq!(
+            preview_verdict(Some((w, h))),
+            PreviewVerdict::TooLarge {
+                width: w,
+                height: h
+            }
+        );
+        // Either edge, not just the first.
+        assert_eq!(
+            preview_verdict(Some((h, w))),
+            PreviewVerdict::TooLarge {
+                width: h,
+                height: w
+            }
+        );
     }
 
     #[test]
     fn the_cap_is_the_boundary_and_not_one_past_it() {
-        // Exactly the cap is allowed; one pixel more is not.
+        // Exactly the edge cap is allowed; one pixel more is not.
         assert_eq!(
-            preview_verdict(Some((PREVIEW_PIXEL_CAP as u32, 1))),
+            preview_verdict(Some((PREVIEW_EDGE_CAP, 1))),
             PreviewVerdict::Show
         );
         assert_eq!(
-            preview_verdict(Some((PREVIEW_PIXEL_CAP as u32 + 1, 1))),
+            preview_verdict(Some((PREVIEW_EDGE_CAP + 1, 1))),
             PreviewVerdict::TooLarge {
-                width: PREVIEW_PIXEL_CAP as u32 + 1,
+                width: PREVIEW_EDGE_CAP + 1,
                 height: 1
             }
+        );
+        assert_eq!(
+            preview_verdict(Some((1, PREVIEW_EDGE_CAP + 1))),
+            PreviewVerdict::TooLarge {
+                width: 1,
+                height: PREVIEW_EDGE_CAP + 1
+            }
+        );
+    }
+
+    /// **The two caps bound two different things, and today one hides the
+    /// other.** The edge cap is the renderer's texture limit and the pixel cap
+    /// is the decode's RAM budget; at 4096 the largest image that clears the
+    /// edge cap is 16.7 MP, which is inside the 32 MP area cap — so nothing
+    /// currently reaches the second check.
+    ///
+    /// That is worth an assert rather than a comment: `PREVIEW_EDGE_CAP` is a
+    /// number a hand-check against a real adapter may raise, and raising it past
+    /// 5657 makes the area cap live again. This fails then, which is the moment
+    /// to re-read both.
+    #[test]
+    fn the_area_cap_sits_behind_the_edge_cap_at_these_numbers() {
+        let widest = u64::from(PREVIEW_EDGE_CAP) * u64::from(PREVIEW_EDGE_CAP);
+        assert!(
+            widest <= PREVIEW_PIXEL_CAP,
+            "the edge cap no longer subsumes the area cap ({widest} > {PREVIEW_PIXEL_CAP}) \
+             — the area check is live again, and both caps need re-reading"
         );
     }
 
