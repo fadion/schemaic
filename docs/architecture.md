@@ -739,7 +739,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     equality together). The app's `load_blob` asks it of `fs::metadata` **before** the read — refusing
     a 4 GB file by inspecting the `Vec` it produced means allocating it first — and again of the
     bytes afterwards, since a file can grow between the two; missing metadata is not itself a
-    refusal, the read below reporting the real error.
+    refusal, the read below reporting the real error. Its sentence contrasts the two sizes through
+    `format::contrasting_bytes`, like the column cap's: every size in a ~51 KB window above 64 MiB
+    otherwise read *"That file is 64.0 MB — the most that can be loaded is 64.0 MB."*
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML/Excel export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping). **Rows arrive through a pull source,
     not as a `&ResultSet`**: `RowChunks::next_chunk` hands over one `RowChunk { rs, order }` at a
@@ -1004,8 +1006,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     report both. A later duplicate gets `_2`, `_3` before the extension, and the suffix is checked
     against the set too, so a real `a_b_2` standing beside two tables that both want `a_b` is not
     clobbered by the deduplicator's own choice
-    (`export_file_names_suffix_does_not_collide_with_a_real_table`). Names come back in the
-    selection's order, one per table, so the caller can zip the two.
+    (`export_file_names_suffix_does_not_collide_with_a_real_table`). **Every base name is reserved
+    before any is handed out**, which is what makes that independent of the order the tables arrive
+    in: checked against the names issued *so far*, it worked only while the real `a_b_2` came first —
+    and the picker sorts, where `*` (42) and `:` (58) both precede `_` (95), so it never did. `a*b`,
+    `a:b`, `a_b_2` put `a:b`'s rows in `a_b_2.csv`, which is the file someone would open expecting
+    `a_b_2`'s. Names come back in the selection's order, one per table, so the caller can zip the two.
     And
     `all_rows_label(size, sorted, manual_tx)` is the Download menu's `All rows` entry, three
     disclosures made at the point of choice in place of an untested `match` in the view (*Data grid*).
@@ -4557,9 +4563,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   it. `EditTable::confirm_cols` carries the values the grid read into the same `WHERE` — the rowid
   still does the identifying and the values only *confirm* it, which is why this is not the
   match-on-all-values scheme a keyless table makes unsafe (duplicate rows are legal there, and the
-  rowid tells them apart). It is populated only for an implicit key, excludes binary columns whose
-  cell is a placeholder rather than a value, and `edit::row_key` is the one builder that appends it,
-  so update, delete and the row panel's immediate save cannot disagree about what a row is. And
+  rowid tells them apart). It is populated only for an implicit key, excludes any column
+  `edit::holds_bytes` answers for — its cell is a `<n bytes>` placeholder rather than the value, and
+  on SQLite that includes a blob living in a `TEXT`-declared column, which the wire flag alone
+  missed and which therefore went into the `WHERE` as the literal placeholder text and matched zero
+  rows — and `edit::row_key` is the one builder that appends it,
+  so update, delete and the row panel's immediate save cannot disagree about what a row is. **An
+  empty set is a refusal**, not a widening: with nothing to confirm with, the `WHERE` is the rowid
+  alone and the premise above is simply false again, so `analyze_edit` leaves the table out and the
+  result is read-only — which costs the blob write on a table whose every non-key column holds bytes,
+  and is what that shape had before the blob write existed. And
   `sqlite_rebuild_sql`'s copy now names `rowid` explicitly — gated on `TableInfo::implicit_key`
   being reachable and on no draft column shadowing any of the three spellings — which stops the
   renumbering at source and preserves the gaps a delete left. A `WITHOUT ROWID` table is unchanged in every
@@ -5206,7 +5219,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `min_width(0)`/`flex_shrink(1)` and the actions in one with `flex_shrink(0)`. Every modal shares
     this row, so the fix belongs to the widget rather than to the one sentence that exposed it, and
     the caller's half is `text_ellipsis` on a status that can run long — so it ends in a `…` rather
-    than in a clipped word.
+    than in a clipped word. **`min_width(0)` goes on the status itself as well as on that wrapper**,
+    because `min-width: auto` applies to *every* flex item: relaxing it on the container left the
+    status inside with taffy's automatic minimum, so it never compressed, `text_ellipsis` never had a
+    narrower box to end a line in, and the documented contract could not be kept by a caller who did
+    everything right. Ten of the twelve callers had noticed and were spelling
+    `status.style(|s| s.min_width(0.0))` themselves — a helper whose contract only holds if the
+    caller repeats half of it is one that will keep being called wrong.
     Also the **read-only fact panel** — `fact_section` (a heading with its rows under it), `fact_row`
     (one `label: value` line) and `fact_note` (an icon-led caveat), the three views a panel of
     *observed* facts is built from. They were `properties.rs`'s private helpers until `users_view.rs`
@@ -6121,13 +6140,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     true and flipped the answer for a reason that had nothing to do with accounts. It had none while
     `preview_of` had them, which is how the nonsense title shipped.
     `withheld` is `SchemaPlan::unsupported()`, so the "not applied in part" refusal fires on the
-    button *and* inside `apply()` on this path too, and `script` is
+    button *and* inside `apply()` on this path too. **`omitted` is `SchemaPlan::omitted` and is a
+    second block beside it, drawn by `omitted_block`, which discloses and does not refuse** — the
+    difference between the two is what makes them two blocks. Withheld means half an edit, and half
+    an edit is not a smaller edit, so Apply waits for the tick to be cleared; omitted means whole
+    objects sat out, what is below is complete, and the user has no tick to clear because those rows
+    have none. Refusing on it would make a comparison unusable on MySQL the moment one routine
+    differs, so it is stated in the muted colour above the statements and Apply stays live.
+    `preview_of` fills it with an empty list: a designer edit is about one object, which is either in
+    the plan or has no plan. `script` is
     `SchemaPlan::export_script()` — the same field `preview_of` fills that way, and for the same
     reason: Copy and Open in editor both put the text somewhere durable. It happens to equal
     `editor_script()` byte for byte for a comparison, which produces no account change, but the rule
     is enforced by *calling* the scrubbing function rather than by a comment observing there is
-    nothing to scrub today. `subject` names the plan ("12 objects") rather than an object,
-    there being no single object to name, and the post-apply `refresh_db` already re-introspects a
+    nothing to scrub today. `subject` names the plan and the database it lands in
+    (`SchemaPlan::subject_in` — "12 objects in shop") rather than an object, there being no single
+    object to name, and the post-apply `refresh_db` already re-introspects a
     whole database, which is the right refresh for a plan that touched many of its objects.
     **`preview_account` takes an `AccountPlanTarget` captured where the plan was raised**, not the
     live `edit_ctx`. `conn_id`, `dialect` and `read_only` come off the `AccountTarget`/`GrantTarget`
@@ -7485,7 +7513,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     question asked about the *result on screen* rather than about the schema tree — and counted in
     `workspace_modals_up`, without which its backdrop would resolve `inset(0)` against nothing.
     Its content does not come from the result: `BlobUi`'s `state` is filled by the app's
-    `ViewBlobFn` — `(conn_id, Option<BlobRef>, BlobTarget, Option<BlobStageFn>)`, the `BlobRef`
+    `ViewBlobFn` — `(conn_id, Option<BlobRef>, BlobTarget, Option<BlobStage>)`, the `BlobRef`
     absent for a cell with nothing committed to read and the stage fn absent for one nothing can
     write — and the three things that can arrive each get a sentence: the bytes, `Empty`
     (the cell is NULL *or* the row is gone *or* the row is not committed yet, one state because the
@@ -7556,11 +7584,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the `BlobRef` that addresses the row stays in the app with the connection it has to be asked
     over, so two places are never responsible for aiming one fetch.
     **The panel is a write surface now, not only a viewer.** `BlobUi::stage` holds where a loaded
-    file goes: a `BlobStageFn` the **grid** supplies, because the grid is what holds the staged
+    file goes: a `BlobStage` the **grid** supplies, because the grid is what holds the staged
     edit and this panel knows the cell only well enough to *name* it — giving it the coordinates
     would put one cell's identity in two places, which `BlobTarget` already refuses for the read
     half. `None` there is a cell nothing can write, and it is what leaves *Load from file*
     disabled; the button sits before *Save to file* and the three actions take `ACTION_TAB + 1/2/3`.
+    **It is a struct with two closures — `put` and `live` — and not a bare `Rc<dyn Fn(Vec<u8>) ->
+    bool>`**, because `put` asks `is_live` inside itself and so no caller can skip the check. The
+    signal holding it is window-scoped while the sink closes over a `GridState`, so the two do not
+    die together, and floem's `get_untracked` is `try_get_untracked().unwrap()`: a stale sink is a
+    panic that takes the window and every tab's uncommitted edits, not a no-op. The *offer* is
+    guarded too — `loadable` asks `is_live` rather than merely `is_some`, and `stage` is a term in
+    the panel's rebuild key, which it was not: the one thing that clears the signal after the panel
+    is up (the grid behind it being disposed) left the button enabled over a sink that could no
+    longer take anything, and the user waited out a file dialog and a read of up to 64 MiB to be told
+    the cell could not be written.
     The panel owns the open dialog and the app does the read: `BlobLoadFn`
     (`TabActions::load_blob`, a `std::fs::read` on a blocking worker) is `BlobSaveFn` in reverse and
     off-thread for the same reason — the file can be as large as the value it replaces.
@@ -7579,8 +7617,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     family whose late arrival would write to a *database* rather than to a label; a load arriving
     with no sink is refused in words rather than dropped, because doing nothing quietly looks
     exactly like a load that worked.
-    **And the sink itself can refuse**: `BlobStageFn` returns a `bool`, and the panel says which way
-    it went. The file dialog stands open for as long as the user takes to choose and the grid is free
+    **And the sink itself can refuse**: `BlobStage::put` returns a `bool`, and the panel says which
+    way it went. The file dialog stands open for as long as the user takes to choose and the grid is free
     to move underneath it — the pending row discarded, the row marked for deletion, the result re-run
     read-only — so the gate `blob_launch` passed is not necessarily the one that holds when the bytes
     land, and `GridState::stage_bytes` asks it again (see the grid). Reporting a refusal as *Loaded
@@ -7592,7 +7630,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **An oversized file is refused here, before anything is staged**, against `BlobTarget::cap` —
     the column's declared capacity, which `grid::blob_launch` reads off `EditModel::byte_cap`. The
     message names both sizes ("That file is 136.7 KB — this column holds at most 64.0 KB.") because
-    the column's own limit is a fact the user has no other way to learn. The alternative is the
+    the column's own limit is a fact the user has no other way to learn, and it renders the pair
+    through **`format::contrasting_bytes`** rather than `human_bytes` twice: a 65,536-byte file
+    refused by a `BLOB` (65,535) read *"That file is 64.0 KB — this column holds at most 64.0 KB."*,
+    one decimal being right for a size shown alone and wrong for a sentence whose whole content is
+    that the two differ. The alternative is the
     server's, and it is much worse placed: MySQL's `ERROR 1406: Data too long` arrives at the
     commit, names the column rather than the file, lands after this panel has closed, and takes
     every other staged edit in the batch down with the rollback. The comparison is `>`, so a file of
@@ -7662,9 +7704,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `Db::fetch_schema` on *both* sides. The diagram instead reads whatever the schema tree already
     loaded and says "not loaded yet" otherwise, which would rule this feature out entirely: the
     right-hand side is routinely a database on another connection the tree has never introspected.
-    There is no `CancellationToken` — there is no Stop to offer, `start_fetch`'s reason — so
-    staleness is handled the properties fetch's way, by dropping the landing unless `overlay.compare`
-    still equals the target it was asked for. The dialect refusal happens **before either round
+    **It carries a `CancellationToken` even though there is no Stop to offer.** Staleness is still
+    handled the properties fetch's way — the landing is dropped unless `overlay.compare` still equals
+    the target it was asked for — but dropping the *answer* goes on paying for the *read*, and this
+    read is two full `fetch_schema` sweeps across two servers: picking a different right-hand side
+    three times left three of them running to completion for nobody. Each ask cancels the one it
+    supersedes. The dialect refusal happens **before either round
     trip**, through `compare::comparable` (see its entry for why that is by dialect and not by
     engine).
     **The five view-state signals are kept apart from the comparison, for the properties modal's
@@ -7696,13 +7741,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is the single `main` — emptied every other SQLite connection's list outright. `names_for` is
     handed the rules and the id of the connection being *listed*, which is the same distinction
     `db_hidden`'s own entry exists to keep.
-    That listing is deliberately **unguarded against two clicks landing out of order**, and what
-    makes it safe is load-bearing: the connection id travels *with the list* — `compare_dbs` holds
-    `(u64, Vec<String>)` and step two builds its `CompareSide` from that pair, not from whichever row
-    was clicked — so the worst case is reading the earlier click's databases, and picking one still
-    compares against the connection they came from. Capturing the clicked id in the row's closure
-    instead would cost nothing visible and turn a stale list into a comparison run against the wrong
-    server.
+    **That listing is guarded against two clicks landing out of order, in both arms**, and it had a
+    guard in neither: a listing the user abandoned — a second server clicked while the first was
+    still out — landed late, its *success* arm replacing the picker under the pointer so that a click
+    already on its way retargeted to a different server's database, and its *failure* arm replacing a
+    fully rendered comparison with an error about a server the user had moved on from. Each ask takes
+    the next generation and the landing returns early unless that is still the current one. The
+    second defence is unchanged and still load-bearing: the connection id travels *with the list* —
+    `compare_dbs` holds `(u64, Vec<String>)` and step two builds its `CompareSide` from that pair,
+    not from whichever row was clicked — so even a stale list is picked against the connection it
+    came from. Capturing the clicked id in the row's closure instead would cost nothing visible and
+    turn a stale list into a comparison run against the wrong server.
+    **A no-op `set` is not free on either of this modal's keyed signals.** Clearing `compare_dbs_err`
+    asks `is_some` first, because the modal's body is a `dyn_container` keyed partly on it, so
+    writing `None` over `None` disposed and rebuilt the filter bar, the whole row tree and the diff
+    pane — losing the tree's scroll position for a listing that had not even been sent yet. The row
+    click guards `compare_focus` the same way, where a rebuild costs a fresh `line_diff` over both
+    sides' DDL and a restyle of every row.
     **The MySQL bodies are shown, readable, and cannot be ticked**, which is the limitation most
     worth knowing here. `CompareEntry::needs_source` is true of a trigger, routine or event whose
     body the eager `fetch_schema` read out of `information_schema` with its escapes already
@@ -7710,15 +7765,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     warning triangle where its tick would be, plus the sentence "body must be re-read before this can
     be applied"; **Select all** goes through `SchemaComparison::selectable_keys`, which filters the
     same way (and by the query too — see its entry), the app's seed above filters the same way, and
-    **`plan_of`** — `c.plan(|e| selected.contains(&e.key()) && !e.needs_source())` — keeps a tick
-    that arrived by some other route (a comparison replaced under a stale selection, a future
-    "invert") from reaching `emit`. The three spell the same rule at three sites, and it has to stay
-    the same rule: counting over a laxer predicate than the one that builds the plan is how a
-    confident "1 object" comes to sit over a button that builds an empty plan and returns. Lifting
-    the block means re-reading each body through `Db::{trigger,routine,event}_source` first — open
-    work, not something to fake in the meantime.
+    **`plan_of` is `c.plan(|e| is_planned(e, selected))`** — one predicate, `compare::is_planned`,
+    which now lives in the core crate rather than here: it was the single thing deciding which
+    objects reach an irreversible `Db::run_ddl`, sitting untestable in this module while `plan`
+    already took it as a parameter. `SchemaComparison::plan` re-applies the same exclusion on its own
+    account, so a tick that arrived by some other route (a comparison replaced under a stale
+    selection, a future "invert") cannot reach `emit` however the caller's predicate answers.
+    Counting over a laxer predicate than the one that builds the plan is how a confident "1 object"
+    comes to sit over a button that builds an empty plan and returns. **And the preview now says so
+    out loud**: what is kept out travels as `SchemaPlan::omitted` into the modal's own block, where
+    it discloses without refusing — before that, the last surface ahead of Apply counted only what
+    was included and reported "Applied N statements to 1 object" over a three-difference comparison.
+    Lifting the block means re-reading each body through `Db::{trigger,routine,event}_source` first —
+    open work, not something to fake in the meantime.
     **Preview never applies.** `open_plan_preview` builds the `SchemaPlan`, reads the left
-    connection's `read_only` off the connection list, names it "N objects" and hands it to
+    connection's `read_only` off the connection list, names it through `SchemaPlan::subject_in` —
+    the count and the database it lands in, both from the plan rather than hand-rolled here — and hands it to
     `ddl_preview::preview_of_plan` — the same modal, the same Apply and the same `Db::run_ddl` a
     one-table designer edit takes. The comparison closes on the way there, so the plan is a snapshot
     rather than a selection the preview no longer reflects.
@@ -7726,7 +7788,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `plan_of` and then `emit()` on every checkbox tick — cloning a `ChangeSet` per selected object
     and rendering the whole migration's SQL synchronously on the UI thread to display a number. It
     now counts the entries the predicate accepts, reading the selection with `with` so the `HashSet`
-    is not cloned, and the status reads "N objects selected"; the statement count lives in the
+    is not cloned, and the sentence beside the button is `compare::selection_note(planned)` — the
+    same plural rule as the preview's subject, one function away rather than hand-rolled a hundred
+    lines from it; the statement count lives in the
     preview, which is the only place it can be had without emitting. The button is keyed on a
     separate `Memo<bool>` rather than on the count, because `dyn_container` has no equality check of
     its own and was tearing the button — and with it its focus-ring registration — down on every tick
@@ -7741,15 +7805,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     module-private and nothing was promoted to share them. Status is one glyph per row (`+` arrives,
     `−` goes, `~` changes, `=` agrees) so a long list reads down a column instead of as a wall of
     words, and the diff pane is one `diff::line_diff` over `CompareEntry::{left_ddl,right_ddl}`. The
+    filter bar's summary line carries `CompareCounts::uncertain` beside the four status tallies,
+    because it is the one line about the whole comparison: the per-row hint is still there, but an
+    uncertain match is overwhelmingly an object that came out `Same`, which the default hides. The
     right-side picker is an **inline expand-in-place list rather than the popup menu**, because
     `menu_panel` anchors itself to a measured rect and this control sits in a fixed header — the
     import modal's sheet picker is the precedent.
     **An empty tree says *which* emptiness it is, and it is chosen inside the container that tracks
-    the filter** rather than once above it. Three cases are reachable and they read differently — a
-    filter that matched nothing, two schemas that agree, and two databases with nothing in them —
-    and "nothing matches that filter" over an unfiltered identical pair is the wrong answer to the
-    question asked, while "these match" over a failed filter is worse: it claims agreement the
-    comparison never checked. The message was an early return *outside* that container, which also
+    the filter** rather than once above it — but the choosing is `SchemaComparison::empty_reason`'s
+    now, not this module's. Four cases are reachable and they read differently — a filter that
+    matched nothing, a filter that matched only objects the two schemas agree on while *Include
+    identical* is off, two schemas that agree, and two databases with nothing in them — and "nothing
+    matches that filter" over an unfiltered identical pair is the wrong answer to the question asked,
+    while "these match" over a failed filter is worse: it claims agreement the comparison never
+    checked. The second of the four was the one this module got wrong while the arms lived here,
+    inside a `dyn_container`'s child closure where no test could reach them.
+    The message was an early return *outside* that container, which also
     made **Identical too** dead in an all-identical comparison, the tick having nothing left to
     re-render. The picker's failure line is the same lesson one level up: it renders **above**
     whichever step is showing rather than instead of one, because an error arm of its own replaced
@@ -8007,8 +8078,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `Err(_) if token.is_cancelled() => ExportOutcome::Cancelled` arm, the token being the witness
   because the refusal's error text cannot be told from a write error's; it asks the token once more
   before `publish`, so a stopped render is never renamed over the destination; and its failure arm
-  runs the same `writes_incrementally()` sweep the streamed one does, so a buffered format's
-  zero-byte `.part` is removed rather than left for a message to point at. `AllRows` is
+  **and its cancel arm** run the same `writes_incrementally()` sweep the streamed one does, since a
+  buffered format has written nothing into the sibling whatever ended the export — a 0-byte
+  `foo.xlsx.part` in the user's folder, under a message reading *"foo.xlsx was not changed."* that
+  does not mention it, is litter either way, while an incremental format's sibling holds the rows
+  that arrived and is the one thing worth keeping. The `AllRows` arm had the identical gap on cancel
+  and both now sweep. **The worker's `JoinHandle` is awaited, not dropped**: this arm's only exit
+  from the modal is an outcome, so a worker that ended without reporting — a panic in a renderer, a
+  `spawn_blocking` pool shutdown — left an undismissable modal *and* a permanently occupied cancel
+  slot; it reports `Export failed: worker died: …`, which its `AllRows` sibling has said since it was
+  written. `AllRows` is
   **two tasks and a bounded channel of 2** — the reader is async (two of the three drivers are) and
   the writer is synchronous file IO, which must not run on a runtime worker. The writer's
   `PullChunks` closure turns a channel `Err` into an `io::Error` and a channel close into
@@ -8532,7 +8611,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     at the end anyway. The per-file tallies are folded with `ExportTally::absorb`, the same fold the
     single file uses, so one sentence can name what none of them could carry. `FilesOutcome` is its
     own type rather than `DumpOutcome` because all three of its endings count **files in a folder**,
-    which is the one thing the dump's three never have to say.
+    which is the one thing the dump's three never have to say — and all three now carry
+    `replaced: Vec<String>` as well.
+    **What the export is about to overwrite is collected before it overwrites any of it.** A
+    pre-flight walks the plan's file names against the chosen directory and keeps the ones already
+    there, once, ahead of the loop: after the first `rename` the answer is contaminated by this
+    export's own output, and a `Cancelled` or `Failed` arm would report whichever prefix it happened
+    to reach. `select_directories()` has no overwrite prompt, so this is the folder form's only
+    equivalent of the save dialog's "replace?", and it is a disclosure rather than a refusal —
+    `export::files_note`/`files_cancel_note`/`files_failure_note` take the list and
+    `replaced_clause` renders it.
+    **The per-file resolution is `core::dump::dump_verdict` too, not a second copy of it.** Those
+    five arms were written out again here and the copy diverged in the one arm the extraction exists
+    to protect: `WriteEnd::Failed` carries the writer's own words, which already begin
+    *"Export failed:"*, and re-prefixing them produced *"Export failed: Export failed: No space left
+    on device (os error 28) — 3 files already written to out are kept."* The writer's refusal to
+    publish a truncated file is folded into the **read** end before asking, because that is what it
+    is — a cancel whose only witness is the token, a stop that landed between the last chunk and the
+    rename never reaching the reader at all. And `write_one`'s rename failure no longer names the
+    `.part` file: the caller's `sweep()` deletes it three lines later, so the one sentence telling
+    the user where their rows went named a path that no longer existed by the time they read it. It
+    names the destination instead.
   - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
     adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
     system allocator. It exists to answer one question the OS can't: whether memory growth is a
@@ -9082,6 +9181,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   `GridState::alive()`, which is `rs.try_get_untracked().is_some()`. Since `get_untracked` is
   `try_get_untracked().unwrap()`, the failure this prevents is a panic that takes the window and
   every tab's uncommitted edits — not a no-op.
+  **The binary panel's write sink is the same shape, and this is the mechanism that satisfies the
+  rule for it.** `BlobUi::stage` is window-scoped and holds a `BlobStage` closing over one grid's
+  `GridState`, while the file dialog it is used behind is not window-modal (floem's `open_file` is a
+  plain `std::thread::spawn`), so the grid can be disposed while the user is still choosing a file.
+  Three parts, and the first two are the same pair as above: the sink carries its own `live` closure
+  and `BlobStage::put` asks it *inside* itself, so no caller can skip the check; and
+  `GridState::stage_bytes`/`stage_new_bytes` open with `alive()`. The third is the cleanup —
+  `grid_view` clears the signal **when the installed sink answers `false`**, an identity-free test,
+  which is what keeps it correct with several grids alive: only a dead grid's cleanup runs, and only
+  that grid's sink is dead. That third part is not redundant with the first two, because they stop
+  the panic and it stops the *offer*: without it the user waited out a file dialog and a read of up
+  to 64 MiB to be told the cell could not be written.
 - **Themable colors reach reactive styles as `fn() -> Color`, never a captured `Color`.** A `Color`
   read once at build freezes and won't follow a live theme switch; pass the fn and call it inside
   the `.style(move |s| …)` closure (see `FieldCfg::background`).
@@ -9214,7 +9325,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   repaired where the key is built rather than where it is checked: `EditTable::confirm_cols` puts
   the values the grid read into the same `WHERE` for an implicit key only, and `edit::row_key` is
   the one builder that appends them. Restoring the premise is the shape any future key of this kind
-  has to take; loosening the guard is not. Its rollback, by contrast, is the one that needs no
+  has to take; loosening the guard is not. **And where the premise cannot be restored, the table is
+  read-only**: `confirm_columns` answers `None` when an implicit key has nothing left to confirm it
+  — every non-key column holding bytes, which `blobs(data BLOB)` is — and `analyze_edit` refuses the
+  table outright rather than falling back to a bare `rowid = ?`, which is that premise stated and
+  then abandoned. A column holding bytes is excluded from the confirming set because its cell is a
+  `<n bytes>` placeholder and not the value, and the test for that is `edit::holds_bytes`, not the
+  wire flag: a blob in a SQLite `TEXT`-declared column reads back as the same placeholder, and
+  comparing *it* refused every write to the table rather than only the misdirected ones. Its rollback, by contrast, is the one that needs no
   hedging — there is no non-transactional table type. That
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
@@ -11482,6 +11600,16 @@ for keyboard nav.
   rolls the whole batch back over an edit the user could never see. `stage_new_bytes` re-checks that
   the pending row is still there, `new_rows` being free to shrink under an open dialog (Discard, a
   commit, a removed skeleton row). The `bool` is what the panel reports — see `blob_view.rs`.
+  **Both open with `GridState::alive()`**, because the grid can be gone rather than merely changed:
+  the sink is an `Rc` over `GridState` sitting on a *window*-scoped signal, and a re-run, a closed
+  panel or a closed tab disposes the grid's scope while the file dialog — floem's `open_file` is a
+  plain `std::thread::spawn` with no parent window — is still up. That is the `alive()` half of the
+  menu-callback rule in the invariants. The other half is `GridCtx::blob_stage`, which carries the
+  window-scoped `BlobUi::stage` signal into the grid so `grid_view`'s `on_cleanup` can take this
+  grid's sink back out — and it clears it **only when the installed sink answers `false`**, which is
+  what makes an identity-free check right with several grids alive: only a dead grid's cleanup runs,
+  and only that grid's sink is dead, so a panel opened from a different, living grid keeps its offer.
+  It reads through `try_get_untracked`, the window being able to be closing too.
   The `BlobTarget` it builds also carries
   the column's `EditModel::byte_cap`, which is what lets the panel refuse an oversized file at the
   picker instead of at the commit (see `blob_view.rs`). The **row panel's** per-field *Edit*/*View*
@@ -11723,7 +11851,10 @@ for keyboard nav.
   exemption with nothing failing. The effect tracks `rs`, `order`, `dirty` and `new_rows` as well
   as the selection, and reads each cell **as the grid draws it**: tracking only `active`/`anchor`
   left the previous total standing under a sort or a commit splice, and a staged green edit was
-  never in it at all.
+  never in it at all. A staged **blob** is a value there and not a NULL: `CellEdit::as_text` answers
+  `None` for `Bytes`, which is what every *text* caller wants and what this one read as absence, so
+  loading a file into a selected cell turned `3 rows` into `3 rows · 1 null` while the stored blob it
+  replaced counted as a value — the grid holds `<n bytes>` for that one, and that is a text.
   `grid_selection_bar` renders at panel level (like the find bar, so it can sit at the panel's
   edge) while `grid_view` computes it, and it lifts itself above `grid_error_bar` when that one is
   up: they coincide exactly when a bulk delete fails, which is when both have something to say. It
@@ -11761,7 +11892,11 @@ for keyboard nav.
   bar's own style **and** by the selection summary that lifts itself above it — two hand-written
   copies of the same `is_some` chain before, which a new surface would have had to be added to
   twice, and a bar that is up while the summary thinks it isn't is the two of them drawn on top of
-  each other. **What travels in `BarSignals` is state, never an action**: `rollback_tx` is an
+  each other. `grid_error_bar` binds it **exhaustively, with no `..`**, which is what the struct is
+  for: a rest pattern re-opens the exact failure — a field added here and bound nowhere, so a bar the
+  rest of the app is filling never appears. The `..` became vestigial when the export state left this
+  bar, and a vestigial rest pattern is indistinguishable from a deliberate one.
+  **What travels in `BarSignals` is state, never an action**: `rollback_tx` is an
   `Rc<dyn Fn(usize)>` parameter of `grid_error_bar` rather than a field, because the struct is
   `#[derive(Clone, Copy)]` and an `Rc` in it would cost every reader of `any_up` a clone.
   `export_cancel` was the second such parameter until the export's Stop moved to the modal, which
