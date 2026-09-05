@@ -621,17 +621,32 @@ pub fn suggested_filename(base: Option<&str>, format: ExportFormat) -> String {
 /// export that trusted the names would write the second table over the first and
 /// still report both. A later name gets `_2`, `_3`, … before the extension.
 ///
-/// The suffix is checked against the set too, not just appended: a real `a_b_2`
-/// standing beside two tables that both want `a_b` would otherwise be clobbered
-/// by the deduplicator's own choice.
+/// A generated suffix never takes a name some **other** table would have had:
+/// a real `a_b_2` standing beside two tables that both want `a_b` would
+/// otherwise be handed `a_b_2.csv` by the deduplicator, and the real one pushed
+/// to `a_b_2_2.csv`.
+///
+/// **Every base name is reserved before any is handed out**, which is what makes
+/// that independent of the order the tables arrive in. Checking the suffix
+/// against the names issued *so far* only worked while the real `a_b_2` came
+/// first — and the picker sorts, where `*` (42) and `:` (58) both precede `_`
+/// (95), so it never did: `a*b`, `a:b`, `a_b_2` put `a:b`'s rows in
+/// `a_b_2.csv`, which is the file a user would open expecting `a_b_2`'s.
 ///
 /// Returned in `tables`' order, one entry each, so a caller can zip the two.
 pub fn export_file_names(tables: &[String], format: ExportFormat) -> Vec<String> {
     let ext = format.extension();
+    let base: Vec<String> = tables
+        .iter()
+        .map(|t| suggested_filename(Some(t), format))
+        .collect();
+    // Case-insensitively, because `Orders` and `orders` are one file on Windows
+    // and macOS — the same reason `taken` is keyed that way.
+    let reserved: std::collections::HashSet<String> =
+        base.iter().map(|n| n.to_lowercase()).collect();
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(tables.len());
-    for table in tables {
-        let name = suggested_filename(Some(table), format);
+    for name in base {
         // The stem, so the counter goes before the extension rather than after
         // it — `a_b_2.csv`, not `a_b.csv_2`.
         let stem = name
@@ -640,7 +655,14 @@ pub fn export_file_names(tables: &[String], format: ExportFormat) -> Vec<String>
             .to_string();
         let mut candidate = name;
         let mut n = 1u32;
-        while !taken.insert(candidate.to_lowercase()) {
+        loop {
+            let key = candidate.to_lowercase();
+            // `n > 1` is what lets a table keep its *own* name: the reservation
+            // set holds it, and only a **generated** suffix has to step around
+            // the set.
+            if !(n > 1 && reserved.contains(&key)) && taken.insert(key) {
+                break;
+            }
             n += 1;
             candidate = format!("{stem}_{n}.{ext}");
         }
@@ -4666,20 +4688,47 @@ mod tests {
         );
     }
 
+    /// **The suffix must step around every real name, whatever order they
+    /// arrive in.** A real `a_b_2` beside two tables that both sanitize to `a_b`
+    /// would otherwise be handed `a_b_2.csv` by the deduplicator, and the real
+    /// one pushed off to `a_b_2_2.csv`.
+    ///
+    /// Both orders, and the second is the one that matters: the picker sorts,
+    /// and `*` (42) and `:` (58) both precede `_` (95), so `a*b`, `a:b`, `a_b_2`
+    /// is the order production actually produces. The old guard checked the
+    /// names issued *so far*, which is only enough while the real one comes
+    /// first — the one order the old test pinned.
     #[test]
     fn export_file_names_suffix_does_not_collide_with_a_real_table() {
-        // The suffix is only safe if it is itself checked against the set: a
-        // real `a_b_2` beside two tables that both sanitize to `a_b` would
-        // otherwise be overwritten by the deduplicator's own choice.
-        let tables = vec!["a:b".to_string(), "a_b_2".to_string(), "a*b".to_string()];
-        assert_eq!(
-            export_file_names(&tables, ExportFormat::Csv),
-            vec![
-                "a_b.csv".to_string(),
-                "a_b_2.csv".to_string(),
-                "a_b_3.csv".to_string()
-            ]
+        let names = |tables: Vec<&str>| {
+            let owned: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+            let out = export_file_names(&owned, ExportFormat::Csv);
+            owned.into_iter().zip(out).collect::<Vec<_>>()
+        };
+
+        // The order the old guard happened to work in.
+        let real_first = names(vec!["a:b", "a_b_2", "a*b"]);
+        assert!(real_first.contains(&("a_b_2".to_string(), "a_b_2.csv".to_string())));
+
+        // The order the picker actually produces, sorted.
+        let sorted = names(vec!["a*b", "a:b", "a_b_2"]);
+        assert!(
+            sorted.contains(&("a_b_2".to_string(), "a_b_2.csv".to_string())),
+            "the real `a_b_2` keeps its own file: {sorted:?}"
         );
+        // …and nobody else got it.
+        let holders: Vec<&String> = sorted
+            .iter()
+            .filter(|(_, f)| f == "a_b_2.csv")
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(holders, vec!["a_b_2"], "{sorted:?}");
+
+        // Whatever the order, three tables get three distinct files.
+        for set in [real_first, sorted] {
+            let files: std::collections::HashSet<&String> = set.iter().map(|(_, f)| f).collect();
+            assert_eq!(files.len(), 3, "{set:?}");
+        }
     }
 
     #[test]
