@@ -15,18 +15,28 @@
 //!   without a registration are a standing grant for a server that is not there.
 //!   [`AgyRegistration`] owns both and its `Drop` removes both.
 //! - **A crash leaves both behind**, and neither expires. [`sweep`] runs at
-//!   startup and removes any Schemaic registration and rules it finds, because a
-//!   permission the user does not remember granting is exactly what must not
-//!   outlive the process that needed it.
+//!   startup and removes any Schemaic registration and rules it finds *that no
+//!   live instance has claimed*, because a permission the user does not remember
+//!   granting is exactly what must not outlive the process that needed it.
 //! - **The settings file is merged, never rewritten.** It is the user's, it holds
 //!   their `trustedWorkspaces`, and Antigravity rewrites it itself. The surgery
 //!   is pure and tested in `schemaic_ai::harness`; this module only does the IO.
 //!
-//! **Known limit: two Schemaic instances.** [`sweep`] cannot tell a registration
-//! left by a crash from one belonging to a second running instance, so starting
-//! a second Schemaic removes the first's rules until that session next starts
-//! one. The alternative — leaving them on the chance somebody is using them — is
-//! a standing grant nobody remembers making, which is the worse failure.
+//! **Two Schemaic instances, and how the claim tells them apart.** The state is
+//! global to the machine but the sweep runs per process, so [`sweep`] used to
+//! remove a *live* instance's registration and rules the moment a second
+//! Schemaic launched — leaving that session holding database tools which had
+//! silently stopped existing. [`AgyRegistration::install`] now writes a marker
+//! naming the process that owns them, and the sweep defers only while that exact
+//! process is still running.
+//!
+//! **The pid alone would not do it**, which is why the marker carries a start
+//! time as well: pids are reissued, so a crashed instance's marker eventually
+//! names some unrelated live process, and a sweep trusting the number would
+//! decline to clean up for the rest of that pid's life — turning a transient
+//! crash into the permanent standing grant this whole module exists to prevent.
+//! An unreadable or absent marker is treated as no claim at all, in the same
+//! direction and for the same reason.
 //!
 //! **Known limit: the server name is not ours to reserve.** `agy mcp add` is an
 //! upsert and `agy mcp remove` is unconditional, so a user who has registered
@@ -119,6 +129,108 @@ fn edit_settings(create: bool, edit: impl Fn(&str) -> Option<String>) -> bool {
     std::fs::write(&path, next).is_ok()
 }
 
+/// Which process claimed Antigravity's global state, as the marker records it.
+///
+/// **The start time is not decoration.** A pid alone cannot tell a live claim
+/// from a dead one: the operating system hands pids out again, so a marker left
+/// by a crashed instance eventually names some unrelated process that is very
+/// much running, and a sweep that trusted the pid would then decline to clean up
+/// for the rest of that pid's life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Owner {
+    pid: u32,
+    started: u64,
+}
+
+/// Render a marker. One line, two fields — this file is written by one process
+/// and read by another, so the format is the interface between them.
+fn marker_text(o: Owner) -> String {
+    format!("{} {}\n", o.pid, o.started)
+}
+
+/// Read a marker back, or `None` for anything that is not one.
+///
+/// A truncated or garbled marker answers `None`, which [`may_sweep`] treats as
+/// *no claim* — the same direction as no file at all. The alternative, refusing
+/// to sweep on an unreadable marker, would leave a standing permission grant in
+/// the user's config with nothing able to withdraw it.
+fn parse_marker(s: &str) -> Option<Owner> {
+    let mut it = s.split_whitespace();
+    let pid = it.next()?.parse().ok()?;
+    let started = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some(Owner { pid, started })
+}
+
+/// May the startup sweep remove the registration and the allow-rules?
+///
+/// `live` is the start time of the process the marker names, if that pid is
+/// running at all.
+fn may_sweep(marker: Option<Owner>, live: Option<u64>, me: u32) -> bool {
+    let Some(o) = marker else {
+        return true;
+    };
+    // Our own pid, at startup: this process has only just begun, so it cannot be
+    // the instance in the middle of the session that wrote this.
+    if o.pid == me {
+        return true;
+    }
+    // A claim stands only while the process that made it is the one still on
+    // that pid. Anything else — gone, or replaced — is a crash's leftovers.
+    live != Some(o.started)
+}
+
+/// Where the claim is recorded. Beside the app's own state rather than in the
+/// shared temp directory: it is a claim on *this* machine's Antigravity config,
+/// and world-writable is the wrong permission for something a sweep obeys.
+fn marker_path() -> Option<PathBuf> {
+    Some(schemaic_core::persist::private_dir("agy")?.join("registration-owner"))
+}
+
+/// A process's start time, if that pid is running at all.
+///
+/// The impure half of [`may_sweep`], kept to one line of answer so the decision
+/// itself stays testable without a process to look at.
+fn process_start(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let p = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[p]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(p).map(|pr| pr.start_time())
+}
+
+/// Claim the global state for this process, so another instance's startup sweep
+/// leaves it alone.
+fn claim() {
+    let me = std::process::id();
+    let Some(started) = process_start(me) else {
+        // Without a start time the claim could not be told from a pid-reuse, and
+        // a claim that cannot expire is worse than none: it would strand the
+        // allow-rules the sweep exists to withdraw.
+        return;
+    };
+    let Some(path) = marker_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, marker_text(Owner { pid: me, started }));
+}
+
+/// Drop this process's claim.
+fn release() {
+    if let Some(path) = marker_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Run one `agy mcp …` subcommand, discarding its output.
 ///
 /// Best effort by design: if `agy` is missing or refuses, the session simply has
@@ -173,6 +285,9 @@ impl AgyRegistration {
             // Granting: a fresh Antigravity install has no settings file yet, and
             // the rules are what its tools need to run at all.
             edit_settings(true, move |cur| antigravity_settings_with_rules(cur, &r));
+            // And say who owns them, so a second Schemaic's startup sweep does
+            // not withdraw this session's grant while it is still using it.
+            claim();
         }
         Self {
             bin: bin.to_string(),
@@ -210,6 +325,10 @@ impl Drop for AgyRegistration {
             antigravity_settings_without_rules(cur, &rules)
         });
         agy_mcp(&self.bin, &["remove", SERVER]);
+        // The claim goes last, and only after the state it claimed is gone: a
+        // release that ran first would open a window in which another instance's
+        // sweep could race this one's own removal.
+        release();
     }
 }
 
@@ -220,6 +339,24 @@ impl Drop for AgyRegistration {
 /// to a binary the user does not have, on every launch, to clean up state that
 /// cannot exist, is a cost paid by everyone for a case that applies to nobody.
 pub(crate) fn sweep(bin: Option<&str>) {
+    // **Not while another Schemaic is using it.** This runs at every launch, and
+    // the state it cleans is global to the machine rather than to a process, so
+    // a second window opening was enough to withdraw the first's registration
+    // and allow-rules — leaving that session holding database tools that had
+    // silently stopped existing. A claim written by `install` says who owns it;
+    // only a claim whose owner is gone is a crash's leftovers.
+    let owner = marker_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .as_deref()
+        .and_then(parse_marker);
+    if !may_sweep(
+        owner,
+        owner.and_then(|o| process_start(o.pid)),
+        std::process::id(),
+    ) {
+        return;
+    }
+    release();
     // The rules can be removed with no `agy` at all — it is our own file surgery
     // — so that half runs regardless.
     let all: Vec<&str> = crate::ai::AI_TOOLS_WITH_QUERY.to_vec();
@@ -308,5 +445,76 @@ mod tests {
         let rules = antigravity_allow_rules(&all);
         assert!(rules.iter().any(|r| r.contains("run_query")), "{rules:?}");
         assert!(rules.len() >= crate::ai::AI_TOOLS_READ_ONLY.len());
+    }
+
+    const ME: u32 = 4242;
+
+    /// The bug this marker exists for: the sweep runs at **every** launch and
+    /// removed the registration unconditionally, so starting a second Schemaic
+    /// while the first had a live AI session pulled that session's server and
+    /// allow-rules out from under it. The first instance then held a session
+    /// whose database tools had silently stopped existing.
+    #[test]
+    fn a_second_instance_does_not_sweep_a_live_instances_registration() {
+        let owner = Owner {
+            pid: 1234,
+            started: 900,
+        };
+        assert!(
+            !may_sweep(Some(owner), Some(900), ME),
+            "swept a registration whose owner is still running"
+        );
+    }
+
+    /// …and the case the sweep exists for is untouched: an owner that is gone.
+    #[test]
+    fn a_crashed_instances_registration_is_still_swept() {
+        let owner = Owner {
+            pid: 1234,
+            started: 900,
+        };
+        // The pid is not running at all.
+        assert!(may_sweep(Some(owner), None, ME));
+        // The pid is running, but it is not the process that wrote the marker —
+        // the operating system handed that number to something else. Trusting
+        // the pid alone would decline to clean up for the rest of its life.
+        assert!(may_sweep(Some(owner), Some(901), ME));
+    }
+
+    /// No claim, no reason to defer — including a marker too damaged to read,
+    /// which must not be able to strand a permission grant in the user's config.
+    #[test]
+    fn an_absent_or_unreadable_marker_is_not_a_claim() {
+        assert!(may_sweep(None, None, ME));
+        for junk in [
+            "",
+            "   ",
+            "not-a-pid 900",
+            "1234",
+            "1234 900 extra",
+            "1234 x",
+        ] {
+            assert_eq!(parse_marker(junk), None, "{junk:?} parsed as a marker");
+        }
+    }
+
+    /// A marker naming *us* at startup is our own leftover — this process has
+    /// only just begun, so it cannot be in the middle of a session it owns.
+    #[test]
+    fn our_own_stale_marker_does_not_stop_us() {
+        let mine = Owner {
+            pid: ME,
+            started: 900,
+        };
+        assert!(may_sweep(Some(mine), Some(900), ME));
+    }
+
+    #[test]
+    fn a_marker_round_trips() {
+        let o = Owner {
+            pid: 31337,
+            started: 1_700_000_000,
+        };
+        assert_eq!(parse_marker(&marker_text(o)), Some(o));
     }
 }
