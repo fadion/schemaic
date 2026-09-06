@@ -896,27 +896,17 @@ pub(crate) fn start_ai_session(
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "schemaic".to_string());
-        // Codex is configured entirely on its own command line; Antigravity has
-        // no per-invocation configuration at all and needs two pieces of its
-        // global state written instead, which `AgyRegistration` owns and removes.
+        // Codex is configured entirely on its own command line. Antigravity used
+        // to be handled here too — it has no per-invocation configuration and
+        // needs its global state written instead — but it holds one process for
+        // the whole conversation now, so its `AgyRegistration` is gathered on the
+        // persistent path above and never reaches this branch.
         let mut overrides = Vec::new();
-        let mut agy_install: Option<(String, String)> = None;
         let mut oc_config: Option<crate::opencode::OpenCodeConfig> = None;
         match (harness, ep_file.as_ref()) {
             (Harness::Codex, Some(p)) => {
                 overrides =
                     schemaic_ai::harness::codex_mcp_overrides(&exe, &p.to_string_lossy(), allowed);
-            }
-            // **Deferred, not done here.** `install` shells out to `agy mcp add`
-            // twice and rewrites a settings file — a Node CLI start, a config
-            // parse and a write back, seconds rather than milliseconds — and
-            // this function runs on the Floem UI thread, from the send action.
-            // Doing it inline froze the window for that whole time, on top of
-            // the `probe` immediately above. Only the *arguments* are gathered
-            // here; the work happens on a blocking thread inside the session
-            // task.
-            (Harness::Antigravity, Some(p)) => {
-                agy_install = Some((exe.clone(), p.to_string_lossy().into_owned()));
             }
             // No endpoint file → no database tools, rather than a server that
             // would come up pointed at nothing.
@@ -992,36 +982,12 @@ pub(crate) fn start_ai_session(
         // harness switch, unlike the path and the model. `effort_arg` answers
         // with one of *this* harness's own levels or with nothing.
         let effort_arg = harness.effort_arg(&effort).unwrap_or_default().to_string();
-        let agy_bin = bin.clone();
         handle.spawn(async move {
-            // Held for the life of the session: dropping it removes the MCP
-            // registration and the allow-rules together.
-            //
-            // Registered here rather than before the spawn, on a blocking thread
-            // rather than a worker: it is two `agy` invocations and a settings
-            // rewrite, and both the UI thread and an async worker are the wrong
-            // place to wait for them. The first turn's `rx.recv()` has not been
-            // reached yet, so nothing races the registration the session needs.
-            let _registration = match agy_install {
-                None => None,
-                Some((exe, ep)) => {
-                    let reg = tokio::task::spawn_blocking(move || {
-                        crate::antigravity::AgyRegistration::install(&agy_bin, &exe, &ep, allowed)
-                    })
-                    .await
-                    .ok();
-                    if !reg.as_ref().is_some_and(|r| r.is_installed()) {
-                        // Said out loud rather than discovered: the session still
-                        // runs, but every database tool call in it will be
-                        // refused, and the transcript alone would not say why.
-                        tracing::warn!(
-                            "could not register the Schemaic MCP server with Antigravity; \
-                             this session has no database tools"
-                        );
-                    }
-                    reg
-                }
-            };
+            // No global state to hold here: the one harness that needed it —
+            // Antigravity, whose configuration is a registration rather than a
+            // flag — is spawned once per conversation now, so its
+            // `AgyRegistration` lives with the persistent task instead. Codex
+            // and OpenCode are configured entirely per invocation.
             let mut pump = TurnPump::new(ai_tx);
             let mut thread: Option<String> = None;
             while let Some(msg) = rx.recv().await {
@@ -1195,37 +1161,47 @@ pub(crate) fn start_ai_session(
         return (tx, ep_file);
     }
 
-    // MCP config: launch THIS binary in `--mcp-serve` mode, handing it the
-    // (already-tunnelled) DB endpoint via env — written to a temp file so the
-    // credentials never appear on a command line (review C6).
-    let mcp_cfg = write_mcp_config(&endpoint_json(
-        &db,
-        database.as_deref(),
-        data.may_query(),
-        schema_scope != SchemaScope::None,
-        &hidden,
-    ));
     let tools = if data.may_query() {
         AI_TOOLS_WITH_QUERY
     } else {
         AI_TOOLS_READ_ONLY
     };
+    // **Two persistent harnesses, two ways of being told about the server.**
+    // Claude is pointed at a config file: launch THIS binary in `--mcp-serve`
+    // mode, handing it the (already-tunnelled) DB endpoint — written to a temp
+    // file so the credentials never appear on a command line (review C6).
+    // Antigravity has no per-invocation configuration at all, so what it gets
+    // instead is `AgyRegistration`, gathered here and installed inside the
+    // session task: it is two `agy` invocations and a settings rewrite, and this
+    // function runs on the Floem UI thread.
+    let mcp_cfg = match harness {
+        Harness::Claude => write_mcp_config(&endpoint),
+        _ => None,
+    };
+    let agy_install = match harness {
+        Harness::Antigravity => {
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "schemaic".to_string());
+            write_endpoint_file(&endpoint).map(|p| (exe, p.to_string_lossy().into_owned()))
+        }
+        _ => None,
+    };
+    let agy_bin = bin.clone();
     let mcp_cfg_arg = mcp_cfg.as_ref().map(|p| p.to_string_lossy().into_owned());
-    let args = schemaic_ai::build_session_args(
-        &system_context,
-        Some(&model),
-        // Claude's own four, asked the same way the per-turn harnesses ask —
-        // this arm cannot leak another CLI's vocabulary today, and it goes
-        // through the predicate so it still cannot if a level is ever added to
-        // one harness and not another.
-        Some(harness.effort_arg(&effort).unwrap_or_default()),
-        mcp_cfg_arg.as_deref(),
-        tools,
-        // The seal for the binary the gate above actually checked. Re-resolving
-        // here would let the two disagree the moment `harness_bin` gains a
-        // reason to answer differently on a second call.
-        checked.seal,
-    );
+    let spec = schemaic_ai::harness::TurnSpec {
+        system: system_context.clone(),
+        model: model.clone(),
+        // Asked through the predicate, so this arm cannot leak another CLI's
+        // vocabulary even if a level is added to one harness and not another.
+        effort: harness.effort_arg(&effort).unwrap_or_default().to_string(),
+        mcp_config: mcp_cfg_arg.clone(),
+        ..Default::default()
+    };
+    // The seal for the binary the gate above actually checked. Re-resolving here
+    // would let the two disagree the moment `harness_bin` gains a reason to
+    // answer differently on a second call.
+    let args = schemaic_ai::harness::session_args(harness, &spec, checked.seal, tools);
 
     // Before the spawn, because afterwards it is unrecognisable: the OS returns
     // a generic failure and the arm below blames the installation.
@@ -1242,24 +1218,52 @@ pub(crate) fn start_ai_session(
     }
 
     handle.spawn(async move {
-        let mut child = match Command::new(&bin)
-            .args(&args)
-            .current_dir(session_cwd())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Capture stderr (was discarded): a failing `claude` — e.g. an expired
-            // OAuth session — writes its reason here or to stdout, and we need it to
-            // surface a real error instead of an empty response.
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+        // Held for the life of the session: dropping it removes the MCP
+        // registration and the allow-rules together. Installed here rather than
+        // before the spawn, and on a blocking thread rather than a worker,
+        // because it is two `agy` invocations and a settings rewrite. The first
+        // turn's `rx.recv()` has not been reached yet, so nothing races it.
+        let _registration = match agy_install {
+            None => None,
+            Some((exe, ep)) => {
+                let reg = tokio::task::spawn_blocking(move || {
+                    crate::antigravity::AgyRegistration::install(&agy_bin, &exe, &ep, tools)
+                })
+                .await
+                .ok();
+                if !reg.as_ref().is_some_and(|r| r.is_installed()) {
+                    // Said out loud rather than discovered: the session runs, but
+                    // every database tool call in it will be refused.
+                    tracing::warn!(
+                        "could not register the Schemaic MCP server with Antigravity; \
+                         this session has no database tools"
+                    );
+                }
+                reg
+            }
+        };
+        let spawn_child = |args: Vec<String>| {
+            Command::new(&bin)
+                .args(args)
+                .current_dir(session_cwd())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                // Capture stderr (was discarded): a failing CLI — e.g. an expired
+                // OAuth session — writes its reason here or to stdout, and we need
+                // it to surface a real error instead of an empty response.
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+        };
+        let mut child = match spawn_child(args.clone()) {
             Ok(c) => c,
             Err(e) => {
                 let _ = ai_tx.send(AiStreamMsg {
                     segs: vec![schemaic_core::transcript::Seg::Text(format!(
-                        "Couldn't launch the `claude` CLI ({e}). Ensure Claude Code is \
-                         installed (or set SCHEMAIC_CLAUDE_BIN)."
+                        "Couldn't launch the `{}` CLI ({e}). Ensure {} is installed \
+                         (or set its path in Settings → AI).",
+                        harness.bin(),
+                        harness.label()
                     ))],
                     done: true,
                     is_error: true,
@@ -1291,16 +1295,75 @@ pub(crate) fn start_ai_session(
         // Plain-text stdout lines that aren't stream-json (e.g. a fatal error the
         // CLI prints before exiting) — kept as a fallback diagnostic.
         let mut raw_output: Vec<String> = Vec::new();
+        // **One parser for the stream, not one per turn**, which is what makes
+        // the turn-boundary reset inside it load-bearing here — see
+        // `StreamParser::push`.
+        let mut parser = schemaic_ai::stream::StreamParser::new(harness);
+        // The conversation this process is holding, learned from its opening
+        // event. Only ever read to resume after a Stop that had to kill it.
+        let mut conversation: Option<String> = None;
+        // Antigravity has no `--append-system-prompt`, so its outline travels in
+        // the first turn's text. Once, not every turn: the process keeps the
+        // conversation, and re-sending the schema each time is most of what
+        // holding it was for.
+        let mut owes_system = harness.session_system_in_first_turn();
 
         loop {
             tokio::select! {
                 maybe = rx.recv() => match maybe {
+                    Some(SessionMsg::Interrupt) if harness.session_interrupt().is_none() => {
+                        // **No interrupt message exists on this CLI**, and a
+                        // guessed one is worse than none: an unrecognised event
+                        // on its stdin is ignored in silence, so the turn would
+                        // run on with the panel waiting for a stop that never
+                        // came. Ending the process is the only mechanism, and
+                        // the conversation is picked back up by id on the next
+                        // turn — which is why `supports_resume` is true for a
+                        // harness that also holds its conversation.
+                        let _ = child.kill().await;
+                        pump.stop();
+                        let resumed = schemaic_ai::harness::TurnSpec {
+                            resume: conversation.clone(),
+                            ..spec.clone()
+                        };
+                        let next = schemaic_ai::harness::session_args(
+                            harness, &resumed, checked.seal, tools,
+                        );
+                        match spawn_child(next) {
+                            Ok(c) => {
+                                child = c;
+                                stdin = child.stdin.take().expect("stdin piped");
+                                reader = BufReader::new(
+                                    child.stdout.take().expect("stdout piped"),
+                                ).lines();
+                                parser = schemaic_ai::stream::StreamParser::new(harness);
+                                raw_output.clear();
+                            }
+                            // Nothing left to talk to: end the session rather
+                            // than sit on a channel whose child is gone.
+                            Err(_) => break,
+                        }
+                    }
                     Some(msg) => {
                         // The wire encoding lives here, with the task that owns
                         // the child, rather than in the app's send path.
                         let line = match msg {
-                            SessionMsg::Turn(t) => schemaic_ai::user_message_line(&t),
-                            SessionMsg::Interrupt => schemaic_ai::interrupt_line("stop"),
+                            SessionMsg::Turn(t) => {
+                                // Cleared only when there was something to send,
+                                // so an empty outline on the opening turn does
+                                // not spend the one chance to deliver it.
+                                let t = match owes_system && !system_context.trim().is_empty() {
+                                    true => {
+                                        owes_system = false;
+                                        format!("{system_context}\n\n{t}")
+                                    }
+                                    false => t,
+                                };
+                                harness.session_turn_line(&t)
+                            }
+                            SessionMsg::Interrupt => {
+                                harness.session_interrupt().unwrap_or_default()
+                            }
                         };
                         if stdin.write_all(line.as_bytes()).await.is_err() {
                             break;
@@ -1311,7 +1374,13 @@ pub(crate) fn start_ai_session(
                 },
                 line = reader.next_line() => match line {
                     Ok(Some(l)) => {
-                        let events = schemaic_ai::parse_stream_line(&l);
+                        let events = parser.push(&l);
+                        if let Some(schemaic_ai::StreamEvent::SessionStarted { id }) = events
+                            .iter()
+                            .find(|e| matches!(e, schemaic_ai::StreamEvent::SessionStarted { .. }))
+                        {
+                            conversation = Some(id.clone());
+                        }
                         // A non-blank line that yields no events AND isn't valid JSON
                         // is a plain-text diagnostic (e.g. the auth error) — keep it.
                         if events.is_empty()

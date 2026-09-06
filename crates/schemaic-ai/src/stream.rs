@@ -35,13 +35,15 @@
 //! is the fix and the first reason [`StreamParser`] owns a `&mut self`.
 //!
 //! **Tool calls are restated the same way, and that needs the same answer.**
-//! Both per-turn dialects re-send a call while it runs — Codex on every
+//! Codex and Antigravity both re-send a call while it runs — Codex on every
 //! `item.updated` for the item, Antigravity on every `state: "ACTIVE"` for the
 //! step — without marking the repeat. The panel pushes a chip per announcement
 //! and attaches a result to the last pending one, so a restatement left an
 //! earlier chip spinning forever. `StreamParser::seen_tools` is the second piece
-//! of per-stream state, and it is keyed by whatever id that dialect gives the
-//! call.
+//! of per-turn state, and it is keyed by whatever id that dialect gives the
+//! call — which is why [`StreamParser::push`] clears it at a turn boundary. It
+//! was *per stream* until a stream could hold more than one Antigravity turn,
+//! and those step ids start again from zero on each.
 //!
 //! **A side-effecting tool is surfaced, never dropped.** Codex can report
 //! `command_execution` and `file_change` items. Under the sandbox this harness
@@ -95,9 +97,11 @@ impl Coalescer {
 /// Decodes one harness's JSONL into [`StreamEvent`]s.
 ///
 /// Holds the per-message state described in the module docs. One parser per
-/// turn for the one-process-per-turn harnesses, one per session for Claude;
-/// either way it must not be shared between two concurrent streams, because the
-/// coalescer is keyed by ids that are only unique within a stream.
+/// turn for the harnesses spawned per turn, one per session for the two that
+/// hold a process — Claude and Antigravity. Either way it must not be shared
+/// between two concurrent streams: the coalescer and the tool set are keyed by
+/// ids unique only within a *turn*, which is why [`StreamParser::push`] clears
+/// them at every turn boundary rather than only at construction.
 pub struct StreamParser {
     harness: Harness,
     text: Coalescer,
@@ -182,8 +186,14 @@ impl StreamParser {
 
     /// Whether this tool call is being announced for the first time.
     ///
-    /// Ids are only unique within one stream, which is why the set lives on the
-    /// parser and not anywhere longer-lived — the same reason the coalescer does.
+    /// **Unique within one *turn*, which is a narrower promise than the stream.**
+    /// The set lived on the parser because ids mean nothing outside it — the same
+    /// reason the coalescer does — and while Claude was the only harness whose
+    /// stream held more than one turn, "per stream" and "per turn" were the same
+    /// scope; Claude's ids are unique for the life of the process either way.
+    /// Antigravity numbers its steps from zero on each turn, so on a persistent
+    /// one the second turn reuses the first's ids. [`StreamParser::push`] clears
+    /// this at every turn boundary for that reason.
     fn first_sight(&mut self, id: &str) -> bool {
         self.seen_tools.insert(id.to_string())
     }
@@ -202,12 +212,31 @@ impl StreamParser {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             return Vec::new();
         };
-        match self.harness {
+        let out = match self.harness {
             Harness::Claude => crate::parse_stream_line(line),
             Harness::Codex => self.push_codex(&v),
             Harness::Antigravity => self.push_antigravity(&v),
             Harness::OpenCode => self.push_opencode(&v),
+        };
+        // **A turn boundary clears the per-turn state, and it has to now that a
+        // stream can hold more than one turn.** `seen_tools` is keyed by whatever
+        // id the dialect gives a call, and those ids are unique only *within a
+        // turn* — Antigravity numbers its steps from zero on each one. That was
+        // invisible while every multi-turn stream was Claude's, whose ids are
+        // unique for the life of the process; on a persistent Antigravity the
+        // second turn's first tool call carries `step_index` 0 again, the set
+        // already holds it, and the chip announcing it is dropped. A tool call
+        // that ran with nothing on screen to say so is the one failure this
+        // whole dialect is decoded carefully to avoid.
+        if out
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TurnDone { .. }))
+        {
+            self.seen_tools.clear();
+            self.text = Coalescer::default();
+            self.oc = OpenCodeTurn::default();
         }
+        out
     }
 
     /// `opencode run --format json`.
@@ -867,7 +896,56 @@ mod tests {
         );
     }
 
-    /// The same rule on the other per-turn dialect, whose id is `step_index`.
+    /// **The seam the per-turn reset exists for, and it needs two turns to
+    /// show.** `seen_tools` is keyed by `step_index`, and Antigravity numbers
+    /// its steps from zero on *each* turn — so on a persistent session the
+    /// second turn's first tool call arrives with an id the set already holds,
+    /// and its chip is dropped. Every other tool test here drives a single turn,
+    /// which is exactly why the bug was invisible: one parser, one turn, no
+    /// collision. This one feeds two turns through one parser, as a live session
+    /// does.
+    #[test]
+    fn a_second_turn_reuses_step_ids_and_still_gets_its_chips() {
+        let tool = |idx: u32, name: &str| {
+            format!(
+                r#"{{"event":"step_update","step_update":{{"step_index":{idx},"state":"ACTIVE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{{"name":"call_mcp_tool","parameters":{{"ServerName":"schemaic","ToolName":"{name}"}}}}}}}}"#
+            )
+        };
+        let result = r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"ok\n","duration_seconds":1.0,"num_turns":1,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
+        let mut p = StreamParser::new(Harness::Antigravity);
+        let mut chips = 0usize;
+        // Turn one: one call at step 0, then the turn ends.
+        for l in [tool(0, "list_schema").as_str(), result] {
+            chips += p
+                .push(l)
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::ToolUse { .. }))
+                .count();
+        }
+        assert_eq!(chips, 1, "the first turn's chip went missing");
+        // Turn two: a *different* call that happens to be step 0 again.
+        let second = p.push(&tool(0, "describe_table"));
+        assert_eq!(
+            second
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::ToolUse { .. }))
+                .count(),
+            1,
+            "the second turn's tool ran with no chip to show for it: {second:?}"
+        );
+        // …and the restatement rule still holds *within* that second turn.
+        let restated = p.push(&tool(0, "describe_table"));
+        assert!(
+            !restated
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolUse { .. })),
+            "a restatement inside one turn announced itself twice: {restated:?}"
+        );
+    }
+
+    /// The same rule on the other dialect that restates a call, whose id is
+    /// `step_index` — held *within* one turn, which is the half the reset above
+    /// must not undo.
     #[test]
     fn a_restated_agy_tool_step_does_not_add_a_second_chip() {
         let out = drive(
