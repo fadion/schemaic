@@ -46,41 +46,18 @@ confidence-threshold = 0.8
 unmaintained = "workspace"
 # Vulnerabilities are denied by default. Each entry below is a conscious, reviewed
 # exception — a specific advisory we've assessed as not reachable / not fixable.
+#
+# **RUSTSEC-2026-0194 and -0195 (quick-xml < 0.41) used to be listed here and are
+# not any more, because the condition their own entry named has been met.** The
+# tree carried two quick-xml: 0.41 under calamine, which is the one that parses
+# an imported `.xlsx` — untrusted XML, the only untrusted XML this app reads —
+# and a vulnerable 0.39 under `wayland-scanner`, a Linux-only build-time proc
+# macro over Wayland's vendored protocol XML. The old entry said to check the
+# version was >= 0.41 before removing them, and `wayland-scanner` 0.31.11 moved
+# to 0.41: `cargo tree -i quick-xml` now shows exactly one, 0.41.0, under
+# calamine. If a duplicate ever comes back, do not dedupe it *downwards* — that
+# would put the untrusted parser back on the vulnerable code.
 ignore = [
-    # quick-xml < 0.41 quadratic-time attribute parsing (DoS). Only exploitable
-    # via UNTRUSTED XML input, and the *vulnerable* copy never sees any — nor,
-    # on Windows, is it built at all. `cargo tree -i quick-xml@0.39.4 -e
-    # normal,build --target all` has exactly one consumer:
-    #
-    #   quick-xml 0.39.4 <- wayland-scanner (proc-macro) <- smithay-client-toolkit
-    #                    <- floem-winit <- floem
-    #
-    # a build-time proc macro over Wayland's own protocol XML, on Linux only.
-    # Its input is vendored, it runs at compile time, and nothing it produces
-    # parses anything at runtime.
-    #
-    # (An earlier version of this entry said 0.39 was reached "through
-    # usvg/resvg". It is not: usvg parses SVG with roxmltree, and is not a
-    # consumer of either quick-xml version. Following that sentence would have
-    # meant watching floem's SVG stack for an upgrade that can never come from
-    # there, while the crate that *does* pull 0.39 went unwatched.)
-    #
-    # Revisit when the winit/wayland stack moves — wayland-scanner <-
-    # smithay-client-toolkit <- floem-winit is the upgrade path, not the
-    # renderer.
-    #
-    # Schemaic *does* now parse untrusted XML — an imported `.xlsx` is a ZIP of
-    # it, and the file comes from wherever the user got it. That path goes
-    # through calamine, which depends on quick-xml **0.41**: the patched
-    # version, and the reason the tree carries two. So the duplicate that
-    # `[bans] multiple-versions = "warn"` reports here is load-bearing rather
-    # than untidy — deduplicating it *downwards* would put the untrusted parser
-    # on the vulnerable code. If a future change makes these resolve to one
-    # version, check it is >= 0.41 before removing these ignores.
-    "RUSTSEC-2026-0194",
-    # quick-xml < 0.41 unbounded namespace-declaration allocation (memory-exhaustion
-    # DoS). Same reachability + upgrade situation as RUSTSEC-2026-0194 above.
-    "RUSTSEC-2026-0195",
     # `rsa` "Marvin Attack" timing sidechannel (RSA key recovery). Pulled by russh
     # for RSA SSH key/host support. No patched `rsa` release exists yet. The attack
     # needs fine-grained timing of many RSA operations, impractical against a DB

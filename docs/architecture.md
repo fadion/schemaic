@@ -362,9 +362,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     connection in three positions — bare column name, bare table name, bare `AS` alias — asserting
     both predicates against what SQLite actually accepts. It is a standing guard rather than a
     snapshot, so a keyword a future release adds arrives on its own and fails. Against 3.46.0's 147
-    keywords it found the 57 existing `SQLITE_RESERVED` entries all correct and exactly four words
-    missing from the identifier set: the three above, plus `NOTHING` (from `ON CONFLICT DO
-    NOTHING`), which is refused in every position and so joined `SQLITE_RESERVED` itself.
+    keywords — the amalgamation bundled when it was written — it found the 57 existing
+    `SQLITE_RESERVED` entries all correct and exactly four words missing from the identifier set:
+    the three above, plus `NOTHING` (from `ON CONFLICT DO NOTHING`), which is refused in every
+    position and so joined `SQLITE_RESERVED` itself. The bundled engine has since moved to
+    **3.53.2** (`rusqlite` 0.32 → 0.40, carrying `libsqlite3-sys` 0.30 → 0.38) and the guard passed
+    that bump unchanged, still over 147 keywords. Nobody re-read SQLite's keyword list to find that
+    out, which is the whole reason this is a test and not a comment.
     **Which position a word breaks in is load-bearing**: `CAST` and `RAISE` are refused as a bare
     *column* name but accepted as a table's, and `IF` is the reverse — a first draft of the
     end-to-end `a_table_named_for_a_keyword_still_opens` put each one on the side it tolerates and
@@ -1170,11 +1174,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     directly: one call site, so a format that needs a warning cannot be given one nothing asks for.
     **The reader is `calamine`, and an imported `.xlsx` is the first untrusted XML this app has ever
     parsed** — a ZIP of it, from wherever the user got the file. `calamine` depends on quick-xml
-    **0.41**, the patched version; the 0.39 in the tree is reached only through usvg/resvg for the
-    bundled SVG icons and through wayland-scanner at build time. So the duplicate `deny.toml`'s
-    `[bans]` reports is load-bearing rather than untidy — deduplicating it *downwards* would put the
-    untrusted parser on the vulnerable code, which is why `RUSTSEC-2026-0194`/`0195` are ignored
-    there with that reachability argument written out beside them.
+    **0.41**, the version that fixes `RUSTSEC-2026-0194`/`0195`, and that is now the only quick-xml
+    in the tree: `cargo tree -i quick-xml` returns exactly one, 0.41.0, under calamine. There were
+    two for a while, the second a vulnerable 0.39 whose **only** consumer was `wayland-scanner`, a
+    Linux-only build-time proc macro over Wayland's vendored protocol XML — not usvg/resvg, which
+    parses SVG with roxmltree and never depended on either version, an attribution `deny.toml` had
+    to correct once already and which the bump has now settled by demonstration: resvg and usvg sat
+    still at 0.43 while 0.39 disappeared. That XML shipped with the build rather than arriving from
+    a user, so `deny.toml` ignored the two advisories on that reachability argument, on the stated
+    condition that the ignores go once the duplicate did.
+    `wayland-scanner` 0.31.11 moved to quick-xml 0.41 and took the last 0.39 with it, so they are
+    gone (they had begun emitting `advisory-not-detected`) and `RUSTSEC-2023-0071` — `rsa`'s Marvin
+    timing sidechannel, via russh — is the only ignore left. **The argument outlives the
+    duplicate**: if a second quick-xml ever comes back it must not be deduplicated *downwards*,
+    which would put the untrusted parser back on the vulnerable code, and `deny.toml` carries that
+    warning in prose where the ignores used to be.
     `target_verdict` over `DbNodeView` is the modal's other half: whether a schema change means the
     table it is open on has *gone*. `has_table` is an
     `Option<bool>` because "I looked and it wasn't there" and "I haven't looked" are the same
@@ -1590,7 +1604,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     absurd. The predicate answers false for anything it isn't sure of, because the failure mode is a
     plan that *half-applies* — fast path taken, engine refuses the statement, and the edit the
     preview promised is simply gone. A needless rebuild is slow; a wrong fast path is a lie. The
-    rules, each measured against SQLite 3.46 rather than read off the grammar: `position` must be
+    rules, each measured against SQLite 3.46.0 rather than read off the grammar (the bundled engine
+    is 3.53.2 now — the tests below say which half of the gate that re-checked): `position` must be
     `None`, since `ADD COLUMN` always appends and a column dropped into the middle would land at the
     end, leaving the designer showing one order and the table having another — **this is the one
     rule with no error message behind it, the statement succeeds, in the wrong place** (and
@@ -1617,7 +1632,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `db::sqlite`'s `every_natively_added_column_is_one_sqlite_accepts` runs every shape the
     predicate calls native through `run_ddl` at real in-memory SQLite — which is what the fast path
     actually rests on, since a predicate drifting from the engine's restrictions can't be caught by
-    reasoning, only by asking SQLite.
+    reasoning, only by asking SQLite. That test compiles against whatever amalgamation `rusqlite`
+    bundles, so the move to 3.53.2 re-checked the **permissive** half for free and it still passes.
+    The refusals get no such guard: nothing here compiles a shape the gate withholds, so the list
+    above remains what it was measured to be on 3.46.0 and a later SQLite quietly accepting one of
+    them would cost only a rebuild nobody needed — which is the direction this gate is built to fail
+    in.
     **`supports_change(dialect, &Change)` is the second gate, and it answers a different
     question.** It is about one change **on its own** — a context-menu shortcut, which has no draft
     behind it to build a table from — where the designer's plan can answer anything by rebuilding.
@@ -4639,13 +4659,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   reason: SQLite has no lock-timeout *setting*, the wait being this per-connection busy timeout, so
   the failure that statement bounds elsewhere has no analogue. **Values are dynamically typed**: a declared type is an *affinity*, so `value_of`
   reads the storage class of the value in front of it rather than trusting the column, and a BLOB
-  renders as its size, having no lossless text form. **Column provenance is not available from the
-  driver at all** — SQLite's C API has `sqlite3_column_table_name`, but only under
-  `SQLITE_ENABLE_COLUMN_METADATA`, and rusqlite exposes neither the flag nor the call (measured
-  against 0.32.1 and 0.40: there is no `column_metadata` feature and `libsqlite3-sys` generates no
-  binding), so a result's `origin` is derived from the *statement* instead and anything but a
-  plainly single-table `SELECT` is left `None`, which the editing system already reads as
-  not-editable. **Every rowid table has a key, and it isn't a column.** A table with no primary key
+  renders as its size, having no lossless text form. **Column provenance is available from the driver,
+  and deliberately not taken** — SQLite's C API has `sqlite3_column_table_name`, but only under
+  `SQLITE_ENABLE_COLUMN_METADATA`, which rusqlite gates behind a `column_metadata` feature the
+  workspace `Cargo.toml` leaves off; the comment above that dependency holds the configuration
+  detail. On 0.32 the absence was forced — there was no such feature at all — so the derivation
+  below was a description of the driver; since the 0.32 → 0.40 bump it is a choice. **Nothing
+  downstream moved with it**: a result's `origin` is still derived from the *statement*, anything
+  but a plainly single-table `SELECT` is still left `None`, and the editing system still reads that
+  as not-editable. Turning the feature on is a design call rather than a feature-flag edit, because
+  real per-column provenance would attribute columns the statement derivation refuses — a join, a
+  subquery — and so widen which SQLite results are editable, which puts `edit::resolve_key` and the
+  `ColumnOrigin::implicit_key` rowid fallback described next in scope. It has not been made.
+  **Every rowid table has a key, and it isn't a column.** A table with no primary key
   and no usable unique index is read-only on the other two engines because there is genuinely no
   way to name one of its rows; on SQLite there always is one, unless the table was declared
   `WITHOUT ROWID`. Such a table is therefore opened as `SELECT rowid, * FROM t`
@@ -4764,7 +4790,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   as PostgreSQL's poisoned one is the difference between "still committable" and "discard
   everything".
   SSH tunnels return a `TunnelHandle` (drop → port freed) with
-  keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
+  keepalives + TOFU host-key verification (`ssh_known_hosts.json`). **`russh` stays on 0.62
+  deliberately**: 0.63 changes `Handler::check_server_key` to take a `&PublicKeyOrCertificate`
+  rather than a `&ssh_key::PublicKey`, so `ssh.rs` would have to decide what a *certificate* offer
+  means to a fingerprint store before it has anything to hash. That is a migration on the code that
+  decides whether to trust a host, not a version bump, and it is not being done inside a dependency
+  sweep.
   **PostgreSQL cannot connect without naming a database**, which is protocol rather than
   preference and stayed invisible while almost every server had a `postgres` one anybody could
   reach — so `connect_maintenance` guessed at that, the username and `template1` for server-level
@@ -8886,7 +8917,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     reasons the find flash is.
   - `erd_raster.rs` — SVG → PNG for the ER-diagram export, and the only reason `resvg` is a direct
     dependency (it was already in the tree via floem's `svg` view, same version, so it costs no
-    extra compile). It lives in this crate **because of the fonts**: the cards' widths were
+    extra compile). **Which version is floem's choice, not ours**: 0.43 is what `floem_renderer`
+    pulls, and moving the workspace to 0.48 would not upgrade that copy — it would stand a second
+    resvg, usvg and fontdb beside it and spend exactly the saving the shared compile is here for.
+    So this dependency follows floem's rather than the registry's latest. It lives in this crate
+    **because of the fonts**: the cards' widths were
     measured against the bundled IBM Plex Sans, so `png_from_svg` loads those exact bytes
     (`fonts::SANS_FACES`) into its own `fontdb` instead of scanning the machine's — deterministic,
     no startup sweep, and the text lands inside the boxes it was measured for on a build server as
@@ -11529,9 +11564,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   the engine delivered.** `commit_writes` runs a `GridWrite`
   (DELETEs → UPDATEs → INSERTs) in one transaction, each statement required to affect exactly 1 row
   (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. On SQLite
-  the *analysis* is the part that has to be conservative, since no driver reports provenance there
-  and it is derived from the statement (`intel::projection_of`, positional): anything but a plainly
-  single-table `SELECT` is simply not editable. That set has grown by exactly one well-defined
+  the *analysis* is the part that has to be conservative, since the driver's per-column provenance is
+  deliberately left off — see `db::sqlite` — and it is derived from the statement
+  (`intel::projection_of`, positional): anything but a plainly single-table `SELECT` is simply not
+  editable. That set has grown by exactly one well-defined
   shape — items placed ahead of a lone *trailing* `*`, which is what makes `SELECT rowid, * FROM t`
   (a keyless table opened through its rowid) analysable — and by nothing else. The guard did not
   move with it: an implicit key is an ordinary key column to `commit_writes`, so the ordering and

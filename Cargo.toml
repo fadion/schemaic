@@ -82,13 +82,28 @@ futures-util = "0.3"
 # SQLite (third engine). `bundled` compiles SQLite's own amalgamation in, so there
 # is no system library to find and the version is the one we tested against;
 # SQLite is public domain, so it adds no licence obligation for `cargo deny`.
-# `column_metadata` sets SQLITE_ENABLE_COLUMN_METADATA, which is what makes
-# `sqlite3_column_table_name`/`origin_name` available — the same per-column
-# provenance the editing system needs from MySQL's org_table/org_name, and without
-# it no SQLite result would be editable at all. The driver is *blocking*, so every
-# call runs inside `spawn_blocking`; that suits the one-connection-per-operation
-# invariant, which already opens and closes a connection per call.
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+# `column_decltype` is what `value_of` reads to name a column's declared type;
+# an affinity rather than a type, which is why it reads the storage class of the
+# value in front of it and not this.
+#
+# **There is no `column_metadata` here, and that is now a choice rather than a
+# limit.** The per-column provenance the editing system gets free from MySQL's
+# org_table/org_name has no SQLite equivalent turned on: a result's `origin` is
+# derived from the *statement*, so anything but a plainly single-table `SELECT`
+# is left `None` and reads as not-editable. Until the 0.32 -> 0.40 bump that was
+# forced — 0.32 had no such feature at all, and `libsqlite3-sys` generated no
+# binding for `sqlite3_column_table_name`. 0.40 declares
+# `column_metadata = ["libsqlite3-sys?/column_metadata"]`, sets
+# `-DSQLITE_ENABLE_COLUMN_METADATA`, and exposes `Column::table_name`/
+# `origin_name`, so real provenance is now available for the asking. Taking it
+# would widen which SQLite results are editable, which is a design call with the
+# editing invariants attached and not a feature-flag edit — so the flag stays
+# off until somebody makes that call deliberately.
+#
+# The driver is *blocking*, so every call runs inside `spawn_blocking`; that
+# suits the one-connection-per-operation invariant, which already opens and
+# closes a connection per call.
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 # TLS for the two networked engines. One stack for both, so `verify-ca` and
 # `verify-full` mean the same thing whichever engine is behind them — the
 # alternative is two verifiers with two sets of edge cases and one test-bed that
@@ -122,7 +137,7 @@ rustls-pki-types = "1"
 # already makes for `ring`.
 rustls-native-certs = "0.8"
 webpki-roots = "1"
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
 # `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
@@ -140,7 +155,7 @@ velopack = "1.2"
 # Process resource sampling for the status-bar CPU/RAM readout (cross-platform:
 # Windows/macOS/Linux). `default-features = false` + `system` = just the
 # CPU/memory/process reader, no disk/network/component/user probes.
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # The **local** wall clock, and nothing else. `core::date` does its own civil
 # arithmetic (Howard Hinnant's day↔date pair, unit-tested), but "which day is
@@ -189,9 +204,14 @@ csv = "1"
 #
 # `calamine` reads. Note the quick-xml it pulls is **0.41**, the version that
 # fixes RUSTSEC-2026-0194/0195 — which matters here and nowhere else in the
-# tree: an imported `.xlsx` is the first untrusted XML this app has ever parsed
-# (see `deny.toml`, where those two advisories are ignored for the *trusted*
-# bundled-SVG parser floem reaches through usvg).
+# tree: an imported `.xlsx` is the first untrusted XML this app has ever parsed.
+# The tree carried a vulnerable 0.39 alongside it for a while, reached only by
+# `wayland-scanner`'s build-time proc macro over Wayland's own vendored protocol
+# XML, and `deny.toml` ignored the two advisories on that reachability argument.
+# `wayland-scanner` 0.31.11 moved to 0.41 and took the last 0.39 with it, so
+# `cargo tree -i quick-xml` now returns exactly one version and the ignores are
+# gone — see `deny.toml`, which keeps the standing warning never to deduplicate
+# a future duplicate *downwards*.
 rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
 calamine = "0.36"
 

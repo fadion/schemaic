@@ -29,15 +29,25 @@
 //! MySQL and Postgres paths follow in taking the wire's text form: the model
 //! records what the database actually returned.
 //!
-//! **Column provenance is not available from the driver.** MySQL gives
-//! `org_table`/`org_name` on the wire and Postgres has `table_oid`/`column_id` on
-//! a prepared statement; SQLite's C API has the equivalent
-//! (`sqlite3_column_table_name`) but only when compiled with
-//! `SQLITE_ENABLE_COLUMN_METADATA`, and **rusqlite exposes neither the flag nor
-//! the call** — its `Column` carries a name and a declared type and nothing else
-//! (measured against 0.32.1 and confirmed against 0.40: there is no
-//! `column_metadata` feature, and `libsqlite3-sys` generates no binding). So
-//! provenance has to be derived from the *statement* instead, and that is
+//! **Column provenance is available from the driver, and deliberately not
+//! taken.** MySQL gives `org_table`/`org_name` on the wire and Postgres has
+//! `table_oid`/`column_id` on a prepared statement; SQLite's C API has the
+//! equivalent (`sqlite3_column_table_name`) but only when compiled with
+//! `SQLITE_ENABLE_COLUMN_METADATA`, which rusqlite gates behind a
+//! `column_metadata` feature the workspace `Cargo.toml` leaves off — so the
+//! `Column` this crate sees carries a name and a declared type and nothing else.
+//!
+//! On 0.32.1 that was forced rather than chosen: there was no such feature at
+//! all. The 0.32 -> 0.40 bump changed it — 0.40 declares `column_metadata`,
+//! `libsqlite3-sys` sets the compile flag from it, and `Column::table_name`/
+//! `origin_name` exist behind it. **Nothing below moved with that**: the flag is
+//! still off, so the derivation is unchanged and so is every result it refuses.
+//! Turning it on would attribute columns this derivation declines — a join, a
+//! subquery — and so widen which results are editable, which is a design call
+//! against [`schemaic_core::edit`]'s key selection rather than a feature-flag
+//! edit. It has not been made.
+//!
+//! So provenance is derived from the *statement* instead, and that is
 //! deliberately conservative: anything but a plainly single-table `SELECT` leaves
 //! `origin: None`, which the editing system already reads as "not editable" for an
 //! expression column. Guessing wider would make a wrong `UPDATE`, which is the one
