@@ -58,6 +58,15 @@
 //! or an aggregate reports no table at all, which is the same `None` the
 //! statement derivation gave it.
 //!
+//! It also names the **database**, so an `ATTACH`ed table is attributed like any
+//! other. That is why every schema read behind attribution takes a database
+//! argument rather than addressing `main`: two attached files may hold a table
+//! of the same name with different columns, different keys and different
+//! nullability, and a pragma asked without a database would describe one while
+//! the grid edited the other. Which database an *unqualified* name resolves in
+//! is asked of SQLite too — see [`resolve_relation`], since the answer is not
+//! always `main`.
+//!
 //! **Every rowid table has a key, and it isn't a column.** A table with no primary
 //! key and no usable unique index is read-only on the other two engines because
 //! there is genuinely no way to name one of its rows. On SQLite there always is,
@@ -412,16 +421,23 @@ fn columns_of(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
 ///   time is worse than not offering it. It is also the *only* thing standing
 ///   between a compound hidden inside a view and a write to the wrong table, so
 ///   it guards far more than the case it was written for;
-/// - a qualifier other than `main` is skipped — not because provenance can't name
-///   an `ATTACH`ed database (it does), but because `is_view`, `table_columns` and
-///   the index and collation readers all address `main` alone, so nothing here
-///   could check what it was attributing;
-/// - every table provenance names must be one the statement was seen to read, so
-///   nothing is attributed to a table that was never view-checked.
+/// - every relation is resolved to the **database** it is really in
+///   ([`resolve_relation`]), and every column attributed only to a
+///   `(database, table)` pair the statement was seen to read — so nothing is
+///   attributed to a relation that was never checked for being a view, and two
+///   `ATTACH`ed files holding a table of one name cannot stand in for each other.
 ///
-/// Flags come from the table's own pragmas, so `analyze_edit` gets the same
-/// material it gets from the other two engines and needs no SQLite-specific
-/// branch.
+/// Flags come from the table's own pragmas, **asked of that database**, so
+/// `analyze_edit` gets the same material it gets from the other two engines and
+/// needs no SQLite-specific branch. Every schema read behind this takes the
+/// database as an argument for that reason — the column list, the indexes and
+/// their collations, the rowid-ness, the `AUTOINCREMENT` keyword and a generated
+/// column's expression. They addressed `main` alone until attached databases
+/// became attributable, and a lookup that forgot which database it was in would
+/// describe `main.note` while the grid edited `side.note`. The generated
+/// expression was the last of them to learn it and the easiest to miss, having
+/// no pragma behind it at all: it is dug out of a `sqlite_master`, and an
+/// unqualified one is `main`'s.
 ///
 /// **One thing provenance cannot answer, so the statement still does.** A rowid
 /// projected under any of its spellings comes back as `origin_name` `"rowid"` —
@@ -444,15 +460,16 @@ fn attach_origins(
     if sources.is_empty() {
         return;
     }
+    // Each relation resolved to the database it is really in, refusing the whole
+    // result if any of them is a view or isn't there. The database matters twice
+    // over: it decides which `sqlite_master` and which pragmas describe the
+    // table below, and two attached files may hold a table of the same name with
+    // different columns and different keys.
+    let mut read: Vec<(String, String)> = Vec::new();
     for s in &sources {
-        if s.qualifier
-            .as_deref()
-            .is_some_and(|q| !q.eq_ignore_ascii_case(MAIN))
-        {
-            return;
-        }
-        if is_view(conn, &s.name).unwrap_or(true) {
-            return;
+        match resolve_relation(conn, s.qualifier.as_deref(), &s.name) {
+            Some((db, false)) => read.push((db, s.name.clone())),
+            _ => return,
         }
     }
 
@@ -469,7 +486,12 @@ fn attach_origins(
     // only a statement that projected one.
     let spellings: Option<Vec<Option<String>>> =
         projection_of(sql, SqlDialect::Sqlite).and_then(|(source, projection)| {
-            let info = table_columns(conn, &source.name).ok()?;
+            // The database this one source resolved in, taken from the same list
+            // the view check was made against rather than assumed to be `main`.
+            let (db, _) = read
+                .iter()
+                .find(|(_, n)| n.eq_ignore_ascii_case(&source.name))?;
+            let info = table_columns(conn, db, &source.name).ok()?;
             let bases: Vec<Option<String>> = match projection {
                 Projection::Wildcard => info.iter().map(|c| Some(c.name.clone())).collect(),
                 Projection::Items(items) => items,
@@ -489,7 +511,7 @@ fn attach_origins(
         columns: Vec<ColumnInfo>,
         unique: Vec<String>,
     }
-    let mut cache: Vec<(String, Option<TableFacts>)> = Vec::new();
+    let mut cache: Vec<((String, String), Option<TableFacts>)> = Vec::new();
     // Both lists are built from the same prepared statement's column set, so this
     // holds structurally rather than hopefully. It is stated because the loop
     // below `zip`s them: a mismatch would truncate silently, and a column left
@@ -509,25 +531,29 @@ fn attach_origins(
         else {
             continue;
         };
-        if !db.eq_ignore_ascii_case(MAIN) {
-            continue;
-        }
-        // Attribute only to a table the statement was seen to read — and so one
-        // the view check above actually covered.
-        if !sources.iter().any(|s| s.name.eq_ignore_ascii_case(table)) {
+        // Attribute only to a relation the statement was seen to read, matched on
+        // the database as well as the name — so it is one `resolve_relation`
+        // established is a table rather than a view, and so two attached files
+        // holding the same name cannot stand in for each other.
+        if !read
+            .iter()
+            .any(|(d, n)| d.eq_ignore_ascii_case(db) && n.eq_ignore_ascii_case(table))
+        {
             continue;
         }
         let slot = match cache
             .iter()
-            .position(|(t, _)| t.eq_ignore_ascii_case(table))
+            .position(|((d, t), _)| d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table))
         {
             Some(i) => i,
             None => {
-                let loaded = table_columns(conn, table).ok().map(|columns| TableFacts {
-                    columns,
-                    unique: single_column_unique_indexes(conn, table).unwrap_or_default(),
-                });
-                cache.push((table.to_string(), loaded));
+                let loaded = table_columns(conn, db, table)
+                    .ok()
+                    .map(|columns| TableFacts {
+                        columns,
+                        unique: single_column_unique_indexes(conn, db, table).unwrap_or_default(),
+                    });
+                cache.push(((db.to_string(), table.to_string()), loaded));
                 cache.len() - 1
             }
         };
@@ -548,10 +574,11 @@ fn attach_origins(
             let Some(base) = spellings.as_ref().and_then(|b| b[idx].clone()) else {
                 continue;
             };
-            if ROWID_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(&base)) && has_rowid(conn, table)
+            if ROWID_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(&base))
+                && has_rowid(conn, db, table)
             {
                 col.origin = Some(ColumnOrigin {
-                    database: MAIN.to_string(),
+                    database: db.to_string(),
                     schema: None,
                     table: table.to_string(),
                     column: base,
@@ -571,8 +598,13 @@ fn attach_origins(
             continue;
         };
         col.origin = Some(ColumnOrigin {
-            database: MAIN.to_string(),
-            // SQLite has no namespace level; `main` is the database, not a schema.
+            // Whichever database the column is really in — `main` for almost
+            // everything, an `ATTACH`ed name otherwise. `analyze_edit` keys its
+            // groups on this, so it is what keeps two attached files holding a
+            // table of the same name from being edited as one.
+            database: db.to_string(),
+            // SQLite has no namespace level: the name above is a database, and
+            // there is nothing between it and the table.
             schema: None,
             table: table.to_string(),
             column: ci.name.clone(),
@@ -639,11 +671,11 @@ const ROWID_ALIASES: [&str; 3] = ["rowid", "_rowid_", "oid"];
 /// can be separated by a comment or a newline, may be followed by `, STRICT`, and
 /// a column named `without_rowid` reads identically to a substring match. A view,
 /// or a name that isn't there, answers `false` — neither has a rowid either.
-fn has_rowid(conn: &SqliteConn, table: &str) -> bool {
+fn has_rowid(conn: &SqliteConn, db: &str, table: &str) -> bool {
     let wr: Option<i64> = conn
         .query_row(
             "SELECT wr FROM pragma_table_list(?1) WHERE schema = ?2 AND type = 'table'",
-            rusqlite::params![table, MAIN],
+            rusqlite::params![table, db],
             |r| r.get(0),
         )
         .ok();
@@ -660,6 +692,14 @@ fn has_rowid(conn: &SqliteConn, table: &str) -> bool {
 ///
 /// `strict` arrived in SQLite 3.37; on an older library the column is absent and
 /// the query fails, which lands on the same `false`.
+///
+/// **`main` on purpose, unlike its neighbours.** The reads behind write-back
+/// attribution all take a database now, because an `ATTACH`ed table can be
+/// edited; this one is behind the *designer*, which only ever opens a table from
+/// the schema tree, and that tree holds the single `main` node `fetch_databases`
+/// reports for SQLite. It gains a parameter the day an attached table can be
+/// redesigned, and not before — a parameter every caller would pass `MAIN` to is
+/// a worse lie than the constant.
 fn table_list_flags(conn: &SqliteConn, table: &str) -> (bool, bool) {
     conn.query_row(
         "SELECT wr, strict FROM pragma_table_list(?1) WHERE schema = ?2 AND type = 'table'",
@@ -690,35 +730,54 @@ fn implicit_row_key(columns: &[ColumnInfo], has_rowid: bool) -> Option<String> {
         .map(|alias| (*alias).to_string())
 }
 
-/// Is this name a view rather than a base table? `None` when it is neither.
+/// Which database `name` resolves in, and whether it is a view. `None` when the
+/// name is not an object anywhere the statement could have reached it, which the
+/// only caller treats exactly as it treats a view: don't attribute.
+///
+/// **Asked of SQLite rather than assumed**, because an unqualified name is not
+/// necessarily in `main`: it resolves against `temp`, then `main`, then each
+/// attached database in `ATTACH` order, and `pragma_table_list` lists the
+/// schemas holding a name in that same order. So the first row is the one the
+/// statement actually read, and defaulting an unqualified name to `main` would
+/// describe a different table whenever the name lives only in an attached file.
 ///
 /// **Matched case-insensitively**, because SQLite resolves an object name that
 /// way and every other lookup on this path already does. A case-sensitive `=`
-/// here made `SELECT * FROM ARTIST` fall to the caller's "don't attribute"
-/// answer and open read-only, while `SELECT * FROM artist` was editable — the
-/// same table, decided by how the user typed it.
-fn is_view(conn: &SqliteConn, name: &str) -> Result<bool, DbError> {
-    let kind: Option<String> = conn
-        .query_row(
-            "SELECT type FROM sqlite_master \
-             WHERE name = ?1 COLLATE NOCASE AND type IN ('table','view')",
-            [name],
-            |r| r.get(0),
-        )
-        .ok();
-    match kind.as_deref() {
-        Some("view") => Ok(true),
-        Some(_) => Ok(false),
-        // Not found — treated as "don't attribute", by the caller's `unwrap_or(true)`.
-        None => Err(DbError::Query(format!("no such table: {name}"))),
+/// on the older `sqlite_master` query made `SELECT * FROM ARTIST` fall to the
+/// caller's "don't attribute" answer and open read-only, while
+/// `SELECT * FROM artist` was editable — the same table, decided by how the user
+/// typed it. `pragma_table_list` matches the name for us and does it SQLite's
+/// way, so that bug cannot come back through this door.
+fn resolve_relation(
+    conn: &SqliteConn,
+    qualifier: Option<&str>,
+    name: &str,
+) -> Option<(String, bool)> {
+    let mut stmt = conn
+        .prepare("SELECT schema, type FROM pragma_table_list(?1) WHERE type IN ('table','view')")
+        .ok()?;
+    let rows = stmt
+        .query_map([name], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .ok()?;
+    for (schema, kind) in rows.flatten() {
+        if qualifier.is_none_or(|q| q.eq_ignore_ascii_case(&schema)) {
+            return Some((schema, kind == "view"));
+        }
     }
+    None
 }
 
 /// Columns covered by a single-column UNIQUE index — what the editing system can
 /// use as a `WHERE` key when there is no primary key.
-fn single_column_unique_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
+fn single_column_unique_indexes(
+    conn: &SqliteConn,
+    db: &str,
+    table: &str,
+) -> Result<Vec<String>, DbError> {
     let mut out = Vec::new();
-    for ix in table_indexes(conn, table)? {
+    for ix in table_indexes(conn, db, table)? {
         if ix.unique && ix.columns.len() == 1 {
             out.push(ix.columns[0].name.clone());
         }
@@ -1749,12 +1808,15 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
         let mut tables = Vec::new();
         for (name, kind, sql) in master_entries(conn)? {
             let is_view = kind == "view";
-            let columns = table_columns(conn, &name)?;
+            // `MAIN` throughout: `fetch_schema` introspects the one database
+            // SQLite exposes for a connection, and an `ATTACH`ed one is not part
+            // of the schema tree — see `list_databases`.
+            let columns = table_columns(conn, MAIN, &name)?;
             let (indexes, foreign_keys) = if is_view {
                 (Vec::new(), Vec::new())
             } else {
                 (
-                    table_indexes(conn, &name)?,
+                    table_indexes(conn, MAIN, &name)?,
                     table_foreign_keys(conn, &name)?,
                 )
             };
@@ -1765,7 +1827,7 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
             let create_sql = (!is_view).then(|| {
                 let mut out = sql.trim().trim_end_matches(';').to_string();
                 out.push(';');
-                for (_, ix) in index_sql(conn, &name)? {
+                for (_, ix) in index_sql(conn, MAIN, &name)? {
                     out.push('\n');
                     out.push_str(&ix);
                 }
@@ -1780,7 +1842,7 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
             // two engines could not be. Views and `WITHOUT ROWID` tables get
             // `None` and go on behaving as they did.
             let implicit_key = (!is_view)
-                .then(|| implicit_row_key(&columns, has_rowid(conn, &name)))
+                .then(|| implicit_row_key(&columns, has_rowid(conn, MAIN, &name)))
                 .flatten();
             // The two clauses that change what the table *is*. Both are in the
             // `pragma_table_list` row `has_rowid` already reads, and both are
@@ -1944,22 +2006,23 @@ fn master_entries(conn: &SqliteConn) -> Result<Vec<(String, String, String)>, Db
 /// write path that can't see one would offer to insert into it — which SQLite
 /// refuses, failing the whole transaction. `hidden = 1` is a virtual table's
 /// hidden column and is skipped: it isn't part of the table as declared.
-fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbError> {
+fn table_columns(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<ColumnInfo>, DbError> {
     // `coll` is what makes a column's `COLLATE NOCASE` survive a rebuild — the
     // rebuild writes the table from this model, so a collation the model doesn't
     // carry is one the edit silently drops, and `'A' = 'a'` stops being true.
     // `pragma_table_xinfo` has no `coll`; `pragma_table_info` has none either.
     // It comes from the table's own `CREATE` text (see `collations_of`).
-    let collations = collations_of(conn, table)?;
-    let has_rowid = has_rowid(conn, table);
-    let declared_autoincrement = table_declares_autoincrement(conn, table);
+    let collations = collations_of(conn, db, table)?;
+    let has_rowid = has_rowid(conn, db, table);
+    let declared_autoincrement = table_declares_autoincrement(conn, db, table);
     let mut stmt = conn
         .prepare(
-            "SELECT name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo(?1)",
+            "SELECT name, type, \"notnull\", dflt_value, pk, hidden \
+             FROM pragma_table_xinfo(?1, ?2)",
         )
         .map_err(query_err)?;
     let rows = stmt
-        .query_map([table], |r| {
+        .query_map(rusqlite::params![table, db], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1991,7 +2054,7 @@ fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbEr
         // 2 = VIRTUAL, 3 = STORED. The two values *are* the distinction, and
         // collapsing them turned a materialised column back into a computed one.
         let generated = (hidden == 2 || hidden == 3)
-            .then(|| generated_expr(conn, table, &name))
+            .then(|| generated_expr(conn, db, table, &name))
             .flatten();
         // `AUTOINCREMENT` is a separate keyword, but an `INTEGER PRIMARY KEY` is
         // the rowid and is server-assigned whether or not it is present — which is
@@ -2024,9 +2087,13 @@ fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbEr
 }
 
 /// [`declares_autoincrement`] against the table's stored declaration.
-fn table_declares_autoincrement(conn: &SqliteConn, table: &str) -> bool {
+fn table_declares_autoincrement(conn: &SqliteConn, db: &str, table: &str) -> bool {
     conn.query_row(
-        "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        &format!(
+            "SELECT COALESCE(sql, '') FROM {}.sqlite_master \
+             WHERE type = 'table' AND name = ?1",
+            ident_sqlite(db)
+        ),
         [table],
         |r| r.get::<_, String>(0),
     )
@@ -2046,13 +2113,14 @@ fn table_declares_autoincrement(conn: &SqliteConn, table: &str) -> bool {
 /// [`table_indexes`] hands each one to its index as [`IndexInfo::create_sql`],
 /// where a rebuild can replay it instead of re-emitting an index it only partly
 /// read.
-fn index_sql(conn: &SqliteConn, table: &str) -> Result<Vec<(String, String)>, DbError> {
+fn index_sql(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<(String, String)>, DbError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT name, sql FROM sqlite_master \
+        .prepare(&format!(
+            "SELECT name, sql FROM {}.sqlite_master \
              WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL \
              ORDER BY name",
-        )
+            ident_sqlite(db)
+        ))
         .map_err(query_err)?;
     let rows = stmt
         .query_map([table], |r| {
@@ -2309,10 +2377,14 @@ fn view_columns_of(create_sql: &str) -> Option<String> {
 /// can't be read is safe: the column is still marked generated by its caller, and
 /// a missing expression costs a designer field, where a wrong one would emit a
 /// different column.
-fn generated_expr(conn: &SqliteConn, table: &str, column: &str) -> Option<String> {
+fn generated_expr(conn: &SqliteConn, db: &str, table: &str, column: &str) -> Option<String> {
     let sql: String = conn
         .query_row(
-            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            &format!(
+                "SELECT COALESCE(sql, '') FROM {}.sqlite_master \
+                 WHERE type = 'table' AND name = ?1",
+                ident_sqlite(db)
+            ),
             [table],
             |r| r.get(0),
         )
@@ -2374,10 +2446,18 @@ fn generated_expr_of(create_sql: &str, column: &str) -> Option<String> {
 ///
 /// Read at the item's own paren depth only, so a `COLLATE` inside a `CHECK`
 /// predicate or an index expression can't be mistaken for a column's.
-fn collations_of(conn: &SqliteConn, table: &str) -> Result<HashMap<String, String>, DbError> {
+fn collations_of(
+    conn: &SqliteConn,
+    db: &str,
+    table: &str,
+) -> Result<HashMap<String, String>, DbError> {
     let sql: String = conn
         .query_row(
-            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            &format!(
+                "SELECT COALESCE(sql, '') FROM {}.sqlite_master \
+                 WHERE type = 'table' AND name = ?1",
+                ident_sqlite(db)
+            ),
             [table],
             |r| r.get(0),
         )
@@ -2717,14 +2797,14 @@ fn as_expression(sql: &str, at: usize) -> Option<String> {
 ///
 /// Each index also carries the statement that declared it ([`index_sql`]), which
 /// is the only complete record of the ones the pragmas read `lossy`.
-fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbError> {
-    let declared: HashMap<String, String> = index_sql(conn, table)?.into_iter().collect();
-    let column_collations = collations_of(conn, table)?;
+fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexInfo>, DbError> {
+    let declared: HashMap<String, String> = index_sql(conn, db, table)?.into_iter().collect();
+    let column_collations = collations_of(conn, db, table)?;
     let mut stmt = conn
-        .prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)")
+        .prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1, ?2)")
         .map_err(query_err)?;
     let rows = stmt
-        .query_map([table], |r| {
+        .query_map(rusqlite::params![table, db], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)? != 0,
@@ -2738,7 +2818,7 @@ fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbErr
 
     let mut out = Vec::new();
     for (name, unique, origin, partial) in rows {
-        let (columns, dropped_expression) = index_columns(conn, &name, &column_collations)?;
+        let (columns, dropped_expression) = index_columns(conn, db, &name, &column_collations)?;
         let is_pk = origin == "pk";
         out.push(IndexInfo {
             name: if is_pk {
@@ -2781,14 +2861,15 @@ fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbErr
 /// and only the first has to be restated.
 fn index_columns(
     conn: &SqliteConn,
+    db: &str,
     index: &str,
     column_collations: &HashMap<String, String>,
 ) -> Result<(Vec<IndexColumn>, bool), DbError> {
     let mut stmt = conn
-        .prepare("SELECT name, desc, key, coll FROM pragma_index_xinfo(?1) ORDER BY seqno")
+        .prepare("SELECT name, desc, key, coll FROM pragma_index_xinfo(?1, ?2) ORDER BY seqno")
         .map_err(query_err)?;
     let rows = stmt
-        .query_map([index], |r| {
+        .query_map(rusqlite::params![index, db], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, i64>(1)? != 0,
@@ -3044,7 +3125,7 @@ mod tests {
         )
         .unwrap();
         let flags = |t: &str| -> Vec<(String, bool)> {
-            table_columns(&conn, t)
+            table_columns(&conn, MAIN, t)
                 .unwrap()
                 .into_iter()
                 .map(|c| (c.name, c.auto_increment))
@@ -3079,7 +3160,7 @@ mod tests {
              CREATE TABLE decoy (id INTEGER PRIMARY KEY, autoincrement_note TEXT);",
         )
         .unwrap();
-        let keyword = |t: &str| table_columns(&conn, t).unwrap()[0].sqlite_autoincrement;
+        let keyword = |t: &str| table_columns(&conn, MAIN, t).unwrap()[0].sqlite_autoincrement;
         assert!(!keyword("plain"));
         assert!(keyword("keyed"), "and no row exists in sqlite_sequence yet");
         assert!(!keyword("decoy"), "a column name is not the keyword");
@@ -3096,7 +3177,7 @@ mod tests {
                              v INTEGER GENERATED ALWAYS AS (a+1) VIRTUAL);",
         )
         .unwrap();
-        let cols = table_columns(&conn, "g").unwrap();
+        let cols = table_columns(&conn, MAIN, "g").unwrap();
         let of = |n: &str| cols.iter().find(|c| c.name == n).unwrap().generated_stored;
         assert!(!of("a"), "not generated at all");
         assert!(of("s"));
@@ -3116,7 +3197,7 @@ mod tests {
                              ck    TEXT CHECK (ck COLLATE NOCASE <> 'x'));",
         )
         .unwrap();
-        let cols = table_columns(&conn, "c").unwrap();
+        let cols = table_columns(&conn, MAIN, "c").unwrap();
         let of = |n: &str| cols.iter().find(|c| c.name == n).unwrap().collation.clone();
         assert_eq!(of("email").as_deref(), Some("NOCASE"));
         assert_eq!(of("plain"), None);
@@ -3159,7 +3240,7 @@ mod tests {
              CREATE INDEX ix_column ON m (ci);",
         )
         .unwrap();
-        let ixs = table_indexes(&conn, "m").unwrap();
+        let ixs = table_indexes(&conn, MAIN, "m").unwrap();
         let coll = |n: &str| {
             ixs.iter()
                 .find(|i| i.name == n)
@@ -3239,7 +3320,7 @@ mod tests {
     #[test]
     fn introspection_reads_columns_keys_and_generated_expressions() {
         let conn = seeded();
-        let cols = table_columns(&conn, "album").unwrap();
+        let cols = table_columns(&conn, MAIN, "album").unwrap();
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["id", "title", "artist_id", "slug"]);
 
@@ -3266,7 +3347,7 @@ mod tests {
         let conn = SqliteConn::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY, v TEXT);")
             .unwrap();
-        let cols = table_columns(&conn, "t").unwrap();
+        let cols = table_columns(&conn, MAIN, "t").unwrap();
         assert!(cols[0].primary_key);
         assert!(cols[0].nullable, "SQLite allows NULL in a non-INTEGER PK");
         assert!(!cols[0].auto_increment);
@@ -3275,7 +3356,7 @@ mod tests {
     #[test]
     fn an_index_reports_its_order_and_whether_a_constraint_backs_it() {
         let conn = seeded();
-        let ix = table_indexes(&conn, "album").unwrap();
+        let ix = table_indexes(&conn, MAIN, "album").unwrap();
         let by_name = |n: &str| ix.iter().find(|i| i.name == n).cloned();
 
         let explicit = by_name("album_title").expect("the declared index");
@@ -3301,7 +3382,7 @@ mod tests {
         let conn = SqliteConn::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE);")
             .unwrap();
-        let ix = table_indexes(&conn, "t").unwrap();
+        let ix = table_indexes(&conn, MAIN, "t").unwrap();
         let backing = ix
             .iter()
             .find(|i| i.constraint.is_some())
@@ -3436,22 +3517,70 @@ mod tests {
         assert_eq!(o[1].as_ref().expect("name").column, "name");
     }
 
-    /// An `ATTACH`ed database stays unattributed, and that is now the *schema
-    /// lookups'* limit rather than provenance's: SQLite names the database per
-    /// column perfectly well, but `is_view`, `table_columns` and the index and
-    /// collation readers all address `main` alone, so nothing here could check
-    /// whether `side.note` is a view or read its keys. Attributing it would mean
-    /// trusting a table this code has never introspected.
+    /// An `ATTACH`ed database is a database like `main`, and every schema read
+    /// behind attribution now says which one it means. SQLite named the database
+    /// per column all along; what could not answer was this crate, whose lookups
+    /// all addressed `main`.
     #[test]
-    fn an_attached_database_is_still_not_attributed() {
-        let conn = seeded();
-        conn.execute_batch(
-            "ATTACH ':memory:' AS side;
-             CREATE TABLE side.note (id INTEGER PRIMARY KEY, body TEXT);",
-        )
-        .expect("attach");
+    fn an_attached_databases_columns_carry_its_own_name() {
+        let conn = attached();
         let o = origins_for(&conn, "SELECT id, body FROM side.note");
+        let id = o[0].as_ref().expect("attached column is attributed");
+        assert_eq!(id.database, "side");
+        assert_eq!(id.table, "note");
+        assert!(id.flags.primary_key, "read from side's own pragma");
+        assert_eq!(o[1].as_ref().expect("body").column, "body");
+    }
+
+    /// The reason the reads had to be qualified rather than merely allowed: the
+    /// two databases hold a table of the *same name* with different columns, and
+    /// a lookup that forgot which database it was in would describe `main.note`
+    /// while attributing `side.note`. Every flag here comes from a pragma that
+    /// had to be told the database.
+    #[test]
+    fn two_databases_holding_the_same_table_name_do_not_borrow_each_others_schema() {
+        let conn = attached();
+        let side = origins_for(&conn, "SELECT id, body FROM side.note");
+        let main = origins_for(&conn, "SELECT id, body FROM main.note");
+        assert_eq!(side[0].as_ref().unwrap().database, "side");
+        assert_eq!(main[0].as_ref().unwrap().database, "main");
+        // `main.note.body` is NOT NULL and `side.note.body` is not; the flag has
+        // to follow the database, not the name.
+        assert!(main[1].as_ref().unwrap().flags.not_null);
+        assert!(!side[1].as_ref().unwrap().flags.not_null);
+    }
+
+    /// A view in an attached database is refused exactly as one in `main` is —
+    /// which only works if `is_view` looks in the right `sqlite_master`. Asking
+    /// `main`'s would find no such object and, through `unwrap_or(true)`, refuse
+    /// for the wrong reason; asking it about a *table* of that name in `main`
+    /// would wrongly attribute.
+    #[test]
+    fn a_view_in_an_attached_database_is_still_refused() {
+        let conn = attached();
+        conn.execute_batch("CREATE VIEW side.v_note AS SELECT id, body FROM side.note;")
+            .expect("view");
+        let o = origins_for(&conn, "SELECT id, body FROM side.v_note");
         assert!(o.iter().all(|x| x.is_none()));
+    }
+
+    /// End to end: an attached table is editable on its own key, and a join
+    /// across the two databases keys each side in its own.
+    #[test]
+    fn an_attached_table_is_editable_and_joins_across_databases() {
+        let conn = attached();
+        const SQL: &str = "SELECT side.note.id, side.note.body, artist.id, artist.name \
+                           FROM side.note JOIN artist ON artist.id = side.note.id";
+        let rs = run_query(&conn, SQL, &mut crate::RowDest::Capped(100)).unwrap();
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |db, _, t| Some(table_info_in(&conn, db, t)),
+        );
+        assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![0]));
+        assert_eq!(m.table(1).map(|t| t.key_cols.clone()), Some(vec![2]));
+        assert!(m.editable(1), "side.note.body edits through side's key");
+        assert!(m.editable(3), "artist.name edits through main's key");
     }
 
     /// **The hazard driver provenance introduces, and the reason for the shape
@@ -3844,15 +3973,67 @@ mod tests {
     /// `Db` round trip — enough for `analyze_edit`, which reads the columns, the
     /// indexes and nothing else.
     fn table_info_of(conn: &SqliteConn, name: &str) -> TableInfo {
-        let columns = table_columns(conn, name).unwrap();
-        let implicit_key = implicit_row_key(&columns, has_rowid(conn, name));
+        table_info_in(conn, MAIN, name)
+    }
+
+    /// [`table_info_of`] for a named database — what the UI's `schema_for`
+    /// closure does, which is handed the origin's `database` precisely so an
+    /// attached table is described by its own schema and not by a table of the
+    /// same name in `main`.
+    fn table_info_in(conn: &SqliteConn, db: &str, name: &str) -> TableInfo {
+        let columns = table_columns(conn, db, name).unwrap();
+        let implicit_key = implicit_row_key(&columns, has_rowid(conn, db, name));
         TableInfo {
             name: name.to_string(),
-            indexes: table_indexes(conn, name).unwrap(),
+            indexes: table_indexes(conn, db, name).unwrap(),
             columns,
             implicit_key,
             ..Default::default()
         }
+    }
+
+    /// `main` and `side`, each holding a `note` table of the same name and
+    /// different shape — the fixture that makes a forgotten database qualifier
+    /// visible instead of harmless.
+    fn attached() -> SqliteConn {
+        let conn = seeded();
+        conn.execute_batch(
+            "CREATE TABLE note (
+                 id   INTEGER PRIMARY KEY,
+                 body TEXT NOT NULL,
+                 slug TEXT GENERATED ALWAYS AS (lower(body)) VIRTUAL
+             );
+             ATTACH ':memory:' AS side;
+             CREATE TABLE side.note (
+                 id   INTEGER PRIMARY KEY,
+                 body TEXT,
+                 slug TEXT GENERATED ALWAYS AS (upper(body)) VIRTUAL
+             );
+             INSERT INTO note (id, body) VALUES (1, 'main');
+             INSERT INTO side.note (id, body) VALUES (1, 'side');",
+        )
+        .expect("attach");
+        conn
+    }
+
+    /// The last lookup to learn the qualifier, and the one that shows why a list
+    /// of them is worth keeping honest: a generated column's expression has no
+    /// pragma behind it, only the table's own `CREATE` text, so it is read out of
+    /// a `sqlite_master` — and an unqualified one is `main`'s. Both `note` tables
+    /// declare a `slug`, and only the database says which expression is which.
+    #[test]
+    fn a_generated_columns_expression_is_read_from_its_own_database() {
+        let conn = attached();
+        let expr = |db: &str| {
+            table_columns(&conn, db, "note")
+                .unwrap()
+                .into_iter()
+                .find(|c| c.name == "slug")
+                .and_then(|c| c.generated)
+                .expect("slug is generated")
+        };
+        assert!(expr(MAIN).contains("lower"), "main: {}", expr(MAIN));
+        assert!(expr("side").contains("upper"), "side: {}", expr("side"));
     }
 
     /// A rowid table always has a rowid; a `WITHOUT ROWID` table never does, and
@@ -3861,11 +4042,11 @@ mod tests {
     #[test]
     fn has_rowid_answers_for_tables_views_and_without_rowid() {
         let conn = shadowing();
-        assert!(has_rowid(&conn, "plain"));
-        assert!(has_rowid(&conn, "owns_it"));
-        assert!(!has_rowid(&conn, "wr"));
-        assert!(!has_rowid(&conn, "v"));
-        assert!(!has_rowid(&conn, "nonexistent"));
+        assert!(has_rowid(&conn, MAIN, "plain"));
+        assert!(has_rowid(&conn, MAIN, "owns_it"));
+        assert!(!has_rowid(&conn, MAIN, "wr"));
+        assert!(!has_rowid(&conn, MAIN, "v"));
+        assert!(!has_rowid(&conn, MAIN, "nonexistent"));
     }
 
     /// The spelling is chosen, not fixed: a declared column takes the name away,
@@ -3873,8 +4054,8 @@ mod tests {
     #[test]
     fn implicit_row_key_picks_the_first_spelling_no_column_has_taken() {
         let conn = shadowing();
-        let cols = |t: &str| table_columns(&conn, t).unwrap();
-        let key = |t: &str| implicit_row_key(&cols(t), has_rowid(&conn, t));
+        let cols = |t: &str| table_columns(&conn, MAIN, t).unwrap();
+        let key = |t: &str| implicit_row_key(&cols(t), has_rowid(&conn, MAIN, t));
         assert_eq!(key("plain").as_deref(), Some("rowid"));
         assert_eq!(key("owns_it").as_deref(), Some("_rowid_"));
         // Case-insensitively taken — `RowId` and `_ROWID_` are the same names.
@@ -4023,8 +4204,8 @@ mod tests {
     fn a_without_rowid_table_cannot_be_asked_for_a_rowid() {
         let conn = shadowing();
         assert!(conn.prepare("SELECT rowid, * FROM wr").is_err());
-        let cols = table_columns(&conn, "wr").unwrap();
-        assert_eq!(implicit_row_key(&cols, has_rowid(&conn, "wr")), None);
+        let cols = table_columns(&conn, MAIN, "wr").unwrap();
+        assert_eq!(implicit_row_key(&cols, has_rowid(&conn, MAIN, "wr")), None);
     }
 
     /// A **shared** in-memory database plus a `Db` pointing at it.

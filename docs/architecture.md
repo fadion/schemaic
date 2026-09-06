@@ -4711,13 +4711,64 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   single-table read that no parse of the statement can see into
   (`a_view_over_a_set_operation_stays_unattributed`). That check covers **every** relation the
   statement reads rather than a single source, so a view anywhere in a join refuses the whole result
-  (`a_view_anywhere_in_a_join_refuses_the_whole_result`). And an **`ATTACH`ed database**, where the
-  limit has moved: provenance names the database per column perfectly well, but `is_view`,
-  `table_columns`, `single_column_unique_indexes` and the index and collation readers all address
-  `main` alone, so attributing an attached table would mean trusting one nothing here has
-  introspected (`an_attached_database_is_still_not_attributed`). That last one is a genuine follow-up
-  opportunity rather than a property of the engine — it goes away when those readers learn a
-  qualifier.
+  (`a_view_anywhere_in_a_join_refuses_the_whole_result`). The third refusal is **gone**: an
+  **`ATTACH`ed database** is attributed like any other now, and the limit was never provenance's —
+  provenance named the database per column all along, and what could not answer was this crate,
+  whose schema lookups addressed `main`. Ten of them take a `db: &str` and pass it down —
+  `table_columns`, `has_rowid`, `table_declares_autoincrement`, `collations_of`, `generated_expr`,
+  `index_sql`, `index_columns`, `table_indexes`, `single_column_unique_indexes` and
+  `resolve_relation`. The pragma table-valued functions take the schema as a second bound argument
+  (`pragma_table_xinfo(?1, ?2)`, `pragma_index_list(?1, ?2)`, `pragma_index_xinfo(?1, ?2)`) and the
+  `sqlite_master` reads are qualified with `ident_sqlite(db)`. `fetch_schema` passes `MAIN`
+  **explicitly** rather than letting it be the default, because it introspects the one database
+  SQLite exposes for a connection and an attached file is not part of that tree; so does
+  `table_list_flags`, which sits behind the *designer* rather than write-back and so only ever
+  opens a table from the schema tree, where SQLite has the one `main` node. **`generated_expr` was
+  the tenth and was missed on the first pass**, found by reading the list back against the code
+  rather than by a test: a generated column's expression has no pragma behind it at all, only the
+  table's own `CREATE` text out of a `sqlite_master`, so an unqualified one silently answered
+  `main`'s — costing `ColumnInfo::generated`, and with it flipping `no_default` true for a NOT NULL
+  generated column in an attached table. `a_generated_columns_expression_is_read_from_its_own_database`
+  pins it, on the same fixture, where the two `note` tables generate their `slug` by `lower` and
+  `upper` respectively so the wrong database is a visibly wrong answer rather than an absent one.
+  **`is_view` is gone, replaced by `resolve_relation(conn, qualifier, name) -> Option<(String,
+  bool)>`** — the database the name resolves in, plus whether it is a view — and that is not a
+  rename, because an unqualified name does not necessarily live in `main`: SQLite resolves it
+  against `temp`, then `main`, then each attached database in `ATTACH` order. Measured,
+  `pragma_table_list(name)` lists the schemas holding a name in exactly that order, reports `type`
+  as `'table'`/`'view'`, and returns nothing for a name that isn't there — so the first row is the
+  one the statement actually read, where defaulting an unqualified name to `main` would have
+  described a different table whenever the name lives only in an attached file. It also shuts a
+  re-entry route for an old bug: the `sqlite_master` query it replaced needed an explicit
+  `COLLATE NOCASE`, a case-sensitive `=` having once made `SELECT * FROM ARTIST` open read-only
+  while `SELECT * FROM artist` was editable, and `pragma_table_list` matches the name SQLite's own
+  way, so it cannot come back through this door. `attach_origins` therefore resolves **every**
+  relation up front into a `(database, table)` list, refuses the whole result if any of them is a
+  view or isn't found, keys its per-table pragma cache on the pair, and attributes a column only to
+  a pair in that list — matched on the database as well as the name. `ColumnOrigin::database`
+  carries the real database instead of the constant `MAIN`, which is what `edit::analyze_edit`
+  already groups on, so two attached files each holding a `note` are two editable tables rather
+  than one.
+  **The test that guards the qualifier is the same-name one, and only that one.** All four run on
+  an `attached()` fixture where `main` and `side` hold a `note` of the same name and different
+  shape: `an_attached_databases_columns_carry_its_own_name`,
+  `two_databases_holding_the_same_table_name_do_not_borrow_each_others_schema` — which asserts
+  `main.note.body` is NOT NULL and `side.note.body` is not, so a flag read from the wrong database
+  is visible — `a_view_in_an_attached_database_is_still_refused`, and
+  `an_attached_table_is_editable_and_joins_across_databases`, which walks `analyze_edit` to two
+  keyed tables across two databases. Forcing the two schema reads in `attach_origins` back to
+  `MAIN` fails the second of those and **nothing else**, measured by mutation rather than assumed:
+  the first still passes under it, because both `note` tables declare `id` the same way, so it pins
+  the `database` field and not the reads. Widen that fixture rather than adding a fifth test beside
+  it when another lookup learns the qualifier. The helper those tests describe a table through is
+  `table_info_in(conn, db, name)`, with `table_info_of` delegating to it, and it mirrors the UI's
+  `schema_for` closure in being keyed on the origin's `database` — so a table of the same name in
+  `main` can never stand in for an attached one. In the running app that closure answers **`None`**
+  for an attached database rather than its schema, because the SQLite tree holds the single `main`
+  node `fetch_databases` reports; the write is still keyed, from the wire flags `attach_origins`
+  set, which is the `resolve_key` fallback the other two engines take when the schema isn't loaded.
+  What it costs is what the schema alone can answer — `byte_cap`'s `col_cap` is unfilled for those
+  columns.
   **The rowid spelling is the one thing provenance cannot answer, so the statement still does.**
   Measured: `_rowid_` and `oid` both come back with `origin_name` `"rowid"`, and on a table that has
   taken `rowid` for a real column of its own the true rowid and that column are indistinguishable
@@ -11625,8 +11676,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   provenance rather than deriving attribution from the statement — see `db::sqlite`. What the
   statement still decides is whether that provenance may be trusted at all
   (`intel::provenance_sources`), and the widening is real: a join, a subquery and a CTE over ordinary
-  tables are editable where the derivation refused them, while a set operation at any depth, a view
-  anywhere in the statement and an `ATTACH`ed table are each refused for their own stated reason.
+  tables are editable where the derivation refused them, and so is a table in an `ATTACH`ed
+  database — attributed to the database it is really in, now that every schema lookup behind the
+  attribution takes one — while a set operation at any depth and a view anywhere in the statement
+  are each refused for their own stated reason.
   `intel::projection_of` is still read, for the `rowid` *spelling* alone — which is what the
   relaxation placing items ahead of a lone trailing `*` makes analysable in `SELECT rowid, * FROM t`,
   a keyless table opened through its rowid. The guard did not
