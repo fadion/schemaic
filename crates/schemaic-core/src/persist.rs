@@ -526,18 +526,20 @@ fn connections_path() -> Option<PathBuf> {
     Some(config_dir()?.join("connections.json"))
 }
 
-/// Where a child process whose settings resolve **relative to its working
-/// directory** should be spawned, given a config directory.
+/// Where something that must not be world-readable belongs, given a config
+/// directory.
 ///
 /// Pure, and separate from [`private_dir`], because the *choice* is the part
-/// worth pinning and the failure it exists for is silent. The AI session's
-/// `claude` used to run in `std::env::temp_dir()`, which on Unix is
-/// world-writable: another local account can pre-create `.claude/settings.json`
-/// there — `/tmp`'s sticky bit stops them deleting your files, not taking a path
-/// nobody has — and that file's `hooks` then run as this user the next time the
-/// AI panel opens. A CLI new enough for `--setting-sources user` ignores it, but
-/// nothing stood in for that flag on one too old, unlike `DISALLOWED_TOOLS`
-/// standing in for `--tools`.
+/// worth pinning and the failure it exists for is silent. Its consumer is
+/// `ai::mcp_dir`, which holds the per-session files carrying the database host,
+/// user and **plaintext password**: those lived in `std::env::temp_dir()`, which
+/// every account on the machine can list, and the whole of the defence was
+/// `O_EXCL` plus a random name.
+///
+/// **Not the AI session's working directory**, which it used to be and no longer
+/// is. That directory is handed to an agent CLI whose file readers may be live,
+/// so what matters about it is that nothing sensitive sits *above* it — see
+/// `ai::session_cwd`, which creates one per session with no ancestor of ours.
 pub fn private_dir_in(config: &Path, name: &str) -> PathBuf {
     config.join(name)
 }
@@ -545,9 +547,8 @@ pub fn private_dir_in(config: &Path, name: &str) -> PathBuf {
 /// [`private_dir_in`] under our own [`config_dir`], created owner-only.
 ///
 /// `None` when there is no config directory or it cannot be created — the caller
-/// decides what to do, and for the AI session that means falling back to the
-/// temp dir with the exposure above. A last resort on a machine with no config
-/// directory at all, not the default.
+/// decides what to do, and every caller here treats it as a refusal rather than
+/// falling back to somewhere world-readable.
 pub fn private_dir(name: &str) -> Option<PathBuf> {
     let dir = private_dir_in(&config_dir()?, name);
     create_private_dir(&dir).ok()?;
@@ -1056,14 +1057,14 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    /// The one thing that matters about a spawn directory for a child that
-    /// reads directory-relative settings: it is **ours**, not the shared temp
-    /// dir. Asserted as a property rather than a string, so it keeps holding if
-    /// the sub-directory is renamed.
+    /// The one thing that matters about a directory holding a plaintext
+    /// credential: it is **ours**, not the shared temp dir. Asserted as a
+    /// property rather than a string, so it keeps holding if the sub-directory
+    /// is renamed.
     #[test]
     fn a_private_child_directory_is_under_our_config_dir_and_never_the_temp_dir() {
         let config = PathBuf::from("/home/u/.config/schemaic");
-        let dir = private_dir_in(&config, "ai-session");
+        let dir = private_dir_in(&config, "ai-mcp");
         assert!(dir.starts_with(&config), "{dir:?}");
         assert_ne!(
             dir, config,

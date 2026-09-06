@@ -67,9 +67,10 @@ pub(crate) const AI_TOOLS_READ_ONLY: &[&str] = &[
 pub(crate) struct AiSession {
     pub(crate) conn_id: u64,
     pub(crate) stdin_tx: tokio::sync::mpsc::UnboundedSender<SessionMsg>,
-    /// The per-session MCP config file (holds the DB endpoint out of the command
-    /// line — review C6). Removed when the session ends.
-    pub(crate) mcp_cfg: Option<PathBuf>,
+    /// Everything this session put on disk — the endpoint file carrying the
+    /// database password, the MCP config that holds it, the working directory
+    /// the child ran in. Removed when the session ends.
+    pub(crate) private: SessionPrivate,
     /// The AI settings this session was spawned with, so closing the settings
     /// modal only respawns `claude` when one actually changed (review §7.4).
     pub(crate) settings: AiSettings,
@@ -119,10 +120,79 @@ pub(crate) struct AiSettings {
     pub(crate) hidden: HashSet<String>,
 }
 
+/// What one session leaves on disk, handed back so its `Drop` can take it away.
+///
+/// **A `Vec`, and not one `Option<PathBuf>`, because the one-file assumption was
+/// wrong the moment a second harness needed a file.** `start_ai_session`
+/// returned the Claude MCP config, which is `None` for every other harness — so
+/// when Antigravity became persistent, the endpoint file it writes (host, user,
+/// **plaintext password**) had nothing to unlink it and accumulated on disk
+/// indefinitely, one per session, for the life of the machine. The type now
+/// makes "the session owns files" the shape rather than "the session owns *the*
+/// file", and the test over `Harness::ALL` is what holds every path to it.
+#[derive(Default)]
+pub(crate) struct SessionPrivate {
+    /// Files this session created and nothing else reads.
+    pub(crate) files: Vec<PathBuf>,
+    /// The working directory created for this session's children.
+    pub(crate) cwd: Option<PathBuf>,
+}
+
+impl SessionPrivate {
+    /// Gather what a session owns. Each carrier is an `Option` because writing
+    /// it can fail; **every `Some` is a file that must be removed**, and the
+    /// bug this replaces was one carrier being returned and another dropped.
+    fn of(carriers: impl IntoIterator<Item = Option<PathBuf>>, cwd: Option<PathBuf>) -> Self {
+        Self {
+            files: carriers.into_iter().flatten().collect(),
+            cwd,
+        }
+    }
+}
+
+/// How this harness's session is told where the database is.
+///
+/// **One decision for both branches.** The persistent path and the
+/// process-per-turn path each worked it out for themselves, and that is how the
+/// Antigravity endpoint file came to be written by a branch whose return value
+/// described Claude's config. Asked here, both get the same answer and
+/// `every_harness_carries_the_endpoint_exactly_one_way` holds them to it.
+struct EndpointPlumbing {
+    /// A `--mcp-config` file whose `env` map holds the endpoint blob itself.
+    mcp_config: bool,
+    /// A file of its own holding the blob, whose *path* is what the harness is
+    /// given — for the harnesses whose only lever is argv, which is
+    /// world-readable.
+    endpoint_file: bool,
+}
+
+fn endpoint_plumbing(harness: Harness) -> EndpointPlumbing {
+    // Exhaustive, so a fifth harness has to be decided rather than defaulting to
+    // "no database tools" — or, worse, to a file nothing removes.
+    match harness {
+        Harness::Claude => EndpointPlumbing {
+            mcp_config: true,
+            endpoint_file: false,
+        },
+        Harness::Codex | Harness::Antigravity | Harness::OpenCode => EndpointPlumbing {
+            mcp_config: false,
+            endpoint_file: true,
+        },
+    }
+}
+
 impl Drop for AiSession {
     fn drop(&mut self) {
-        if let Some(p) = &self.mcp_cfg {
+        for p in &self.private.files {
             let _ = std::fs::remove_file(p);
+        }
+        if let Some(d) = &self.private.cwd {
+            // Not `remove_dir_all`: this directory is handed to an agent CLI as
+            // its working directory, so a recursive delete is a recursive delete
+            // of whatever that CLI decided to put there. An empty-directory
+            // removal fails harmlessly when it is not empty, and the startup
+            // sweep collects what is left once the owner is gone.
+            let _ = std::fs::remove_dir(d);
         }
     }
 }
@@ -156,20 +226,71 @@ pub(crate) struct McpEndpoint {
     pub(crate) schema: bool,
 }
 
-/// Parse the MCP DB endpoint from `$SCHEMAIC_MCP_ENDPOINT` (the JSON the app
-/// writes into the MCP config file). Falls back to an empty local endpoint.
-pub(crate) fn mcp_endpoint_from_env() -> McpEndpoint {
+/// Parse the MCP DB endpoint from the `--endpoint-file` this process was given,
+/// or from `$SCHEMAIC_MCP_ENDPOINT` (the JSON the app writes into Claude's MCP
+/// config file).
+///
+/// **`Err` rather than a default, and that is the whole point of the change.**
+/// This used to fall back to an empty local endpoint: an unreadable endpoint
+/// file dropped to `None`, found no environment variable — only Claude's config
+/// sets one — and handed `Value::Null` to [`endpoint_from_value`], which
+/// *defaults*. The server then came up on `127.0.0.1:3306` with `samples: true`
+/// and `schema: true`, so a session the user had pinned to `AiData::SchemaOnly`
+/// or `SchemaScope::None` started answering with sample rows and a full
+/// catalogue listing from whatever local MySQL or MariaDB happened to be
+/// listening — both access gates re-opened, against a database nobody
+/// authorised. The trigger was not hypothetical: the sweep that collects these
+/// files could delete a *live* session's.
+///
+/// A missing field inside a blob that *did* parse still defaults, and must: those
+/// defaults are what every endpoint written before a given field existed relies
+/// on. Failing closed is about the blob being absent or unreadable, not about it
+/// being old.
+pub(crate) fn mcp_endpoint_from_env() -> Result<McpEndpoint, String> {
     // A harness whose MCP config is a *file* we write puts the endpoint in that
     // file's `env` map. Codex's only lever is `-c` overrides, which are argv —
     // world-readable — so it gets a path instead and the endpoint stays in a
     // file of its own. The path is not a secret; what it points at is.
-    let from_file = endpoint_file_arg(&std::env::args().collect::<Vec<_>>())
-        .and_then(|p| std::fs::read_to_string(p).ok());
-    let raw = from_file.or_else(|| std::env::var("SCHEMAIC_MCP_ENDPOINT").ok());
-    let v = raw
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .unwrap_or(serde_json::Value::Null);
-    endpoint_from_value(&v)
+    let v = endpoint_blob(
+        endpoint_file_arg(&std::env::args().collect::<Vec<_>>()).as_deref(),
+        |p| std::fs::read_to_string(p).map_err(|e| e.to_string()),
+        std::env::var("SCHEMAIC_MCP_ENDPOINT").ok().as_deref(),
+    )?;
+    Ok(endpoint_from_value(&v))
+}
+
+/// Resolve the endpoint blob, with the filesystem and the environment as
+/// arguments so the **refusal** has a test.
+///
+/// Pure for the reason the rest of this crate's decisions are: the only way to
+/// reach the real function is to be launched as an MCP subprocess by an agent
+/// CLI, so the rule it applies would otherwise be tested by nothing at all —
+/// which is how it came to have no rule.
+fn endpoint_blob(
+    file: Option<&str>,
+    read: impl Fn(&str) -> Result<String, String>,
+    env: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let raw = match file {
+        // **A path we were given and cannot read is a refusal, not an absence.**
+        // Falling through to the environment here is what produced the default
+        // endpoint: only Claude's config sets that variable, so for the other
+        // three the fall-through found nothing, handed `Value::Null` on, and got
+        // `127.0.0.1:3306` with `samples` and `schema` back on.
+        Some(p) => read(p).map_err(|e| format!("--endpoint-file {p} could not be read: {e}"))?,
+        None => env
+            .ok_or(
+                "no database endpoint: neither --endpoint-file nor $SCHEMAIC_MCP_ENDPOINT \
+                 was given",
+            )?
+            .to_string(),
+    };
+    let v = serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|e| format!("the database endpoint is not valid JSON: {e}"))?;
+    if !v.is_object() {
+        return Err("the database endpoint is not a JSON object".to_string());
+    }
+    Ok(v)
 }
 
 /// The path given as `--endpoint-file <path>`, if any.
@@ -279,13 +400,37 @@ fn endpoint_json(
     .to_string()
 }
 
-/// Prefix of the per-session MCP config files, in the system temp directory.
+/// Prefix of the per-session MCP config and endpoint files.
 const MCP_FILE_PREFIX: &str = "schemaic-mcp-";
 
-/// How old one has to be before the startup sweep will remove it. Long enough
-/// that a file belonging to another Schemaic instance still running is never
-/// touched — those are deleted by that instance's own `Drop`.
+/// How old a file whose owner cannot be read has to be before the sweep will
+/// remove it.
+///
+/// **The fallback, not the rule.** Age used to be the whole answer, and it was
+/// wrong in both directions at once: it deleted a *live* instance's endpoint
+/// file (a session older than a day plus a second window was enough, and the
+/// age comes from `modified()`, which for a write-once file is its creation time
+/// and never advances), while never collecting the abandoned `-reply-*.txt`
+/// siblings its own doc claimed it did. A file whose name carries an owner is
+/// now judged by whether that owner is still running; this covers the ones left
+/// by a build that predates the naming, which have no owner to ask about.
 const MCP_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Where the per-session files carrying the database endpoint live.
+///
+/// **Ours, not the shared temp directory.** These hold the DB host, user and
+/// **plaintext password**, and putting them in a directory every account on the
+/// machine can list meant the only thing between them and another user was
+/// `O_EXCL` plus a random name. `persist::private_dir` is `0o700` on Unix and
+/// ACL-scoped to the profile on Windows, which is the permission a credential
+/// wants — and being a directory Schemaic owns is what lets the sweep below
+/// treat *every* entry as its own business rather than pattern-matching for
+/// names in a directory full of other programs' files.
+///
+/// It is also what took the credentials out from under [`session_cwd`]'s parent.
+fn mcp_dir() -> Option<PathBuf> {
+    persist::private_dir("ai-mcp")
+}
 
 /// How long a per-turn child gets to exit after its turn has been decoded.
 ///
@@ -317,33 +462,131 @@ fn write_mcp_config(endpoint: &str) -> Option<PathBuf> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "schemaic".to_string());
     let cfg = mcp_config_json(&exe, endpoint);
-    let dir = std::env::temp_dir();
-    // On Windows the user's temp dir is already ACL-scoped to the user; a
-    // same-user process can read it, but that's no worse than the env var, and
-    // strictly better than a command-line argument (review C6).
+    create_private("cfg", "json", cfg.as_bytes())
+}
+
+/// Create one of this session's private files, named so the sweep can tell
+/// whose it is, and return its path.
+///
+/// `O_EXCL` is kept even though [`mcp_dir`] is owner-only: it refuses an
+/// existing path and refuses to follow a symlink, and the mode a create applies
+/// never applies to a file that was merely opened. Eight attempts, because the
+/// only way a random name collides is another live session of ours.
+fn create_private(kind: &str, ext: &str, bytes: &[u8]) -> Option<PathBuf> {
+    let dir = mcp_dir()?;
+    let owner = crate::liveness::me();
     for _ in 0..8 {
-        let path = dir.join(format!("{MCP_FILE_PREFIX}{}.json", random_tag()));
-        if persist::create_private_new(&path, cfg.as_bytes()).is_ok() {
+        let path = dir.join(private_file_name(kind, ext, owner, &random_tag()));
+        if persist::create_private_new(&path, bytes).is_ok() {
             return Some(path);
         }
     }
     None
 }
 
-/// Where the session child runs.
+/// The name one of this session's private files gets.
 ///
-/// **Not the temp dir.** The CLI resolves `.claude/settings.json` relative to
-/// its working directory, and on Unix `/tmp` is world-writable — another local
-/// account can pre-create that path and have its `hooks` run as this user the
-/// next time the AI panel opens. `--setting-sources user` closes it on a current
-/// CLI, but that flag is exactly the one `CliSeal` may have to drop, and unlike
-/// `--tools` (backstopped by `DISALLOWED_TOOLS`) nothing stood in for it. Owning
-/// the directory makes the flag defence in depth instead of the only line.
+/// **The owner is in the name because the sweep has to read it without opening
+/// the file.** These are written once and never touched again, so `modified()`
+/// is their creation time and an age is not a liveness signal at all — which is
+/// how the old sweep came to delete a live session's endpoint file. A process
+/// with no readable start time gets no owner in the name and falls back to the
+/// age rule, which is the honest answer rather than a claim that cannot expire.
+fn private_file_name(
+    kind: &str,
+    ext: &str,
+    owner: Option<crate::liveness::Owner>,
+    tag: &str,
+) -> String {
+    format!(
+        "{MCP_FILE_PREFIX}{}-{kind}-{tag}.{ext}",
+        owner_segment(owner)
+    )
+}
+
+/// The owner as it appears in a name: two fields, or two empty ones. Kept next
+/// to [`owner_in`], which is the only thing that reads it back.
+fn owner_segment(owner: Option<crate::liveness::Owner>) -> String {
+    match owner {
+        Some(o) => format!("{}-{}", o.pid, o.started),
+        None => "-".to_string(),
+    }
+}
+
+/// The owner encoded in one of our private names, if it carries one.
 ///
-/// The temp dir remains the fallback for a machine with no config directory at
-/// all, where there is nowhere better to go.
-fn session_cwd() -> PathBuf {
-    schemaic_core::persist::private_dir("ai-session").unwrap_or_else(std::env::temp_dir)
+/// One parser for both shapes — the files under [`mcp_dir`] and the session
+/// working directories under the temp dir — because the owner sits immediately
+/// after the prefix in both, and two parsers is how one of them ends up
+/// answering a question the other never asks.
+fn owner_in(name: &str, prefix: &str) -> Option<crate::liveness::Owner> {
+    let rest = name.strip_prefix(prefix)?;
+    let mut parts = rest.split('-');
+    let pid = parts.next()?.parse().ok()?;
+    let started = parts.next()?.parse().ok()?;
+    Some(crate::liveness::Owner { pid, started })
+}
+
+/// Where the session child runs — **a fresh directory of its own, per session.**
+///
+/// **Not the temp dir itself.** The CLI resolves `.claude/settings.json`
+/// relative to its working directory, and on Unix `/tmp` is world-writable —
+/// another local account can pre-create that path and have its `hooks` run as
+/// this user the next time the AI panel opens. A directory created here, now,
+/// with `O_EXCL` semantics and mode `0o700` closes that just as completely as
+/// owning the tree did: nobody can plant a file inside a directory that did not
+/// exist a moment ago and that only this user may write.
+///
+/// **And not `<config_dir>/ai-session`, which is where it used to be.** That
+/// directory's *parent* holds `connections.json` — every saved connection's
+/// host, user, database and SSH account, plus the plaintext DB password, SSH
+/// password and key passphrase whenever the keyring is unavailable — and
+/// `schemaic.log`. It was chosen when Claude, which is `Sealed` and has no
+/// built-in tools, was the only harness; Antigravity is graded `Restricted`, its
+/// filesystem readers are auto-approved in headless mode, and this repository's
+/// own measurements record a turn running `list_dir` and `view_file` unprompted.
+/// A table comment, a column comment, an imported dump or a row value the
+/// assistant reads is text the user did not write, and `../connections.json` was
+/// one relative path away from it.
+///
+/// `None` when no directory could be created, and the caller must then spawn
+/// with no `current_dir` at all rather than fall back to a shared one.
+fn session_cwd() -> Option<PathBuf> {
+    let base = std::env::temp_dir();
+    let owner = crate::liveness::me();
+    for _ in 0..8 {
+        let path = base.join(format!(
+            "{RUN_DIR_PREFIX}{}-{}",
+            owner_segment(owner),
+            random_tag()
+        ));
+        if create_exclusive_dir(&path).is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Prefix of the per-session working directories, in the system temp directory.
+const RUN_DIR_PREFIX: &str = "schemaic-run-";
+
+/// `mkdir` — **not** `mkdir -p` — at `0o700` where the platform has modes.
+///
+/// The refusal of an existing path is the security property, so this must not
+/// become `create_dir_all`: that succeeds on a directory somebody else made, and
+/// on a symlink into one, which is the whole thing being defended against.
+fn create_exclusive_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: the profile's ACL is inherited and other accounts are not in
+        // it, which is the same split `persist::write_private` makes.
+        std::fs::create_dir(path)
+    }
 }
 
 /// A random hex tag for a temp file name. `RandomState` is seeded by the OS, and
@@ -362,38 +605,91 @@ fn random_tag() -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Is this temp-dir entry one of ours, left behind by a session that never got to
-/// run its `Drop` (a crash, a `SIGKILL`, a power loss)?
+/// Was this file left behind by a session that never got to run its `Drop` — a
+/// crash, a `SIGKILL`, a power loss?
 ///
-/// Age is the guard against sweeping a *live* instance's config: nothing else
-/// distinguishes them, and deleting one out from under a running session would
-/// break its MCP tools.
-fn stale_mcp_file(name: &str, age: std::time::Duration) -> bool {
-    name.starts_with(MCP_FILE_PREFIX) && name.ends_with(".json") && age > MCP_STALE_AFTER
+/// **Liveness first, age only as a fallback.** `owner_live` is the start time of
+/// the process the name claims, if that pid is running at all; a name carrying
+/// an owner is decided entirely by [`crate::liveness::may_sweep`], so a live
+/// instance's endpoint file is never removed however old the session gets. Age
+/// answers only for a name with no owner in it — a file written by a build that
+/// predates the naming, or by a process whose start time could not be read.
+fn stale_mcp_file(name: &str, owner_live: Option<u64>, age: std::time::Duration) -> bool {
+    if !name.starts_with(MCP_FILE_PREFIX) {
+        return false;
+    }
+    match owner_in(name, MCP_FILE_PREFIX) {
+        Some(o) => crate::liveness::may_sweep(Some(o), owner_live),
+        None => age > MCP_STALE_AFTER,
+    }
 }
 
-/// Remove long-abandoned MCP config files. They hold DB credentials, so leaving
-/// them in `/tmp` indefinitely is the same orphaned-file hazard as `persist`'s
-/// `.tmp`. Best effort, once per process.
+/// The same question for a session working directory.
+fn stale_run_dir(name: &str, owner_live: Option<u64>, age: std::time::Duration) -> bool {
+    if !name.starts_with(RUN_DIR_PREFIX) {
+        return false;
+    }
+    match owner_in(name, RUN_DIR_PREFIX) {
+        Some(o) => crate::liveness::may_sweep(Some(o), owner_live),
+        None => age > MCP_STALE_AFTER,
+    }
+}
+
+/// Remove abandoned MCP config, endpoint and inline-reply files, and the working
+/// directories of sessions that are gone.
+///
+/// They hold DB credentials, so leaving them behind indefinitely is the same
+/// orphaned-file hazard as `persist`'s `.tmp`. Best effort, once per process.
 fn sweep_stale_mcp_configs() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let now = std::time::SystemTime::now();
-        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let age = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| now.duration_since(t).ok())
-                .unwrap_or_default();
-            if stale_mcp_file(&e.file_name().to_string_lossy(), age) {
-                let _ = std::fs::remove_file(e.path());
-            }
+        if let Some(dir) = mcp_dir() {
+            sweep_dir(&dir, false);
         }
+        // **The old location, still swept.** Every build before this one wrote
+        // these into the shared temp directory, so an upgrading user has
+        // plaintext database passwords sitting there. Those names carry no
+        // owner, so the age rule is what collects them — which is the case that
+        // rule exists for. The session working directories live here too, and
+        // those do carry one.
+        sweep_dir(&std::env::temp_dir(), true);
     });
+}
+
+/// Remove our own leftovers from one directory. `dirs` also collects the
+/// per-session working directories, which only the temp dir holds.
+fn sweep_dir(dir: &std::path::Path, dirs: bool) {
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let meta = e.metadata();
+        let age = meta
+            .as_ref()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or_default();
+        let name = e.file_name().to_string_lossy().into_owned();
+        let is_dir = meta.map(|m| m.is_dir()).unwrap_or(false);
+        if is_dir {
+            // A session's working directory. Removed empty only — see
+            // `AiSession::drop` for why a recursive delete is not ours to do
+            // when an agent CLI has been running in it.
+            let live =
+                owner_in(&name, RUN_DIR_PREFIX).and_then(|o| crate::liveness::process_start(o.pid));
+            if dirs && stale_run_dir(&name, live, age) {
+                let _ = std::fs::remove_dir(e.path());
+            }
+            continue;
+        }
+        let live =
+            owner_in(&name, MCP_FILE_PREFIX).and_then(|o| crate::liveness::process_start(o.pid));
+        if stale_mcp_file(&name, live, age) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// The `claude` MCP config JSON launching `exe --mcp-serve` with the DB endpoint
@@ -412,44 +708,31 @@ fn mcp_config_json(exe: &str, endpoint: &str) -> String {
     .to_string()
 }
 
-/// The endpoint file a Codex session's MCP server reads its DB endpoint from.
+/// The endpoint file a Codex, Antigravity or OpenCode session's MCP server reads
+/// its DB endpoint from.
 ///
 /// **Codex's only configuration lever is `-c key=value`, and that is argv.**
 /// Putting the endpoint there would publish the database credentials to every
 /// process listing on the machine (review C6), so the override carries a *path*
-/// and the endpoint stays in this file. Same directory, prefix and `.json`
-/// suffix as [`write_mcp_config`], so [`sweep_stale_mcp_configs`] already
-/// collects it — it holds exactly the same secret and must not outlive its
-/// session any longer.
-///
-/// **The temp dir here, though [`session_cwd`] was moved out of it — and the two
-/// are not in tension.** That move answered a different threat: the child's
-/// *working directory* is scanned for directory-relative settings files, so a
-/// world-writable cwd lets any local user grant the session permissions. Nothing
-/// scans this path; it is only ever read by name, is created `O_EXCL` with
-/// owner-only permissions (`persist::create_private_new`, which refuses an
-/// existing path and refuses to follow a symlink), and carries the same secret
-/// the Claude config beside it already does. Moving it would buy nothing and
-/// would put it outside the sweeper that collects the other.
+/// and the endpoint stays in this file. Same directory and naming as
+/// [`write_mcp_config`], so [`sweep_stale_mcp_configs`] collects it — it holds
+/// exactly the same secret and must not outlive its session any longer.
 ///
 /// **Two harnesses write this path somewhere that outlives the process**, and
 /// only one of them is a hazard. Antigravity's registration puts it into that
 /// CLI's *own* config, which is why `crate::antigravity::sweep` exists.
 /// OpenCode's goes into `crate::opencode`'s reused config directory — Schemaic's
 /// own, deliberately persistent so the CLI's plugin bootstrap is paid once. In
-/// both cases what survives is the *path*; the file it names is swept here, so a
-/// stale pointer resolves to nothing rather than to an old endpoint. That is
-/// exactly why the endpoint is not written into either of those files directly.
+/// both cases what survives is the *path*; the file it names is removed when the
+/// session ends, so a stale pointer resolves to nothing.
+///
+/// **"Resolves to nothing" is now true, and it used not to be.** The MCP
+/// subprocess treated an unreadable endpoint file as an *absent* one and came up
+/// on a defaulted `127.0.0.1:3306` with every access gate re-opened — see
+/// [`mcp_endpoint_from_env`], which refuses instead.
 fn write_endpoint_file(endpoint: &str) -> Option<PathBuf> {
     sweep_stale_mcp_configs();
-    let dir = std::env::temp_dir();
-    for _ in 0..8 {
-        let path = dir.join(format!("{MCP_FILE_PREFIX}ep-{}.json", random_tag()));
-        if persist::create_private_new(&path, endpoint.as_bytes()).is_ok() {
-            return Some(path);
-        }
-    }
-    None
+    create_private("ep", "json", endpoint.as_bytes())
 }
 
 /// One inline generation's spawn, resolved for the harness the user picked.
@@ -466,6 +749,8 @@ pub(crate) struct InlinePlan {
     output: schemaic_ai::harness::InlineOutput,
     /// Where Codex was told to write its answer; deleted after it is read.
     last_message: Option<PathBuf>,
+    /// The working directory this generation's child runs in, removed with it.
+    cwd: Option<PathBuf>,
     env: Vec<(String, String)>,
 }
 
@@ -531,6 +816,13 @@ pub(crate) fn inline_plan(
     // and the same platform limit, and an oversize prompt otherwise surfaces as
     // `os error 206`, which names the one cause that isn't the problem.
     if let Some(why) = schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit()) {
+        // The reply file was created above, before this check could run — the
+        // path has to exist to go into the argv this check measures — so a
+        // refusal orphaned one every time. Cleaned up here rather than left for
+        // the sweep, which only collects after the owning process is gone.
+        if let Some(p) = &last_message {
+            let _ = std::fs::remove_file(p);
+        }
         return Err(why);
     }
     Ok(InlinePlan {
@@ -539,22 +831,23 @@ pub(crate) fn inline_plan(
         harness,
         output,
         last_message,
+        cwd: session_cwd(),
         env,
     })
 }
 
-/// A temp path for Codex's `-o`, named so the startup sweep collects it if this
-/// process dies between the spawn and the read.
+/// A private path for Codex's `-o`, named so the startup sweep collects it if
+/// this process dies between the spawn and the read.
+///
+/// **It could not, and the file's own doc said it could.** `stale_mcp_file`
+/// required a `.json` suffix while this creates a `.txt`, so every orphaned
+/// reply — and `inline_plan` creates one *before* the oversize check, so every
+/// refusal orphans one — stayed on disk forever. An existing test even pinned
+/// the denial, against a hand-written name no caller produces. The sweep now
+/// matches the prefix and asks the owner, so the suffix is not a filter.
 fn inline_reply_path() -> Option<PathBuf> {
     sweep_stale_mcp_configs();
-    let dir = std::env::temp_dir();
-    for _ in 0..8 {
-        let path = dir.join(format!("{MCP_FILE_PREFIX}reply-{}.txt", random_tag()));
-        if persist::create_private_new(&path, b"").is_ok() {
-            return Some(path);
-        }
-    }
-    None
+    create_private("reply", "txt", b"")
 }
 
 /// Run one inline generation to completion and hand back the reply text.
@@ -565,26 +858,46 @@ pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
         // takes its prompt in argv — and a CLI that waits for it costs seconds.
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    // **The same guard both session spawns apply**, and this path had none: the
+    // child inherited the app's own process working directory, so a user who
+    // launches Schemaic from a world-writable directory gave any local account a
+    // `.claude/settings.json` whose `hooks` run as them on the next Ctrl+K.
+    // Claude, the default harness, has only the cwd standing between it and
+    // that. `plan.cwd` is a directory created for this generation and removed
+    // with it.
+    if let Some(d) = &plan.cwd {
+        cmd.current_dir(d);
+    }
+    // **Clear before set, the same order the session path states in a comment.**
+    // The two key sets are disjoint today, which is the only reason the reverse
+    // order was harmless — and `OPENCODE_CONFIG_DIR`, already in the cleared
+    // list, is one rename away from being the variable the seal *uses*, at which
+    // point clearing last would strip this path's own seal and run one-shots on
+    // the `build` agent with `bash` while the panel reported `Sealed`.
+    // `no_seal_variable_is_also_cleared` pins the disjointness so the order
+    // stays a belt beside a brace rather than the only thing holding it.
+    for k in crate::opencode::OpenCodeConfig::env_remove() {
+        cmd.env_remove(k);
+    }
     for (k, v) in &plan.env {
         cmd.env(k, v);
     }
-    if plan.harness == Harness::OpenCode {
-        // Setting our own variables is half the job; removing the user's is the
-        // other half. See `OpenCodeConfig::env_remove`.
-        for k in crate::opencode::OpenCodeConfig::env_remove() {
-            cmd.env_remove(k);
-        }
-    }
-    let out = cmd.output().await.map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    // Read and remove the file whatever the exit status: a failed run that still
-    // wrote one would otherwise leave it for the sweeper.
+    let ran = cmd.output().await.map_err(|e| e.to_string());
+    // Read and remove the file whatever happened: a failed run that still wrote
+    // one would otherwise leave it for the sweeper, which collects only once the
+    // owning process is gone.
     let filed = plan.last_message.as_ref().map(|p| {
         let t = std::fs::read_to_string(p).unwrap_or_default();
         let _ = std::fs::remove_file(p);
         t
     });
+    if let Some(d) = &plan.cwd {
+        // Empty-only, for the reason `AiSession::drop` gives.
+        let _ = std::fs::remove_dir(d);
+    }
+    let out = ran?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
         return Err(schemaic_ai::cli_failure_message(
             plan.harness,
@@ -826,12 +1139,21 @@ fn spawn_refusal(harness: Harness, constraint: Constraint) -> Option<String> {
     }
 }
 
+/// Spawn a session and hand back its stdin channel plus the files it owns.
+///
+/// **Every return has to carry its files, and one did not.** The persistent
+/// branch returned the Claude MCP config — `None` for every other harness — so
+/// once Antigravity joined that branch, the endpoint file holding the database
+/// host, user and plaintext password had nothing to unlink it. The type is now a
+/// [`SessionPrivate`] rather than an `Option<PathBuf>`, and
+/// `every_harness_carries_the_endpoint_exactly_one_way` walks `Harness::ALL`
+/// rather than naming the harness that happened to be wrong.
 pub(crate) fn start_ai_session(
     handle: &tokio::runtime::Handle,
     p: StartAiParams,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<SessionMsg>,
-    Option<PathBuf>,
+    SessionPrivate,
 ) {
     let StartAiParams {
         system_context,
@@ -868,7 +1190,7 @@ pub(crate) fn start_ai_session(
         // whose settings have not changed — so the *second* question was
         // swallowed in silence and the panel spun. See `refuse_every_turn`.
         refuse_every_turn(handle, rx, ai_tx, why);
-        return (tx, None);
+        return (tx, SessionPrivate::default());
     }
 
     let endpoint = endpoint_json(
@@ -885,7 +1207,15 @@ pub(crate) fn start_ai_session(
     // channel interface is identical to Claude's, so nothing upstream of here
     // changes — only what this task does with each message.
     if !harness.is_persistent() {
-        let ep_file = write_endpoint_file(&endpoint);
+        let ep_file = endpoint_plumbing(harness)
+            .endpoint_file
+            .then(|| write_endpoint_file(&endpoint))
+            .flatten();
+        // One directory for the whole session, though the children are one per
+        // turn: they run the same conversation, and a directory per turn would
+        // be a directory per turn left behind when the app is killed.
+        let cwd = session_cwd();
+        let private = SessionPrivate::of([ep_file.clone()], cwd.clone());
         // **The same list Claude's `--allowedTools` gets**, so no two harnesses
         // can disagree about what this connection's access level offers.
         let allowed: &[&str] = if data.may_query() {
@@ -971,7 +1301,7 @@ pub(crate) fn start_ai_session(
                 // holding `rx`, every question after this one is dropped in
                 // silence rather than told why.
                 refuse_every_turn(handle, rx, ai_tx, why);
-                return (tx, ep_file);
+                return (tx, private);
             }
             _ => {}
         }
@@ -1034,8 +1364,10 @@ pub(crate) fn start_ai_session(
                     }
                 }
                 cmd.envs(oc_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                if let Some(d) = &cwd {
+                    cmd.current_dir(d);
+                }
                 let child = cmd
-                    .current_dir(session_cwd())
                     // **Never piped.** `codex exec` reads stdin when it is a
                     // pipe and appends it to the prompt as a `<stdin>` block —
                     // measured: a run with stdin at EOF still printed "Reading
@@ -1098,9 +1430,12 @@ pub(crate) fn start_ai_session(
                         line = reader.next_line() => match line {
                             Ok(Some(l)) => {
                                 let events = parser.push(&l);
+                                // The parser already knows what the line was —
+                                // asking it is what stopped this from being the
+                                // third `serde_json::from_str` of the same line.
                                 if events.is_empty()
-                                    && !l.trim().is_empty()
-                                    && serde_json::from_str::<serde_json::Value>(l.trim()).is_err()
+                                    && parser.last_line()
+                                        == schemaic_ai::stream::LineKind::Plain
                                 {
                                     raw.push(l.trim().to_string());
                                 }
@@ -1158,7 +1493,7 @@ pub(crate) fn start_ai_session(
                 }
             }
         });
-        return (tx, ep_file);
+        return (tx, private);
     }
 
     let tools = if data.may_query() {
@@ -1174,19 +1509,27 @@ pub(crate) fn start_ai_session(
     // instead is `AgyRegistration`, gathered here and installed inside the
     // session task: it is two `agy` invocations and a settings rewrite, and this
     // function runs on the Floem UI thread.
-    let mcp_cfg = match harness {
-        Harness::Claude => write_mcp_config(&endpoint),
-        _ => None,
-    };
-    let agy_install = match harness {
-        Harness::Antigravity => {
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "schemaic".to_string());
-            write_endpoint_file(&endpoint).map(|p| (exe, p.to_string_lossy().into_owned()))
-        }
-        _ => None,
-    };
+    let plumbing = endpoint_plumbing(harness);
+    let mcp_cfg = plumbing
+        .mcp_config
+        .then(|| write_mcp_config(&endpoint))
+        .flatten();
+    let agy_ep = plumbing
+        .endpoint_file
+        .then(|| write_endpoint_file(&endpoint))
+        .flatten();
+    let agy_install = agy_ep.as_ref().map(|p| {
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "schemaic".to_string());
+        (exe, p.to_string_lossy().into_owned())
+    });
+    // **Every file this session owns, whichever harness it is.** The old return
+    // was `mcp_cfg` alone — `None` for all three of the others — so the
+    // Antigravity endpoint file, plaintext password and all, was never unlinked
+    // by anything.
+    let private = SessionPrivate::of([mcp_cfg.clone(), agy_ep.clone()], session_cwd());
+    let cwd = private.cwd.clone();
     let agy_bin = bin.clone();
     let mcp_cfg_arg = mcp_cfg.as_ref().map(|p| p.to_string_lossy().into_owned());
     let spec = schemaic_ai::harness::TurnSpec {
@@ -1207,14 +1550,20 @@ pub(crate) fn start_ai_session(
     // a generic failure and the arm below blames the installation.
     if let Some(why) = schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit()) {
         let _ = ai_tx.send(AiStreamMsg {
-            segs: vec![schemaic_core::transcript::Seg::Text(why)],
+            segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
             done: true,
             is_error: true,
             stats: None,
         });
-        // A live sender with no process behind it: the panel shows the message
-        // and the next question re-enters here, where the same check applies.
-        return (tx, mcp_cfg);
+        // **The third non-spawning return, and the one that was left behind.**
+        // The comment that used to stand here — "the next question re-enters
+        // here, where the same check applies" — is the sentence
+        // `refuse_every_turn`'s own doc quotes as disproved: `rx` is dropped on
+        // this return, `needs_respawn` does not rebuild a session whose settings
+        // have not changed, so every later question was a discarded `Err` and
+        // the bubble spun with nothing said.
+        refuse_every_turn(handle, rx, ai_tx, why);
+        return (tx, private);
     }
 
     handle.spawn(async move {
@@ -1243,10 +1592,12 @@ pub(crate) fn start_ai_session(
             }
         };
         let spawn_child = |args: Vec<String>| {
-            Command::new(&bin)
-                .args(args)
-                .current_dir(session_cwd())
-                .stdin(Stdio::piped())
+            let mut cmd = Command::new(&bin);
+            cmd.args(args);
+            if let Some(d) = &cwd {
+                cmd.current_dir(d);
+            }
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 // Capture stderr (was discarded): a failing CLI — e.g. an expired
                 // OAuth session — writes its reason here or to stdout, and we need
@@ -1383,9 +1734,9 @@ pub(crate) fn start_ai_session(
                         }
                         // A non-blank line that yields no events AND isn't valid JSON
                         // is a plain-text diagnostic (e.g. the auth error) — keep it.
+                        // Asked of the parser, which parsed it a moment ago.
                         if events.is_empty()
-                            && !l.trim().is_empty()
-                            && serde_json::from_str::<serde_json::Value>(l.trim()).is_err()
+                            && parser.last_line() == schemaic_ai::stream::LineKind::Plain
                         {
                             raw_output.push(l.trim().to_string());
                         }
@@ -1422,7 +1773,7 @@ pub(crate) fn start_ai_session(
         let _ = child.kill().await;
     });
 
-    (tx, mcp_cfg)
+    (tx, private)
 }
 
 /// The parts of the AI's context that change *while a session is alive* — the
@@ -2684,22 +3035,183 @@ mod tests {
         }
     }
 
+    /// A file that carries an owner is decided by whether that owner is running,
+    /// and by nothing else.
+    ///
+    /// **Both directions were wrong, and both are here.** Age alone deleted a
+    /// *live* instance's endpoint file once its session passed a day — and the
+    /// age comes from `modified()`, which for a write-once file never advances,
+    /// so a long session was enough on its own. The same rule also refused to
+    /// collect anything without a `.json` suffix, which is every abandoned
+    /// inline-reply file the module's own doc claimed it swept.
     #[test]
-    fn only_our_own_long_abandoned_temp_files_are_swept() {
+    fn a_live_sessions_files_are_never_swept_however_old_they_get() {
+        use std::time::Duration;
+        let old = MCP_STALE_AFTER * 30;
+        let live = private_file_name("ep", "json", Some(OWNER), "0123abcd0123abcd");
+        // The owner is still on that pid: not ours to remove, at any age. This
+        // file holds the database host, user and plaintext password.
+        assert!(!stale_mcp_file(&live, Some(OWNER.started), old));
+        // The owner is gone, or the pid was handed to something else.
+        assert!(stale_mcp_file(&live, None, Duration::ZERO));
+        assert!(stale_mcp_file(
+            &live,
+            Some(OWNER.started + 1),
+            Duration::ZERO
+        ));
+    }
+
+    /// The suffix is not a filter, and it used to be. `inline_reply_path`
+    /// creates a `.txt`; the old predicate required `.json` and an existing test
+    /// pinned that denial with a hand-written name no caller produces.
+    #[test]
+    fn every_kind_of_file_this_module_creates_can_be_swept() {
+        use std::time::Duration;
+        for (kind, ext) in [("cfg", "json"), ("ep", "json"), ("reply", "txt")] {
+            let name = private_file_name(kind, ext, Some(OWNER), "abcd");
+            assert!(
+                stale_mcp_file(&name, None, Duration::ZERO),
+                "{name} would be left behind forever"
+            );
+        }
+    }
+
+    /// A name with no owner in it — written by a build older than the naming, or
+    /// by a process whose start time could not be read — falls back to age.
+    #[test]
+    fn a_file_with_no_owner_falls_back_to_the_age_rule() {
         use std::time::Duration;
         let old = MCP_STALE_AFTER + Duration::from_secs(1);
-        // Ours, from a session that crashed days ago — it holds DB credentials.
-        assert!(stale_mcp_file("schemaic-mcp-0123abcd0123abcd.json", old));
-        // Ours, but recent: it may belong to another Schemaic still running, and
-        // that instance's own `Drop` is what should remove it.
-        assert!(!stale_mcp_file(
-            "schemaic-mcp-0123abcd0123abcd.json",
-            Duration::from_secs(30)
+        let legacy = "schemaic-mcp-0123abcd0123abcd.json";
+        assert_eq!(owner_in(legacy, MCP_FILE_PREFIX), None);
+        assert!(stale_mcp_file(legacy, None, old));
+        assert!(!stale_mcp_file(legacy, None, Duration::from_secs(30)));
+        // …and so does one we wrote without an owner segment.
+        let unowned = private_file_name("ep", "json", None, "abcd");
+        assert_eq!(owner_in(&unowned, MCP_FILE_PREFIX), None);
+        assert!(stale_mcp_file(&unowned, None, old));
+        assert!(!stale_mcp_file(&unowned, None, Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn nothing_that_is_not_ours_is_ever_swept() {
+        let old = MCP_STALE_AFTER * 30;
+        for foreign in ["some-other-tool.json", "schemaic-session.json", "notes.txt"] {
+            assert!(!stale_mcp_file(foreign, None, old), "{foreign}");
+            assert!(!stale_run_dir(foreign, None, old), "{foreign}");
+        }
+    }
+
+    /// The session working directory is judged the same way, by the same parser.
+    #[test]
+    fn a_run_directory_outlives_its_owner_and_no_longer() {
+        use std::time::Duration;
+        let name = format!("{RUN_DIR_PREFIX}{}-abcd", owner_segment(Some(OWNER)));
+        assert_eq!(owner_in(&name, RUN_DIR_PREFIX), Some(OWNER));
+        assert!(!stale_run_dir(
+            &name,
+            Some(OWNER.started),
+            MCP_STALE_AFTER * 30
         ));
-        // Not ours, however old.
-        assert!(!stale_mcp_file("some-other-tool.json", old));
-        assert!(!stale_mcp_file("schemaic-mcp-notjson.txt", old));
-        assert!(!stale_mcp_file("schemaic-session.json", old));
+        assert!(stale_run_dir(&name, None, Duration::ZERO));
+    }
+
+    const OWNER: crate::liveness::Owner = crate::liveness::Owner {
+        pid: 4242,
+        started: 1_700_000_000,
+    };
+
+    /// **The fail-open this closes, stated as its composition.** The resolver
+    /// dropped an unreadable file to `None`, fell through to an environment
+    /// variable only Claude's config ever sets, and handed `Value::Null` to
+    /// `endpoint_from_value` — which *defaults*. So the MCP subprocess came up
+    /// on `127.0.0.1:3306` with `samples: true` and `schema: true`, and a
+    /// session the user had pinned to `SchemaOnly` or `SchemaScope::None`
+    /// answered with sample rows and a full catalogue from whatever local server
+    /// was listening. The trigger was real: the sweep could delete a live
+    /// session's endpoint file.
+    #[test]
+    fn an_endpoint_file_that_cannot_be_read_refuses_rather_than_defaulting() {
+        let unreadable = |_: &str| Err("no such file".to_string());
+        let err = endpoint_blob(Some("/gone.json"), unreadable, None)
+            .expect_err("an unreadable endpoint file must refuse");
+        assert!(err.contains("/gone.json"), "{err}");
+
+        // **And it does not fall through to the environment.** Claude's variable
+        // may well be set in this process's environment for unrelated reasons;
+        // a Codex session's unreadable file must not be answered with it.
+        let err = endpoint_blob(
+            Some("/gone.json"),
+            unreadable,
+            Some(r#"{"host":"other-host"}"#),
+        )
+        .expect_err("fell through to the environment");
+        assert!(err.contains("/gone.json"), "{err}");
+
+        // The shape the default would have had, so this test names what it is
+        // preventing rather than only that something was refused.
+        let defaulted = endpoint_from_value(&serde_json::Value::Null);
+        assert!(defaulted.samples && defaulted.schema);
+    }
+
+    #[test]
+    fn a_blob_that_is_not_a_json_object_refuses() {
+        let read = |_: &str| Ok("[1,2,3]".to_string());
+        assert!(endpoint_blob(Some("/e.json"), read, None).is_err());
+        let read = |_: &str| Ok("{not json".to_string());
+        assert!(endpoint_blob(Some("/e.json"), read, None).is_err());
+        // Nothing at all is also a refusal, not an empty local endpoint.
+        let read = |_: &str| Ok(String::new());
+        assert!(endpoint_blob(None, read, None).is_err());
+    }
+
+    /// A field missing from a blob that *did* parse still defaults, and must:
+    /// those defaults are what every endpoint written before a given field
+    /// existed relies on. Failing closed is about the blob being unreadable, not
+    /// about it being old.
+    #[test]
+    fn an_old_blob_still_gets_its_back_compat_defaults() {
+        let read = |_: &str| Ok(r#"{"host":"h","port":3307}"#.to_string());
+        let v = endpoint_blob(Some("/e.json"), read, None).expect("a parseable blob");
+        let e = endpoint_from_value(&v);
+        assert!(e.samples, "a blob predating `samples` lost its default");
+        assert!(e.schema, "a blob predating `schema` lost its default");
+        // …and the Claude path, whose blob arrives in the environment, is
+        // untouched by any of this.
+        let v = endpoint_blob(None, |_| Ok(String::new()), Some(r#"{"host":"h"}"#))
+            .expect("the environment path still resolves");
+        assert_eq!(v["host"], "h");
+    }
+
+    /// Every harness carries the endpoint exactly one way, and the way it
+    /// carries it is a file the session hands back.
+    ///
+    /// **The bug was the second half.** `start_ai_session` returned Claude's MCP
+    /// config, which is `None` for the other three, so when Antigravity became
+    /// persistent its endpoint file — host, user, **plaintext password** — had
+    /// nothing to unlink it and accumulated one per session for the life of the
+    /// machine. Walking `Harness::ALL` rather than naming Antigravity is what
+    /// makes the next harness land here instead of on a user's disk.
+    #[test]
+    fn every_harness_carries_the_endpoint_exactly_one_way() {
+        for h in Harness::ALL {
+            let p = endpoint_plumbing(h);
+            assert!(
+                p.mcp_config ^ p.endpoint_file,
+                "{h:?} carries the endpoint {} ways",
+                u8::from(p.mcp_config) + u8::from(p.endpoint_file)
+            );
+            // …and whichever carrier it is, it reaches `SessionPrivate`. Both
+            // are gathered by one call, so neither can be the one left out.
+            let carrier = PathBuf::from("carrier");
+            let carriers = [
+                p.mcp_config.then(|| carrier.clone()),
+                p.endpoint_file.then(|| carrier.clone()),
+            ];
+            let private = SessionPrivate::of(carriers, Some(PathBuf::from("cwd")));
+            assert_eq!(private.files, vec![carrier], "{h:?} leaks its endpoint");
+            assert!(private.cwd.is_some());
+        }
     }
 
     use schemaic_core::schema::{ColumnInfo, TableInfo};

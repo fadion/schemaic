@@ -17,6 +17,7 @@ mod antigravity;
 mod conn_sources;
 mod dump;
 mod heap;
+mod liveness;
 mod logging;
 mod mcp;
 mod opencode;
@@ -177,7 +178,20 @@ fn main() {
     // points at is, which is the whole reason it is not inlined. No credential
     // URL is involved either way.
     if std::env::args().any(|a| a == "--mcp-serve") {
-        let endpoint = mcp_endpoint_from_env();
+        // **Refused, not defaulted.** An endpoint that cannot be read used to
+        // fall back to `127.0.0.1:3306` with sample rows and catalogue listing
+        // switched back *on*, so a session the user had pinned to schema-only
+        // started answering from whatever local server was listening. Reported
+        // on stderr — stdout is the JSON-RPC stream and nothing may write to it
+        // — and the CLI that launched us surfaces the server as failed, which is
+        // the honest end state.
+        let endpoint = match mcp_endpoint_from_env() {
+            Ok(e) => e,
+            Err(why) => {
+                eprintln!("schemaic --mcp-serve: {why}");
+                std::process::exit(2);
+            }
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8956,7 +8970,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let database = context_now.active_db.clone();
                 if let Ok(db) = db_for(active_id) {
                     let mcp_database = database.clone();
-                    let (stdin_tx, mcp_cfg) = start_ai_session(
+                    // **The old session goes first.** Assigning over
+                    // `ai_session` below drops it, which is *after* the new
+                    // one's `install` has been handed to a blocking thread — so
+                    // an Antigravity teardown regularly ran after the new
+                    // session's registration and took it back out again. The
+                    // `Claim` nonce is what makes that harmless rather than a
+                    // race won by whoever finishes last; taking the old session
+                    // here is the ordering half, and the two together are the
+                    // fix.
+                    ai_session.borrow_mut().take();
+                    let (stdin_tx, private) = start_ai_session(
                         &handle,
                         StartAiParams {
                             system_context: context,
@@ -8979,7 +9003,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     *ai_session.borrow_mut() = Some(AiSession {
                         conn_id: active_id,
                         stdin_tx,
-                        mcp_cfg,
+                        private,
                         settings: ai_settings_now(),
                         // The system prompt just stated this context, so the
                         // first turn has no delta to report.

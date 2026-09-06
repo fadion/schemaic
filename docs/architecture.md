@@ -5155,7 +5155,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   and the bug that made that the safe answer at the time, is under `app/agent_cli.rs`. A
   harness key `main.rs` does not recognise is `tracing::warn!`ed and falls back to Claude.
   **Getting the tools to each harness is four different mechanisms, and only Claude's is per
-  invocation.** Claude gets a temp `--mcp-config` file; Codex gets `-c` overrides on its own command
+  invocation.** Claude gets a `--mcp-config` file in a directory of Schemaic's own (`ai::mcp_dir()`,
+  and it was the temp dir until the credentials in it were moved somewhere only this user can
+  list); Codex gets `-c` overrides on its own command
   line; Antigravity has no per-invocation configuration at all and needs **two pieces of its own
   global state** written instead — an `agy mcp add` registration *and* a per-tool
   `permissions.allow` rule in its `settings.json` — which is what `app/antigravity.rs` owns and
@@ -5216,18 +5218,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   drops the two directory-relative sources, because the CLI resolves them against the child's
   working directory; the one-shot paths below inherit the app's own working directory instead, and
   the flag covers them for the same reason.
-  **And the session child no longer runs in the temp dir.** `ai::session_cwd` is
-  `persist::private_dir("ai-session")` — a directory under the app's own config dir, created
-  owner-only (`create_private_dir`, `0o700` where the platform has modes; on Windows the profile's
-  ACL already scopes it). `std::env::temp_dir` on Unix is world-writable, and `/tmp`'s sticky bit
+  **And the session child runs in a directory made for it, never in the temp dir itself.**
+  `ai::session_cwd` creates `<temp>/schemaic-run-<pid>-<started>-<tag>`, fresh per session, through
+  `create_exclusive_dir` — `DirBuilder::mode(0o700).create` on Unix, `fs::create_dir` elsewhere, and
+  deliberately **not** `create_dir_all`, because refusing an existing path *is* the security
+  property: `create_dir_all` succeeds on a directory somebody else made, and on a symlink into one.
+  `std::env::temp_dir` on Unix is world-writable, and `/tmp`'s sticky bit
   stops another local account deleting your files, not taking a path nobody has: a
   `.claude/settings.json` pre-created there has its `hooks` run as this user the next time the AI
   panel opens. `--setting-sources user` closes that on a current CLI, but it is exactly the flag
   `CliSeal` may have to drop, and unlike `--tools` — backstopped by `DISALLOWED_TOOLS` — nothing
-  stood in for it. Owning the directory makes the flag defence in depth instead of the only line.
-  The temp dir stays as the fallback for a machine with no config directory at all, which is where
-  `private_dir` answers `None`; `private_dir_in` is the pure half, separate so the *choice* is the
-  part that can be pinned. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
+  stood in for it. Nobody can plant a file in a directory that did not exist a moment ago and that
+  only this user may write, so owning *this* directory makes the flag defence in depth exactly as
+  owning a tree of ours did.
+  **It was `persist::private_dir("ai-session")`, under the app's own config dir, and that was the
+  release review's one Critical (R3-L5-01).** That directory's *parent* holds `connections.json` —
+  every saved connection's host, user, database and SSH account, plus the plaintext DB password, SSH
+  password and key passphrase in the keyring-unavailable fallback — and `schemaic.log`. It was
+  chosen when Claude, which is `Sealed` and has no built-in tools, was the only harness; Antigravity
+  is graded `Restricted`, its filesystem readers are auto-approved headless, and this repository's
+  own measurements record a turn running `list_dir` and `view_file` unprompted. A table comment, a
+  column comment, an imported dump or a row value is text the user did not write, and
+  `../connections.json` was one relative path away. The credentials the AI paths *write* moved the
+  other way in the same change, out of the temp dir and into `ai::mcp_dir()` — see the `ai.rs` entry.
+  `session_cwd` answers `Option<PathBuf>`, and `None` means the caller spawns with **no**
+  `current_dir` at all rather than falling back to a shared one. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
   otherwise swallow a later flag's name as a tool name, and both
   `the_session_loads_no_mcp_server_and_no_config_dir_of_its_own_finding` and the test above pin that
   order. **They did not prompt — they ran.** Driving the old flag set with
@@ -5596,8 +5611,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     user's file is the part that is unit-tested. **Merged, never rewritten**: it is the user's file,
     it holds their `trustedWorkspaces`, and that CLI rewrites it itself, so the document is parsed,
     the rules are unioned in, and every other key is handed back untouched. Adding is idempotent, so
-    a crashed session's leftovers do not accumulate; removing prunes the containers it emptied, so
-    the file returns to its prior shape rather than keeping scaffolding; and an **unparseable
+    a crashed session's leftovers do not accumulate; removing prunes empty `permissions`/`allow`
+    containers so the file returns to its prior shape rather than keeping scaffolding, but **only
+    the ones this call emptied** — the prune used to test the *post-`retain`* state instead, so a
+    user whose own file already held `{"permissions":{"allow":[]}}` lost that key on a launch where
+    Schemaic had added nothing and withdrawn nothing
+    (`an_empty_container_we_did_not_empty_is_left_where_it_was`); and an **unparseable
     document is declined** rather than overwritten — the cost of that is one session without
     database tools, and the cost of the alternative is the user's file. An empty or missing file is
     an empty document, because that is what a fresh install looks like and refusing it would deny
@@ -5605,6 +5624,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     removal matches by value, so a rule the *user* added by hand for the same tool is
     indistinguishable from ours and goes with it — the alternative is a standing grant nobody
     remembers making.
+    **"Nothing changed" is this layer's answer to give, because nothing outside it can compute
+    one.** Both functions return `Option<SettingsEdit>` — `None` is still the decline, and otherwise
+    `Unchanged` or `Write(text)` — and `app/antigravity.rs` writes only on the second. The caller
+    used to decide by comparing the returned text against the bytes it had read, a comparison that
+    never succeeds against a real file: `to_string_pretty` emits no trailing newline, and with no
+    `preserve_order` feature in this workspace `serde_json::Map` is a `BTreeMap`, so the user's keys
+    come back sorted. So every Antigravity user had another vendor's `settings.json` truncated,
+    re-sorted and rewritten at **every** launch — including everyone who never opened the AI panel,
+    since the startup sweep withdraws rules that are usually not there. A rewrite is not free even
+    when the content is equivalent: it re-sorts keys, strips the trailing newline, collapses CRLF,
+    normalises numbers and collapses duplicate keys — a fair price for an edit the user asked for,
+    and no price at all is the right one for an edit that removes nothing
+    (`withdrawing_from_a_file_that_holds_none_of_our_rules_changes_nothing`,
+    `granting_a_rule_that_is_already_there_changes_nothing`). `render_settings` is the single exit,
+    and it adds the trailing newline every editor and CLI that writes this file leaves on it.
     **`opencode_config_json` is the same division for the harness whose whole configuration is one
     file**: the JSON is built and tested here, and `app/opencode.rs` does the IO. It holds both
     halves at once — the `mcp` table naming our server and its `--endpoint-file` command line, and
@@ -9460,8 +9494,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   re-entered and met the same check — which is the shape of drift this document exists to catch, in a
   comment rather than a paragraph. `refuse_every_turn` is the cheap way to make that claim true: a
   task holding `rx` open that re-states the reason per turn (and ignores `Interrupt`, since Stop on an
-  idle panel is not a question). Both refusal paths take it — the constraint one and the OpenCode
-  config-write failure. It lives on the one function that spawns an agent for the
+  idle panel is not a question). **All three** non-spawning returns take it — the constraint one, the
+  OpenCode config-write failure, and the persistent branch's oversize refusal, which was the one left
+  behind and had the same silence to show for it: it returned a `tx` whose `rx` it had just dropped,
+  `needs_respawn` saw no settings change, and every later question was a discarded `Err`.
+  It lives on the one function that spawns an agent for the
   same reason the write guard lives on the run action: a gate a caller has to remember is one
   `return` from not existing. And it **reuses the binary and the `Probe` it checked** for the spawn
   and for `build_session_args`'s seal — re-resolving would let the thing checked and the thing run
@@ -9541,8 +9578,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   enough that a healthy CLI flushing and shutting down is never killed mid-cleanup, short enough that
   one which never exits cannot wedge the session against every later question.
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
-  per-session temp `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
-  to other same-user processes. **A harness Schemaic cannot hand a config file gets a *path*
+  per-session `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
+  to other same-user processes. **That file, and every other per-session file carrying the endpoint,
+  lives in `ai::mcp_dir()` — `persist::private_dir("ai-mcp")` — and not in the shared temp
+  directory.** They hold the DB host, user and **plaintext password**, and in a directory every
+  account on the machine can list the only thing between them and another user was `O_EXCL` plus a
+  random name. `private_dir` is `0o700` on Unix and ACL-scoped to the profile on Windows;
+  `private_dir_in` is its pure half, separate so the *choice* of root is the part a test can pin.
+  `O_EXCL` is kept anyway, in the one `create_private(kind, ext, bytes)` that `write_mcp_config`,
+  `write_endpoint_file` and `inline_reply_path` all now go through: it refuses an existing path and
+  refuses to follow a symlink, and the mode a create applies never applies to a file that was merely
+  *opened*. **A harness Schemaic cannot hand a config file gets a *path*
   instead of the blob, and still never the credential.** Codex's only configuration lever is
   `-c key=value` and those are argv, so `mcp_endpoint_from_env` now prefers the file named by
   `--endpoint-file <path>` and falls back to `$SCHEMAIC_MCP_ENDPOINT`; the path is not the secret,
@@ -9560,13 +9606,68 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   collects it. It holds the same secret and must not outlive its session any longer. **OpenCode is on
   that route for a third reason**: it is configured by a file, like Claude, but by a *reused* one, so
   the `--endpoint-file <path>` in its `opencode.json` is what keeps the credential out of a directory
-  that outlives the session (`crate::opencode`). Pure clusters
+  that outlives the session (`crate::opencode`).
+  **Which of those two routes a harness takes is one decision, `endpoint_plumbing(harness) ->
+  EndpointPlumbing { mcp_config, endpoint_file }`**, because it used to be two independent
+  `match harness` sites — one in each of `start_ai_session`'s branches — and that is precisely how
+  the two came to disagree. The persistent branch handed back `mcp_cfg`, which is `write_mcp_config`
+  for Claude and `None` for every other harness, so when Antigravity became persistent its endpoint
+  file (host, user, plaintext password) had nothing to unlink it and accumulated one per session for
+  the life of the machine. What a session hands back is a `SessionPrivate { files: Vec<PathBuf>, cwd:
+  Option<PathBuf> }` rather than an `Option<PathBuf>`, gathered by a single `SessionPrivate::of` call
+  so neither carrier can be the one left out, and `AiSession`'s `Drop` unlinks every file and removes
+  the working directory — `remove_dir`, **not** `remove_dir_all`, because an agent CLI ran in there
+  and a recursive delete of whatever it left is not ours to do; the sweep collects the rest once the
+  owner is gone. `every_harness_carries_the_endpoint_exactly_one_way` walks `Harness::ALL` and holds
+  both halves at once: each harness carries the endpoint exactly one way, *and* whichever carrier
+  that is reaches `SessionPrivate`. The second half is the composition, and the composition was the
+  bug.
+  **And the subprocess reading that file fails closed.** `mcp_endpoint_from_env` returns
+  `Result<McpEndpoint, String>`; the decision is the pure `endpoint_blob(file, read, env)`, which
+  takes the filesystem and the environment as arguments because the only way to reach the real
+  function is to be launched as an MCP subprocess by an agent CLI — so the rule it applies would
+  otherwise be tested by nothing at all, which is how it came to have no rule. It used to fall
+  through: an unreadable `--endpoint-file` dropped to `None`, fell back to `$SCHEMAIC_MCP_ENDPOINT`
+  — which **only Claude's config sets** — found nothing, and handed `Value::Null` to
+  `endpoint_from_value`, which *defaults*. The server came up on `127.0.0.1:3306` with an empty user,
+  `samples: true` and `schema: true`, so a session the user had pinned to `AiData::SchemaOnly` or
+  `SchemaScope::None` started answering with sample rows and a full catalogue listing from whatever
+  local MySQL or MariaDB was listening — both access gates re-opened against a database nobody
+  authorised, and the trigger was not hypothetical, because the age-based sweep below could delete a
+  live session's endpoint file. **A missing field inside a blob that *did* parse still defaults, and
+  must**: those defaults are what every endpoint written before a given field existed relies on
+  (`an_old_blob_still_gets_its_back_compat_defaults`), so failing closed is about the blob being
+  absent or unreadable and not about it being old. `mcp.rs` is untouched by this — it destructured
+  the defaulted endpoint and started answering, so the fix belongs upstream of it — and `main.rs`'s
+  `--mcp-serve` arm prints the reason to **stderr**, because stdout is the JSON-RPC stream, then
+  exits 2 so the launching CLI surfaces the server as failed
+  (`an_endpoint_file_that_cannot_be_read_refuses_rather_than_defaulting`, which also pins that it
+  does *not* fall through to the environment, and `a_blob_that_is_not_a_json_object_refuses`).
+  **The sweep that collects what a crash left behind asks liveness, not age.**
+  `stale_mcp_file(name, owner_live, age)` and `stale_run_dir` both parse an `Owner` out of the name —
+  one parser, `owner_in(name, prefix)`, since the owner sits immediately after the prefix in both
+  shapes — and hand it to `liveness::may_sweep`. `MCP_STALE_AFTER` (still 24 hours) is now only the
+  fallback for a name carrying **no** owner: one written by a build older than the naming, or by a
+  process whose start time could not be read. Age alone was wrong in both directions at once. It
+  deleted a *live* instance's endpoint file — a session older than a day plus a second window was
+  enough, and `modified()` on a write-once file is its creation time and never advances — while its
+  `.json` requirement meant `inline_reply_path`'s `.txt` could **never** be collected, though the
+  sweeper's own doc said it was, and an existing test pinned that denial against a hand-written name
+  no caller produces. `sweep_stale_mcp_configs` sweeps `mcp_dir()` **and** the old temp location,
+  because an upgrading user has plaintext passwords sitting there under the old ownerless names — the
+  case the age fallback exists for. Five tests hold it:
+  `a_live_sessions_files_are_never_swept_however_old_they_get`,
+  `every_kind_of_file_this_module_creates_can_be_swept`,
+  `a_file_with_no_owner_falls_back_to_the_age_rule`, `nothing_that_is_not_ours_is_ever_swept` and
+  `a_run_directory_outlives_its_owner_and_no_longer`. Pure clusters
   split out: `agent_cli.rs` (agent-CLI
   discovery — env override / known install locations / PATH+PATHEXT — plus the one part of it that
   is *not* pure, `probe`, which spawns `<bin>` with that harness's `help_args` and caches what it
   reads per
   `(harness, path)`; its own entry is below), `antigravity.rs` (that CLI's two pieces of global
-  state, also below), `opencode.rs` (the config directory that harness is sealed by, and the
+  state, also below), `liveness.rs` (whether the process that left something behind is still
+  running, which `antigravity.rs`'s sweep and `ai.rs`'s own sweep both ask — also below),
+  `opencode.rs` (the config directory that harness is sealed by, and the
   environment pointing it there — also below) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
   stays in `main.rs`.
@@ -9607,10 +9708,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   they were Claude-only — an unsealed Claude is a refusal at `start_ai_session`, and inline never
   reached that function — but a one-shot can be Codex or Antigravity now, whose constraint *is* the
   sandbox flag, so `spawn_refusal` is asked here for the same reason it is asked there, and the
-  oversize check sits beside it. `inline_reply_path` is Codex's `-o` temp file, named with
-  `MCP_FILE_PREFIX` so the existing `sweep_stale_mcp_configs` collects it if the process dies between
+  oversize check sits beside it. `inline_reply_path` is Codex's `-o` file, in `mcp_dir()` and named
+  with `MCP_FILE_PREFIX` so `sweep_stale_mcp_configs` collects it if the process dies between
   the spawn and the read; `run_inline` reads and removes it whatever the exit status, so a failed run
-  that still wrote one leaves nothing for the sweeper.
+  that still wrote one leaves nothing for the sweeper. **And so does the oversize refusal**, which
+  used not to: the path has to exist to go into the argv that check measures, so `inline_plan`
+  created one and then refused, orphaning a file every time. It is removed at the refusal rather than
+  left to the sweep, which only collects once the owning process is gone.
+  **`run_inline` runs its child in a working directory of its own too**, `InlinePlan::cwd` from the
+  same `session_cwd`, removed when the generation finishes. It used to set no `current_dir` at all,
+  so the child inherited the app's *own* process working directory: a user who launches Schemaic
+  from a world-writable directory gave any local account a `.claude/settings.json` whose `hooks` run
+  as them on the next Ctrl+K, and Claude — the default harness — has only the cwd standing between it
+  and that. It also clears OpenCode's config variables **before** setting ours, the order the session
+  path states in a comment and this one had backwards, and clears them unconditionally rather than
+  behind `harness == Harness::OpenCode`.
   **What comes back is gated, not trusted**: `inline_outcome` runs `extract_sql` (fences off) and
   then `intel::sql_reply` (the parse gate above), and a reply that will not parse becomes
   `Failed("The model did not return SQL")` rather than an edit. It takes the runner's
@@ -9769,14 +9881,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     for the life of the session and taken back out again. It is the only harness configured by
     writing into the user's *own* files — the others take a flag, a `-c` override, or (OpenCode) a
     file in a directory Schemaic owns — which is why this is a module rather than four lines in
-    `ai.rs`. `AgyRegistration::install` runs `agy mcp add` and
+    `ai.rs`. `AgyRegistration::install` claims the state, runs `agy mcp add` and
     merges the connection's `permissions.allow` rules into `settings.json`, and its `Drop` removes
-    both. The `--` ahead of the command is load-bearing rather than punctuation: the arguments being
+    all three. The `--` ahead of the command is load-bearing rather than punctuation: the arguments being
     registered start with `-`, and `agy mcp add` rejects a flag placed after the server name. **Both, together, in both directions** — a registration without rules is a server whose
     every call is refused, and rules without a registration are a standing grant for a server that
-    is not there. A failed install removes **nothing** on drop, since tearing down a registration
-    this session never added would take out a working one belonging to somebody else
-    (`a_failed_registration_removes_nothing_on_drop`). The rules come from the connection's own
+    is not there, which is why `install` folds the settings result into `installed`: a registered
+    server whose rules were declined is withdrawn again rather than reported as a working session,
+    so `is_installed()` stops answering `true` for a session whose every call that CLI refuses. A
+    failed install removes **nothing** on drop, since tearing down a registration this session never
+    added would take out a working one belonging to somebody else — one of the three ways
+    `may_release` answers no, and `a_failed_registration_removes_nothing_on_drop` asks it directly
+    now: the version that asserted only "does not panic" passed with the guard deleted, because on
+    CI there is no settings file and a fake `agy` cannot spawn. The rules come from the connection's own
     allow-list, so a schema-only connection never grants `run_query` and `run_command` is never
     granted at all; the surgery itself is `schemaic_ai::harness`'s pure, tested half and this module
     only does the IO.
@@ -9809,17 +9926,32 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     no business leaving a file where it keeps its settings.
     `withdrawing_rules_from_a_file_that_is_not_there_writes_nothing` drives the composition rather
     than the predicate, because the composition is what bit.
+    **The settings write is atomic, and its answer is used.** `edit_settings` writes through
+    `persist::write_file_atomic`, whose own doc opens by naming the failure it exists for:
+    `fs::write` truncates before it writes, so a full disk, a dropped network share or a crash
+    between the two leaves the file empty — and this is another vendor's configuration, in a
+    directory Schemaic does not own and cannot regenerate. It returns whether the file now says what
+    it was asked to say, which includes the `harness::SettingsEdit::Unchanged` case where it already
+    did and nothing is written at all. All three callers used to discard that answer, so
+    `is_installed()` could report `true` with no rules granted, and a withdraw that failed or was
+    declined — an unwritable file, an unparseable one — left a standing `run_query` auto-approval in
+    the user's configuration permanently and silently. A failed withdraw is a `tracing::error!` now,
+    at `Drop` and in `sweep` both, because the state it leaves is the one this module calls the bad
+    one — rules standing with no registration — and it is permanent: the next launch's sweep fails
+    on the same file the same way.
     **The sweep now asks whether the leftovers are leftovers, and what it used to be was a live bug
     rather than a stated limit.** It ran at every launch and removed the registration and the
     allow-rules unconditionally, so launching a second Schemaic pulled the database tools out from
     under a *live* first instance's running session, which then held a server whose every call had
-    silently stopped existing. `AgyRegistration::install` calls `claim()` after a successful install
-    and the sweep consults what it wrote, returning early while the process named there is still
-    running; when it does decide to sweep, it clears that stale marker along with the state. The
-    decision is the pure `may_sweep(marker, live, me) -> bool` over a private `Owner { pid, started }`
-    with `marker_text`/`parse_marker` either side of it, and the process lookup — `process_start`,
-    through the `sysinfo` dependency the app already had — is kept outside it, so the rule is testable
-    with no process to look at (`a_second_instance_does_not_sweep_a_live_instances_registration`).
+    silently stopped existing. `AgyRegistration::install` writes a `Claim` **before** it installs
+    anything and the sweep consults what it wrote, returning early while the session named there is
+    still running; when it does decide to sweep, it clears that stale marker along with the state.
+    The liveness half of that decision is not this module's any more: `Owner`, `process_start` and
+    the pure `may_sweep(marker, live) -> bool` live in `liveness.rs`, where the other sweep that
+    asks the same question can reach them. What stays here is the `Claim { owner, nonce }` the
+    marker records, `claim_text`/`parse_claim` either side of it, and the pure
+    `may_release(mine, on_disk, installed)`
+    (`a_second_instance_does_not_sweep_a_live_instances_registration`).
     **The start time is what makes the claim safe, and a pid alone would not have been.** Pids are
     reissued, so a crashed instance's marker eventually names some unrelated live process, and a sweep
     trusting the number would decline to clean up for the rest of that pid's life — turning a
@@ -9828,13 +9960,47 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     unreadable** marker is treated as no claim at all, in that same direction and for the same
     reason: a truncated file must not be able to strand a permission in the user's config with nothing
     left able to withdraw it (`a_crashed_instances_registration_is_still_swept`,
-    `an_absent_or_unreadable_marker_is_not_a_claim`, `our_own_stale_marker_does_not_stop_us` for the
-    marker naming this very process at startup, and `a_marker_round_trips` over the two-field line
-    that is the whole interface between the writer and the reader).
-    **`Drop` releases the claim last, after both removals**, because releasing first would open a
-    window in which another instance's sweep could race this one's own teardown. The marker lives at
+    `an_absent_or_unreadable_marker_is_not_a_claim`, `our_own_live_claim_survives_our_own_startup_sweep`
+    for the marker naming this very process at startup — the old name for that test,
+    `our_own_stale_marker_does_not_stop_us`, asserted the opposite and encoded the bug `liveness.rs`
+    was extracted over — and `a_claim_round_trips` over the three-field line that is the whole
+    interface between the writer and the reader).
+    **The nonce is the third field, and a respawn is what needs it.** Changing a setting respawns
+    the AI session: `ai_send` used to start the new one first and drop the old one afterwards —
+    assigning over `ai_session` is when the old `Drop` ran — on a
+    different worker with no ordering between them, so the old session's `Drop` regularly ran *after*
+    the new `install` and removed the registration, the rules and the marker the new session had just
+    put in place — same pid, same start time, so an `Owner` alone could not tell the two apart, and
+    the new session then ran with every database tool refused while `is_installed()` said `true`.
+    With a nonce the ordering stops mattering, which is the only fix available: whoever claims last
+    owns the state, and a `Drop` whose nonce is no longer the one on disk removes nothing
+    (`the_previous_sessions_teardown_does_not_disarm_the_one_that_replaced_it`).
+    `ai_send` takes the old session out **before** it calls `start_ai_session` now, which shortens
+    the window without being the guarantee — `install` is handed to a blocking thread inside the new
+    session's task, so the old teardown can still land after it — and the comment at that call site
+    says as much, so nobody reads the reordering as having replaced the nonce.
+    **The claim goes first and is released last, and the first half is what changed.** It used to be
+    written *after* `agy mcp add` and after the grant, so from the instant the registration landed
+    until the claim returned there was machine-global state that no marker accounted for, and another
+    launch's sweep landing in that window removed it out from under a live session; a claim
+    protecting state it was written after protects nothing. It is written through
+    `persist::write_file_atomic` for the reason the marker's reader is another process: `fs::write`
+    truncates first, so a sweep landing between the truncate and the write read `""` or a prefix,
+    `parse_claim` answers `None` for both, and a torn write by a *live* instance was read as no claim
+    at all. **A claim that cannot be made means no install at all** — without one there is nothing to
+    stop another instance's sweep withdrawing the grant mid-session and nothing to tell this session's
+    own teardown whether the state is still its own, so the session runs without database tools and
+    says so. `Drop` still releases last, after both removals, because releasing first would open the
+    mirror window in which another instance's sweep could race this one's own teardown, and
+    `release(mine)` removes the marker only while the marker is still the caller's. The marker lives at
     `persist::private_dir("agy")/registration-owner` rather than in the shared temp directory: it is a
     claim a sweep obeys, and world-writable is the wrong permission for that.
+    **And `Drop` asks `may_release` now, where it consulted nothing at all.** It performed the same
+    three removals as the sweep eighteen lines away without asking whose state it was, so a second
+    window's session *ending* silently disarmed a live one just as surely as its starting used to — a
+    claim that governs one remover and not the other governs nothing. `may_release` answers no three
+    ways, each a bug that happened: a session that never installed, a session that never claimed, and
+    a claim that is no longer the one on disk.
     **A second limit, recorded rather than guarded: the server name is not ours to reserve.**
     `agy mcp add` is an upsert and `agy mcp remove` is unconditional, so a user who has registered
     their *own* MCP server under the name `schemaic` — or one pointing at a different Schemaic build
@@ -9848,10 +10014,48 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     comment now says so nobody tidies it into `~/.antigravity`. The path was **observed, not
     documented**, so `$SCHEMAIC_AGY_SETTINGS` overrides it: if that CLI moves the file, the failure
     should be "no database tools" and not "wrote into the wrong file"
-    (`the_settings_path_is_overridable_for_a_cli_that_moves_it`). `agy mcp` calls are best-effort by
+    (`the_settings_path_is_overridable_for_a_cli_that_moves_it`, which asks the pure
+    `settings_path_from(override_var, home)` rather than mutating the process environment as it used
+    to — `unsafe { std::env::set_var }` in a parallel test binary whose siblings read the environment
+    on other threads is documented UB, and it hard-*removed* a documented user-facing override
+    instead of restoring it). `agy mcp` calls are best-effort by
     design — a missing or refusing binary costs the session its database tools, which the failing
     tool call already reports, where failing the whole session over a config write would be worse;
     a registration that did not take is `tracing::warn!`ed rather than left to be discovered.
+  - `liveness.rs` — **is the process that left this behind still running?**, asked once for the
+    whole app. Two unrelated sweeps asked it and answered it two different ways, each wrong in one
+    direction: `antigravity::sweep` read a pid marker and special-cased its own pid, while `ai`'s
+    temp sweep — which deletes MCP config and endpoint files, and those carry the database password
+    — answered with a 24-hour mtime, so a session older than a day plus a second window was enough
+    to delete a *live* instance's endpoint file, and abandoned siblings with the wrong suffix were
+    never collected at all. An `Owner` is a pid **and** the start time of the process that held it,
+    because pids are reissued: a crashed instance's claim eventually names some unrelated live
+    process, and anything trusting the number alone would decline to clean up for the rest of that
+    pid's life — turning a transient crash into a permanent standing grant, or a permanent plaintext
+    credential on disk (`a_reissued_pid_is_not_the_owner`). `me()` is this process, or `None` when
+    its start time cannot be read, because a claim that cannot be told from a pid-reuse cannot
+    expire and is worse than none — so callers treat that as "do not claim" rather than falling back
+    to the bare pid. `process_start` is the `sysinfo` lookup and the only impure part, kept to one
+    line of answer so `is_live` and `may_sweep` stay testable with no process to look at. An absent,
+    unreadable or garbled claim is **not** a claim
+    (`an_absent_or_unreadable_claim_never_blocks_a_sweep`): both callers have to be able to clean up
+    after a crash they cannot identify, and refusing to act on a garbled marker would strand exactly
+    what the sweep exists to remove.
+    **`may_sweep` has no "our own pid" arm, and that arm is why this module exists.** It used to
+    answer `true` for any marker naming this pid, on the reasoning that a sweep runs at startup and
+    so cannot be the instance mid-session. The sweep is a *detached* thread with `detect_bin`, a
+    `sysinfo` refresh and an `agy mcp remove` ahead of it, nothing joins it and no flag marks it
+    done, so a user who presses Enter in the AI panel first has already written a marker naming this
+    pid *with this pid's start time* — which that arm then swept, disarming the session that had just
+    installed it. The start-time comparison answers our own process correctly with no special case: a
+    marker written by *this* process carries *this* start time and is live, one left by a previous
+    process on the same pid carries a different one and is not
+    (`our_own_live_claim_is_not_sweepable_even_though_it_names_our_pid`, which composes the two rather
+    than testing `is_live` alone). **Both sweeps call it now**, so the module doc's second consumer
+    is real rather than pending: `ai.rs`'s `stale_mcp_file` and `stale_run_dir` parse an `Owner` out
+    of the file or directory name and ask `may_sweep`, and `MCP_STALE_AFTER` has dropped to the
+    fallback for a name that carries no owner at all. The live endpoint file the 24-hour mtime used
+    to delete went with it.
   - `opencode.rs` — the config directory an OpenCode session is sealed by, and the environment that
     points the CLI at it. `OpenCodeConfig::write` puts `harness::opencode_config_json` on disk and
     hands back the root, `write_inline` does the same for a one-shot with
@@ -9896,8 +10100,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     *data* directory and moving it logs the user out of the CLI they just signed into, failing on
     credentials rather than on anything Schemaic visibly did. **`OPENCODE_DISABLE_PROJECT_CONFIG=1`**
     closes the second axis, the `opencode.json`/`.opencode/` that CLI also reads from its working
-    directory; `ai::session_cwd` is a private app directory with nothing there to read today, so this
-    is defence in depth behind owning the cwd, exactly as Claude's `--setting-sources` is. And **the
+    directory; `ai::session_cwd` is a directory created for that one session and empty when the CLI
+    starts in it, so this is defence in depth behind owning the cwd, exactly as Claude's
+    `--setting-sources` is. And **the
     value must be absolute**: a relative one made the CLI resolve it against its own cwd and die on
     `EEXIST: mkdir '..\pC\opencode'`, which names neither Schemaic nor the variable. `private_dir`
     returns an absolute path, so that is a property of the source rather than something enforced
@@ -10575,12 +10780,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   `db::lock_wait_sql` so a lock nobody could ask about comes back as an error instead of never.
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
-  endpoint via a temp `--mcp-config` file, not argv — or, for a harness whose only configuration
+  endpoint via a `--mcp-config` file, not argv — or, for a harness whose only configuration
   lever *is* argv, via a private file whose **path** rides in `--endpoint-file` while the endpoint
   itself never leaves the file (`harness::codex_mcp_overrides`, `ai::endpoint_file_arg`). The same
   `--endpoint-file` route carries Antigravity, whose registration writes that command line into the
   CLI's **own config**: a path there outlives the process, which is one of the two reasons
-  `antigravity::sweep` exists. Don't add new plaintext-secret surfaces.
+  `antigravity::sweep` exists. **Both files live in `ai::mcp_dir()`, which is ours and `0o700`,
+  rather than the shared temp directory they used to**: they hold a plaintext password, and in a
+  directory every account on the machine can list, `O_EXCL` plus a random name was the whole of the
+  defence. And a subprocess that cannot read the file it was pointed at **refuses** rather than
+  defaulting — `ai::mcp_endpoint_from_env` returns `Err`, because the fallback was a
+  `127.0.0.1:3306` endpoint with every access gate back on. Don't add new plaintext-secret surfaces.
   **"Never in a log" includes a log the environment asked for.** `app::logging`'s
   `log_directives`/`filter_for` append `russh=warn`, `russh_cryptovec=warn` and `russh_util=warn`
   *after* whatever `RUST_LOG` said, because `RUST_LOG` **replaces** the default filter rather than
