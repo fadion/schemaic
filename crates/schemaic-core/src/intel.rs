@@ -4830,6 +4830,93 @@ fn source_table_of(name: &sqlparser::ast::ObjectName) -> Option<SourceTable> {
     }
 }
 
+/// Every base relation `sql` reads, or `None` when its shape makes a driver's
+/// **per-column provenance** untrustworthy.
+///
+/// This is the gate on SQLite's `sqlite3_column_table_name`/`origin_name`, and
+/// it exists because that provenance answers a narrower question than it looks
+/// like it does. It names the table a result *column expression* resolves to,
+/// not the table a result *row* came from, and for a compound `SELECT` those are
+/// different: SQLite reports one branch's provenance for the whole result.
+/// Measured on 3.53.2, `SELECT id, name FROM t UNION SELECT id, note FROM u`
+/// answers `t`, while the same union read through a view answers `u` — so it is
+/// not a rule a caller could compensate for, it is whatever the code generator
+/// resolved last. Half those rows are in the other table, and an edit attributed
+/// by that would `UPDATE` a table the row was never in.
+///
+/// So a set operation **at any depth** refuses the whole statement, including
+/// one buried in a derived table or a CTE body. What is deliberately *not*
+/// refused is a join, a subquery or a CTE over ordinary tables: provenance is
+/// per column and resolves straight through those to the real base column, which
+/// is exactly the widening it is taken for.
+///
+/// **The relations come back so the caller can refuse the ones it can't verify.**
+/// A compound hidden behind a *view* leaves nothing in this statement to see it
+/// by — `SELECT * FROM v` parses as a plain single-table read whatever `v` is —
+/// so the caller has to ask its catalogue whether any of these names is a view,
+/// which is a question this crate has no connection to answer. Names bound by a
+/// CTE are left out: they shadow any real object of the same name, and the body
+/// they stand for was walked here already.
+pub fn provenance_sources(sql: &str, dialect: SqlDialect) -> Option<Vec<SourceTable>> {
+    use sqlparser::ast::{Query, SetExpr, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct Sources {
+        relations: Vec<SourceTable>,
+        cte_names: Vec<String>,
+    }
+    impl Visitor for Sources {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if matches!(q.body.as_ref(), SetExpr::SetOperation { .. }) {
+                return ControlFlow::Break(());
+            }
+            if let Some(with) = &q.with {
+                for cte in &with.cte_tables {
+                    self.cte_names.push(cte.alias.name.value.clone());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_relation(&mut self, name: &sqlparser::ast::ObjectName) -> ControlFlow<()> {
+            match source_table_of(name) {
+                Some(t) => self.relations.push(t),
+                // A shape `source_table_of` refuses — a three-part name — is one
+                // this can't name to the caller, so it can't be checked either.
+                None => return ControlFlow::Break(()),
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+        return None;
+    };
+    let mut v = Sources::default();
+    if query.visit(&mut v).is_break() {
+        return None;
+    }
+    let Sources {
+        relations,
+        cte_names,
+    } = v;
+    Some(
+        relations
+            .into_iter()
+            .filter(|r| {
+                r.qualifier.is_some() || !cte_names.iter().any(|c| c.eq_ignore_ascii_case(&r.name))
+            })
+            .collect(),
+    )
+}
+
 /// The table a statement reads **in full** — every row of it, once each — or
 /// `None` when the statement is anything else.
 ///
@@ -5684,6 +5771,86 @@ mod tests {
             ] {
                 assert!(!is_single_expression(text, d), "{d:?} accepted {text}");
             }
+        }
+    }
+
+    /// The shapes driver provenance may be trusted on, and the relations each
+    /// one reads — a join, a subquery and a CTE all come back with every base
+    /// table named, because that is the widening the gate exists to permit.
+    #[test]
+    fn provenance_sources_names_every_table_a_readable_shape_touches() {
+        let names = |sql: &str| -> Option<Vec<String>> {
+            provenance_sources(sql, SqlDialect::Sqlite)
+                .map(|v| v.iter().map(|t| t.name.to_lowercase()).collect())
+        };
+        assert_eq!(names("SELECT id FROM t"), Some(vec!["t".into()]));
+        assert_eq!(
+            names("SELECT t.a, u.b FROM t JOIN u ON u.t_id = t.id"),
+            Some(vec!["t".into(), "u".into()])
+        );
+        assert_eq!(
+            names("SELECT id FROM (SELECT * FROM t)"),
+            Some(vec!["t".into()])
+        );
+        // A CTE's *name* is not a relation to check — it shadows any object of
+        // that name — but the body it stands for is walked, so `t` is reported.
+        assert_eq!(
+            names("WITH c AS (SELECT * FROM t) SELECT id FROM c"),
+            Some(vec!["t".into()])
+        );
+        // A table read only by a `WHERE` subquery still gets named: it is read,
+        // so the caller must be able to ask whether it is a view.
+        assert_eq!(
+            names("SELECT a FROM t WHERE a IN (SELECT b FROM u)"),
+            Some(vec!["t".into(), "u".into()])
+        );
+        // The qualifier survives, since it is part of which table this is.
+        let q = provenance_sources("SELECT id FROM side.note", SqlDialect::Sqlite).unwrap();
+        assert_eq!(q[0].qualifier.as_deref(), Some("side"));
+        assert_eq!(q[0].name, "note");
+    }
+
+    /// A set operation anywhere refuses the statement, because SQLite attributes
+    /// the whole result to one branch of it. Nesting is the point: a union inside
+    /// a derived table or a CTE body still produces output columns that name one
+    /// branch's table, and the statement around it looks perfectly ordinary.
+    #[test]
+    fn a_set_operation_at_any_depth_refuses_provenance() {
+        for sql in [
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "SELECT a FROM t UNION ALL SELECT b FROM u",
+            "SELECT a FROM t EXCEPT SELECT b FROM u",
+            "SELECT a FROM t INTERSECT SELECT b FROM u",
+            "SELECT x FROM (SELECT a FROM t UNION SELECT b FROM u)",
+            "WITH c AS (SELECT a FROM t UNION SELECT b FROM u) SELECT x FROM c",
+            "SELECT a FROM t WHERE a IN (SELECT b FROM u UNION SELECT c FROM v)",
+        ] {
+            assert!(
+                provenance_sources(sql, SqlDialect::Sqlite).is_none(),
+                "attributed a set operation: {sql}"
+            );
+        }
+    }
+
+    /// Anything this can't read the shape of is refused rather than guessed at —
+    /// the gate's failure direction is "say less", the same one every other
+    /// write-back predicate here takes.
+    #[test]
+    fn provenance_sources_refuses_what_it_cannot_read() {
+        for sql in [
+            "",
+            "   ",
+            "not sql at all",
+            // Not a query: nothing to attribute a result row to.
+            "UPDATE t SET a = 1",
+            "INSERT INTO t VALUES (1)",
+            // More than one statement — which of them produced the result?
+            "SELECT a FROM t; SELECT b FROM u",
+        ] {
+            assert!(
+                provenance_sources(sql, SqlDialect::Sqlite).is_none(),
+                "read a shape it should have refused: {sql}"
+            );
         }
     }
 

@@ -29,30 +29,34 @@
 //! MySQL and Postgres paths follow in taking the wire's text form: the model
 //! records what the database actually returned.
 //!
-//! **Column provenance is available from the driver, and deliberately not
-//! taken.** MySQL gives `org_table`/`org_name` on the wire and Postgres has
+//! **Column provenance comes from the driver, gated on the statement's shape.**
+//! MySQL gives `org_table`/`org_name` on the wire and Postgres has
 //! `table_oid`/`column_id` on a prepared statement; SQLite's C API has the
-//! equivalent (`sqlite3_column_table_name`) but only when compiled with
-//! `SQLITE_ENABLE_COLUMN_METADATA`, which rusqlite gates behind a
-//! `column_metadata` feature the workspace `Cargo.toml` leaves off — so the
-//! `Column` this crate sees carries a name and a declared type and nothing else.
+//! equivalent (`sqlite3_column_table_name`/`origin_name`) when compiled with
+//! `SQLITE_ENABLE_COLUMN_METADATA`, which is what the workspace's
+//! `column_metadata` feature sets. It had to be derived from the *statement*
+//! until rusqlite 0.40, which is the release that first offered the feature at
+//! all; `Statement::columns_with_metadata` is how it is read now.
 //!
-//! On 0.32.1 that was forced rather than chosen: there was no such feature at
-//! all. The 0.32 -> 0.40 bump changed it — 0.40 declares `column_metadata`,
-//! `libsqlite3-sys` sets the compile flag from it, and `Column::table_name`/
-//! `origin_name` exist behind it. **Nothing below moved with that**: the flag is
-//! still off, so the derivation is unchanged and so is every result it refuses.
-//! Turning it on would attribute columns this derivation declines — a join, a
-//! subquery — and so widen which results are editable, which is a design call
-//! against [`schemaic_core::edit`]'s key selection rather than a feature-flag
-//! edit. It has not been made.
+//! **The gate is not ceremony, because provenance answers a narrower question
+//! than its name suggests.** It names the table a result *column* resolves to,
+//! not the table a result *row* came from, and for a compound `SELECT` those
+//! differ: SQLite reports one branch's provenance for the whole result. Measured
+//! on 3.53.2, `t UNION u` answers `t` directly and `u` through a view, so it is
+//! not a bias a caller could correct for. Half those rows live in the other
+//! table, and attributing by that would `UPDATE` a table the row was never in —
+//! the one failure this whole layer exists to prevent. So
+//! [`schemaic_core::intel::provenance_sources`] refuses a set operation at any
+//! depth and hands back the relations the statement reads, and
+//! [`attach_origins`] refuses the ones it cannot verify.
 //!
-//! So provenance is derived from the *statement* instead, and that is
-//! deliberately conservative: anything but a plainly single-table `SELECT` leaves
-//! `origin: None`, which the editing system already reads as "not editable" for an
-//! expression column. Guessing wider would make a wrong `UPDATE`, which is the one
-//! failure this whole layer exists to prevent. See [`attach_origins`] for what the
-//! derivation does accept.
+//! What that buys over the derivation it replaced is a **join, a subquery or a
+//! CTE**: provenance is per column and resolves straight through them to the
+//! real base column, so each column is attributed to the table it actually came
+//! from and [`schemaic_core::edit`] groups them into an editable table each,
+//! exactly as it already did for the other two engines. An expression, a literal
+//! or an aggregate reports no table at all, which is the same `None` the
+//! statement derivation gave it.
 //!
 //! **Every rowid table has a key, and it isn't a column.** A table with no primary
 //! key and no usable unique index is read-only on the other two engines because
@@ -392,87 +396,164 @@ fn columns_of(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
 }
 
 /// Fill in each result column's `origin`, so the editing system can decide what
-/// is writable — the statement-derived stand-in for the provenance MySQL reads
-/// off the wire and PostgreSQL off a prepared statement's `table_oid`.
+/// is writable — the same per-column provenance MySQL reads off the wire and
+/// PostgreSQL off a prepared statement's `table_oid`, read here off the prepared
+/// statement's own column metadata.
 ///
 /// Everything about it is deliberately conservative, because the failure it
 /// guards against is an `UPDATE` aimed at the wrong row or the wrong column:
 ///
-/// - the statement must be a plainly single-table `SELECT`
-///   ([`schemaic_core::intel::projection_of`]) — a join, a CTE, a subquery or a
-///   set operation leaves every column unattributed and the result read-only;
+/// - the statement's **shape** must be one provenance can be trusted on
+///   ([`schemaic_core::intel::provenance_sources`]) — which refuses a set
+///   operation at any depth, and hands back the relations the statement reads so
+///   they can be checked here;
 /// - a **view** is skipped. SQLite will not accept a write to one without an
 ///   `INSTEAD OF` trigger, and offering an edit that the server refuses at commit
-///   time is worse than not offering it;
-/// - a qualifier other than `main` is skipped, since an `ATTACH`ed database is a
-///   different file and nothing here has introspected it;
-/// - the projection is placed **positionally**, never matched by name — see
-///   `projection_of` for the aliasing case that makes the difference.
+///   time is worse than not offering it. It is also the *only* thing standing
+///   between a compound hidden inside a view and a write to the wrong table, so
+///   it guards far more than the case it was written for;
+/// - a qualifier other than `main` is skipped — not because provenance can't name
+///   an `ATTACH`ed database (it does), but because `is_view`, `table_columns` and
+///   the index and collation readers all address `main` alone, so nothing here
+///   could check what it was attributing;
+/// - every table provenance names must be one the statement was seen to read, so
+///   nothing is attributed to a table that was never view-checked.
 ///
 /// Flags come from the table's own pragmas, so `analyze_edit` gets the same
 /// material it gets from the other two engines and needs no SQLite-specific
 /// branch.
-fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
-    use schemaic_core::intel::{Projection, SqlDialect, projection_of};
+///
+/// **One thing provenance cannot answer, so the statement still does.** A rowid
+/// projected under any of its spellings comes back as `origin_name` `"rowid"` —
+/// measured, `_rowid_` and `oid` report it too — and the `WHERE` the write-back
+/// builds has to name the spelling that actually reaches the rowid of a table
+/// which has taken `rowid` for a column of its own. So the implicit-key branch
+/// reads the spelling off the statement, and attributes nothing when the
+/// statement isn't the shape that produces one.
+fn attach_origins(
+    conn: &SqliteConn,
+    sql: &str,
+    stmt: &rusqlite::Statement<'_>,
+    columns: &mut [Column],
+) {
+    use schemaic_core::intel::{Projection, SqlDialect, projection_of, provenance_sources};
 
-    let Some((source, projection)) = projection_of(sql, SqlDialect::Sqlite) else {
+    let Some(sources) = provenance_sources(sql, SqlDialect::Sqlite) else {
         return;
     };
-    if source
-        .qualifier
-        .as_deref()
-        .is_some_and(|q| !q.eq_ignore_ascii_case(MAIN))
-    {
+    if sources.is_empty() {
         return;
     }
-    if is_view(conn, &source.name).unwrap_or(true) {
-        return;
-    }
-    let Ok(info) = table_columns(conn, &source.name) else {
-        return;
-    };
-    let unique = single_column_unique_indexes(conn, &source.name).unwrap_or_default();
-
-    // The base column each result column reads, by position.
-    let bases: Vec<Option<String>> = match projection {
-        Projection::Wildcard => info.iter().map(|c| Some(c.name.clone())).collect(),
-        Projection::Items(items) => items,
-        // The wildcard expands into whatever follows the placed leading items —
-        // `SELECT rowid, * FROM t` is one of these. The width check below is what
-        // keeps the expansion honest.
-        Projection::LeadingThenWildcard(lead) => lead
-            .into_iter()
-            .chain(info.iter().map(|c| Some(c.name.clone())))
-            .collect(),
-    };
-    // A wildcard's width has to agree with the table's, or the placement is off —
-    // which happens for real when a generated column is present, since SQLite
-    // omits a VIRTUAL column from `SELECT *` in some versions but `table_xinfo`
-    // always lists it.
-    if bases.len() != columns.len() {
-        return;
+    for s in &sources {
+        if s.qualifier
+            .as_deref()
+            .is_some_and(|q| !q.eq_ignore_ascii_case(MAIN))
+        {
+            return;
+        }
+        if is_view(conn, &s.name).unwrap_or(true) {
+            return;
+        }
     }
 
-    for (col, base) in columns.iter_mut().zip(bases) {
-        let Some(base) = base else { continue };
-        let Some(ci) = info.iter().find(|c| c.name.eq_ignore_ascii_case(&base)) else {
+    // The base column each result column reads *as the statement wrote it*, which
+    // is needed for the rowid spelling alone — every other column is attributed
+    // from provenance. `None` when the statement isn't the single-table shape
+    // `projection_of` reads, which is most of the shapes now allowed here.
+    //
+    // The width check at the end is the old positional guard, and what changed is
+    // what it costs. It used to gate the whole attribution — a wildcard expanding
+    // to a different width than `table_xinfo` reports, which a generated column
+    // really does cause, left every column of the result unattributed. Provenance
+    // needs no alignment, so a mismatch now costs only the rowid spelling, and
+    // only a statement that projected one.
+    let spellings: Option<Vec<Option<String>>> =
+        projection_of(sql, SqlDialect::Sqlite).and_then(|(source, projection)| {
+            let info = table_columns(conn, &source.name).ok()?;
+            let bases: Vec<Option<String>> = match projection {
+                Projection::Wildcard => info.iter().map(|c| Some(c.name.clone())).collect(),
+                Projection::Items(items) => items,
+                Projection::LeadingThenWildcard(lead) => lead
+                    .into_iter()
+                    .chain(info.iter().map(|c| Some(c.name.clone())))
+                    .collect(),
+            };
+            (bases.len() == columns.len()).then_some(bases)
+        });
+
+    // One pragma read per distinct table, not per column: a wide join would
+    // otherwise re-introspect the same table once for every column of it.
+    // `None` is a table whose schema could not be read, cached so the failure
+    // isn't retried per column either.
+    struct TableFacts {
+        columns: Vec<ColumnInfo>,
+        unique: Vec<String>,
+    }
+    let mut cache: Vec<(String, Option<TableFacts>)> = Vec::new();
+    // Both lists are built from the same prepared statement's column set, so this
+    // holds structurally rather than hopefully. It is stated because the loop
+    // below `zip`s them: a mismatch would truncate silently, and a column left
+    // unattributed for a reason nobody wrote down is how a read-only grid becomes
+    // a mystery instead of a decision.
+    let metas = stmt.columns_with_metadata();
+    if metas.len() != columns.len() {
+        return;
+    }
+
+    for (idx, (col, meta)) in columns.iter_mut().zip(metas.iter()).enumerate() {
+        // All three or nothing: SQLite reports none of them for a column that is
+        // an expression, a literal or an aggregate, which is exactly the set that
+        // belongs to no base column.
+        let (Some(db), Some(table), Some(origin)) =
+            (meta.database_name(), meta.table_name(), meta.origin_name())
+        else {
+            continue;
+        };
+        if !db.eq_ignore_ascii_case(MAIN) {
+            continue;
+        }
+        // Attribute only to a table the statement was seen to read — and so one
+        // the view check above actually covered.
+        if !sources.iter().any(|s| s.name.eq_ignore_ascii_case(table)) {
+            continue;
+        }
+        let slot = match cache
+            .iter()
+            .position(|(t, _)| t.eq_ignore_ascii_case(table))
+        {
+            Some(i) => i,
+            None => {
+                let loaded = table_columns(conn, table).ok().map(|columns| TableFacts {
+                    columns,
+                    unique: single_column_unique_indexes(conn, table).unwrap_or_default(),
+                });
+                cache.push((table.to_string(), loaded));
+                cache.len() - 1
+            }
+        };
+        let Some(facts) = cache[slot].1.as_ref() else {
+            continue;
+        };
+        let (info, unique) = (&facts.columns, &facts.unique);
+        let Some(ci) = info.iter().find(|c| c.name.eq_ignore_ascii_case(origin)) else {
             // Not a declared column — but it may still be the table's rowid,
             // named explicitly because `SELECT *` does not return it. A declared
-            // column of the same name is looked for *first* and wins, which is
+            // column of the same name was looked for *first* and wins, which is
             // what SQLite itself does with the name, so a table with its own
             // `rowid` column is unaffected by any of this.
             //
-            // The name is recorded **as written**: `_rowid_` is the spelling that
-            // reaches the true rowid of a table that has taken `rowid`, and the
-            // `WHERE` the write-back builds from this must resolve to the same
-            // value the `SELECT` read.
-            if ROWID_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(&base))
-                && has_rowid(conn, &source.name)
+            // The name is recorded **as the statement wrote it**: `_rowid_` is the
+            // spelling that reaches the true rowid of a table that has taken
+            // `rowid`, and provenance flattens all three to `rowid`.
+            let Some(base) = spellings.as_ref().and_then(|b| b[idx].clone()) else {
+                continue;
+            };
+            if ROWID_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(&base)) && has_rowid(conn, table)
             {
                 col.origin = Some(ColumnOrigin {
                     database: MAIN.to_string(),
                     schema: None,
-                    table: source.name.clone(),
+                    table: table.to_string(),
                     column: base,
                     flags: ColumnFlags {
                         // Not a primary key: it is one only in the sense that it
@@ -493,7 +574,7 @@ fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
             database: MAIN.to_string(),
             // SQLite has no namespace level; `main` is the database, not a schema.
             schema: None,
-            table: source.name.clone(),
+            table: table.to_string(),
             column: ci.name.clone(),
             flags: ColumnFlags {
                 primary_key: ci.primary_key,
@@ -758,7 +839,7 @@ fn run_query(
     }
 
     let mut columns = columns_of(&stmt);
-    attach_origins(conn, sql, &mut columns);
+    attach_origins(conn, sql, &stmt, &mut columns);
     let ncols = columns.len();
     let chunk_capacity = dest.chunk_capacity();
     let mut builder = ResultBuilder::with_capacity(columns, chunk_capacity);
@@ -3264,8 +3345,8 @@ mod tests {
     fn origins_for(conn: &SqliteConn, sql: &str) -> Vec<Option<ColumnOrigin>> {
         let stmt = conn.prepare(sql).expect("prepare");
         let mut cols = columns_of(&stmt);
+        attach_origins(conn, sql, &stmt, &mut cols);
         drop(stmt);
-        attach_origins(conn, sql, &mut cols);
         cols.into_iter().map(|c| c.origin).collect()
     }
 
@@ -3302,18 +3383,149 @@ mod tests {
     }
 
     #[test]
-    fn a_computed_column_and_a_joined_statement_are_not_editable() {
+    fn a_computed_column_is_not_editable() {
         let conn = seeded();
-        // An expression belongs to no column.
+        // An expression belongs to no column: SQLite reports no table and no
+        // origin for it, which is the same answer the statement derivation gave.
         let o = origins_for(&conn, "SELECT id, id * 2 FROM artist");
         assert!(o[0].is_some());
         assert!(o[1].is_none(), "an expression has no base column");
-        // A join leaves the whole result unattributed.
-        let o = origins_for(
-            &conn,
-            "SELECT album.id, artist.name FROM album JOIN artist ON album.artist_id = artist.id",
+    }
+
+    /// **The widening driver provenance buys.** A join used to leave the whole
+    /// result unattributed, because the derivation it replaced could only name
+    /// *one* source table. SQLite reports a table per output column, so each one
+    /// is attributed to the table it actually came from and `analyze_edit` groups
+    /// them into an `EditTable` each — which is what MySQL and PostgreSQL have
+    /// always done from their own wire provenance.
+    #[test]
+    fn a_join_attributes_each_column_to_its_own_table() {
+        let conn = seeded();
+        const SQL: &str = "SELECT album.id, album.title, artist.id, artist.name \
+                           FROM album JOIN artist ON album.artist_id = artist.id";
+        let o = origins_for(&conn, SQL);
+        assert_eq!(o[0].as_ref().expect("album.id").table, "album");
+        assert_eq!(o[1].as_ref().expect("album.title").table, "album");
+        assert_eq!(o[2].as_ref().expect("artist.id").table, "artist");
+        assert_eq!(o[3].as_ref().expect("artist.name").table, "artist");
+
+        // End to end: two tables, each keyed on its own primary key, each of its
+        // data columns editable. `resolve_key`'s duplicate-column guard is scoped
+        // to one table's own group, so the two `id`s don't collide.
+        let rs = run_query(&conn, SQL, &mut crate::RowDest::Capped(100)).unwrap();
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, t| Some(table_info_of(&conn, t)),
         );
-        assert!(o.iter().all(|x| x.is_none()), "a join is not editable");
+        assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![0]));
+        assert_eq!(m.table(1).map(|t| t.key_cols.clone()), Some(vec![2]));
+        assert!(m.editable(1), "album.title edits through album's key");
+        assert!(m.editable(3), "artist.name edits through artist's key");
+    }
+
+    /// A derived table is not a table the derivation could name, but SQLite
+    /// resolves an output column straight through one to the base column it
+    /// really reads — so a subquery is attributed where it used to be refused.
+    #[test]
+    fn a_subquery_resolves_through_to_the_base_table() {
+        let conn = seeded();
+        let o = origins_for(&conn, "SELECT id, name FROM (SELECT * FROM artist)");
+        assert_eq!(o[0].as_ref().expect("id").table, "artist");
+        assert_eq!(o[0].as_ref().unwrap().column, "id");
+        assert_eq!(o[1].as_ref().expect("name").column, "name");
+    }
+
+    /// An `ATTACH`ed database stays unattributed, and that is now the *schema
+    /// lookups'* limit rather than provenance's: SQLite names the database per
+    /// column perfectly well, but `is_view`, `table_columns` and the index and
+    /// collation readers all address `main` alone, so nothing here could check
+    /// whether `side.note` is a view or read its keys. Attributing it would mean
+    /// trusting a table this code has never introspected.
+    #[test]
+    fn an_attached_database_is_still_not_attributed() {
+        let conn = seeded();
+        conn.execute_batch(
+            "ATTACH ':memory:' AS side;
+             CREATE TABLE side.note (id INTEGER PRIMARY KEY, body TEXT);",
+        )
+        .expect("attach");
+        let o = origins_for(&conn, "SELECT id, body FROM side.note");
+        assert!(o.iter().all(|x| x.is_none()));
+    }
+
+    /// **The hazard driver provenance introduces, and the reason for the shape
+    /// gate.** For a compound `SELECT`, SQLite reports *one* branch's provenance
+    /// for the whole result — measured: `t UNION u` answers `t` for a direct
+    /// union and `u` when the same union is read through a view, so it is not
+    /// even a consistent rule. Half the rows come from the other table, so an
+    /// edit would `UPDATE` a table the row was never in.
+    ///
+    /// This asserted the same thing before provenance landed, because the old
+    /// derivation refused every set operation as a side effect of only ever
+    /// naming one source table. It is written down now because the new code has
+    /// to refuse it *on purpose*.
+    #[test]
+    fn a_set_operation_is_never_attributed() {
+        let conn = seeded();
+        for sql in [
+            "SELECT id, name FROM artist UNION SELECT id, title FROM album",
+            "SELECT id, name FROM artist UNION ALL SELECT id, title FROM album",
+            "SELECT id FROM artist EXCEPT SELECT id FROM album",
+            "SELECT id FROM artist INTERSECT SELECT id FROM album",
+            // Nested a level down, where the output columns still come back
+            // attributed to one branch.
+            "SELECT id, name FROM (SELECT id, name FROM artist \
+             UNION SELECT id, title FROM album)",
+        ] {
+            let o = origins_for(&conn, sql);
+            assert!(
+                o.iter().all(|x| x.is_none()),
+                "a set operation must not be attributed: {sql}"
+            );
+        }
+    }
+
+    /// **The view refusal has to cover every relation, not the first one.** Once
+    /// a join is attributable, "is this a view" stops being a question about *the*
+    /// source table and becomes one about each of them — and the answer that
+    /// matters is the refusing one, wherever it sits. A gate that checked only the
+    /// leading relation would attribute `album` here and hand back an editable
+    /// result that is half view.
+    #[test]
+    fn a_view_anywhere_in_a_join_refuses_the_whole_result() {
+        let conn = seeded();
+        for sql in [
+            "SELECT album.id, big.title FROM album JOIN big ON big.id = album.id",
+            "SELECT big.title, album.id FROM big JOIN album ON big.id = album.id",
+            "SELECT id, title FROM (SELECT id, title FROM big)",
+        ] {
+            let o = origins_for(&conn, sql);
+            assert!(
+                o.iter().all(|x| x.is_none()),
+                "attributed a result reading a view: {sql}"
+            );
+        }
+    }
+
+    /// The same hazard with nothing in the statement to see it by: `big_union` is
+    /// a view over a `UNION`, so the SQL that reads it is a plain single-table
+    /// `SELECT` and no parse of it can know. The view refusal is what catches
+    /// this, which is why it stays even though provenance resolves through a view
+    /// perfectly well for a simple one.
+    #[test]
+    fn a_view_over_a_set_operation_stays_unattributed() {
+        let conn = seeded();
+        conn.execute_batch(
+            "CREATE VIEW big_union AS \
+             SELECT id, name FROM artist UNION SELECT id, title FROM album;",
+        )
+        .expect("view");
+        let o = origins_for(&conn, "SELECT id, name FROM big_union");
+        assert!(
+            o.iter().all(|x| x.is_none()),
+            "a compound hidden behind a view is still a compound"
+        );
     }
 
     /// A view has no rows of its own, and SQLite refuses a write to one without an

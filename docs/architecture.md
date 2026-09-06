@@ -286,8 +286,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **`simple_select_source` is the one definition of "structurally simple enough to aim a write
     at"** — one statement, a `SELECT` body, no CTE, one `FROM` entry, no joins, a plain named table
     — shared by `filter::build_query` (which needs to know it may splice a `WHERE` into the
-    statement that produced a result) and by SQLite's write-back (which needs to know which base
-    table a grid row belongs to). Two predicates that agreed on the day they were written is the
+    statement that produced a result) and by SQLite's write-back, which reaches it through
+    `projection_of` and — now that the driver's own provenance does the attributing — needs it only
+    to recover the *spelling* a projected `rowid` was written with. Two predicates that agreed on the day they were written is the
     arrangement `ident_sql` exists to rule out, and a test pins that the two callers still agree.
     `single_source_table` is its entry point for a caller holding only SQL.
     **`full_table_source` is the stricter twin of it**, and the two are not
@@ -306,6 +307,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     it says "estimate", not "of a different query". A lock hint (`FOR UPDATE`) and
     `SQL_CALC_FOUND_ROWS` sit in the same neighbourhood, change no row count, and still qualify;
     a test pins that too.
+    **`provenance_sources` is the gate on a *driver's* per-column provenance**, and `db::sqlite`'s
+    `attach_origins` is its only caller. It answers `None` for what it cannot read — a statement that
+    doesn't parse, several statements, anything that isn't a `Query` — and for a **set operation at
+    any depth**, one buried in a derived table or a CTE body included; otherwise it hands back every
+    base relation the statement reads, with CTE-bound names filtered out, since those shadow any real
+    object of the same name and the body they stand for was walked here already. The set-operation
+    refusal is the load-bearing part, and it is there because provenance answers a narrower question
+    than its name suggests: it names the table a result *column expression* resolves to, not the table
+    a result *row* came from. Measured on SQLite 3.53.2,
+    `SELECT id, name FROM t UNION SELECT id, note FROM u` reports `t` for the whole result, while the
+    same union read through a view reports `u` — so it is not a consistent rule a caller could
+    compensate for, it is whatever the code generator resolved last. Half the rows are in the other
+    table, so attributing by it would `UPDATE` a table the row was never in. **The relations come back
+    so the caller can refuse the ones this crate cannot check**: a compound hidden behind a *view*
+    leaves nothing in the statement to see it by — `SELECT * FROM v` parses as a plain single-table
+    read whatever `v` is — and only a catalogue can say which of these names is a view, which is a
+    question a pure module has no connection to answer. Three tests hold it:
+    `provenance_sources_names_every_table_a_readable_shape_touches`,
+    `a_set_operation_at_any_depth_refuses_provenance` and
+    `provenance_sources_refuses_what_it_cannot_read`.
     **`projection_of`** is the derivation over `single_source_table`: which base column each result column reads, or
     `None` where it is computed. It is **positional, not name-matched**, and that is the whole
     reason it is a function rather than a lookup — `SELECT a AS b, b FROM t` produces a first
@@ -4659,18 +4680,54 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   reason: SQLite has no lock-timeout *setting*, the wait being this per-connection busy timeout, so
   the failure that statement bounds elsewhere has no analogue. **Values are dynamically typed**: a declared type is an *affinity*, so `value_of`
   reads the storage class of the value in front of it rather than trusting the column, and a BLOB
-  renders as its size, having no lossless text form. **Column provenance is available from the driver,
-  and deliberately not taken** — SQLite's C API has `sqlite3_column_table_name`, but only under
-  `SQLITE_ENABLE_COLUMN_METADATA`, which rusqlite gates behind a `column_metadata` feature the
-  workspace `Cargo.toml` leaves off; the comment above that dependency holds the configuration
-  detail. On 0.32 the absence was forced — there was no such feature at all — so the derivation
-  below was a description of the driver; since the 0.32 → 0.40 bump it is a choice. **Nothing
-  downstream moved with it**: a result's `origin` is still derived from the *statement*, anything
-  but a plainly single-table `SELECT` is still left `None`, and the editing system still reads that
-  as not-editable. Turning the feature on is a design call rather than a feature-flag edit, because
-  real per-column provenance would attribute columns the statement derivation refuses — a join, a
-  subquery — and so widen which SQLite results are editable, which puts `edit::resolve_key` and the
-  `ColumnOrigin::implicit_key` rowid fallback described next in scope. It has not been made.
+  renders as its size, having no lossless text form. **Column provenance comes from the driver, gated
+  on the statement's shape.** SQLite's C API has `sqlite3_column_table_name`/`origin_name`, but only
+  under `SQLITE_ENABLE_COLUMN_METADATA`, which is what rusqlite's `column_metadata` feature sets —
+  the workspace `Cargo.toml` turns it on and the comment above that dependency holds the
+  configuration detail. `attach_origins` reads it off the prepared statement it is now handed
+  (`Statement::columns_with_metadata`; the accessors live on `ColumnMetadata`, **not** on `Column`).
+  It could not have been asked for before rusqlite 0.40, which is the release that first offered the
+  feature at all — so the statement derivation it replaced was a description of the driver before it
+  was a choice. **What it buys is a join, a subquery or a CTE**: provenance is per column and resolves
+  straight through those to the real base column, so each column is attributed to the table it
+  actually came from and `edit::analyze_edit` groups them into an editable table each — which is what
+  MySQL and PostgreSQL have always done from their own wire provenance. The edit layer needed **no
+  change at all** for that: `analyze_edit` already groups by `(database, schema, table)` and
+  `resolve_key`'s duplicate-column guard is scoped per group, so the two `id` columns of a two-table
+  join do not collide. `a_join_attributes_each_column_to_its_own_table` walks one through
+  `analyze_edit` and asserts two keyed tables, and `a_subquery_resolves_through_to_the_base_table`
+  covers the derived table. An alias was already right under the positional derivation and still is —
+  measured, `SELECT name AS qty, qty AS name` reports the swapped real columns.
+  **The gate is not ceremony**: provenance names the table a result *column expression* resolves to,
+  not the table a result *row* came from, and `intel::provenance_sources` is where that argument and
+  its measurements are written down. Three shapes are refused here, and each refusal is deliberate
+  now rather than a side effect of a derivation that could only ever name one source table. A **set
+  operation at any depth**, because SQLite reports one branch's provenance for the whole result
+  (`a_set_operation_is_never_attributed`). A **view**, anywhere in what the statement reads — the
+  behaviour is unchanged but the reason has grown, because SQLite resolves provenance straight
+  through a simple view to its base table (measured: `SELECT * FROM v` reports `t`, not `v`), so a
+  view would otherwise be attributed, and this refusal is the **only** thing standing between a
+  compound hidden inside a view and a write to the wrong table: `SELECT * FROM big_union` is a plain
+  single-table read that no parse of the statement can see into
+  (`a_view_over_a_set_operation_stays_unattributed`). That check covers **every** relation the
+  statement reads rather than a single source, so a view anywhere in a join refuses the whole result
+  (`a_view_anywhere_in_a_join_refuses_the_whole_result`). And an **`ATTACH`ed database**, where the
+  limit has moved: provenance names the database per column perfectly well, but `is_view`,
+  `table_columns`, `single_column_unique_indexes` and the index and collation readers all address
+  `main` alone, so attributing an attached table would mean trusting one nothing here has
+  introspected (`an_attached_database_is_still_not_attributed`). That last one is a genuine follow-up
+  opportunity rather than a property of the engine — it goes away when those readers learn a
+  qualifier.
+  **The rowid spelling is the one thing provenance cannot answer, so the statement still does.**
+  Measured: `_rowid_` and `oid` both come back with `origin_name` `"rowid"`, and on a table that has
+  taken `rowid` for a real column of its own the true rowid and that column are indistinguishable
+  through provenance — while the `WHERE` the write-back builds has to name the spelling that actually
+  reaches the rowid. So `attach_origins` still calls `intel::projection_of`, **solely** to recover
+  that spelling, and attributes no implicit key when the statement isn't the shape that produces one.
+  The positional zip survives for that and nothing else, width check included, so a projection it
+  cannot line up now costs an implicit key rather than misattributing a column. The
+  declared-column-wins-first ordering described next falls out of the structure: a declared `rowid`
+  column is found in the table's own column list before the implicit branch is reached at all.
   **Every rowid table has a key, and it isn't a column.** A table with no primary key
   and no usable unique index is read-only on the other two engines because there is genuinely no
   way to name one of its rows; on SQLite there always is one, unless the table was declared
@@ -11564,13 +11621,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   the engine delivered.** `commit_writes` runs a `GridWrite`
   (DELETEs → UPDATEs → INSERTs) in one transaction, each statement required to affect exactly 1 row
   (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. On SQLite
-  the *analysis* is the part that has to be conservative, since the driver's per-column provenance is
-  deliberately left off — see `db::sqlite` — and it is derived from the statement
-  (`intel::projection_of`, positional): anything but a plainly single-table `SELECT` is simply not
-  editable. That set has grown by exactly one well-defined
-  shape — items placed ahead of a lone *trailing* `*`, which is what makes `SELECT rowid, * FROM t`
-  (a keyless table opened through its rowid) analysable — and by nothing else. The guard did not
-  move with it: an implicit key is an ordinary key column to `commit_writes`, so the ordering and
+  the *analysis* is the part that has to be conservative, and it now reads the driver's per-column
+  provenance rather than deriving attribution from the statement — see `db::sqlite`. What the
+  statement still decides is whether that provenance may be trusted at all
+  (`intel::provenance_sources`), and the widening is real: a join, a subquery and a CTE over ordinary
+  tables are editable where the derivation refused them, while a set operation at any depth, a view
+  anywhere in the statement and an `ATTACH`ed table are each refused for their own stated reason.
+  `intel::projection_of` is still read, for the `rowid` *spelling* alone — which is what the
+  relaxation placing items ahead of a lone trailing `*` makes analysable in `SELECT rowid, * FROM t`,
+  a keyless table opened through its rowid. The guard did not
+  move with any of it: an implicit key is an ordinary key column to `commit_writes`, so the ordering and
   the 1-row net apply to it unchanged, and widening the analysis further is still the way this
   invariant gets regressed. **The net's premise is that a stale key matches zero rows, and an
   implicit key breaks it** — SQLite reassigns rowids, so a number the grid still holds can name a

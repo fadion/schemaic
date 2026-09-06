@@ -82,28 +82,33 @@ futures-util = "0.3"
 # SQLite (third engine). `bundled` compiles SQLite's own amalgamation in, so there
 # is no system library to find and the version is the one we tested against;
 # SQLite is public domain, so it adds no licence obligation for `cargo deny`.
-# `column_decltype` is what `value_of` reads to name a column's declared type;
-# an affinity rather than a type, which is why it reads the storage class of the
-# value in front of it and not this.
 #
-# **There is no `column_metadata` here, and that is now a choice rather than a
-# limit.** The per-column provenance the editing system gets free from MySQL's
-# org_table/org_name has no SQLite equivalent turned on: a result's `origin` is
-# derived from the *statement*, so anything but a plainly single-table `SELECT`
-# is left `None` and reads as not-editable. Until the 0.32 -> 0.40 bump that was
-# forced — 0.32 had no such feature at all, and `libsqlite3-sys` generated no
-# binding for `sqlite3_column_table_name`. 0.40 declares
-# `column_metadata = ["libsqlite3-sys?/column_metadata"]`, sets
-# `-DSQLITE_ENABLE_COLUMN_METADATA`, and exposes `Column::table_name`/
-# `origin_name`, so real provenance is now available for the asking. Taking it
-# would widen which SQLite results are editable, which is a design call with the
-# editing invariants attached and not a feature-flag edit — so the flag stays
-# off until somebody makes that call deliberately.
+# **`column_metadata` sets `-DSQLITE_ENABLE_COLUMN_METADATA`**, which is what
+# makes `sqlite3_column_table_name`/`origin_name` available — the same per-column
+# provenance the editing system gets free from MySQL's org_table/org_name and
+# PostgreSQL's table_oid, reached here through `Statement::columns_with_metadata`
+# (the accessors are on `ColumnMetadata`, not on `Column`). `db::sqlite`'s
+# `attach_origins` is the only reader; what it does and does not trust the answer
+# for is written there, and the short version is that provenance names the table
+# a *column expression* resolves to rather than the one a *row* came from, so a
+# compound `SELECT` still has to be refused on shape.
+#
+# It could not have been asked for before 0.40: 0.32 had no such feature and
+# `libsqlite3-sys` generated no binding, which is why the derivation it now feeds
+# was written to work off the statement alone.
+#
+# `column_decltype` is what `value_of` reads to name a column's declared type; an
+# affinity rather than a type, which is why it reads the storage class of the
+# value in front of it and not this.
 #
 # The driver is *blocking*, so every call runs inside `spawn_blocking`; that
 # suits the one-connection-per-operation invariant, which already opens and
 # closes a connection per call.
-rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40", features = [
+    "bundled",
+    "column_decltype",
+    "column_metadata",
+] }
 # TLS for the two networked engines. One stack for both, so `verify-ca` and
 # `verify-full` mean the same thing whichever engine is behind them — the
 # alternative is two verifiers with two sets of edge cases and one test-bed that
