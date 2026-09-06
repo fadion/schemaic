@@ -3545,6 +3545,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       set — the cap notice exists precisely for that case, so the number it needs has to travel.
       `fingerprint` folds the attachment in, per its own rule that a field a mutation can change
       belongs there.
+      An assistant or error turn also carries a `harness` — the `Harness::key` of the CLI that
+      produced *it*, stamped by `main.rs`'s send path when the turn starts rather than read from the
+      live setting at render time, because switching CLI in Settings does not start a new
+      conversation. A `String` and not the `Harness` itself: this crate sits below `schemaic-ai` and
+      cannot name that type, so `schemaic_ai::harness::speaker_label` is the only thing that turns it
+      back into a name. `#[serde(default)]` is load-bearing rather than habit — every conversation
+      already on disk predates the field, and without it the user's saved history stops parsing.
+      `ChatMessage::pending` *takes* the harness instead of defaulting it, so the one place a turn
+      begins is the one place its author is recorded; `user()` sets `None`, a question having no
+      author to record, and so does the app's own "can't reach the database" refusal, which no CLI
+      answered. A turn that *fails* keeps its stamp, because the stream flips the already-stamped
+      pending message to `Role::Error` rather than pushing a new one.
       Also the message box's **prompt recall** (Ctrl+Up/Down): `user_prompts` (the user's own
       questions, newest first, blanks dropped and a repeat kept only at its newest spot) +
       `recall_step`, which is a **cycle** — `None → newest → … → oldest → None` — rather than a
@@ -3560,15 +3572,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       over segments that include a tool call's untruncated result — and kept a permanent second
       resident copy of the conversation. It is `O(segments)` and allocates nothing, on the stated
       assumption that a message is only ever *extended*; a test walks every mutation the stream
-      makes, because a fingerprint that misses one freezes a bubble's content on screen.
+      makes, because a fingerprint that misses one freezes a bubble's content on screen. The
+      `harness` is mixed in too, and that is a **deliberate exception** to the assumption above: the
+      field is written once at construction and mutated by nothing, so by the rule it need not be
+      there at all. It is there because "immutable" is a property of today's call sites rather than
+      of the type, and a speaker label frozen on the wrong CLI's name is precisely the bug the field
+      was added to fix. **Its bytes, not just its length** — that is the one place the length-only
+      rule does not carry, because every other string here only ever *grows* while a harness key is
+      swapped whole. Two keys of equal length fingerprinted identically, and a message whose
+      fingerprint does not move keeps its rendered speaker label. Today's four keys happen to have
+      distinct lengths, which is luck rather than design: a fifth named `crush` or `cline` collides
+      with `codex` on length alone. A key is a handful of bytes, so the cost is still nothing.
     - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
       every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
       to 200 rows of real table data, and writing it verbatim exported user data to a plaintext
       config file indefinitely. Stripping happens at the *bytes* boundary, not in `save`, so
       switching connections and back mid-session still shows that session's own results.
       `persistable` drops a still-streaming turn and its unanswered question before capping. A
-      restored conversation is transcript, not memory: prose is replayed into a fresh `claude`
-      session's system prompt, tool calls never are.
+      restored conversation is transcript, not memory: prose is replayed into a fresh agent-CLI
+      session's system prompt, tool calls never are. That session need not be the harness that
+      produced the transcript — each message carries its own `harness`, so a conversation restored
+      after a switch keeps naming whoever answered each turn while the *next* turn runs on the CLI
+      selected now.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
     `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
     `selected_text` resolves a mirrored byte range against the buffer for the AI panel: the range
@@ -5102,11 +5127,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   compiles it via `--features schemaic-db/live-tests`, since otherwise it
   would be the one code in the repository no push compiles.
 - `schemaic-ai` — agent-CLI sessions (stream-json) and turn parsing, for whichever CLI the user has
-  installed. `harness.rs` and `stream.rs` model three of them (`claude`, `codex`, `antigravity`),
-  and **all three are driven, with database tools**. Each is selectable from the settings modal's
-  *Agent CLI* dropdown, persisted as `UiState::ai_harness`, carried on `AiSettings::harness`,
+  installed. `harness.rs` and `stream.rs` model four of them (`claude`, `codex`, `antigravity`,
+  `opencode`), and **all four are driven, with database tools**. Each is selectable from the settings
+  modal's *Agent CLI* dropdown, persisted as `UiState::ai_harness`, carried on `AiSettings::harness`,
   resolved and interrogated by `app/agent_cli.rs`, and spawned by `app/ai.rs` — Claude as one
-  persistent child per conversation, the other two as one process per turn.
+  persistent child per conversation, the other three as one process per turn.
   **A fourth, `gemini`, was modelled here and refused, and it has now been deleted rather than left
   as a menu entry that says no.** Google withdrew OAuth for personal accounts, so `gemini` needs an
   API key to authenticate at all, and the CLI's own sign-in points at Antigravity as its successor —
@@ -5127,7 +5152,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   argv is `inline_args` — the binary and the model id are the two halves of one rule, and for a
   while only the first half existed. A
   harness key `main.rs` does not recognise is `tracing::warn!`ed and falls back to Claude.
-  **Getting the tools to each harness is three different mechanisms, and only Claude's is per
+  **Getting the tools to each harness is four different mechanisms, and only Claude's is per
   invocation.** Claude gets a temp `--mcp-config` file; Codex gets `-c` overrides on its own command
   line; Antigravity has no per-invocation configuration at all and needs **two pieces of its own
   global state** written instead — an `agy mcp add` registration *and* a per-tool
@@ -5137,6 +5162,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   to end against the real binary, with the four rules in place the same prompt returned real rows,
   and `run_command` was never granted — which is what makes the CLI's own suggestion of
   `--dangerously-skip-permissions` unnecessary rather than merely unattractive.
+  OpenCode has no configuration flag either (`--config` does not exist), but the state it needs is
+  **ours rather than the user's**: `app/opencode.rs` writes an `opencode.json` into a directory
+  Schemaic owns and points `XDG_CONFIG_HOME` at it, so one file carries both the MCP server and the
+  seal and nothing of the user's is edited.
   **The isolation is not symmetric either, and Antigravity has none at all** — the one asymmetry the
   list above would otherwise pass over while naming every other. Claude gets `--strict-mcp-config`
   and Codex has its whole `mcp_servers` table assigned out from under it, and both of those
@@ -5146,10 +5175,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `permissions.allow` rules cover only the four `mcp(schemaic/<tool>)` names, so a user whose own
   settings already allow their own servers' tools has those live inside Schemaic's SQL assistant.
   Written down rather than fixed, because an undocumented gap is the one that gets assumed shut.
+  **OpenCode displaces them as well, and is the one that does it without touching anything of the
+  user's** — `XDG_CONFIG_HOME` pointed at Schemaic's own directory takes their registered servers
+  out of the resolved config entirely (measured: they vanish from `opencode debug config`), and
+  because nothing of theirs was edited there is nothing to put back and no startup sweep. Note what
+  does **not** do this: `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` both **merge** with the
+  user's own file rather than replacing it, so a config naming only our server resolved to ours
+  *alongside* theirs. They are the obvious lever and the wrong one, which is why that is written here
+  rather than left for the next person to "simplify" towards.
+  **And rejecting them as a lever is not the same as being safe from them.** A child inherits the
+  parent's environment, so a user — or a shell profile, or whatever launched Schemaic — with
+  `OPENCODE_CONFIG` already exported gets their file merged straight back into a session
+  `XDG_CONFIG_HOME` was supposed to have isolated. Measured with both set at once: a foreign MCP
+  server appears alongside ours, inside a session the panel reports as `Sealed`. Setting our own
+  variables is half the seal and removing theirs is the other half, which is
+  `OpenCodeConfig::env_remove` and the `cmd.env_remove(..)` loop in `ai.rs` — see both entries below.
   **The spawned session is sealed to what Schemaic hands it, and that is `build_session_args`'s
   three flags rather than `DISALLOWED_TOOLS`.** That statement is now *graded* rather than boolean,
-  because only `claude` can honour it in full — `harness::Constraint` is the grade, and reporting
-  "sealed" for all three harnesses would be the denylist-era bug a second time: a guard that reads
+  because not every CLI can honour it in full — `claude` and `opencode` can, by two different
+  mechanisms, and Codex and Antigravity cannot. `harness::Constraint` is the grade, and reporting
+  "sealed" for every harness would be the denylist-era bug a second time: a guard that reads
   as total over a set nobody measured. The denylist named ten built-in tools and read like
   the guard; measured against the shipped CLI by reading the `system`/`init` event's own `tools`
   array, the old flag set left **nineteen** more live in the AI panel that it had never heard of —
@@ -5213,7 +5258,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   than of a version number.** Schemaic spawns whatever `claude` the user has and pins no version,
   and a flag an older CLI does not know does not degrade the session, it kills it — the child exits
   with `error: unknown option '--tools'` before the first turn and the AI panel is gone until the
-  user upgrades. So `agent_cli::probe` runs `<bin> --help` and hands the **whole probe** —
+  user upgrades. So `agent_cli::probe` runs `<bin>` with that harness's own `Harness::help_args`
+  (`--help`, or `exec --help` on Codex — see the entry below for the isolation that hid on the
+  top-level page) and hands the **whole probe** —
   the exit status and both streams — to `schemaic_ai::seal_from_probe`, which reads a
   `CliSeal` out of it, one `bool` per flag. The status is half the answer and the caller must not
   decide it alone: a `--help` that fails loudly still prints something, and that something is a
@@ -5277,6 +5324,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   rather than once at startup, so changing the override re-warms the key that will actually be
   used — and the effect reads the **harness** signal as well, since that is the other half of the
   key and a second way to warm an entry nobody reads.
+  **The effect warms two entries, because the inline paths do not use the selected harness.** Ctrl+K,
+  AI Fill and AI Seed always probe `(Claude, inline_claude_bin(..))`, which is a different key from
+  `(selected harness, its bin)` whenever the selection is not Claude — so with Codex, Antigravity or
+  OpenCode chosen, every Ctrl+K paid a blocking, timeout-free `claude --help` on the Floem UI thread.
+  That is verbatim the regression this function's own doc says it prevents, reintroduced through the
+  second key rather than through the path. The effect now warms the Claude entry as well when the
+  selection is something else; it costs one thread at startup, and nothing once the entry is there.
   **`inline_args` is sealed the same way, and its case is sharper.** Ctrl+K, AI Fill and AI Seed
   each want one string back that a parser then reads, and none of them has a surface that could
   render a tool call — so where the chat panel merely stalls on a tool it cannot prompt for, those
@@ -5285,7 +5339,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (`a_one_shot_generation_is_given_no_tools_and_no_servers`, and `inline_args_flags_in_order` holds
   the exact argv).
   - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
-    `Harness` (`Claude`/`Codex`/`Antigravity`) is **a dialect rather than a vendor**: the
+    `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`) is **a dialect rather than a vendor**: the
     variant names the wire format a binary speaks, which is the only thing decoding needs to know,
     so a fork that still speaks its parent's JSONL is that parent here. `key`/`label`/`bin` are the
     value `UiState::ai_harness` persists, the settings label and the name looked for on `PATH` —
@@ -5301,14 +5355,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     report (`an_unknown_harness_survives_the_round_trip_rather_than_being_corrected`); and a
     settings file written before the field existed carries no key at all and loads as Claude,
     because Claude was the only harness there was
-    (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`). Everything else is asked as a
+    (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`).
+    **`speaker_name` is a fourth string, and it differs from `label` in exactly one place on
+    purpose**: `label` is "Claude Code", the product you install and point a path at, while a
+    transcript header is naming a speaker and reads "Claude" — which is also the name that header
+    carried before it learned to vary, so an existing conversation does not appear to change its
+    mind about who wrote it. The other three answer the same in both, spelled out rather than
+    delegated to `label` so that a product name gaining a suffix cannot reach the transcript on its
+    own (`the_speaker_name_is_the_product_name_except_where_it_is_deliberately_not` pins both
+    halves). The free function `speaker_label(Option<&str>)` is the only thing that turns a
+    persisted `ChatMessage::harness` back into a name: the uppercased speaker name, or `"ASSISTANT"`
+    for `None` **and** for a key this build does not recognise. Both fall back rather than guess, for
+    `from_key`'s reason — a transcript written before the field existed could have been produced by
+    Claude, Codex or Antigravity, the three `Harness::ALL` held when the field was added alongside
+    `OpenCode`, and nothing on disk says which; one written by a later build may name a harness this
+    one has never heard of. Naming Claude there would be the `AiModel::from_cli` failure put back at
+    the one place the user can read it. Everything else is asked as a
     **capability** and never as a variant
     (`supports_effort`, `effort_levels`, `effort_arg`, `supports_resume`, `is_persistent`,
-    `streams_deltas`, `supports_model_choice`, `suggested_models`) — the same reason the engine
+    `streams_deltas`, `supports_model_choice`, `suggested_models`, `restricted_means_sandbox`,
+    `seals_by_flag`, `help_args`) — the same reason the engine
     predicates exist:
-    `== Harness::Claude` compiles cleanly while sorting a fourth CLI onto whichever side it happens
-    to fall. There is one deliberate exception, `Constraint::notice`, and it states its reason where
-    it is described below.
+    `== Harness::Claude` compiles cleanly while sorting the next CLI onto whichever side it happens
+    to fall. **There is no exception left.** `Constraint::notice` was documented here as the one
+    deliberate `h == Harness::Claude`, and OpenCode is exactly the fourth CLI that shape sorts wrong;
+    it is now two capabilities, described below.
     **`suggested_models` is a menu, never a permitted set**, and the distinction is the whole reason
     it returns a slice rather than the field being a dropdown: the model id is a free string, so a
     list here is the aliases each CLI documents as stable and anything dated, private or newer than
@@ -5317,7 +5388,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `a_model_id_no_build_has_heard_of_still_reaches_the_command_line`). Antigravity's list is
     deliberately **empty**, because its model names were never measured — and an empty list means
     "nothing useful to suggest, let them type", not "no models allowed", so a caller must render the
-    field regardless. That is the failure this API is shaped against: the app shipped a closed
+    field regardless. OpenCode's entries are **`provider/model`, and the provider half is not
+    decoration**: a bare `claude-sonnet-5` is not an id that CLI accepts, and every line
+    `opencode models` prints is qualified. The four suggested name the built-in `opencode` provider,
+    which is the one an install has before the user adds credentials of their own; somebody
+    authenticated straight to a vendor types `anthropic/…` or `openai/…` and the free-text field
+    passes it through untouched. That is the failure this API is shaped against: the app shipped a closed
     three-variant `AiModel` for a year, and its `from_cli` coerced every unrecognised id to Haiku, so
     a settings file naming a real model ran a different one with nothing on screen to say so.
     **A capability that is a `bool` can still be too coarse, and `supports_effort` is where that
@@ -5335,10 +5411,35 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `each_harness_offers_only_the_effort_levels_its_own_flag_takes`). The settings modal clamps the
     *selection* as well (`AiEffort::clamped_to`, under `settings.rs`), but that is about what the
     box shows; this is the one that decides the command line.
-    **The seal is graded here, because the three do not answer it equally well.** `Constraint` is
-    ordered `Unknown < Restricted < Sealed`, and only Claude reaches the top, because only
-    `--tools ""` empties the *built-in* set outright and leaves nothing but the allow-listed MCP
-    tools. The other two are both `Restricted`, each by its own lever: Codex by
+    **OpenCode made the list non-contiguous, which is why it is a list and not a ceiling.** Its flag
+    is `--variant` and the three levels its help names are `minimal|high|max` — no `low`, no
+    `medium`, and a `max` above Claude's `xhigh`. The list is deliberately *not* widened to the union
+    with anyone else's: that help text calls the accepted set provider-specific, so it is not even
+    constant across OpenCode's own models, and `effort_arg` clamping to what the flag documents sends
+    no flag rather than an invented level when `xhigh` or `medium` arrives from another harness
+    (`another_harness_effort_level_is_clamped_before_it_reaches_argv`, which drives the
+    `effort_arg` → `turn_args` composition rather than the predicate alone). The knock-on is in
+    `schemaic-ui`: a four-variant `AiEffort` intersected this list at exactly `High`, so see the
+    settings-modal entry for why the enum is now the six-way union.
+    **The seal is graded here, because the four do not answer it equally well.** `Constraint` is
+    ordered `Unknown < Restricted < Sealed`, and **two** harnesses reach the top by two different
+    mechanisms. Claude does it with a flag: `--tools ""` empties the *built-in* set outright and
+    leaves nothing but the allow-listed MCP tools. OpenCode does it with *configuration* — the agent
+    definition `opencode_config_json` writes carries a `tools` map setting every documented built-in
+    to `false`, and `opencode debug agent schemaic` then resolves that agent to eleven disabled
+    tools and one enabled — `invalid`, the CLI's own handler for a malformed tool call, which its
+    own description calls *"Do not use"* and which it excludes from the set it offers the model
+    (`activeTools: …filter(m => m !== "invalid")`). The twelve written and the eleven returned are
+    not the same eleven: `lsp` and `websearch` are documented by `--permissions` but are not
+    registered tools in the measured build and drop out, while `question` is never written here and
+    comes back disabled anyway. The map is a **denylist by omission**, which is the load-bearing
+    detail: a name absent from it stays *enabled*, so it has to name every tool the CLI documents,
+    and one a future build adds is live until somebody adds it here. That asymmetry is why the list
+    is deliberately over-inclusive: a name that has gone costs nothing, a name that is
+    missing costs the seal. `the_agent_has_every_built_in_tool_switched_off` (under `app/opencode.rs`)
+    asserts the map is non-empty and that nothing in it is left on, and names `bash`/`read`/`write`/
+    `edit` explicitly, because "everything in the map is false" stays true if a rename drops them out
+    of it. Codex and Antigravity are both `Restricted`, each by its own lever: Codex by
     `sandbox_mode="read-only"`, Antigravity by `--sandbox`. Both
     stop writes and command side effects and both leave built-in tools that can still *read*
     the machine the child was launched on — and Antigravity is the one where that is measured rather
@@ -5347,7 +5448,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     but a permission mode, and a measured turn ran `list_dir` and `view_file` with no prompt at all.
     There is no flag that empties that set, which is why the grade is a ceiling and not a
     to-do. So `Constraint::notice` states that to the user in one line, and
-    returns `None` for `Sealed` — a banner on every Claude session is how a user learns to ignore
+    returns `None` for `Sealed` — a banner on every sealed session is how a user learns to ignore
     the two grades that mean something.
     **A notice says what *this* harness gives you and stops there.** `Restricted` reads
     *"`<Harness>` runs read-only: it cannot write files or run commands, but its built-in tools can
@@ -5356,17 +5457,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     harness the user had just declined, printed in the one place they were exercising the choice.
     `the_weaker_grades_say_so_and_the_strongest_stays_quiet` pins both halves, the second over every
     harness × every non-`Sealed` grade: a notice may name Claude only when the harness *is* Claude.
-    **And `Restricted` does not mean one thing, so the sentence is asked per *harness*.** For Codex
-    and Antigravity the grade is a real sandbox and *"cannot write files or run commands"* is a claim
-    the OS is enforcing. For Claude it means only that `--help` did not list `--tools`, so the seal
-    fell back to `DISALLOWED_TOOLS` — the denylist this section opens by describing as the guard that
-    looked total and left nineteen built-ins live, several of which ran with no permission request at
-    all. Printing the sandbox sentence there would be the comfortable lie one grade down, shown to
+    **And `Restricted` does not mean one thing, so the sentence has to describe the mechanism.** For
+    Codex and Antigravity the grade is a real sandbox and *"cannot write files or run commands"* is a
+    claim the OS is enforcing. For Claude it means only that `--help` did not list `--tools`, so the
+    seal fell back to `DISALLOWED_TOOLS` — the denylist this section opens by describing as the guard
+    that looked total and left nineteen built-ins live, several of which ran with no permission request
+    at all. Printing the sandbox sentence there would be the comfortable lie one grade down, shown to
     the user as a positive assurance, so Claude gets its own line naming the denylist and pointing at
-    a CLI update (`a_denylisted_claude_is_not_described_as_unable_to_write_or_run`). This is the one
-    place the ask-a-capability rule is deliberately not followed, and the reason is that *this is* a
-    harness question: two different mechanisms arrive at one grade, and the difference between them
-    is the whole content of the sentence.
+    a CLI update (`a_denylisted_claude_is_not_described_as_unable_to_write_or_run`).
+    **That was asked as `h == Harness::Claude`, with everything else falling through to the sandbox
+    wording, and it is the harness-identity check this document warns about wearing the name of a
+    justification.** OpenCode is the fourth CLI it sorts onto the wrong side: its seal is a `tools` map
+    and it has no sandbox at all, so the fallthrough would have promised an OS-enforced read-only that
+    nothing enforces — the strongest kind of false claim, made to the user as a positive assurance. The
+    question is now two capabilities. `restricted_means_sandbox` (Codex, Antigravity) picks the sandbox
+    sentence, and `only_a_sandboxed_harness_is_told_the_os_is_stopping_it` holds the two to each other
+    over `Harness::ALL`. `seals_by_flag` (Claude alone) picks the denylist line, because *"updating the
+    CLI restores the full seal"* is advice that fixes nothing where the seal is configuration —
+    OpenCode reaches `Sealed` too, and by a file
+    (`only_a_flag_sealed_harness_is_told_an_update_would_help`). A third arm catches a harness that is
+    neither and **promises nothing**, saying only that Schemaic could not fully restrict it. No harness
+    reaches that arm today, and it is worded rather than left unreachable precisely because
+    "unreachable" is what the Claude arm assumed too.
     **`Constraint::Unknown` refuses the spawn** (`is_runnable` is false), which is the opposite
     failure direction from `CliSeal`/`seal_from_help` above, and both are right for the same
     underlying fact: an unknown flag *kills* the child. An unreadable Claude probe therefore yields
@@ -5375,7 +5487,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     non-Claude harness the conservative answer is refusal rather than assumption
     (`an_unreadable_probe_refuses_rather_than_assuming`,
     `a_harness_missing_its_constraining_flag_is_not_runnable`,
-    `only_claude_can_reach_the_sealed_grade`).
+    `an_unreadable_probe_refuses_every_harness`,
+    `each_harness_reaches_exactly_the_grade_its_mechanism_earns` — the last two run over
+    `Harness::ALL`, replacing an `only_claude_can_reach_the_sealed_grade` that asserted three
+    harnesses one at a time and so held its own name for none of them).
+    **A seal that is not a flag needs a different probe, and OpenCode's arm greps `--pure`.** Every
+    other grade is read straight off the lever itself: `--tools`, `--sandbox`, either present in the
+    help text or not. OpenCode's lever is a file Schemaic writes and an environment variable it sets,
+    and `--help` can confirm neither. `--pure` is what it greps instead — greppable, passed on every
+    turn, and *genuinely part of the constraint*, since it is what keeps the user's external plugins
+    (arbitrary code they installed) out of the session. It stands as evidence that the binary is the
+    OpenCode these mechanisms were measured against; a help text without it is `Unknown` and refuses,
+    exactly as with the others (`the_constraint_is_sealed_only_when_the_probe_read_a_help_page`,
+    whose second half holds a readable help page for something that is *not* OpenCode to `Unknown`
+    rather than to a grade).
+    **The other half of that grade is enforced at the call site, because this is the one harness where
+    a missing config does not fail closed.** `--agent schemaic` naming an agent that does not exist
+    does not stop the run — it leaves it on OpenCode's own default `build` agent, which has `bash`.
+    So `ai::start_ai_session` **refuses the session outright** when `OpenCodeConfig::write` returns
+    `None`, rather than degrading the way the Codex path does with `codex_isolation_only`. A seal that
+    silently becomes a shell is precisely what `Constraint` exists to prevent, and here the grade is
+    only honest because the refusal is there.
     **Codex's isolation is conditional and does not decide the grade.** `--ignore-user-config` is
     that CLI's `--strict-mcp-config` and `--setting-sources user` rolled into one — its own help text
     says *"Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`"*, so it drops the
@@ -5385,18 +5517,39 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`isolation_does_not_decide_the_grade`). Note the two probes answer an absent flag in opposite
     directions on purpose: a missing isolation flag is a known, lesser, still-runnable state, while
     a missing *grade* means nobody knows whether side effects are blocked at all.
+    **And "the probe saw it" was false on every real machine, because Codex keeps that flag off its
+    top-level help page.** Measured against the installed binary: `codex --help` lists `--model`,
+    `--sandbox`, `--help` and `--version` and *not* `--ignore-user-config`, while `codex exec --help`
+    lists all of them. The probe asked the top-level page, so `codex_isolates_config` answered `false`
+    always, the flag was never passed, and every Codex session loaded the user's own
+    `~/.codex/config.toml` — their MCP servers, whose tools nobody here allow-listed, and their hooks,
+    which are commands. `Harness::help_args` is the fix and is a **capability rather than a literal at
+    the call site**, because the seam is where the bug lived: the pure decoder was tested with
+    `codex exec --help` text pasted in by hand while `probe` fed it a different page, so both halves
+    passed alone and neither was wrong on its own. It answers `["exec", "--help"]` for Codex and
+    `["--help"]` for the other three, and the last element is always the help flag itself, since every
+    harness's page still has to answer the grade question
+    (`codex_is_probed_on_the_subcommand_that_documents_its_isolation`). `codex exec --help` also
+    carries `--sandbox`, so one page still answers both — and
+    `the_codex_help_page_answers_the_grade_and_the_isolation_together` keeps the *old* page as a
+    fixture beside the new one, holding it to a resolved grade and a silently absent isolation, so the
+    regression stays legible rather than merely gone.
     **The endpoint never reaches argv, and that forced a new mechanism.** Codex's only configuration
     lever is `-c key=value`, and those *are* argv — readable by every process listing on the
     machine — so the DB endpoint could not travel that way without undoing review C6. The override
     names an endpoint *file* instead: `schemaic --mcp-serve --endpoint-file <path>`, where the path
     is not the credential and what it points at is
     (`the_endpoint_never_reaches_a_codex_command_line` drives a real `mysql://root:hunter2@…`
-    through it). **Claude is the only harness left in the other camp** — it is configured by a file
-    Schemaic writes, so its endpoint still travels in that file's `env` map, in
-    `$SCHEMAIC_MCP_ENDPOINT`, exactly as before. Antigravity takes `--endpoint-file` too, in the
-    argv `agy mcp add` registers, so the split is one file-configured harness against two that read
-    the path off their own command line (`main.rs`'s comment beside `--mcp-serve` says the same, and
-    it named Gemini on the file side until that harness went).
+    through it). **Claude is the only harness left carrying the endpoint itself** — it is configured
+    by a file Schemaic writes *per session*, so the endpoint still travels in that file's `env` map,
+    in `$SCHEMAIC_MCP_ENDPOINT`, exactly as before. Antigravity takes `--endpoint-file` too, in the
+    argv `agy mcp add` registers, and OpenCode takes it in the `command` array of the `opencode.json`
+    written for it — a file, like Claude's, but a **reused** one that outlives the session, which is
+    why it carries the path and never the blob
+    (`the_endpoint_path_is_configured_but_the_endpoint_is_not`). So the split is one harness carrying
+    the endpoint against three carrying a path to it, for two different reasons: argv is public, and
+    a reused directory is persistent (`main.rs`'s comment beside `--mcp-serve` says the same, and it
+    named Gemini on the file side until that harness went).
     `codex_mcp_overrides` **replaces the whole `mcp_servers` table** (`mcp_servers={schemaic={…}}`)
     rather than setting `mcp_servers.schemaic.command`, because `-c` merges: the user's own servers
     would otherwise join Schemaic's SQL assistant with nobody here having allow-listed them.
@@ -5440,15 +5593,44 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     removal matches by value, so a rule the *user* added by hand for the same tool is
     indistinguishable from ours and goes with it — the alternative is a standing grant nobody
     remembers making.
+    **`opencode_config_json` is the same division for the harness whose whole configuration is one
+    file**: the JSON is built and tested here, and `app/opencode.rs` does the IO. It holds both
+    halves at once — the `mcp` table naming our server and its `--endpoint-file` command line, and
+    the `agent` entry whose `tools` map is the seal — which is Claude's `--mcp-config` plus
+    `--tools ""` folded into a single document. The connection's access level reaches it the way it
+    reaches every other harness: the tools it may call are named, by their **bare** names via
+    `bare_tool_name`, in the agent's `description` rather than in a permission rule, because OpenCode
+    allows MCP tools by default and there is no per-tool approval to set; the server itself still
+    refuses anything the level does not offer, and naming them only saves the model a turn spent
+    discovering that (`a_read_only_connection_never_advertises_run_query`).
+    Two public constants sit beside it and are deliberately **not** one. `OPENCODE_AGENT` is the
+    agent this file defines and `turn_args` selects, so a rename cannot make the definition and the
+    selection disagree — and a disagreement there is silent, since the run falls back to `build`.
+    `MCP_SERVER` is the name the server is registered under, and it exists because **one dialect has
+    to decode a name Schemaic itself wrote**: OpenCode flattens the server into the tool name, so
+    `stream.rs` reads `schemaic_run_query` back as `mcp__schemaic__run_query` off this prefix. They
+    are the same string today and answer different questions — the agent is the tool *set*, this is
+    the tool *source* — and collapsing them is how one rename quietly becomes two.
     `TurnSpec` and `turn_args` build one turn's command line — one struct rather than eight
     positional arguments, because the harnesses draw on overlapping subsets of it and a positional
     list is how `--model`'s value ends up in `--effort`'s slot. Claude's argv stays
     `build_session_args`: it is spawned once per *conversation* with its prompt arriving on stdin,
-    where the other two are spawned per turn. **Where the prompt sits differs and is not a detail
-    to generalise from one of them**: Codex takes it as the last *positional*, last on purpose since
-    a flag after it reads as part of it; Antigravity's is `-p`'s value and therefore first.
+    where the other three are spawned per turn. **Where the prompt sits differs and is not a detail
+    to generalise from one of them**: Codex and OpenCode take it as the last *positional*, last on
+    purpose since a flag after it reads as part of it; Antigravity's is `-p`'s value and therefore
+    first.
+    **The model is trimmed once at the top of `turn_args`, because the field it comes from is free
+    text the user can clear.** Typing a space and closing the settings modal leaves `" "`, which an
+    `!is_empty()` waves through as `--model " "` — an unknown model, killing the spawn and reported to
+    the user as "Couldn't launch the CLI", which is the one explanation that is not the problem.
+    `build_session_args` already trimmed on Claude's path and these three did not, and that divergence
+    between the two argv builders was the whole bug.
+    `a_whitespace_only_model_is_no_model_on_every_harness` loops `Harness::ALL` and also asserts no
+    *other* blank argument reached argv, while `a_model_with_surrounding_space_is_sent_trimmed` holds
+    the direction that would break by over-trimming.
     **The system context rides the first turn of a thread and none of the rest**, which is
-    `turn_system`. Neither of these two has an `--append-system-prompt`, so `prefixed_prompt` folds
+    `turn_system`. Neither Codex nor Antigravity has an `--append-system-prompt` and none is passed
+    to OpenCode either, so for all three `prefixed_prompt` folds
     the schema outline into the prompt itself (with a blank line between, or the outline's last table
     name reads as the first word of the question) — and a resumed turn makes the CLI replay the whole
     prior thread, every turn of which already carries its own copy. Sent every time, turn N put the
@@ -5496,13 +5678,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     flag was checked against the installed binary. And the help itself is read
     off **stderr**, where `agy` writes it while exiting 0 — a stdout-only probe finds it empty and
     refuses a working install, which is why `agent_cli::probe` folds both streams.
-    With the Gemini adapter deleted, `claude`, `codex` and `agy` are the three, and every argv here
-    is for a binary somebody has run: what remains unverified is a *flag* on a driven harness — the
-    Antigravity resume above — rather than a whole harness nobody could sign in to.
-  - `stream.rs` — one transcript vocabulary, three CLI dialects. Every harness decodes into the same
+    **The OpenCode argv is `run --pure --agent schemaic --format json`, and two of those flags do
+    more than they look.** `--agent` is what selects the sealed agent, so it is not decoration around
+    the config file but the half that activates it; drop it and the turn runs as `build` with every
+    built-in (`a_turn_runs_the_sealed_agent_and_asks_for_json`, and
+    `the_agent_the_config_defines_is_the_one_the_argv_selects` under `app/opencode.rs`, which walks
+    the argv's `--agent` value back into the JSON and checks *that* agent is the one with the tools
+    switched off — a `const` on both sides can never break the lookup, but the JSON growing a
+    different shape around it can). `--pure` is the plugin half of the seal *and* the reason a first
+    turn finishes: see `app/opencode.rs` for the three-minute silent bootstrap it skips. `--model`
+    and `--variant` are omitted when empty, `--session <id>` is the resume, and the prompt is the
+    last positional as Codex's is.
+    **No `--auto`, and the reason is the opposite of Antigravity's.** Measured, a headless turn under
+    this agent called its tool and returned without ever asking permission, because OpenCode's
+    default permission set allows rather than denies; Antigravity's auto-*denies*, which is the whole
+    reason `AgyRegistration`'s allow-rules exist. Its own help calls the flag dangerous, and passing
+    it would buy nothing while pre-approving whatever a future build adds to the tool set
+    (`a_turn_never_passes_the_auto_approve_flag`).
+    With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` are the four, and every
+    argv here is for a binary somebody has run: what remains unverified is a *flag* on a driven
+    harness — the Antigravity resume above — rather than a whole harness nobody could sign in to.
+  - `stream.rs` — one transcript vocabulary, four CLI dialects. Every harness decodes into the same
     `StreamEvent`s the panel already renders, so the dialect stops at this module and nothing
     downstream learns which CLI produced a turn. **They do not even agree on where the discriminator
-    lives**: Claude and Codex tag a line with `type`, while Antigravity tags it with `event`
+    lives**: Claude, Codex and OpenCode tag a line with `type`, while Antigravity tags it with `event`
     and nests the payload under a key of the same name (`{"event":"init","init":{…}}`,
     `{"event":"step_update","step_update":{…}}`). A line shaped like the other three decodes to
     nothing at all, which is why that is pinned rather than assumed
@@ -5524,9 +5723,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     with. It is keyed by ids unique only within one stream, so a parser must not be shared between
     two concurrent ones — one per turn for the process-per-turn harnesses, one per session for
     Claude.
-    **There are two pieces of that state now, and the second is `seen_tools`.** Both per-turn
-    dialects restate a tool call while it is still running, neither marking the repeat — Codex on
-    every `item.updated` for the item id, Antigravity on every `state: "ACTIVE"` for the
+    **OpenCode sends neither, and that is structural rather than a sampling artefact.** Its printer
+    emits a `text` part only once `time.end` is set — once the part is *finished* — so a whole answer
+    arrives in one event, a measured 2964-character reply among them. `streams_deltas` is false for
+    it, and no amount of coalescing would help, because no partial text is ever written to decode.
+    The visible cost is that there is no "it has started" moment to report: the panel's spinner runs
+    until the text lands.
+    **There are two pieces of that state now, and the second is `seen_tools`.** Two of the three
+    per-turn dialects restate a tool call while it is still running, neither marking the repeat —
+    Codex on every `item.updated` for the item id, Antigravity on every `state: "ACTIVE"` for the
     `step_index` — while `TurnState::apply` pushes a chip for every `ToolUse` it is handed and
     attaches a `ToolResult` to the *last* pending one. So a restated call left the earlier chip
     spinning for the rest of the transcript. The set holds whatever id that dialect gives the call,
@@ -5535,6 +5740,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `two_distinct_tool_calls_still_get_a_chip_each` for the direction that would break by
     over-suppressing). **An Antigravity step with no `step_index` is announced anyway**: every
     measured step carried one, and silently dropping a call is the worse of the two failures.
+    OpenCode is the third and does not restate: a measured call arrived **once, already
+    `completed`**, with its `input` and its `output` in the same event, so `opencode_tool` emits the
+    chip and fills it from one line. It is keyed on `callID` all the same — the part id changes
+    between restatements where the call id does not — and the `running` status is handled, so a build
+    that starts streaming its calls costs one chip rather than a duplicate per event.
+    **Both halves of a Codex `mcp_tool_call` are guarded now, and the result half was not.**
+    `seen_tools` kept a restated call from opening a second chip, but the completion path emitted its
+    `ToolResult` unconditionally — so a call whose *only* event is `item.completed` produced a result
+    with no chip to land in, and `TurnState::apply` attaches a loose result to the most recent call
+    still awaiting one. A database answer was therefore stamped onto whatever chip happened to be
+    open, a `command_execution` among them, or dropped outright when none was, leaving no record of a
+    query that ran; a restated completion had the mirror problem, a second result for one call. The
+    chip is now opened on **first sight, whichever event arrives first**, and the result is guarded by
+    its own key, `<id>\0done` — keyed apart because one id has to be able to announce once *and*
+    resolve once, and a NUL cannot occur in an id. That completion-only shape is not hypothetical:
+    it is what a refusal looks like (`a_real_codex_tool_refusal_is_flagged_on_the_chip`, captured
+    before the approval was configured), and a refused call the user cannot see is the failure that
+    arm exists to surface. `codex_mcp_tool_result_reads_content_blocks_and_flags_failure` is the other
+    pin; both fed a lone `item.completed` and asserted `[ToolResult]`, and both now expect
+    `[ToolUse, ToolResult]`.
     **Codex's session model differs in kind, not in field names** — one process per *turn*, resumed
     by id (`codex exec resume <id>`), against Claude's one persistent bidirectional process per
     conversation. `StreamEvent::SessionStarted { id }` exists to carry the `thread.started`/`init`
@@ -5567,13 +5792,43 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     names rather than dropped, for the same reason Codex's side-effecting items are, and here it is
     not hypothetical: a measured turn ran `list_dir` and `view_file` unprompted, because
     Antigravity's filesystem readers are auto-approved in headless mode.
-    **Which dialects are measured and which are read is the real confidence boundary.** Codex and
-    Antigravity are pinned by fixtures captured **verbatim** from the installed binaries
-    (`codex exec --json`, `agy -p --output-format stream-json`) — including a matched Antigravity
+    **OpenCode never says a turn is over, and inferring the end is the load-bearing one here.** Every
+    other dialect emits a terminal event — `turn.completed`, `result`, a final `stream-json` message.
+    This printer simply stops writing when the session goes idle, so the close is read off
+    `step_finish.reason`: `tool-calls` means the model is going round again and anything else ends
+    the turn. It is visible in both directions if it is wrong — end on `tool-calls` and the answer is
+    cut off before it is written, never end and the app closes the turn on process exit and reports a
+    working turn as *"ended unexpectedly"*. `an_opencode_turn_ends_only_on_the_terminal_step` holds
+    the fixture to exactly one `TurnDone`, and it being the last event. The `error` type is the
+    printer's only failure event and nothing follows it either, so the `TurnDone` comes from there or
+    not at all (`an_opencode_session_error_ends_the_turn_and_says_why`, which also emits the message
+    as prose — there is no body it would otherwise be explained in).
+    The rest of the dialect follows from the same shape. **Tokens are reported per *step*, not per
+    turn** — a measured two-step turn reported input 2497 and then 637 — so `OpenCodeTurn` accumulates
+    them across `step_finish` events and a footer reading only the last would understate that turn by
+    a factor of four (`an_opencode_turn_sums_tokens_across_its_steps`); `saw_tokens` keeps "nothing
+    reported" apart from "zero", so a footer stays blank rather than claiming `0 in / 0 out`. Wall
+    time is stated nowhere in the stream, but every event carries a millisecond `timestamp`, so the
+    span between the first and the last is the turn's own and is exact — this is the one dialect
+    where a duration is *derived* rather than read or left `None`. The session id sits on the **top
+    level of every event** as `sessionID` rather than in an opening event of its own, so it is taken
+    from whichever arrives first and announced once; it is what `--session` resumes with. **And the
+    tool name arrives flattened**: OpenCode folds the server into it, so our own tools come through as
+    `schemaic_run_query` where Codex keeps `server` and `tool` apart. `opencode_tool_name` rewrites
+    that one prefix — read off `harness::MCP_SERVER`, because this is the only dialect that has to
+    decode a name Schemaic itself wrote — back to the qualified `mcp__schemaic__run_query` every other
+    harness produces, and leaves anything unprefixed alone so a built-in still shows under its own
+    name rather than being dressed up as an MCP call.
+    **Which dialects are measured and which are read is the real confidence boundary.** Codex,
+    Antigravity and OpenCode are pinned by fixtures captured **verbatim** from the installed binaries
+    (`codex exec --json`, `agy -p --output-format stream-json`,
+    `opencode run --pure --agent schemaic --format json`) — including a matched Antigravity
     pair where the harness and the prompt are identical and permission is the only difference
     (`a_real_denied_antigravity_tool_call_names_the_tool_and_fails_the_turn`,
     `a_real_completed_antigravity_tool_call_fills_its_chip_and_succeeds`), which is what makes the
-    `"status":"SUCCESS"` refusal above evidence rather than a story. Each capture also has a second
+    `"status":"SUCCESS"` refusal above evidence rather than a story. `OC_REAL_TOOL_CYCLE` is the
+    OpenCode one, and it is the fixture carrying the two facts that dialect turns on: a `step_finish`
+    whose `reason` is `tool-calls` is not the end, and the one whose reason is `stop` is. Each capture also has a second
     test driving the same bytes through `TurnState`, so the *composition* is covered and not only the
     parser. Keep them byte-for-byte: tidying an id or a usage key turns evidence back into a fixture
     that agrees with the code that produced it. The one dialect no binary had ever produced was
@@ -5795,7 +6050,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     appended only when there are some. A hint describing a control that is not on screen reads as a
     bug in the modal rather than as a note about the field.
     `AiEffort` **stays** a closed enum, and that is not an inconsistency: its
-    vocabulary is defined by the flag (`low|medium|high|xhigh`), not by a vendor's model catalogue.
+    vocabulary is defined by the flag, not by a vendor's model catalogue. **What it is closed
+    *over* is the union of every harness's flag, and that is not optional.** It held Claude's four
+    (`low|medium|high|xhigh`) until OpenCode arrived with `minimal|high|max`; filtering four variants
+    by that list leaves exactly `High`, so the dropdown became one item and two of that harness's
+    three levels were unreachable from the UI — the `AiModel`-coerced-to-Haiku narrowing again, in the
+    control next to it. The enum is now the six-way union
+    (`Minimal, Low, Medium, High, Extra, Max`), still ordered low→high because `clamped_to` reads a
+    level's rank off that order and measures distance along it. `from_cli` no longer folds `max` into
+    `xhigh`: they were one level while no
+    harness took both, and OpenCode takes `max` and not `xhigh`, so the fold made a saved `max` come
+    back as `Extra` and clamp to `high` on the very harness that had written it.
     **The Effort row is hidden, not disabled, where the harness has no such flag** (Codex). A
     greyed control still claims *this exists for you and is off*, which is a different statement and
     a false one. The row builds its dropdown **inside** a `dyn_container` because a floem view is not
@@ -5830,7 +6095,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     said `haiku` configured the session with a value last chosen for a different program and it died
     on an unknown model. Empty already means "the harness's default" and omits the flag entirely —
     but on **two** argv builders, and only one of them was covered. `turn_args` skips an empty id for
-    the per-turn harnesses (`an_empty_model_lets_the_harness_keep_its_own_default`, which loops
+    the per-turn harnesses — and a whitespace-only one, which is the same clear a keystroke short and
+    the divergence between the builders described under `harness.rs`
+    (`an_empty_model_lets_the_harness_keep_its_own_default`, which loops
     `Harness::ALL` — and whose Claude arm asserts nothing at all, because `turn_args` returns
     `Vec::new()` for the one harness whose argv is `build_session_args`). That builder passed
     `Some(&model)` straight through, so the clear this paragraph describes spawned
@@ -5841,17 +6108,39 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     path — so clearing lands on the one value
     every harness is guaranteed to take. It is a *clear*, not a per-harness memory: switching back
     does not restore the old id.
-    **Effort is clamped down rather than cleared**, because unlike the other two it has no "the
-    harness's default" value: `AiEffort` is a closed enum and every level in it means something.
-    `Extra` is Claude's `xhigh` and Antigravity's flag stops at `high`, so the switch moves the
-    selection to the highest level the new harness advertises — `AiEffort::clamped_to`, whose `ALL`
-    is ordered low→high so the last surviving entry is the closest this CLI can reach, and which
-    answers `None` when the harness has no effort flag at all and the row is hidden. The argv is
-    already clamped by `Harness::effort_arg`, so this is about what the modal *shows*: the closed
-    dropdown renders the selected level unconditionally, so a box reading "Extra" under a harness
-    that neither offers it in the list below nor sends it is a caption for a level that exists
-    nowhere else on screen (`a_level_out_of_range_clamps_down_to_the_highest_the_harness_takes`,
-    `a_clamped_level_is_always_one_the_harness_advertises`).
+    **Effort is clamped to the nearest level the harness offers rather than cleared**, because unlike
+    the other two it has no "the harness's default" value: `AiEffort` is a closed enum and every level
+    in it means something. `AiEffort::clamped_to` ranks the requested level against `ALL` and takes the
+    offered level at the smallest distance, breaking a tie **downward** (`min_by_key` on
+    `(distance, rank > want)`), and answers `None` when the harness has no effort flag at all and the
+    row is hidden. The argv is already clamped by `Harness::effort_arg`, so this is about what the
+    modal *shows*: the closed dropdown renders the selected level unconditionally, so a box reading
+    "Extra" under a harness that neither offers it in the list below nor sends it is a caption for a
+    level that exists nowhere else on screen.
+    **It took the *highest* offered level until a review caught it, and that is a bill rather than a
+    stale caption.** Taking the last surviving entry of a low→high list is the harness's most expensive
+    level; it only looks like clamping *down* when the level asked for sits above everything on
+    offer — Claude's `xhigh` against Antigravity's `low|medium|high`, which is the one case the original
+    test covered. OpenCode put a hole in the middle: its levels are `minimal|high|max`, so the shipped
+    default `Medium` fell through to `Max`, the switch persisted `"max"`, and switching back to Claude
+    carried that on to `xhigh`. Two turns of the harness dropdown left a user who had never opened the
+    Effort control on the priciest setting of both CLIs.
+    `a_level_out_of_range_lands_on_the_nearest_the_harness_takes` is the renamed original, and
+    `clamping_lands_on_the_nearest_offered_level_and_never_the_priciest_by_default` is the property
+    that would have caught it: every harness × every level, asserting nothing offered is strictly
+    closer and that a tie goes to the cheaper side. Three narrower pins sit beside it for the
+    directions prose argues about — `the_default_level_survives_a_round_trip_through_opencode` walks
+    the exact path above, `a_level_below_everything_offered_moves_up_to_the_nearest` holds that
+    proximity rather than "clamp down" is the rule (Claude has no `minimal`, so `Minimal` moves *up*
+    to `low`), and `a_tie_between_two_neighbours_picks_the_cheaper_one` holds the tie break. And
+    `a_clamped_level_is_always_one_the_harness_advertises` still holds the property the display depends
+    on.
+    **The clamp runs on every run of the effect; the path and the model clear only on an actual
+    switch.** They are different questions — "did the user change harness" against "is the level in the
+    box one this harness takes" — and gating the clamp on the change meant the restore from
+    `ui_state.json` never clamped at all: a file pairing `opencode` with `medium` came back reading
+    "Medium" in a closed dropdown whose list offers only Minimal/High/Max, while `effort_arg` sent no
+    flag. That is the stale caption the clamp exists to prevent, arrived at from the other direction.
     The effect returns the **previous** harness rather than reading the
     signal twice: on the first run there is none, and clearing then would throw away the override
     just restored from `ui_state.json`.
@@ -7132,8 +7421,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the statement about to be previewed would carry the clause.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
-    question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while Claude's turn has
-    no surface at all — full-width prose on the panel, marked only by a 2px `accent` rule down its
+    question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while the assistant's turn
+    has no surface at all — full-width prose on the panel, marked only by a 2px `accent` rule down its
     *right* edge, with the cost footer separated by space rather than a rule. That is why there is
     no `bubble_claude_bg`: the assistant's text (`bubble_claude_text`) is a foreground with no
     paired background, and `contrast.rs` audits it against `bg_panel`. The rule is a setting
@@ -7154,6 +7443,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `RwSignal::new(false)` is a *new* signal after each rebuild, so a card the reader had opened to
     check what was sent snapped shut the moment the answer landed. That scope outlives the rebuilds
     and dies with the message.
+    **The label over a reply names the harness stamped on *that message*, never the live setting** —
+    `speaker_label(m.harness.as_deref())`, with "YOU" over the user's own turn. This was a literal
+    `"CLAUDE"`, and the user who found it drove one conversation through three harnesses (ask Claude,
+    switch to Antigravity in Settings, ask again, switch to OpenCode, ask again) and was told all
+    three answers were Claude's — each reply itself correct, each harness reporting its own model
+    accurately, only the name over it wrong. Reading `ai_harness` at render time is the tempting fix
+    and the worse bug: it would have corrected the newest label and broken every earlier one,
+    retroactively attributing Claude's replies to whichever CLI happened to be selected when the
+    panel was next drawn, so the transcript would be wrong about *history* rather than merely wrong
+    about now. `switching_harness_does_not_relabel_the_answers_already_given` builds exactly that
+    three-harness conversation and asserts the labels stay put.
     **The panel's own words name the selected harness, or nobody.** The empty state reads
     *"`<Harness>` not connected."*: `available` has answered per harness since the picker existed
     while that string stayed literal, so Codex selected with no `codex` on `PATH` read "Claude not
@@ -8980,13 +9280,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   with `Constraint::notice`. It used to have a second arm — a harness this build did not drive,
   which was Gemini and only Gemini — and with that harness deleted every variant the enum names is
   driven, so the unestablished constraint is the only refusal left. **The arm was rewritten rather
-  than removed**: it is now an exhaustive `match harness { Claude | Codex | Antigravity => None }`,
+  than removed**: it is now an exhaustive
+  `match harness { Claude | Codex | Antigravity | OpenCode => None }`,
   so the *next* harness added to the enum lands here as a non-exhaustive-match error and has to be
   decided. A `None` fall-through would instead spawn it on an argv read off documentation, which
   dies on its first unknown flag and gets reported as an installation problem — the one thing that
-  would not be wrong with it. The refusal sends its line to the panel over `ai_tx` and returns a **live sender
-  with no process behind it**, the same shape the oversize arm below it uses, so the next question
-  re-enters here and meets the same check. It lives on the one function that spawns an agent for the
+  would not be wrong with it. **The refusal has to keep answering, and for a while it answered once
+  and then swallowed everything.** It sent its line to the panel over `ai_tx` and returned its sender
+  with nothing spawned — which drops `rx` and closes the channel, and `needs_respawn` does not rebuild
+  a session whose settings have not changed, so `start_ai_session` was never re-entered: the *second*
+  question was a discarded `Err` on a dead sender, the pending bubble spun until the user pressed
+  Stop, and nothing anywhere said why. The comment here claimed the opposite — that the next question
+  re-entered and met the same check — which is the shape of drift this document exists to catch, in a
+  comment rather than a paragraph. `refuse_every_turn` is the cheap way to make that claim true: a
+  task holding `rx` open that re-states the reason per turn (and ignores `Interrupt`, since Stop on an
+  idle panel is not a question). Both refusal paths take it — the constraint one and the OpenCode
+  config-write failure. It lives on the one function that spawns an agent for the
   same reason the write guard lives on the run action: a gate a caller has to remember is one
   `return` from not existing. And it **reuses the binary and the `Probe` it checked** for the spawn
   and for `build_session_args`'s seal — re-resolving would let the thing checked and the thing run
@@ -8994,12 +9303,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   itself is pure and tested separately (`spawn_refusal` is reachable in a test where the spawn is
   not): `the_driven_harnesses_run_and_the_rest_say_so`, which now loops `Harness::ALL` and asserts
   both halves — a runnable grade refuses nobody, and `Unknown` refuses everybody — rather than
-  naming the harnesses by hand, so a fourth added to the enum is covered the moment it compiles.
+  naming the harnesses by hand, so a harness added to the enum is covered the moment it compiles.
   **There are two session models behind one channel, and the seam is `SessionMsg`.**
   `start_ai_session` branches on `harness.is_persistent()`: Claude keeps its one bidirectional child
-  per conversation, while Codex and Antigravity spawn **one process per turn**, continuity coming
-  from an id captured off `StreamEvent::SessionStarted` (`thread.started`/`init`) and handed to the
-  next turn as `TurnSpec::resume`. **The interface upstream did not change**, and that is the point:
+  per conversation, while Codex, Antigravity and OpenCode spawn **one process per turn**, continuity
+  coming from an id captured off `StreamEvent::SessionStarted` (`thread.started`/`init`/`sessionID`)
+  and handed to the next turn as `TurnSpec::resume`. **The interface upstream did not change**, and that is the point:
   `AiSession::stdin_tx` carries a typed `SessionMsg::{Turn, Interrupt}` rather than the raw stdin
   JSON line `main.rs` used to build, because that made the app's send path fluent in one CLI's wire
   protocol — and a process-per-turn harness has no such protocol at all. The encoding now belongs to
@@ -9013,6 +9322,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   refactored onto it rather than left alongside: it briefly had its own copy, and two copies drift
   on exactly the details a user notices — whether a half-finished turn renders, whether stats reach
   the footer, whether the accumulator is reset at the boundary.
+  **`fail()` *appends* its reason to what streamed in rather than replacing it**, and sending the
+  reason alone is not a smaller version of that: the consumer assigns `last.segs = msg.segs`
+  wholesale, so a one-segment message threw away every word already on screen. That was invisible on
+  Claude, whose `result` event carries the accumulated turn so the final snapshot is complete, and
+  wrong on the three harnesses that end a turn by *exiting* — press Stop on a long Codex, Antigravity
+  or OpenCode answer and the prose you were reading vanished, replaced by "Stopped.". The consumer's
+  own comment already promised the opposite, which is what made the two halves look consistent.
+  **The per-turn child is released before it is waited on, and the wait is bounded.** After a decoded
+  `TurnDone` the loop breaks and the child is reaped — but the loop owns the read half of stdout, and
+  a child that keeps writing past its terminal event fills the pipe and blocks in `wait()` forever.
+  `kill_on_drop` cannot help, because `child` is not dropped until `wait()` returns, so the task never
+  reached the outer `rx.recv()` again: the session accepted no further question and Stop could not
+  reach it either, the inner `select!` having already gone. So `drop(reader)` closes the pipe first,
+  and `tokio::time::timeout(CHILD_EXIT_GRACE, child.wait())` — ten seconds — kills a child that hangs
+  for its own reasons. The turn is already rendered by then, so the grace is only about reaping: long
+  enough that a healthy CLI flushing and shutting down is never killed mid-cleanup, short enough that
+  one which never exits cannot wedge the session against every later question.
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session temp `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. **A harness Schemaic cannot hand a config file gets a *path*
@@ -9030,12 +9356,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `--endpoint-file <path>` is written into that CLI's own config rather than passed per invocation —
   still the path and never the endpoint, and `write_endpoint_file` puts the file in the same
   directory, with the same prefix, as the Claude config so `sweep_stale_mcp_configs` already
-  collects it. It holds the same secret and must not outlive its session any longer. Pure clusters
+  collects it. It holds the same secret and must not outlive its session any longer. **OpenCode is on
+  that route for a third reason**: it is configured by a file, like Claude, but by a *reused* one, so
+  the `--endpoint-file <path>` in its `opencode.json` is what keeps the credential out of a directory
+  that outlives the session (`crate::opencode`). Pure clusters
   split out: `agent_cli.rs` (agent-CLI
   discovery — env override / known install locations / PATH+PATHEXT — plus the one part of it that
-  is *not* pure, `probe`, which spawns `<bin> --help` and caches what it reads per
+  is *not* pure, `probe`, which spawns `<bin>` with that harness's `help_args` and caches what it
+  reads per
   `(harness, path)`; its own entry is below), `antigravity.rs` (that CLI's two pieces of global
-  state, also below) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
+  state, also below), `opencode.rs` (the config directory that harness is sealed by, and the
+  environment pointing it there — also below) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
   stays in `main.rs`.
   **Every prompt's database list comes out of one funnel**, `snapshot_databases`: it reads the
@@ -9145,8 +9476,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   drift into a block nothing picks up.
   - `agent_cli.rs` — finding the agent CLI, and asking it what it accepts. It was `claude_cli.rs`
     until the settings gained a harness, and the rename is not cosmetic: the module now looks for
-    three binaries and interrogates whichever one is selected, so leaving it named for one of them
-    while it probes the other two is the drift this document exists to catch.
+    four binaries and interrogates whichever one is selected, so leaving it named for one of them
+    while it probes the other three is the drift this document exists to catch.
     `detect_bin(h)` asks three sources in order — `$SCHEMAIC_<HARNESS>_BIN` (Claude keeps
     `SCHEMAIC_CLAUDE_BIN`, which shipped before any other harness existed and someone's launcher may
     still set it), then that harness's **known install locations**, then a `PATH` search honouring
@@ -9155,14 +9486,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     process inherits, so a `PATH`-only search reported two working CLIs as not installed and the
     panel would have said so. The locations are Claude `~/.local/bin`, Codex
     `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` and `~/.codex/bin`, Antigravity
-    `%LOCALAPPDATA%\agy\bin` and `~/.local/bin` — and each candidate ends in that harness's own
-    executable (`a_known_location_ends_in_the_harnesss_own_executable`, which also holds the Windows
-    extension on). `harness_bin(h, override)` and `harness_reachable(h, path)` are the former
+    `%LOCALAPPDATA%\agy\bin` and `~/.local/bin`, OpenCode `%APPDATA%\npm\node_modules\opencode-ai\bin`,
+    `~/.opencode/bin`, `~/.local/bin` and `~/.npm-global/lib/node_modules/opencode-ai/bin` — and each
+    candidate ends in that harness's own executable
+    (`a_known_location_ends_in_the_harnesss_own_executable`, which also holds the Windows
+    extension on). **For OpenCode the middle step is doing a second job**, and it is a Windows one: a
+    global `npm i -g opencode-ai` puts an `opencode.cmd` shim on `PATH` beside the real
+    `opencode.exe` it calls, `which_on_path` honours `PATHEXT`, and a `.cmd` needs a shell rather than
+    the `Command::new` this spawns with. Listing the real binary first is what makes it win before the
+    shim is ever found. `harness_bin(h, override)` and `harness_reachable(h, path)` are the former
     `claude_bin`/`claude_reachable` with the harness passed in rather than assumed — the first
     resolves what to spawn, the second answers the settings modal's "is this reachable".
     **One `--help`, three answers.** `probe(h, bin)` returns a `Probe { seal, constraint,
     isolate_config }` rather than the old bare `CliSeal`, because all three come out of the same help
-    text and spawning it three times is three times the ~140 ms nobody has. It folds **stdout and
+    text and spawning it three times is three times the ~140 ms nobody has. **Which page that is comes
+    from `Harness::help_args`, not from a literal `--help` here**, and the difference was Codex's whole
+    config isolation: `--ignore-user-config` is documented on `codex exec --help` and not on the
+    top-level page this used to ask, so `codex_isolates_config` was `false` on every real machine and
+    every Codex session loaded the user's own `~/.codex/config.toml`. `exec` carries `--sandbox` too,
+    so one spawn still answers all three. `schemaic-ai` states the measurement and names the tests.
+    It folds **stdout and
     stderr** together: `agy --help` writes to *stderr* and exits 0, so reading stdout alone found an
     empty help and refused a working binary. A non-zero exit yields `Constraint::Unknown` without
     consulting the text at all — a `--help` that failed printed a diagnostic, not a help text. And a
@@ -9202,9 +9545,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `the_inline_binary_and_the_inline_model_agree_on_who_is_selected`, which holds the two
     functions to one answer about who is selected rather than testing each alone).
   - `antigravity.rs` — the two pieces of that CLI's **global** state a Schemaic session needs, owned
-    for the life of the session and taken back out again. Every other harness is configured per
-    invocation; Antigravity is configured by writing into the user's own files, which is why this is
-    a module rather than four lines in `ai.rs`. `AgyRegistration::install` runs `agy mcp add` and
+    for the life of the session and taken back out again. It is the only harness configured by
+    writing into the user's *own* files — the others take a flag, a `-c` override, or (OpenCode) a
+    file in a directory Schemaic owns — which is why this is a module rather than four lines in
+    `ai.rs`. `AgyRegistration::install` runs `agy mcp add` and
     merges the connection's `permissions.allow` rules into `settings.json`, and its `Drop` removes
     both. The `--` ahead of the command is load-bearing rather than punctuation: the arguments being
     registered start with `-`, and `agy mcp add` rejects a flag placed after the server name. **Both, together, in both directions** — a registration without rules is a server whose
@@ -9265,6 +9609,70 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     design — a missing or refusing binary costs the session its database tools, which the failing
     tool call already reports, where failing the whole session over a config write would be worse;
     a registration that did not take is `tracing::warn!`ed rather than left to be discovered.
+  - `opencode.rs` — the config directory an OpenCode session is sealed by, and the environment that
+    points the CLI at it. `OpenCodeConfig::write` puts `harness::opencode_config_json` on disk and
+    hands back the root; `env()` is what the child `Command` gets, `env_remove()` is what it must
+    *clear*; `root()` is for logging and tests.
+    **A directory rather than a file, because the file levers are additive.** That CLI has no
+    `--config` flag, and the two environment variables that look like the answer are not one:
+    measured against the installed binary, `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` both
+    **merge** with the user's own `~/.config/opencode/opencode.json`, so a config naming only our
+    server resolved to ours *and* theirs. `XDG_CONFIG_HOME` is the one that replaces — pointed at a
+    directory of ours, the user's globally registered servers vanish from `opencode debug config`
+    entirely. That is this harness's `--strict-mcp-config`, and unlike `antigravity.rs` it edits
+    nothing of the user's, so there is no `Drop`, no teardown and no startup sweep in this module.
+    **Rejecting those two as the lever left them able to reopen the seal, which is what `env_remove`
+    is for.** Setting `XDG_CONFIG_HOME` says nothing about what the child *inherits*, and both merging
+    variables merge just as well when the parent's environment supplied them: measured with
+    `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` exported alongside our own, a foreign MCP server
+    resolves beside ours inside a session reported as `Sealed`. `env_remove()` names those two and
+    `OPENCODE_CONFIG_DIR`, and `ai.rs` calls `cmd.env_remove(..)` for each **before** `.envs(..)`;
+    after the fix only our server resolves. The third did not move the resolved config when measured
+    on its own — it is cleared because it is a config-redirection variable by name, and leaving it for
+    the next person to re-measure is exactly how the other two got missed. What is deliberately **not**
+    cleared is anything under the data directory or `HOME`, for the reason the next paragraph gives
+    about `XDG_DATA_HOME`: `auth.json` lives there, and taking it away logs the user out of their own
+    CLI rather than isolating anything
+    (`nothing_the_seal_depends_on_is_cleared_by_accident` holds both halves at once: everything `env()`
+    sets survives `env_remove()`, and `XDG_DATA_HOME`/`HOME`/`USERPROFILE`/`OPENCODE_API_KEY` are
+    untouched; `every_config_lever_the_module_rejected_is_cleared_from_the_child` is the other
+    direction).
+    Three further details in it are load-bearing. **Only `XDG_CONFIG_HOME`, never `XDG_DATA_HOME`** — the two
+    are easy to set together and the second breaks the session, because `auth.json` lives under the
+    *data* directory and moving it logs the user out of the CLI they just signed into, failing on
+    credentials rather than on anything Schemaic visibly did. **`OPENCODE_DISABLE_PROJECT_CONFIG=1`**
+    closes the second axis, the `opencode.json`/`.opencode/` that CLI also reads from its working
+    directory; `ai::session_cwd` is a private app directory with nothing there to read today, so this
+    is defence in depth behind owning the cwd, exactly as Claude's `--setting-sources` is. And **the
+    value must be absolute**: a relative one made the CLI resolve it against its own cwd and die on
+    `EEXIST: mkdir '..\pC\opencode'`, which names neither Schemaic nor the variable. `private_dir`
+    returns an absolute path, so that is a property of the source rather than something enforced
+    here. The doubled name in `<root>/opencode/opencode.json` is not a slip either: `XDG_CONFIG_HOME`
+    names the *parent* the CLI looks for its own subdirectory in.
+    **The directory is reused, not per-session, and that is measured rather than tidy.** A config
+    directory OpenCode has not seen makes it bootstrap a plugin runtime into it — a real `npm
+    install`, writing `package.json`, `package-lock.json` and `node_modules/`. On a fresh directory
+    it ran **past three minutes printing not one line** before it was killed, which is
+    indistinguishable from a hang; `--pure` brought the same first turn to **four seconds**. Both
+    mitigations are kept because they answer different halves: `--pure` (in `harness::turn_args`)
+    skips the install outright, and reusing one directory pays whatever bootstrap does happen at most
+    once per machine rather than once per session. The consequence is the reason the endpoint is not
+    in this file — a reused directory **outlives the session**, so the config carries only the
+    *path* of the per-session endpoint file (`ai::write_endpoint_file`, `O_EXCL`, owner-only, swept
+    with the others) and the credential never enters the reused directory at all. The `opencode.json`
+    itself is written plainly rather than through `create_private_new`: it holds no secret, and it is
+    rewritten every session, so an existing path is the normal case and not the collision `O_EXCL`
+    refuses.
+    **`write` returning `None` must refuse the session, and `ai::start_ai_session` does.** This is the
+    one harness where a missing config does not fail closed: `--agent schemaic` naming an agent that
+    does not exist leaves the run on OpenCode's own `build` agent, which has `bash`. So there is no
+    degraded mode here of the kind the Codex path takes with `codex_isolation_only` — the user gets a
+    message saying the assistant is disabled because the file that restricts it could not be written.
+    The tests here are over the pure JSON (`harness::opencode_config_json`) rather than the IO, and
+    the one worth knowing is `the_agent_the_config_defines_is_the_one_the_argv_selects`, which walks
+    `--agent`'s value out of `turn_args` and back into the document: both sides read `OPENCODE_AGENT`
+    so a rename can never break the lookup, but the JSON growing a different shape around the name
+    can, and that failure is silent.
   - `conn_sources.rs` — the I/O half of connection import: which paths on *this* machine are worth
     opening, and reading them. Deliberately only that half — nothing here interprets the bytes,
     which is what keeps `core::conn_import` unit-tested and leaves the part that cannot be (a walk
