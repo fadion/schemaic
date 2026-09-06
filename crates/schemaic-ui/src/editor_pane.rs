@@ -1570,6 +1570,21 @@ fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f6
     rows
 }
 
+/// The right edge of the visible code column, in `editor_area` coords — the
+/// "fold" every overlay in that unclipped container has to bound itself to.
+///
+/// A zero-width viewport (before first layout) is *unknown*, not "no room": it
+/// yields infinity, so a highlight drawn that early is left alone rather than
+/// blanked. One definition, because three overlays had to agree on it and two of
+/// them originally didn't clamp at all.
+fn visible_hi(content_x: f64, vp: Rect) -> f64 {
+    if vp.width() > 0.0 {
+        content_x + vp.width()
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// Pixel box `(x, y, w, h)` in `editor_area` coords around the single-line byte
 /// span `[lo, hi]`, for the caret-driven highlight overlays (bracket matching,
 /// identifier occurrences). `None` when either end is off screen.
@@ -1577,32 +1592,53 @@ fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f6
 /// The horizontal edges are **snapped to whole pixels** (floor left, ceil right)
 /// so the 1px border lands crisply on the device grid — otherwise a glyph at a
 /// fractional x antialiases ~1px off (looked like the box was biased right).
+///
+/// Like [`statement_line_boxes_at`], the box is **clamped to the visible code
+/// column**, and `None` when nothing of it is left. `editor_area` neither scrolls
+/// nor clips, so an unclamped box paints wherever the arithmetic puts it: scroll
+/// a query right until a highlighted identifier leaves the viewport and its box
+/// was drawn at a negative x, on top of the schema panel. That panel clips its
+/// own children, but it is painted *before* the editor, so a sibling overlay's
+/// stray rectangle lands over it regardless.
+///
+/// `vp` is the viewport rect — origin *and* size, since the clamp needs the
+/// width. A zero width (before first layout) means "unknown", not "no room".
 fn span_box_at(
     points: impl Fn(usize) -> Option<(Point, Point)>,
     sql: &str,
     lo: usize,
     hi: usize,
-    vp: (f64, f64),
+    vp: Rect,
 ) -> Option<(f64, f64, f64, f64)> {
     let content_x = content_x_of(sql);
     let (top, bot) = points(lo)?;
     let (end, _) = points(hi)?;
-    let left = (content_x + top.x - vp.0).floor();
-    let right = (content_x + end.x - vp.0).ceil();
-    let w = (right - left).max(4.0);
-    let y = top.y + EDITOR_PAD_TOP - vp.1;
+    let vis_hi = visible_hi(content_x, vp);
+    let left = (content_x + top.x - vp.x0).floor().max(content_x);
+    let right = (content_x + end.x - vp.x0).ceil().min(vis_hi);
+    // Wholly past the fold, or wholly behind the gutter: draw nothing rather
+    // than a stub pinned to whichever edge it fell off.
+    if right <= left {
+        return None;
+    }
+    // The 4px floor keeps a zero-width span visible, but never past the fold.
+    let w = (right - left).max(4.0).min(vis_hi - left);
+    let y = top.y + EDITOR_PAD_TOP - vp.y0;
     Some((left, y, w, bot.y - top.y))
 }
 
 /// Pixel underline segment `(x, y, width)` in `editor_area` coords for the word
 /// `[lo, hi]` (assumed single-line). `None` when either end is off screen — a
 /// diagnostic outside the visible region must render *nothing*, not a stub.
+/// Clamped to the visible code column on the same terms as [`span_box_at`], and
+/// for the same reason — a squiggle for a diagnostic scrolled out to the side is
+/// no more entitled to paint over the panel beside the editor than a box is.
 fn underline_seg_at(
     points: impl Fn(usize) -> Option<(Point, Point)>,
     sql: &str,
     lo: usize,
     hi: usize,
-    vp: (f64, f64),
+    vp: Rect,
 ) -> Option<(f64, f64, f64)> {
     let content_x = content_x_of(sql);
     let (top, bot) = points(lo)?;
@@ -1611,20 +1647,24 @@ fn underline_seg_at(
     // highlight border masked it; a tight underline exposes it), so nudge left to
     // sit flush with the glyphs.
     const WAVE_X_ADJUST: f64 = 3.0;
-    let x0 = content_x + top.x - WAVE_X_ADJUST - vp.0;
-    let x1 = content_x + end.x - WAVE_X_ADJUST - vp.0;
+    let vis_hi = visible_hi(content_x, vp);
+    let x0 = (content_x + top.x - WAVE_X_ADJUST - vp.x0).max(content_x);
+    let x1 = (content_x + end.x - WAVE_X_ADJUST - vp.x0).min(vis_hi);
+    if x1 <= x0 {
+        return None;
+    }
     // Sit the wave ~2px below the glyphs (bot.y is the line's bottom; the
     // descenders end a few px above it, so drop the wave's top to just past them).
-    // +`EDITOR_PAD_TOP` for the editor's top padding, −`vp.1` for the scroll.
-    let y = bot.y - WAVE_H + 2.0 + EDITOR_PAD_TOP - vp.1;
-    Some((x0, y, (x1 - x0).max(2.0)))
+    // +`EDITOR_PAD_TOP` for the editor's top padding, −`vp.y0` for the scroll.
+    let y = bot.y - WAVE_H + 2.0 + EDITOR_PAD_TOP - vp.y0;
+    Some((x0, y, (x1 - x0).max(2.0).min(vis_hi - x0)))
 }
 
 /// Pixel box in `editor_area` coords around the single-line span `[lo, hi]`.
 /// `None` when off screen.
 fn span_box(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f64, f64, f64)> {
     let vp = ed.viewport.get();
-    span_box_at(editor_points(ed), sql, lo, hi, (vp.x0, vp.y0))
+    span_box_at(editor_points(ed), sql, lo, hi, vp)
 }
 
 // (There is no `ed`-taking `underline_seg` wrapper: the squiggle overlay has to
@@ -1665,11 +1705,7 @@ fn statement_line_boxes_at(
 ) -> Vec<(f64, f64, f64, f64)> {
     let content_x = content_x_of(sql);
     // The visible slice of the code column, in `editor_area` coords.
-    let vis_hi = if vp.width() > 0.0 {
-        content_x + vp.width()
-    } else {
-        f64::INFINITY
-    };
+    let vis_hi = visible_hi(content_x, vp);
     let mut boxes = Vec::new();
     let mut pos = lo;
     loop {
@@ -4529,7 +4565,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // `None` = off screen. Rendering nothing is the point: this
                     // used to collapse to a 2px stub at the editor's top-left
                     // carrying the tooltip of an error twenty lines away.
-                    underline_seg_at(&points, &sql, d.range.0, d.range.1, (vp.x0, vp.y0))
+                    underline_seg_at(&points, &sql, d.range.0, d.range.1, vp)
                         .map(|(x, y, w)| (x, y, w, d.severity, d.message.clone()))
                 })
                 .collect::<Vec<_>>()
@@ -5655,8 +5691,8 @@ mod geometry_tests {
 
     #[test]
     fn an_offset_the_editor_cannot_place_produces_no_segment() {
-        assert_eq!(underline_seg_at(|_| None, SQL, 30, 40, (0.0, 0.0)), None);
-        assert_eq!(span_box_at(|_| None, SQL, 30, 40, (0.0, 0.0)), None);
+        assert_eq!(underline_seg_at(|_| None, SQL, 30, 40, VP), None);
+        assert_eq!(span_box_at(|_| None, SQL, 30, 40, VP), None);
         assert!(statement_line_boxes_at(|_| None, SQL, 0, SQL.len(), VP).is_empty());
     }
 
@@ -5676,10 +5712,11 @@ mod geometry_tests {
         // Line ~25 of a long script: document y 450, viewport scrolled to 400.
         // The old code returned the document y, putting the squiggle hundreds
         // of pixels below a ~190px pane.
-        let seg = underline_seg_at(at(450.0), SQL, 10, 18, (0.0, 400.0)).unwrap();
+        let scrolled_down = Rect::new(0.0, 400.0, 800.0, 590.0);
+        let seg = underline_seg_at(at(450.0), SQL, 10, 18, scrolled_down).unwrap();
         assert!(seg.1 < 200.0, "y must be viewport-relative, got {}", seg.1);
 
-        let b = span_box_at(at(450.0), SQL, 10, 18, (0.0, 400.0)).unwrap();
+        let b = span_box_at(at(450.0), SQL, 10, 18, scrolled_down).unwrap();
         assert!(b.1 < 200.0, "y must be viewport-relative, got {}", b.1);
 
         let boxes =
@@ -5689,16 +5726,22 @@ mod geometry_tests {
 
     #[test]
     fn horizontal_scroll_shifts_every_overlay_left() {
-        let unscrolled = span_box_at(at(0.0), SQL, 10, 18, (0.0, 0.0)).unwrap();
-        let scrolled = span_box_at(at(0.0), SQL, 10, 18, (120.0, 0.0)).unwrap();
+        // Offsets 30..38 — x 240..304 — rather than something nearer the start:
+        // scrolled 120px they are still well inside the code column, so what is
+        // measured here is the *shift*, not the clamp that
+        // `an_occurrence_box_scrolled_off_to_the_left_is_not_drawn_at_all`
+        // covers. A token that clamps can't also demonstrate a translation.
+        let scrolled_vp = Rect::new(120.0, 0.0, 920.0, 180.0);
+        let unscrolled = span_box_at(at(0.0), SQL, 30, 38, VP).unwrap();
+        let scrolled = span_box_at(at(0.0), SQL, 30, 38, scrolled_vp).unwrap();
         assert!(
             (unscrolled.0 - scrolled.0 - 120.0).abs() < 1.5,
             "{} vs {}",
             unscrolled.0,
             scrolled.0
         );
-        let u = underline_seg_at(at(0.0), SQL, 10, 18, (0.0, 0.0)).unwrap();
-        let s = underline_seg_at(at(0.0), SQL, 10, 18, (120.0, 0.0)).unwrap();
+        let u = underline_seg_at(at(0.0), SQL, 30, 38, VP).unwrap();
+        let s = underline_seg_at(at(0.0), SQL, 30, 38, scrolled_vp).unwrap();
         assert!((u.0 - s.0 - 120.0).abs() < 1.5, "{} vs {}", u.0, s.0);
     }
 
@@ -5771,6 +5814,75 @@ mod geometry_tests {
         let boxes = statement_line_boxes_at(wide, &sql, 0, sql.len(), Rect::ZERO);
         assert_eq!(boxes.len(), 1);
         assert!(boxes[0].2 > 300.0, "{:?}", boxes[0]);
+    }
+
+    // ── The same fold, for the *text* overlays ────────────────────────────
+    //
+    // `statement_line_boxes_at` was clamped when its border drew across the
+    // panel beside the editor; `span_box_at` and `underline_seg_at` share that
+    // unclipped container and were left unclamped, so the identifier-occurrence
+    // box did exactly the same thing one token at a time. Scrolling a query
+    // right until a highlighted identifier left the viewport painted its box
+    // over the schema panel — the panel clips its own children, but it is drawn
+    // *before* the editor, so a sibling's negative x lands on top of it.
+
+    /// One line of 50 glyphs at 8px, so the code runs to x=400.
+    fn one_long_line() -> impl Fn(usize) -> Option<(Point, Point)> {
+        |off: usize| {
+            Some((
+                Point::new(off as f64 * 8.0, 0.0),
+                Point::new(off as f64 * 8.0, 18.0),
+            ))
+        }
+    }
+
+    #[test]
+    fn an_occurrence_box_past_the_fold_is_not_drawn_at_all() {
+        let sql = "x".repeat(50);
+        // Token at x 320..384, in a 200px-wide viewport scrolled to 0.
+        let vp = Rect::new(0.0, 0.0, 200.0, 180.0);
+        assert_eq!(span_box_at(one_long_line(), &sql, 40, 48, vp), None);
+        assert_eq!(underline_seg_at(one_long_line(), &sql, 40, 48, vp), None);
+    }
+
+    #[test]
+    fn an_occurrence_box_scrolled_off_to_the_left_is_not_drawn_at_all() {
+        let sql = "x".repeat(50);
+        // Scrolled 300px right; the token at x 0..64 is entirely behind the
+        // gutter. This is the reported bug: it used to paint at a negative x,
+        // over the panel to the left of the editor.
+        let vp = Rect::new(300.0, 0.0, 500.0, 180.0);
+        assert_eq!(span_box_at(one_long_line(), &sql, 0, 8, vp), None);
+        assert_eq!(underline_seg_at(one_long_line(), &sql, 0, 8, vp), None);
+    }
+
+    #[test]
+    fn a_half_scrolled_occurrence_box_is_trimmed_to_the_visible_column() {
+        let sql = "x".repeat(50);
+        let content_x = content_x_of(&sql);
+        // Token at x 288..352, viewport scrolled to 300 and 200px wide: its left
+        // half is behind the gutter, its right half is visible.
+        let vp = Rect::new(300.0, 0.0, 200.0, 180.0);
+        let b = span_box_at(one_long_line(), &sql, 36, 44, vp).expect("partly visible");
+        assert!(b.0 >= content_x, "left {} is over the gutter", b.0);
+        assert!(
+            b.0 + b.2 <= content_x + 200.0 + 0.01,
+            "right {} is past the fold at {}",
+            b.0 + b.2,
+            content_x + 200.0
+        );
+        let u = underline_seg_at(one_long_line(), &sql, 36, 44, vp).expect("partly visible");
+        assert!(u.0 >= content_x, "left {} is over the gutter", u.0);
+        assert!(u.0 + u.2 <= content_x + 200.0 + 0.01, "{u:?} past the fold");
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_still_draws_an_occurrence_box() {
+        // Same rule the statement border follows: width 0 is "unknown", not "no
+        // room". Clamping to it would blank every highlight before first layout.
+        let sql = "x".repeat(50);
+        assert!(span_box_at(one_long_line(), &sql, 0, 8, Rect::ZERO).is_some());
+        assert!(underline_seg_at(one_long_line(), &sql, 0, 8, Rect::ZERO).is_some());
     }
 
     // ── The gutter ────────────────────────────────────────────────────────
