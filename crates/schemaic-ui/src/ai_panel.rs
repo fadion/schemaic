@@ -1,9 +1,18 @@
-//! The AI Assistant panel: the Claude Code chat surface on the right. Renders the
+//! The AI Assistant panel: the agent-CLI chat surface on the right. Renders the
 //! conversation (`message_bubble` → `render_segments`, prose as light markdown via
 //! the shared `render_markdown`, tool calls as `tool_chip`s), the auto-following
 //! scroll with a jump-to-bottom affordance, the live "thinking" elapsed timer, and
-//! the message input (`ai_input_row`, or a disabled placeholder when Claude isn't
-//! reachable). All state comes in via the `Ui` bundle (`ui.ai` / `ui.ai_actions`).
+//! the message input (`ai_input_row`, or a disabled placeholder when the selected
+//! harness isn't reachable). All state comes in via the `Ui` bundle (`ui.ai` /
+//! `ui.ai_actions`).
+//!
+//! **The panel names no CLI of its own.** The label over a reply comes from the
+//! harness stamped on *that message* when its turn started
+//! (`schemaic_ai::harness::speaker_label`), not from the live setting — a
+//! conversation can span several, because switching harness in Settings does not
+//! start a new one. This module used to print a literal "CLAUDE" over every
+//! answer, which is what a user driving Claude, then Antigravity, then OpenCode
+//! through one thread saw over all three.
 
 use std::rc::Rc;
 
@@ -64,7 +73,7 @@ pub fn mark_messages_seen(n: usize) {
     ai_seen().set(n);
 }
 
-// ── AI panel: Claude Code chat ───────────────────────────────────────────────
+// ── AI panel: agent-CLI chat ───────────────────────────────────────────────
 pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let messages = ui.ai.messages;
     let input = ui.ai.input;
@@ -152,9 +161,21 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             })
         },
     };
-    // Reactive: is Claude reachable for the current CLI-path value? Drives the
+    // Reactive: is the selected harness reachable for the current CLI-path
+    // value? Drives the
     // empty-state message and the disabled message box.
-    let available = floem::reactive::create_memo(move |_| cli_ok(cli_path.get()));
+    // **Tracks the harness as well as the path.** `cli_ok` resolves reachability
+    // against `ai_harness.get_untracked()`, so a memo watching only `cli_path`
+    // describes the *previous* CLI until something writes the path. That it
+    // looks right today is luck: the harness-switch effect happens to `set`
+    // `cli_path` on every switch, and making that clear conditional — or
+    // reordering the two effects — would leave the panel offering a working
+    // input box for a CLI that is not installed. The settings modal already keys
+    // its own hint on `(cli_path, harness)`.
+    let available = floem::reactive::create_memo(move |_| {
+        panel_harness.track();
+        cli_ok(cli_path.get())
+    });
 
     // Live "thinking" elapsed timer: (re)start a 100ms poll whenever a turn goes
     // busy; it stops itself once `busy` clears (the final summary takes over).
@@ -512,9 +533,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let convo = stack((scrolled, jump))
         .style(|s| s.flex_col().flex_grow(1.0_f32).width_full().min_height(0.0));
 
-    // Input: enabled when Claude is reachable, otherwise a disabled placeholder
-    // box (no point sending into a black hole).
-    // Two ways the box can be inert, and they mean different things: Claude
+    // Input: enabled when the selected harness is reachable, otherwise a
+    // disabled placeholder box (no point sending into a black hole).
+    // Two ways the box can be inert, and they mean different things: the CLI
     // isn't reachable, or the database isn't. The second is recoverable from the
     // header's Retry, so say which it is rather than showing one dead box.
     let conn_status = ui.conn.conn_status;
@@ -943,7 +964,7 @@ fn attachment_chip(
     })
 }
 
-// The disabled message box shown when Claude isn't connected — matches the real
+// The disabled message box shown when the selected CLI isn't connected — matches the real
 // box's metrics but is inert (dim placeholder, no send icon, no pointer events).
 fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
     let box_ = container(text(placeholder).style(|s| {
@@ -988,7 +1009,17 @@ fn message_bubble(
     attach_open: RwSignal<bool>,
 ) -> impl IntoView {
     let is_user = m.role == Role::User;
-    let label_txt = if is_user { "YOU" } else { "CLAUDE" };
+    // **The harness that produced *this* turn, not the one selected now.** This
+    // was the literal "CLAUDE", which sat over Antigravity's and OpenCode's
+    // answers too — and the tempting fix, reading the live setting, would have
+    // relabelled every earlier reply the moment the user switched CLI. A
+    // conversation can span several harnesses, so the name travels on the
+    // message. See `schemaic_ai::harness::speaker_label`.
+    let label_txt = if is_user {
+        "YOU".to_string()
+    } else {
+        schemaic_ai::harness::speaker_label(m.harness.as_deref())
+    };
 
     let body: AnyView = if is_user {
         // User's own message: a dim recap, under whatever data went with it —
@@ -1388,5 +1419,85 @@ mod attach_preview_tests {
     fn an_unmeasured_window_takes_the_wanted_height() {
         assert_eq!(attach_preview_cap(220.0, 0.0), 220.0);
         assert_eq!(attach_preview_cap(220.0, 1.0), 220.0);
+    }
+}
+
+#[cfg(test)]
+mod speaker_label_tests {
+    use schemaic_ai::harness::{Harness, speaker_label};
+    use schemaic_core::transcript::{ChatMessage, Role};
+
+    /// The label `message_bubble` draws, as the composition it actually
+    /// performs: the message a turn creates, read back the way the view reads
+    /// it.
+    fn label_of(m: &ChatMessage) -> String {
+        if m.role == Role::User {
+            "YOU".to_string()
+        } else {
+            speaker_label(m.harness.as_deref())
+        }
+    }
+
+    #[test]
+    fn a_turn_is_labelled_with_the_harness_that_produced_it() {
+        // The reported bug: every reply read "CLAUDE", whichever CLI answered.
+        for h in Harness::ALL {
+            let m = ChatMessage::pending(Some(h.key().to_string()));
+            assert_eq!(label_of(&m), h.speaker_name().to_uppercase(), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn switching_harness_does_not_relabel_the_answers_already_given() {
+        // **The property that rules out the tempting fix.** Reading the live
+        // setting would have made one conversation's whole history rename itself
+        // to whichever CLI was selected last — and this is exactly how the panel
+        // is used: ask Claude, switch, ask Antigravity, switch, ask OpenCode.
+        let conversation = [
+            ChatMessage::user("first".into()),
+            ChatMessage::pending(Some(Harness::Claude.key().to_string())),
+            ChatMessage::user("second".into()),
+            ChatMessage::pending(Some(Harness::Antigravity.key().to_string())),
+            ChatMessage::user("third".into()),
+            ChatMessage::pending(Some(Harness::OpenCode.key().to_string())),
+        ];
+        let labels: Vec<String> = conversation.iter().map(label_of).collect();
+        assert_eq!(
+            labels,
+            vec!["YOU", "CLAUDE", "YOU", "ANTIGRAVITY", "YOU", "OPENCODE",]
+        );
+    }
+
+    #[test]
+    fn a_users_own_turn_is_never_given_a_harness() {
+        // The question is the user's, whoever answers it.
+        let m = ChatMessage::user("hi".into());
+        assert_eq!(m.harness, None);
+        assert_eq!(label_of(&m), "YOU");
+    }
+
+    #[test]
+    fn a_transcript_saved_before_this_field_existed_still_loads() {
+        // **The upgrade path.** Conversations are persisted, and every one on
+        // disk today predates this field. Without `serde(default)` they would
+        // fail to parse and the user's history would silently vanish.
+        let old = r#"{"role":"Assistant","text":"","segs":[{"Text":"hello"}]}"#;
+        let m: ChatMessage = serde_json::from_str(old).expect("old transcripts still parse");
+        assert_eq!(m.harness, None);
+        // Rendered neutrally rather than attributed to a CLI that may not have
+        // written it.
+        assert_eq!(label_of(&m), "ASSISTANT");
+    }
+
+    #[test]
+    fn the_harness_survives_a_save_and_reload() {
+        // The other half: what is stamped has to come back, or the label is
+        // right until the app restarts and wrong afterwards.
+        for h in Harness::ALL {
+            let m = ChatMessage::pending(Some(h.key().to_string()));
+            let json = serde_json::to_string(&m).expect("serialises");
+            let back: ChatMessage = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(label_of(&back), h.speaker_name().to_uppercase(), "{h:?}");
+        }
     }
 }

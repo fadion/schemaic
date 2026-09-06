@@ -25,6 +25,38 @@
 //!   tools with it set — `run_command` and `write_to_file` among them. Its
 //!   filesystem readers are auto-approved in headless mode: a measured turn ran
 //!   `list_dir` and `view_file` unprompted.
+//! - `opencode` empties its built-in set too, but by *configuration* rather than
+//!   a flag: an agent definition whose `tools` map sets every documented name to
+//!   `false`, selected with `--agent`. Measured against `opencode debug agent`,
+//!   which resolves that agent to eleven disabled tools and one enabled — and
+//!   the enabled one is `invalid`, the CLI's own handler for a malformed tool
+//!   call, which it excludes from the set it offers the model. That is a true
+//!   seal, the second one here.
+//!
+//! **The seal that is not a flag needs a different kind of probe, and a
+//! different kind of care.** Claude's grade is read straight off `--help`,
+//! because `--tools` either exists or does not. OpenCode's lives in a file
+//! Schemaic writes and an environment variable it sets, neither of which
+//! `--help` can confirm — so [`constraint_from_help`] greps for `--pure`
+//! instead, which is real evidence the binary is the one these mechanisms were
+//! measured against and is itself part of the constraint (it keeps the user's
+//! external plugins, which are arbitrary code, out of the session).
+//!
+//! The rest of that seal is enforced where it is applied rather than where it is
+//! graded: `ai::start_ai_session` refuses the session outright if
+//! [`opencode_config_json`] cannot be written. This is the one harness where a
+//! missing config does **not** fail closed — `--agent schemaic` naming an agent
+//! that does not exist leaves the run on OpenCode's default `build` agent, which
+//! has `bash` — so the refusal is the only thing keeping the grade honest.
+//!
+//! **Its MCP isolation is total, and costs no global state.** `XDG_CONFIG_HOME`
+//! pointed at a directory Schemaic owns removes the user's own registered
+//! servers from the resolved config entirely (measured). Note what does *not*
+//! work: `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` both **merge** with the
+//! user's file rather than replacing it, so a config naming only our server
+//! resolved to ours alongside theirs. They are the obvious lever and the wrong
+//! one. See [`crate::harness::opencode_config_json`] and the app's `opencode`
+//! module.
 //!
 //! **Codex needs a per-tool approval too, and for the same reason Antigravity
 //! does.** `codex exec` runs with approval policy `never` — there is nobody to
@@ -63,7 +95,7 @@
 //! shut.
 //!
 //! So [`Constraint`] is graded rather than boolean, and the grade is shown to the
-//! user rather than averaged away. Reporting "sealed" for all three would be the
+//! user rather than averaged away. Reporting "sealed" for all four would be the
 //! comfortable lie: it is exactly the shape of the bug the denylist era already
 //! shipped once, where the guard looked total and left nineteen tools live.
 //!
@@ -93,23 +125,51 @@ pub enum Harness {
     /// which would make it persistent like Claude. That mode is **not** what we
     /// drive, because it is not what was measured: the per-turn `-p` path is.
     Antigravity,
+    /// `opencode run --format json` — `type`-tagged whole *parts*, one process
+    /// per turn.
+    ///
+    /// **Its `text` events are not deltas, and that is structural rather than a
+    /// sampling artefact.** The JSON printer emits a text part only once
+    /// `time.end` is set — i.e. once the part is finished — so a 2964-character
+    /// answer arrives as a single event. [`Harness::streams_deltas`] is false
+    /// here for that reason, and none of the coalescing state Codex needs is
+    /// wanted: nothing is ever restated.
+    ///
+    /// **It is also the only harness with no turn-completion event at all.** The
+    /// printer stops when the session goes idle; there is no `turn.completed` to
+    /// decode. The end of a turn is read off `step_finish.reason` instead — see
+    /// [`crate::stream::StreamParser`] — because the alternative is a stream that
+    /// simply stops, which the app reports as "ended unexpectedly".
+    OpenCode,
 }
 
 impl Harness {
     /// Every harness, in the order the settings UI offers them.
-    pub const ALL: [Harness; 3] = [Harness::Claude, Harness::Codex, Harness::Antigravity];
+    pub const ALL: [Harness; 4] = [
+        Harness::Claude,
+        Harness::Codex,
+        Harness::Antigravity,
+        Harness::OpenCode,
+    ];
 
     /// The stable string form, matched back by [`Harness::from_key`].
     ///
-    /// This is what `UiState::ai_harness` stores. Nothing in the UI *sets* it
-    /// yet — hand-editing `ui_state.json` is the only way to choose a harness
-    /// today — but the app reads it at startup and writes it back on save, so a
-    /// key that changes here silently retargets everyone's settings file.
+    /// This is what `UiState::ai_harness` stores. Settings → AI writes it from
+    /// the *Agent CLI* dropdown, the app reads it back at startup, and a
+    /// `ChatMessage` stamps it to record which CLI answered a turn — so a key
+    /// that changes here silently retargets everyone's settings file *and*
+    /// unnames every reply already in their saved transcripts.
+    ///
+    /// (This used to say the UI could not set it and `ui_state.json` had to be
+    /// hand-edited. That stopped being true when the dropdown shipped; it is
+    /// noted because the sentence read as a live constraint long after it had
+    /// become a description of the past.)
     pub fn key(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
             Harness::Antigravity => "antigravity",
+            Harness::OpenCode => "opencode",
         }
     }
 
@@ -120,6 +180,58 @@ impl Harness {
             Harness::Claude => "Claude Code",
             Harness::Codex => "Codex",
             Harness::Antigravity => "Antigravity",
+            Harness::OpenCode => "OpenCode",
+        }
+    }
+
+    /// Who a reply in the transcript is *from*, as opposed to which product the
+    /// settings dropdown is offering.
+    ///
+    /// The two differ in exactly one place and deliberately: [`Harness::label`]
+    /// is "Claude Code", the thing you install and point a path at, while a
+    /// header over an answer is naming a speaker and reads "CLAUDE". That is
+    /// also the name that header carried before it learned to vary, so an
+    /// existing transcript does not appear to change its mind about who wrote
+    /// it.
+    ///
+    /// A method rather than a `match` at the call site, so the transcript and
+    /// the settings box cannot drift into disagreeing about which harness is
+    /// which — and so a new harness answers the question once.
+    pub fn speaker_name(self) -> &'static str {
+        match self {
+            Harness::Claude => "Claude",
+            // The rest name themselves the same way in both places; they are
+            // spelled out rather than delegated to `label` so that a product
+            // name gaining a suffix does not silently reach the transcript.
+            Harness::Codex => "Codex",
+            Harness::Antigravity => "Antigravity",
+            Harness::OpenCode => "OpenCode",
+        }
+    }
+
+    /// The arguments that print the help page this harness's grade is read from.
+    ///
+    /// **Codex hides half its own flags from the top-level page, and the half it
+    /// hides is the isolation.** Measured against the installed binary:
+    /// `codex --help` lists `--model`, `--sandbox`, `--help`, `--version` and
+    /// *not* `--ignore-user-config`; `codex exec --help` lists all of them. The
+    /// probe asked the top-level page, so [`codex_isolates_config`] answered
+    /// `false` on every real machine, `--ignore-user-config` was never passed,
+    /// and every Codex session loaded the user's own `~/.codex/config.toml` —
+    /// their MCP servers, whose tools nobody here allow-listed, and their hooks,
+    /// which are commands.
+    ///
+    /// It is a method rather than a literal at the call site because that is the
+    /// seam the bug lived in: the pure decoder was tested with `codex exec
+    /// --help` text pasted in by hand, while the caller fed it a different page
+    /// entirely, and neither half was wrong on its own.
+    ///
+    /// `exec` is also where Codex's `--sandbox` lives, so one page still answers
+    /// every question the probe asks.
+    pub fn help_args(self) -> &'static [&'static str] {
+        match self {
+            Harness::Codex => &["exec", "--help"],
+            Harness::Claude | Harness::Antigravity | Harness::OpenCode => &["--help"],
         }
     }
 
@@ -130,6 +242,7 @@ impl Harness {
             Harness::Codex => "codex",
             // Not "antigravity" — the binary is `agy`.
             Harness::Antigravity => "agy",
+            Harness::OpenCode => "opencode",
         }
     }
 
@@ -191,16 +304,34 @@ impl Constraint {
             // Asked per harness rather than per capability because this *is* a
             // harness question: two different mechanisms reach one grade, and the
             // difference between them is the whole content of the sentence.
-            Constraint::Restricted if h == Harness::Claude => Some(format!(
+            // **Asked as a capability, because the sentence is a claim about a
+            // mechanism.** This was `h == Harness::Claude`, with everything else
+            // falling through to the sandbox wording — a harness-identity check
+            // standing in for one, which is the shape `CLAUDE.md` names: it
+            // compiles cleanly while sorting a fourth CLI onto whichever side it
+            // happens to land. OpenCode is that fourth: its seal is a `tools`
+            // map and it has no sandbox at all, so the fallthrough would have
+            // promised the user an OS-enforced read-only that nothing enforces.
+            Constraint::Restricted if h.restricted_means_sandbox() => Some(format!(
+                "{} runs read-only: it cannot write files or run commands, but its \
+                 built-in tools can still read this machine.",
+                h.label()
+            )),
+            Constraint::Restricted if h.seals_by_flag() => Some(format!(
                 "This {} build does not accept the flag that empties its built-in \
                  tools, so they are held back by a denylist instead — weaker, and \
                  not something Schemaic can guarantee. Updating the CLI restores \
                  the full seal.",
                 h.label()
             )),
+            // Neither a sandbox nor a flag we can name. Reached by no harness
+            // today — OpenCode's grade is `Sealed` or `Unknown`, never this —
+            // and worded to promise nothing rather than to be unreachable,
+            // because "unreachable" is what the arm above assumed too.
             Constraint::Restricted => Some(format!(
-                "{} runs read-only: it cannot write files or run commands, but its \
-                 built-in tools can still read this machine.",
+                "Schemaic could not fully restrict {}'s built-in tools for this \
+                 session, so it may be able to do more than answer questions about \
+                 this database.",
                 h.label()
             )),
             Constraint::Unknown => Some(format!(
@@ -222,7 +353,7 @@ impl Harness {
     pub fn supports_model_choice(self) -> bool {
         matches!(
             self,
-            Harness::Claude | Harness::Codex | Harness::Antigravity
+            Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode
         )
     }
 
@@ -243,6 +374,19 @@ impl Harness {
             Harness::Claude => &["haiku", "sonnet", "opus", "opusplan"],
             Harness::Codex => &["gpt-5.4", "gpt-5.4-codex", "o3"],
             Harness::Antigravity => &[],
+            // **`provider/model`, and the provider half is the point.** A bare
+            // `claude-sonnet-5` is not a model id this CLI accepts; every entry
+            // `opencode models` prints is qualified. These name the built-in
+            // `opencode` provider, which is the one an install has without the
+            // user adding credentials of their own — a user authenticated
+            // straight to a vendor types `anthropic/…` or `openai/…` instead,
+            // which the free-text field passes through untouched.
+            Harness::OpenCode => &[
+                "opencode/claude-sonnet-5",
+                "opencode/claude-opus-5",
+                "opencode/gpt-5",
+                "opencode/gemini-3.1-pro",
+            ],
         }
     }
 
@@ -271,6 +415,15 @@ impl Harness {
             Harness::Claude => &["low", "medium", "high", "xhigh"],
             Harness::Antigravity => &["low", "medium", "high"],
             Harness::Codex => &[],
+            // `--variant`, whose help calls it "model variant (provider-specific
+            // reasoning effort, e.g., high, max, minimal)". These are the three
+            // that help text names, and deliberately not the union with anyone
+            // else's: `medium` and `low` are Claude's and Antigravity's
+            // vocabulary, and "provider-specific" means the accepted set is not
+            // even constant across OpenCode's own models. `effort_arg` clamps to
+            // this list, so a level carried over from another harness sends no
+            // flag rather than an invented one.
+            Harness::OpenCode => &["minimal", "high", "max"],
         }
     }
 
@@ -296,12 +449,45 @@ impl Harness {
             .find(|l| *l == requested)
     }
 
+    /// When this harness is graded [`Constraint::Restricted`], is that an OS
+    /// sandbox doing the restricting?
+    ///
+    /// The grade is shared; the mechanism behind it is not, and
+    /// [`Constraint::notice`] has to describe the mechanism — "it cannot write
+    /// files or run commands" is a claim the OS enforces for Codex and
+    /// Antigravity and nothing enforces anywhere else.
+    pub fn restricted_means_sandbox(self) -> bool {
+        match self {
+            Harness::Codex | Harness::Antigravity => true,
+            // Claude's `Restricted` is the denylist fallback when `--tools` is
+            // absent; OpenCode has no sandbox lever at all — it seals with a
+            // `tools` map or not at all.
+            Harness::Claude | Harness::OpenCode => false,
+        }
+    }
+
+    /// Is this harness's seal a *flag* on its own command line, such that an
+    /// older build missing that flag is the reason for a weaker grade?
+    ///
+    /// True only for Claude (`--tools`). OpenCode also reaches [`Constraint::Sealed`]
+    /// but does it by configuration, so "updating the CLI restores the full seal"
+    /// would be advice that fixes nothing there.
+    pub fn seals_by_flag(self) -> bool {
+        matches!(self, Harness::Claude)
+    }
+
     /// Does a turn stream *incremental* text?
     ///
     /// Claude sends deltas, and so does Antigravity (`step_update.text_delta`).
     /// Codex restates a message cumulatively, which is what
     /// [`crate::stream::StreamParser`] coalesces; the panel uses this only to
     /// decide whether a first token means "it has started".
+    ///
+    /// **OpenCode is the one that sends neither.** Its printer emits a text part
+    /// only after `time.end` is set, so the whole answer arrives in one event
+    /// and there is no "it has started" moment to report — the panel's spinner
+    /// runs until the text lands. That is a property of the CLI, not something
+    /// coalescing can recover: no partial text is ever written to decode.
     pub fn streams_deltas(self) -> bool {
         matches!(self, Harness::Claude | Harness::Antigravity)
     }
@@ -356,6 +542,39 @@ pub fn constraint_from_help(h: Harness, help: &str) -> Constraint {
         Harness::Antigravity => {
             if crate::mentions_flag(help, "--sandbox") {
                 Constraint::Restricted
+            } else {
+                Constraint::Unknown
+            }
+        }
+        // **The only harness whose seal is not a flag**, which is why this arm
+        // greps for something other than the lever it depends on.
+        //
+        // OpenCode's built-in tools are emptied by an *agent definition* — a
+        // `tools` map with every documented name set to `false`, verified
+        // against `opencode debug agent`, which resolves it to eleven disabled
+        // tools and nothing live. Its MCP isolation is an *environment variable*,
+        // `XDG_CONFIG_HOME`, pointed at a directory Schemaic owns: measured, the
+        // user's own globally-registered servers disappear from
+        // `opencode debug config`. Neither of those appears in `--help`, so
+        // there is nothing to grep for that would confirm the seal itself.
+        //
+        // `--pure` is greppable, is genuinely part of the constraint — it stops
+        // the user's external plugins, which are arbitrary code, from loading
+        // into the session — and is passed on every turn. So it stands as the
+        // evidence that this binary is the OpenCode these mechanisms were
+        // measured against. A binary without it is not one we can claim to have
+        // sealed, and `Unknown` refuses the session rather than assuming.
+        //
+        // The grade is `Sealed` rather than `Restricted` because the tool set
+        // really is empty, exactly as `claude --tools ""` empties it — not a
+        // sandbox that leaves readers live. The other half of that promise is
+        // enforced at the call site: `crate::harness::opencode_config_json` is
+        // the only way the agent is defined, and `ai::start_ai_session` refuses
+        // the turn outright if it cannot be written, rather than falling back to
+        // a default agent that has every tool.
+        Harness::OpenCode => {
+            if crate::mentions_flag(help, "--pure") {
+                Constraint::Sealed
             } else {
                 Constraint::Unknown
             }
@@ -421,6 +640,13 @@ pub struct TurnSpec {
 /// *conversation*, not per turn, and its prompt arrives later on stdin. These
 /// two are spawned per turn with the prompt in argv.
 pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
+    // **Trimmed, because the field it comes from is free text the user can
+    // clear.** Typing a space and closing the settings modal leaves `" "`, which
+    // `!is_empty()` waves through as `--model " "` — an unknown model, reported
+    // to the user as "Couldn't launch the CLI", which is the one explanation
+    // that is not the problem. `build_session_args` already trims on Claude's
+    // path; these three did not, and that divergence was the whole bug.
+    let model = spec.model.trim();
     match h {
         // Claude does not take a per-turn command line.
         Harness::Claude => Vec::new(),
@@ -448,9 +674,9 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
             // Codex requires a git repo unless told otherwise, and the session
             // cwd is a private app directory that is not one.
             a.push("--skip-git-repo-check".into());
-            if !spec.model.is_empty() {
+            if !model.is_empty() {
                 a.push("--model".into());
-                a.push(spec.model.clone());
+                a.push(model.to_string());
             }
             // Caller-supplied overrides go *before* the constraint below.
             for o in &spec.mcp_overrides {
@@ -491,9 +717,9 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
                 // prompt is user text and must not be able to invoke either.
                 "--disable-slash-commands".into(),
             ];
-            if !spec.model.is_empty() {
+            if !model.is_empty() {
                 a.push("--model".into());
-                a.push(spec.model.clone());
+                a.push(model.to_string());
             }
             if !spec.effort.is_empty() {
                 a.push("--effort".into());
@@ -505,7 +731,208 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
             }
             a
         }
+        Harness::OpenCode => {
+            let mut a: Vec<String> = vec![
+                "run".into(),
+                // **Not a performance flag, though it is also that.** `--pure`
+                // runs without external plugins, which is the third leg of the
+                // seal (the config directory and the agent's empty `tools` map
+                // being the other two): a plugin is arbitrary code the user
+                // installed, and nothing else here would keep it out.
+                //
+                // It is *also* what makes the first turn survivable. A config
+                // directory OpenCode has not seen before makes it bootstrap its
+                // plugin runtime — a real npm install into that directory,
+                // measured at over three minutes and producing not one line of
+                // output before it finished. With `--pure` the same first turn
+                // took four seconds. A user would have read the difference as a
+                // hang.
+                "--pure".into(),
+                // The sealed agent from `opencode_config_json`. Naming it is
+                // what selects the empty tool set; without it the session runs
+                // as `build`, which has every built-in.
+                "--agent".into(),
+                OPENCODE_AGENT.into(),
+                "--format".into(),
+                "json".into(),
+            ];
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            if !spec.effort.is_empty() {
+                a.push("--variant".into());
+                a.push(spec.effort.clone());
+            }
+            if let Some(id) = spec.resume.as_deref().filter(|s| !s.is_empty()) {
+                a.push("--session".into());
+                a.push(id.into());
+            }
+            // **No `--auto`.** Its own help calls it dangerous, and it is not
+            // needed: measured, a headless turn under this agent called its tool
+            // and returned without ever asking for permission, because OpenCode's
+            // default permission set allows rather than denies. That is the
+            // opposite of Antigravity, where an unprompted tool is auto-*denied*
+            // and the turn reports success with an empty answer — the failure
+            // that made `AgyRegistration`'s allow-rules necessary. Passing
+            // `--auto` here would buy nothing and pre-approve anything a future
+            // build adds to the tool set.
+            //
+            // Prompt last: it is the positional argument.
+            a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
+            a
+        }
     }
+}
+
+/// The name of the agent [`opencode_config_json`] defines and
+/// [`turn_args`] selects with `--agent`.
+///
+/// One constant because the two must agree: a definition nothing selects leaves
+/// the session on OpenCode's own `build` agent, which has every built-in tool —
+/// the seal silently absent rather than reported missing.
+pub const OPENCODE_AGENT: &str = "schemaic";
+
+/// What the transcript prints over one assistant turn, given the harness that
+/// produced it.
+///
+/// **The turn's own harness, not the one selected now.** A conversation can span
+/// several: the user switches CLI in Settings mid-thread and asks the next
+/// question, which is exactly how the panel's hard-coded "CLAUDE" was found
+/// sitting over an Antigravity answer. Reading the *live* setting would fix that
+/// label and break every earlier one, retroactively attributing Claude's replies
+/// to whichever CLI happens to be selected when the panel is next drawn — a
+/// worse failure, because the transcript would then be wrong about history
+/// rather than merely wrong about now. So the key is stamped on the message when
+/// the turn starts and read back from there.
+///
+/// `None` and unrecognised both answer "ASSISTANT" rather than a guess.
+///
+/// `None` is a transcript persisted before the field existed — which means a
+/// build shipping Claude, Codex and Antigravity, the three [`Harness::ALL`] held
+/// when the field was added alongside [`Harness::OpenCode`]. Any of the three
+/// could have written it and nothing on disk says which, so there is no safe
+/// default; naming Claude would be [`Harness::from_key`]'s refusal-to-guess rule
+/// broken at the one place the user can read the result.
+///
+/// An unrecognised key is the same problem from the other direction: a
+/// transcript written by a *later* build, naming a harness this one does not
+/// have.
+pub fn speaker_label(harness_key: Option<&str>) -> String {
+    harness_key
+        .and_then(Harness::from_key)
+        .map(|h| h.speaker_name().to_uppercase())
+        .unwrap_or_else(|| "ASSISTANT".to_string())
+}
+
+/// The name Schemaic registers its MCP server under.
+///
+/// It exists because **one dialect has to decode a name it wrote itself.** Codex
+/// reports `server` and `tool` as separate fields, so its decoder rebuilds the
+/// qualified name from the event; OpenCode reports one flattened `tool`, and the
+/// only way to read `schemaic_run_query` as *our* `run_query` is to know the
+/// prefix we registered. A literal on both sides would be a rename away from a
+/// transcript that labels every database call by its raw name.
+///
+/// Deliberately not [`OPENCODE_AGENT`], which happens to be the same string
+/// today and answers a different question — the agent is the tool *set*, this is
+/// the tool *source*. Collapsing them is how one rename silently becomes two.
+pub const MCP_SERVER: &str = "schemaic";
+
+/// The `opencode.json` that seals an OpenCode session and gives it our MCP
+/// server.
+///
+/// This is OpenCode's answer to Claude's `--mcp-config` plus `--tools ""`, and
+/// to Codex's `-c mcp_servers={…}`: one file, holding both halves.
+///
+/// **The seal is the `tools` map, and it must name every tool to close.** The
+/// map is a denylist by omission — anything not listed stays enabled — so the
+/// entries are the names `opencode agent create --permissions` documents.
+/// Verified rather than assumed: `opencode debug agent schemaic`, run against
+/// the JSON this function emits, reports every one of them disabled.
+///
+/// It reports one tool still enabled, `invalid`, and that is not a hole. Its own
+/// description is *"Do not use"*, its `execute` returns nothing but a message
+/// that the arguments were malformed, and the CLI excludes it from the set it
+/// offers the model (`activeTools: …filter(m => m !== "invalid")`). It is the
+/// fallback for a tool call that failed to parse, not a capability — which is
+/// written down here because the alternative is discovering it again in a probe
+/// and wondering whether the seal leaks.
+///
+/// **The endpoint is not here, for the reason it is not in Codex's `-c`
+/// override.** It carries the database credentials, and this file outlives the
+/// session: the directory is reused so the plugin bootstrap described in
+/// [`turn_args`] is paid at most once, which means anything written here stays
+/// on disk after the app closes. The credentials travel in the separate
+/// `--endpoint-file` written per session and swept, and only its *path* appears
+/// here — the same split the Codex path makes for a different reason.
+///
+/// **`mcp` is assigned, not merged into.** Whatever the user has registered
+/// globally is displaced by pointing `XDG_CONFIG_HOME` at the directory holding
+/// this file, so their servers are not in the resolved config at all. That is
+/// this harness's `--strict-mcp-config`, and unlike Antigravity's it costs no
+/// global state: nothing of the user's is edited, so nothing has to be put back.
+pub fn opencode_config_json(exe: &str, endpoint_file: &str, allowed: &[&str]) -> String {
+    // Every tool `opencode agent create --permissions` lists, all off.
+    //
+    // **Twelve are written and eleven come back, and the direction of that gap
+    // is the whole point.** `opencode debug agent` resolves this map against the
+    // build's own tool registry: `lsp` and `websearch` are documented by
+    // `--permissions` but are not registered tools in the measured build, so
+    // they are dropped; `question` is not written here and comes back disabled
+    // anyway. The map is a **denylist by omission** — a name absent from it
+    // stays *enabled* — so a name here that the CLI no longer has costs nothing,
+    // while a name the CLI gains and this list has not heard of is live. That
+    // asymmetry is why the list is deliberately over-inclusive, and why it sits
+    // next to the probe that can confirm what actually resolved.
+    let builtins = [
+        "bash",
+        "read",
+        "edit",
+        "write",
+        "glob",
+        "grep",
+        "webfetch",
+        "websearch",
+        "task",
+        "todowrite",
+        "lsp",
+        "skill",
+    ];
+    let tools: serde_json::Map<String, serde_json::Value> = builtins
+        .iter()
+        .map(|t| ((*t).to_string(), serde_json::Value::Bool(false)))
+        .collect();
+    // The allow-list rides in the agent's description rather than a permission
+    // rule: OpenCode allows MCP tools by default (see `turn_args`), so there is
+    // no per-tool approval to set, and the server itself refuses anything this
+    // connection's access level does not offer. Naming them keeps the model from
+    // spending a turn discovering that.
+    let offered = allowed
+        .iter()
+        .map(|t| t.rsplit("__").next().unwrap_or(t))
+        .collect::<Vec<_>>()
+        .join(", ");
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            MCP_SERVER: {
+                "type": "local",
+                "enabled": true,
+                "command": [exe, "--mcp-serve", "--endpoint-file", endpoint_file],
+            }
+        },
+        "agent": {
+            OPENCODE_AGENT: {
+                "mode": "primary",
+                "description": format!(
+                    "Schemaic's SQL assistant. Database tools available: {offered}."
+                ),
+                "tools": tools,
+            }
+        }
+    })
+    .to_string()
 }
 
 /// Fold the system context into the prompt for harnesses with no
@@ -760,24 +1187,55 @@ mod tests {
         );
     }
 
+    /// **A sandbox is never a seal, however good the help page looks.**
+    ///
+    /// This was `only_claude_can_reach_the_sealed_grade`, and both halves of
+    /// that name had stopped being true: OpenCode reaches `Sealed` too, and the
+    /// test never asserted "only" in the first place — it checked three
+    /// harnesses one at a time, so a fourth could have reached any grade at all
+    /// without failing it. The name was the claim; nothing under it was.
+    ///
+    /// It now runs over `Harness::ALL`, so the grade of every harness is
+    /// asserted and a new one has to be *decided* here rather than inheriting
+    /// whatever `constraint_from_help` happens to return.
     #[test]
-    fn only_claude_can_reach_the_sealed_grade() {
-        let claude = "Usage: claude\n  --tools <t>\n  --help\n";
-        assert_eq!(
-            constraint_from_help(Harness::Claude, claude),
-            Constraint::Sealed
-        );
+    fn each_harness_reaches_exactly_the_grade_its_mechanism_earns() {
+        // Each harness's *best case*: a readable help page listing the flag its
+        // own arm greps for.
+        let best = |h: Harness| match h {
+            Harness::Claude => "Usage: claude\n  --tools <t>\n  --help\n",
+            Harness::Codex => "Usage: codex\n  --sandbox <s>\n  --help\n",
+            Harness::Antigravity => "Usage: agy\n  --sandbox\n  --help\n",
+            Harness::OpenCode => "Usage: opencode\n  --pure\n  --help\n",
+        };
+        for h in Harness::ALL {
+            let got = constraint_from_help(h, best(h));
+            let want = match h {
+                // Empties the built-in set: `--tools ""` and an agent whose
+                // `tools` map is all false.
+                Harness::Claude | Harness::OpenCode => Constraint::Sealed,
+                // A sandbox blocks side effects and leaves the readers live.
+                // There is no flag on either that empties the tool set, so
+                // neither can ever be `Sealed` — the claim this test exists to
+                // hold.
+                Harness::Codex | Harness::Antigravity => Constraint::Restricted,
+            };
+            assert_eq!(got, want, "{h:?}");
+        }
+    }
 
-        let codex = "Usage: codex\n  --sandbox <s>\n  --help\n";
-        assert_eq!(
-            constraint_from_help(Harness::Codex, codex),
-            Constraint::Restricted
-        );
-        let agy = "Usage: agy\n  --sandbox\n  --help\n";
-        assert_eq!(
-            constraint_from_help(Harness::Antigravity, agy),
-            Constraint::Restricted
-        );
+    /// The other direction, for every harness at once: no help page at all means
+    /// no grade, and no session.
+    #[test]
+    fn an_unreadable_probe_refuses_every_harness() {
+        for h in Harness::ALL {
+            assert_eq!(constraint_from_help(h, ""), Constraint::Unknown, "{h:?}");
+            assert_eq!(
+                constraint_from_help(h, "segmentation fault"),
+                Constraint::Unknown,
+                "{h:?}"
+            );
+        }
     }
 
     #[test]
@@ -1400,6 +1858,477 @@ mod tests {
             let out = antigravity_settings_with_rules(empty, &rules).expect("merged");
             let v: serde_json::Value = serde_json::from_str(&out).expect("json");
             assert_eq!(v["permissions"]["allow"][0], "mcp(schemaic/list_schema)");
+        }
+    }
+}
+
+#[cfg(test)]
+mod opencode_tests {
+    use super::*;
+
+    fn spec() -> TurnSpec {
+        TurnSpec {
+            prompt: "count rows".into(),
+            system: "tables: users(id)".into(),
+            ..Default::default()
+        }
+    }
+
+    fn args_of(s: &TurnSpec) -> Vec<String> {
+        turn_args(Harness::OpenCode, s)
+    }
+
+    fn flag_value(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .map(|i| args[i + 1].clone())
+    }
+
+    #[test]
+    fn a_turn_runs_the_sealed_agent_and_asks_for_json() {
+        let a = args_of(&spec());
+        assert_eq!(a[0], "run");
+        assert!(a.contains(&"--pure".to_string()), "{a:?}");
+        assert_eq!(flag_value(&a, "--agent").as_deref(), Some(OPENCODE_AGENT));
+        assert_eq!(flag_value(&a, "--format").as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn the_prompt_is_the_last_argument_and_carries_the_schema() {
+        // It is positional, so anything appended after it would be read as more
+        // prompt.
+        let a = args_of(&spec());
+        let last = a.last().expect("prompt");
+        assert!(last.starts_with("tables: users(id)"), "{last}");
+        assert!(last.ends_with("count rows"), "{last}");
+    }
+
+    #[test]
+    fn a_resumed_turn_names_the_session_and_drops_the_schema() {
+        // Same rule as the other per-turn harnesses: a resumed thread replays
+        // every earlier turn, each already carrying the outline, so re-sending
+        // it pays for the catalogue once per turn.
+        let mut s = spec();
+        s.resume = Some("ses_abc".into());
+        let a = args_of(&s);
+        assert_eq!(flag_value(&a, "--session").as_deref(), Some("ses_abc"));
+        assert_eq!(a.last().map(String::as_str), Some("count rows"));
+    }
+
+    #[test]
+    fn an_empty_resume_is_not_a_session_flag() {
+        let mut s = spec();
+        s.resume = Some(String::new());
+        assert!(!args_of(&s).contains(&"--session".to_string()));
+    }
+
+    #[test]
+    fn an_empty_model_sends_no_model_flag() {
+        // `--model ""` is what a harness switch produces: the field is cleared
+        // outright, and this harness's ids are `provider/model`, so an empty one
+        // is not merely useless but unparseable.
+        let s = spec();
+        assert!(s.model.is_empty());
+        assert!(!args_of(&s).contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn a_model_is_passed_through_verbatim() {
+        let mut s = spec();
+        s.model = "anthropic/claude-sonnet-5".into();
+        assert_eq!(
+            flag_value(&args_of(&s), "--model").as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn effort_rides_on_variant_not_effort() {
+        // `--effort` is Antigravity's flag and Claude's; this CLI calls it
+        // `--variant` and would die on an unknown option.
+        let mut s = spec();
+        s.effort = "high".into();
+        let a = args_of(&s);
+        assert!(!a.contains(&"--effort".to_string()), "{a:?}");
+        assert_eq!(flag_value(&a, "--variant").as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn another_harness_effort_level_is_clamped_before_it_reaches_argv() {
+        // The composition the app performs: `effort_arg` first, `turn_args`
+        // second. Claude's `xhigh` and Antigravity's `medium` survive a harness
+        // switch in settings, and neither is a variant this CLI advertises.
+        for level in ["xhigh", "medium", "low"] {
+            assert_eq!(Harness::OpenCode.effort_arg(level), None, "{level}");
+            let mut s = spec();
+            s.effort = Harness::OpenCode
+                .effort_arg(level)
+                .unwrap_or_default()
+                .into();
+            let a = args_of(&s);
+            assert!(!a.contains(&"--variant".to_string()), "{level}: {a:?}");
+        }
+        assert_eq!(Harness::OpenCode.effort_arg("max"), Some("max"));
+    }
+
+    #[test]
+    fn a_turn_never_passes_the_auto_approve_flag() {
+        // Measured: a headless turn calls its tools without it, because this
+        // CLI's default permissions allow rather than deny. Its own help calls
+        // the flag dangerous, and it would pre-approve whatever a future build
+        // adds to the tool set.
+        let mut s = spec();
+        s.effort = "max".into();
+        s.model = "opencode/gpt-5".into();
+        s.resume = Some("ses_1".into());
+        assert!(!args_of(&s).contains(&"--auto".to_string()));
+    }
+
+    #[test]
+    fn no_other_harness_flags_leak_into_the_argv() {
+        // The failure this whole layer exists to stop: one CLI's vocabulary
+        // reaching another. None of these is an OpenCode flag.
+        let mut s = spec();
+        s.model = "opencode/gpt-5".into();
+        s.effort = "high".into();
+        s.mcp_overrides = vec!["mcp_servers={}".into()];
+        s.isolate_config = true;
+        s.mcp_config = Some("/tmp/x.json".into());
+        let a = args_of(&s);
+        for foreign in [
+            "--sandbox",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "-c",
+            "--mcp-config",
+            "--conversation",
+            "--output-format",
+            "--disable-slash-commands",
+            "-p",
+            "exec",
+        ] {
+            assert!(!a.contains(&foreign.to_string()), "{foreign} in {a:?}");
+        }
+    }
+
+    #[test]
+    fn the_constraint_is_sealed_only_when_the_probe_read_a_help_page() {
+        // `--pure` is the greppable evidence; an unreadable probe refuses rather
+        // than assuming, because this harness's seal is a file we write and a
+        // binary that is not OpenCode would ignore it entirely.
+        // Trimmed from the real `opencode --help`, keeping the flag rows
+        // verbatim. Both halves of the probe are exercised: `looks_like_help`
+        // wants one of `--help`/`--version`/`--model`/`--print`, and the grade
+        // wants `--pure`.
+        let help = "\
+Commands:
+  opencode run [message..]     run opencode with a message
+  opencode serve               starts a headless opencode server
+
+Options:
+  -h, --help          show help                                       [boolean]
+  -v, --version       show version number                             [boolean]
+      --pure          run without external plugins                    [boolean]
+  -m, --model         model to use in the format of provider/model     [string]
+";
+        assert_eq!(
+            constraint_from_help(Harness::OpenCode, help),
+            Constraint::Sealed
+        );
+        // A readable help page for something that is not OpenCode: the seal
+        // Schemaic writes would mean nothing to it, so the session is refused
+        // rather than run on an assumption.
+        assert_eq!(
+            constraint_from_help(
+                Harness::OpenCode,
+                "Usage: other\n  --help  show help\n  --version  print version\n"
+            ),
+            Constraint::Unknown
+        );
+        assert_eq!(
+            constraint_from_help(Harness::OpenCode, ""),
+            Constraint::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unknown_constraint_is_not_runnable() {
+        assert!(!Constraint::Unknown.is_runnable());
+        assert!(Constraint::Sealed.is_runnable());
+        // Sealed shows no banner: it is the grade the app has always quietly
+        // provided, and a notice on every turn trains the user past the two that
+        // matter.
+        assert_eq!(Constraint::Sealed.notice(Harness::OpenCode), None);
+        assert!(
+            Constraint::Unknown
+                .notice(Harness::OpenCode)
+                .is_some_and(|n| n.contains("OpenCode"))
+        );
+    }
+
+    #[test]
+    fn the_capability_answers_match_what_was_measured() {
+        let h = Harness::OpenCode;
+        assert!(!h.is_persistent());
+        assert!(h.supports_resume());
+        // The one that is false where two of the other three are true: its
+        // printer emits a text part only once it is finished.
+        assert!(!h.streams_deltas());
+        assert!(h.supports_model_choice());
+        assert!(h.supports_effort());
+    }
+
+    #[test]
+    fn the_key_round_trips_and_is_distinct() {
+        assert_eq!(Harness::from_key("opencode"), Some(Harness::OpenCode));
+        for h in Harness::ALL {
+            assert_eq!(Harness::from_key(h.key()), Some(h));
+        }
+        let keys: std::collections::HashSet<_> = Harness::ALL.iter().map(|h| h.key()).collect();
+        assert_eq!(keys.len(), Harness::ALL.len());
+    }
+
+    #[test]
+    fn every_suggested_model_is_provider_qualified() {
+        // A bare alias is not an id this CLI accepts, and a suggestion chip that
+        // fails the turn is worse than no chip.
+        for m in Harness::OpenCode.suggested_models() {
+            assert!(m.contains('/'), "{m}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod speaker_label_tests {
+    use super::*;
+
+    #[test]
+    fn each_harness_is_named_by_its_own_speaker_name() {
+        // The bug this exists for: the panel printed "CLAUDE" over every reply,
+        // including ones a different CLI had just produced. Driven from
+        // `Harness::ALL` so a new harness cannot be added without a name here.
+        for h in Harness::ALL {
+            let got = speaker_label(Some(h.key()));
+            assert_eq!(got, h.speaker_name().to_uppercase(), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn the_speaker_name_is_the_product_name_except_where_it_is_deliberately_not() {
+        // Guards the one intentional divergence rather than leaving it to be
+        // "tidied" into `label()` later: the settings box installs *Claude Code*,
+        // the transcript is quoting *Claude*. Every other harness must agree, so
+        // a second gratuitous difference fails here.
+        assert_eq!(Harness::Claude.label(), "Claude Code");
+        assert_eq!(Harness::Claude.speaker_name(), "Claude");
+        for h in Harness::ALL {
+            if h == Harness::Claude {
+                continue;
+            }
+            assert_eq!(h.speaker_name(), h.label(), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn no_speaker_name_collides_with_the_unknown_placeholder() {
+        // "ASSISTANT" has to stay distinguishable from a harness that is named,
+        // or the neutral fallback stops being readable as one.
+        for h in Harness::ALL {
+            assert_ne!(speaker_label(Some(h.key())), "ASSISTANT", "{h:?}");
+        }
+    }
+
+    #[test]
+    fn the_four_labels_are_distinct() {
+        // A label that collides tells the user nothing, which is the state this
+        // replaces.
+        let names: std::collections::HashSet<String> = Harness::ALL
+            .iter()
+            .map(|h| speaker_label(Some(h.key())))
+            .collect();
+        assert_eq!(names.len(), Harness::ALL.len(), "{names:?}");
+    }
+
+    #[test]
+    fn a_turn_from_before_this_field_existed_is_not_attributed_to_anyone() {
+        // Transcripts persisted by an earlier build carry no harness, and by
+        // then three CLIs could already have written them — so the honest answer
+        // is the neutral one. Guessing "Claude" here is the same move
+        // `AiModel::from_cli` made when it coerced every unknown model to Haiku:
+        // a plausible name in place of an unknown, with nothing on screen to say
+        // it was invented.
+        assert_eq!(speaker_label(None), "ASSISTANT");
+    }
+
+    #[test]
+    fn an_unrecognised_key_is_neutral_rather_than_guessed() {
+        // A transcript written by a *later* build naming a harness this one does
+        // not have. Same rule as `Harness::from_key`, which returns `None`
+        // rather than picking a working harness.
+        assert_eq!(speaker_label(Some("gemini")), "ASSISTANT");
+        assert_eq!(speaker_label(Some("")), "ASSISTANT");
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+
+    /// **The isolation probe has to read the page the flag is on.**
+    ///
+    /// Measured: `codex --help` lists `--model`/`--sandbox`/`--help`/`--version`
+    /// and *not* `--ignore-user-config`; `codex exec --help` lists all of them.
+    /// The probe asked the top-level page, so `codex_isolates_config` was false
+    /// on every real machine and every Codex session loaded the user's own
+    /// `~/.codex/config.toml` — their MCP servers and their hooks.
+    ///
+    /// The bug lived in the seam: `the_isolation_probe_needs_real_help_and_the_
+    /// real_flag` fed the decoder `exec --help` text by hand while the caller
+    /// fed it something else, so both halves passed alone. This pins the
+    /// *argv* — the thing that was wrong.
+    #[test]
+    fn codex_is_probed_on_the_subcommand_that_documents_its_isolation() {
+        assert_eq!(Harness::Codex.help_args(), &["exec", "--help"]);
+        // The others have no subcommand to descend into.
+        for h in Harness::ALL {
+            if h == Harness::Codex {
+                continue;
+            }
+            assert_eq!(h.help_args(), &["--help"], "{h:?}");
+        }
+        // Every harness's page must still be able to answer the grade question,
+        // so the last argument is always the help flag itself.
+        for h in Harness::ALL {
+            assert_eq!(h.help_args().last(), Some(&"--help"), "{h:?}");
+        }
+    }
+
+    /// The page Codex is now asked for carries *both* things read off it.
+    #[test]
+    fn the_codex_help_page_answers_the_grade_and_the_isolation_together() {
+        // Trimmed from the real `codex exec --help`, flag rows verbatim.
+        let exec_help = "\
+Usage: codex exec [OPTIONS] [PROMPT]
+
+Options:
+  -m, --model <MODEL>              Model the agent should use
+  -s, --sandbox <SANDBOX_MODE>     Select the sandbox policy
+      --ignore-user-config         Do not load ~/.codex/config.toml
+      --skip-git-repo-check        Allow running outside a Git repository
+  -h, --help                       Print help
+  -V, --version                    Print version
+";
+        assert_eq!(
+            constraint_from_help(Harness::Codex, exec_help),
+            Constraint::Restricted
+        );
+        assert!(codex_isolates_config(exec_help));
+
+        // And the top-level page, which is what used to be read: the grade still
+        // resolves, the isolation silently does not. Kept as a test so the
+        // regression is legible rather than merely absent.
+        let top_help = "\
+Usage: codex [OPTIONS] [PROMPT]
+
+Options:
+  -m, --model <MODEL>       Model the agent should use
+  -s, --sandbox <SANDBOX>   Select the sandbox policy
+  -h, --help                Print help
+  -V, --version             Print version
+";
+        assert_eq!(
+            constraint_from_help(Harness::Codex, top_help),
+            Constraint::Restricted
+        );
+        assert!(
+            !codex_isolates_config(top_help),
+            "the top-level page cannot establish the isolation — that is why \
+             `help_args` descends into `exec`"
+        );
+    }
+
+    /// A cleared-then-spaced model field must not reach any harness's argv.
+    ///
+    /// The field is free text. Claude's builder trimmed; the other three tested
+    /// `!is_empty()`, so `" "` became `--model " "` — an unknown model, reported
+    /// as "Couldn't launch the CLI", which is the one cause that is not it.
+    #[test]
+    fn a_whitespace_only_model_is_no_model_on_every_harness() {
+        for h in Harness::ALL {
+            for blank in ["", " ", "   ", "\t", "\n"] {
+                let spec = TurnSpec {
+                    prompt: "hi".into(),
+                    model: blank.into(),
+                    ..Default::default()
+                };
+                let args = turn_args(h, &spec);
+                assert!(
+                    !args.iter().any(|a| a == "--model"),
+                    "{h:?} sent --model for {blank:?}: {args:?}"
+                );
+                // And nothing blank reached argv by another route.
+                assert!(
+                    !args.iter().any(|a| !a.is_empty() && a.trim().is_empty()),
+                    "{h:?} passed a blank argument: {args:?}"
+                );
+            }
+        }
+    }
+
+    /// A real model id still survives, untrimmed in the middle.
+    #[test]
+    fn a_model_with_surrounding_space_is_sent_trimmed() {
+        for h in Harness::ALL {
+            if h == Harness::Claude {
+                continue; // no per-turn argv; `build_session_args` covers it
+            }
+            let spec = TurnSpec {
+                prompt: "hi".into(),
+                model: "  provider/some-model  ".into(),
+                ..Default::default()
+            };
+            let args = turn_args(h, &spec);
+            let i = args.iter().position(|a| a == "--model").expect("--model");
+            assert_eq!(args[i + 1], "provider/some-model", "{h:?}");
+        }
+    }
+
+    /// **The `Restricted` notice describes a mechanism, so it must be asked as
+    /// one.** The sandbox sentence is a claim the OS enforces; promising it for
+    /// a harness with no sandbox would be a positive assurance nothing backs.
+    #[test]
+    fn only_a_sandboxed_harness_is_told_the_os_is_stopping_it() {
+        for h in Harness::ALL {
+            let notice = Constraint::Restricted
+                .notice(h)
+                .unwrap_or_else(|| panic!("{h:?} said nothing at Restricted"));
+            let claims_sandbox = notice.contains("cannot write files or run commands");
+            assert_eq!(
+                claims_sandbox,
+                h.restricted_means_sandbox(),
+                "{h:?}: {notice}"
+            );
+            // Whatever it says, it names itself and no one else.
+            assert!(notice.contains(h.label()), "{h:?}: {notice}");
+            for other in Harness::ALL {
+                if other != h && other.label() != h.label() {
+                    assert!(!notice.contains(other.label()), "{h:?} named {other:?}");
+                }
+            }
+        }
+    }
+
+    /// "Update the CLI and the seal comes back" is only true where the seal is a
+    /// flag an older build could be missing.
+    #[test]
+    fn only_a_flag_sealed_harness_is_told_an_update_would_help() {
+        for h in Harness::ALL {
+            let notice = Constraint::Restricted.notice(h).expect("a notice");
+            assert_eq!(
+                notice.contains("Updating the CLI"),
+                h.seals_by_flag(),
+                "{h:?}: {notice}"
+            );
         }
     }
 }

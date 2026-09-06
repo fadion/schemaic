@@ -66,6 +66,7 @@ fn env_vars(h: Harness) -> &'static [&'static str] {
         Harness::Claude => &["SCHEMAIC_CLAUDE_BIN"],
         Harness::Codex => &["SCHEMAIC_CODEX_BIN"],
         Harness::Antigravity => &["SCHEMAIC_ANTIGRAVITY_BIN"],
+        Harness::OpenCode => &["SCHEMAIC_OPENCODE_BIN"],
     }
 }
 
@@ -134,6 +135,38 @@ fn known_locations(h: Harness) -> Vec<std::path::PathBuf> {
                         .join(".local")
                         .join("bin")
                         .join(exe("agy")),
+                );
+            }
+        }
+        // **npm-installed, which makes the `PATH` entry the wrong file to
+        // spawn.** A global `npm i -g opencode-ai` puts a `opencode.cmd` shim on
+        // `PATH` beside the real `opencode.exe` it calls, and `which_on_path`
+        // honours `PATHEXT` — so the fallback finds the `.cmd`, which needs a
+        // shell to run and is not what `Command::new` starts. The real binary is
+        // listed first so it wins before that ever happens.
+        Harness::OpenCode => {
+            if let Some(dir) = std::env::var_os("APPDATA") {
+                out.push(
+                    std::path::PathBuf::from(dir)
+                        .join("npm")
+                        .join("node_modules")
+                        .join("opencode-ai")
+                        .join("bin")
+                        .join(exe("opencode")),
+                );
+            }
+            if let Some(home) = home {
+                let home = std::path::PathBuf::from(home);
+                // The install script's own location, then npm's Unix prefix.
+                out.push(home.join(".opencode").join("bin").join(exe("opencode")));
+                out.push(home.join(".local").join("bin").join(exe("opencode")));
+                out.push(
+                    home.join(".npm-global")
+                        .join("lib")
+                        .join("node_modules")
+                        .join("opencode-ai")
+                        .join("bin")
+                        .join(exe("opencode")),
                 );
             }
         }
@@ -275,7 +308,14 @@ pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
     // the rest of the run, reporting "could not confirm … so the assistant is
     // disabled" with no retry path anywhere. Returning early leaves the next
     // attempt free to ask again.
-    let Some(o) = std::process::Command::new(bin).arg("--help").output().ok() else {
+    // `Harness::help_args`, not a literal `--help`: Codex keeps
+    // `--ignore-user-config` off its top-level page, so asking the wrong one
+    // silently dropped that harness's whole config isolation.
+    let Some(o) = std::process::Command::new(bin)
+        .args(h.help_args())
+        .output()
+        .ok()
+    else {
         return Probe {
             seal: CliSeal::ALL,
             constraint: Constraint::Unknown,

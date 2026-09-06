@@ -4822,57 +4822,108 @@ impl From<RightPanel> for schemaic_core::persist::RightPanelState {
 // `build_session_args(.., model: Option<&str>, ..)` on the other — so it added
 // nothing but the narrowing. See `AiUi::model` and `Harness::suggested_models`.
 
-/// AI reasoning effort → Claude CLI `--effort` level (Extra = `xhigh`).
+/// AI reasoning effort → the harness's own effort flag (Claude and Antigravity
+/// `--effort`, OpenCode `--variant`).
+///
+/// **The union of what the harnesses take, not any one CLI's list.** No harness
+/// offers all six: Claude takes `low|medium|high|xhigh`, Antigravity the first
+/// three, OpenCode `minimal|high|max`. The settings dropdown filters this by
+/// `Harness::effort_levels` and the argv is clamped again by
+/// `Harness::effort_arg`, so a variant no harness advertises is never sent.
+///
+/// Extending it was not optional once OpenCode arrived. Filtering a four-variant
+/// list by `minimal|high|max` leaves exactly `High`, so that harness's two
+/// distinctive levels were unreachable from the UI — the same narrowing that
+/// made `AiModel` (above) coerce every unknown model to Haiku, arriving in the
+/// control next to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AiEffort {
+    Minimal,
     Low,
     Medium,
     High,
     Extra,
+    Max,
 }
 impl AiEffort {
-    pub const ALL: [AiEffort; 4] = [
+    /// Ordered low→high, which [`AiEffort::clamped_to`] depends on: it reads a
+    /// level's rank off this order and measures distance along it, so the
+    /// positions carry meaning and reordering the variants changes which level a
+    /// harness switch lands on.
+    pub const ALL: [AiEffort; 6] = [
+        AiEffort::Minimal,
         AiEffort::Low,
         AiEffort::Medium,
         AiEffort::High,
         AiEffort::Extra,
+        AiEffort::Max,
     ];
     pub fn cli(self) -> &'static str {
         match self {
+            AiEffort::Minimal => "minimal",
             AiEffort::Low => "low",
             AiEffort::Medium => "medium",
             AiEffort::High => "high",
             AiEffort::Extra => "xhigh",
+            AiEffort::Max => "max",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
+            AiEffort::Minimal => "Minimal",
             AiEffort::Low => "Low",
             AiEffort::Medium => "Medium",
             AiEffort::High => "High",
             AiEffort::Extra => "Extra",
+            AiEffort::Max => "Max",
         }
     }
+    /// Parse a persisted level. Unknown falls back to `Medium`, as it always has:
+    /// this reads `UiState::ai_effort`, and the value is clamped to the live
+    /// harness's own list before it reaches either the dropdown or the argv.
+    ///
+    /// **`max` is its own level now, not a spelling of `xhigh`.** It used to map
+    /// there because no harness took both; OpenCode takes `max` and not `xhigh`,
+    /// so folding them would have made a saved `max` come back as Claude's
+    /// `xhigh` and clamp to `high` on the harness that had just written it.
     pub fn from_cli(s: &str) -> AiEffort {
         match s {
+            "minimal" => AiEffort::Minimal,
             "low" => AiEffort::Low,
             "high" => AiEffort::High,
-            "xhigh" | "max" => AiEffort::Extra,
+            "xhigh" => AiEffort::Extra,
+            "max" => AiEffort::Max,
             _ => AiEffort::Medium,
         }
     }
 
-    /// This level if `levels` contains it, else the highest one that does.
+    /// This level if `levels` contains it, else the **nearest** one that does.
     ///
     /// **What the settings box shows must be a level the harness takes.** The
     /// argv is clamped by `Harness::effort_arg`, so a stale selection sends
     /// nothing wrong — but the closed dropdown renders `label(active)`
     /// unconditionally, so `Extra` chosen on Claude still read "Extra" after a
     /// switch to Antigravity, naming a level that was neither offered in the
-    /// list below it nor sent. Clamping *down* rather than resetting to a
-    /// constant is the honest answer to "the level you asked for is out of this
-    /// CLI's range": `ALL` is ordered low→high, so the last surviving entry is
-    /// the closest this harness can reach.
+    /// list below it nor sent. Moving to the closest level the CLI does offer is
+    /// the honest answer to "the one you asked for is out of range"; resetting to
+    /// a constant would discard a choice the user did make.
+    ///
+    /// Distance is measured along [`AiEffort::ALL`], which is ordered low→high.
+    /// Ties go **downward**: asked for something between two offered levels,
+    /// spend less rather than more. Note this is *proximity*, not "clamp down" —
+    /// `Minimal` under Claude, which has no such level, moves **up** to `low`.
+    ///
+    /// **It took the highest offered level until a review caught it, and that is
+    /// a bill rather than a stale caption.** The last surviving entry of a
+    /// low→high list is the harness's *most expensive* level; it reads as
+    /// clamping down only when the level asked for sits above everything on
+    /// offer — Claude's `xhigh` against Antigravity's list, which is the one case
+    /// the original test covered. OpenCode put a hole in the middle: its levels
+    /// are `minimal|high|max`, so the shipped default `Medium` — a level a user
+    /// need never have touched — fell through to `Max`, the switch persisted
+    /// `"max"`, and switching back to Claude carried that to `xhigh`. Two turns
+    /// of the harness dropdown left someone on the priciest setting of both CLIs
+    /// having never opened the Effort control.
     ///
     /// `None` when the harness has no effort flag at all — there is no level to
     /// show, and the row is hidden.
@@ -4880,9 +4931,14 @@ impl AiEffort {
         if levels.contains(&self.cli()) {
             return Some(self);
         }
+        let rank = |e: AiEffort| AiEffort::ALL.iter().position(|x| *x == e).unwrap_or(0);
+        let want = rank(self);
         AiEffort::ALL
             .into_iter()
-            .rfind(|e| levels.contains(&e.cli()))
+            .filter(|e| levels.contains(&e.cli()))
+            // `(distance, is_above)`: the closest level wins, and `false < true`
+            // makes the cheaper side win a tie.
+            .min_by_key(|e| (rank(*e).abs_diff(want), rank(*e) > want))
     }
 }
 
@@ -10023,7 +10079,7 @@ mod effort_clamp_tests {
     /// follows a harness that changes its flag instead of pinning today's answer
     /// twice.
     #[test]
-    fn a_level_out_of_range_clamps_down_to_the_highest_the_harness_takes() {
+    fn a_level_out_of_range_lands_on_the_nearest_the_harness_takes() {
         let claude = Harness::Claude.effort_levels();
         let agy = Harness::Antigravity.effort_levels();
         // The case that was live: chosen on Claude, still displayed on a harness
@@ -10041,6 +10097,128 @@ mod effort_clamp_tests {
             None
         );
         assert_eq!(AiEffort::High.clamped_to(&[]), None);
+    }
+
+    /// **Every level a harness advertises has to be reachable from the box.**
+    ///
+    /// The settings dropdown offers `AiEffort::ALL` *filtered* by
+    /// `effort_levels()`, so a level this enum cannot spell is one the user can
+    /// never pick — silently, with the control still on screen looking complete.
+    /// That is what adding OpenCode exposed: its `minimal|high|max` intersected
+    /// a four-variant `Low|Medium|High|Extra` at exactly one entry, leaving a
+    /// one-item dropdown and two unreachable levels.
+    ///
+    /// Written over `Harness::ALL` rather than against OpenCode's list, so the
+    /// next harness with its own vocabulary fails here rather than shipping the
+    /// same hole.
+    #[test]
+    fn every_level_a_harness_takes_can_be_chosen_in_the_box() {
+        for h in Harness::ALL {
+            let offered: Vec<&str> = AiEffort::ALL
+                .into_iter()
+                .map(AiEffort::cli)
+                .filter(|c| h.effort_levels().contains(c))
+                .collect();
+            assert_eq!(
+                offered,
+                h.effort_levels().to_vec(),
+                "{h:?} advertises {:?} but the box can only offer {offered:?}",
+                h.effort_levels()
+            );
+        }
+    }
+
+    /// A level round-trips through the settings file under its own name.
+    ///
+    /// `max` used to parse as `Extra` (`xhigh`), which was harmless while no
+    /// harness took both. OpenCode takes `max` and not `xhigh`, so the fold
+    /// would have turned a saved `max` into `xhigh`, which clamps back to `high`
+    /// on the very harness that wrote it — a setting that silently changes
+    /// itself between sessions.
+    #[test]
+    fn every_level_survives_a_trip_through_the_settings_file() {
+        for e in AiEffort::ALL {
+            assert_eq!(AiEffort::from_cli(e.cli()), e, "{e:?} did not round-trip");
+        }
+    }
+
+    /// **A harness switch must never cost more than the level you chose.**
+    ///
+    /// The regression this pins: `clamped_to` fell back to the *last* offered
+    /// level, so `Medium` — the shipped default, which a user need never have
+    /// touched — landed on OpenCode's `Max`, persisted as `"max"`, and came back
+    /// to Claude as `xhigh`. Asserted as a property over every harness pair and
+    /// every starting level rather than the one case that used to be covered,
+    /// because the old code was *correct* for that case and wrong everywhere in
+    /// the middle.
+    #[test]
+    fn clamping_lands_on_the_nearest_offered_level_and_never_the_priciest_by_default() {
+        let rank = |e: AiEffort| AiEffort::ALL.iter().position(|x| *x == e).unwrap();
+        for h in Harness::ALL {
+            let levels = h.effort_levels();
+            if levels.is_empty() {
+                continue;
+            }
+            for want in AiEffort::ALL {
+                let Some(got) = want.clamped_to(levels) else {
+                    panic!("{h:?} offers {levels:?} but clamped {want:?} to nothing");
+                };
+                let d = |e: AiEffort| rank(e).abs_diff(rank(want));
+                // Nothing on offer is strictly closer to what was asked for.
+                // This is what the old `rfind` broke: it took the *last* entry,
+                // which is the most expensive one, however far away it sat.
+                for other in AiEffort::ALL
+                    .into_iter()
+                    .filter(|e| levels.contains(&e.cli()))
+                {
+                    assert!(
+                        d(got) <= d(other),
+                        "{h:?}: {want:?} → {got:?}, but {other:?} is nearer in {levels:?}"
+                    );
+                }
+                // A tie is broken downward: never pay more for a coin flip.
+                if let Some(tied) = AiEffort::ALL
+                    .into_iter()
+                    .filter(|e| levels.contains(&e.cli()) && d(*e) == d(got))
+                    .min_by_key(|e| rank(*e))
+                {
+                    assert_eq!(got, tied, "{h:?}: {want:?} broke a tie upward");
+                }
+            }
+        }
+    }
+
+    /// The specific path the user would have walked.
+    #[test]
+    fn the_default_level_survives_a_round_trip_through_opencode() {
+        let oc = Harness::OpenCode.effort_levels();
+        let claude = Harness::Claude.effort_levels();
+        // Medium is what a fresh install carries.
+        let on_oc = AiEffort::Medium.clamped_to(oc).expect("a level");
+        assert_eq!(on_oc, AiEffort::High, "Medium must not become Max");
+        // And back again, without having climbed.
+        assert_eq!(on_oc.clamped_to(claude), Some(AiEffort::High));
+    }
+
+    /// Nearest wins even when the nearer level is *above* — clamping down is not
+    /// the rule, proximity is.
+    #[test]
+    fn a_level_below_everything_offered_moves_up_to_the_nearest() {
+        // Minimal against Claude's low|medium|high|xhigh: `low` is adjacent.
+        assert_eq!(
+            AiEffort::Minimal.clamped_to(Harness::Claude.effort_levels()),
+            Some(AiEffort::Low)
+        );
+    }
+
+    /// A tie between one level below and one above spends less.
+    #[test]
+    fn a_tie_between_two_neighbours_picks_the_cheaper_one() {
+        // Medium sits exactly between low and high.
+        assert_eq!(
+            AiEffort::Medium.clamped_to(&["low", "high"]),
+            Some(AiEffort::Low)
+        );
     }
 
     /// The property the display depends on: whatever comes back is a level this

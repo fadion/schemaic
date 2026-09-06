@@ -1,4 +1,4 @@
-//! One transcript vocabulary, three CLI dialects.
+//! One transcript vocabulary, four CLI dialects.
 //!
 //! Schemaic drives whichever agent CLI the user has installed, and each one
 //! reports a turn in its own JSONL shape. The panel renders exactly one:
@@ -6,10 +6,24 @@
 //! dialect stops here — every harness decodes into the same [`StreamEvent`]s,
 //! and nothing downstream learns which CLI produced them.
 //!
-//! **They do not even agree on where the discriminator lives.** Claude and Codex
-//! tag a line with `type`; Antigravity tags it with `event` and nests
-//! the payload under a key of the same name. That is measured, not documented —
-//! see the captured fixtures in the tests.
+//! **They do not even agree on where the discriminator lives.** Claude, Codex
+//! and OpenCode tag a line with `type`; Antigravity tags it with `event` and
+//! nests the payload under a key of the same name. That is measured, not
+//! documented — see the captured fixtures in the tests.
+//!
+//! **One of them never says a turn is over.** Claude, Codex and Antigravity each
+//! emit a terminal event. OpenCode's printer simply stops writing when the
+//! session goes idle, so the close is inferred from `step_finish.reason` —
+//! `tool-calls` means another step follows, anything else ends the turn. That
+//! inference is load-bearing in both directions: end early and the answer is
+//! truncated, never end and the app closes the turn on process exit and reports
+//! a working turn as "ended unexpectedly".
+//!
+//! **And one of them streams nothing.** Claude and Antigravity send deltas,
+//! Codex sends cumulative restatements, and OpenCode sends whole finished parts
+//! — its printer emits a text part only once `time.end` is set. There is no
+//! partial text to decode, which is why [`Harness::streams_deltas`] is false for
+//! it and no amount of coalescing would change that.
 //!
 //! **One dialect needs state, so decoding is a parser and not a function.**
 //! Claude and Antigravity stream *deltas*: each line carries the text new since
@@ -98,6 +112,62 @@ pub struct StreamParser {
     /// of the transcript. This is the same problem [`Coalescer`] solves for prose
     /// and the same reason the parser is stateful.
     seen_tools: std::collections::HashSet<String>,
+    /// The one dialect that reports usage per *step* and never says a turn is
+    /// over. See [`StreamParser::push_opencode`].
+    oc: OpenCodeTurn,
+}
+
+/// What an OpenCode turn accumulates across its steps.
+///
+/// Every other harness hands the parser a finished turn's numbers in one event.
+/// This one reports them per step and stops writing when it is done, so the
+/// running totals — and the wall clock, which it reports as nothing at all — are
+/// assembled here.
+#[derive(Default)]
+struct OpenCodeTurn {
+    /// `SessionStarted` is emitted once, off whichever event arrives first.
+    session_announced: bool,
+    first_ts: Option<u64>,
+    last_ts: Option<u64>,
+    input: u64,
+    output: u64,
+    /// Distinguishes "no tokens reported" from "zero tokens", so a footer shows
+    /// nothing rather than a confident `0 in / 0 out`.
+    saw_tokens: bool,
+}
+
+impl OpenCodeTurn {
+    fn stats(&self) -> TurnStats {
+        TurnStats {
+            // Nothing in the stream states a duration, but every event is
+            // timestamped in milliseconds, so the turn's own span is exact.
+            duration_ms: match (self.first_ts, self.last_ts) {
+                (Some(a), Some(b)) if b >= a => Some(b - a),
+                _ => None,
+            },
+            input_tokens: self.saw_tokens.then_some(self.input),
+            output_tokens: self.saw_tokens.then_some(self.output),
+        }
+    }
+}
+
+/// `schemaic_run_query` → `mcp__schemaic__run_query`; anything else unchanged.
+///
+/// **OpenCode flattens the server into the tool name**, where Codex keeps them
+/// as separate fields its decoder rejoins. So our own server's tools arrive
+/// prefixed and everything else — the built-ins, and any server a future config
+/// adds — arrives bare. Rewriting only our prefix keeps the transcript and the
+/// allow-list speaking the one qualified form every other harness produces,
+/// while a built-in still shows under its own name rather than being dressed up
+/// as an MCP call.
+fn opencode_tool_name(raw: &str) -> String {
+    let prefix = format!("{}_", crate::harness::MCP_SERVER);
+    match raw.strip_prefix(&prefix) {
+        Some(bare) if !bare.is_empty() => {
+            format!("mcp__{}__{bare}", crate::harness::MCP_SERVER)
+        }
+        _ => raw.to_string(),
+    }
 }
 
 impl StreamParser {
@@ -106,6 +176,7 @@ impl StreamParser {
             harness,
             text: Coalescer::default(),
             seen_tools: std::collections::HashSet::new(),
+            oc: OpenCodeTurn::default(),
         }
     }
 
@@ -135,7 +206,163 @@ impl StreamParser {
             Harness::Claude => crate::parse_stream_line(line),
             Harness::Codex => self.push_codex(&v),
             Harness::Antigravity => self.push_antigravity(&v),
+            Harness::OpenCode => self.push_opencode(&v),
         }
+    }
+
+    /// `opencode run --format json`.
+    ///
+    /// **The dialect with no ending.** Every other harness here says when a turn
+    /// is over — `turn.completed`, `result`, a final `stream-json` message. This
+    /// printer just stops writing when the session goes idle, so the close has to
+    /// be *inferred*, and the only thing carrying that information is
+    /// `step_finish.reason`: `tool-calls` means the model is going round again,
+    /// anything else means it has stopped. Getting it wrong is visible in both
+    /// directions — end early and the answer is cut off mid-turn, never end and
+    /// the app closes the turn on process exit and reports a working turn as
+    /// "ended unexpectedly".
+    ///
+    /// An absent `reason` is read as terminal. It has never been observed absent
+    /// (the AI SDK behind it always sets a finish reason), and of the two ways to
+    /// be wrong about a value that does not occur, this one degrades to a
+    /// truncated turn only if a *tool* step ever omits it, while the other would
+    /// stamp an error on every ordinary turn.
+    ///
+    /// **Tokens are per step, not per turn**, so they accumulate here rather than
+    /// being read off the last event. The measured two-step turn reported 2497
+    /// input and then 637; a footer showing only the second understates the turn
+    /// by a factor of four.
+    fn push_opencode(&mut self, v: &serde_json::Value) -> Vec<StreamEvent> {
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let mut out = Vec::new();
+
+        // The session id arrives on the top level of *every* event rather than in
+        // an opening one of its own, so it is taken from whichever comes first
+        // and only once. It is what `--session` resumes the next turn with.
+        if let Some(id) = v.get("sessionID").and_then(|s| s.as_str())
+            && !id.is_empty()
+            && !self.oc.session_announced
+        {
+            self.oc.session_announced = true;
+            out.push(StreamEvent::SessionStarted { id: id.to_string() });
+        }
+        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_u64()) {
+            self.oc.first_ts.get_or_insert(ts);
+            self.oc.last_ts = Some(ts);
+        }
+
+        let part = v.get("part").unwrap_or(&serde_json::Value::Null);
+        match ty {
+            // Nothing to render: it opens a step, and a step is not a turn.
+            "step_start" => {}
+            "text" => {
+                // Whole parts, never deltas — see `Harness::streams_deltas`. The
+                // printer only emits one once `time.end` is set and dedupes by
+                // part id before it gets here, so there is nothing to coalesce.
+                if let Some(t) = part.get("text").and_then(|t| t.as_str())
+                    && !t.is_empty()
+                {
+                    out.push(StreamEvent::TextDelta(t.to_string()));
+                }
+            }
+            "tool_use" => out.extend(self.opencode_tool(part)),
+            "step_finish" => {
+                let at = |k: &str| {
+                    part.pointer(&format!("/tokens/{k}"))
+                        .and_then(|n| n.as_u64())
+                };
+                if let Some(i) = at("input") {
+                    self.oc.input += i;
+                    self.oc.saw_tokens = true;
+                }
+                if let Some(o) = at("output") {
+                    self.oc.output += o;
+                    self.oc.saw_tokens = true;
+                }
+                let reason = part.get("reason").and_then(|r| r.as_str());
+                if reason != Some("tool-calls") {
+                    out.push(StreamEvent::TurnDone {
+                        is_error: reason == Some("error"),
+                        stats: self.oc.stats(),
+                    });
+                }
+            }
+            // `session.error`, the printer's only failure event. Nothing follows
+            // it, so the turn is closed here or not at all.
+            "error" => {
+                let e = v.get("error").unwrap_or(&serde_json::Value::Null);
+                let msg = e
+                    .pointer("/data/message")
+                    .and_then(|m| m.as_str())
+                    .or_else(|| e.get("name").and_then(|n| n.as_str()))
+                    .unwrap_or_default();
+                if !msg.is_empty() {
+                    out.push(StreamEvent::TextDelta(format!("\n{msg}\n")));
+                }
+                out.push(StreamEvent::TurnDone {
+                    is_error: true,
+                    stats: self.oc.stats(),
+                });
+            }
+            // `reasoning` among them: it only appears under `--thinking`, which
+            // is not passed, and the panel has no place for it — same call the
+            // Codex dialect makes for its `reasoning` items.
+            _ => {}
+        }
+        out
+    }
+
+    /// One `tool_use` part.
+    ///
+    /// **The call and its result arrive together**, unlike both other per-turn
+    /// dialects: a measured call was reported once, already `completed`, with its
+    /// `input` and `output` in the same event. So this emits the chip and fills
+    /// it from one line. The `running` status is handled anyway — the state
+    /// machine has one — and `seen_tools` keeps a call announced once if a build
+    /// ever does restate it.
+    fn opencode_tool(&mut self, part: &serde_json::Value) -> Vec<StreamEvent> {
+        let raw = part
+            .get("tool")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        let state = part.get("state").unwrap_or(&serde_json::Value::Null);
+        let status = state.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        // `callID` is the dialect's own id for the call; the part id changes
+        // between restatements where the call id does not.
+        let id = part
+            .get("callID")
+            .and_then(|c| c.as_str())
+            .unwrap_or(raw)
+            .to_string();
+
+        let mut out = Vec::new();
+        if self.first_sight(&id) {
+            let sql = state
+                .pointer("/input/sql")
+                .or_else(|| state.pointer("/input/query"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            out.push(StreamEvent::ToolUse {
+                name: opencode_tool_name(raw),
+                sql,
+            });
+        }
+        match status {
+            // Still running: the chip stays open, and the result arrives on a
+            // later event for the same `callID`.
+            "running" | "pending" | "" => {}
+            _ => {
+                let is_error = status == "error";
+                let text = state
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .or_else(|| state.get("output").and_then(|o| o.as_str()))
+                    .unwrap_or_default()
+                    .to_string();
+                out.push(StreamEvent::ToolResult { text, is_error });
+            }
+        }
+        out
     }
 
     /// `agy -p --output-format stream-json`.
@@ -311,23 +538,37 @@ impl StreamParser {
                     .or_else(|| item.pointer("/arguments/query"))
                     .and_then(|s| s.as_str())
                     .map(|s| s.to_string());
-                if !completed {
-                    // Only the first sighting: `item.updated` restates a call in
-                    // progress, and a chip per restatement is a chip that never
-                    // fills. See `StreamParser::seen_tools`.
-                    return match self.first_sight(id) {
-                        true => vec![StreamEvent::ToolUse { name, sql }],
-                        false => Vec::new(),
-                    };
+                // **Both halves are guarded, and the result half was not.**
+                // `first_sight` kept a restated call from opening a second chip,
+                // but the completion path emitted a `ToolResult` unconditionally
+                // — so a call whose only event is `item.completed` produced a
+                // result with no chip to land in, and `TurnState::apply` attaches
+                // a loose result to *the most recent tool call still awaiting
+                // one*. That stamps a database answer onto whatever chip happened
+                // to be open (a `command_execution`, say), or drops it entirely
+                // when none is, and the user sees no record of a query that ran.
+                // A restated `completed` had the mirror problem: a second
+                // `ToolResult` for one call.
+                let mut out = Vec::new();
+                if self.first_sight(id) {
+                    out.push(StreamEvent::ToolUse { name, sql });
                 }
-                let err = item
-                    .pointer("/error/message")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string());
-                let is_error =
-                    err.is_some() || item.get("status").and_then(|s| s.as_str()) == Some("failed");
-                let text = err.unwrap_or_else(|| mcp_result_text(item));
-                vec![StreamEvent::ToolResult { text, is_error }]
+                if !completed {
+                    return out;
+                }
+                // Keyed apart from the call itself: one id has to be able to
+                // announce once *and* resolve once. A NUL cannot occur in an id.
+                if self.first_sight(&format!("{id}\u{0}done")) {
+                    let err = item
+                        .pointer("/error/message")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string());
+                    let is_error = err.is_some()
+                        || item.get("status").and_then(|s| s.as_str()) == Some("failed");
+                    let text = err.unwrap_or_else(|| mcp_result_text(item));
+                    out.push(StreamEvent::ToolResult { text, is_error });
+                }
+                out
             }
             // Side effects. They should not happen under the constraint this
             // harness is launched with; if one does, it is shown rather than
@@ -687,8 +928,16 @@ mod tests {
                 r#"{"type":"item.completed","item":{"id":"t1","type":"mcp_tool_call","server":"schemaic","tool":"run_query","arguments":{},"result":{"content":[{"type":"text","text":"1 row"}]},"status":"completed"}}"#,
             ],
         );
+        // A call whose only event is `item.completed` opens its own chip before
+        // filling it. It used to emit the result alone, which `TurnState::apply`
+        // then attached to whichever *other* call was still pending — or dropped
+        // when none was.
         match &ok[..] {
-            [StreamEvent::ToolResult { text, is_error }] => {
+            [
+                StreamEvent::ToolUse { name, .. },
+                StreamEvent::ToolResult { text, is_error },
+            ] => {
+                assert_eq!(name, "mcp__schemaic__run_query");
                 assert_eq!(text, "1 row");
                 assert!(!is_error);
             }
@@ -702,7 +951,10 @@ mod tests {
             ],
         );
         match &bad[..] {
-            [StreamEvent::ToolResult { text, is_error }] => {
+            [
+                StreamEvent::ToolUse { .. },
+                StreamEvent::ToolResult { text, is_error },
+            ] => {
                 assert_eq!(text, "nope");
                 assert!(is_error);
             }
@@ -890,8 +1142,15 @@ mod tests {
                 r#"{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"schemaic","tool":"list_schema","arguments":{},"result":null,"error":{"message":"MCP tool call requires approval, but approval policy is never"},"status":"failed"}}"#,
             ],
         );
+        // The refusal arrives as one `item.completed` with no `item.started`
+        // before it, so the chip is opened here too — a refused call the user
+        // cannot see is the failure this whole arm exists to surface.
         match &out[..] {
-            [StreamEvent::ToolResult { text, is_error }] => {
+            [
+                StreamEvent::ToolUse { name, .. },
+                StreamEvent::ToolResult { text, is_error },
+            ] => {
+                assert_eq!(name, "mcp__schemaic__list_schema");
                 assert!(*is_error);
                 assert!(text.contains("requires approval"), "{text}");
             }
@@ -1133,6 +1392,205 @@ mod tests {
         let out = drive(
             Harness::Antigravity,
             &[r#"{"type":"result","result":{"status":"SUCCESS"}}"#],
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    // ---- OpenCode ----------------------------------------------------------
+
+    /// **Captured verbatim** from `opencode run --pure --agent schemaic
+    /// --format json`, driving a tool call and then answering. Byte-for-byte
+    /// apart from the line breaks this array imposes: the ids, the per-step
+    /// `tokens` objects and the `reason` values are exactly what the binary
+    /// wrote.
+    ///
+    /// It is the fixture that carries the two facts this dialect turns on — a
+    /// `step_finish` whose `reason` is `tool-calls` is *not* the end of the
+    /// turn, and the one whose reason is `stop` is, because nothing resembling
+    /// `turn.completed` is ever emitted.
+    const OC_REAL_TOOL_CYCLE: &[&str] = &[
+        r#"{"type":"step_start","timestamp":1788647017491,"sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","part":{"id":"prt_073ab8c0d001tZ8IFpFLsXlWR1","messageID":"msg_073ab87250011eYtXhMHciOVKE","sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","type":"step-start"}}"#,
+        r#"{"type":"tool_use","timestamp":1788647017703,"sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","part":{"type":"tool","tool":"glob","callID":"call_7d7b5533c49a40c6a5d4feca","state":{"status":"completed","input":{"pattern":"*.json"},"output":"only.json","metadata":{"count":1,"truncated":false},"time":{"start":1788647017603,"end":1788647017683}},"id":"prt_073ab8c62001vDU6f5IalTNarS","sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","messageID":"msg_073ab87250011eYtXhMHciOVKE"}}"#,
+        r#"{"type":"step_finish","timestamp":1788647017703,"sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","part":{"id":"prt_073ab8cd7001Z3Tclx7O3xs4hk","reason":"tool-calls","messageID":"msg_073ab87250011eYtXhMHciOVKE","sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","type":"step-finish","tokens":{"total":2536,"input":2497,"output":10,"reasoning":29,"cache":{"write":0,"read":0}},"cost":0}}"#,
+        r#"{"type":"step_start","timestamp":1788647018629,"sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","part":{"id":"prt_073ab907f001lV8Cg2emVjlGnQ","messageID":"msg_073ab8cdd001Gm7WtJOOb7DqA4","sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","type":"step-start"}}"#,
+        r#"{"type":"text","timestamp":1788647018724,"sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","part":{"id":"prt_073ab90c1001ClXrpFkcoD8FeO","messageID":"msg_073ab8cdd001Gm7WtJOOb7DqA4","sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","type":"text","text":"DONE","time":{"start":1788647018689,"end":1788647018716}}}"#,
+        r#"{"type":"step_finish","timestamp":1788647018724,"sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","part":{"id":"prt_073ab90dd001jG5FDOUzUeQQiA","reason":"stop","messageID":"msg_073ab8cdd001Gm7WtJOOb7DqA4","sessionID":"ses_f8c547cecffep40rcGQbMKGwOv","type":"step-finish","tokens":{"total":2645,"input":637,"output":2,"reasoning":22,"cache":{"write":0,"read":1984}},"cost":0}}"#,
+    ];
+
+    #[test]
+    fn a_real_opencode_tool_cycle_decodes_end_to_end() {
+        let out = drive(Harness::OpenCode, OC_REAL_TOOL_CYCLE);
+        match &out[..] {
+            [
+                StreamEvent::SessionStarted { id },
+                StreamEvent::ToolUse { name, .. },
+                StreamEvent::ToolResult { text, is_error },
+                StreamEvent::TextDelta(t),
+                StreamEvent::TurnDone { is_error: e2, .. },
+            ] => {
+                assert_eq!(id, "ses_f8c547cecffep40rcGQbMKGwOv");
+                assert_eq!(name, "glob");
+                assert_eq!(text, "only.json");
+                assert!(!is_error);
+                assert_eq!(t, "DONE");
+                assert!(!e2);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_opencode_turn_ends_only_on_the_terminal_step() {
+        // The whole dialect turns on this: `tool-calls` means another step is
+        // coming, and closing the turn there would cut the answer off before it
+        // was written. Exactly one `TurnDone`, and it is the last event.
+        let out = drive(Harness::OpenCode, OC_REAL_TOOL_CYCLE);
+        let dones = out
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::TurnDone { .. }))
+            .count();
+        assert_eq!(dones, 1, "{out:?}");
+        assert!(
+            matches!(out.last(), Some(StreamEvent::TurnDone { .. })),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_opencode_turn_sums_tokens_across_its_steps() {
+        // Per-*step* counts, not a turn total: the fixture's two steps report
+        // input 2497 then 637, and a footer showing only the last would tell the
+        // user the turn cost a quarter of what it did.
+        let out = drive(Harness::OpenCode, OC_REAL_TOOL_CYCLE);
+        match out.last() {
+            Some(StreamEvent::TurnDone { stats, .. }) => {
+                assert_eq!(stats.input_tokens, Some(2497 + 637));
+                assert_eq!(stats.output_tokens, Some(10 + 2));
+                // Wall clock across the turn, from the event timestamps.
+                assert_eq!(stats.duration_ms, Some(1788647018724 - 1788647017491));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_real_opencode_turn_renders_as_one_text_segment() {
+        // The composition, not the parser alone — the seam the fix campaign
+        // found thirteen tests missing.
+        let mut p = StreamParser::new(Harness::OpenCode);
+        let mut st = crate::TurnState::default();
+        for line in OC_REAL_TOOL_CYCLE {
+            for ev in p.push(line) {
+                st.apply(&ev);
+            }
+        }
+        let segs = st.segments();
+        assert!(segs.contains(&Seg::Text("DONE".to_string())), "{segs:?}");
+    }
+
+    #[test]
+    fn an_opencode_session_error_ends_the_turn_and_says_why() {
+        // `session.error` is the printer's only failure event, and nothing
+        // follows it — so a `TurnDone` has to come from here or the panel spins
+        // until the process exits and blames the exit status instead.
+        let out = drive(
+            Harness::OpenCode,
+            &[
+                r#"{"type":"error","error":{"name":"ProviderAuthError","data":{"message":"no credentials"}}}"#,
+            ],
+        );
+        assert!(text_of(&out).contains("no credentials"), "{out:?}");
+        assert!(
+            matches!(
+                out.last(),
+                Some(StreamEvent::TurnDone { is_error: true, .. })
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_opencode_error_falls_back_to_its_name() {
+        // `data.message` is optional in the printer; `name` is not.
+        let out = drive(
+            Harness::OpenCode,
+            &[r#"{"type":"error","error":{"name":"UnknownError"}}"#],
+        );
+        assert!(text_of(&out).contains("UnknownError"), "{out:?}");
+    }
+
+    #[test]
+    fn an_opencode_tool_still_pending_opens_a_chip_without_closing_it() {
+        // Every measured call arrived already `completed`, but the state machine
+        // has a `running` status and a chip that fills from a result we never
+        // received would be wrong in the other direction.
+        let out = drive(
+            Harness::OpenCode,
+            &[
+                r#"{"type":"tool_use","timestamp":1,"sessionID":"s","part":{"type":"tool","tool":"grep","callID":"c1","state":{"status":"running","input":{}}}}"#,
+            ],
+        );
+        // The id leads, as it does on every OpenCode event; what matters is that
+        // the chip opens and nothing closes it.
+        assert!(
+            matches!(
+                &out[..],
+                [
+                    StreamEvent::SessionStarted { .. },
+                    StreamEvent::ToolUse { .. }
+                ]
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_opencode_restated_tool_call_announces_once() {
+        // Same guard the other two per-turn dialects need, keyed on `callID`.
+        let running = r#"{"type":"tool_use","timestamp":1,"sessionID":"s","part":{"type":"tool","tool":"grep","callID":"c1","state":{"status":"running","input":{}}}}"#;
+        let done = r#"{"type":"tool_use","timestamp":2,"sessionID":"s","part":{"type":"tool","tool":"grep","callID":"c1","state":{"status":"completed","output":"hits"}}}"#;
+        let out = drive(Harness::OpenCode, &[running, done]);
+        let uses = out
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolUse { .. }))
+            .count();
+        assert_eq!(uses, 1, "{out:?}");
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, StreamEvent::ToolResult { text, .. } if text == "hits")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_opencode_mcp_tool_keeps_the_qualified_name_the_allowlist_speaks() {
+        // Our own server's tools arrive prefixed by OpenCode itself; the chip
+        // and the allow-list both speak `mcp__schemaic__run_query`.
+        let out = drive(
+            Harness::OpenCode,
+            &[
+                r#"{"type":"tool_use","timestamp":1,"sessionID":"s","part":{"type":"tool","tool":"schemaic_run_query","callID":"c9","state":{"status":"completed","input":{"sql":"select 1"},"output":"1"}}}"#,
+            ],
+        );
+        match out
+            .iter()
+            .find(|e| matches!(e, StreamEvent::ToolUse { .. }))
+        {
+            Some(StreamEvent::ToolUse { name, sql }) => {
+                assert_eq!(name, "mcp__schemaic__run_query");
+                assert_eq!(sql.as_deref(), Some("select 1"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_opencode_event_is_keyed_on_type_and_ignores_antigravity_shapes() {
+        // The mirror of the Antigravity trap above: a line tagged the *other*
+        // dialect's way must decode to nothing rather than being half-read.
+        let out = drive(
+            Harness::OpenCode,
+            &[r#"{"event":"result","result":{"status":"SUCCESS"}}"#],
         );
         assert!(out.is_empty(), "{out:?}");
     }
