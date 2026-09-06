@@ -26,17 +26,29 @@
 //! global to the machine but the sweep runs per process, so [`sweep`] used to
 //! remove a *live* instance's registration and rules the moment a second
 //! Schemaic launched — leaving that session holding database tools which had
-//! silently stopped existing. [`AgyRegistration::install`] now writes a marker
-//! naming the process that owns them, and the sweep defers only while that exact
-//! process is still running.
+//! silently stopped existing. [`AgyRegistration::install`] writes a [`Claim`]
+//! naming the session that owns them, and both removers defer to it.
 //!
-//! **The pid alone would not do it**, which is why the marker carries a start
-//! time as well: pids are reissued, so a crashed instance's marker eventually
-//! names some unrelated live process, and a sweep trusting the number would
-//! decline to clean up for the rest of that pid's life — turning a transient
-//! crash into the permanent standing grant this whole module exists to prevent.
-//! An unreadable or absent marker is treated as no claim at all, in the same
-//! direction and for the same reason.
+//! **Both removers, which is the part that was missing.** A claim that governs
+//! one and not the other governs nothing: the sweep consulted the marker while
+//! `Drop`, eighteen lines away, performed the same three removals and consulted
+//! nothing — so a second window's session *ending* disarmed a live one just as
+//! surely as its starting used to. [`may_release`] is now the same question
+//! [`crate::liveness::may_sweep`] asks, and neither remover has one of its own.
+//!
+//! **Three fields, and each closes a different way of getting this wrong.** The
+//! pid says who; the start time survives pid reuse, so a crashed instance's
+//! marker cannot name some unrelated live process and freeze the sweep for the
+//! rest of that pid's life (that reasoning lives in [`crate::liveness`]); and
+//! the nonce separates two sessions of *one* process, which a respawn produces
+//! and which the first two fields cannot tell apart. An unreadable or absent
+//! marker is treated as no claim at all, in the same direction and for the same
+//! reason.
+//!
+//! **The claim goes first and is dropped last.** It used to be written *after*
+//! the registration and the grant, leaving a window in which machine-global
+//! state existed that no marker accounted for; it is written atomically, because
+//! its reader is another process and a torn `fs::write` read as no claim at all.
 //!
 //! **Known limit: the server name is not ours to reserve.** `agy mcp add` is an
 //! upsert and `agy mcp remove` is unconditional, so a user who has registered
@@ -49,8 +61,10 @@
 //! single [`SERVER`] constant so a future check has one place to hook.
 
 use schemaic_ai::harness::{
-    antigravity_allow_rules, antigravity_settings_with_rules, antigravity_settings_without_rules,
+    SettingsEdit, antigravity_allow_rules, antigravity_settings_with_rules,
+    antigravity_settings_without_rules,
 };
+use schemaic_core::persist;
 use std::path::PathBuf;
 
 /// The MCP server name registered with `agy`. Also the `schemaic/` half of every
@@ -66,14 +80,34 @@ const SERVER: &str = "schemaic";
 /// exists for the case where that CLI moves it and this constant is wrong — the
 /// failure is then "no database tools" rather than "wrote into the wrong file".
 fn settings_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SCHEMAIC_AGY_SETTINGS")
+    settings_path_from(
+        std::env::var("SCHEMAIC_AGY_SETTINGS").ok().as_deref(),
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .as_deref(),
+    )
+}
+
+/// The rule behind [`settings_path`], with the environment as arguments.
+///
+/// **Pure so the test does not have to mutate the process environment.** It
+/// used to, with `unsafe { std::env::set_var }`, in a test binary whose siblings
+/// read the environment on other threads (`script.rs` and `conn_sources.rs` both
+/// call `env::temp_dir()`) — documented UB, and on glibc a real
+/// use-after-free when `setenv` reallocates `environ` under a concurrent
+/// `getenv`. It also *removed* a documented user-facing override rather than
+/// restoring it, so a developer running the suite lost their own setting.
+fn settings_path_from(
+    override_var: Option<&str>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(p) = override_var
         && !p.trim().is_empty()
     {
         return Some(PathBuf::from(p));
     }
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     Some(
-        PathBuf::from(home)
+        PathBuf::from(home?)
             .join(".gemini")
             .join("antigravity-cli")
             .join("settings.json"),
@@ -107,125 +141,179 @@ fn settings_to_edit(create: bool, existing: Option<String>) -> Option<String> {
 
 /// Rewrite the settings file through `edit`, which is handed the current text.
 ///
-/// Does nothing when [`settings_to_edit`] declines, or when `edit` does (an
-/// unparseable document — see `antigravity_settings_with_rules`). Returns
-/// whether it wrote.
-fn edit_settings(create: bool, edit: impl Fn(&str) -> Option<String>) -> bool {
+/// **The answer is used, not discarded.** All three callers ignored it, so
+/// `is_installed()` could report `true` with no rules granted, and a withdraw
+/// that failed or was declined — an unwritable file, an unparseable one — left a
+/// standing `run_query` auto-approval in the user's configuration permanently
+/// and silently. A grant that did not take must reach the session; a withdraw
+/// that did not take must reach the log.
+///
+/// `true` means the file now says what it was asked to say — which includes the
+/// [`SettingsEdit::Unchanged`] case, where it already did and **nothing is
+/// written**. That is not a shortcut: see [`SettingsEdit`] for what a needless
+/// rewrite costs the user's file.
+///
+/// The write is [`persist::write_file_atomic`], whose doc opens by naming the
+/// failure it exists for: `fs::write` truncates before it writes, so a full
+/// disk, a dropped network share or a crash between the two leaves the file
+/// empty. This is another vendor's configuration in a directory Schemaic does
+/// not own and cannot regenerate — the highest-blast-radius write in the app.
+fn edit_settings(create: bool, edit: impl Fn(&str) -> Option<SettingsEdit>) -> bool {
     let Some(path) = settings_path() else {
         return false;
     };
     let Some(current) = settings_to_edit(create, std::fs::read_to_string(&path).ok()) else {
         return false;
     };
-    let Some(next) = edit(&current) else {
-        return false;
-    };
-    if next == current {
-        return true;
+    match edit(&current) {
+        // Declined: the document is not a JSON object, and losing the user's
+        // file is worse than losing this session's database tools.
+        None => false,
+        Some(SettingsEdit::Unchanged) => true,
+        Some(SettingsEdit::Write(next)) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            persist::write_file_atomic(&path, next.as_bytes()).is_ok()
+        }
     }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    std::fs::write(&path, next).is_ok()
 }
 
-/// Which process claimed Antigravity's global state, as the marker records it.
+/// Which *session* holds Antigravity's global state, as the marker records it.
 ///
-/// **The start time is not decoration.** A pid alone cannot tell a live claim
-/// from a dead one: the operating system hands pids out again, so a marker left
-/// by a crashed instance eventually names some unrelated process that is very
-/// much running, and a sweep that trusted the pid would then decline to clean up
-/// for the rest of that pid's life.
+/// The [`Owner`] half answers "is the holder still running", and the reasoning
+/// for carrying a start time beside the pid lives with it in
+/// [`crate::liveness`]. The `nonce` answers the question a pid cannot: **two
+/// sessions in the same process.** Changing a setting respawns the AI session,
+/// and the new session's `install` runs concurrently with the old session's
+/// `Drop` on a different worker with no ordering between them — same pid, same
+/// start time, so an owner alone cannot tell them apart. When the teardown
+/// finished last it removed the registration, the rules and the marker the new
+/// session had just installed, and that session then ran with every database
+/// tool refused while `is_installed()` said `true`.
+///
+/// With a nonce the ordering stops mattering, which is the only fix available:
+/// whoever claims last owns the state, and a `Drop` whose nonce is no longer the
+/// one on disk removes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Owner {
-    pid: u32,
-    started: u64,
+struct Claim {
+    owner: crate::liveness::Owner,
+    nonce: u64,
 }
 
-/// Render a marker. One line, two fields — this file is written by one process
+/// Render a claim. One line, three fields — this file is written by one process
 /// and read by another, so the format is the interface between them.
-fn marker_text(o: Owner) -> String {
-    format!("{} {}\n", o.pid, o.started)
+fn claim_text(c: Claim) -> String {
+    format!("{} {} {}\n", c.owner.pid, c.owner.started, c.nonce)
 }
 
-/// Read a marker back, or `None` for anything that is not one.
+/// Read a claim back, or `None` for anything that is not one.
 ///
-/// A truncated or garbled marker answers `None`, which [`may_sweep`] treats as
-/// *no claim* — the same direction as no file at all. The alternative, refusing
-/// to sweep on an unreadable marker, would leave a standing permission grant in
-/// the user's config with nothing able to withdraw it.
-fn parse_marker(s: &str) -> Option<Owner> {
+/// A truncated or garbled marker answers `None`, which [`liveness::may_sweep`]
+/// treats as *no claim* — the same direction as no file at all. The alternative,
+/// refusing to sweep on an unreadable marker, would leave a standing permission
+/// grant in the user's config with nothing able to withdraw it.
+///
+/// [`liveness::may_sweep`]: crate::liveness::may_sweep
+fn parse_claim(s: &str) -> Option<Claim> {
     let mut it = s.split_whitespace();
     let pid = it.next()?.parse().ok()?;
     let started = it.next()?.parse().ok()?;
+    let nonce = it.next()?.parse().ok()?;
     if it.next().is_some() {
         return None;
     }
-    Some(Owner { pid, started })
+    Some(Claim {
+        owner: crate::liveness::Owner { pid, started },
+        nonce,
+    })
 }
 
-/// May the startup sweep remove the registration and the allow-rules?
+/// May *this* registration's teardown remove the global state?
 ///
-/// `live` is the start time of the process the marker names, if that pid is
-/// running at all.
-fn may_sweep(marker: Option<Owner>, live: Option<u64>, me: u32) -> bool {
-    let Some(o) = marker else {
-        return true;
-    };
-    // Our own pid, at startup: this process has only just begun, so it cannot be
-    // the instance in the middle of the session that wrote this.
-    if o.pid == me {
-        return true;
-    }
-    // A claim stands only while the process that made it is the one still on
-    // that pid. Anything else — gone, or replaced — is a crash's leftovers.
-    live != Some(o.started)
+/// **The asymmetry this closes.** The sweep read the marker, resolved the
+/// owner's liveness and deferred; `Drop` performed the same three removals
+/// eighteen lines away and consulted nothing at all — so a second window's
+/// session ending silently disarmed a live one. A claim that governs one remover
+/// and not the other governs nothing.
+///
+/// Three ways to answer no, and each is a bug that happened:
+/// - `installed == false` — never `agy mcp remove` a server this session did not
+///   add, which would tear down a *working* registration belonging to another
+///   instance.
+/// - `mine == None` — this session never managed to claim, so it is not holding
+///   anything to give back.
+/// - `on_disk != mine` — somebody claimed after us. On a respawn that somebody
+///   is the *next session in this very process*, which is why the comparison is
+///   the whole [`Claim`] and not its [`Owner`].
+fn may_release(mine: Option<Claim>, on_disk: Option<Claim>, installed: bool) -> bool {
+    installed && mine.is_some() && on_disk == mine
 }
 
 /// Where the claim is recorded. Beside the app's own state rather than in the
 /// shared temp directory: it is a claim on *this* machine's Antigravity config,
 /// and world-writable is the wrong permission for something a sweep obeys.
 fn marker_path() -> Option<PathBuf> {
-    Some(schemaic_core::persist::private_dir("agy")?.join("registration-owner"))
+    Some(persist::private_dir("agy")?.join("registration-owner"))
 }
 
-/// A process's start time, if that pid is running at all.
+/// The claim recorded on disk right now, if there is a readable one.
+fn claim_on_disk() -> Option<Claim> {
+    let text = std::fs::read_to_string(marker_path()?).ok()?;
+    parse_claim(&text)
+}
+
+/// A nonce for one registration. Only ever compared for equality with itself, so
+/// a process-local counter mixed with the clock is enough to keep two sessions
+/// of one process apart.
+fn next_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    n.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(now)
+}
+
+/// Claim the global state for this session, **before** installing it.
 ///
-/// The impure half of [`may_sweep`], kept to one line of answer so the decision
-/// itself stays testable without a process to look at.
-fn process_start(pid: u32) -> Option<u64> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let p = Pid::from_u32(pid);
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[p]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    sys.process(p).map(|pr| pr.start_time())
-}
-
-/// Claim the global state for this process, so another instance's startup sweep
-/// leaves it alone.
-fn claim() {
-    let me = std::process::id();
-    let Some(started) = process_start(me) else {
-        // Without a start time the claim could not be told from a pid-reuse, and
-        // a claim that cannot expire is worse than none: it would strand the
-        // allow-rules the sweep exists to withdraw.
-        return;
+/// **The claim goes first, and that is the opposite of the release.** It used to
+/// be written after `agy mcp add` and after the settings grant, so from the
+/// instant the registration landed until the claim returned, machine-global
+/// state existed that no marker accounted for — and a second launch's sweep in
+/// that window removed a live session's grant. A claim protecting state it was
+/// written after protects nothing; the release is last for the mirror reason,
+/// and only there because by then the state is already gone.
+///
+/// Written through [`persist::write_file_atomic`] because the reader is another
+/// process: `fs::write` truncates first, so a sweep landing between the truncate
+/// and the write read `""` or a prefix, [`parse_claim`] answered `None` for
+/// both, and a torn write by a *live* instance was treated as no claim at all.
+///
+/// `None` when the claim could not be made — no start time (it could not then be
+/// told from a pid-reuse, and a claim that cannot expire is worse than none), no
+/// private directory, or the write failed. The caller must not install without
+/// one.
+fn claim() -> Option<Claim> {
+    let c = Claim {
+        owner: crate::liveness::me()?,
+        nonce: next_nonce(),
     };
-    let Some(path) = marker_path() else {
-        return;
-    };
+    let path = marker_path()?;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, marker_text(Owner { pid: me, started }));
+    persist::write_file_atomic(&path, claim_text(c).as_bytes()).ok()?;
+    Some(c)
 }
 
-/// Drop this process's claim.
-fn release() {
+/// Drop a claim, but only if it is still the one on disk.
+fn release(mine: Option<Claim>) {
+    if mine.is_none() || claim_on_disk() != mine {
+        return;
+    }
     if let Some(path) = marker_path() {
         let _ = std::fs::remove_file(path);
     }
@@ -253,8 +341,12 @@ fn agy_mcp(bin: &str, args: &[&str]) -> bool {
 pub(crate) struct AgyRegistration {
     bin: String,
     rules: Vec<String>,
-    /// Whether the registration actually took. A failed install must not have
-    /// its `Drop` remove a server this session never added.
+    /// This session's claim, or `None` if it never made one.
+    mine: Option<Claim>,
+    /// Whether the registration **and** its allow-rules actually took. A failed
+    /// install must not have its `Drop` remove a server this session never
+    /// added, and a session whose rules were declined has no database tools
+    /// however well `agy mcp add` went.
     installed: bool,
 }
 
@@ -264,10 +356,29 @@ impl AgyRegistration {
     /// `allowed` is the connection's own tool list, so a schema-only connection
     /// never grants `run_query` — the same rule the Codex overrides and Claude's
     /// `--allowedTools` follow.
+    ///
+    /// **Order: claim, register, grant.** See [`claim`] for why it goes first
+    /// and [`Claim`] for what the nonce buys on a respawn.
     pub(crate) fn install(bin: &str, exe: &str, endpoint_file: &str, allowed: &[&str]) -> Self {
+        let rules = antigravity_allow_rules(allowed);
+        let mine = claim();
+        let mut reg = Self {
+            bin: bin.to_string(),
+            rules,
+            mine,
+            installed: false,
+        };
+        if mine.is_none() {
+            // Without a claim there is nothing to stop another instance's sweep
+            // withdrawing this grant mid-session, and nothing to tell this
+            // session's own teardown whether the state is still its own. The
+            // session runs without database tools instead, which it says.
+            tracing::warn!("could not claim Antigravity's configuration for this session");
+            return reg;
+        }
         // `--` first: the command's own arguments start with `-`, and `agy mcp
         // add` rejects a flag placed after the server name.
-        let installed = agy_mcp(
+        let registered = agy_mcp(
             bin,
             &[
                 "add",
@@ -279,21 +390,30 @@ impl AgyRegistration {
                 endpoint_file,
             ],
         );
-        let rules = antigravity_allow_rules(allowed);
-        if installed {
-            let r = rules.clone();
-            // Granting: a fresh Antigravity install has no settings file yet, and
-            // the rules are what its tools need to run at all.
-            edit_settings(true, move |cur| antigravity_settings_with_rules(cur, &r));
-            // And say who owns them, so a second Schemaic's startup sweep does
-            // not withdraw this session's grant while it is still using it.
-            claim();
+        if !registered {
+            release(reg.mine.take());
+            return reg;
         }
-        Self {
-            bin: bin.to_string(),
-            rules,
-            installed,
+        let r = reg.rules.clone();
+        // Granting: a fresh Antigravity install has no settings file yet, and
+        // the rules are what its tools need to run at all.
+        //
+        // **The answer decides whether this session has tools.** It used to be
+        // discarded, so an unparseable or unwritable `settings.json` produced a
+        // registered server whose every call that CLI refuses, reported as a
+        // working session.
+        let granted = edit_settings(true, move |cur| antigravity_settings_with_rules(cur, &r));
+        if !granted {
+            tracing::warn!(
+                "Antigravity's settings file could not be granted the Schemaic tool rules; \
+                 withdrawing the registration rather than leaving a server whose calls are refused"
+            );
+            agy_mcp(bin, &["remove", SERVER]);
+            release(reg.mine.take());
+            return reg;
         }
+        reg.installed = true;
+        reg
     }
 
     /// Did the registration take? `false` means the session runs without
@@ -314,21 +434,34 @@ impl AgyRegistration {
 /// cheaper of the two.
 impl Drop for AgyRegistration {
     fn drop(&mut self) {
-        if !self.installed {
+        // **The same ownership question the sweep asks**, and it used to ask
+        // nothing at all. See [`may_release`].
+        if !may_release(self.mine, claim_on_disk(), self.installed) {
             return;
         }
         let rules = std::mem::take(&mut self.rules);
         // Withdrawing: only ever from a file that is there. This arm is reached
         // after a successful `install`, so it will be — but the flag is the
         // rule, not the reachability.
-        edit_settings(false, move |cur| {
+        let withdrawn = edit_settings(false, move |cur| {
             antigravity_settings_without_rules(cur, &rules)
         });
+        if !withdrawn {
+            // The end state the module doc names as the bad one — rules without
+            // a registration — and it is permanent: the next launch's sweep
+            // fails on the same file for the same reason. Said out loud rather
+            // than discovered.
+            tracing::error!(
+                "could not withdraw Schemaic's tool rules from Antigravity's settings file; \
+                 they are still granted. Remove the `mcp(schemaic/…)` entries from \
+                 `permissions.allow` by hand if the file is not going to become writable."
+            );
+        }
         agy_mcp(&self.bin, &["remove", SERVER]);
         // The claim goes last, and only after the state it claimed is gone: a
         // release that ran first would open a window in which another instance's
         // sweep could race this one's own removal.
-        release();
+        release(self.mine.take());
     }
 }
 
@@ -345,18 +478,16 @@ pub(crate) fn sweep(bin: Option<&str>) {
     // and allow-rules — leaving that session holding database tools that had
     // silently stopped existing. A claim written by `install` says who owns it;
     // only a claim whose owner is gone is a crash's leftovers.
-    let owner = marker_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .as_deref()
-        .and_then(parse_marker);
-    if !may_sweep(
-        owner,
-        owner.and_then(|o| process_start(o.pid)),
-        std::process::id(),
+    let held = claim_on_disk();
+    if !crate::liveness::may_sweep(
+        held.map(|c| c.owner),
+        held.and_then(|c| crate::liveness::process_start(c.owner.pid)),
     ) {
         return;
     }
-    release();
+    // Whatever was on disk is a dead instance's, so it is ours to drop — and
+    // `release` compares, so passing what we just read is what lets it go.
+    release(held);
     // The rules can be removed with no `agy` at all — it is our own file surgery
     // — so that half runs regardless.
     let all: Vec<&str> = crate::ai::AI_TOOLS_WITH_QUERY.to_vec();
@@ -365,9 +496,17 @@ pub(crate) fn sweep(bin: Option<&str>) {
     // them have no Antigravity at all — writing `{}` into that CLI's config
     // directory to withdraw rules nobody granted is the whole hazard `create`
     // exists to close.
-    edit_settings(false, move |cur| {
+    if !edit_settings(false, move |cur| {
         antigravity_settings_without_rules(cur, &rules)
-    });
+    }) {
+        // Only ever reached with a file that *is* there and could not be parsed
+        // or written — never for the majority of users, who have no Antigravity
+        // and whose read simply fails. See the `create` argument.
+        tracing::error!(
+            "a crashed session's Schemaic tool rules could not be withdrawn from \
+             Antigravity's settings file; they are still granted"
+        );
+    }
     if let Some(bin) = bin {
         agy_mcp(bin, &["remove", SERVER]);
     }
@@ -376,6 +515,7 @@ pub(crate) fn sweep(bin: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::liveness::{Owner, may_sweep};
 
     /// **The sweep must not create the file it is cleaning.** It runs at every
     /// launch for every user, and most have no Antigravity: reading fails, the
@@ -389,15 +529,20 @@ mod tests {
         // The sweep's arguments: no file, and no permission to create one.
         assert_eq!(settings_to_edit(false, None), None);
         // …and had it been allowed to proceed, this is what would have landed —
-        // the write this test exists to prevent.
-        let would_have_written =
-            antigravity_settings_without_rules("", &rules).expect("the pure layer accepts empty");
-        assert_eq!(would_have_written.trim(), "{}");
+        // the write this test exists to prevent. (It is `Unchanged` now, which
+        // is a second guard on the same hazard: nothing was there to remove.)
+        assert_eq!(
+            antigravity_settings_without_rules("", &rules),
+            Some(SettingsEdit::Unchanged)
+        );
 
         // Granting is the other half and still creates: a fresh install has no
         // file, and its tools are refused without the rules.
         let fresh = settings_to_edit(true, None).expect("a document to edit");
-        let granted = antigravity_settings_with_rules(&fresh, &rules).expect("merged");
+        let Some(SettingsEdit::Write(granted)) = antigravity_settings_with_rules(&fresh, &rules)
+        else {
+            panic!("a fresh install must be granted its rules");
+        };
         assert!(granted.contains("mcp(schemaic/list_schema)"), "{granted}");
 
         // An existing document is handed over verbatim either way.
@@ -412,28 +557,75 @@ mod tests {
     #[test]
     fn the_settings_path_is_overridable_for_a_cli_that_moves_it() {
         // Not a documented location — it was observed — so the override exists
-        // to make being wrong cost tools rather than the wrong file.
-        unsafe { std::env::set_var("SCHEMAIC_AGY_SETTINGS", "/tmp/zz-agy.json") };
-        assert_eq!(settings_path(), Some(PathBuf::from("/tmp/zz-agy.json")));
-        unsafe { std::env::remove_var("SCHEMAIC_AGY_SETTINGS") };
-        // Without it, the observed path under the user's home.
-        let p = settings_path().expect("a home directory");
-        assert!(p.ends_with("settings.json"), "{p:?}");
-        assert!(p.to_string_lossy().contains("antigravity-cli"), "{p:?}");
+        // to make being wrong cost tools rather than the wrong file. Asked as a
+        // pure question: the version of this test that answered it by mutating
+        // the process environment was documented UB in a parallel test binary
+        // whose siblings read it.
+        let home = std::ffi::OsString::from("/home/u");
+        assert_eq!(
+            settings_path_from(Some("/tmp/zz-agy.json"), Some(&home)),
+            Some(PathBuf::from("/tmp/zz-agy.json"))
+        );
+        // An override that is present but blank is not an override.
+        for blank in ["", "   "] {
+            let p = settings_path_from(Some(blank), Some(&home)).expect("the home path");
+            assert!(p.ends_with("settings.json"), "{p:?}");
+            assert!(p.to_string_lossy().contains("antigravity-cli"), "{p:?}");
+        }
+        // Without either, there is no path at all — and no file to write.
+        assert_eq!(settings_path_from(None, None), None);
     }
 
+    /// **The guard, not the absence of a panic.** This test used to assert only
+    /// that dropping a failed registration did not panic — which it does not
+    /// with the guard deleted either, because on CI there is no settings file
+    /// and `agy_mcp("zz-not-a-binary")` cannot spawn. With the guard gone the
+    /// suite would then delete a *live* session's marker on every `cargo test`,
+    /// causing the regression the test exists to catch. So the decision is asked
+    /// directly.
     #[test]
     fn a_failed_registration_removes_nothing_on_drop() {
-        // The `Drop` must not `agy mcp remove` a server this session never
-        // added — that would tear down a *working* registration belonging to
-        // another instance.
-        let reg = AgyRegistration {
-            bin: "zz-not-a-binary".to_string(),
-            rules: vec!["mcp(schemaic/list_schema)".to_string()],
-            installed: false,
+        let mine = Claim {
+            owner: Owner {
+                pid: 1234,
+                started: 900,
+            },
+            nonce: 7,
         };
-        assert!(!reg.is_installed());
-        drop(reg); // must not panic, and must not touch anything
+        // A registration that never took: nothing of ours is out there, and
+        // `agy mcp remove` would tear down another instance's working server.
+        assert!(!may_release(Some(mine), Some(mine), false));
+        // A session that never managed to claim is not holding anything either.
+        assert!(!may_release(None, Some(mine), true));
+        assert!(!may_release(None, None, true));
+        // The successful case, so the guard is not vacuously "never".
+        assert!(may_release(Some(mine), Some(mine), true));
+    }
+
+    /// **A respawn is two sessions in one process**, so the pid and the start
+    /// time are identical and only the nonce separates them. `ai_send` starts
+    /// the new session first and drops the old one afterwards, on a different
+    /// worker with no ordering — so the teardown regularly runs *after* the new
+    /// install, and used to remove the registration, the rules and the marker
+    /// the new session had just put in place. That session then had every
+    /// database tool refused while `is_installed()` said `true`.
+    #[test]
+    fn the_previous_sessions_teardown_does_not_disarm_the_one_that_replaced_it() {
+        let owner = Owner {
+            pid: 1234,
+            started: 900,
+        };
+        let old = Claim { owner, nonce: 1 };
+        let new = Claim { owner, nonce: 2 };
+        assert!(
+            !may_release(Some(old), Some(new), true),
+            "the old session's Drop removed the new session's registration"
+        );
+        // …and the ordinary case is untouched: nobody claimed after us.
+        assert!(may_release(Some(old), Some(old), true));
+        // An owner comparison alone cannot see this, which is why the nonce is
+        // in the marker at all.
+        assert_eq!(old.owner, new.owner);
     }
 
     #[test]
@@ -447,21 +639,21 @@ mod tests {
         assert!(rules.len() >= crate::ai::AI_TOOLS_READ_ONLY.len());
     }
 
-    const ME: u32 = 4242;
-
-    /// The bug this marker exists for: the sweep runs at **every** launch and
+    /// The bug the marker exists for: the sweep runs at **every** launch and
     /// removed the registration unconditionally, so starting a second Schemaic
     /// while the first had a live AI session pulled that session's server and
-    /// allow-rules out from under it. The first instance then held a session
-    /// whose database tools had silently stopped existing.
+    /// allow-rules out from under it.
     #[test]
     fn a_second_instance_does_not_sweep_a_live_instances_registration() {
-        let owner = Owner {
-            pid: 1234,
-            started: 900,
+        let c = Claim {
+            owner: Owner {
+                pid: 1234,
+                started: 900,
+            },
+            nonce: 5,
         };
         assert!(
-            !may_sweep(Some(owner), Some(900), ME),
+            !may_sweep(Some(c.owner), Some(900)),
             "swept a registration whose owner is still running"
         );
     }
@@ -474,47 +666,60 @@ mod tests {
             started: 900,
         };
         // The pid is not running at all.
-        assert!(may_sweep(Some(owner), None, ME));
+        assert!(may_sweep(Some(owner), None));
         // The pid is running, but it is not the process that wrote the marker —
         // the operating system handed that number to something else. Trusting
         // the pid alone would decline to clean up for the rest of its life.
-        assert!(may_sweep(Some(owner), Some(901), ME));
+        assert!(may_sweep(Some(owner), Some(901)));
     }
 
     /// No claim, no reason to defer — including a marker too damaged to read,
     /// which must not be able to strand a permission grant in the user's config.
     #[test]
     fn an_absent_or_unreadable_marker_is_not_a_claim() {
-        assert!(may_sweep(None, None, ME));
+        assert!(may_sweep(None, None));
         for junk in [
             "",
             "   ",
-            "not-a-pid 900",
+            "not-a-pid 900 1",
             "1234",
-            "1234 900 extra",
-            "1234 x",
+            "1234 900",
+            "1234 900 1 extra",
+            "1234 x 1",
+            "1234 900 x",
         ] {
-            assert_eq!(parse_marker(junk), None, "{junk:?} parsed as a marker");
+            assert_eq!(parse_claim(junk), None, "{junk:?} parsed as a claim");
         }
     }
 
-    /// A marker naming *us* at startup is our own leftover — this process has
-    /// only just begun, so it cannot be in the middle of a session it owns.
+    /// **The arm that is deliberately gone.** `may_sweep` used to answer `true`
+    /// for any marker naming our own pid, on the stated assumption that a sweep
+    /// runs "at startup" and so cannot be the instance mid-session. The sweep is
+    /// a *detached* thread with `detect_bin`, a `sysinfo` refresh and an
+    /// `agy mcp remove` ahead of it; a user who presses Enter in the AI panel
+    /// first has already installed a marker naming this pid, with this pid's
+    /// start time. Nothing joined that thread and no flag marked it done.
     #[test]
-    fn our_own_stale_marker_does_not_stop_us() {
+    fn our_own_live_claim_survives_our_own_startup_sweep() {
         let mine = Owner {
-            pid: ME,
+            pid: 4242,
             started: 900,
         };
-        assert!(may_sweep(Some(mine), Some(900), ME));
+        assert!(
+            !may_sweep(Some(mine), Some(900)),
+            "the startup sweep removed the session this very process had just installed"
+        );
     }
 
     #[test]
-    fn a_marker_round_trips() {
-        let o = Owner {
-            pid: 31337,
-            started: 1_700_000_000,
+    fn a_claim_round_trips() {
+        let c = Claim {
+            owner: Owner {
+                pid: 31337,
+                started: 1_700_000_000,
+            },
+            nonce: 99,
         };
-        assert_eq!(parse_marker(&marker_text(o)), Some(o));
+        assert_eq!(parse_claim(&claim_text(c)), Some(c));
     }
 }

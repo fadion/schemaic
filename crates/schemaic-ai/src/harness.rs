@@ -1369,6 +1369,30 @@ pub fn antigravity_allow_rules(allowed: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// What one of the settings surgeries below asks its caller to do.
+///
+/// **The "nothing changed" answer has to come from here**, because nothing
+/// outside can compute it. The caller used to decide by comparing the returned
+/// text against the bytes it read, which is a comparison that never succeeds: a
+/// `to_string_pretty` re-serialization carries no trailing newline, and with no
+/// `preserve_order` feature in this workspace `serde_json::Map` is a `BTreeMap`,
+/// so the user's keys come back sorted. Every Antigravity user therefore had
+/// another vendor's configuration file truncated and rewritten on **every**
+/// launch — including everyone who never opened the AI panel, since the startup
+/// sweep withdraws rules that are usually not there.
+///
+/// Rewriting is not free even when the content is equivalent: it re-sorts keys,
+/// strips the trailing newline, collapses CRLF, normalizes numbers and collapses
+/// duplicate keys. It is a fair price for an edit the user asked for, and no
+/// price at all is right for an edit that removes nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettingsEdit {
+    /// The document already says what it was asked to say. **Write nothing.**
+    Unchanged,
+    /// Replace the file with this text.
+    Write(String),
+}
+
 /// Add `rules` to an Antigravity `settings.json`, preserving everything else.
 ///
 /// **Merged, never rewritten.** This is the user's file: it holds their
@@ -1381,24 +1405,32 @@ pub fn antigravity_allow_rules(allowed: &[&str]) -> Vec<String> {
 /// is one we must not overwrite, and the cost of declining is that Antigravity
 /// gets no database tools this session rather than that the user loses a file.
 ///
-/// Idempotent: adding a rule that is already there changes nothing, so a crashed
-/// session that left rules behind does not accumulate duplicates.
-pub fn antigravity_settings_with_rules(current: &str, rules: &[String]) -> Option<String> {
+/// Idempotent, and it says so: adding a rule that is already there answers
+/// [`SettingsEdit::Unchanged`], so a crashed session that left rules behind
+/// costs the next launch neither a duplicate nor a rewrite.
+pub fn antigravity_settings_with_rules(current: &str, rules: &[String]) -> Option<SettingsEdit> {
     let mut doc = parse_settings(current)?;
-    let allow = doc
-        .entry("permissions")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()?
-        .entry("allow")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    let arr = allow.as_array_mut()?;
-    for r in rules {
-        let v = serde_json::Value::String(r.clone());
-        if !arr.contains(&v) {
-            arr.push(v);
+    let mut added = false;
+    {
+        let allow = doc
+            .entry("permissions")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()?
+            .entry("allow")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let arr = allow.as_array_mut()?;
+        for r in rules {
+            let v = serde_json::Value::String(r.clone());
+            if !arr.contains(&v) {
+                arr.push(v);
+                added = true;
+            }
         }
     }
-    serde_json::to_string_pretty(&serde_json::Value::Object(doc)).ok()
+    if !added {
+        return Some(SettingsEdit::Unchanged);
+    }
+    Some(SettingsEdit::Write(render_settings(doc)?))
 }
 
 /// Remove exactly `rules` from an Antigravity `settings.json`.
@@ -1411,21 +1443,40 @@ pub fn antigravity_settings_with_rules(current: &str, rules: &[String]) -> Optio
 /// standing grant nobody remembers making — the worse of the two.
 ///
 /// Empty `permissions`/`allow` containers are pruned so the file returns to the
-/// shape it had before, rather than accumulating scaffolding.
-pub fn antigravity_settings_without_rules(current: &str, rules: &[String]) -> Option<String> {
+/// shape it had before — but **only the ones this call emptied**. The pruning
+/// used to test the *post-`retain`* state instead, so a user whose own file
+/// already held `{"permissions":{"allow":[]}}` had that key deleted on a launch
+/// where Schemaic had added nothing and withdrawn nothing.
+pub fn antigravity_settings_without_rules(current: &str, rules: &[String]) -> Option<SettingsEdit> {
     let mut doc = parse_settings(current)?;
+    let mut removed = false;
     if let Some(perms) = doc.get_mut("permissions").and_then(|p| p.as_object_mut()) {
+        let mut emptied_allow = false;
         if let Some(arr) = perms.get_mut("allow").and_then(|a| a.as_array_mut()) {
+            let before = arr.len();
             arr.retain(|v| !v.as_str().is_some_and(|s| rules.iter().any(|r| r == s)));
-            if arr.is_empty() {
-                perms.remove("allow");
+            removed = arr.len() != before;
+            emptied_allow = removed && arr.is_empty();
+        }
+        if emptied_allow {
+            perms.remove("allow");
+            if perms.is_empty() {
+                doc.remove("permissions");
             }
         }
-        if perms.is_empty() {
-            doc.remove("permissions");
-        }
     }
-    serde_json::to_string_pretty(&serde_json::Value::Object(doc)).ok()
+    if !removed {
+        return Some(SettingsEdit::Unchanged);
+    }
+    Some(SettingsEdit::Write(render_settings(doc)?))
+}
+
+/// Serialize a settings document back out, with the trailing newline every
+/// editor and CLI that writes this file leaves on it.
+fn render_settings(doc: serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let mut s = serde_json::to_string_pretty(&serde_json::Value::Object(doc)).ok()?;
+    s.push('\n');
+    Some(s)
 }
 
 /// A settings document, or `None` if it is not a JSON object.
@@ -2083,6 +2134,17 @@ mod tests {
   ]
 }"#;
 
+    /// The text a surgery asked for, or a panic naming which answer came back.
+    /// Every test below that asserts on *content* wants a real write; the ones
+    /// that assert on `Unchanged` say so directly.
+    fn written(edit: Option<SettingsEdit>) -> String {
+        match edit {
+            Some(SettingsEdit::Write(s)) => s,
+            Some(SettingsEdit::Unchanged) => panic!("expected a write, got Unchanged"),
+            None => panic!("expected a write, the document was declined"),
+        }
+    }
+
     #[test]
     fn the_rules_name_each_tool_and_follow_the_access_level() {
         let full =
@@ -2101,7 +2163,7 @@ mod tests {
     #[test]
     fn adding_rules_preserves_every_other_setting() {
         let rules = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
-        let out = antigravity_settings_with_rules(AGY_SETTINGS, &rules).expect("merged");
+        let out = written(antigravity_settings_with_rules(AGY_SETTINGS, &rules));
         let v: serde_json::Value = serde_json::from_str(&out).expect("json");
         // The user's own key survives untouched — this is their file.
         assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\jonid");
@@ -2112,9 +2174,14 @@ mod tests {
     fn adding_the_same_rule_twice_does_not_duplicate_it() {
         // A crashed session leaves rules behind; the next one must not stack.
         let rules = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
-        let once = antigravity_settings_with_rules(AGY_SETTINGS, &rules).expect("merged");
-        let twice = antigravity_settings_with_rules(&once, &rules).expect("merged");
-        let v: serde_json::Value = serde_json::from_str(&twice).expect("json");
+        let once = written(antigravity_settings_with_rules(AGY_SETTINGS, &rules));
+        // The second grant has nothing to add, so it asks for no write at all —
+        // and what it would have written still holds exactly one rule.
+        assert_eq!(
+            antigravity_settings_with_rules(&once, &rules),
+            Some(SettingsEdit::Unchanged)
+        );
+        let v: serde_json::Value = serde_json::from_str(&once).expect("json");
         assert_eq!(
             v["permissions"]["allow"].as_array().expect("array").len(),
             1
@@ -2125,8 +2192,8 @@ mod tests {
     fn removing_our_rules_restores_the_original_shape() {
         let rules =
             antigravity_allow_rules(&["mcp__schemaic__list_schema", "mcp__schemaic__run_query"]);
-        let added = antigravity_settings_with_rules(AGY_SETTINGS, &rules).expect("merged");
-        let back = antigravity_settings_without_rules(&added, &rules).expect("removed");
+        let added = written(antigravity_settings_with_rules(AGY_SETTINGS, &rules));
+        let back = written(antigravity_settings_without_rules(&added, &rules));
         let v: serde_json::Value = serde_json::from_str(&back).expect("json");
         assert_eq!(v["trustedWorkspaces"][0], "C:\\Users\\jonid");
         // The scaffolding is gone, not left behind empty.
@@ -2136,11 +2203,12 @@ mod tests {
     #[test]
     fn a_rule_we_did_not_add_is_left_alone() {
         let mine = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
-        let with_theirs =
-            antigravity_settings_with_rules(AGY_SETTINGS, &["mcp(other/their_tool)".to_string()])
-                .expect("merged");
-        let both = antigravity_settings_with_rules(&with_theirs, &mine).expect("merged");
-        let back = antigravity_settings_without_rules(&both, &mine).expect("removed");
+        let with_theirs = written(antigravity_settings_with_rules(
+            AGY_SETTINGS,
+            &["mcp(other/their_tool)".to_string()],
+        ));
+        let both = written(antigravity_settings_with_rules(&with_theirs, &mine));
+        let back = written(antigravity_settings_without_rules(&both, &mine));
         let v: serde_json::Value = serde_json::from_str(&back).expect("json");
         let allow = v["permissions"]["allow"].as_array().expect("array");
         assert_eq!(allow.len(), 1);
@@ -2159,11 +2227,79 @@ mod tests {
         );
     }
 
+    /// **The launch sweep must not rewrite a file it took nothing out of.**
+    /// `edit_settings` used to decide that by comparing the pure layer's
+    /// `to_string_pretty` output against the bytes it read — which never matches
+    /// a file an editor or a CLI wrote, because that output carries no trailing
+    /// newline and (this workspace does not enable `preserve_order`) comes back
+    /// with the user's keys sorted. So every Antigravity user had another
+    /// vendor's settings truncated, re-sorted and rewritten at **every** launch,
+    /// including the ones who never opened the AI panel. Only the pure layer can
+    /// answer "did anything change", so it does.
+    #[test]
+    fn withdrawing_from_a_file_that_holds_none_of_our_rules_changes_nothing() {
+        let rules = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
+        for untouched in [
+            AGY_SETTINGS,
+            r#"{"permissions":{"allow":["mcp(other/their_tool)"]}}"#,
+            "{}",
+            "",
+        ] {
+            assert_eq!(
+                antigravity_settings_without_rules(untouched, &rules),
+                Some(SettingsEdit::Unchanged),
+                "rewrote a file it removed nothing from: {untouched}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: granting a rule that is already granted
+    /// is not a reason to rewrite the user's file either. A crashed session
+    /// leaves its rules behind, so this is the *common* case on the next launch.
+    #[test]
+    fn granting_a_rule_that_is_already_there_changes_nothing() {
+        let rules = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
+        let once = written(antigravity_settings_with_rules(AGY_SETTINGS, &rules));
+        assert_eq!(
+            antigravity_settings_with_rules(&once, &rules),
+            Some(SettingsEdit::Unchanged)
+        );
+    }
+
+    /// **Prune only what we emptied.** The pruning tested the *post-`retain`*
+    /// state rather than whether `retain` removed anything, so a user who
+    /// already had `{"permissions":{"allow":[]}}` — Schemaic having added
+    /// nothing — lost the key on the next launch's sweep. Both the function's
+    /// own doc and `docs/architecture.md` claim it prunes only containers it
+    /// emptied.
+    #[test]
+    fn an_empty_container_we_did_not_empty_is_left_where_it_was() {
+        let rules = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
+        let theirs = r#"{"permissions":{"allow":[]},"trustedWorkspaces":["/home/x"]}"#;
+        assert_eq!(
+            antigravity_settings_without_rules(theirs, &rules),
+            Some(SettingsEdit::Unchanged),
+            "deleted a key the user's own file already had"
+        );
+        // And an `allow` that held only somebody else's rule keeps its
+        // container even though ours is gone from it.
+        let mixed = format!(
+            r#"{{"permissions":{{"allow":["mcp(other/t)","{}"]}}}}"#,
+            rules[0]
+        );
+        let out = written(antigravity_settings_without_rules(&mixed, &rules));
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            v["permissions"]["allow"].as_array().expect("array").len(),
+            1
+        );
+    }
+
     #[test]
     fn a_fresh_install_with_an_empty_file_still_gets_its_rules() {
         let rules = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
         for empty in ["", "   ", "\n"] {
-            let out = antigravity_settings_with_rules(empty, &rules).expect("merged");
+            let out = written(antigravity_settings_with_rules(empty, &rules));
             let v: serde_json::Value = serde_json::from_str(&out).expect("json");
             assert_eq!(v["permissions"]["allow"][0], "mcp(schemaic/list_schema)");
         }
