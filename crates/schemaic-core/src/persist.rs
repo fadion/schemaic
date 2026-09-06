@@ -206,10 +206,19 @@ pub struct UiState {
     /// (`Harness::key`), written by Settings → AI.
     ///
     /// Defaults to `claude`, which is what every settings file written before
-    /// this field existed meant — the app drove that CLI and nothing else. An
-    /// unrecognised value is **not** silently replaced with the default; the app
-    /// reports it, because substituting a different CLI than the file names is
-    /// invisible to the person reading the panel.
+    /// this field existed meant — the app drove that CLI and nothing else.
+    ///
+    /// An unrecognised value is **not** silently replaced with the default —
+    /// and that promise used to be false one save later, which is the more
+    /// interesting half. Serde keeps whatever the file said, but the app
+    /// persisted `Harness::key()` of the *fallback*, so the next thing that
+    /// touched the settings overwrote the name the user's file carried and a
+    /// build that later grew that harness had nothing to restore. The app holds
+    /// the raw key and writes it back until the user picks a harness themselves;
+    /// the fallback is reported rather than substituted, because a panel driving
+    /// a different CLI than the file names is invisible to the person reading
+    /// it. Loading one also clears `ai_model` and `ai_cli_path`, which were set
+    /// for a CLI this build does not have.
     #[serde(default = "default_ai_harness")]
     pub ai_harness: String,
     /// AI Assistant — override path to the agent CLI binary. Empty = auto-detect.
@@ -515,6 +524,21 @@ pub fn config_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(dir.join("schemaic"))
+}
+
+/// Which [`UiState::ai_harness`] key a save should write.
+///
+/// `unknown` is the raw key the file carried when this build did not recognise
+/// it; `running` is `Harness::key()` of the one actually driving the panel.
+///
+/// **The rule, rather than one line at the persist site**, because that line was
+/// the whole bug: the field's doc promised an unrecognised value would not be
+/// silently replaced with the default, and the save wrote the *fallback's* key
+/// over it. `an_unknown_harness_survives_the_round_trip_rather_than_being_
+/// corrected` was green throughout, because it tested serde in isolation and
+/// never the composition with the caller that overwrote.
+pub fn ai_harness_to_persist(unknown: Option<&str>, running: &str) -> String {
+    unknown.unwrap_or(running).to_string()
 }
 
 /// Path to the persisted UI-state file, if we can determine a config directory.
@@ -1049,9 +1073,10 @@ pub fn clear_connections_backup() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionsFile, FileStore, Load, RECOVERIES, RightPanelState, UiState, classify,
-        legacy_ai_run_queries_in, private_dir_in, read_bytes, recover, recovery_notice, sibling,
-        statement_timeout, statement_timeout_label, take_recoveries, write_bytes,
+        ConnectionsFile, FileStore, Load, RECOVERIES, RightPanelState, UiState,
+        ai_harness_to_persist, classify, legacy_ai_run_queries_in, private_dir_in, read_bytes,
+        recover, recovery_notice, sibling, statement_timeout, statement_timeout_label,
+        take_recoveries, write_bytes,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -1175,6 +1200,21 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&state).expect("serializes"))
                 .expect("re-parses");
         assert_eq!(back.ai_harness, "some-future-cli");
+
+        // **Serde is only half of it, and the other half is the caller.** This
+        // test was green while the app wrote `Harness::key()` of the *fallback*
+        // on every save, so the key survived the round trip here and was gone
+        // from the user's file one save later. The composition is the rule
+        // below, and the app calls it rather than spelling it out at the persist
+        // site.
+        assert_eq!(
+            ai_harness_to_persist(Some(&state.ai_harness), "claude"),
+            "some-future-cli",
+            "the fallback overwrote the name the file carried"
+        );
+        assert_eq!(ai_harness_to_persist(None, "codex"), "codex");
+        // …and once the user picks something, the file names what runs.
+        assert_eq!(ai_harness_to_persist(None, "claude"), "claude");
     }
 
     // ── The save/load composition ─────────────────────────────────────────

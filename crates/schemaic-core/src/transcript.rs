@@ -822,6 +822,43 @@ mod tests {
         let mut b = base.clone();
         b.segs = vec![Seg::Text("a".into()), Seg::Text("bc".into())];
         assert_ne!(fp(&a), fp(&b));
+
+        // The harness key, which this test enumerated every other field and
+        // omitted. It is what the speaker label above the bubble is drawn from.
+        assert!(
+            changed(|m| m.harness = Some("codex".into())),
+            "a harness key"
+        );
+    }
+
+    /// **"The bytes, not just the length" cannot be tested with real keys**, and
+    /// that is the whole reason this test exists separately: `claude`, `codex`,
+    /// `antigravity` and `opencode` are 6, 5, 11 and 8 bytes, so any test
+    /// written against today's four passes with a length-only fold. The property
+    /// the field's own fifteen-line comment defends needs keys that collide on
+    /// length — a fifth harness named `crush` or `cline` is exactly that against
+    /// `codex`, and the bug it would produce is a bubble keeping the previous
+    /// CLI's name over a new CLI's answer.
+    #[test]
+    fn two_harness_keys_of_the_same_length_do_not_fingerprint_alike() {
+        let with = |key: &str| {
+            let mut m = ChatMessage::pending(None);
+            m.harness = Some(key.to_string());
+            m.fingerprint()
+        };
+        // Synthetic on purpose: no pair among the shipped four is equal-length.
+        assert_eq!("codex".len(), "crush".len());
+        assert_ne!(with("codex"), with("crush"), "equal-length keys collided");
+        assert_ne!(with("codex"), with("cline"));
+        // …and the ordinary cases still hold.
+        assert_ne!(with("codex"), with("claude"));
+        assert_eq!(with("codex"), with("codex"));
+        // Absent is not the same as any key, including an empty one.
+        let mut none = ChatMessage::pending(None);
+        none.harness = None;
+        let mut empty = ChatMessage::pending(None);
+        empty.harness = Some(String::new());
+        assert_ne!(none.fingerprint(), empty.fingerprint());
     }
 
     /// The other half: a message that has not changed must fingerprint the same,

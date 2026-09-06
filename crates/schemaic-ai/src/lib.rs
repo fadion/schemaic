@@ -366,18 +366,50 @@ pub fn oversize_reason(
     limit: usize,
 ) -> Option<String> {
     // Roughly what the OS sees: the arguments plus a separator each.
-    let total: usize = args.iter().map(|a| a.len() + 1).sum();
-    let longest = args.iter().map(String::len).max().unwrap_or(0);
+    let total: usize = args.iter().map(|a| arg_units(a) + 1).sum();
+    let longest = args.iter().map(|a| arg_units(a)).max().unwrap_or(0);
     if total <= limit && longest <= limit {
         return None;
     }
     let name = harness.label();
+    // **The unit, not "characters".** Windows counts UTF-16 code units and
+    // everything else counts bytes, and the number is only useful if the reader
+    // can compare it to something — a byte count labelled "characters" is the
+    // same kind of wrong the measurement itself used to be, one step further on.
+    let unit = arg_unit_name();
     Some(format!(
         "The context sent to {name} is too large for one command line \
-         ({total} characters; this platform allows about {limit}). Narrow \
+         ({total} {unit}; this platform allows about {limit}). Narrow \
          Settings → AI → schema scope to the active database (or None), or \
          shorten the query in the editor."
     ))
+}
+
+/// What [`arg_units`] counts, for the message that reports it.
+fn arg_unit_name() -> &'static str {
+    match cfg!(windows) {
+        true => "characters",
+        false => "bytes",
+    }
+}
+
+/// One argument's length **in the units the platform's limit is counted in**.
+///
+/// **UTF-16 code units on Windows, bytes elsewhere**, and this used to be
+/// `str::len()` — UTF-8 bytes — on both. `arg_limit`'s own doc correctly
+/// describes the Windows cap as *characters*, which for `CreateProcessW` means
+/// UTF-16 units: a CJK schema costs three bytes and one unit per character, so a
+/// ~12,000-character outline was refused at "36,0xx characters" when the real
+/// command line was ~12,000 units. Conservative in direction, but the number in
+/// the refusal was wrong by 3× and the lever it suggests — narrowing the schema
+/// scope — could not close a gap that was not there.
+///
+/// Elsewhere `MAX_ARG_STRLEN` really is bytes, and `str::len()` is exact.
+fn arg_units(a: &str) -> usize {
+    match cfg!(windows) {
+        true => a.encode_utf16().count(),
+        false => a.len(),
+    }
 }
 
 /// Build a legible error message for a failed CLI invocation, on any harness.
@@ -1338,5 +1370,35 @@ mod tests {
         // would still fail.
         let args = vec!["-p".to_string(), "y".repeat(200)];
         assert!(oversize_reason(crate::harness::Harness::Claude, &args, 150).is_some());
+    }
+
+    /// **The limit's units are the platform's, not UTF-8's.** Windows'
+    /// `CreateProcessW` counts UTF-16 code units — which `arg_limit`'s doc
+    /// already calls *characters* — and this measured `str::len()`, so a schema
+    /// outline in CJK cost three per character and was refused at a third of
+    /// the real cap, with a number in the message wrong by 3× and a suggested
+    /// lever that could not close a gap that was not there.
+    #[test]
+    fn an_argument_is_measured_in_the_units_the_platform_caps() {
+        // 1,000 characters: 1,000 UTF-16 units, 3,000 UTF-8 bytes.
+        let cjk = "\u{8868}".repeat(1_000);
+        assert_eq!(cjk.chars().count(), 1_000);
+        assert_eq!(cjk.len(), 3_000);
+        assert_eq!(
+            super::arg_units(&cjk),
+            if cfg!(windows) { 1_000 } else { 3_000 }
+        );
+
+        // A cap of 1,100 units fits it on Windows and does not on Unix, where
+        // the byte count really is the constraint (`MAX_ARG_STRLEN`).
+        let args = vec![cjk];
+        let refused = oversize_reason(crate::harness::Harness::Claude, &args, 1_100).is_some();
+        assert_eq!(refused, !cfg!(windows));
+
+        // ASCII is one unit per byte everywhere, so nothing about the ordinary
+        // case moved.
+        let ascii = vec!["y".repeat(1_000)];
+        assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 1_100).is_none());
+        assert!(oversize_reason(crate::harness::Harness::Claude, &ascii, 900).is_some());
     }
 }
