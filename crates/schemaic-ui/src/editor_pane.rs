@@ -1227,7 +1227,11 @@ fn run_menu_pos(anchor: Point, menu: (f64, f64), content_x: f64, vp: Rect) -> Po
     if vp.width() <= 0.0 || vp.height() <= 0.0 {
         return Point::new(x.max(0.0), y.max(0.0));
     }
-    let fold = content_x + vp.width();
+    // Equivalent to the inline `content_x + vp.width()` this used to spell, since
+    // the zero-width case returned above — but spelled through the shared
+    // definition so the fold has exactly one, and a future change to it can't
+    // reach three call sites and miss the fourth.
+    let fold = visible_hi(content_x, vp);
     let flipped = if x + menu_w > fold { x - menu_w } else { x };
     Point::new(
         flipped.min(fold - menu_w).max(0.0),
@@ -1587,7 +1591,8 @@ fn visible_hi(content_x: f64, vp: Rect) -> f64 {
 
 /// Pixel box `(x, y, w, h)` in `editor_area` coords around the single-line byte
 /// span `[lo, hi]`, for the caret-driven highlight overlays (bracket matching,
-/// identifier occurrences). `None` when either end is off screen.
+/// identifier occurrences). `None` when either end is off screen *or* when the
+/// span lies wholly outside the visible code column.
 ///
 /// The horizontal edges are **snapped to whole pixels** (floor left, ceil right)
 /// so the 1px border lands crisply on the device grid — otherwise a glyph at a
@@ -4449,7 +4454,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
 
     // Bracket matching: two faint boxes around the paren adjacent to the caret and
     // its partner. Click-through like the other overlays; each box reads the editor
-    // `viewport` (inside `char_box`) so it tracks scroll.
+    // `viewport` (inside `span_box`) so it tracks scroll, and bounds itself to
+    // the visible code column so it can't paint outside the editor.
     let bracket_match_view = {
         let ed = ed_bm2;
         dyn_container(
