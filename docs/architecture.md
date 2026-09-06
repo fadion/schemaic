@@ -5863,14 +5863,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     command-specific flags parsed after a subcommand"*, which is to say a **later** `-c` wins. Put
     before `mcp_overrides`, a caller passing its own `sandbox_mode` would silently outrank the
     constraint.
-    **What that measurement did *not* establish is the rest of that page.** `--sandbox`'s absence
-    from `codex exec resume` is the one thing anybody read off the binary; a resumed turn also
-    carries `--json`, `--skip-git-repo-check`, `--model` and, when the probe saw it,
-    `--ignore-user-config`, and nothing in the code, the tests or this document records whether that
-    subcommand takes them. If one of them is missing, every Codex turn after the first dies and is
-    reported as *"The Codex turn ended unexpectedly"*. It is a one-command check that no session can
-    run, so it is written up as a hand check in `review/release-v0.23.0/user-verify-fix.md` rather
-    than asserted here.
+    **The rest of that page has been read now, and it closes favourably.** `--sandbox`'s absence
+    from `codex exec resume` was for a long time the only thing anybody had read off the binary; the
+    other four flags a resumed turn carries — `--json`, `--skip-git-repo-check`, `--model` and, when
+    the probe saw it, `--ignore-user-config` — were taken from the `exec` page, which is the very
+    page that also carries `--sandbox`, so the one flag that had been looked up was the one proving
+    the two pages differ. `codex exec resume --help` on **codex-cli 0.153.4** lists `-c/--config`,
+    `--last`, `--all`, `--enable`, `--disable`, `-i/--image`, `--strict-config`, `-m/--model`,
+    `--dangerously-bypass-approvals-and-sandbox`, `--dangerously-bypass-hook-trust`,
+    `--thread-source`, `--skip-git-repo-check`, `--ephemeral`, `--ignore-user-config`,
+    `--ignore-rules`, `--output-schema`, `--json`, `-o/--output-last-message` and `-h/--help` — and
+    no `--sandbox`, confirming the one measurement that had been taken. So every flag `turn_args`
+    puts on a resumed turn is real — those four, and the `-c` that carries both the caller's
+    overrides and the `sandbox_mode` constraint — and the failure this was a risk of, one unknown
+    option killing every Codex turn after the first and being reported as *"The Codex turn ended
+    unexpectedly"*, was never live.
+    `a_resumed_codex_turn_passes_only_flags_that_subcommand_takes` holds the argv inside that list
+    and separately asserts the four are present, so it cannot pass by emitting nothing; it was
+    watched failing against a `turn_args` that passes `--sandbox` on resume. Its `RESUME_FLAGS`
+    const is a transcript of that help page and **has to be re-read from `--help` when the CLI is
+    upgraded** — that is the point of holding it as a const, not a maintenance smell to be replaced
+    with something cleverer.
     **The Antigravity argv lives in `session_args` now and leads with `--input-format stream-json
     --output-format stream-json`** — the second required by the first, on that flag's own help. Its
     two flags of evidence carry over unchanged from the per-turn argv it replaced: `--sandbox`
@@ -6072,10 +6085,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     rather than generalised. Antigravity's half of that is measured rather than assumed: a captured
     answer split **mid-word** across two `text_delta`s (`"orders\nwidge"`, then `"ts\n"`), which is
     what a partial chunk looks like and a cumulative restatement never does
-    (`real_antigravity_deltas_are_partial_chunks_and_append`). Codex re-sends a message's whole text
-    on every `item.updated` for the
-    same item id — and that one, unlike the Antigravity half beside it, is **not** measured; see the
-    confidence-boundary paragraph at the end of this entry. Appended as they arrive, a three-chunk reply renders as
+    (`real_antigravity_deltas_are_partial_chunks_and_append`). Codex *documents* re-sending a
+    message's whole text on every `item.updated` for the same item id — and that one, unlike the
+    Antigravity half beside it, is a contract rather than an observation: measured, this build never
+    restates at all, which is the finding in the confidence-boundary paragraph at the end of this
+    entry. Appended as they arrive, a three-chunk reply renders as
     "Hi" + "Hi there" + "Hi there!"; the private `Coalescer` emits only the unseen suffix instead,
     and falls back to the whole string when the text is *not* an extension of what came before, so a
     rewritten message loses nothing rather than being diffed against a string it shares no prefix
@@ -6101,7 +6115,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Codex on every `item.updated` for the item id, Antigravity on every `state: "ACTIVE"` for the
     `step_index` — while `TurnState::apply` pushes a chip for every `ToolUse` it is handed and
     attaches a `ToolResult` to the *last* pending one. So a restated call left the earlier chip
-    spinning for the rest of the transcript. The set holds whatever id that dialect gives the call,
+    spinning for the rest of the transcript. **Antigravity's half of that is measured and Codex's is
+    a documented contract**, on exactly the footing of the cumulative prose restatement it mirrors
+    (see the confidence-boundary paragraph at the end of this entry): the three codex-cli 0.153.4
+    turns that settled the prose question contained no tool call at all — no MCP server was
+    configured, and shell execution was refused before an item existed — so nothing has yet shown
+    Codex restating a call either. The guard is kept for the reason the `Coalescer` is kept: the
+    shape is one Codex documents, and being wrong in the other direction costs a chip that spins for
+    the rest of the transcript. The set holds whatever id that dialect gives the call,
     and only the first sighting announces a chip (`a_restated_tool_call_does_not_add_a_second_chip`,
     `a_restated_agy_tool_step_does_not_add_a_second_chip`, and
     `two_distinct_tool_calls_still_get_a_chip_each` for the direction that would break by
@@ -6137,12 +6158,37 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     query that ran; a restated completion had the mirror problem, a second result for one call. The
     chip is now opened on **first sight, whichever event arrives first**, and the result is guarded by
     its own key, `<id>\0done` — keyed apart because one id has to be able to announce once *and*
-    resolve once, and a NUL cannot occur in an id. That completion-only shape is not hypothetical:
-    it is what a refusal looks like (`a_real_codex_tool_refusal_is_flagged_on_the_chip`, captured
+    resolve once, and a NUL cannot occur in an id. That completion-only shape is not the
+    unlikely branch but the measured normal one: three real turns on codex-cli 0.153.4 carried **no
+    `item.started` at all**, every item arriving bare as a single `item.completed`, so a result with
+    no chip to land in was what happened every time rather than a corner. It is also
+    what a refusal looks like (`a_real_codex_tool_refusal_is_flagged_on_the_chip`, captured
     before the approval was configured), and a refused call the user cannot see is the failure that
     arm exists to surface. `codex_mcp_tool_result_reads_content_blocks_and_flags_failure` is the other
     pin; both fed a lone `item.completed` and asserted `[ToolResult]`, and both now expect
     `[ToolUse, ToolResult]`.
+    **The sibling arms had neither guard, which is the same bug twice over.** `command_execution` and
+    `file_change` were decoded inline while `mcp_tool_call` alone was given `first_sight` on each
+    half, so a *streamed* step emitted an unconditional `ToolUse` on every `!completed` line — four
+    `item.*` lines for one shell command opening four chips, three of which never receive a result
+    and spin for the rest of the turn — and a step whose only line is `item.completed` emitted a
+    `ToolResult` with no chip to land in, which `TurnState::apply` staples onto the most recent call
+    still awaiting one: `ls` output, or the contents of a file, landing on whatever `run_query` chip
+    happened to be open, where the user reads it as the answer to their query. Both arms go through
+    one `side_effect(id, completed, name, text, is_error)` helper now, which applies the same
+    `first_sight(id)` on the open and `first_sight("<id>\0done")` on the close. Which of the two
+    failures fires is not a matter of luck: the completed-only shape is the measured normal case
+    (above), while `command_execution`'s *own* event shape is the part that stays inferred, which is
+    why the helper is written to be right for both shapes rather than for the one that was observed.
+    **Two tests had pinned the unguarded shape and were widened in the same commit** —
+    `codex_a_side_effecting_item_is_shown_not_swallowed` asserted the single-event form and now
+    asserts the open/close pair — and one of them is why the arm shipped unguarded at all:
+    `a_restated_tool_call_does_not_add_a_second_chip` carried a docstring reasoning about
+    `command_execution` while its body drove `mcp_tool_call`, so the arm the argument was about had
+    no test whatever. That docstring now names what it drives, and
+    `codex_a_restated_shell_step_opens_one_chip_and_closes_it` covers the other, driven through
+    `TurnState` as well as the parser because a chip that never closes is a rendering fact the event
+    list does not show.
     **Codex's session model differs in kind, not in field names** — one process per *turn*, resumed
     by id (`codex exec resume <id>`), against Claude's one persistent bidirectional process per
     conversation. `StreamEvent::SessionStarted { id }` exists to carry the `thread.started`/`init`
@@ -6159,6 +6205,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     reports no wall time, so `TurnStats::duration_ms` stays `None` rather than being invented: the
     panel's live counter already shows elapsed time, and a fabricated total would disagree with what
     the user just watched (`codex_turn_completed_carries_usage_and_no_invented_duration`).
+    **`codex_stats` reads `input_tokens` and `output_tokens` and adds nothing to them — the opposite
+    call from the one the OpenCode arm below makes**, which is worth writing down because the two
+    look like the same question and the wrong inference is one line away. Measured across three
+    turns on codex-cli 0.153.4, `cached_input_tokens` was 9,984 of 12,595 input, 34,048 of 38,134
+    and 22,016 of 25,058: always a *fraction of* the input beside it, never a sibling of it. Adding
+    it (or `reasoning_output_tokens`) would double-count the cache on every turn and overstate a
+    Codex conversation by roughly the amount the OpenCode fix stopped understating one. It is not
+    *proven* — Codex publishes no `total` to reconcile against — and it does not need to be, since
+    with no total the conservative reading is the one that cannot invent tokens the user never
+    spent. A `total` appearing in a future build settles it.
     **Antigravity's `status` is not the verdict, and that is the load-bearing one.** A measured turn
     whose only tool call was *refused* still reported `"status":"SUCCESS"` with an empty `response`,
     recording the refusal nowhere but in a `denied_actions` array — read on `status` alone, a turn
@@ -6193,7 +6249,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     turn** — a measured two-step turn reported input 2497 and then 637 — so `OpenCodeTurn` accumulates
     them across `step_finish` events and a footer reading only the last would understate that turn by
     a factor of four (`an_opencode_turn_sums_tokens_across_its_steps`); `saw_tokens` keeps "nothing
-    reported" apart from "zero", so a footer stays blank rather than claiming `0 in / 0 out`. Wall
+    reported" apart from "zero", so a footer stays blank rather than claiming `0 in / 0 out`.
+    **And every field the step bills for, which used to be two of four.** Summing `input` and
+    `output` alone dropped `reasoning` and every cached input token, so `OC_REAL_TOOL_CYCLE`
+    rendered `↑3.1k ↓12` for a turn that really spent 5,181 — the input understated by 39%, and the
+    gap widens as cache reads grow. The arithmetic is settled by the fixture rather than by a claim
+    about OpenCode's source: each step's own `total` reconciles exactly as
+    `input + output + reasoning + cache.read`, at 2536 and at 2645, and that identity is asserted in
+    the test so a step whose fields stop adding up fails rather than quietly shifting the footer.
+    `cache.write` is deliberately left out, because it is not part of that `total`. **Codex's arm
+    answers the same-looking question the other way** — see `codex_stats` above: OpenCode's four
+    figures are siblings that sum to a published total, where Codex's `cached_input_tokens` nests
+    *inside* the `input_tokens` beside it, so one is added and the other must not be. Wall
     time is stated nowhere in the stream, but every event carries a millisecond `timestamp`, so the
     span between the first and the last is the turn's own and is exact — this is the one dialect
     where a duration is *derived* rather than read or left `None`. The session id sits on the **top
@@ -6252,17 +6319,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     longer spinning — rather than on the event list alone. Keep them byte-for-byte: tidying an id or a usage key turns evidence back into a fixture
     that agrees with the code that produced it. The one dialect no binary had ever produced was
     Gemini's, and deleting that harness took it with it.
-    **One shape inside a measured dialect is still unmeasured, and it is the `Coalescer`'s.** No
-    captured Codex fixture contains an `item.updated` line — `CODEX_REAL_TURN`'s answer was one
-    word — so *whether Codex restates a message cumulatively* is an assumption this module is built
-    on rather than something a binary has shown, and every test that exercises the accumulator feeds
-    it hand-written cumulative strings. The two ways it could be wrong are opposite and both silent:
-    no `item.updated` at all makes the `Coalescer` dead weight to delete rather than tune, while an
-    `item.updated` carrying a *delta* makes `advance` take its whole-string fallback every time and
-    renders every chunk twice, with all four tests green because they feed it the shape it expects.
-    Only a live capture settles it, so the capture is written up as a hand check in
-    `review/release-v0.23.0/user-verify-fix.md` and named in the test's own doc; it is not something
-    a session can measure.
+    **The one shape inside a measured dialect that was itself unmeasured was the `Coalescer`'s, and
+    it has now been measured.** *Whether Codex restates a message cumulatively* was an assumption
+    this module is built on rather than something a binary had shown — no captured fixture contained
+    an `item.updated` line, `CODEX_REAL_TURN`'s answer being one word — and of the two ways that
+    could be wrong, it turned out to be the first: three real `codex exec --json` turns on codex-cli
+    0.153.4, of 394, 439 and 209 output tokens with one a ~300-word prose answer, produced **zero
+    `item.updated` lines and zero `item.started` lines**. Every item, the long answer included,
+    arrived as a single bare `item.completed` carrying the whole text. So `advance` is called once
+    per message with no prior text to compare against, `K = 1`, and the Θ(N·K) is Θ(N): the question
+    of tuning it further is moot on this build rather than answered. **The `Coalescer` is kept
+    rather than deleted**, which is the trade and not inertia — the alternative is a transcript that
+    renders every prefix again the day a build starts streaming, a data-loss-shaped bug arriving
+    from a CLI upgrade with nothing here to catch it, and cumulative restatement is a shape Codex
+    documents. What the measurement changes is the cost of keeping it (one hash lookup per message)
+    and the standing of the four tests that drive it: they feed hand-written cumulative strings for
+    a shape this build never emits, which `the_coalescer_emits_only_what_is_new` now says on its
+    face rather than leaving a reader to take those lines for a capture. **What the same three turns
+    do not settle is `command_execution` itself.** Two attempts to make the model run a shell
+    command came back *"command execution is blocked by this environment's policy"* with **no
+    `command_execution` item emitted at all** — the refusal happens before an item is created — so
+    that item's event shape stays inferred, and the arm that turns one into a chip is written to be
+    correct for the streamed and the completed-only shape alike, so nothing turns on which it is.
+    `CODEX_REAL_TURN` is confirmed representative rather than a lucky short answer, and **no new
+    fixture was added**: a 300-word near-duplicate of a shape that one already pins would hold
+    nothing it does not.
 - `schemaic-term` — terminal panel + shell (`shell.rs`).
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
@@ -9819,8 +9900,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   per-turn branch's Antigravity arm and its `_registration` block were **deleted rather than left
   unreachable**, because configuration for a harness that no longer takes that path is the copy that
   quietly stops matching the one that runs.
-  **The per-turn child's stdin is `Stdio::null()`, never piped**: measured, `codex exec` prints
-  *"Reading additional input from stdin…"* and appends piped stdin to the prompt as a `<stdin>`
+  **The per-turn child's stdin is `Stdio::null()`, never piped**: measured, and still true on
+  codex-cli 0.153.4, `codex exec` prints *"Reading additional input from stdin…"* when stdin is a
+  pipe at EOF, and appends piped stdin to the prompt as a `<stdin>`
   block, so a pipe we never wrote to would silently append itself to every turn.
   And every harness folds its events through **one**
   `TurnPump` — prose and chips accumulate, a snapshot goes out when anything changed, `TurnDone`

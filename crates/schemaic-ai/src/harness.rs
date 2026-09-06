@@ -834,6 +834,19 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
                 a.push("resume".into());
                 a.push(id.into());
             }
+            // **Every flag on a resumed turn is measured, not assumed.** Only
+            // `--sandbox`'s *absence* had ever been checked against
+            // `codex exec resume`, and the other four were read off the `exec`
+            // page — which is the page that does not carry `--sandbox` either,
+            // so the one flag anybody had looked up was the one that proved the
+            // pages differ. If another were missing, every turn after the first
+            // would die and be reported as "The Codex turn ended unexpectedly".
+            //
+            // Read off `codex exec resume --help`, codex-cli 0.153.4: the page
+            // lists all four, and the `-c` that carries both the caller's
+            // overrides and the constraint below. It does **not** list
+            // `--sandbox`. (`-o` and `--ephemeral` are on that page too but are
+            // `inline_argv`'s, not this arm's — a one-shot never resumes.)
             a.push("--json".into());
             if resuming.is_none() {
                 // Defence in depth, and only where it is taken: `--sandbox`
@@ -2037,6 +2050,79 @@ mod tests {
             &a[..3],
             &["exec".to_string(), "resume".into(), "th_9".into()]
         );
+    }
+
+    /// **Nothing on a resumed turn may be a flag `codex exec resume` does not
+    /// take**, because one that is not there kills the spawn on an unknown
+    /// option and every turn after the first is reported as "The Codex turn
+    /// ended unexpectedly" — a CLI failure blamed on the CLI.
+    ///
+    /// The list is `codex exec resume --help` on codex-cli 0.153.4, read
+    /// directly. Only `--sandbox`'s *absence* had ever been checked; the rest
+    /// were taken from the `exec` page, which is the very page that also
+    /// carries `--sandbox`, so the one flag anybody had looked up was the one
+    /// proving the two pages differ.
+    ///
+    /// A test rather than a comment because the argv is what has to stay inside
+    /// the list, and it is the argv that drifts.
+    #[test]
+    fn a_resumed_codex_turn_passes_only_flags_that_subcommand_takes() {
+        // Verbatim from `codex exec resume --help`, 0.153.4. `--sandbox` is
+        // absent and is the reason this test exists.
+        const RESUME_FLAGS: &[&str] = &[
+            "-c",
+            "--config",
+            "--last",
+            "--all",
+            "--enable",
+            "--disable",
+            "-i",
+            "--image",
+            "--strict-config",
+            "-m",
+            "--model",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+            "--thread-source",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--json",
+            "-o",
+            "--output-last-message",
+            "-h",
+            "--help",
+        ];
+        let mut s = spec();
+        s.resume = Some("th_9".into());
+        s.model = "gpt-5.4-codex".into();
+        s.isolate_config = true;
+        s.mcp_overrides = codex_mcp_overrides("/usr/bin/schemaic", "/tmp/ep.json", &[]);
+        let a = turn_args(Harness::Codex, &s);
+
+        for arg in &a {
+            if !arg.starts_with('-') || arg.as_str() == "-" {
+                continue; // a value, a subcommand, or the prompt
+            }
+            assert!(
+                RESUME_FLAGS.contains(&arg.as_str()),
+                "`codex exec resume` does not take {arg}: {a:?}"
+            );
+        }
+        // The four that were assumed until they were read off the page — every
+        // one of them present, so this is not vacuously "no flags at all".
+        for must in [
+            "--json",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--model",
+        ] {
+            assert!(a.iter().any(|x| x == must), "{must} missing: {a:?}");
+        }
+        // And the one that genuinely is not on that page.
+        assert!(!a.iter().any(|x| x == "--sandbox"), "{a:?}");
     }
 
     /// `codex exec` takes `--sandbox`; `codex exec resume` does **not** (measured
