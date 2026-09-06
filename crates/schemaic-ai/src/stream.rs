@@ -119,6 +119,26 @@ pub struct StreamParser {
     /// The one dialect that reports usage per *step* and never says a turn is
     /// over. See [`StreamParser::push_opencode`].
     oc: OpenCodeTurn,
+    /// What the last line was, so the caller need not parse it again to find
+    /// out. See [`StreamParser::last_line`].
+    last_line: LineKind,
+}
+
+/// What one line of a CLI's stdout turned out to be.
+///
+/// The distinction that matters is [`LineKind::Plain`]: a non-blank line that is
+/// not JSON is a diagnostic the CLI printed as prose — an expired OAuth session,
+/// a missing model — and it is the only explanation the user will get, so it is
+/// kept and shown when the turn ends badly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineKind {
+    /// Nothing was pushed yet, or the line was blank.
+    #[default]
+    Blank,
+    /// Valid JSON, whether or not this dialect had anything to say about it.
+    Json,
+    /// Not JSON: prose the CLI printed.
+    Plain,
 }
 
 /// What an OpenCode turn accumulates across its steps.
@@ -181,6 +201,7 @@ impl StreamParser {
             text: Coalescer::default(),
             seen_tools: std::collections::HashSet::new(),
             oc: OpenCodeTurn::default(),
+            last_line: LineKind::Blank,
         }
     }
 
@@ -198,22 +219,87 @@ impl StreamParser {
         self.seen_tools.insert(id.to_string())
     }
 
+    /// One Codex side-effect item — a shell command, a file change — turned into
+    /// the same guarded chip-open / chip-close pair `mcp_tool_call` gets.
+    ///
+    /// **Both guards, because these two arms had neither.** `mcp_tool_call` was
+    /// given `first_sight` on each half and its siblings were not, so:
+    ///
+    /// - A *streamed* step emitted an unconditional `ToolUse` on every
+    ///   `!completed` line. Codex restates an item on `item.updated`, so four
+    ///   lines for one shell command opened four chips, three of which never
+    ///   receive a result and spin for the rest of the turn.
+    /// - A step whose only line is `item.completed` — nothing opened it — emitted
+    ///   a `ToolResult` with no chip to land in, and `TurnState::apply` attaches
+    ///   a loose result to *the most recent tool call still awaiting one*. That
+    ///   staples `ls` output, or the contents of a file, onto whatever
+    ///   `run_query` chip happened to be open, and the user reads it as the
+    ///   answer to their query.
+    ///
+    /// The done-key is the same `id + NUL + "done"` shape, so one id can announce
+    /// once and resolve once.
+    fn side_effect(
+        &mut self,
+        id: &str,
+        completed: bool,
+        name: &str,
+        text: impl FnOnce() -> String,
+        is_error: bool,
+    ) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        if self.first_sight(id) {
+            out.push(StreamEvent::ToolUse {
+                name: name.to_string(),
+                sql: None,
+            });
+        }
+        if completed && self.first_sight(&format!("{id}\u{0}done")) {
+            out.push(StreamEvent::ToolResult {
+                text: text(),
+                is_error,
+            });
+        }
+        out
+    }
+
     /// Which harness this parser decodes.
     pub fn harness(&self) -> Harness {
         self.harness
     }
 
+    /// What the line last handed to [`StreamParser::push`] was.
+    ///
+    /// **So the caller does not have to parse it again to find out.** Both
+    /// session tasks need to tell "no events because this is not JSON" — a fatal
+    /// error the CLI printed as prose, which is the only diagnostic there will
+    /// be — from "no events because this is JSON I ignore". They answered it by
+    /// running `serde_json::from_str` on the line a second time, after `push`
+    /// had already done so, for every line of every turn.
+    pub fn last_line(&self) -> LineKind {
+        self.last_line
+    }
+
     /// Decode one output line into zero or more events.
     pub fn push(&mut self, line: &str) -> Vec<StreamEvent> {
-        let line = line.trim();
+        // **A BOM survives `trim`.** U+FEFF is not `White_Space`, so a byte-order
+        // mark on the first line — which a Windows console redirect or a shim
+        // that re-encodes a pipe can prepend — made `from_str` fail, and the
+        // line was filed as prose. On the two dialects that carry the session id
+        // on their opening line that costs the whole conversation's continuity,
+        // not one event: `resume` never learns the id, so every later turn opens
+        // a fresh conversation.
+        let line = line.trim_start_matches('\u{feff}').trim();
         if line.is_empty() {
+            self.last_line = LineKind::Blank;
             return Vec::new();
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            self.last_line = LineKind::Plain;
             return Vec::new();
         };
+        self.last_line = LineKind::Json;
         let out = match self.harness {
-            Harness::Claude => crate::parse_stream_line(line),
+            Harness::Claude => crate::parse_stream_value(&v),
             Harness::Codex => self.push_codex(&v),
             Harness::Antigravity => self.push_antigravity(&v),
             Harness::OpenCode => self.push_opencode(&v),
@@ -300,9 +386,23 @@ impl StreamParser {
                     part.pointer(&format!("/tokens/{k}"))
                         .and_then(|n| n.as_u64())
                 };
-                if let Some(i) = at("input") {
-                    self.oc.input += i;
-                    self.oc.saw_tokens = true;
+                // **Four fields, not two.** The footer summed `input` and
+                // `output` alone, which drops every cached input token — and the
+                // captured fixture's own `total` proves it: it reconciles
+                // exactly, in both of its steps, as
+                // `input + output + reasoning + cache.read`. A turn that really
+                // spent 5,181 tokens rendered `↑3.1k ↓12`, understating the
+                // input by 39%, and the gap widens as cache reads grow. Cached
+                // input is billed input; it is not free, and it is not nothing.
+                //
+                // `cache.write` is deliberately absent: it is not part of the
+                // fixture's `total`, so adding it would overstate the turn by
+                // the same reasoning that understating it was wrong.
+                for k in ["input", "reasoning", "cache/read"] {
+                    if let Some(n) = at(k) {
+                        self.oc.input += n;
+                        self.oc.saw_tokens = true;
+                    }
                 }
                 if let Some(o) = at("output") {
                     self.oc.output += o;
@@ -310,8 +410,24 @@ impl StreamParser {
                 }
                 let reason = part.get("reason").and_then(|r| r.as_str());
                 if reason != Some("tool-calls") {
+                    // **A turn cut short is not a clean turn.** Only the exact
+                    // string `"error"` used to be flagged, so a `reason` of
+                    // `"length"` — the model hit its output cap — or
+                    // `"content-filter"` filed a truncated or withheld answer as
+                    // a success, with nothing on screen to say the last sentence
+                    // was not the end of one. The Antigravity arm applies the
+                    // opposite rule (anything but `SUCCESS` is a failure) to the
+                    // same question.
+                    //
+                    // Named rather than inverted, and that is the paragraph
+                    // above's reasoning applied a second time: an unrecognised
+                    // reason must not stamp an error on an ordinary turn, so
+                    // only the ones whose meaning is known are flagged.
+                    if let Some(note) = opencode_cutoff_note(reason) {
+                        out.push(StreamEvent::TextDelta(note.to_string()));
+                    }
                     out.push(StreamEvent::TurnDone {
-                        is_error: reason == Some("error"),
+                        is_error: opencode_is_failure(reason),
                         stats: self.oc.stats(),
                     });
                 }
@@ -586,7 +702,15 @@ impl StreamParser {
                     return out;
                 }
                 // Keyed apart from the call itself: one id has to be able to
-                // announce once *and* resolve once. A NUL cannot occur in an id.
+                // announce once *and* resolve once.
+                //
+                // The separator is a NUL because Codex mints these ids and none
+                // it has produced contains one — *not* because a NUL is
+                // impossible in a JSON string, which it is not: ` ` is
+                // legal and `serde_json` decodes it, so an id of `t1`+NUL+`done`
+                // would collide with item `t1`'s done-key. Nothing outside that
+                // CLI chooses an id, so this is a statement about the source and
+                // not about the encoding.
                 if self.first_sight(&format!("{id}\u{0}done")) {
                     let err = item
                         .pointer("/error/message")
@@ -604,45 +728,44 @@ impl StreamParser {
             // swallowed. See the module docs.
             "command_execution" => {
                 let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                if !completed {
-                    return vec![StreamEvent::ToolUse {
-                        name: "shell".to_string(),
-                        sql: None,
-                    }];
-                }
                 let code = item.get("exit_code").and_then(|c| c.as_i64());
                 let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                vec![StreamEvent::ToolResult {
-                    text: format!(
-                        "{cmd}\n{}",
-                        item.get("aggregated_output")
-                            .and_then(|o| o.as_str())
-                            .unwrap_or("")
-                    ),
-                    is_error: status == "failed" || code.is_some_and(|c| c != 0),
-                }]
+                self.side_effect(
+                    id,
+                    completed,
+                    "shell",
+                    || {
+                        format!(
+                            "{cmd}\n{}",
+                            item.get("aggregated_output")
+                                .and_then(|o| o.as_str())
+                                .unwrap_or("")
+                        )
+                    },
+                    status == "failed" || code.is_some_and(|c| c != 0),
+                )
             }
             "file_change" => {
-                if !completed {
-                    return vec![StreamEvent::ToolUse {
-                        name: "file_change".to_string(),
-                        sql: None,
-                    }];
-                }
-                let paths: Vec<String> = item
-                    .get("changes")
-                    .and_then(|c| c.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|c| c.get("path").and_then(|p| p.as_str()))
-                            .map(|p| p.to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                vec![StreamEvent::ToolResult {
-                    text: paths.join("\n"),
-                    is_error: item.get("status").and_then(|s| s.as_str()) == Some("failed"),
-                }]
+                let failed = item.get("status").and_then(|s| s.as_str()) == Some("failed");
+                self.side_effect(
+                    id,
+                    completed,
+                    "file_change",
+                    || {
+                        let paths: Vec<String> = item
+                            .get("changes")
+                            .and_then(|c| c.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|c| c.get("path").and_then(|p| p.as_str()))
+                                    .map(|p| p.to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        paths.join("\n")
+                    },
+                    failed,
+                )
             }
             "error" => {
                 let msg = item.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -650,6 +773,30 @@ impl StreamParser {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+/// Did an OpenCode step finish badly? Pure, so the rule has a test that does not
+/// have to drive a whole turn.
+fn opencode_is_failure(reason: Option<&str>) -> bool {
+    matches!(reason, Some("error" | "length" | "content-filter"))
+}
+
+/// What to tell the user when a turn stopped for a reason that is not the model
+/// having finished, or `None` when it is.
+///
+/// The answer stays on screen either way — this is the sentence that says the
+/// last one was not the end of it.
+fn opencode_cutoff_note(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("length") => Some(
+            "\n\n_The answer stops here because the model reached its output limit — \
+             it is not finished._\n",
+        ),
+        Some("content-filter") => {
+            Some("\n\n_The rest of the answer was withheld by a content filter._\n")
+        }
+        _ => None,
     }
 }
 
@@ -799,9 +946,95 @@ mod tests {
     #[test]
     fn every_harness_ignores_blank_and_malformed_lines() {
         for h in Harness::ALL {
-            let out = drive(h, &["", "   ", "{not json", "[]", "{}"]);
-            assert!(out.is_empty(), "{:?} produced {:?}", h, out.len());
+            let out = drive(
+                h,
+                &[
+                    "",
+                    "   ",
+                    "\t\r\n",
+                    "{not json",
+                    "[]",
+                    "{}",
+                    "null",
+                    "0",
+                    r#""a string""#,
+                    r#"{"type":null}"#,
+                    r#"{"type":123}"#,
+                    r#"{"type":{"nested":"object"}}"#,
+                    r#"{"type":"item.completed"}"#,
+                    r#"{"type":"item.completed","item":null}"#,
+                    r#"{"type":"item.completed","item":[]}"#,
+                    r#"{"type":"a type nothing decodes"}"#,
+                ],
+            );
+            assert!(out.is_empty(), "{:?} produced {:?}", h, out);
         }
+    }
+
+    /// The one deliberate exception, recorded so it is not read as a leak in the
+    /// test above: an OpenCode `step_finish` whose `reason` cannot be read ends
+    /// the turn. `push_opencode`'s doc argues for that direction — the printer
+    /// never says a turn is over, so of the two ways to be wrong about a missing
+    /// reason, this one truncates a turn only if a *tool* step ever omits it,
+    /// while the other stamps an error on every ordinary turn.
+    #[test]
+    fn an_opencode_step_finish_with_no_readable_reason_ends_the_turn() {
+        let out = drive(
+            Harness::OpenCode,
+            &[r#"{"type":"step_finish","part":"not an object"}"#],
+        );
+        assert!(
+            matches!(
+                &out[..],
+                [StreamEvent::TurnDone {
+                    is_error: false,
+                    ..
+                }]
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// **`trim` does not remove a byte-order mark**, because U+FEFF is not
+    /// `White_Space`. A BOM on the first line — a Windows console redirect, a
+    /// shim that re-encodes a pipe — therefore made `from_str` fail and the line
+    /// was filed as prose. On the two dialects that carry the session id on
+    /// their opening line that costs the **whole conversation's continuity**,
+    /// not one event: `resume` never learns the id, so every later turn opens a
+    /// fresh conversation with no memory of the last.
+    #[test]
+    fn a_byte_order_mark_does_not_swallow_the_session_id() {
+        let line = "\u{feff}".to_string() + r#"{"type":"thread.started","thread_id":"th_1"}"#;
+        let out = drive(Harness::Codex, &[&line]);
+        assert!(
+            matches!(&out[..], [StreamEvent::SessionStarted { id }] if id == "th_1"),
+            "{out:?}"
+        );
+        // …and the line is not filed as a plain-text diagnostic either, which is
+        // the other half: the app keeps those and shows them when a turn fails.
+        let mut p = StreamParser::new(Harness::Codex);
+        p.push(&line);
+        assert_eq!(p.last_line(), LineKind::Json);
+    }
+
+    /// The three answers `last_line` exists to keep apart, so the app does not
+    /// have to re-parse the line to tell them apart.
+    #[test]
+    fn a_line_reports_what_it_was_without_being_parsed_again() {
+        let mut p = StreamParser::new(Harness::Codex);
+        p.push("");
+        assert_eq!(p.last_line(), LineKind::Blank);
+        p.push("   ");
+        assert_eq!(p.last_line(), LineKind::Blank);
+        // Prose the CLI printed: an expired OAuth session, a missing model. It
+        // is the only explanation there will be, so the app keeps it.
+        p.push("error: could not authenticate");
+        assert_eq!(p.last_line(), LineKind::Plain);
+        // JSON this dialect has nothing to say about is **not** prose, and
+        // filing it as such put protocol noise in the failure message.
+        p.push(r#"{"type":"reasoning_summary"}"#);
+        assert_eq!(p.last_line(), LineKind::Json);
+        assert!(p.push(r#"{"type":"reasoning_summary"}"#).is_empty());
     }
 
     // ---- Codex ------------------------------------------------------------
@@ -863,11 +1096,16 @@ mod tests {
     }
 
     /// **One call, one chip, however many times the CLI restates it.**
-    /// `codex_item` treats every non-`item.completed` event as "in progress", and
-    /// `command_execution` is streamed with `item.updated` as its output grows —
-    /// so a second `ToolUse` reached `TurnState::apply`, which pushes a segment
+    /// `codex_item` treats every non-`item.completed` event as "in progress", so
+    /// a second `ToolUse` reached `TurnState::apply`, which pushes a segment
     /// unconditionally. The result attaches to the *last* pending chip, leaving
     /// the first spinning for the rest of the transcript.
+    ///
+    /// This drives `mcp_tool_call`, which is what it names. Its docstring used
+    /// to reason about `command_execution` — the arm that is actually streamed
+    /// with `item.updated` — while the body exercised this one, so the arm the
+    /// argument was about had no test at all and shipped without the guard. That
+    /// case is `codex_a_restated_shell_step_opens_one_chip_and_closes_it`.
     #[test]
     fn a_restated_tool_call_does_not_add_a_second_chip() {
         let out = drive(
@@ -1055,6 +1293,12 @@ mod tests {
             "{shell:?}"
         );
 
+        // **A completed-only item opens its own chip before it fills it.** It
+        // used to emit a bare `ToolResult`, and `TurnState::apply` attaches a
+        // loose result to the most recent tool call still awaiting one — so this
+        // file change was stapled onto whatever `run_query` chip happened to be
+        // open, and the user read `/etc/passwd` as the answer to their query.
+        // The composition is the finding, so the assertion is the pair.
         let edit = drive(
             Harness::Codex,
             &[
@@ -1062,9 +1306,64 @@ mod tests {
             ],
         );
         match &edit[..] {
-            [StreamEvent::ToolResult { text, .. }] => assert!(text.contains("/etc/passwd")),
+            [
+                StreamEvent::ToolUse { name, .. },
+                StreamEvent::ToolResult { text, .. },
+            ] => {
+                assert_eq!(name, "file_change");
+                assert!(text.contains("/etc/passwd"));
+            }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// **The guard the sibling arm had and these two did not.** Codex restates
+    /// an item on every `item.updated`, so one shell command arrived as four
+    /// lines and opened four chips — three of which never receive a result and
+    /// spin for the rest of the turn. `mcp_tool_call` was given `first_sight` on
+    /// both halves; `command_execution` and `file_change` were given neither.
+    ///
+    /// Driven through `TurnState` as well as the parser, because a chip that
+    /// never closes is a rendering fact and the event list alone does not show
+    /// it.
+    #[test]
+    fn codex_a_restated_shell_step_opens_one_chip_and_closes_it() {
+        let out = drive(
+            Harness::Codex,
+            &[
+                r#"{"type":"item.started","item":{"id":"c1","type":"command_execution","command":"ls","aggregated_output":"","status":"in_progress"}}"#,
+                r#"{"type":"item.updated","item":{"id":"c1","type":"command_execution","command":"ls","aggregated_output":"a","status":"in_progress"}}"#,
+                r#"{"type":"item.updated","item":{"id":"c1","type":"command_execution","command":"ls","aggregated_output":"a\nb","status":"in_progress"}}"#,
+                r#"{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"ls","aggregated_output":"a\nb","exit_code":0,"status":"completed"}}"#,
+            ],
+        );
+        let opens = out
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolUse { .. }))
+            .count();
+        let closes = out
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolResult { .. }))
+            .count();
+        assert_eq!(opens, 1, "one shell step opened {opens} chips: {out:?}");
+        assert_eq!(closes, 1, "{out:?}");
+
+        // The composition: every chip the turn opened is answered.
+        let mut turn = crate::TurnState::default();
+        for e in &out {
+            turn.apply(e);
+        }
+        let segs = turn.segments();
+        let pending = segs
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    schemaic_core::transcript::Seg::Tool(t) if t.result.is_none()
+                )
+            })
+            .count();
+        assert_eq!(pending, 0, "a chip is still spinning: {segs:?}");
     }
 
     #[test]
@@ -1534,21 +1833,81 @@ mod tests {
         );
     }
 
+    /// Per-*step* counts, not a turn total: the fixture's two steps report input
+    /// 2497 then 637, and a footer showing only the last would tell the user the
+    /// turn cost a quarter of what it did.
+    ///
+    /// **And every field the step bills for, which used to be two of four.** The
+    /// footer summed `input` and `output` alone and dropped `reasoning` and
+    /// every cached input token, so this same fixture rendered `↑3.1k ↓12` for a
+    /// turn that really spent 5,181 — the input understated by 39%. The
+    /// arithmetic is settled by the fixture itself and needs no claim about
+    /// OpenCode's source: each step's own `total` reconciles exactly as
+    /// `input + output + reasoning + cache.read`, at 2536 and at 2645. That
+    /// identity is asserted here, so a step whose fields stop adding up fails
+    /// rather than quietly shifting the footer.
     #[test]
     fn an_opencode_turn_sums_tokens_across_its_steps() {
-        // Per-*step* counts, not a turn total: the fixture's two steps report
-        // input 2497 then 637, and a footer showing only the last would tell the
-        // user the turn cost a quarter of what it did.
+        // Step one: 2497 + 10 + 29 + 0 = 2536, its reported `total`.
+        assert_eq!(2497 + 10 + 29, 2536);
+        // Step two: 637 + 2 + 22 + 1984 = 2645, its reported `total`.
+        assert_eq!(637 + 2 + 22 + 1984, 2645);
+
         let out = drive(Harness::OpenCode, OC_REAL_TOOL_CYCLE);
         match out.last() {
             Some(StreamEvent::TurnDone { stats, .. }) => {
-                assert_eq!(stats.input_tokens, Some(2497 + 637));
+                assert_eq!(stats.input_tokens, Some(2497 + 29 + 637 + 22 + 1984));
                 assert_eq!(stats.output_tokens, Some(10 + 2));
+                // The two halves account for both steps' `total` between them,
+                // which is the property the footer is claiming to show.
+                assert_eq!(
+                    stats.input_tokens.unwrap_or(0) + stats.output_tokens.unwrap_or(0),
+                    2536 + 2645
+                );
                 // Wall clock across the turn, from the event timestamps.
                 assert_eq!(stats.duration_ms, Some(1788647018724 - 1788647017491));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// **A truncated answer is not a clean success.** `reason: "length"` means
+    /// the model hit its output cap mid-sentence and `"content-filter"` means
+    /// the rest was withheld; both used to close the turn with `is_error: false`
+    /// and nothing on screen to say the last sentence was not the end of one.
+    /// The Antigravity arm applies the opposite rule to the same question.
+    #[test]
+    fn an_opencode_turn_cut_off_by_the_token_cap_says_so() {
+        for (reason, must_mention) in [("length", "output limit"), ("content-filter", "withheld")] {
+            let line = format!(
+                r#"{{"type":"step_finish","timestamp":1,"sessionID":"s1","part":{{"reason":"{reason}","tokens":{{"input":5,"output":5}}}}}}"#
+            );
+            let out = drive(Harness::OpenCode, &[&line]);
+            assert!(
+                out.iter().any(|e| matches!(
+                    e,
+                    StreamEvent::TextDelta(t) if t.contains(must_mention)
+                )),
+                "nothing told the user the answer was cut off: {out:?}"
+            );
+            assert!(
+                matches!(
+                    out.last(),
+                    Some(StreamEvent::TurnDone { is_error: true, .. })
+                ),
+                "{reason} filed as a clean success: {out:?}"
+            );
+        }
+        // …and an ordinary end is still an ordinary end, in both spellings.
+        for reason in [Some("stop"), None] {
+            assert!(!opencode_is_failure(reason));
+            assert_eq!(opencode_cutoff_note(reason), None);
+        }
+        // An unrecognised reason must not stamp an error on a working turn —
+        // the same reasoning `push_opencode`'s doc gives for reading an absent
+        // reason as terminal.
+        assert!(!opencode_is_failure(Some("other")));
+        assert!(opencode_is_failure(Some("error")));
     }
 
     #[test]

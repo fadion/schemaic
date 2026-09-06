@@ -467,6 +467,18 @@ pub fn parse_stream_line(line: &str) -> Vec<StreamEvent> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
+    parse_stream_value(&v)
+}
+
+/// The same, for a caller that has already parsed the line.
+///
+/// **Split out because Claude's lines were parsed three times.**
+/// `StreamParser::push` parses to dispatch on the harness, this function parsed
+/// the text again, and the app parsed a third time to work out whether an empty
+/// result meant "not JSON" or "JSON I ignore". Every other dialect took the
+/// already-parsed value; only this one went back to the string. Before the range
+/// that added the parser, it was parsed once.
+pub fn parse_stream_value(v: &serde_json::Value) -> Vec<StreamEvent> {
     match v.get("type").and_then(|t| t.as_str()) {
         // Live token stream.
         Some("stream_event") => {
@@ -517,7 +529,7 @@ pub fn parse_stream_line(line: &str) -> Vec<StreamEvent> {
         }
         Some("result") => vec![StreamEvent::TurnDone {
             is_error: v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false),
-            stats: parse_stats(&v),
+            stats: parse_stats(v),
         }],
         _ => Vec::new(),
     }
