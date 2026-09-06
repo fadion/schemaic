@@ -5823,10 +5823,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     genuinely does not hold for Antigravity while a chat session holds the registration. It does hold
     for the other three, which are configured per invocation, and this is written down because that
     sentence is exactly the one that would otherwise be read as covering all four.
-    **And there is no per-invocation fix in that CLI to reach for.** It has no config flag for this,
-    and no definable agent the way OpenCode has — `agy agent` only lists agents, and lists none — so
-    this is a known limit with an open decision rather than unfinished wiring: document it, or refuse
-    a one-shot while an Antigravity chat session is live. That decision is parked in `TODO.md`.
+    **And there is no per-invocation fix in that CLI to reach for, so the limit stands as
+    described.** It has no config flag for this, and no definable agent the way OpenCode has —
+    `agy agent` only lists agents, and lists none. The one alternative was to refuse a one-shot
+    while an Antigravity chat session is live, and that is decided against: the exposure is exactly
+    the window in which a chat session holds the registration and no wider, the inline prompt asks
+    for SQL and nothing else, and Ctrl+K, AI Fill and AI Seed are keystrokes — refusing one because
+    a panel happens to be open would cost more, on every press, than the narrow overlap it removes.
+    So this is a settled limit rather than unfinished wiring, and nothing in the code gates on it:
+    this paragraph is the whole of the record.
     **`cli_failure_message` takes the harness now, and that is not decoration.** Its last-resort arm
     said *"the claude CLI exited with status N"* whatever had run, so a user who had picked Codex was
     sent to check an installation that was not the one that failed — the same wrong-cause report the
