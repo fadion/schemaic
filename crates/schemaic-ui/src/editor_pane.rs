@@ -55,6 +55,7 @@ use crate::completion::{
 };
 use crate::consts::*;
 use crate::inline_diff;
+use crate::shortcuts::primary_held;
 use crate::widgets::*;
 use crate::{
     ConnNode, CtxMenu, FieldCfg, InlineAiRequest, InlineAiState, NavKeys, PopupAnchor, RightPanel,
@@ -2059,7 +2060,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // document cannot tell a typed `x` from Ctrl+X. Only typing (or
         // Ctrl+Space) may open a closed popup; see `completion::popup_may_open`.
         comp.typed.set(match &kp.key {
-            KeyInput::Keyboard(key, _) => types_a_character(key, mods.control(), mods.alt()),
+            KeyInput::Keyboard(key, _) => types_a_character(key, primary_held(mods), mods.alt()),
             _ => false,
         });
         // Any keypress dismisses the unsafe-run notice (and doesn't execute). The
@@ -2071,7 +2072,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // `on_event_stop`s KeyDown, so the workspace-root handler never sees it
         // while the editor is focused. Checked before completion so Ctrl+Tab cycles
         // tabs rather than being eaten as a completion-accept Tab.
-        if mods.control() {
+        if primary_held(mods) {
             let is_tab = matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _));
             let ch = match &kp.key {
                 KeyInput::Keyboard(Key::Character(c), _) => Some(c.as_str().to_ascii_lowercase()),
@@ -2147,7 +2148,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     comp.sel.update(|i| *i = (*i + len - 1) % len);
                     return CommandExecuted::Yes;
                 }
-                let accept_enter = !mods.control()
+                let accept_enter = !primary_held(mods)
                     && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _));
                 let accept_tab = !mods.shift()
                     && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _));
@@ -2181,7 +2182,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // are on we compute and apply the spaces ourselves (via the tested pure
         // `soft_tab_indent`). Hard tabs fall through to the default (a literal
         // `\t`, whose display width already follows SqlStyling::tab_width).
-        if !mods.control()
+        if !primary_held(mods)
             && !mods.shift()
             && !comp.open.get_untracked()
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
@@ -2210,7 +2211,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Soft-tab outdent (Shift+Tab): the inverse of the above. Same reason —
         // floem's built-in outdent uses the buffer's fixed indent width — so we
         // remove one level (a leading tab, or up to `tw` spaces) per line ourselves.
-        if !mods.control()
+        if !primary_held(mods)
             && mods.shift()
             && !comp.open.get_untracked()
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
@@ -2244,7 +2245,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Ctrl+Space: force the completion popup open in the current context,
         // even with no prefix typed. Read the caret directly (no edit is in
         // flight, so it isn't lagging — no need to defer like the `.update` path).
-        if mods.control() {
+        if primary_held(mods) {
             let space = matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Space), _))
                 || matches!(&kp.key, KeyInput::Keyboard(Key::Character(c), _) if c.as_str() == " ");
             if space {
@@ -2270,7 +2271,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Ctrl+K: open the inline AI prompt. Capture the caret offset (and the
         // selection range, if any) so Accept knows where to insert / what to
         // replace, plus the caret point for anchoring the popup.
-        if mods.control()
+        if primary_held(mods)
             && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
             && c.as_str().eq_ignore_ascii_case("k")
         {
@@ -2330,7 +2331,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Ctrl+Alt+L — reformat SQL (DataGrip's shortcut). Match the *physical* L
         // key, not the produced character: on Windows Ctrl+Alt is delivered as
         // AltGr, so the logical `Key::Character` may not be "l".
-        if mods.control() && mods.alt() {
+        if primary_held(mods) && mods.alt() {
             use floem::keyboard::{KeyCode, PhysicalKey};
             if matches!(
                 kp.key,
@@ -2346,7 +2347,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // token, so the toggle is computed in `core::text_ops` and applied as one
         // full-buffer edit (a single undo step). Ctrl+X diverges from DataGrip
         // (which cuts) — here it deletes the line.
-        if mods.control()
+        if primary_held(mods)
             && !mods.shift()
             && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
         {
@@ -2465,7 +2466,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // Panel toggles (also handled at the workspace root for non-editor
         // focus). Ctrl+Shift+E = Schema, Ctrl+Shift+A = AI, Ctrl+` = Terminal.
         // AI/Terminal share the right slot, so each key shows-or-hides its panel.
-        if mods.control()
+        if primary_held(mods)
             && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
         {
             let c = c.as_str();
@@ -2500,7 +2501,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return CommandExecuted::Yes;
             }
         }
-        if mods.control() && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _)) {
+        if primary_held(mods)
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _))
+        {
             let sql = query.get_untracked();
             editor_sig.with_untracked(|e| {
                 let offset = e.cursor.get_untracked().offset();
@@ -2548,7 +2551,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // `\n` and so merges the newline-less last line into its neighbour.
         // Computed in `core::text_ops::move_line`, applied as one full-buffer edit.
         if mods.alt()
-            && !mods.control()
+            && !primary_held(mods)
             && !mods.shift()
             && matches!(
                 kp.key,
@@ -2595,7 +2598,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // (only `receive_char`/`run_command` are), so without the first check a
         // typed bracket edited straight through the freeze; and without the second
         // the deferred restore then cleared the freeze for the rest of the preview.
-        if !mods.control()
+        if !primary_held(mods)
             && !mods.alt()
             && let KeyInput::Keyboard(Key::Character(cs), _) = &kp.key
             && let Some(ch) = single_char(cs)
@@ -2668,7 +2671,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // both halves. Backspace is a Named key, so Floem's unconditional
         // char-insert never fires for it — returning `Yes` just pre-empts the
         // default DeleteBackward.
-        if !mods.control()
+        if !primary_held(mods)
             && !mods.alt()
             && !mods.shift()
             && matches!(
@@ -3216,7 +3219,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 if let Event::PointerWheel(pe) = e {
                     // Ctrl+wheel zooms the editor font (temporary, per-tab). Checked
                     // before shift so it wins; scroll up = zoom in.
-                    if pe.modifiers.control() {
+                    if primary_held(pe.modifiers) {
                         let dy = pe.delta.y;
                         if dy != 0.0 {
                             let cur = zoom.get_untracked().unwrap_or_else(theme::editor_font_size);
@@ -3572,7 +3575,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     guard.set(None);
                 }
                 // Ctrl+middle-click resets the temporary font zoom to the user's size.
-                if pe.button.is_auxiliary() && pe.modifiers.control() {
+                if pe.button.is_auxiliary() && primary_held(pe.modifiers) {
                     if zoom.get_untracked().is_some() {
                         zoom.set(None);
                         theme::bump_editor_generation();

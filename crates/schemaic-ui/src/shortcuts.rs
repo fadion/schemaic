@@ -40,6 +40,10 @@
 //! row is accurate or in the right group — it only has to catch the one failure
 //! that keeps recurring, which is a binding added and never written down.
 
+use std::borrow::Cow;
+
+use floem::keyboard::Modifiers;
+
 /// One group of the Shortcuts modal: a heading and its `(keys, description)` rows.
 pub(crate) type ShortcutGroup = (&'static str, &'static [(&'static str, &'static str)]);
 
@@ -177,16 +181,68 @@ pub(crate) const COMMAND_KEYS: &[(&str, &str, &str)] = &[
 ];
 
 /// The keys to show on a palette row for the command called `name`.
-pub(crate) fn command_keys(name: &str) -> Option<&'static str> {
+///
+/// Respelled for the platform, like every other rendered key string — see
+/// [`keys_label`]. The lookup still matches on the table's own Ctrl spelling, so
+/// the byte-identity the tests enforce between the two tables is untouched.
+pub(crate) fn command_keys(name: &str) -> Option<Cow<'static, str>> {
     COMMAND_KEYS
         .iter()
         .find(|(n, _, _)| *n == name)
-        .map(|(_, _, k)| *k)
+        .map(|(_, _, k)| keys_label(k))
+}
+
+// ── The primary modifier ─────────────────────────────────────────────────────
+// macOS spells it Cmd and every other desktop spells it Ctrl. Both halves of
+// that — what the modal *says* and what the handlers *accept* — hang off the one
+// capability below, so they cannot drift into disagreeing: a modal that showed
+// Cmd while the handlers only took Ctrl would be documentation of a key that
+// does nothing, which is worse than the Ctrl label it replaced.
+
+/// Whether this platform's primary shortcut modifier is Cmd rather than Ctrl.
+///
+/// The single `cfg!(target_os = …)` for this concern. Callers ask the
+/// capability, per *Ask the capability, never `cfg!(target_os = …)` at the use
+/// site* in `docs/architecture.md` — the functions below take it as an argument
+/// precisely so both platforms stay testable from whichever one runs the suite.
+pub(crate) const PRIMARY_IS_CMD: bool = cfg!(target_os = "macos");
+
+/// A [`SHORTCUTS`] key string as this platform should read it: `Ctrl+K` on
+/// Windows and Linux, `Cmd+K` on macOS.
+///
+/// The tables stay Ctrl-spelled and are rewritten here on the way to the screen.
+/// A second, Cmd-spelled table would be the obvious alternative and is the wrong
+/// one — two tables drift, and the tests that keep the modal and the palette
+/// honest work by comparing them literally.
+pub(crate) fn keys_label(keys: &'static str) -> Cow<'static, str> {
+    keys_label_on(keys, PRIMARY_IS_CMD)
+}
+
+fn keys_label_on(keys: &'static str, primary_is_cmd: bool) -> Cow<'static, str> {
+    if primary_is_cmd && keys.contains("Ctrl") {
+        Cow::Owned(keys.replace("Ctrl", "Cmd"))
+    } else {
+        Cow::Borrowed(keys)
+    }
+}
+
+/// Is the platform's primary shortcut modifier held?
+///
+/// Ctrl everywhere, and Cmd *as well* on macOS — additive on purpose, so the
+/// Ctrl bindings a macOS user already learned keep working. Off macOS this
+/// deliberately ignores Meta: there it is the Windows/Super key, and answering
+/// to it would take over shortcuts that belong to the desktop.
+pub(crate) fn primary_held(mods: Modifiers) -> bool {
+    primary_from(mods.control(), mods.meta(), PRIMARY_IS_CMD)
+}
+
+fn primary_from(control: bool, meta: bool, primary_is_cmd: bool) -> bool {
+    control || (primary_is_cmd && meta)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMAND_KEYS, SHORTCUTS, command_keys};
+    use super::{COMMAND_KEYS, SHORTCUTS, command_keys, keys_label, keys_label_on, primary_from};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -574,8 +630,14 @@ mod tests {
 
     #[test]
     fn command_keys_looks_up_by_name_and_misses_cleanly() {
-        assert_eq!(command_keys("go to line"), Some("Ctrl+G"));
-        assert_eq!(command_keys("previous tab"), Some("Ctrl+Shift+Tab"));
+        // Compared against `keys_label` rather than a literal: the lookup is by
+        // the table's own Ctrl spelling, but what comes back is respelled for the
+        // platform, so a literal here would assert Ctrl on a macOS run.
+        assert_eq!(command_keys("go to line"), Some(keys_label("Ctrl+G")));
+        assert_eq!(
+            command_keys("previous tab"),
+            Some(keys_label("Ctrl+Shift+Tab"))
+        );
         // A command with no binding, and one that doesn't exist, both yield None
         // — the row simply shows no keys.
         assert_eq!(command_keys("duplicate tab"), None);
@@ -593,6 +655,60 @@ mod tests {
         for (name, _, _) in COMMAND_KEYS {
             assert!(seen.insert(*name), "duplicate COMMAND_KEYS entry {name:?}");
         }
+    }
+
+    /// macOS spells the primary modifier Cmd, so the table's rows are rewritten
+    /// on the way to the screen rather than duplicated per platform — one table
+    /// stays the single source, and `every_command_key_is_a_real_shortcut` can
+    /// go on comparing the two tables byte for byte.
+    #[test]
+    fn a_key_string_is_respelled_for_cmd_only_where_cmd_is_the_modifier() {
+        assert_eq!(keys_label_on("Ctrl+K", true), "Cmd+K");
+        assert_eq!(keys_label_on("Ctrl+K", false), "Ctrl+K");
+    }
+
+    #[test]
+    fn every_ctrl_in_a_row_is_respelled_not_just_the_first() {
+        // `Ctrl+Home / Ctrl+End` is one row holding two bindings; respelling the
+        // head of it and leaving the tail would document a key that isn't there.
+        assert_eq!(
+            keys_label_on("Ctrl+Home / Ctrl+End", true),
+            "Cmd+Home / Cmd+End"
+        );
+        assert_eq!(keys_label_on("Ctrl+Shift+A", true), "Cmd+Shift+A");
+        assert_eq!(keys_label_on("Ctrl+Alt+L", true), "Cmd+Alt+L");
+    }
+
+    #[test]
+    fn a_row_with_no_ctrl_is_left_exactly_as_it_was() {
+        for row in ["Alt+↑ / Alt+↓", "Enter", "F5", "Shift+Tab"] {
+            assert_eq!(keys_label_on(row, true), row);
+            assert_eq!(keys_label_on(row, false), row);
+        }
+    }
+
+    /// The half that decides what the app *does*, and the reason it takes the
+    /// capability rather than reading `cfg!` itself: both platforms have to be
+    /// testable from whichever one the suite happens to run on.
+    #[test]
+    fn cmd_counts_as_the_primary_modifier_only_where_cmd_is_the_modifier() {
+        // On macOS, Cmd works and Ctrl keeps working — the change is additive,
+        // so nothing a macOS user already knew stops working.
+        assert!(primary_from(false, true, true), "Cmd on macOS");
+        assert!(primary_from(true, false, true), "Ctrl still works on macOS");
+        // Off macOS the Meta key is the Windows/Super key, and binding the app's
+        // shortcuts to it would hijack keys that belong to the desktop.
+        assert!(
+            !primary_from(false, true, false),
+            "the Windows/Super key must never stand in for Ctrl"
+        );
+        assert!(primary_from(true, false, false), "Ctrl off macOS");
+        assert!(!primary_from(false, false, true));
+        assert!(!primary_from(false, false, false));
+        // The fourth off-macOS combination, so the four together say the whole
+        // thing: off macOS the answer is the Ctrl bit and nothing else, which is
+        // what makes this change provably macOS-only in effect.
+        assert!(primary_from(true, true, false), "Ctrl+Super is still Ctrl");
     }
 
     #[test]

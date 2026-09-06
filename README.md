@@ -114,7 +114,7 @@ intelligence, built to feel instant.
   two server engines; SQLite keeps no such statistics), query history, `EXPLAIN`
   query plans, and a global "find anywhere" for schema objects. The ER diagram
   covers a whole database or one table's neighbourhood, finds tables and columns
-  with Ctrl+F, and exports as an image or as diagram source.
+  with Ctrl+F (Cmd+F on macOS), and exports as an image or as diagram source.
 - **`.sql` files** — open a script into a tab and save it back, or run a whole
   file against a database. A script is treated as a write without reading it
   first, so it can't slip past the guard that stands in front of everything else.
@@ -134,17 +134,18 @@ intelligence, built to feel instant.
   line, and for SQLite starting in the database file's own directory so `.output`
   and `.read` land where you'd expect.
 - **AI assistant** — an agent-CLI session wired into the app rather than bolted
-  beside it, driving **your own** installed CLI — Claude Code, Codex, Antigravity
-  or OpenCode — picked in Settings → AI with the model id and reasoning effort,
-  and never started on a binary Schemaic could not confirm it can restrict. Fix a
-  failed query from its error, rewrite the statement under the caret and accept or
-  reject the diff (Ctrl+K), explain or optimize it, ask about an `EXPLAIN` plan,
-  summarize a column or a value, or generate realistic rows for a table from the
-  shape of the data already in it. A built-in MCP server lets it read your schema
-  and query the database, so answers are about your data rather than a generic
-  guess — and it proposes a table change as a patch that lands in the same
-  preview any hand edit does, never as SQL run behind your back. How much it may
-  see is set **per connection**: schema only, on request, or full.
+  beside it, driving **your own** installed CLI — Claude Code, Codex,
+  Antigravity or OpenCode — picked in Settings → AI with the model id and
+  reasoning effort, and never started on a binary Schemaic could not confirm it
+  can restrict. Fix a failed query from its error, rewrite the statement under
+  the caret and accept or reject the diff (Ctrl+K, Cmd+K on macOS), explain or
+  optimize it, ask about an `EXPLAIN` plan, summarize a column or a value, or
+  generate realistic rows for a table from the shape of the data already in it.
+  A built-in MCP server lets it read your schema and query the database, so
+  answers are about your data rather than a generic guess — and it proposes a
+  table change as a patch that lands in the same preview any hand edit does,
+  never as SQL run behind your back. How much it may see is set **per
+  connection**: schema only, on request, or full.
 - **Themeable** — dark / light UI themes, multiple editor color schemes, and an
   interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
 

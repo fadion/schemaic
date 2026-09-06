@@ -5453,7 +5453,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 // one thing the ring exists to prevent. Step the innermost
                 // overlay's ring instead.
                 if matches!(ke.key.logical_key, Key::Named(NamedKey::Tab))
-                    && !m.control()
+                    && !crate::shortcuts::primary_held(m)
                     && let Some((ring_root, ring)) = widgets::innermost_ring_root()
                 {
                     ring.step_from(ring_root, m.shift());
@@ -5493,8 +5493,8 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 if modal_up() {
                     return EventPropagation::Continue;
                 }
-                if m.control() {
-                    // Global nav (Ctrl+P/T/W/Tab/1-9) — also wired inside the
+                if crate::shortcuts::primary_held(m) {
+                    // Global nav (Ctrl+P/T/W/Tab/1-9, Cmd on macOS) — also wired inside the
                     // editor, which stops KeyDown; here it catches every other
                     // focus (grid, schema, nothing).
                     let is_tab = matches!(ke.key.logical_key, Key::Named(NamedKey::Tab));
@@ -8629,7 +8629,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         // Ctrl+Arrow recall, before the plain-arrow hooks: the modifier is what
         // tells the two apart, and the plain-arrow branch below doesn't look at
         // it.
-        if mods.control()
+        if crate::shortcuts::primary_held(mods)
             && let Some(cb) = match &kp.key {
                 KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _) => ctrl_up.as_ref(),
                 KeyInput::Keyboard(Key::Named(NamedKey::ArrowDown), _) => ctrl_down.as_ref(),
@@ -8752,7 +8752,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             // `enter_never_breaks` opts a multiline field out of the newline
             // entirely — it is the *question* case, where a second line means
             // nothing and the box is multiline only to wrap and grow.
-            let plain = !mods.shift() && !mods.control();
+            let plain = !mods.shift() && !crate::shortcuts::primary_held(mods);
             // `enter_never_breaks` is folded in here rather than into `plain`: once
             // a field cannot break its line, no modifier combination changes what
             // Enter means, so the guards below stop consulting `plain` at all.
