@@ -255,6 +255,13 @@ sudo curl -fsSL https://fadion.github.io/schemaic/schemaic.repo \
 sudo dnf install schemaic
 ```
 
+The first `dnf install` reports `repomd.xml GPG signature verification error:
+Signing key not found` and then offers to import the key — twice, once for the
+repository index and once for the packages. That is what a machine which has
+never seen the key is supposed to do, not a failure, and it shows the
+fingerprint below each time so you can check before answering. The script above
+never shows it, because it imports the key before adding the repository.
+
 Upgrades then arrive with `apt-get upgrade` or `dnf upgrade`. Nothing upgrades
 on its own unless you have already set that up — Debian and Ubuntu users can add
 `"Schemaic:stable";` to `Unattended-Upgrade::Allowed-Origins` to include
@@ -262,7 +269,16 @@ Schemaic in it.
 
 Both repositories are signed, and every `.rpm` in them is signed too. That key
 says a package came from this repository and arrived unaltered; it is not a
-code-signing certificate and vouches for no identity beyond that.
+code-signing certificate and vouches for no identity beyond that. Its
+fingerprint is:
+
+```
+ABDBDC3958F3FAFC734273796566ECED7795DC1A
+```
+
+That is printed here as well as on the site on purpose: a fingerprint you can
+only check against the same server the key came from is not a check at all,
+and this repository's history is a channel that server does not control.
 
 #### Or by hand, from a release
 
