@@ -44,13 +44,28 @@ production data, or any data you care about.
 - **SQL editor** — syntax highlighting, schema-aware autocomplete, structure-aware
   diagnostics (unknown tables/columns, syntax errors, typo hints) from a real
   per-dialect parser, one-key formatting, auto-closing pairs, and bracket matching.
+- **Snippets and parameters** — a snippet library scoped the way you actually
+  work (this connection, this engine, or everywhere), expanded by abbreviation
+  from the completion popup, with a per-engine starter pack you can duplicate but
+  not break. Write `:name` in a statement and a bar appears to fill it in — the
+  values are substituted before the run, so the missing-`WHERE` check reads the
+  SQL that will really execute rather than the template.
 - **Results grid** — inline editing that writes back to the database
   (transactional, with a per-row safety net); add / duplicate / delete rows;
   server-side filter and sort straight from the column headers; per-column freeze;
   a whole-row JSON view/edit panel; per-column display formatters; paste a block
   from a spreadsheet straight onto the selection (staged as ordinary edits, so
-  you still commit or discard it); and export to CSV / JSON / SQL / Markdown /
-  HTML.
+  you still commit or discard it); range selection that totals what you've
+  highlighted; and export to CSV / JSON / SQL / Markdown / HTML / Excel —
+  streaming the whole table when you ask for it, not just the rows that happened
+  to be fetched. Results worth keeping can be pinned to a strip that stays on
+  screen while you go on querying.
+- **Binary columns** — a blob cell isn't dragged into the result set with
+  everything else: open one and its bytes are fetched on their own, shown as an
+  image preview (PNG, JPEG, GIF, BMP, WebP, ICO) or a hex dump, and a file can be
+  staged back into the cell as bytes, committed like any other edit. A value too
+  large to fetch whole is said to be truncated and then refuses to be saved to a
+  file, rather than handing you a partial blob that looks complete.
 - **Statement timeout** — optional, off by default: cancel a statement that runs
   longer than you meant it to, per statement rather than per script, using the
   same server-side cancellation the Cancel button does.
@@ -60,47 +75,92 @@ production data, or any data you care about.
   isn't shown, because there is no manual mode there yet.
 - **Schema editing** — a visual table designer (columns, indexes, foreign keys,
   CHECK constraints) plus editors for views and triggers, for stored functions
-  and procedures on MySQL/MariaDB and PostgreSQL, and for PostgreSQL types,
-  domains and sequences. Every change is shown as the SQL it will run,
+  and procedures on MySQL/MariaDB and PostgreSQL, for PostgreSQL types, domains
+  and sequences, and for MySQL's scheduled events. Databases and schemas
+  can be created and dropped, and a PostgreSQL materialized view refreshed, from
+  the tree's own menus. Every change is shown as the SQL it will run,
   with anything destructive spelled out in plain language, before it runs. Tables,
   views and triggers on all three engines — including SQLite, where a column
   change is a table rebuild and the app generates, verifies and runs the whole
   script for you.
+- **Compare schemas** — pair two databases object by object (tables, views,
+  triggers, routines, events, enums, domains, sequences), tick the differences you
+  want, and get one migration through the same preview and Apply as every other
+  change. Same dialect only — a MySQL-to-PostgreSQL migration generated from a
+  diff would be wrong, so the app refuses it instead of emitting it. Anything it
+  can't express is named in an "omitted" block above the plan rather than quietly
+  dropped.
+- **Export a database** — structure and data from a whole database, one schema, or
+  a single table. As SQL it's one replayable file, with foreign keys restated
+  after the rows; in any of the other five formats it's one file per table in a
+  folder. The header says what it left out and why — keys pointing outside the
+  selection, a dependency cycle, and the identity columns that mean restored rows
+  are renumbered rather than carrying their old ids.
+- **Users and privileges** — browse a server's accounts and roles, read one
+  account's privileges as the actual `GRANT` statements, and create, drop, grant
+  or revoke through the ordinary DDL preview. MySQL/MariaDB and PostgreSQL;
+  server-owned accounts are shown read-only, and where a privilege could be held
+  indirectly — through a role, ownership, or superuser — the pane says the list is
+  direct grants only instead of implying it is the whole picture.
+- **Server activity** — the connection's live sessions, with a lock-wait banner,
+  and *Kill session* / *Cancel query* on any of them. MySQL/MariaDB and
+  PostgreSQL. Where the engine can't say what is blocking what, it still shows who
+  is waiting and admits it can't name the blocker.
 - **Live Monitor** — watch a table and see inserts, updates and deletes as they
-  land, down to which column changed.
-- **Import** — load CSV / TSV / JSON (array or JSON Lines) into a table, with
-  column mapping and a full validation pass that reports every problem, with its
-  line number, before a single row is written.
-- **Navigate** — schema browser with favorites, query history, `EXPLAIN` query
-  plans, an ER diagram of a whole database or one table's neighbourhood, and a
-  global "find anywhere" for schema objects.
-- **Connect** — MySQL / MariaDB / PostgreSQL, direct or over SSH tunnels, and
+  land, down to which column changed; pause, clear or export the change log.
+- **Import** — load CSV / TSV / JSON (array or JSON Lines) / Excel `.xlsx` into a
+  table, with column mapping and a full validation pass that reports every
+  problem, with its line number, before a single row is written.
+- **Navigate** — schema browser with favorites, table sizes and a properties panel
+  that marks an estimate as an estimate rather than dressing it up as a count (the
+  two server engines; SQLite keeps no such statistics), query history, `EXPLAIN`
+  query plans, and a global "find anywhere" for schema objects. The ER diagram
+  covers a whole database or one table's neighbourhood, finds tables and columns
+  with Ctrl+F, and exports as an image or as diagram source.
+- **`.sql` files** — open a script into a tab and save it back, or run a whole
+  file against a database. A script is treated as a write without reading it
+  first, so it can't slip past the guard that stands in front of everything else.
+- **Connect** — MySQL / MariaDB / PostgreSQL, direct or over SSH tunnels, with
+  TLS from *prefer* through *verify-full* (client certificates included, verified
+  against the OS trust store rather than a root set compiled in years ago), and
   SQLite by picking a file (no server, so no host, credentials or tunnel to fill
   in). Per-connection colors, environment badges, and a read-only guard-rail on
-  all of them.
+  all of them. Coming from another client, you can import the servers you already
+  have — a pasted URL or DSN, DBeaver, DataGrip, `~/.my.cnf`, `~/.pgpass`,
+  `~/.pg_service.conf` — as a proposal you review row by row. Where a source keeps
+  its passwords encrypted or in the OS credential store, you're told so rather
+  than left with a connection that silently won't open.
 - **Terminal** — an embedded shell, and a one-click `mysql` / `mariadb` / `psql` /
   `sqlite3` session against the active connection — through the SSH tunnel when
   there is one, with the password passed by environment rather than on the command
   line, and for SQLite starting in the database file's own directory so `.output`
   and `.read` land where you'd expect.
 - **AI assistant** — an agent-CLI session wired into the app rather than bolted
-  beside it, driving **your own** installed CLI: Claude Code, Codex,
-  Antigravity or OpenCode, picked in Settings → AI along with the model id, which
-  is a free text field rather than a list this build happens to know. What each
-  one is allowed to do differs and the panel says so — Claude Code and OpenCode
-  can be given no built-in tools at all; the other two run read-only, and
-  Schemaic will not start a session on a binary it could not confirm it can
-  restrict. Then: **AI Fix** on a
-  failed query, which hands it the error and the query
-  and offers you the corrected SQL as a diff; rewrite the statement
-  under the caret and accept or reject that diff yourself (Ctrl+K); explain or
-  optimize it from the right-click menu; ask about an `EXPLAIN` plan without
-  retyping it; summarize a column or a single value; or generate realistic rows
-  for a table from the shape of the data already in it. A built-in MCP server
-  lets it read your schema and query the database, so answers are about your data
-  rather than a generic guess — on every harness, and never beyond what that
-  connection's data-access setting allows. The one-shot generators (Ctrl+K, AI
-  Fill, AI Seed) run whichever harness the chat panel is using.
+  beside it, driving **your own** installed CLI: **Claude Code, Codex, Antigravity
+  or OpenCode**, picked in Settings → AI along with the model id — a free text
+  field with suggestions, not a list this build happens to know, so a model
+  released after it still works — and a reasoning-effort setting where the CLI has
+  one. What each is allowed to do differs, and the settings screen says so before
+  you start: Claude Code and OpenCode can be given no built-in tools at all, the
+  other two run read-only, and Schemaic will not open a session on a binary it
+  could not confirm it can restrict.
+
+  Then: **AI Fix** on a failed query, which hands it the error and the statement
+  and offers the correction as a diff; rewrite the statement under the caret and
+  accept or reject that diff yourself (Ctrl+K); explain or optimize it from the
+  right-click menu; ask about an `EXPLAIN` plan without retyping it; summarize a
+  column or a single value; or generate realistic rows for a table from the shape
+  of the data already in it. A built-in MCP server lets the assistant read your
+  schema and query the database — on every harness — so answers are about your
+  data rather than a generic guess, and it can propose a table change as a patch
+  that lands in the same preview any hand edit does, never as SQL run behind your
+  back. How much it may see is set **per connection**, not globally: schema only,
+  on request, or full.
+
+  One limit worth knowing before you switch: the one-shot generators (Ctrl+K, AI
+  Fill, AI Seed) always run Claude Code, whichever CLI drives the chat panel.
+  Their prompt is built from Claude's flags, so with another CLI selected they
+  look for Claude and report it missing if it isn't there.
 - **Themeable** — dark / light UI themes, multiple editor color schemes, and an
   interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
 
