@@ -4,15 +4,21 @@
 #
 #     curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
 #
-# Picks the right artifact from the latest GitHub Release for this machine: the
-# .pkg on macOS, a .deb on Debian and Ubuntu, an .rpm on Fedora, RHEL and
-# openSUSE, and the self-updating AppImage on every other Linux.
+# Picks the right route for this machine: the .pkg on macOS, the signed apt
+# repository on Debian and Ubuntu, the signed dnf/zypper repository on Fedora,
+# RHEL and openSUSE, and the self-updating AppImage on every other Linux.
 #
-# **They are not equivalent, and the script says which is which at the end.**
-# The .pkg and the AppImage are Velopack installs and check for updates on
-# their own. A .deb or .rpm lands in /usr/bin, which is not a Velopack install,
-# so the in-app check correctly never runs - those are updated by re-running
-# this script, until there is an apt/dnf repository to point at.
+# **Every one of those updates itself, by a different mechanism, and the script
+# says which at the end.** The .pkg and the AppImage are Velopack installs and
+# poll GitHub on their own. A .deb or .rpm lands in /usr/bin, which is not a
+# Velopack install, so the in-app check correctly never runs - those come from
+# the package repositories at https://fadion.github.io/schemaic and are carried
+# forward by `apt-get upgrade` / `dnf upgrade` with the rest of the system.
+#
+# Set SCHEMAIC_NO_REPO=1 to install a single downloaded .deb or .rpm instead,
+# adding nothing to the system's source lists. That build does not update
+# itself and re-running this script is the only way forward from it, which is
+# the trade being made.
 #
 # On macOS this script is also the way past Gatekeeper, and not by defeating
 # it: the quarantine flag is set by whatever downloads a file, and curl does
@@ -24,6 +30,14 @@ REPO="fadion/schemaic"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 RAW="https://raw.githubusercontent.com/${REPO}/main"
 APP_ID="io.github.fadion.Schemaic"
+
+# The package repositories. This URL is written into the user's source list and
+# their machine will keep asking for it for as long as Schemaic is installed,
+# so it is as permanent as the Velopack channel names - moving it means every
+# existing install stops seeing updates, silently, with no route back to those
+# users to tell them. Change it only alongside a plan for that.
+SITE="https://fadion.github.io/schemaic"
+KEYRING="/usr/share/keyrings/schemaic-archive-keyring.gpg"
 
 if [ -t 1 ]; then
     RED=$'\033[0;31m'
@@ -134,7 +148,66 @@ detect_family() {
     fi
 }
 
+# Adding a third-party repository is a bigger thing to do to someone's machine
+# than dropping a package on it, and it is the whole point: apt will keep
+# fetching from here, so this is also the only route on which an upgrade
+# arrives without the user coming back.
 install_deb() {
+    if [ "${SCHEMAIC_NO_REPO:-0}" = 1 ]; then
+        install_deb_direct
+        return
+    fi
+
+    local tmp first
+    tmp="$(mktemp -d)"
+    info "Adding the Schemaic apt repository (${SITE}/deb)"
+
+    # The dearmored keyring is published beside the armoured key precisely so
+    # this needs no gpg on the machine - a slim container often has none, and
+    # `gpg --dearmor` would be an extra dependency for a file we can just as
+    # easily publish in both forms.
+    download_to "${SITE}/schemaic-archive-keyring.gpg" "${tmp}/keyring.gpg"
+    # A 404 or a captive-portal page arrives here looking like a file, and apt
+    # would then reject every update with an unhelpful signature error. A
+    # keyring begins with an OpenPGP public-key packet: 0x98, 0x99 or 0xc6.
+    first="$(od -An -tx1 -N1 "${tmp}/keyring.gpg" | tr -d ' \n')"
+    case "$first" in
+        98 | 99 | c6) ;;
+        *)
+            err "the downloaded signing key is not a GPG keyring (got bytes '${first}')"
+            rm -rf "$tmp"
+            exit 1
+            ;;
+    esac
+
+    download_to "${SITE}/schemaic.sources" "${tmp}/schemaic.sources"
+    if ! grep -q '^Types: deb' "${tmp}/schemaic.sources"; then
+        err "the downloaded apt source is not a deb822 sources file"
+        rm -rf "$tmp"
+        exit 1
+    fi
+
+    info "Installing the repository (this needs root)"
+    run_privileged install -m 0644 -D "${tmp}/keyring.gpg" "$KEYRING"
+    run_privileged install -m 0644 -D "${tmp}/schemaic.sources" /etc/apt/sources.list.d/schemaic.sources
+    rm -rf "$tmp"
+    ok "Repository added, signed by the published key"
+
+    # Not fatal. A machine with somebody else's broken PPA in its lists fails
+    # `apt-get update` as a whole, and that is not a reason to refuse to
+    # install Schemaic - if our own source is the broken one, the install below
+    # says so precisely.
+    if ! run_privileged apt-get update; then
+        warn "apt-get update reported an error, often from an unrelated repository; continuing"
+    fi
+    info "Installing schemaic"
+    run_privileged apt-get install -y schemaic
+    ok "Installed"
+}
+
+# The pre-repository route, kept for SCHEMAIC_NO_REPO=1: one package, nothing
+# added to the system's source lists, and no updates.
+install_deb_direct() {
     local url tmp
     url="$(asset_url '_amd64\.deb')"
     tmp="$(mktemp --suffix=.deb)"
@@ -158,6 +231,64 @@ install_deb() {
 }
 
 install_rpm() {
+    if [ "${SCHEMAIC_NO_REPO:-0}" = 1 ] || ! { has dnf || has zypper; }; then
+        # Plain rpm with no dnf and no zypper has no repository support worth
+        # the name, so that machine takes the direct route whatever it asked
+        # for - and is told so.
+        if [ "${SCHEMAIC_NO_REPO:-0}" != 1 ]; then
+            warn "neither dnf nor zypper is available; installing a single package instead of adding the repository"
+        fi
+        install_rpm_direct
+        return
+    fi
+
+    local tmp
+    tmp="$(mktemp -d)"
+    info "Adding the Schemaic package repository (${SITE}/rpm)"
+
+    download_to "${SITE}/schemaic.asc" "${tmp}/schemaic.asc"
+    if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "${tmp}/schemaic.asc"; then
+        err "the downloaded signing key is not an armoured GPG key"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    download_to "${SITE}/schemaic.repo" "${tmp}/schemaic.repo"
+    if ! grep -q '^\[schemaic\]' "${tmp}/schemaic.repo"; then
+        err "the downloaded repository definition is not a .repo file"
+        rm -rf "$tmp"
+        exit 1
+    fi
+
+    # Imported into the rpm database up front so the packages verify against a
+    # key the machine already holds. Without this, dnf offers to import it
+    # mid-install, which is a prompt in the middle of a piped script and a much
+    # worse moment to be deciding whether to trust a key.
+    info "Importing the signing key (this needs root)"
+    run_privileged rpm --import "${tmp}/schemaic.asc"
+
+    if has dnf; then
+        run_privileged install -m 0644 -D "${tmp}/schemaic.repo" /etc/yum.repos.d/schemaic.repo
+        rm -rf "$tmp"
+        ok "Repository added, with signature checking on"
+        info "Installing schemaic"
+        run_privileged dnf install -y schemaic
+    else
+        # zypper reads its own directory, not /etc/yum.repos.d.
+        run_privileged install -m 0644 -D "${tmp}/schemaic.repo" /etc/zypp/repos.d/schemaic.repo
+        rm -rf "$tmp"
+        ok "Repository added, with signature checking on"
+        info "Installing schemaic"
+        run_privileged zypper --non-interactive refresh schemaic
+        run_privileged zypper --non-interactive install schemaic
+    fi
+    ok "Installed"
+}
+
+# The pre-repository route, kept for SCHEMAIC_NO_REPO=1 and for machines with
+# no dnf or zypper: one package, nothing added to the system, no updates. The
+# .rpm on the Releases page is unsigned - only the copies in the repository are
+# signed - which is why every branch below waives the signature check.
+install_rpm_direct() {
     local url tmp
     url="$(asset_url '\.x86_64\.rpm')"
     tmp="$(mktemp --suffix=.rpm)"
@@ -170,11 +301,10 @@ install_rpm() {
     fi
     ok "Downloaded ${url##*/}"
 
-    # Unsigned on purpose (see the packaging notes in the release workflow), so
-    # every branch below waives its signature check. Worth stating rather than
-    # burying: it means the download is trusted because of where it came from,
-    # and nothing else.
-    warn "Schemaic's packages are not GPG-signed; the install below waives the signature check."
+    # Worth stating rather than burying: waiving the check means this download
+    # is trusted because of where it came from, and nothing else. The copies in
+    # the repository are signed, which is the reason to prefer that route.
+    warn "The .rpm on the Releases page is not GPG-signed; the install below waives the signature check."
     info "Installing (this needs root)"
     if has dnf; then
         run_privileged dnf install -y --nogpgcheck "$tmp"
@@ -281,14 +411,31 @@ echo
 ok "Schemaic is installed."
 case "$family" in
     debian)
-        info "Updates:   this build does not update itself - re-run this script for the next"
-        info "           release, or use SCHEMAIC_PKG_FAMILY=appimage, which does."
-        info "Uninstall: sudo apt-get remove schemaic"
+        if [ "${SCHEMAIC_NO_REPO:-0}" = 1 ]; then
+            info "Updates:   none - this is a single package, with no repository behind it."
+            info "           Re-run this script without SCHEMAIC_NO_REPO to get them."
+            info "Uninstall: sudo apt-get remove schemaic"
+        else
+            info "Updates:   with the rest of your system - sudo apt-get update && sudo apt-get upgrade."
+            info "           To have unattended-upgrades pick it up too, add \"Schemaic:stable\";"
+            info "           to Unattended-Upgrade::Allowed-Origins."
+            info "Uninstall: sudo apt-get remove schemaic \\"
+            info "           && sudo rm /etc/apt/sources.list.d/schemaic.sources ${KEYRING}"
+        fi
         ;;
     rpm)
-        info "Updates:   this build does not update itself - re-run this script for the next"
-        info "           release, or use SCHEMAIC_PKG_FAMILY=appimage, which does."
-        info "Uninstall: sudo dnf remove schemaic"
+        if [ "${SCHEMAIC_NO_REPO:-0}" = 1 ] || { ! has dnf && ! has zypper; }; then
+            info "Updates:   none - this is a single package, with no repository behind it."
+            info "           Re-run this script without SCHEMAIC_NO_REPO to get them."
+            info "Uninstall: sudo dnf remove schemaic"
+        elif has dnf; then
+            info "Updates:   with the rest of your system - sudo dnf upgrade."
+            info "Uninstall: sudo dnf remove schemaic && sudo rm /etc/yum.repos.d/schemaic.repo"
+        else
+            info "Updates:   with the rest of your system - sudo zypper update."
+            info "Uninstall: sudo zypper remove schemaic \\"
+            info "           && sudo rm /etc/zypp/repos.d/schemaic.repo"
+        fi
         ;;
     appimage)
         info "Updates:   checked automatically; the app offers a restart when one is staged."

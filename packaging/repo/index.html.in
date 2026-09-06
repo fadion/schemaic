@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schemaic package repositories</title>
+<link rel="icon" href="icon.png">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --fg: #1c1c1a; --muted: #6b6b66; --rule: #e2e2dd;
+    --code-bg: #f2f2ee; --accent: #b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a; --fg: #e6e6e3; --muted: #9a9a94; --rule: #2c2c31;
+      --code-bg: #202024; --accent: #e8a33d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 3rem 1.25rem 5rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: .85rem; margin-bottom: .35rem; }
+  header img { width: 42px; height: 42px; }
+  h1 { font-size: 1.5rem; margin: 0; letter-spacing: -.01em; }
+  h2 { font-size: 1.05rem; margin: 2.75rem 0 .6rem; letter-spacing: -.01em; }
+  h2:first-of-type { margin-top: 2rem; }
+  p { margin: .7rem 0; }
+  .lede { color: var(--muted); margin-bottom: 2rem; }
+  .version { color: var(--muted); font-size: .85rem; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+    padding: .85rem 1rem; overflow-x: auto; margin: .8rem 0;
+    font: 13px/1.65 ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace; font-size: .92em; }
+  p code, li code { background: var(--code-bg); padding: .1em .35em; border-radius: 3px; }
+  a { color: var(--accent); }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 3rem 0 1.5rem; }
+  footer { color: var(--muted); font-size: .85rem; }
+  .note { border-left: 2px solid var(--rule); padding-left: 1rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="icon.png" alt="">
+    <h1>Schemaic package repositories</h1>
+  </header>
+  <p class="lede">
+    APT and DNF repositories for <a href="https://github.com/fadion/schemaic">Schemaic</a>,
+    a fast native SQL editor for MySQL, MariaDB, PostgreSQL and SQLite.
+    Install from here and updates arrive with the rest of your system.
+    <span class="version">Latest: __VERSION__.</span>
+  </p>
+
+  <p>The one-line way in, on any Linux, is the installer script — it detects the
+  distribution, adds the right repository below, and installs:</p>
+  <pre><code>curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash</code></pre>
+  <p>Everything below is what that script does, written out, for anyone who
+  would rather do it by hand.</p>
+
+  <h2>Debian, Ubuntu and derivatives</h2>
+  <pre><code>curl -fsSL __BASE_URL__/schemaic.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/schemaic-archive-keyring.gpg
+curl -fsSL __BASE_URL__/schemaic.sources \
+  | sudo tee /etc/apt/sources.list.d/schemaic.sources > /dev/null
+sudo apt-get update
+sudo apt-get install schemaic</code></pre>
+  <p>Upgrades then come with <code>sudo apt-get upgrade</code>.</p>
+
+  <h2>Fedora, RHEL, CentOS and openSUSE</h2>
+  <pre><code>sudo curl -fsSL __BASE_URL__/schemaic.repo \
+  -o /etc/yum.repos.d/schemaic.repo
+sudo dnf install schemaic</code></pre>
+  <p>On openSUSE, <code>sudo zypper addrepo __BASE_URL__/schemaic.repo</code>
+  and <code>sudo zypper install schemaic</code>. Upgrades come with
+  <code>dnf upgrade</code> or <code>zypper update</code>.</p>
+
+  <h2>Signing key</h2>
+  <p>Both repositories are signed, and so is every RPM in them. The public key
+  is <a href="schemaic.asc">schemaic.asc</a>
+  (<a href="schemaic-archive-keyring.gpg">binary keyring</a> for APT's
+  <code>signed-by</code>); its fingerprint is:</p>
+  <pre><code>__FINGERPRINT__</code></pre>
+  <p class="note">This key says a package came from this repository and arrived
+  unaltered. It is not a code-signing certificate and vouches for no identity
+  beyond that — the Windows and macOS builds are unsigned, deliberately, and
+  say so.</p>
+
+  <h2>Unattended upgrades</h2>
+  <p>Debian and Ubuntu users who want Schemaic picked up automatically can add
+  its origin to <code>/etc/apt/apt.conf.d/50unattended-upgrades</code>:</p>
+  <pre><code>Unattended-Upgrade::Allowed-Origins {
+    "Schemaic:stable";
+};</code></pre>
+  <p>Nothing upgrades on its own without that — a package manager waits to be
+  asked.</p>
+
+  <h2>What is here</h2>
+  <p>The <strong>five most recent releases</strong> in each format, so a
+  release you would rather not be on can be rolled back to with
+  <code>apt-get install schemaic=X.Y.Z</code> or
+  <code>dnf downgrade schemaic</code>. Older versions stay available as direct
+  downloads on the
+  <a href="https://github.com/fadion/schemaic/releases">Releases page</a>, which
+  is where these packages are built from.</p>
+  <p>Only <code>x86_64</code>/<code>amd64</code>. There is no 32-bit or ARM
+  Linux build to publish.</p>
+
+  <hr>
+  <footer>
+    Schemaic is in active development — do not trust it with data you care
+    about. Rebuilt on every release from
+    <a href="https://github.com/fadion/schemaic/blob/main/.github/workflows/pages.yml">pages.yml</a>.
+  </footer>
+</main>
+</body>
+</html>
