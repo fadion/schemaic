@@ -220,16 +220,53 @@ it.
 curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
 ```
 
-The script picks the artifact that fits the system — a `.deb` on Debian and
-Ubuntu, an `.rpm` on Fedora, RHEL and openSUSE, the AppImage everywhere
-else — and tells you at the end how that build updates itself. Override the choice
-with `SCHEMAIC_PKG_FAMILY=debian|rpm|appimage`. Read it first if you would
-rather not pipe a script into a shell; it is
-[install.sh](install.sh) in this repository, and it uses `sudo` only for the
-package-manager step.
+The script picks the route that fits the system — the **apt repository** on
+Debian and Ubuntu, the **dnf/zypper repository** on Fedora, RHEL and openSUSE,
+the self-updating AppImage everywhere else — and tells you at the end how that
+install updates itself. Override the choice with
+`SCHEMAIC_PKG_FAMILY=debian|rpm|appimage`, or set `SCHEMAIC_NO_REPO=1` to take a
+single downloaded package and add nothing to your source lists. Read it first if
+you would rather not pipe a script into a shell; it is [install.sh](install.sh)
+in this repository, and it uses `sudo` only for the package-manager step.
 
-To do it by hand instead, from the
-[latest release](https://github.com/fadion/schemaic/releases/latest):
+**Everything on this list updates itself now**, by one of two mechanisms: the
+AppImage checks GitHub in the background and offers a restart, and a packaged
+install is carried forward by the package manager along with the rest of your
+system.
+
+#### The package repositories
+
+Signed, hosted at <https://fadion.github.io/schemaic>, and holding the five most
+recent releases. To add them by hand — Debian, Ubuntu and derivatives:
+
+```sh
+curl -fsSL https://fadion.github.io/schemaic/schemaic-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/schemaic-archive-keyring.gpg > /dev/null
+curl -fsSL https://fadion.github.io/schemaic/schemaic.sources \
+  | sudo tee /etc/apt/sources.list.d/schemaic.sources > /dev/null
+sudo apt-get update && sudo apt-get install schemaic
+```
+
+Fedora, RHEL, CentOS (and openSUSE, with `zypper` in place of `dnf`):
+
+```sh
+sudo curl -fsSL https://fadion.github.io/schemaic/schemaic.repo \
+  -o /etc/yum.repos.d/schemaic.repo
+sudo dnf install schemaic
+```
+
+Upgrades then arrive with `apt-get upgrade` or `dnf upgrade`. Nothing upgrades
+on its own unless you have already set that up — Debian and Ubuntu users can add
+`"Schemaic:stable";` to `Unattended-Upgrade::Allowed-Origins` to include
+Schemaic in it.
+
+Both repositories are signed, and every `.rpm` in them is signed too. That key
+says a package came from this repository and arrived unaltered; it is not a
+code-signing certificate and vouches for no identity beyond that.
+
+#### Or by hand, from a release
+
+From the [latest release](https://github.com/fadion/schemaic/releases/latest):
 
 | Artifact | Install | Updates |
 | --- | --- | --- |
@@ -238,10 +275,12 @@ To do it by hand instead, from the
 | `schemaic-X.Y.Z-1.x86_64.rpm` | `sudo dnf install --nogpgcheck ./schemaic-*.rpm` | No |
 | `schemaic-vX.Y.Z-linux-x86_64.tar.gz` | Extract anywhere | No |
 
-The AppImage is the only Linux artifact that updates itself. A `.deb` or `.rpm`
-installs to `/usr/bin`, which the updater correctly refuses to touch, so those
-are updated by re-running the script above. The packages are not GPG-signed,
-which is why the `.rpm` line above waives the check.
+None of these update themselves. A `.deb` or `.rpm` installs to `/usr/bin`,
+which the in-app updater correctly refuses to touch — with the repository added
+that is the package manager's job, and without it there is nothing behind the
+install to update from. The packages *on the Releases page* are unsigned, which
+is why the `.rpm` line waives the check; the copies in the repository are
+signed.
 
 The binary needs a GPU stack and the usual desktop libraries at runtime
 (`libxkbcommon`, Wayland or X11, Vulkan or EGL). The `.deb` and `.rpm` declare

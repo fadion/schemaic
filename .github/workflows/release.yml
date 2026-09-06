@@ -180,13 +180,17 @@ jobs:
 
       # ── Distribution packages ────────────────────────────────────────────
       # A .deb and an .rpm around the same binary the archive above wraps.
-      # These are *convenience* packaging, not an update channel: an install
-      # under /usr/bin is not a Velopack install, so `UpdateManager::new` fails
-      # there, `check_gate` returns `NotInstalled` and the in-app update check
-      # correctly never runs. What they buy is a desktop entry, an icon,
-      # AppStream metadata for the software centres, dependency resolution and
-      # a clean uninstall. Updates come from re-running install.sh until there
-      # is an apt/dnf repository to point at.
+      # An install under /usr/bin is not a Velopack install, so
+      # `UpdateManager::new` fails there, `check_gate` returns `NotInstalled`
+      # and the in-app update check correctly never runs. What they buy is a
+      # desktop entry, an icon, AppStream metadata for the software centres,
+      # dependency resolution and a clean uninstall.
+      #
+      # Updates for them come from the apt/dnf repositories the `pages` job
+      # below builds *out of these very assets* - which is why they are
+      # published unsigned and re-signed there rather than signed here. A
+      # release must not be able to fail on a missing GPG key; a repository
+      # publish can, and does.
       #
       # Both wrap the *same* staged payload (packaging/linux/stage-payload.sh),
       # so the two formats cannot drift into shipping different files.
@@ -455,3 +459,30 @@ jobs:
           files: |
             dist-packages/*.deb
             dist-packages/*.rpm
+
+  # ── The Linux package repositories ──────────────────────────────────────
+  # Rebuilds the apt/dnf repositories on GitHub Pages from the release this run
+  # just published, which is what makes `apt upgrade` and `dnf upgrade` carry
+  # Schemaic forward instead of the user re-running install.sh.
+  #
+  # **Called, not triggered.** A release created with GITHUB_TOKEN does not fire
+  # the `release` event, so a workflow listening for one would never start; and
+  # a workflow listening for the tag would start *beside* this one, before any
+  # asset existed, and publish the previous version. `needs: release` is the
+  # only ordering that is actually true: pages.yml builds the site by
+  # downloading this release, so it has to run after every leg has uploaded.
+  #
+  # Failing here does not retract anything - the GitHub Release is already
+  # complete and every direct download works. It means the repositories still
+  # describe the previous version, which is repaired by running the Pages
+  # workflow again from the Actions tab.
+  pages:
+    name: Publish the Linux package repositories
+    needs: release
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml
+    secrets: inherit

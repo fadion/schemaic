@@ -10880,8 +10880,76 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `schemaic.spec` add each format's metadata, and `install.sh` at the repo root picks between
     them and the AppImage. Those installs land in `/usr/bin`, which is *not* a Velopack install, so
     `UpdateManager::new` fails, `check_gate` answers `NotInstalled` and `should_recheck` ends the
-    poll loop for good — the correct outcome (a distribution package is the package manager's to
-    update), and the reason the AppImage stays the recommended Linux artifact.
+    poll loop for good — the correct outcome, because a distribution package is the package
+    manager's to update, and there is deliberately **no UI at all** telling a `/usr/bin` install
+    that a version exists: the header chip never appears there, because nothing it could offer
+    would be the right way to take the update. **That reasoning used to be aspirational**: the
+    package manager was the right owner but had nothing to fetch from, which is why this passage
+    once ended by calling the AppImage the recommended Linux artifact for that reason.
+    `packaging/repo/` is what made it true, and no Rust changed to do it.
+    **`packaging/repo/` publishes a signed APT repository and a signed DNF/zypper repository to
+    GitHub Pages at `https://fadion.github.io/schemaic`, so a `.deb`/`.rpm` install is carried
+    forward by `apt-get upgrade` / `dnf upgrade` with the rest of the system.** `build-site.sh` is
+    the whole build: it collects the `.deb` and `.rpm` assets of the five most recent releases,
+    calls `build-apt-repo.sh` (a `pool/`, a `dists/stable/`, a clearsigned `InRelease` and a
+    detached `Release.gpg`, all through `apt-ftparchive`) and `build-rpm-repo.sh` (`rpmsign
+    --addsign` over every package, `createrepo_c`, a detached `repodata/repomd.xml.asc`), then
+    writes the client configuration, both encodings of the public key — a binary keyring for apt's
+    `Signed-By`, an armoured `.asc` for dnf's `gpgkey=`, because an inline armoured key needs apt
+    2.4 and Debian 11 and Ubuntu 20.04 do not have it — and the landing page from `index.html.in`.
+    **The GitHub Release assets are the source of truth and the site is derived**: nothing is
+    incremental, every run downloads the packages again and rebuilds from nothing. That buys two
+    things — there is no accumulated state to corrupt, and a repository that has gone wrong is
+    repaired by re-running the workflow rather than by unpicking what the last run did.
+    **There is no `gh-pages` branch, on purpose.** A branch carrying ~40 MB of packages per release
+    would be cloned by everyone who ever clones this repository, forever, and pruning it later
+    would not shrink a clone that already exists; an Actions deployment has no git history, so the
+    published size is the only size — five releases is about 205 MB against Pages' 1 GB site limit,
+    under a 100 GB/month bandwidth allowance.
+    **Signing is mandatory and `pages.yml` fails closed without a key**, and that does not reverse
+    the ship-unsigned decision below: this is *repo* signing, which attests that a package came
+    from this repository unaltered and vouches for no identity, where Authenticode attests to a
+    publisher. The alternative here is not "an unsigned repository" — the option apt actually
+    offers is instructing every user to write `[trusted=yes]`, i.e. to turn the check off, which is
+    a weaker posture than the direct download it replaces. The key is RSA-4096 with **no expiry**:
+    EdDSA is unverifiable by RHEL-era `rpm`, and an expiry would break `apt update` on a date
+    rather than on a release — a scheduled outage with nothing to do about it but rotate. For the
+    same span of clients the rpm metadata is compressed `gz` rather than `createrepo_c`'s zstd
+    default, which RHEL-8-era dnf cannot read; it costs a few hundred kilobytes.
+    **The `.rpm` published on the GitHub Release stays unsigned and the repository re-signs its own
+    copy**, so the two files differ by exactly the signature header — same payload, same version,
+    and `dnf upgrade` replaces one with the other. The asymmetry is deliberate: a release must not
+    be able to fail on a missing GPG key, a repository publish can and does.
+    **`verify-site.sh` runs before every deploy and is the only check there is** — no unit test
+    could stand in for it, because the failure class is not a wrong answer from a function but
+    metadata disagreeing with the packages beside it: a `Packages` naming a `.deb` that was pruned,
+    a `Release` describing the previous run's `Packages.gz`. Every tool involved reports success
+    for those, and they surface on a user's machine at install time. So it reads the built site
+    back the way a client would, offline: `gpgv` and `rpmkeys` against the *published* keyring
+    rather than the developer's own — a machine holding the secret key would answer yes either
+    way — and `verify-site.py` re-hashes every file the indexes name and pins the client
+    configuration. It was exercised against two deliberate corruptions, a flipped byte in a pooled
+    `.deb` and a deleted `Packages.gz`, and failed on both.
+    **The publish is *called*, not triggered.** `release.yml`'s `pages` job is `needs: release`,
+    gated on `github.ref_type == 'tag'`, and `uses: ./.github/workflows/pages.yml` with `secrets:
+    inherit`. A release created with `GITHUB_TOKEN` does not fire the `release` event, so a
+    workflow listening for one would never start; a workflow keyed on the tag would start *beside*
+    `release.yml`, before any asset existed, and publish the previous version. `needs: release` is
+    the only ordering that is true, because the site is built by downloading the release this run
+    just made. Failing there retracts nothing — the Release is complete and every direct download
+    still works; it means the repositories describe the previous version until `workflow_dispatch`
+    on the Pages workflow rebuilds them.
+    **`install.sh`'s `debian` and `rpm` families now add the repository and install from it**, and
+    the old single-package bodies survive as `install_deb_direct` / `install_rpm_direct` — reached
+    by `SCHEMAIC_NO_REPO=1`, and for rpm automatically on a machine with neither `dnf` nor
+    `zypper`, which has no repository support worth the source-list entry. Those two are the route
+    with nothing behind it, so the tail messaging names the real update route per family rather
+    than one line for all of them. **As of this commit none of it has run against the real site.**
+    The prerequisites are in place — Pages is on the Actions source, and `GPG_PRIVATE_KEY` and
+    `GPG_PASSPHRASE` are set — but until the first publish lands, the URLs `install.sh` writes into
+    a source list resolve to nothing, and the RPM half (`rpmsign`, `createrepo_c`, the
+    `repomd.xml.asc` signature) has been reasoned about rather than executed: no machine involved
+    in building it had `createrepo_c`. Delete this note once a publish has succeeded.
     **Both packages hand-write their dependency lists, and no scanner can replace them**: `readelf
     -d` on the binary lists glibc and nothing else, because winit reaches X11, Wayland and xkbcommon
     through `libloading` and wgpu reaches Vulkan and EGL the same way. An automatically derived list
@@ -10916,8 +10984,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     that form at all — there is no CA-based code signing, only GPG with your own key, self-signed by
     construction, and nothing on the path we ship verifies it: no runtime or desktop checks an
     AppImage's embedded signature by default, and Velopack does not sign AppImages at all. GPG
-    becomes mandatory only if we ever run our own apt repository, since apt refuses an unsigned
-    `Release`.
+    becomes mandatory only if we run our own apt repository, since apt refuses an unsigned
+    `Release` — which is no longer hypothetical: `packaging/repo/` does, and `pages.yml` fails
+    closed without a key. That is repo signing rather than code signing, so it leaves this decision
+    exactly where it stands; the distinction is drawn where those repositories are described above.
     **Signing is not a prerequisite for auto-update**, and an earlier version of this reasoning
     wrongly made it one, on the grounds that auto-update pushes executables. Velopack's update
     integrity comes from HTTPS plus a size/hash check against `releases.<channel>.json`
@@ -11594,6 +11664,24 @@ Re-introducing the anti-patterns these guard against is a regression:
   shipped on GitHub. The friction is the value — a rename has to be deliberate in two places, one of
   which is a comment explaining why it must not happen. Adding a platform is expected and safe: add
   the name in both places. See `app::update` for the packed file names this was measured against.
+  **The published package-repository identity is the same rule with a second instance**, and a more
+  thinly guarded one. `https://fadion.github.io/schemaic/deb` and `/rpm`, `Origin: Schemaic`,
+  `Suite: stable`, and the keyring path `/usr/share/keyrings/schemaic-archive-keyring.gpg` that
+  `Signed-By` names are written into every user's source list by `install.sh`, and that machine
+  keeps asking for them for as long as Schemaic is installed — so moving one stops updates for
+  every existing install, silently, with no route back to those users, exactly as a channel rename
+  does. `Origin`+`Suite` is additionally the string an unattended-upgrades user pins as
+  `"Schemaic:stable"`. Two guards divide the work, both in `pages.yml` and both blocking the
+  deploy. `verify-site.py`'s `check_client_config` pins the keyring path, `Suites: stable` and the
+  `/deb` and `/rpm` segments against each *built site* — the artefact, after it exists. The host is
+  parameterised through `SCHEMAIC_REPO_URL` precisely so a site can be built and installed from at
+  `http://localhost:8000`, so it cannot be pinned there; it is pinned instead in the *source*, by
+  the `Check the repository URL agrees everywhere` step, which compares `install.sh`'s `SITE`,
+  `build-site.sh`'s default and the workflow's own `SCHEMAIC_REPO_URL` against one literal and
+  fails if any drifts. That is the same shape as the channel guard and has the same limit: it
+  catches one of the three moving, not a deliberate edit of all four. **`Origin` is checked
+  nowhere** — it is held only by `build-apt-repo.sh` and the prose that tells users to pin
+  `"Schemaic:stable"` agreeing by hand.
 - **Splitting `lib.rs` / `main.rs`:** grep the line range for interleaved unrelated `fn`s first; a
   helper still used by code that stays goes to `widgets.rs` (glob-imported), not the new leaf
   module; mark cross-called items `pub(crate)`; build + `cargo fmt` + smoke-launch each step.

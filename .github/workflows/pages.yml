@@ -1,0 +1,146 @@
+name: Pages
+
+# Publishes the APT and DNF repositories to GitHub Pages.
+#
+# **The GitHub Release is the source of truth; this site is derived from it.**
+# Every run downloads the last five releases' .deb and .rpm assets and rebuilds
+# the whole site from nothing. There is no gh-pages branch on purpose: a branch
+# holding ~40 MB of packages per release would be carried by every clone of
+# this repository forever, and pruning it later would not shrink a single clone
+# that already exists. An Actions deployment has no git history at all, so the
+# published size is the only size.
+#
+# It is *called* by release.yml after every leg of a tagged build has finished
+# — not triggered by the release event, which would never fire: a release
+# created with GITHUB_TOKEN does not start another workflow. `workflow_dispatch`
+# is the repair path, and it is a real one: because the build is a rebuild, a
+# repository that has gone wrong is fixed by running this again.
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Deploy to Pages (uncheck to build and upload the artifact only)"
+        type: boolean
+        default: true
+
+# `id-token` is what the Pages deployment uses to prove where the artifact came
+# from; `contents: read` is enough because nothing here writes to the repo.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never two deployments at once, and never cancel one in flight: a half-written
+# repository is one where InRelease does not match the Packages file beside it,
+# and every client sees a hash mismatch until the next release.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish the package repositories
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Bounded and retried for the same reason release.yml is: an apt mirror
+      # that stalls never fails on its own, and a job left to itself runs for
+      # six hours before GitHub steps in.
+      - name: Install the repository tooling
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update -o Acquire::Retries=3; then
+              break
+            fi
+            echo "::warning::apt-get update stalled or failed (attempt $attempt of 3), retrying"
+            sleep 5
+          done
+          # apt-utils provides apt-ftparchive, rpm provides rpmsign.
+          sudo timeout 300 apt-get install -y apt-utils createrepo-c rpm gnupg xz-utils
+
+      # Fails closed. An unsigned repository is not a degraded version of this
+      # one — it is a repository whose only client instruction is "turn the
+      # signature check off", which is worse than the direct download it would
+      # be replacing. So a missing key stops the publish rather than shipping
+      # something that needs [trusted=yes] to use.
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY}" ]; then
+            echo "::error::secrets.GPG_PRIVATE_KEY is not set. Generate a signing key and add it before publishing — packaging/repo/README.md has the commands. Publishing unsigned is not an option here."
+            exit 1
+          fi
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          # gpg 2.1+ refuses --pinentry-mode loopback for some operations
+          # unless the agent is told to allow it, and there is no terminal on a
+          # runner for the alternative.
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --kill gpg-agent || true
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          fpr="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')"
+          [ -n "$fpr" ] || { echo "::error::no secret key after import"; exit 1; }
+          echo "GPG_KEY_ID=$fpr" >> "$GITHUB_ENV"
+          echo "::notice::signing with $fpr"
+          if [ -n "${GPG_PASSPHRASE}" ]; then
+            pass="${RUNNER_TEMP}/gpg-passphrase"
+            install -m 600 /dev/null "$pass"
+            printf '%s' "${GPG_PASSPHRASE}" > "$pass"
+            echo "GPG_PASSPHRASE_FILE=$pass" >> "$GITHUB_ENV"
+          fi
+
+      # The base URL is app identity in the same way a Velopack channel name is:
+      # it is written into every user's source list and their machine keeps
+      # asking for it, so moving it stops updates for every existing install —
+      # silently, and with no route back to those users to tell them. It lives
+      # in three files that have no reason to be edited together, and a drift
+      # between them would publish a repository at one URL while telling people
+      # to add another. So the three are compared rather than trusted.
+      #
+      # Changing the URL deliberately means changing it in all three *and*
+      # here — which is the friction, not an oversight.
+      - name: Check the repository URL agrees everywhere
+        run: |
+          set -euo pipefail
+          expected="https://fadion.github.io/schemaic"
+          fail=0
+          grep -q "^SITE=\"${expected}\"$" install.sh \
+            || { echo "::error::install.sh does not point at ${expected}"; fail=1; }
+          grep -q "^BASE_URL=\"\${SCHEMAIC_REPO_URL:-${expected}}\"$" packaging/repo/build-site.sh \
+            || { echo "::error::packaging/repo/build-site.sh does not default to ${expected}"; fail=1; }
+          grep -q "^ *SCHEMAIC_REPO_URL: ${expected}$" .github/workflows/pages.yml \
+            || { echo "::error::this workflow does not build for ${expected}"; fail=1; }
+          [ "$fail" -eq 0 ]
+
+      - name: Build the site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCHEMAIC_REPO_URL: https://fadion.github.io/schemaic
+          SCHEMAIC_RETAIN: "5"
+          SCHEMAIC_GH_REPO: ${{ github.repository }}
+        run: bash packaging/repo/build-site.sh site
+
+      # A repository whose metadata does not match its packages installs
+      # nothing, and finds that out on a user's machine. This reads the site
+      # back the way a client would, before it is anywhere a client can see it.
+      - name: Verify the built repositories
+        run: bash packaging/repo/verify-site.sh site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to Pages
+        id: deploy
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        uses: actions/deploy-pages@v4

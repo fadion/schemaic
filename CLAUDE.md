@@ -106,7 +106,11 @@ substitute for the statement, and none of these is a style preference.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** — `sql::is_word_byte`/`is_word_start`
   are the only definitions.
 - **A Velopack channel name is app identity, like `--packId`** — add a name, never rename one;
-  the names live only in `release.yml`, so the guard is a CI step there, not a `cargo test`.
+  the names live only in `release.yml`, so the guard is a CI step there, not a `cargo test`. **The
+  published package-repository identity is the same rule, second instance**: the Pages base URL,
+  `Origin`/`Suite` and the `Signed-By` keyring path are written into users' source lists and
+  moving one orphans every install just as silently. Its guards are CI steps in `pages.yml`, for
+  the same reason.
 - **Splitting `lib.rs`/`main.rs`** has its own procedure; read it before starting one.
 
 Two further sections are load-bearing and easy to regress by not knowing they exist: **Floem 0.2
