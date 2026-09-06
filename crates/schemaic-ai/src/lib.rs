@@ -307,7 +307,13 @@ pub fn build_session_args(
 /// path leaves no trace anywhere: not in a transcript, not in a chip, not in the
 /// string the caller keeps. They need no tool and no server — the whole request
 /// is in the prompt.
-pub fn inline_args(intent: &str, system: &str, model: &str, seal: CliSeal) -> Vec<String> {
+pub fn inline_args(
+    intent: &str,
+    system: &str,
+    model: &str,
+    effort: &str,
+    seal: CliSeal,
+) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-p".into(),
         intent.into(),
@@ -323,6 +329,13 @@ pub fn inline_args(intent: &str, system: &str, model: &str, seal: CliSeal) -> Ve
     if !model.trim().is_empty() {
         a.push("--model".into());
         a.push(model.into());
+    }
+    // Already clamped to Claude's own levels by `harness::inline_argv`, which is
+    // the only caller — so an `xhigh` carried over from another harness's
+    // setting never reaches the flag.
+    if !effort.trim().is_empty() {
+        a.push("--effort".into());
+        a.push(effort.into());
     }
     a.extend(seal_args(seal));
     a
@@ -1036,7 +1049,7 @@ mod tests {
         assert!(a[d + 1..].contains(&"Artifact".to_string()));
         assert!(a[d + 1..].contains(&"Bash".to_string()));
 
-        let inline = inline_args("i", "s", "m", CliSeal::NONE);
+        let inline = inline_args("i", "s", "m", "", CliSeal::NONE);
         assert!(!inline.iter().any(|x| x == "--tools"), "{inline:?}");
     }
 
@@ -1122,7 +1135,7 @@ mod tests {
         // the full built-in set, the user's own MCP servers and every settings
         // file — and unlike the chat panel they have no surface that could show
         // a tool call, so anything the model reached for happened unseen.
-        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8", CliSeal::ALL);
+        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8", "", CliSeal::ALL);
         let t = a.iter().position(|x| x == "--tools").expect("--tools");
         assert_eq!(a[t + 1], "");
         assert!(a.iter().any(|x| x == "--strict-mcp-config"));
@@ -1135,7 +1148,7 @@ mod tests {
 
     #[test]
     fn inline_args_flags_in_order() {
-        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8", CliSeal::ALL);
+        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8", "", CliSeal::ALL);
         assert_eq!(
             a,
             vec![

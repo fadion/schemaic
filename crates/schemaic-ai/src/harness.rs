@@ -936,6 +936,10 @@ pub struct InlineSpec {
     pub system: String,
     /// Model id, verbatim. Empty = the harness's own default.
     pub model: String,
+    /// Reasoning effort as the user set it, in whatever vocabulary the harness
+    /// they set it under uses. **Clamped here** rather than by the caller — see
+    /// [`inline_argv`].
+    pub effort: String,
     /// Claude's seal flags, from the probe. Ignored by every other harness,
     /// whose constraint is a sandbox flag baked into the argv below.
     pub seal: crate::CliSeal,
@@ -973,8 +977,14 @@ pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
     // can clear, and `--model " "` dies as an unknown model under "couldn't
     // launch the CLI" — the one explanation that is not the problem.
     let model = spec.model.trim();
+    // **Clamped here rather than by the caller**, unlike `turn_args`, whose
+    // caller hands it an already-answered `effort_arg`. Three call sites reach
+    // this one and each would have had to remember; the setting outlives a
+    // harness switch, so a level from the previous harness's vocabulary is the
+    // ordinary case rather than the exotic one.
+    let effort = h.effort_arg(spec.effort.trim()).unwrap_or_default();
     match h {
-        Harness::Claude => crate::inline_args(&spec.intent, &spec.system, model, spec.seal),
+        Harness::Claude => crate::inline_args(&spec.intent, &spec.system, model, effort, spec.seal),
         Harness::Codex => {
             let mut a: Vec<String> = vec![
                 "exec".into(),
@@ -1030,6 +1040,10 @@ pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
                 a.push("--model".into());
                 a.push(model.to_string());
             }
+            if !effort.is_empty() {
+                a.push("--effort".into());
+                a.push(effort.to_string());
+            }
             a
         }
         Harness::OpenCode => {
@@ -1047,6 +1061,10 @@ pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
             if !model.is_empty() {
                 a.push("--model".into());
                 a.push(model.to_string());
+            }
+            if !effort.is_empty() {
+                a.push("--variant".into());
+                a.push(effort.to_string());
             }
             a.push(prefixed_prompt(&spec.system, &spec.intent));
             a
@@ -2521,6 +2539,7 @@ mod inline_tests {
             intent: "count the rows".into(),
             system: "tables: users(id)".into(),
             model: "some-model".into(),
+            effort: String::new(),
             seal: CliSeal::ALL,
             isolate_config: true,
             last_message: "C:/tmp/last.txt".into(),
@@ -2680,6 +2699,58 @@ mod inline_tests {
         assert!(
             inline_argv(Harness::Claude, &spec()).contains(&"--append-system-prompt".to_string())
         );
+    }
+
+    /// A one-shot honours the effort setting too — it never did on Claude's
+    /// path, so the setting silently applied to the chat panel alone.
+    #[test]
+    fn effort_reaches_each_harness_in_its_own_flag() {
+        for h in Harness::ALL {
+            let s = InlineSpec {
+                effort: "high".into(),
+                ..spec()
+            };
+            let a = inline_argv(h, &s);
+            match h {
+                // No such flag on `codex exec`, so nothing to send.
+                Harness::Codex => assert!(
+                    !a.contains(&"--effort".to_string()),
+                    "Codex was sent an effort it has no flag for: {a:?}"
+                ),
+                Harness::OpenCode => {
+                    assert_eq!(
+                        flag_value(&a, "--variant").as_deref(),
+                        Some("high"),
+                        "{a:?}"
+                    )
+                }
+                _ => assert_eq!(flag_value(&a, "--effort").as_deref(), Some("high"), "{a:?}"),
+            }
+        }
+    }
+
+    /// **Clamped to the harness's own vocabulary**, the same rule `effort_arg`
+    /// exists for: the setting survives a harness switch, so Claude's `xhigh`
+    /// is still selected when the picker moves to Antigravity, whose `--effort`
+    /// never advertised it.
+    #[test]
+    fn an_effort_the_harness_never_advertised_is_not_sent() {
+        for h in Harness::ALL {
+            let s = InlineSpec {
+                effort: "xhigh".into(),
+                ..spec()
+            };
+            let a = inline_argv(h, &s);
+            if h == Harness::Claude {
+                // Claude's own fourth level, and it does travel.
+                assert_eq!(flag_value(&a, "--effort").as_deref(), Some("xhigh"));
+                continue;
+            }
+            assert!(
+                !a.contains(&"--effort".to_string()) && !a.contains(&"--variant".to_string()),
+                "{h:?} was handed another harness's level: {a:?}"
+            );
+        }
     }
 
     /// The same trim `turn_args` needed: the field is free text the user can

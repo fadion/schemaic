@@ -9294,6 +9294,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 ai_harness.get_untracked(),
                 &ai_cli_path.get_untracked(),
                 &ai_model.get_untracked(),
+                ai_effort.get_untracked().cli(),
                 &intent,
                 &system,
             ) {
@@ -9382,6 +9383,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let harness = ai_harness.get_untracked();
                 let cli_path = ai_cli_path.get_untracked();
                 let model = ai_model.get_untracked();
+                let effort = ai_effort.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
                 let schemaic_ui::AiFillRequest {
                     source,
@@ -9408,21 +9410,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     );
                     let system = "You output only the requested raw value — no quotes, \
                                   no markdown, no prose.";
-                    let res = match ai::inline_plan(harness, &cli_path, &model, &prompt, system) {
-                        Ok(plan) => match ai::run_inline(plan).await {
-                            Ok(text) => match schemaic_core::seed::parse_fill_response(&text) {
-                                schemaic_core::seed::FillOutcome::Value(v) => {
-                                    AiFillResult::Value(v)
-                                }
-                                schemaic_core::seed::FillOutcome::Null => AiFillResult::Null,
-                                schemaic_core::seed::FillOutcome::Empty => {
-                                    AiFillResult::Failed("The AI returned no value.".into())
-                                }
+                    let res =
+                        match ai::inline_plan(harness, &cli_path, &model, &effort, &prompt, system)
+                        {
+                            Ok(plan) => match ai::run_inline(plan).await {
+                                Ok(text) => match schemaic_core::seed::parse_fill_response(&text) {
+                                    schemaic_core::seed::FillOutcome::Value(v) => {
+                                        AiFillResult::Value(v)
+                                    }
+                                    schemaic_core::seed::FillOutcome::Null => AiFillResult::Null,
+                                    schemaic_core::seed::FillOutcome::Empty => {
+                                        AiFillResult::Failed("The AI returned no value.".into())
+                                    }
+                                },
+                                Err(why) => AiFillResult::Failed(why),
                             },
                             Err(why) => AiFillResult::Failed(why),
-                        },
-                        Err(why) => AiFillResult::Failed(why),
-                    };
+                        };
                     finish(res);
                 });
             },
@@ -9451,6 +9455,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let harness = ai_harness.get_untracked();
                 let cli_path = ai_cli_path.get_untracked();
                 let model = ai_model.get_untracked();
+                let effort = ai_effort.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));
                 let schemaic_ui::AiSeedRequest {
                     source,
@@ -9476,16 +9481,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     );
                     let system = "You output only a JSON array of row objects — no \
                                   markdown, no prose.";
-                    let res = match ai::inline_plan(harness, &cli_path, &model, &prompt, system) {
-                        Ok(plan) => match ai::run_inline(plan).await {
-                            Ok(text) => match schemaic_core::seed::parse_seed_response(&text) {
-                                Ok(rows) => AiSeedResult::Rows(rows),
-                                Err(e) => AiSeedResult::Failed(e.to_string()),
+                    let res =
+                        match ai::inline_plan(harness, &cli_path, &model, &effort, &prompt, system)
+                        {
+                            Ok(plan) => match ai::run_inline(plan).await {
+                                Ok(text) => match schemaic_core::seed::parse_seed_response(&text) {
+                                    Ok(rows) => AiSeedResult::Rows(rows),
+                                    Err(e) => AiSeedResult::Failed(e.to_string()),
+                                },
+                                Err(why) => AiSeedResult::Failed(why),
                             },
                             Err(why) => AiSeedResult::Failed(why),
-                        },
-                        Err(why) => AiSeedResult::Failed(why),
-                    };
+                        };
                     finish(res);
                 });
             },

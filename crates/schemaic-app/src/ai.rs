@@ -482,6 +482,7 @@ pub(crate) fn inline_plan(
     harness: Harness,
     cli_path: &str,
     model: &str,
+    effort: &str,
     intent: &str,
     system: &str,
 ) -> Result<InlinePlan, String> {
@@ -515,6 +516,9 @@ pub(crate) fn inline_plan(
         intent: intent.to_string(),
         system: system.to_string(),
         model: model.to_string(),
+        // Passed as the user set it: `inline_argv` clamps it to this harness's
+        // own levels, so a level carried over from another sends no flag.
+        effort: effort.to_string(),
         seal: p.seal,
         isolate_config: p.isolate_config,
         last_message: last_message
@@ -3770,6 +3774,7 @@ mod tests {
             "count rows",
             &out,
             "claude-opus-5",
+            "",
             schemaic_ai::CliSeal::ALL,
         );
         assert_eq!(

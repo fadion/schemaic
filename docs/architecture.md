@@ -5345,7 +5345,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   carrying `mcp_servers` on Codex, and an OpenCode config with the `mcp` block left out. The whole
   request is in the prompt (`no_inline_generation_is_given_a_server_or_a_session` over
   `Harness::ALL`, `a_one_shot_generation_is_given_no_tools_and_no_servers` for Claude's arm, and
-  `inline_args_flags_in_order` holds its exact argv).
+  `inline_args_flags_in_order` holds its exact argv). **On Antigravity that is a statement about the
+  argv and not about the run**: its server is registered globally, and a one-shot fired while a chat
+  session holds that registration sees it — measured, and written up under `harness.rs`'s
+  `inline_argv` entry with the reason no flag there can take it away.
   - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
     `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`) is **a dialect rather than a vendor**: the
     variant names the wire format a binary speaks, which is the only thing decoding needs to know,
@@ -5705,22 +5708,37 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`a_turn_never_passes_the_auto_approve_flag`).
     **`inline_argv` is the closed counterpart of `turn_args`, and "closed" is the whole
     specification.** Ctrl+K, AI Fill and AI Seed each want one string back that a parser then reads,
-    so `InlineSpec` carries intent, system, model, seal, `isolate_config` and Codex's `last_message`
-    and nothing else — there is no field for a server, an approval map or a resume id, because no arm
-    may have one. On every harness the argv is free of `--mcp-config`, of a `-c` carrying
+    so `InlineSpec` carries intent, system, model, effort, seal, `isolate_config` and Codex's
+    `last_message` and nothing else — there is no field for a server, an approval map or a resume id,
+    because no arm may have one. On every harness the argv is free of `--mcp-config`, of a `-c` carrying
     `mcp_servers`, and of anything that resumes a thread this one-shot never saw
     (`no_inline_generation_is_given_a_server_or_a_session` runs the forbidden list over
     `Harness::ALL`, narrowing Codex's one permitted `-c` to `sandbox_mode=` rather than exempting the
-    flag). Claude's arm delegates to `crate::inline_args` unchanged: it was the whole of this path for
-    as long as the other three spawned Claude regardless of the picker, and is now one of four.
+    flag). Claude's arm delegates to `crate::inline_args`, which gained an `effort` parameter and is
+    otherwise what it was: it was the whole of this path for as long as the other three spawned Claude
+    regardless of the picker, and is now one of four.
     Measured against the installed binaries, Codex is `exec --ephemeral --skip-git-repo-check
     --sandbox read-only --color never`, then `--ignore-user-config` when the probe saw it, then
     `--model`, then `-c sandbox_mode="read-only"`, then `-o <file>`, then the prompt as the last
     positional; Antigravity is `-p <prompt> --output-format text --sandbox --disable-slash-commands`
-    plus `--model`; OpenCode is `run --pure --agent schemaic --format default` plus `--model`, prompt
-    last. **`--output-format text` is named on Antigravity although it is the default**, because the
-    session path asks that same binary for `stream-json` and a default that moved would put a JSONL
-    envelope where a parser expects SQL.
+    plus `--model` and `--effort`; OpenCode is `run --pure --agent schemaic --format default` plus
+    `--model` and `--variant`, prompt last. **`--output-format text` is named on Antigravity although
+    it is the default**, because the session path asks that same binary for `stream-json` and a
+    default that moved would put a JSONL envelope where a parser expects SQL.
+    **Effort reaches a one-shot now, and `inline_argv` clamps it itself.** It never did on Claude's
+    path, so a setting the modal presents as the assistant's applied to the chat panel alone; each
+    harness takes it in its own flag — `--effort` on Claude and Antigravity, `--variant` on OpenCode,
+    nothing at all on Codex, whose `effort_levels()` is empty and which therefore gets no flag rather
+    than a dropped one (`effort_reaches_each_harness_in_its_own_flag`). **The clamp lives here rather
+    than at the caller, and that is a deliberate divergence from `turn_args`**, which is handed an
+    already-answered `effort_arg` by its single caller in `ai.rs`: three call sites reach this
+    function and each would have had to remember. So `InlineSpec::effort` is the level as the user
+    set it, in whatever vocabulary the harness they set it under uses, and `inline_argv` asks
+    `h.effort_arg(spec.effort.trim())` before any arm sees it. The setting outlives a harness switch,
+    so Claude's `xhigh` under Antigravity is the ordinary case and not the exotic one, and it is
+    dropped rather than sent (`an_effort_the_harness_never_advertised_is_not_sent`). `inline_args`
+    says in its own doc that the value arrives clamped, because `inline_argv` is its only caller and
+    a second one would have to do the same.
     **Codex is the only harness whose reply is read from a file, and that is a contract rather than an
     observation.** `inline_output` is where that lives — `LastMessageFile` for Codex, `Stdout` for the
     other three — and the reason is that `codex exec` without `--json` prints *for a person*:
@@ -5741,13 +5759,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is `sealed_tools`, extracted so this config and `opencode_config_json` cannot come to disagree
     about which built-ins are off — the same reason `seal_args` is shared by Claude's two argv
     builders — and the denylist-by-omission caveat above applies to both of them equally.
-    **One hole the argv cannot close, and it is Antigravity's.** Everything above is a guarantee about
-    a command line, and Antigravity is the harness with no per-invocation configuration at all: its
-    server is registered *globally* by `AgyRegistration` for the life of a chat session. A one-shot
-    fired while an Antigravity chat session is open therefore runs against a live registration and its
-    standing `permissions.allow` rules, and no flag in this argv can take them away. That is reasoned
-    from the mechanism rather than measured, and it is written down because "no inline generation is
-    given a server" is exactly the sentence that would otherwise be read as covering it.
+    **One hole the argv cannot close, and it is Antigravity's — measured now, not inferred.**
+    Everything above is a guarantee about a command line, and Antigravity is the harness with no
+    per-invocation configuration at all: its server is registered *globally* by `AgyRegistration` for
+    the life of a chat session. Measured against the installed `agy`, with a server registered through
+    `agy mcp add`, `agy -p` — print mode, exactly what `inline_argv` builds — lists that server's tools
+    among its own, `list_schema`, `describe_table` and `propose_table_change` included; with no
+    registration it lists Antigravity's built-ins alone. So "no inline generation is given a server"
+    genuinely does not hold for Antigravity while a chat session holds the registration. It does hold
+    for the other three, which are configured per invocation, and this is written down because that
+    sentence is exactly the one that would otherwise be read as covering all four.
+    **And there is no per-invocation fix in that CLI to reach for.** It has no config flag for this,
+    and no definable agent the way OpenCode has — `agy agent` only lists agents, and lists none — so
+    this is a known limit with an open decision rather than unfinished wiring: document it, or refuse
+    a one-shot while an Antigravity chat session is live. That decision is parked in `TODO.md`.
     **`cli_failure_message` takes the harness now, and that is not decoration.** Its last-resort arm
     said *"the claude CLI exited with status N"* whatever had run, so a user who had picked Codex was
     sent to check an installation that was not the one that failed — the same wrong-cause report the
@@ -9459,7 +9484,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   back from, and OpenCode's environment — or hands back the reason it will not run, and `run_inline`
   executes it. Each of Ctrl+K, AI Fill and AI Seed carried its own copy of that before: two passed
   `Stdio::null()` and Ctrl+K did not, so Ctrl+K alone paid the CLI's wait on a stdin that was never
-  going to arrive. **It also carries the gate the inline paths never had.** They read the probe for
+  going to arrive. It takes the effort setting alongside the model now — each of the three call sites
+  passes `ai_effort.get_untracked().cli()`, and `harness::inline_argv` is what clamps that to the
+  selected harness's own vocabulary. **It also carries the gate the inline paths never had.** They read the probe for
   Claude's seal flags and spawned whatever it said about the *constraint*, which was survivable while
   they were Claude-only — an unsealed Claude is a refusal at `start_ai_session`, and inline never
   reached that function — but a one-shot can be Codex or Antigravity now, whose constraint *is* the
@@ -9665,11 +9692,33 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     into a directory it creates inside Google's config tree. An app that has never run that CLI has
     no business leaving a file where it keeps its settings.
     `withdrawing_rules_from_a_file_that_is_not_there_writes_nothing` drives the composition rather
-    than the predicate, because the composition is what bit. **The known limit is stated rather than hidden**: it cannot tell a
-    crash's leftovers from a second running Schemaic, so starting a second instance removes the
-    first's rules until that session next installs them. The alternative — leaving them on the
-    chance somebody is using them — is a permission nobody remembers granting, outliving the process
-    that needed it, which is the worse of the two failures.
+    than the predicate, because the composition is what bit.
+    **The sweep now asks whether the leftovers are leftovers, and what it used to be was a live bug
+    rather than a stated limit.** It ran at every launch and removed the registration and the
+    allow-rules unconditionally, so launching a second Schemaic pulled the database tools out from
+    under a *live* first instance's running session, which then held a server whose every call had
+    silently stopped existing. `AgyRegistration::install` calls `claim()` after a successful install
+    and the sweep consults what it wrote, returning early while the process named there is still
+    running; when it does decide to sweep, it clears that stale marker along with the state. The
+    decision is the pure `may_sweep(marker, live, me) -> bool` over a private `Owner { pid, started }`
+    with `marker_text`/`parse_marker` either side of it, and the process lookup — `process_start`,
+    through the `sysinfo` dependency the app already had — is kept outside it, so the rule is testable
+    with no process to look at (`a_second_instance_does_not_sweep_a_live_instances_registration`).
+    **The start time is what makes the claim safe, and a pid alone would not have been.** Pids are
+    reissued, so a crashed instance's marker eventually names some unrelated live process, and a sweep
+    trusting the number would decline to clean up for the rest of that pid's life — turning a
+    transient crash into exactly the permanent standing grant this module exists to prevent. A pid
+    that *is* running but started at a different time is therefore swept, and an absent **or
+    unreadable** marker is treated as no claim at all, in that same direction and for the same
+    reason: a truncated file must not be able to strand a permission in the user's config with nothing
+    left able to withdraw it (`a_crashed_instances_registration_is_still_swept`,
+    `an_absent_or_unreadable_marker_is_not_a_claim`, `our_own_stale_marker_does_not_stop_us` for the
+    marker naming this very process at startup, and `a_marker_round_trips` over the two-field line
+    that is the whole interface between the writer and the reader).
+    **`Drop` releases the claim last, after both removals**, because releasing first would open a
+    window in which another instance's sweep could race this one's own teardown. The marker lives at
+    `persist::private_dir("agy")/registration-owner` rather than in the shared temp directory: it is a
+    claim a sweep obeys, and world-writable is the wrong permission for that.
     **A second limit, recorded rather than guarded: the server name is not ours to reserve.**
     `agy mcp add` is an upsert and `agy mcp remove` is unconditional, so a user who has registered
     their *own* MCP server under the name `schemaic` — or one pointing at a different Schemaic build
