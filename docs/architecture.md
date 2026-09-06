@@ -6521,6 +6521,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     on (see **No floem `Dropdown`** below). `themed_toggle` is the un-ringed builder beneath, and
     is **private** on purpose: a control nobody can Tab to is one left out of the modal's keyboard
     order by accident.
+    **The body opens with a version caption, and the string it shows is composed in `schemaic-core`.**
+    `settings_version_line` renders `core::app_version_label()` — `Schemaic v0.24.0`, built from
+    `APP_NAME` and `APP_VERSION` (`env!("CARGO_PKG_VERSION")`, which inherits
+    `[workspace.package].version`). It is the only place the version is on screen anywhere in the
+    app — there is no About window — and until it landed `APP_VERSION`'s one other reader was the
+    startup `tracing::info!` line in `app/main.rs`. Composing the string in core rather than in the
+    view is what stops it going stale: a `chore: release vX.Y.Z` edits one number in one
+    `Cargo.toml`, and that number is already what the caption renders, so there is no second edit to
+    remember. Two tests sit beside the function, and the equality one is honest in its own doc
+    comment about how far it reaches — same-crate `env!` on both sides means a literal substituted
+    for the derivation still passes until the *next* bump parts the two; catching it the moment it
+    was written would mean reading `Cargo.toml` from a test, which the no-filesystem rule forbids.
+    It is a **caption, not a fifth heading**: `theme::text_dim()` at `theme::font_body()`, unbold,
+    deliberately not `settings_section_header`'s styling, so it identifies the panel instead of
+    competing with `General`. **Its spacing is derived from the section header's, not chosen**, and
+    that is the part a tidy-up would break: the caption carries the same
+    `margin_bottom(theme::scaled(2.0))` a header carries, and is wrapped with `general_group` in an
+    `intro` `v_stack` at a group's own `gap(theme::scaled(16.0))`, so the air under the caption is
+    exactly the air under `General` and both follow the same two constants. Left in the body's own
+    stack it would have spent the 28 that separates *sections* and floated above the form instead.
     `log_row` is the General section's one non-toggle: it names the log's **full path** (`log_hint`,
     which is the pure half and is tested) and reveals the folder holding it through
     `Ui::open_config_dir`. The log had been written and rotated since `logging.rs` landed, and

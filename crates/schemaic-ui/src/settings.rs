@@ -1447,6 +1447,27 @@ fn settings_section_header(t: &'static str) -> impl IntoView {
     })
 }
 
+/// `Schemaic v0.24.0`, above the first section.
+///
+/// Dimmed and unbold on purpose: it is a caption identifying the panel, not a
+/// fifth section heading competing with `General`. The string comes from
+/// [`schemaic_core::app_version_label`] so a release bump reaches it with no
+/// edit here — see the tests beside that function for what that does and does
+/// not guarantee.
+///
+/// The trailing `margin_bottom` is the one [`settings_section_header`] carries,
+/// for the same reason: paired with a group's 16 gap it puts exactly as much air
+/// under this line as sits under `General`, so the caption and the heading below
+/// it read as one balanced block. Both spacings then move together if either
+/// constant changes.
+fn settings_version_line() -> impl IntoView {
+    text(schemaic_core::app_version_label()).style(|s| {
+        s.font_size(theme::font_body())
+            .color(theme::text_dim())
+            .margin_bottom(theme::scaled(2.0))
+    })
+}
+
 pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
     let open = ui.layout.theme_settings_open;
     let ui_theme = ui.layout.ui_theme;
@@ -1592,13 +1613,21 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             ))
             .style(|s| s.flex_col().gap(theme::scaled(16.0)));
 
-            let body =
-                v_stack((general_group, editor_group, query_group, theme_group)).style(|s| {
-                    s.flex_col()
-                        .gap(theme::scaled(28.0))
-                        .padding(theme::scaled(14.0))
-                        .width_full()
-                });
+            // The version caption pairs with the first section instead of
+            // standing as a group of its own: the outer 28 is the gap that
+            // separates *sections*, and spending it here would leave the caption
+            // floating above the form. Inside this wrapper it gets a group's own
+            // 16 — which, with the 2 margin the caption carries, is exactly the
+            // air under `General`.
+            let intro = v_stack((settings_version_line(), general_group))
+                .style(|s| s.flex_col().gap(theme::scaled(16.0)));
+
+            let body = v_stack((intro, editor_group, query_group, theme_group)).style(|s| {
+                s.flex_col()
+                    .gap(theme::scaled(28.0))
+                    .padding(theme::scaled(14.0))
+                    .width_full()
+            });
             // Scroll so the taller grouped modal never overflows the window.
             let body = autohide(scroll(body)).style(|s| {
                 s.width_full()
