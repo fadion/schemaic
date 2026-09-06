@@ -13,9 +13,11 @@
 //!
 //! `XDG_CONFIG_HOME` is. Pointed at a directory of our own, the user's globally
 //! registered servers vanish from `opencode debug config` entirely. That is this
-//! harness's `--strict-mcp-config`, and it costs no global state — nothing of the
-//! user's is edited, so unlike [`crate::antigravity`] there is nothing to put
-//! back and no sweep for a session that died before it could.
+//! harness's `--strict-mcp-config`, and it costs nothing of the *user's* —
+//! unlike [`crate::antigravity`] there is no permission to put back. The
+//! directory is still ours to collect, which is what [`sweep`] does; the
+//! difference is that leaving one behind costs disk rather than a standing
+//! grant.
 //!
 //! **Only `XDG_CONFIG_HOME`, and never `XDG_DATA_HOME`.** The two are easy to set
 //! together and the second would break the session: OpenCode keeps `auth.json`
@@ -23,7 +25,8 @@
 //! just signed into, and the turn fails on credentials rather than on anything
 //! Schemaic did visibly.
 //!
-//! # Why it is reused rather than per-session
+//! # Why it is reused rather than per-session, and per-*instance* rather than
+//! per-user
 //!
 //! A config directory OpenCode has not seen before makes it bootstrap a plugin
 //! runtime into that directory — a real `npm install`, writing `package.json`,
@@ -32,17 +35,99 @@
 //! indistinguishable from a hang. Two things answer it, and both are kept because
 //! they answer different halves: `--pure` (in `harness::turn_args`) skips the
 //! external-plugin install outright, and reusing one directory means whatever
-//! bootstrap does happen is paid at most once per machine rather than once per
-//! session.
+//! bootstrap does happen is paid at most once per running app rather than once
+//! per session.
 //!
-//! Reuse has a consequence, and it is the reason the database endpoint is not in
-//! this file: a reused directory **outlives the session**. Anything written here
-//! is still on disk after the app closes. So the config carries only the *path*
-//! of the per-session endpoint file — `ai::write_endpoint_file`, created
-//! `O_EXCL` with owner-only permissions and swept like the Claude and Codex ones
-//! — and the credentials never enter the reused directory at all.
+//! **Reuse stops at the instance boundary**, and it did not, which was a bug
+//! rather than a trade. The file carries the endpoint-file path and the offered
+//! tool names — exactly what differs per connection — and OpenCode is a process
+//! *per turn*, so with one root per user a second window's session re-pointed
+//! the first window's next question at *its* database, with its credentials and
+//! its access level, while the first window's panel, transcript and deltas all
+//! named the first connection. [`instance_root`] adds the pid; [`sweep`] takes
+//! the dead ones away.
+//!
+//! Reuse still has a consequence, and it is the reason the database endpoint is
+//! not in this file: a reused directory **outlives the session**. Anything
+//! written here is still on disk after that session ends. So the config carries
+//! only the *path* of the per-session endpoint file —
+//! `ai::write_endpoint_file`, created `O_EXCL` with owner-only permissions in a
+//! directory of Schemaic's own, and unlinked when the session ends — and the
+//! credentials never enter the reused directory at all.
 
 use std::path::{Path, PathBuf};
+
+/// The config root for `kind`, **belonging to this instance and no other**.
+///
+/// **Two Schemaic windows, one file.** The root was `private_dir(kind)` with no
+/// per-instance component, and the file inside it carries exactly the two things
+/// that differ per connection: the path of the endpoint file, and the tool names
+/// this connection's access level offers. OpenCode is a process *per turn*, so
+/// window A's next question read what window B had written — A's assistant
+/// talking to B's database, with B's credentials and B's access level, while A's
+/// panel, transcript and deltas all named A's connection.
+///
+/// The pid is the discriminator because that is what a running instance has and
+/// a dead one does not; the sweep below collects the roots of instances that are
+/// gone. `write_inline`'s "two roots cannot race" argument is unchanged and is
+/// now a *third* axis rather than the only one — see that function.
+///
+/// The reuse the module docs argue for survives: a directory per instance is
+/// still a directory the CLI has usually seen before within that instance's
+/// life, and the plugin bootstrap `--pure` skips is paid at most once per
+/// instance rather than once per turn.
+fn instance_root(kind: &str) -> Option<PathBuf> {
+    let dir = schemaic_core::persist::private_dir(kind)?.join(instance_tag());
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// This process's name for its own config roots.
+fn instance_tag() -> String {
+    format!("pid-{}", std::process::id())
+}
+
+/// Remove the config roots of instances that are gone.
+///
+/// Called at startup, beside `antigravity::sweep` and for the same reason: a
+/// per-instance directory that nothing collects is a directory per launch,
+/// forever. Nothing in here is a secret — the module docs are explicit that the
+/// endpoint never enters this tree — so this is tidiness rather than exposure,
+/// which is why it removes recursively where `ai`'s session directories do not:
+/// every file under a root here was written by Schemaic or by an OpenCode
+/// bootstrap into a directory Schemaic made for it.
+pub(crate) fn sweep() {
+    for kind in ["opencode", "opencode-inline"] {
+        let Some(base) = schemaic_core::persist::private_dir(kind) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name
+                .strip_prefix("pid-")
+                .and_then(|p| p.parse::<u32>().ok())
+            else {
+                // Including the pre-instance layout: an `opencode/` directory
+                // left directly under the base by an older build. It is ours and
+                // nothing reads it any more.
+                if name == "opencode" {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+                continue;
+            };
+            // **Any live process on that pid, not ours specifically.** A second
+            // window's root must survive, and the cost of being wrong the other
+            // way — an unrelated process happening to hold a recycled pid — is
+            // one directory kept until the next launch, not a session broken.
+            if crate::liveness::process_start(pid).is_none() {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+}
 
 /// The directory OpenCode is told to read its configuration from, and the file
 /// inside it that seals the session.
@@ -67,7 +152,7 @@ impl OpenCodeConfig {
     /// every built-in tool including `bash`. A seal that silently becomes a shell
     /// is exactly the failure `Constraint` exists to prevent.
     pub(crate) fn write(exe: &str, endpoint_file: &str, allowed: &[&str]) -> Option<Self> {
-        let root = schemaic_core::persist::private_dir("opencode")?;
+        let root = instance_root("opencode")?;
         let dir = root.join("opencode");
         std::fs::create_dir_all(&dir).ok()?;
         let cfg = schemaic_ai::harness::opencode_config_json(exe, endpoint_file, allowed);
@@ -93,7 +178,7 @@ impl OpenCodeConfig {
     /// does not exist runs on `build`, which has every built-in including
     /// `bash`.
     pub(crate) fn write_inline() -> Option<Self> {
-        let root = schemaic_core::persist::private_dir("opencode-inline")?;
+        let root = instance_root("opencode-inline")?;
         let dir = root.join("opencode");
         std::fs::create_dir_all(&dir).ok()?;
         let cfg = schemaic_ai::harness::opencode_inline_config_json();
@@ -116,15 +201,28 @@ impl OpenCodeConfig {
     /// `ai::session_cwd` is a private app directory, so there is nothing there to
     /// read today — this keeps that true if the cwd ever moves, the same way
     /// Claude's `--setting-sources` is defence in depth behind owning the cwd.
-    pub(crate) fn env(&self) -> Vec<(String, String)> {
+    /// **`OsString`, not `String`, and that is the third way the seal could
+    /// silently open.** This returned `String`s built with `to_string_lossy`, so
+    /// a config root that is not valid UTF-8 — a home directory in a legacy
+    /// encoding, a Windows path with an unpaired surrogate — pointed
+    /// `XDG_CONFIG_HOME` at a directory with the invalid bytes replaced by
+    /// U+FFFD: *not* where the config was written. `--agent schemaic` then names
+    /// an agent that does not exist, which OpenCode answers by falling back to
+    /// its own `build` agent — every built-in tool, `bash` included — while the
+    /// panel reports `Sealed`. `write`'s contract is that a failure to seal must
+    /// **refuse**, and it is honoured for a failed write and a missing
+    /// `private_dir`; a root that cannot survive a `String` round trip was the
+    /// one way past it. `Command::env` takes `AsRef<OsStr>`, so the round trip
+    /// was imposed only by this signature.
+    pub(crate) fn env(&self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
         vec![
             (
-                "XDG_CONFIG_HOME".to_string(),
-                self.root.to_string_lossy().into_owned(),
+                std::ffi::OsString::from("XDG_CONFIG_HOME"),
+                self.root.clone().into_os_string(),
             ),
             (
-                "OPENCODE_DISABLE_PROJECT_CONFIG".to_string(),
-                "1".to_string(),
+                std::ffi::OsString::from("OPENCODE_DISABLE_PROJECT_CONFIG"),
+                std::ffi::OsString::from("1"),
             ),
         ]
     }
@@ -247,16 +345,67 @@ mod tests {
         assert!(!whole.contains("password"), "{whole}");
     }
 
+    /// The seal has two halves and only one is `XDG_CONFIG_HOME`. These
+    /// variables *merge* into the resolved config (measured), so a user with one
+    /// exported would have their own servers inside a session reported as
+    /// `Sealed` — inheriting an environment is enough to undo it.
+    ///
+    /// **The whole set, not a sample.** This checked two of the three, so
+    /// `OPENCODE_CONFIG_DIR` could be dropped or misspelled with the suite
+    /// green — and the doc on that entry says in as many words that leaving it
+    /// unpinned "is how the other two got missed".
     #[test]
     fn every_config_lever_the_module_rejected_is_cleared_from_the_child() {
-        // The seal has two halves and only one is `XDG_CONFIG_HOME`. These
-        // variables *merge* into the resolved config (measured), so a user with
-        // one exported would have their own servers inside a session reported as
-        // `Sealed` — inheriting an environment is enough to undo it.
-        let cleared = super::OpenCodeConfig::env_remove();
-        for var in ["OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"] {
-            assert!(cleared.contains(&var), "{var} is not cleared");
-        }
+        assert_eq!(
+            super::OpenCodeConfig::env_remove(),
+            &[
+                "OPENCODE_CONFIG",
+                "OPENCODE_CONFIG_CONTENT",
+                "OPENCODE_CONFIG_DIR",
+            ]
+        );
+    }
+
+    /// **"Two roots cannot race" was argued in a paragraph and asserted
+    /// nowhere**, and the decision is two string literals inlined between a
+    /// `create_dir_all` and an `fs::write`. Changing `"opencode-inline"` to
+    /// `"opencode"` is a plausible tidy-up — the subdirectory under each is
+    /// already `opencode/` — and it would leave a Ctrl+K during a live chat
+    /// overwriting that session's config with the server-less inline one, with
+    /// the suite green.
+    ///
+    /// **And a third axis:** two Schemaic *instances* must not share a root
+    /// either. The file carries the endpoint-file path and the offered tool
+    /// names, which is exactly what differs per connection, and OpenCode is a
+    /// process per turn — so a second window's session used to re-point the
+    /// first's next question at its own database and access level.
+    #[test]
+    fn no_two_configs_that_must_differ_can_land_on_one_path() {
+        let Some(session) = super::instance_root("opencode") else {
+            // No config directory on this machine: nothing to assert about
+            // roots that cannot be created. `write` returns `None` there and the
+            // caller refuses the session.
+            return;
+        };
+        let inline = super::instance_root("opencode-inline").expect("a sibling root");
+        assert_ne!(
+            session, inline,
+            "a chat session and a one-shot would share one opencode.json"
+        );
+        // Both really are the file the CLI reads, so the inequality above is
+        // about the thing that matters rather than about two unrelated paths.
+        assert_eq!(
+            session.file_name(),
+            inline.file_name(),
+            "the instance component must be the same on both, or this test is \
+             comparing the wrong halves"
+        );
+        // The instance component is what a second window differs by, and it is
+        // present rather than assumed.
+        let tag = super::instance_tag();
+        assert!(session.ends_with(&tag), "{session:?}");
+        assert!(inline.ends_with(&tag), "{inline:?}");
+        assert_ne!(tag, "pid-", "the tag carries no instance identity");
     }
 
     #[test]
@@ -268,11 +417,25 @@ mod tests {
         };
         let cleared = super::OpenCodeConfig::env_remove();
         for (k, _) in cfg.env() {
+            let k = k.to_string_lossy().into_owned();
             assert!(
                 !cleared.contains(&k.as_str()),
                 "{k} is both set and cleared"
             );
         }
+        // **The value reaches the child as the bytes on disk**, not as a
+        // `to_string_lossy` of them. A root that is not valid UTF-8 used to
+        // point `XDG_CONFIG_HOME` at a directory with U+FFFD where the invalid
+        // bytes were — somewhere the config was never written — and
+        // `--agent schemaic` naming an agent that does not exist leaves the run
+        // on OpenCode's `build` agent, which has `bash`, while the panel reports
+        // `Sealed`.
+        let (_, v) = cfg
+            .env()
+            .into_iter()
+            .find(|(k, _)| k == "XDG_CONFIG_HOME")
+            .expect("the seal's lever");
+        assert_eq!(std::path::Path::new(&v), cfg.root());
         // And the auth the session needs is untouched: `auth.json` lives under
         // the *data* directory, so clearing a data or home variable would log
         // the user out of their own CLI rather than isolate anything.

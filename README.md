@@ -19,13 +19,16 @@ intelligence, built to feel instant.
   in a transaction that rolls back unless exactly one row changed, and generated
   `ALTER` / `DROP` is always shown as SQL — with what it destroys named in plain
   language — before it runs.
-- **Local** — no account, no telemetry, no cloud service. The only things that
-  leave your machine are your database traffic and, if you turn the assistant on,
-  the prompts you send through your own agent CLI — whichever one you point it
-  at, under that CLI's own account and its own terms. Schemaic itself has no API
-  key and talks to no model provider. Credentials go to the OS keyring — never a
-  URL, never a command line — falling back to the config file only on a machine
-  with no keyring at all.
+- **Local** — no account, no telemetry, no cloud service. Schemaic itself has no
+  API key and talks to no model provider. Credentials go to the OS keyring —
+  never a URL, never a command line — falling back to the config file only on a
+  machine with no keyring at all. Turn the assistant on and your prompts go out
+  through your own agent CLI, under that CLI's own account and its own terms;
+  what *else* that CLI sends is its business and not Schemaic's, and it is not
+  nothing — three of the four keep built-in tools that can read the machine
+  they run on, and one of those was measured reading files without being asked.
+  The AI panel tells you which restrictions are actually in force for the CLI
+  you picked, in a sentence, before you send anything.
 - **Every engine, properly** — MySQL/MariaDB, PostgreSQL and SQLite are separate
   dialects all the way down: quoting, DDL, completion and diagnostics follow what
   you're actually connected to, not a shared lowest common denominator. Where an

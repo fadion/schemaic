@@ -31,7 +31,7 @@ mod update;
 #[global_allocator]
 static GLOBAL: heap::Tracking = heap::Tracking;
 
-use agent_cli::{detect_bin, harness_bin, harness_reachable, probe};
+use agent_cli::{detect_bin, harness_bin, harness_reachable};
 use ai::{
     AiContextParams, AiSession, AiSettings, AiStreamMsg, RECAP_QUESTIONS, StartAiParams,
     active_tab_database, ai_context, apply_turn_delta, extract_sql, inline_system_prompt,
@@ -1439,6 +1439,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     create_effect(move |_| schemaic_ui::theme::set_editor_tab_width(tab_width.get()));
     create_effect(move |_| schemaic_ui::theme::set_editor_soft_tabs(soft_tabs.get()));
     create_effect(move |_| schemaic_ui::theme::set_editor_word_wrap(word_wrap.get()));
+    // Bumped when a background probe fills the cache, so the settings modal's
+    // constraint notice — which reads the cache and must never fill it, being on
+    // the UI thread — knows to look again.
+    let ai_probe_gen = RwSignal::new(0u64);
     // Probe what this CLI takes now, off-thread, so the first AI action doesn't
     // pay for it — see `agent_cli::probe`.
     //
@@ -1453,7 +1457,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     create_effect(move |_| {
         let h = ai_harness.get();
         let path = ai_cli_path.get();
-        agent_cli::warm_probe_cache(h, harness_bin(h, &path));
+        // **The settings notice reads the cache and never fills it**, so this
+        // has to tell it when an answer lands, or a harness switch leaves the
+        // grade blank until something else re-renders the modal. A cold key is
+        // exactly what switching harness produces — it *clears* `cli_path` —
+        // which is why the memo and this thread used to start in the same
+        // update pass and both miss.
+        let bump = create_ext_action(Scope::current(), move |()| {
+            ai_probe_gen.update(|n| *n += 1);
+        });
+        agent_cli::warm_probe_cache(h, harness_bin(h, &path), move || bump(()));
         // **One key now covers every AI entry point.** The one-shot generators
         // used to run Claude whatever was selected, so they read a second key —
         // `(Claude, <claude bin>)` — that this effect did not fill, and each
@@ -1470,7 +1483,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // cannot distinguish (a second running Schemaic).
     {
         let agy = detect_bin(Harness::Antigravity);
-        std::thread::spawn(move || antigravity::sweep(agy.as_deref()));
+        std::thread::spawn(move || {
+            antigravity::sweep(agy.as_deref());
+            // OpenCode's roots are Schemaic's own rather than the user's, so
+            // this is tidiness rather than a permission being withdrawn — but a
+            // per-instance directory nothing collects is a directory per launch,
+            // forever. Same thread, because both shell out or walk the disk and
+            // neither is wanted on the UI thread.
+            opencode::sweep();
+        });
     }
     // **A path override belongs to the harness it was typed for.** `ai_cli_path`
     // is one field shared by every harness, so leaving it behind across a switch
@@ -1504,29 +1525,39 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the previous harness: on the first run there is none, and clearing then
     // would discard the override restored from `ui_state.json` before the user
     // has touched anything.
+    // What each harness held when it was last selected, so browsing the list and
+    // coming back does not cost the user their path and model. Session-scoped on
+    // purpose: it is a "you were just here" memory, not a fifth thing to
+    // persist.
+    let harness_fields: RwSignal<HashMap<Harness, (String, String)>> =
+        RwSignal::new(HashMap::new());
     create_effect(move |prev: Option<Harness>| {
         let now = ai_harness.get();
-        if let Some(prev) = prev
-            && prev != now
+        // Filed under the harness being *left*, before anything is cleared.
+        if let Some(p) = prev
+            && p != now
         {
-            ai_cli_path.set(String::new());
-            ai_model.set(String::new());
+            let held = (ai_cli_path.get_untracked(), ai_model.get_untracked());
+            harness_fields.update(|m| {
+                m.insert(p, held);
+            });
         }
-        // **Clamped on every run, including the first.** The path and the model
-        // are cleared only on an actual *switch* — the comment above says why —
-        // but the effort level is a different question: it is not "did the user
-        // change harness", it is "is the level in the box one this harness
-        // takes". Gating it on a change meant the restore from `ui_state.json`
-        // never clamped, so a file pairing `opencode` with `medium` (a hand
-        // edit, a build that changes a harness's levels, any path writing the
-        // two fields independently) came back showing "Medium" in a closed
-        // dropdown whose list offers only Minimal/High/Max, while `effort_arg`
-        // sent no flag at all. That stale caption is the exact thing
-        // `clamped_to` was added to prevent.
-        if let Some(e) = ai_effort.get_untracked().clamped_to(now.effort_levels())
-            && e != ai_effort.get_untracked()
-        {
-            ai_effort.set(e);
+        // The rule itself is `schemaic_ui::harness_switch`, pure and tested —
+        // see its doc for what each field does and why the clamp is not gated on
+        // a switch. Every bug in this decision's history sat here, in the
+        // composition, rather than in any of the three answers.
+        let plan = schemaic_ui::harness_switch(
+            prev,
+            now,
+            ai_cli_path.get_untracked(),
+            ai_model.get_untracked(),
+            ai_effort.get_untracked(),
+            harness_fields.with_untracked(|m| m.get(&now).cloned()),
+        );
+        ai_cli_path.set(plan.cli_path.unwrap_or_default());
+        ai_model.set(plan.model.unwrap_or_default());
+        if plan.effort != ai_effort.get_untracked() {
+            ai_effort.set(plan.effort);
         }
         now
     });
@@ -10376,10 +10407,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             constraint_notice: Rc::new(move || {
                 let h = ai_harness.get_untracked();
                 let bin = harness_bin(h, &ai_cli_path.get_untracked());
-                // The same probe the spawn gate consults, so the modal cannot
-                // promise a grade the session then refuses. Cached per
-                // (harness, path), so this is not a spawn per keystroke.
-                probe(h, &bin).constraint.notice(h)
+                // **The cache, never the probe.** This closure runs inside a
+                // `create_memo` on the Floem UI thread, and `probe` spawns a
+                // blocking, timeout-free `--help` on a cold key. The harness
+                // dropdown produces a cold key by construction — switching
+                // harness clears `cli_path`, so the memo and the thread that
+                // warms it were started in the same update pass and both
+                // missed, leaving the UI thread to pay for it. A miss now shows
+                // nothing; `agent_cli::probe_generation` moves when the warm
+                // lands and the memo runs again.
+                //
+                // Read *tracked*, which is what subscribes the memo: the warming
+                // thread bumps this when the answer lands, and without the
+                // subscription a cold key would show nothing until some
+                // unrelated change re-ran the memo.
+                let _ = ai_probe_gen.get();
+                crate::agent_cli::probe_cached(h, &bin)?
+                    .constraint
+                    .notice(h)
             }),
         }),
         history: HistoryUi {

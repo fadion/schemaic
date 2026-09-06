@@ -1075,10 +1075,12 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                     }
                     // Only the levels this harness's own flag takes — Claude has
                     // a fourth (`xhigh`) that Antigravity does not advertise.
-                    let offered: Vec<AiEffort> = AiEffort::ALL
-                        .into_iter()
-                        .filter(|e| levels.contains(&e.cli()))
-                        .collect();
+                    // The rule lives in `AiEffort::offered_by` rather than here,
+                    // because a decision inside a view closure is one no test
+                    // can reach: the test that guarded this re-performed the
+                    // filter in its own body and stayed green whatever this
+                    // line did.
+                    let offered = AiEffort::offered_by(levels);
                     v_stack((
                         settings_group_label("Effort"),
                         focusable_dropdown(

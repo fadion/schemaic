@@ -50,6 +50,25 @@
 //! state existed that no marker accounted for; it is written atomically, because
 //! its reader is another process and a torn `fs::write` read as no claim at all.
 //!
+//! **Known limit: the grant is user-global while it stands, and cannot be
+//! narrowed.** `agy mcp add` writes into the user's own MCP config and
+//! `permissions.allow` is an allow-list rather than a prompt-list, so for as
+//! long as a Schemaic AI session is open, *any* `agy` run by this user — in any
+//! directory, started by anything — finds the `schemaic` server registered and
+//! its database tools pre-approved, with no prompt. `cd ~/work/some-repo && agy
+//! -p "explain this build failure"` can therefore reach the database through a
+//! `README` or `AGENTS.md` the user did not write.
+//!
+//! No lever was found that scopes either half to one process: the registration
+//! is per user by construction, and a per-session server *name* would not help,
+//! since an unrelated run inherits whatever name is registered. What is left is
+//! to keep the window as narrow as it can be — the grant is installed when a
+//! session starts and withdrawn when it ends, and covers only the tools that
+//! connection's access level offers, so a schema-only connection never grants
+//! `run_query` — and to say so rather than let it be assumed shut.
+//! `Constraint::notice` tells the user, in the panel, that this harness's MCP
+//! surface is not Schemaic's to restrict.
+//!
 //! **Known limit: the server name is not ours to reserve.** `agy mcp add` is an
 //! upsert and `agy mcp remove` is unconditional, so a user who has registered
 //! their *own* MCP server under the name `schemaic` — or one pointing at a
@@ -67,9 +86,18 @@ use schemaic_ai::harness::{
 use schemaic_core::persist;
 use std::path::PathBuf;
 
-/// The MCP server name registered with `agy`. Also the `schemaic/` half of every
+/// The MCP server name registered with `agy`. Also the `<server>/` half of every
 /// allow-rule, so the two halves cannot drift apart.
-const SERVER: &str = "schemaic";
+///
+/// **It is one constant now, and the claim that it always was is what made this
+/// worth fixing.** `agy mcp add` was given a private `SERVER` in this crate
+/// while `antigravity_allow_rules` emitted the literal `mcp(schemaic/…)` in
+/// `schemaic-ai`, which cannot see it — two independent spellings of one name,
+/// documented as one. Renaming either half auto-*denies* every tool call, and
+/// per this module's header a denied Antigravity turn still reports
+/// `"status":"SUCCESS"` with an empty response, so the failure would have been
+/// a silent one.
+pub(crate) const SERVER: &str = schemaic_ai::harness::MCP_SERVER;
 
 /// Where Antigravity keeps the permissions file.
 ///
@@ -626,6 +654,24 @@ mod tests {
         // An owner comparison alone cannot see this, which is why the nonce is
         // in the marker at all.
         assert_eq!(old.owner, new.owner);
+    }
+
+    /// **The registration and the rules must name the same server.** They were
+    /// two independent literals — a private `SERVER` here, and
+    /// `format!("mcp(schemaic/…)")` in another crate that cannot see it — while
+    /// the doc on both claimed one constant. Renaming either half leaves the
+    /// registration standing and every rule pointing at a server that is not
+    /// there, which Antigravity answers by *denying* the call — and a denied
+    /// turn still reports `"status":"SUCCESS"` with an empty response, so the
+    /// user would have seen the assistant simply stop using the database.
+    ///
+    /// Asserted as the composition rather than `SERVER == MCP_SERVER`: the rule
+    /// string is what `agy` matches the registration against, so that is what
+    /// has to carry the name.
+    #[test]
+    fn the_allow_rules_name_the_server_that_was_registered() {
+        let rules = antigravity_allow_rules(&["mcp__schemaic__list_schema"]);
+        assert_eq!(rules, vec![format!("mcp({SERVER}/list_schema)")]);
     }
 
     #[test]

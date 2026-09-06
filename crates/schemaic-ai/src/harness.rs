@@ -301,9 +301,6 @@ impl Constraint {
             // would be the comfortable lie one grade down, and shown to the user
             // as a positive assurance.
             //
-            // Asked per harness rather than per capability because this *is* a
-            // harness question: two different mechanisms reach one grade, and the
-            // difference between them is the whole content of the sentence.
             // **Asked as a capability, because the sentence is a claim about a
             // mechanism.** This was `h == Harness::Claude`, with everything else
             // falling through to the sandbox wording — a harness-identity check
@@ -312,10 +309,26 @@ impl Constraint {
             // happens to land. OpenCode is that fourth: its seal is a `tools`
             // map and it has no sandbox at all, so the fallthrough would have
             // promised the user an OS-enforced read-only that nothing enforces.
+            // **The sandbox covers the CLI's own tools, and the sentence used to
+            // claim more than that.** It read "it cannot write files or run
+            // commands" as a flat assurance, while this module's own header
+            // records that MCP tools execute *under* `--sandbox` and — for the
+            // one harness with no MCP isolation — that the user's own registered
+            // servers are live inside the session. A positive assurance the
+            // module contradicts eleven paragraphs above it is the asymmetry the
+            // grade exists to prevent, so the claim is now scoped to what the
+            // sandbox is actually enforcing, and the harness that lets other
+            // servers in says so.
             Constraint::Restricted if h.restricted_means_sandbox() => Some(format!(
-                "{} runs read-only: it cannot write files or run commands, but its \
-                 built-in tools can still read this machine.",
-                h.label()
+                "{} runs sandboxed: its own built-in tools cannot write files or run \
+                 commands, though they can still read this machine.{}",
+                h.label(),
+                match h.isolates_mcp_servers() {
+                    true => "",
+                    false =>
+                        " Any MCP servers you have registered with it are also \
+                              available to this session, and Schemaic cannot restrict them.",
+                }
             )),
             Constraint::Restricted if h.seals_by_flag() => Some(format!(
                 "This {} build does not accept the flag that empties its built-in \
@@ -474,6 +487,73 @@ impl Harness {
     /// would be advice that fixes nothing there.
     pub fn seals_by_flag(self) -> bool {
         matches!(self, Harness::Claude)
+    }
+
+    /// Is this harness's seal an **environment** Schemaic must set on the child
+    /// (and clear the user's copy of), rather than flags on its command line?
+    ///
+    /// Claude takes `--mcp-config` and `--tools`, Codex takes `-c` overrides,
+    /// Antigravity takes nothing at all and is configured by global state.
+    /// OpenCode is the one whose configuration is a *directory*, reached only
+    /// through `XDG_CONFIG_HOME`.
+    ///
+    /// **Asked here because the four call sites asked it four ways**, none of
+    /// them compile-forced: a `match harness { OpenCode => …, _ => Vec::new() }`
+    /// for the inline environment, an `== Harness::OpenCode` on the session
+    /// spawn, and an `== Harness::Codex` in the probe — every one failing to the
+    /// *unsafe* side for a fifth harness, which would get no environment seal
+    /// and keep the user's config-redirection variables while the panel reported
+    /// `Sealed`. The exhaustive `match` below is the point: a fifth harness is a
+    /// compile error here rather than a silent default there.
+    pub fn env_seal(self) -> bool {
+        match self {
+            Harness::OpenCode => true,
+            Harness::Claude | Harness::Codex | Harness::Antigravity => false,
+        }
+    }
+
+    /// Does this harness take a flag that stops it reading the user's own
+    /// configuration file, such that `--help` can be asked whether this build
+    /// has it?
+    ///
+    /// True only for Codex (`--ignore-user-config`). The others do not need one:
+    /// Claude has `--strict-mcp-config` unconditionally, OpenCode's whole config
+    /// root is redirected, and Antigravity has no isolation at all
+    /// ([`Harness::isolates_mcp_servers`]).
+    pub fn isolates_config_by_flag(self) -> bool {
+        match self {
+            Harness::Codex => true,
+            Harness::Claude | Harness::Antigravity | Harness::OpenCode => false,
+        }
+    }
+
+    /// Does a session on this harness see **only** the MCP server Schemaic gave
+    /// it, or the user's own registered servers as well?
+    ///
+    /// Claude has `--strict-mcp-config`; Codex has the whole `mcp_servers` table
+    /// assigned out from under it ([`codex_mcp_overrides`], or
+    /// [`codex_isolation_only`] when even our own server cannot be configured);
+    /// OpenCode's `XDG_CONFIG_HOME` redirection makes the user's globally
+    /// registered servers vanish from `opencode debug config` entirely. All
+    /// three *displace* what the user has registered.
+    ///
+    /// **`agy` has no counterpart, and that is measured rather than assumed.**
+    /// `agy mcp add` appends to the user's own MCP config, so an Antigravity
+    /// session sees every server they have registered alongside ours, and the
+    /// per-tool `permissions.allow` rules Schemaic writes cover only the four
+    /// `mcp(schemaic/…)` names — a user whose own settings already allow their
+    /// own servers' tools has those live inside a SQL assistant. No flag was
+    /// found that closes it.
+    ///
+    /// This exists because the sentence the *user* reads has to know it:
+    /// [`Constraint::notice`] promised "cannot write files or run commands" as a
+    /// flat assurance on a harness this module's own header records as having no
+    /// MCP isolation at all.
+    pub fn isolates_mcp_servers(self) -> bool {
+        match self {
+            Harness::Claude | Harness::Codex | Harness::OpenCode => true,
+            Harness::Antigravity => false,
+        }
     }
 
     /// Does a turn stream *incremental* text?
@@ -1365,7 +1445,7 @@ fn toml_str(s: &str) -> String {
 pub fn antigravity_allow_rules(allowed: &[&str]) -> Vec<String> {
     allowed
         .iter()
-        .map(|t| format!("mcp(schemaic/{})", bare_tool_name(t)))
+        .map(|t| format!("mcp({MCP_SERVER}/{})", bare_tool_name(t)))
         .collect()
 }
 
@@ -2742,18 +2822,38 @@ Options:
     /// **The `Restricted` notice describes a mechanism, so it must be asked as
     /// one.** The sandbox sentence is a claim the OS enforces; promising it for
     /// a harness with no sandbox would be a positive assurance nothing backs.
+    ///
+    /// **Named, not derived.** These two tests used to compute
+    /// `notice.contains("cannot write…") == h.restricted_means_sandbox()` — an
+    /// assertion against the very predicate that produced the substring, so
+    /// flipping `restricted_means_sandbox` to include OpenCode (the exact
+    /// regression the fix was written for) left the suite green and nothing
+    /// pinned OpenCode's `Restricted` notice at all. Each harness is spelled out
+    /// here, so a change to the predicate has to be argued for in this table.
     #[test]
-    fn only_a_sandboxed_harness_is_told_the_os_is_stopping_it() {
+    fn each_harness_is_told_what_is_actually_restricting_it() {
         for h in Harness::ALL {
             let notice = Constraint::Restricted
                 .notice(h)
                 .unwrap_or_else(|| panic!("{h:?} said nothing at Restricted"));
-            let claims_sandbox = notice.contains("cannot write files or run commands");
-            assert_eq!(
-                claims_sandbox,
-                h.restricted_means_sandbox(),
-                "{h:?}: {notice}"
-            );
+            let says_sandbox = notice.contains("cannot write files or run commands");
+            let says_update = notice.contains("Updating the CLI");
+            let says_other_servers = notice.contains("MCP servers you have registered");
+            let (want_sandbox, want_update, want_other_servers) = match h {
+                // An OS-enforced sandbox, and the one harness whose MCP servers
+                // are the user's own as well as ours.
+                Harness::Antigravity => (true, false, true),
+                Harness::Codex => (true, false, false),
+                // The denylist fallback when `--tools` is absent: nothing is
+                // enforcing anything, and a newer build restores the seal.
+                Harness::Claude => (false, true, false),
+                // Seals by configuration or not at all. No sandbox to promise,
+                // and no CLI update that would help.
+                Harness::OpenCode => (false, false, false),
+            };
+            assert_eq!(says_sandbox, want_sandbox, "{h:?}: {notice}");
+            assert_eq!(says_update, want_update, "{h:?}: {notice}");
+            assert_eq!(says_other_servers, want_other_servers, "{h:?}: {notice}");
             // Whatever it says, it names itself and no one else.
             assert!(notice.contains(h.label()), "{h:?}: {notice}");
             for other in Harness::ALL {
@@ -2764,17 +2864,34 @@ Options:
         }
     }
 
-    /// "Update the CLI and the seal comes back" is only true where the seal is a
-    /// flag an older build could be missing.
+    /// **The notice must not promise more than the sandbox covers.** It read
+    /// "it cannot write files or run commands" flat, while this module's header
+    /// records that MCP tools execute *under* `--sandbox` and that one harness
+    /// has no MCP isolation at all — so the sentence was a positive assurance
+    /// the module contradicts eleven paragraphs above it.
     #[test]
-    fn only_a_flag_sealed_harness_is_told_an_update_would_help() {
+    fn a_harness_that_lets_other_mcp_servers_in_says_so() {
+        // The claim is scoped to the CLI's own tools, on every harness that
+        // makes it.
         for h in Harness::ALL {
             let notice = Constraint::Restricted.notice(h).expect("a notice");
+            if notice.contains("cannot write files or run commands") {
+                assert!(
+                    notice.contains("its own built-in tools"),
+                    "{h:?} promises more than the sandbox covers: {notice}"
+                );
+            }
             assert_eq!(
-                notice.contains("Updating the CLI"),
-                h.seals_by_flag(),
+                notice.contains("Schemaic cannot restrict them"),
+                !h.isolates_mcp_servers(),
                 "{h:?}: {notice}"
             );
+        }
+        // And the capability itself is the measured one, spelled out rather than
+        // read back off the notice.
+        assert!(!Harness::Antigravity.isolates_mcp_servers());
+        for h in [Harness::Claude, Harness::Codex, Harness::OpenCode] {
+            assert!(h.isolates_mcp_servers(), "{h:?}");
         }
     }
 }

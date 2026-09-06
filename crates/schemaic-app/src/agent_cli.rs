@@ -287,10 +287,7 @@ pub(crate) fn harness_bin(h: Harness, override_path: &str) -> String {
 /// Schemaic restarts, so a session spawned in between is sealed the old way.
 /// What covers it for Claude is `DISALLOWED_TOOLS`, passed at every seal level.
 pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<(Harness, String), Probe>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = probe_cache();
     let key = (h, bin.to_string());
     if let Ok(c) = cache.lock()
         && let Some(p) = c.get(&key)
@@ -337,12 +334,42 @@ pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
         } else {
             Constraint::Unknown
         },
-        isolate_config: h == Harness::Codex && o.status.success() && codex_isolates_config(&both),
+        // Asked as a capability rather than `h == Harness::Codex`: that shape
+        // compiles cleanly while sorting a fifth harness onto whichever side it
+        // happens to land, and this one lands on `isolate_config: false` — the
+        // *unsafe* side, where the child reads the user's own configuration.
+        isolate_config: h.isolates_config_by_flag()
+            && o.status.success()
+            && codex_isolates_config(&both),
     };
     if let Ok(mut c) = cache.lock() {
         c.insert(key, probe);
     }
     probe
+}
+
+/// The `(harness, resolved path) -> Probe` memo, shared by [`probe`] and
+/// [`probe_cached`].
+fn probe_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(Harness, String), Probe>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(Harness, String), Probe>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The cached answer for `(h, bin)`, or `None` if nobody has probed it yet.
+///
+/// **For a caller that must not block**, which is the settings modal: its notice
+/// memo runs on the Floem UI thread, and calling [`probe`] there pays a
+/// synchronous `--help` on every cold key. The harness dropdown produces a cold
+/// key by construction — switching harness *clears* `cli_path`, so the memo and
+/// the warming thread were started in the same update pass and both missed. The
+/// modal shows nothing until [`warm_probe_cache`] has an answer, and
+/// [`probe_generation`] is what tells it to look again.
+pub(crate) fn probe_cached(h: Harness, bin: &str) -> Option<Probe> {
+    let cache = probe_cache();
+    let c = cache.lock().ok()?;
+    c.get(&(h, bin.to_string())).copied()
 }
 
 /// Fill [`probe`]'s cache for `(h, bin)` on a background thread.
@@ -355,9 +382,15 @@ pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
 /// one warmed an entry nothing ever read and left all four AI entry points
 /// paying a blocking `--help` on the UI thread. Its caller re-warms from an
 /// effect on the setting for the same reason — and now on the harness too.
-pub(crate) fn warm_probe_cache(h: Harness, bin: String) {
+///
+/// `done` is called on the UI thread once the entry is filled, so a view that
+/// showed nothing on the miss can ask again. Build it with
+/// `floem::ext_event::create_ext_action`: this runs on a plain `std` thread and
+/// must not touch a signal directly.
+pub(crate) fn warm_probe_cache(h: Harness, bin: String, done: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
         let _ = probe(h, &bin);
+        done();
     });
 }
 

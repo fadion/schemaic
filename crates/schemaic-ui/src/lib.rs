@@ -4927,6 +4927,23 @@ impl AiEffort {
     ///
     /// `None` when the harness has no effort flag at all — there is no level to
     /// show, and the row is hidden.
+    /// The levels a harness taking exactly `levels` should offer in the box, in
+    /// this enum's own order.
+    ///
+    /// **Lifted out of the view closure, where it was an expression.** The
+    /// settings dropdown filtered `AiEffort::ALL` inline, and the test that
+    /// claimed to guard it re-performed the same filter in its own body — so
+    /// changing the view's filter to `.take(3)`, or to `AiEffort::ALL`
+    /// unfiltered, left the workspace green while the dropdown offered `xhigh`
+    /// under a harness whose flag does not take it. The test calls *this* now,
+    /// and the view calls nothing else.
+    pub fn offered_by(levels: &[&str]) -> Vec<AiEffort> {
+        AiEffort::ALL
+            .into_iter()
+            .filter(|e| levels.contains(&e.cli()))
+            .collect()
+    }
+
     pub fn clamped_to(self, levels: &[&str]) -> Option<AiEffort> {
         if levels.contains(&self.cli()) {
             return Some(self);
@@ -4939,6 +4956,89 @@ impl AiEffort {
             // `(distance, is_above)`: the closest level wins, and `false < true`
             // makes the cheaper side win a tie.
             .min_by_key(|e| (rank(*e).abs_diff(want), rank(*e) > want))
+    }
+}
+
+/// What a harness switch does to the three settings that are one field shared by
+/// every harness.
+///
+/// **Pure, and lifted out of the Floem effect that used to hold all of it.**
+/// Every bug in this decision's history sat at the composition — the clamp that
+/// was gated on a change and so never ran on the restore, the model id that was
+/// not cleared, the path that pointed the new CLI at the old CLI's binary — and
+/// a rule inside a `create_effect` is a rule nothing can test. `AiEffort::
+/// clamped_to` had six tests in isolation while the caller that decides *when*
+/// to apply it had none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessSwitch {
+    /// The CLI path override to keep, or `None` to clear it.
+    ///
+    /// `ai_cli_path` is one field shared by every harness, so leaving a Claude
+    /// path behind across a switch points the new CLI's spawn at the old CLI's
+    /// binary: pick Codex after setting a Claude path and `harness_bin`
+    /// resolves it, spawning *Claude* with Codex's argv. It dies on the first
+    /// unknown flag and reports it as an installation problem, which is the one
+    /// thing that is not wrong with it. Empty already means "auto-detect".
+    pub cli_path: Option<String>,
+    /// The model id to keep, or `None` to clear it.
+    ///
+    /// The same reason with a quieter failure: no CLI's `--model` accepts
+    /// another CLI's ids, and empty already means "the harness's default", which
+    /// is the one id every harness is guaranteed to take.
+    pub model: Option<String>,
+    /// The effort level to show.
+    ///
+    /// **Clamped rather than cleared**, because unlike the other two it has no
+    /// "the harness's default" value — it is a closed enum and every level in it
+    /// means something. `Extra` is Claude's `xhigh` and Antigravity's flag stops
+    /// at `high`, so the switch moves the selection to the *nearest* level the
+    /// new harness advertises. Nearest, not highest: taking the highest is what
+    /// sent a default `Medium` to OpenCode's `Max`.
+    pub effort: AiEffort,
+}
+
+/// Decide what a harness switch keeps.
+///
+/// `prev` is the harness the fields were last set for — `None` on the first run,
+/// where clearing would discard the override restored from `ui_state.json`
+/// before the user has touched anything.
+///
+/// `remembered` is what this harness held the last time it was selected, if
+/// anything. **This is what gives the dropdown a way back.** Browsing the list
+/// and returning used to destroy the CLI path, the model id and (through the
+/// clamp) the effort level permanently: the modal's ✕, its backdrop and Escape
+/// all commit, so there was no cancel, and the clearing fired on any
+/// `prev != now` in *both* directions. A user who opened the dropdown to see
+/// what was there and picked their own harness again came back to three empty
+/// fields, with the modal's own header still promising "Changes commit when the
+/// modal closes".
+///
+/// **The clamp runs on every call, including the first**, which is a different
+/// question from "did the user switch": it is "is the level in the box one this
+/// harness takes". Gating it on a change meant the restore from `ui_state.json`
+/// never clamped, so a file pairing `opencode` with `medium` came back showing
+/// "Medium" in a dropdown offering only Minimal/High/Max while `effort_arg` sent
+/// no flag at all.
+pub fn harness_switch(
+    prev: Option<Harness>,
+    now: Harness,
+    cli_path: String,
+    model: String,
+    effort: AiEffort,
+    remembered: Option<(String, String)>,
+) -> HarnessSwitch {
+    let switched = prev.is_some_and(|p| p != now);
+    let (cli_path, model) = match (switched, remembered) {
+        // Coming back to a harness this session has already configured: its own
+        // path and model, not the ones typed for the harness being left.
+        (true, Some((p, m))) => (Some(p), Some(m)),
+        (true, None) => (None, None),
+        (false, _) => (Some(cli_path), Some(model)),
+    };
+    HarnessSwitch {
+        cli_path,
+        model,
+        effort: effort.clamped_to(now.effort_levels()).unwrap_or(effort),
     }
 }
 
@@ -10072,7 +10172,7 @@ pub(crate) fn search_box(
 
 #[cfg(test)]
 mod effort_clamp_tests {
-    use super::AiEffort;
+    use super::{AiEffort, harness_switch};
     use crate::Harness;
 
     /// Against the harnesses' **own** level lists rather than literals, so this
@@ -10114,16 +10214,153 @@ mod effort_clamp_tests {
     #[test]
     fn every_level_a_harness_takes_can_be_chosen_in_the_box() {
         for h in Harness::ALL {
-            let offered: Vec<&str> = AiEffort::ALL
+            // **The function the view calls**, not a copy of the expression it
+            // used to contain. This test re-performed the filter in its own
+            // body, so changing the view to `.take(3)` — or to `AiEffort::ALL`
+            // unfiltered, which is the regression it names — left it green.
+            let offered: Vec<&str> = AiEffort::offered_by(h.effort_levels())
                 .into_iter()
                 .map(AiEffort::cli)
-                .filter(|c| h.effort_levels().contains(c))
                 .collect();
             assert_eq!(
                 offered,
                 h.effort_levels().to_vec(),
                 "{h:?} advertises {:?} but the box can only offer {offered:?}",
                 h.effort_levels()
+            );
+            // Nothing this harness does *not* advertise can be picked, which is
+            // the half a "can every level be chosen" test cannot see.
+            for e in AiEffort::ALL {
+                assert_eq!(
+                    AiEffort::offered_by(h.effort_levels()).contains(&e),
+                    h.effort_levels().contains(&e.cli()),
+                    "{h:?} offers {e:?}"
+                );
+            }
+        }
+    }
+
+    /// **A harness switch clears the two fields no other harness can use.**
+    #[test]
+    fn switching_harness_clears_the_path_and_the_model_that_were_typed_for_the_old_one() {
+        let s = harness_switch(
+            Some(Harness::Claude),
+            Harness::Codex,
+            r"C:\tools\claude.exe".into(),
+            "haiku".into(),
+            AiEffort::Medium,
+            None,
+        );
+        // `harness_bin` would otherwise resolve this and spawn *Claude* with
+        // Codex's argv, dying on the first unknown flag under a "check your
+        // installation" message naming the one cause that is not it.
+        assert_eq!(s.cli_path, None);
+        // And no CLI's `--model` takes another's ids.
+        assert_eq!(s.model, None);
+    }
+
+    /// **The first run keeps everything**, or the override restored from
+    /// `ui_state.json` is discarded before the user has touched anything.
+    #[test]
+    fn the_restore_from_the_settings_file_is_not_a_switch() {
+        let s = harness_switch(
+            None,
+            Harness::Claude,
+            r"C:\tools\claude.exe".into(),
+            "haiku".into(),
+            AiEffort::Medium,
+            None,
+        );
+        assert_eq!(s.cli_path.as_deref(), Some(r"C:\tools\claude.exe"));
+        assert_eq!(s.model.as_deref(), Some("haiku"));
+    }
+
+    /// …and selecting the same harness again is not a switch either.
+    #[test]
+    fn re_selecting_the_current_harness_changes_nothing() {
+        let s = harness_switch(
+            Some(Harness::Codex),
+            Harness::Codex,
+            "/usr/bin/codex".into(),
+            "gpt-5.4-codex".into(),
+            AiEffort::High,
+            None,
+        );
+        assert_eq!(s.cli_path.as_deref(), Some("/usr/bin/codex"));
+        assert_eq!(s.model.as_deref(), Some("gpt-5.4-codex"));
+        assert_eq!(s.effort, AiEffort::High);
+    }
+
+    /// **Browsing the dropdown and coming back must not cost the user their
+    /// settings.** The modal's ✕, its backdrop *and* Escape all commit — there
+    /// is no cancel — and the clearing fires in both directions, so opening the
+    /// list to see what was there and picking your own harness again came back
+    /// to three empty fields, permanently, while the modal's header still read
+    /// "Changes commit when the modal closes".
+    #[test]
+    fn coming_back_to_a_harness_restores_what_it_held() {
+        let claude = (r"C:\tools\claude.exe".to_string(), "haiku".to_string());
+        // Away to Codex: Claude's fields are filed, and Codex starts clean.
+        let away = harness_switch(
+            Some(Harness::Claude),
+            Harness::Codex,
+            claude.0.clone(),
+            claude.1.clone(),
+            AiEffort::Medium,
+            None,
+        );
+        assert_eq!(away.cli_path, None);
+        // …and back again, with what Claude was holding.
+        let back = harness_switch(
+            Some(Harness::Codex),
+            Harness::Claude,
+            String::new(),
+            String::new(),
+            AiEffort::Medium,
+            Some(claude.clone()),
+        );
+        assert_eq!(back.cli_path.as_deref(), Some(claude.0.as_str()));
+        assert_eq!(back.model.as_deref(), Some(claude.1.as_str()));
+    }
+
+    /// **The clamp runs on every call, including the first** — a different
+    /// question from "did the user switch". Gating it on a change meant the
+    /// restore never clamped, so a settings file pairing `opencode` with
+    /// `medium` came back showing "Medium" in a dropdown that offers only
+    /// Minimal/High/Max, while `effort_arg` sent no flag at all.
+    #[test]
+    fn the_level_in_the_box_is_always_one_this_harness_takes() {
+        for h in Harness::ALL {
+            for e in AiEffort::ALL {
+                for prev in [None, Some(Harness::Claude), Some(h)] {
+                    let s = harness_switch(prev, h, String::new(), String::new(), e, None);
+                    assert!(
+                        h.effort_levels().is_empty() || h.effort_levels().contains(&s.effort.cli()),
+                        "{h:?} shows {:?}, which it does not take (from {e:?}, prev {prev:?})",
+                        s.effort
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The two closures that ask the same capability must agree**, because
+    /// they decide different things about the same control: one builds the
+    /// dropdown and one hides the section. If `supports_effort()` ever stopped
+    /// meaning "there are levels", a `Display::None` section would keep a
+    /// focus-ring Tab stop on a dropdown nobody can see.
+    ///
+    /// They agree today for one reason recorded in another crate —
+    /// `Harness::supports_effort` *computes* `!effort_levels().is_empty()` —
+    /// so this is the one-line pin that keeps that true.
+    #[test]
+    fn supports_effort_is_exactly_having_levels() {
+        for h in Harness::ALL {
+            assert_eq!(h.supports_effort(), !h.effort_levels().is_empty(), "{h:?}");
+            assert_eq!(
+                h.supports_effort(),
+                !AiEffort::offered_by(h.effort_levels()).is_empty(),
+                "{h:?}: the section is shown but the box is empty, or the reverse"
             );
         }
     }

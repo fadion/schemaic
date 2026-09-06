@@ -751,7 +751,22 @@ pub(crate) struct InlinePlan {
     last_message: Option<PathBuf>,
     /// The working directory this generation's child runs in, removed with it.
     cwd: Option<PathBuf>,
-    env: Vec<(String, String)>,
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+/// May a one-shot generation run on this harness at this grade?
+///
+/// **The same rule the chat panel applies, asked through the same function.**
+/// Pure and separate from [`inline_plan`] for the reason the rest of this
+/// crate's gates are: the only way to reach `inline_plan` is to spawn a process,
+/// so the *rule* had no test — and a gate with no test is one edit from a gate
+/// that always answers yes. `a_one_shot_refuses_on_exactly_the_grades_a_session_
+/// does` is what holds the two together.
+fn inline_gate(harness: Harness, constraint: Constraint) -> Result<(), String> {
+    match spawn_refusal(harness, constraint) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
 }
 
 /// Resolve the selected harness into a runnable inline spawn, or say why not.
@@ -773,9 +788,7 @@ pub(crate) fn inline_plan(
 ) -> Result<InlinePlan, String> {
     let bin = harness_bin(harness, cli_path);
     let p = probe(harness, &bin);
-    if let Some(why) = spawn_refusal(harness, p.constraint) {
-        return Err(why);
-    }
+    inline_gate(harness, p.constraint)?;
     let output = schemaic_ai::harness::inline_output(harness);
     let last_message = match output {
         schemaic_ai::harness::InlineOutput::LastMessageFile => Some(
@@ -787,15 +800,15 @@ pub(crate) fn inline_plan(
     // OpenCode's seal is a config directory, so a failure to write it is a
     // refusal rather than a degradation: `--agent` naming an agent that is not
     // defined runs on `build`, which has every built-in including `bash`.
-    let env = match harness {
-        Harness::OpenCode => crate::opencode::OpenCodeConfig::write_inline()
+    let env = match harness.env_seal() {
+        true => crate::opencode::OpenCodeConfig::write_inline()
             .ok_or_else(|| {
                 "Couldn't write OpenCode's configuration, so the generation was not started \
                  (without it the CLI would run with its own tools enabled)."
                     .to_string()
             })?
             .env(),
-        _ => Vec::new(),
+        false => Vec::new(),
     };
     let spec = schemaic_ai::harness::InlineSpec {
         intent: intent.to_string(),
@@ -1031,6 +1044,32 @@ impl TurnPump {
         }
     }
 
+    /// Put a line of Schemaic's own at the **top** of the turn being
+    /// accumulated, without ending it.
+    ///
+    /// **The channel a degraded session did not have.** There are three ways to
+    /// start a session with no database tools — the endpoint file could not be
+    /// written, `agy mcp add` failed, the settings grant was declined — and all
+    /// three were silent, one of them without even a `tracing::warn!`, while the
+    /// system prompt went on telling the model it has `list_schema`,
+    /// `describe_table` and `run_query`. The user watched the assistant refuse
+    /// to look anything up and had nothing to tell them why.
+    ///
+    /// Not a `fail`, because the session works — it just cannot reach the
+    /// database — and not a snapshot of its own, because the panel's consumer
+    /// assigns `last.segs` wholesale and the next real snapshot would erase it.
+    /// Held in the accumulator, it rides every snapshot of that turn.
+    fn note(&mut self, text: String) {
+        self.turn
+            .apply(&schemaic_ai::StreamEvent::TextDelta(format!("{text}\n\n")));
+        let _ = self.ai_tx.send(AiStreamMsg {
+            segs: self.turn.segments(),
+            done: false,
+            is_error: false,
+            stats: None,
+        });
+    }
+
     /// End the turn with a message of our own — a spawn that failed, a child
     /// that died, a refusal. Always sends, so the panel never keeps spinning.
     ///
@@ -1108,6 +1147,46 @@ fn refuse_every_turn(
             });
         }
     });
+}
+
+/// The one sentence a session with no database tools puts in front of the user.
+///
+/// Pure, and one wording for all three paths that produce this state, because
+/// the failure was that each of them said something different — nothing, a log
+/// line, and nothing again — while the system prompt kept telling the model it
+/// has `list_schema`, `describe_table` and `run_query`.
+fn no_tools_note(cause: &str) -> String {
+    format!(
+        "**This session has no database tools.** {cause}, so the assistant \
+         cannot look anything up — it can only answer from the schema outline \
+         already in its prompt. Closing and reopening the panel will try again."
+    )
+}
+
+/// Does a respawned persistent session owe its system context again?
+///
+/// **Because the one chance to deliver it is spent per *conversation*, not per
+/// session.** Antigravity has no `--append-system-prompt`, so its schema
+/// outline, tools line, propose-change protocol and the user's own instructions
+/// travel in the text of the first turn — once, because the process keeps the
+/// conversation and re-sending all of it every turn is most of what holding one
+/// was for. That "once" was a latched `bool`, set false when the first turn went
+/// out and never looked at again.
+///
+/// Pressing Stop kills the child and spawns a fresh one, resuming by id. Stop
+/// *before* the CLI has announced that id — the window between the first
+/// question and its opening event — leaves `conversation == None`, so the
+/// respawn opens a brand-new conversation with no memory of anything, while the
+/// latched flag says the context has been delivered. The assistant then answers
+/// the rest of the session with no schema, no tools line and none of the user's
+/// instructions, and nothing says so.
+///
+/// The process-per-turn sibling keys the same decision on `resume.is_none()` and
+/// self-heals; this is that rule, written down. `owed` is carried in because a
+/// context that never went out — an empty outline on the opening turn does not
+/// spend the chance — is still owed whatever the respawn can resume.
+fn owes_system_after_respawn(harness: Harness, owed: bool, resume: Option<&str>) -> bool {
+    owed || (harness.session_system_in_first_turn() && resume.is_none())
 }
 
 /// Why a session must not start on this harness, or `None` to go ahead.
@@ -1233,6 +1312,9 @@ pub(crate) fn start_ai_session(
         // persistent path above and never reaches this branch.
         let mut overrides = Vec::new();
         let mut oc_config: Option<crate::opencode::OpenCodeConfig> = None;
+        // See `TurnPump::note`: a session that cannot reach the database has to
+        // say so, on every path that produces one.
+        let mut degraded: Option<String> = None;
         match (harness, ep_file.as_ref()) {
             (Harness::Codex, Some(p)) => {
                 overrides =
@@ -1252,6 +1334,11 @@ pub(crate) fn start_ai_session(
             // unconditionally, and Antigravity has none to lose.
             (Harness::Codex, None) => {
                 overrides = schemaic_ai::harness::codex_isolation_only();
+                tracing::warn!("no endpoint file for Codex; this session has no database tools");
+                degraded = Some(no_tools_note(
+                    "Schemaic could not create the private file that tells the assistant \
+                     how to reach your database",
+                ));
             }
             // **OpenCode's whole configuration is a directory**, written here
             // rather than per turn: the contents do not change between turns of
@@ -1279,7 +1366,7 @@ pub(crate) fn start_ai_session(
         // agent that does not exist does not fail, it leaves the run on
         // OpenCode's own `build` agent, which has `bash`. Refusing is the only
         // direction that keeps `Constraint::Sealed` an honest answer.
-        let mut oc_env: Vec<(String, String)> = Vec::new();
+        let mut oc_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
         match (harness, oc_config.as_ref()) {
             (Harness::OpenCode, Some(c)) => {
                 tracing::debug!(dir = %c.root().display(), "opencode config written");
@@ -1319,6 +1406,9 @@ pub(crate) fn start_ai_session(
             // `AgyRegistration` lives with the persistent task instead. Codex
             // and OpenCode are configured entirely per invocation.
             let mut pump = TurnPump::new(ai_tx);
+            if let Some(why) = degraded {
+                pump.note(why);
+            }
             let mut thread: Option<String> = None;
             while let Some(msg) = rx.recv().await {
                 let prompt = match msg {
@@ -1352,18 +1442,23 @@ pub(crate) fn start_ai_session(
                 }
                 let mut cmd = Command::new(&bin);
                 cmd.args(&args);
-                // **Clear before set, and both are OpenCode's alone.** A child
-                // inherits our environment, so `OPENCODE_CONFIG` exported in the
-                // user's shell merges their file back into a session
-                // `XDG_CONFIG_HOME` was supposed to have isolated — the seal
-                // undone by the lever `crate::opencode` rejected for merging.
-                // Empty for every other harness, whose configuration is flags.
-                if harness == Harness::OpenCode {
-                    for k in crate::opencode::OpenCodeConfig::env_remove() {
-                        cmd.env_remove(k);
-                    }
+                // **Clear before set.** A child inherits our environment, so
+                // `OPENCODE_CONFIG` exported in the user's shell merges their
+                // file back into a session `XDG_CONFIG_HOME` was supposed to
+                // have isolated — the seal undone by the lever
+                // `crate::opencode` rejected for merging.
+                //
+                // Unconditional, where it used to sit behind
+                // `harness == Harness::OpenCode`: removing three variables no
+                // other harness reads costs nothing, and a harness-identity
+                // check that fails to the *unsafe* side for the next CLI added
+                // is worth less than the three lines it saves. `oc_env` is empty
+                // for every harness whose configuration is flags, so the set
+                // half needs no condition either.
+                for k in crate::opencode::OpenCodeConfig::env_remove() {
+                    cmd.env_remove(k);
                 }
-                cmd.envs(oc_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                cmd.envs(oc_env.iter().map(|(k, v)| (k, v)));
                 if let Some(d) = &cwd {
                     cmd.current_dir(d);
                 }
@@ -1518,6 +1613,11 @@ pub(crate) fn start_ai_session(
         .endpoint_file
         .then(|| write_endpoint_file(&endpoint))
         .flatten();
+    // Whether this session's tools depend on a registration at all. Asked off
+    // the plumbing rather than off the harness, so "the endpoint file could not
+    // be written" and "the registration failed" are one question with one answer
+    // for the user.
+    let needs_agy = harness == Harness::Antigravity;
     let agy_install = agy_ep.as_ref().map(|p| {
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
@@ -1572,21 +1672,33 @@ pub(crate) fn start_ai_session(
         // before the spawn, and on a blocking thread rather than a worker,
         // because it is two `agy` invocations and a settings rewrite. The first
         // turn's `rx.recv()` has not been reached yet, so nothing races it.
-        let _registration = match agy_install {
-            None => None,
-            Some((exe, ep)) => {
+        // Why this session has no database tools, if it has none. Said to the
+        // *user* through `TurnPump::note` below, not only to the log — see that
+        // method for what the silence cost.
+        let mut degraded: Option<String> = None;
+        let _registration = match (needs_agy, agy_install) {
+            (false, _) => None,
+            // The endpoint file could not be written, so there is nothing to
+            // register a server against.
+            (true, None) => {
+                tracing::warn!("no endpoint file for Antigravity; this session has no database tools");
+                degraded = Some(no_tools_note("Schemaic could not create the private file that tells the assistant how to reach your database"));
+                None
+            }
+            (true, Some((exe, ep))) => {
                 let reg = tokio::task::spawn_blocking(move || {
                     crate::antigravity::AgyRegistration::install(&agy_bin, &exe, &ep, tools)
                 })
                 .await
                 .ok();
                 if !reg.as_ref().is_some_and(|r| r.is_installed()) {
-                    // Said out loud rather than discovered: the session runs, but
-                    // every database tool call in it will be refused.
                     tracing::warn!(
                         "could not register the Schemaic MCP server with Antigravity; \
                          this session has no database tools"
                     );
+                    degraded = Some(no_tools_note(
+                        "Schemaic could not register its database tools with Antigravity",
+                    ));
                 }
                 reg
             }
@@ -1627,6 +1739,9 @@ pub(crate) fn start_ai_session(
         let mut reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
         // The same accumulator the process-per-turn tasks use — see `TurnPump`.
         let mut pump = TurnPump::new(ai_tx.clone());
+        if let Some(why) = degraded {
+            pump.note(why);
+        }
 
         // Drain stderr concurrently into a shared buffer so it's available if the
         // session dies (reading it only on exit could deadlock a full pipe).
@@ -1689,10 +1804,34 @@ pub(crate) fn start_ai_session(
                                 ).lines();
                                 parser = schemaic_ai::stream::StreamParser::new(harness);
                                 raw_output.clear();
+                                // **The one chance to deliver the outline is
+                                // spent per *conversation*, not per session.**
+                                // See `owes_system_after_respawn`.
+                                owes_system = owes_system_after_respawn(
+                                    harness, owes_system, conversation.as_deref(),
+                                );
                             }
-                            // Nothing left to talk to: end the session rather
-                            // than sit on a channel whose child is gone.
-                            Err(_) => break,
+                            // Nothing left to talk to. The session ends here, and
+                            // it has to *say* so: breaking out drops `rx`, and
+                            // `needs_respawn` does not rebuild a session whose
+                            // settings have not changed, so every later question
+                            // was a discarded `Err` and the bubble spun.
+                            Err(e) => {
+                                let why = format!(
+                                    "The {} session could not be restarted after \
+                                     stopping ({e}), so it has ended. Ask again to \
+                                     start a new one.",
+                                    harness.label()
+                                );
+                                pump.fail(why.clone());
+                                refuse_every_turn(
+                                    &tokio::runtime::Handle::current(),
+                                    rx,
+                                    ai_tx.clone(),
+                                    why,
+                                );
+                                return;
+                            }
                         }
                     }
                     Some(msg) => {
@@ -1717,7 +1856,25 @@ pub(crate) fn start_ai_session(
                             }
                         };
                         if stdin.write_all(line.as_bytes()).await.is_err() {
-                            break;
+                            // The child's stdin is gone, so this question was
+                            // never asked and no later one can be either. Said
+                            // out loud: ending here silently left the panel
+                            // spinning on a turn nothing was ever going to
+                            // answer, and `needs_respawn` rebuilds nothing when
+                            // the settings have not changed.
+                            let why = format!(
+                                "The {} session is no longer accepting questions. \
+                                 Ask again to start a new one.",
+                                harness.label()
+                            );
+                            pump.fail(why.clone());
+                            refuse_every_turn(
+                                &tokio::runtime::Handle::current(),
+                                rx,
+                                ai_tx.clone(),
+                                why,
+                            );
+                            return;
                         }
                         let _ = stdin.flush().await;
                     }
@@ -1752,20 +1909,46 @@ pub(crate) fn start_ai_session(
                         let code = child.wait().await.ok().and_then(|s| s.code());
                         let stderr_text = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
                         let raw = raw_output.join("\n");
-                        if code != Some(0) || !stderr_text.trim().is_empty() || !raw.trim().is_empty()
-                        {
-                            let why =
-                                schemaic_ai::cli_failure_message(harness, code, &raw, &stderr_text);
-                            let _ = ai_tx.send(AiStreamMsg {
-                                segs: vec![schemaic_core::transcript::Seg::Text(format!(
-                                    "The AI session ended unexpectedly: {why}"
-                                ))],
-                                done: true,
-                                is_error: true,
-                                stats: None,
-                            });
-                        }
-                        break;
+                        let ended_badly = code != Some(0)
+                            || !stderr_text.trim().is_empty()
+                            || !raw.trim().is_empty();
+                        // **Through the pump, so the answer already on screen
+                        // survives.** This was a raw `ai_tx.send` carrying only
+                        // the reason, and the consumer assigns `last.segs =
+                        // msg.segs` wholesale — so a CLI dying mid-answer
+                        // replaced three streamed paragraphs with one error
+                        // line. That is verbatim the bug `TurnPump::fail` was
+                        // added to fix; the range routed the process-per-turn
+                        // path's three terminal errors through it and left this
+                        // one, with `pump`'s live accumulator in scope on the
+                        // very line and not consulted.
+                        let why = match ended_badly {
+                            true => format!(
+                                "The AI session ended unexpectedly: {}",
+                                schemaic_ai::cli_failure_message(
+                                    harness, code, &raw, &stderr_text
+                                )
+                            ),
+                            // A clean exit with nothing to report is still the
+                            // end of the session, and the panel is still
+                            // waiting — it just has no CLI failure to name.
+                            false => format!(
+                                "The {} session ended. Ask again to start a new one.",
+                                harness.label()
+                            ),
+                        };
+                        pump.fail(why.clone());
+                        let _ = child.kill().await;
+                        // The session is over, and every later question has to
+                        // be told so rather than dropped on a receiverless
+                        // channel.
+                        refuse_every_turn(
+                            &tokio::runtime::Handle::current(),
+                            rx,
+                            ai_tx.clone(),
+                            why,
+                        );
+                        return;
                     }
                 },
             }
@@ -2676,6 +2859,221 @@ fn render_inline_prompt(
          Current editor contents, for context ({UNTRUSTED_NOTE}):\n{current}\n\n{task}",
         current = schemaic_core::prompt::fenced_as("sql", &req.current_sql),
     )
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use schemaic_ai::StreamEvent;
+    use schemaic_core::transcript::{Seg, TurnStats};
+
+    /// Multi-threaded on purpose: `refuse_every_turn` *spawns*, and a
+    /// current-thread runtime only drives spawned tasks while something is
+    /// blocked on it — which the app's runtime is not, and neither is this test.
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    fn pump() -> (TurnPump, crossbeam_channel::Receiver<AiStreamMsg>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        (TurnPump::new(tx), rx)
+    }
+
+    fn text_of(m: &AiStreamMsg) -> String {
+        m.segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **`TurnPump` folds every harness's events into a turn and had no tests at
+    /// all** — including for the append-not-replace `fail` this range shipped.
+    /// It needs nothing but a channel and a `Vec<StreamEvent>`, which is the
+    /// whole reason its absence was worth filing.
+    #[test]
+    fn the_pump_streams_a_snapshot_per_change_and_closes_on_turn_done() {
+        let (mut p, rx) = pump();
+        assert!(!p.push(vec![StreamEvent::TextDelta("Hel".into())]));
+        assert!(!p.push(vec![StreamEvent::TextDelta("lo".into())]));
+        // Events that render nothing send nothing: a snapshot per no-op event
+        // is a whole-transcript clone per no-op event.
+        assert!(!p.push(vec![StreamEvent::SessionStarted { id: "s1".into() }]));
+        assert!(!p.push(Vec::new()));
+        assert!(p.push(vec![StreamEvent::TurnDone {
+            is_error: false,
+            stats: TurnStats::default(),
+        }]));
+
+        let msgs: Vec<_> = rx.try_iter().collect();
+        assert_eq!(msgs.len(), 3, "one per change, plus the close");
+        assert!(!msgs[0].done && !msgs[1].done);
+        assert_eq!(text_of(&msgs[1]), "Hello");
+        assert!(msgs[2].done && !msgs[2].is_error);
+        // Empty stats are not reported as stats.
+        assert!(msgs[2].stats.is_none());
+    }
+
+    /// **The bug `fail` exists for, asserted as the composition.** The panel's
+    /// consumer assigns `last.segs = msg.segs` wholesale, so a final snapshot
+    /// carrying only the reason threw away every word already on screen — press
+    /// Stop on a long answer and the prose you were reading was replaced by
+    /// "Stopped.".
+    #[test]
+    fn a_failure_is_appended_to_what_streamed_in_not_substituted_for_it() {
+        let (mut p, rx) = pump();
+        p.push(vec![StreamEvent::TextDelta("half an answer".into())]);
+        p.fail("the CLI died".into());
+        let last = rx.try_iter().last().expect("a final snapshot");
+        assert!(last.done && last.is_error);
+        assert!(
+            text_of(&last).contains("half an answer"),
+            "{last:?}",
+            last = text_of(&last)
+        );
+        assert!(text_of(&last).contains("the CLI died"));
+
+        // `stop` adds nothing of its own: `mark_stopped` already appends the
+        // `(stopped)` marker, and a `fail("Stopped.")` here as well left the
+        // bubble reading *answer* / "Stopped." / "(stopped)".
+        let (mut p, rx) = pump();
+        p.push(vec![StreamEvent::TextDelta("half an answer".into())]);
+        p.stop();
+        let last = rx.try_iter().last().expect("a final snapshot");
+        assert_eq!(text_of(&last), "half an answer");
+    }
+
+    /// The accumulator resets at the boundary, or turn two renders turn one
+    /// above it.
+    #[test]
+    fn a_turn_does_not_leak_into_the_next_one() {
+        let (mut p, rx) = pump();
+        p.push(vec![StreamEvent::TextDelta("first".into())]);
+        p.push(vec![StreamEvent::TurnDone {
+            is_error: false,
+            stats: TurnStats::default(),
+        }]);
+        p.push(vec![StreamEvent::TextDelta("second".into())]);
+        let last = rx.try_iter().last().expect("a snapshot");
+        assert_eq!(text_of(&last), "second");
+    }
+
+    /// A session that cannot reach the database says so **and keeps the note**
+    /// through every later snapshot of that turn, because the consumer replaces
+    /// `segs` wholesale.
+    #[test]
+    fn a_degraded_session_says_so_and_the_answer_does_not_erase_it() {
+        let (mut p, rx) = pump();
+        p.note(no_tools_note(
+            "Schemaic could not register its database tools",
+        ));
+        p.push(vec![StreamEvent::TextDelta(
+            "I cannot look that up.".into(),
+        )]);
+        let last = rx.try_iter().last().expect("a snapshot");
+        let t = text_of(&last);
+        assert!(t.contains("no database tools"), "{t}");
+        assert!(t.contains("I cannot look that up."), "{t}");
+        // One wording for all three paths that reach this state — they used to
+        // say nothing, a log line, and nothing again.
+        assert!(no_tools_note("x").contains("no database tools"));
+    }
+
+    /// **The rule no test named, which is why one of the three returns broke
+    /// it.** A `start_ai_session` return that spawns nothing must hand `rx` to
+    /// `refuse_every_turn`, or the channel closes, `needs_respawn` rebuilds
+    /// nothing (same connection, same settings) and every later question is a
+    /// discarded `Err` while the bubble spins with nothing said.
+    #[test]
+    fn a_refused_session_answers_every_later_question_rather_than_the_first() {
+        let rt = rt();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SessionMsg>();
+        let (ai_tx, ai_rx) = crossbeam_channel::unbounded();
+        refuse_every_turn(rt.handle(), rx, ai_tx, "the reason".to_string());
+
+        for n in 1..=3 {
+            assert!(
+                tx.send(SessionMsg::Turn(format!("q{n}"))).is_ok(),
+                "turn {n}"
+            );
+        }
+        // Stop on an idle panel is not a question and needs no answer.
+        assert!(tx.send(SessionMsg::Interrupt).is_ok());
+
+        let mut answered = 0;
+        while answered < 3 {
+            let m = ai_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("an answer per question");
+            assert!(m.done && m.is_error);
+            assert_eq!(text_of(&m), "the reason");
+            answered += 1;
+        }
+        // The interrupt produced nothing of its own.
+        assert!(ai_rx.try_recv().is_err());
+        drop(tx);
+    }
+
+    /// **The gate every one-shot goes through had no tests, including that it
+    /// calls the refusal at all** — delete the three lines and the workspace
+    /// stays green. `spawn_refusal` was tested, but only in isolation, and the
+    /// inline paths' whole history is of spawning regardless of what the probe
+    /// said.
+    #[test]
+    fn a_one_shot_refuses_on_exactly_the_grades_a_session_does() {
+        for h in Harness::ALL {
+            // A binary we could not establish is restrictable is not one to run
+            // a generation on either, and the sentence says which.
+            let refused = inline_gate(h, Constraint::Unknown)
+                .expect_err("an unestablished constraint must refuse");
+            assert!(refused.contains(h.label()), "{h:?}: {refused}");
+            assert_eq!(
+                Some(refused),
+                spawn_refusal(h, Constraint::Unknown),
+                "{h:?}: the one-shot and the session gave different reasons"
+            );
+            // And a runnable grade is runnable for both, so the gate is not
+            // vacuously "always no".
+            for ok in [Constraint::Restricted, Constraint::Sealed] {
+                assert!(inline_gate(h, ok).is_ok(), "{h:?} at {ok:?}");
+                assert_eq!(spawn_refusal(h, ok), None, "{h:?} at {ok:?}");
+            }
+        }
+    }
+
+    /// **The one chance to send the outline is spent per conversation.** Stop
+    /// before the CLI has announced its conversation id and the respawn opens a
+    /// fresh one with no memory — while the latched flag said the schema
+    /// outline, the tools line, the propose-change protocol and the user's own
+    /// instructions had already been delivered. Silently, for the rest of the
+    /// session.
+    #[test]
+    fn a_stop_before_the_conversation_id_arrives_re_arms_the_system_context() {
+        let h = Harness::Antigravity;
+        assert!(h.session_system_in_first_turn(), "the premise of the rule");
+        // Delivered, then stopped before `SessionStarted`: the respawn cannot
+        // resume, so it is owed again.
+        assert!(owes_system_after_respawn(h, false, None));
+        // Delivered, and the respawn resumes the same conversation: the CLI
+        // still has it.
+        assert!(!owes_system_after_respawn(h, false, Some("conv-1")));
+        // Never delivered — an empty outline does not spend the chance — stays
+        // owed either way.
+        assert!(owes_system_after_respawn(h, true, Some("conv-1")));
+        // And a harness that puts its system prompt on the argv never owes one.
+        for other in Harness::ALL {
+            if other.session_system_in_first_turn() {
+                continue;
+            }
+            assert!(!owes_system_after_respawn(other, false, None), "{other:?}");
+        }
+    }
 }
 
 #[cfg(test)]
