@@ -87,6 +87,14 @@ The public key is not committed here on purpose. The site exports it from the
 private key on every run, so there is exactly one copy and nothing that can
 quietly disagree with what is actually signing the packages.
 
+**The fingerprint is a deliberate exception, and rotating the key means editing
+the top-level README.** It is printed there because the by-hand `dnf` route asks
+the user to approve a fingerprint, and one they can only compare against the
+same server the key arrived from is not a comparison — this repository's history
+is a channel that server does not control. That only works while the two agree,
+so a rotation updates the README in the same commit, or the independent channel
+becomes an independently wrong answer.
+
 ### 2. Pages
 
 Once, so that deployments from Actions are accepted:
