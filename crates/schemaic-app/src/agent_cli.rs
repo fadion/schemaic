@@ -345,50 +345,6 @@ pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
     probe
 }
 
-/// The binary for the **one-shot inline** generations — Ctrl+K, AI Fill, AI
-/// Seed — which are Claude-only.
-///
-/// Those three build their argv with `schemaic_ai::inline_args`, which is
-/// Claude's flag set (`-p --append-system-prompt --model` plus the seal). No
-/// other harness accepts it, so they always spawn Claude regardless of which
-/// harness drives the *chat panel*.
-///
-/// **The override path is honoured only when Claude is the selected harness.**
-/// `ai_cli_path` points at whichever CLI the user chose; handing that path to a
-/// Claude spawn would run `codex` with Claude's flags and die on the first
-/// unknown option. When another harness is selected, this auto-detects Claude
-/// instead and fails with the ordinary "not installed" message if it is absent —
-/// which is the truth: that feature needs Claude and it is not there.
-pub(crate) fn inline_claude_bin(selected: Harness, override_path: &str) -> String {
-    let path = if selected == Harness::Claude {
-        override_path
-    } else {
-        ""
-    };
-    harness_bin(Harness::Claude, path)
-}
-
-/// The model id for those same one-shot generations.
-///
-/// **The exact counterpart of [`inline_claude_bin`], and it was missing.** That
-/// function refuses to hand Claude's argv another harness's *binary*; the model
-/// id travelled anyway. `ai_model` follows the selected harness — under Codex
-/// the suggestion chips are `gpt-5.4`, `gpt-5.4-codex`, `o3` — so Ctrl+K after
-/// picking one spawned `claude … --model gpt-5.4-codex` and died on an unknown
-/// model, with the same "check your installation" message covering the same
-/// wrong cause.
-///
-/// Empty when another harness is selected, which `inline_args` omits, so the
-/// generation runs on Claude's own default. Guessing a Claude equivalent for the
-/// id the user picked would be inventing a mapping between two vendors'
-/// catalogues.
-pub(crate) fn inline_claude_model(selected: Harness, model: &str) -> String {
-    match selected == Harness::Claude {
-        true => model.to_string(),
-        false => String::new(),
-    }
-}
-
 /// Fill [`probe`]'s cache for `(h, bin)` on a background thread.
 ///
 /// Nothing waits on it: a miss simply pays the probe where it would have anyway.
@@ -473,55 +429,20 @@ mod tests {
         );
     }
 
-    /// The trap: `ai_cli_path` follows the *selected* harness, so on Codex it is
-    /// a path to `codex`. Passing that to a Claude-flagged spawn runs the wrong
-    /// binary with flags it has never heard of.
+    /// **What replaced the three tests that stood here.** They pinned the
+    /// Claude-only inline rule — that the override path and the model id were
+    /// *withheld* from every other harness — and that rule is gone: the one-shot
+    /// generators build their own harness's argv now, so the override belongs to
+    /// whichever CLI is selected, exactly as it does for the chat panel. The
+    /// argv itself is pinned in `schemaic_ai::harness::inline_tests`.
     #[test]
-    fn the_inline_paths_never_spawn_another_harnesss_binary() {
-        let codex_path = "/nonexistent/zz-codex";
-        assert_ne!(
-            inline_claude_bin(Harness::Codex, codex_path),
-            codex_path,
-            "Codex's binary was handed to a Claude-only argv"
-        );
-        assert_ne!(
-            inline_claude_bin(Harness::Antigravity, codex_path),
-            codex_path
-        );
-        // With Claude selected the override is exactly what it has always been.
-        assert_eq!(inline_claude_bin(Harness::Claude, codex_path), codex_path);
-    }
-
-    /// The same trap one field over, and it was live: the binary was guarded and
-    /// the **model id** was not, so `claude … --model gpt-5.4-codex` was what
-    /// Ctrl+K spawned after picking a Codex chip.
-    #[test]
-    fn the_inline_paths_never_pass_another_harnesss_model_id() {
-        // A real id from another harness's own suggestion list, so this fails if
-        // the guard is dropped rather than if a placeholder changes.
-        for id in Harness::Codex.suggested_models() {
-            assert_eq!(inline_claude_model(Harness::Codex, id), "");
-        }
-        assert_eq!(inline_claude_model(Harness::Antigravity, "anything"), "");
-        // Claude's own choice still travels, and empty stays empty — which
-        // `inline_args` omits, leaving the CLI its default.
-        assert_eq!(inline_claude_model(Harness::Claude, "opus"), "opus");
-        assert_eq!(inline_claude_model(Harness::Claude, ""), "");
-    }
-
-    /// The seam the pure test cannot see: the binary and the id are two
-    /// decisions and the bug was that only one of them was made. Whatever
-    /// `inline_claude_bin` decides about the override, `inline_claude_model`
-    /// must decide the same way about the model — one selected harness, one
-    /// answer.
-    #[test]
-    fn the_inline_binary_and_the_inline_model_agree_on_who_is_selected() {
+    fn the_inline_paths_use_the_selected_harnesss_own_binary() {
+        let path = "/nonexistent/zz-cli";
         for h in Harness::ALL {
-            let honours_path = inline_claude_bin(h, "/nonexistent/zz-cli") == "/nonexistent/zz-cli";
-            let honours_model = !inline_claude_model(h, "some-id").is_empty();
             assert_eq!(
-                honours_path, honours_model,
-                "{h:?}: the override path and the model id disagree about the selected harness"
+                harness_bin(h, path),
+                path,
+                "{h:?}: the override was not honoured for the selected harness"
             );
         }
     }

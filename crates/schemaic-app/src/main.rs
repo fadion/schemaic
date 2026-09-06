@@ -161,7 +161,6 @@ use schemaic_ui::{
     SnippetsUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, TxChoice,
     TxPrompt, Ui, pick_connection_color,
 };
-use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 fn main() {
@@ -517,33 +516,38 @@ fn mark_stopped(messages: RwSignal<Vec<ChatMessage>>) {
     });
 }
 
-fn inline_outcome(
-    success: bool,
-    stdout: &[u8],
-    stderr: &[u8],
-    dialect: SqlDialect,
-) -> InlineAiState {
-    if success {
-        let sql = extract_sql(&String::from_utf8_lossy(stdout));
-        if sql.trim().is_empty() {
-            return InlineAiState::Failed("No SQL returned".to_string());
+/// Turn one inline generation's result into the editor's state.
+///
+/// **Takes the runner's `Result`, not the raw process output**, because reading
+/// the reply is no longer one thing: three harnesses answer on stdout and Codex
+/// answers in a file, and deciding which belongs with the argv that chose it
+/// (`ai::run_inline`) rather than here. What arrives is either the reply or a
+/// message that already names the CLI that failed.
+fn inline_outcome(reply: Result<String, String>, dialect: SqlDialect) -> InlineAiState {
+    match reply {
+        Ok(text) => {
+            let sql = extract_sql(&text);
+            if sql.trim().is_empty() {
+                return InlineAiState::Failed("No SQL returned".to_string());
+            }
+            // Fences off, now prove it is SQL. The tool the model runs in can put
+            // a line of its own on stdout, and Ctrl+K's output goes straight into
+            // the editor — so anything that will not parse is refused rather than
+            // offered. See `intel::sql_reply` for what it will and won't shave off.
+            match schemaic_core::intel::sql_reply(&sql, dialect) {
+                Some(sql) => InlineAiState::Ready(sql),
+                None => InlineAiState::Failed("The model did not return SQL".to_string()),
+            }
         }
-        // Fences off, now prove it is SQL. The tool the model runs in can put a
-        // line of its own on stdout, and Ctrl+K's output goes straight into the
-        // editor — so anything that will not parse is refused rather than
-        // offered. See `intel::sql_reply` for what it will and won't shave off.
-        match schemaic_core::intel::sql_reply(&sql, dialect) {
-            Some(sql) => InlineAiState::Ready(sql),
-            None => InlineAiState::Failed("The model did not return SQL".to_string()),
-        }
-    } else {
-        InlineAiState::Failed(
-            String::from_utf8_lossy(stderr)
-                .lines()
+        // One line: the bar this lands in is a single row, and a CLI's stderr can
+        // run to a stack trace.
+        Err(why) => InlineAiState::Failed(
+            why.lines()
                 .next()
+                .filter(|l| !l.trim().is_empty())
                 .unwrap_or("generation failed")
                 .to_string(),
-        )
+        ),
     }
 }
 
@@ -1436,18 +1440,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let h = ai_harness.get();
         let path = ai_cli_path.get();
         agent_cli::warm_probe_cache(h, harness_bin(h, &path));
-        // **And the Claude entry the one-shot generators read, which is a
-        // different key whenever another harness is selected.** Ctrl+K, AI Fill
-        // and AI Seed always run Claude (`inline_claude_bin`), so with Codex,
-        // Antigravity or OpenCode chosen they probe `(Claude, <claude bin>)` —
-        // a key the line above never fills. That is verbatim the regression this
-        // effect's own doc says it exists to prevent, reintroduced through the
-        // second key: every Ctrl+K paid a blocking, timeout-free `claude --help`
-        // on the Floem UI thread. Warming it costs one thread at startup, and
-        // nothing when the entry is already there.
-        if h != Harness::Claude {
-            agent_cli::warm_probe_cache(Harness::Claude, agent_cli::inline_claude_bin(h, &path));
-        }
+        // **One key now covers every AI entry point.** The one-shot generators
+        // used to run Claude whatever was selected, so they read a second key —
+        // `(Claude, <claude bin>)` — that this effect did not fill, and each
+        // Ctrl+K paid a blocking, timeout-free `claude --help` on the Floem UI
+        // thread. They build their own harness's argv now (`ai::inline_plan`),
+        // which is the same key as the line above.
     });
     // Antigravity is the one harness Schemaic configures by writing into the
     // *user's* files, so a session that never ran its cleanup leaves an MCP
@@ -9288,45 +9286,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 ai_schema_scope.get_untracked(),
             );
             let intent = req.intent.clone();
-            // Claude-only: this argv is `inline_args`. See `inline_claude_bin`.
-            let bin = agent_cli::inline_claude_bin(
+            let send = create_ext_action(cx, move |state: InlineAiState| inline_ai.set(state));
+            // Whichever CLI the user picked, on its own flags. This used to
+            // resolve Claude regardless — see `ai::inline_plan`, which also
+            // carries the oversize check and the constraint gate.
+            let plan = match ai::inline_plan(
                 ai_harness.get_untracked(),
                 &ai_cli_path.get_untracked(),
-            );
-            // Follow the AI panel's model choice, but only when that choice is
-            // one Claude can take — see `inline_claude_model`, which is
-            // `inline_claude_bin`'s counterpart for the id.
-            let model = agent_cli::inline_claude_model(
-                ai_harness.get_untracked(),
                 &ai_model.get_untracked(),
-            );
-            let send = create_ext_action(cx, move |state: InlineAiState| inline_ai.set(state));
-            // **The same pre-spawn check the chat panel makes**, because it is
-            // the same argv entry and the same platform limit. Without it an
-            // oversize prompt surfaced as `os error 206`, which names the one
-            // cause that isn't the problem — and Ctrl+K on a large catalogue was
-            // simply broken with nothing on screen to say why.
-            let args = schemaic_ai::inline_args(
                 &intent,
                 &system,
-                &model,
-                probe(Harness::Claude, &bin).seal,
-            );
-            if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
-                inline_ai.set(InlineAiState::Failed(why));
-                return;
-            }
+            ) {
+                Ok(p) => p,
+                Err(why) => {
+                    inline_ai.set(InlineAiState::Failed(why));
+                    return;
+                }
+            };
             let jh = handle.spawn(async move {
-                let out = Command::new(bin)
-                    .args(args)
-                    .kill_on_drop(true)
-                    .output()
-                    .await;
-                let state = match out {
-                    Ok(o) => inline_outcome(o.status.success(), &o.stdout, &o.stderr, dialect),
-                    Err(e) => InlineAiState::Failed(e.to_string()),
-                };
-                send(state);
+                send(inline_outcome(ai::run_inline(plan).await, dialect));
             });
             *task_slot.borrow_mut() = Some(jh);
         })
@@ -9399,15 +9377,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // introspection hasn't run — the sample still carries conventions).
                 // The implicit row key is dropped: `sample_sql` doesn't project one.
                 let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
-                // Claude-only: this argv is `inline_args`. See `inline_claude_bin`.
-                let bin = agent_cli::inline_claude_bin(
-                    ai_harness.get_untracked(),
-                    &ai_cli_path.get_untracked(),
-                );
-                let model = agent_cli::inline_claude_model(
-                    ai_harness.get_untracked(),
-                    &ai_model.get_untracked(),
-                );
+                // Read off the signals here — the spawn below is not on the UI
+                // thread, and `ai::inline_plan` takes what they say.
+                let harness = ai_harness.get_untracked();
+                let cli_path = ai_cli_path.get_untracked();
+                let model = ai_model.get_untracked();
                 let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
                 let schemaic_ui::AiFillRequest {
                     source,
@@ -9434,21 +9408,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     );
                     let system = "You output only the requested raw value — no quotes, \
                                   no markdown, no prose.";
-                    // Before the move into `Command::new`, and normally a cache
-                    // hit — `warm_probe_cache` ran at startup.
-                    let seal = probe(Harness::Claude, &bin).seal;
-                    let out = Command::new(bin)
-                        .args(schemaic_ai::inline_args(&prompt, system, &model, seal))
-                        // Close stdin so `claude -p` doesn't stall ~3s waiting for
-                        // piped input ("no stdin data received") before responding.
-                        .stdin(std::process::Stdio::null())
-                        .kill_on_drop(true)
-                        .output()
-                        .await;
-                    let res = match out {
-                        Ok(o) if o.status.success() => {
-                            let stdout = String::from_utf8_lossy(&o.stdout);
-                            match schemaic_core::seed::parse_fill_response(&stdout) {
+                    let res = match ai::inline_plan(harness, &cli_path, &model, &prompt, system) {
+                        Ok(plan) => match ai::run_inline(plan).await {
+                            Ok(text) => match schemaic_core::seed::parse_fill_response(&text) {
                                 schemaic_core::seed::FillOutcome::Value(v) => {
                                     AiFillResult::Value(v)
                                 }
@@ -9456,14 +9418,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                 schemaic_core::seed::FillOutcome::Empty => {
                                     AiFillResult::Failed("The AI returned no value.".into())
                                 }
-                            }
-                        }
-                        Ok(o) => AiFillResult::Failed(schemaic_ai::cli_failure_message(
-                            o.status.code(),
-                            &String::from_utf8_lossy(&o.stdout),
-                            &String::from_utf8_lossy(&o.stderr),
-                        )),
-                        Err(e) => AiFillResult::Failed(e.to_string()),
+                            },
+                            Err(why) => AiFillResult::Failed(why),
+                        },
+                        Err(why) => AiFillResult::Failed(why),
                     };
                     finish(res);
                 });
@@ -9489,15 +9447,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 // The implicit row key is dropped: `sample_sql` doesn't project one.
                 let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
-                // Claude-only: this argv is `inline_args`. See `inline_claude_bin`.
-                let bin = agent_cli::inline_claude_bin(
-                    ai_harness.get_untracked(),
-                    &ai_cli_path.get_untracked(),
-                );
-                let model = agent_cli::inline_claude_model(
-                    ai_harness.get_untracked(),
-                    &ai_model.get_untracked(),
-                );
+                // Read off the signals here — see the fill callback above.
+                let harness = ai_harness.get_untracked();
+                let cli_path = ai_cli_path.get_untracked();
+                let model = ai_model.get_untracked();
                 let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));
                 let schemaic_ui::AiSeedRequest {
                     source,
@@ -9523,31 +9476,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     );
                     let system = "You output only a JSON array of row objects — no \
                                   markdown, no prose.";
-                    // Before the move into `Command::new`, and normally a cache
-                    // hit — `warm_probe_cache` ran at startup.
-                    let seal = probe(Harness::Claude, &bin).seal;
-                    let out = Command::new(bin)
-                        .args(schemaic_ai::inline_args(&prompt, system, &model, seal))
-                        // Close stdin so `claude -p` doesn't stall ~3s waiting for
-                        // piped input ("no stdin data received") before responding.
-                        .stdin(std::process::Stdio::null())
-                        .kill_on_drop(true)
-                        .output()
-                        .await;
-                    let res = match out {
-                        Ok(o) if o.status.success() => {
-                            let stdout = String::from_utf8_lossy(&o.stdout);
-                            match schemaic_core::seed::parse_seed_response(&stdout) {
+                    let res = match ai::inline_plan(harness, &cli_path, &model, &prompt, system) {
+                        Ok(plan) => match ai::run_inline(plan).await {
+                            Ok(text) => match schemaic_core::seed::parse_seed_response(&text) {
                                 Ok(rows) => AiSeedResult::Rows(rows),
                                 Err(e) => AiSeedResult::Failed(e.to_string()),
-                            }
-                        }
-                        Ok(o) => AiSeedResult::Failed(schemaic_ai::cli_failure_message(
-                            o.status.code(),
-                            &String::from_utf8_lossy(&o.stdout),
-                            &String::from_utf8_lossy(&o.stderr),
-                        )),
-                        Err(e) => AiSeedResult::Failed(e.to_string()),
+                            },
+                            Err(why) => AiSeedResult::Failed(why),
+                        },
+                        Err(why) => AiSeedResult::Failed(why),
                     };
                     finish(res);
                 });
@@ -11640,22 +11577,22 @@ mod app_tests {
 
     #[test]
     fn inline_outcome_success_returns_stripped_sql() {
-        let out = inline_outcome(true, b"```sql\nSELECT 1\n```", b"", MY);
+        let out = inline_outcome(Ok("```sql\nSELECT 1\n```".into()), MY);
         assert!(matches!(out, InlineAiState::Ready(sql) if sql == "SELECT 1"));
     }
 
     #[test]
     fn inline_outcome_blank_success_is_no_sql_returned() {
-        let out = inline_outcome(true, b"   \n", b"", MY);
+        let out = inline_outcome(Ok("   \n".into()), MY);
         assert!(matches!(out, InlineAiState::Failed(m) if m == "No SQL returned"));
     }
 
     #[test]
     fn inline_outcome_failure_surfaces_first_stderr_line() {
-        let out = inline_outcome(false, b"", b"boom: bad model\nsecond line", MY);
+        let out = inline_outcome(Err("boom: bad model\nsecond line".into()), MY);
         assert!(matches!(out, InlineAiState::Failed(m) if m == "boom: bad model"));
-        // Empty stderr → a generic fallback message.
-        let out = inline_outcome(false, b"", b"", MY);
+        // Nothing to say → a generic fallback message, never a blank bar.
+        let out = inline_outcome(Err(String::new()), MY);
         assert!(matches!(out, InlineAiState::Failed(m) if m == "generation failed"));
     }
 
@@ -11665,9 +11602,10 @@ mod app_tests {
     #[test]
     fn inline_outcome_drops_a_tool_diagnostic_riding_on_the_sql() {
         let out = inline_outcome(
-            true,
-            b"```sql\nSELECT * FROM t;\nClient.listTools() called but server does not advertise\n```",
-            b"",
+            Ok(
+                "```sql\nSELECT * FROM t;\nClient.listTools() called but server does not advertise\n```"
+                    .into(),
+            ),
             MY,
         );
         assert!(matches!(out, InlineAiState::Ready(sql) if sql == "SELECT * FROM t;"));
@@ -11676,7 +11614,7 @@ mod app_tests {
     /// And a reply with no SQL in it at all is a failure, not an empty edit.
     #[test]
     fn inline_outcome_refuses_a_reply_that_is_only_prose() {
-        let out = inline_outcome(true, b"I'm sorry, I can't do that.", b"", MY);
+        let out = inline_outcome(Ok("I'm sorry, I can't do that.".into()), MY);
         assert!(matches!(out, InlineAiState::Failed(m) if m == "The model did not return SQL"));
     }
 }

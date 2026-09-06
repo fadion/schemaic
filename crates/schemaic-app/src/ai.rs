@@ -452,6 +452,149 @@ fn write_endpoint_file(endpoint: &str) -> Option<PathBuf> {
     None
 }
 
+/// One inline generation's spawn, resolved for the harness the user picked.
+///
+/// **Built once and shared by all three one-shot features**, because they had
+/// drifted apart while each carried its own copy: two passed `Stdio::null()` and
+/// Ctrl+K did not, so Ctrl+K alone paid the CLI's several-second wait on a stdin
+/// that was never going to arrive. A struct they all go through cannot drift
+/// again.
+pub(crate) struct InlinePlan {
+    bin: String,
+    args: Vec<String>,
+    harness: Harness,
+    output: schemaic_ai::harness::InlineOutput,
+    /// Where Codex was told to write its answer; deleted after it is read.
+    last_message: Option<PathBuf>,
+    env: Vec<(String, String)>,
+}
+
+/// Resolve the selected harness into a runnable inline spawn, or say why not.
+///
+/// **The gate the inline paths never had.** They read the probe only for
+/// Claude's seal flags and spawned regardless of what it said about the
+/// constraint, which was survivable while they were Claude-only — Claude's
+/// unsealed spawn is a refusal at [`start_ai_session`], and inline never reached
+/// that function. Now that a one-shot can be Codex or Antigravity, whose
+/// constraint *is* the sandbox flag, an unreadable probe has to refuse here for
+/// the same reason it refuses there.
+pub(crate) fn inline_plan(
+    harness: Harness,
+    cli_path: &str,
+    model: &str,
+    intent: &str,
+    system: &str,
+) -> Result<InlinePlan, String> {
+    let bin = harness_bin(harness, cli_path);
+    let p = probe(harness, &bin);
+    if let Some(why) = spawn_refusal(harness, p.constraint) {
+        return Err(why);
+    }
+    let output = schemaic_ai::harness::inline_output(harness);
+    let last_message = match output {
+        schemaic_ai::harness::InlineOutput::LastMessageFile => Some(
+            inline_reply_path()
+                .ok_or_else(|| "Couldn't create a temporary file for the reply.".to_string())?,
+        ),
+        schemaic_ai::harness::InlineOutput::Stdout => None,
+    };
+    // OpenCode's seal is a config directory, so a failure to write it is a
+    // refusal rather than a degradation: `--agent` naming an agent that is not
+    // defined runs on `build`, which has every built-in including `bash`.
+    let env = match harness {
+        Harness::OpenCode => crate::opencode::OpenCodeConfig::write_inline()
+            .ok_or_else(|| {
+                "Couldn't write OpenCode's configuration, so the generation was not started \
+                 (without it the CLI would run with its own tools enabled)."
+                    .to_string()
+            })?
+            .env(),
+        _ => Vec::new(),
+    };
+    let spec = schemaic_ai::harness::InlineSpec {
+        intent: intent.to_string(),
+        system: system.to_string(),
+        model: model.to_string(),
+        seal: p.seal,
+        isolate_config: p.isolate_config,
+        last_message: last_message
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    let args = schemaic_ai::harness::inline_argv(harness, &spec);
+    // The same pre-spawn check the chat panel makes: it is the same argv entry
+    // and the same platform limit, and an oversize prompt otherwise surfaces as
+    // `os error 206`, which names the one cause that isn't the problem.
+    if let Some(why) = schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit()) {
+        return Err(why);
+    }
+    Ok(InlinePlan {
+        bin,
+        args,
+        harness,
+        output,
+        last_message,
+        env,
+    })
+}
+
+/// A temp path for Codex's `-o`, named so the startup sweep collects it if this
+/// process dies between the spawn and the read.
+fn inline_reply_path() -> Option<PathBuf> {
+    sweep_stale_mcp_configs();
+    let dir = std::env::temp_dir();
+    for _ in 0..8 {
+        let path = dir.join(format!("{MCP_FILE_PREFIX}reply-{}.txt", random_tag()));
+        if persist::create_private_new(&path, b"").is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Run one inline generation to completion and hand back the reply text.
+pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
+    let mut cmd = Command::new(&plan.bin);
+    cmd.args(&plan.args)
+        // Nothing is ever written to these children's stdin — every one of them
+        // takes its prompt in argv — and a CLI that waits for it costs seconds.
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    for (k, v) in &plan.env {
+        cmd.env(k, v);
+    }
+    if plan.harness == Harness::OpenCode {
+        // Setting our own variables is half the job; removing the user's is the
+        // other half. See `OpenCodeConfig::env_remove`.
+        for k in crate::opencode::OpenCodeConfig::env_remove() {
+            cmd.env_remove(k);
+        }
+    }
+    let out = cmd.output().await.map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // Read and remove the file whatever the exit status: a failed run that still
+    // wrote one would otherwise leave it for the sweeper.
+    let filed = plan.last_message.as_ref().map(|p| {
+        let t = std::fs::read_to_string(p).unwrap_or_default();
+        let _ = std::fs::remove_file(p);
+        t
+    });
+    if !out.status.success() {
+        return Err(schemaic_ai::cli_failure_message(
+            plan.harness,
+            out.status.code(),
+            &stdout,
+            &stderr,
+        ));
+    }
+    match plan.output {
+        schemaic_ai::harness::InlineOutput::LastMessageFile => Ok(filed.unwrap_or_default()),
+        schemaic_ai::harness::InlineOutput::Stdout => Ok(stdout),
+    }
+}
+
 /// What the app asks of a live session.
 ///
 /// **Typed, rather than the wire bytes.** This used to be the raw JSON line
@@ -901,7 +1044,9 @@ pub(crate) fn start_ai_session(
                     isolate_config: isolate,
                 };
                 let args = schemaic_ai::harness::turn_args(harness, &spec);
-                if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
+                if let Some(why) =
+                    schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit())
+                {
                     pump.fail(why);
                     continue;
                 }
@@ -1033,7 +1178,8 @@ pub(crate) fn start_ai_session(
                     } else {
                         let stderr_text = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
                         let joined = raw.join("\n");
-                        let why = schemaic_ai::cli_failure_message(code, &joined, &stderr_text);
+                        let why =
+                            schemaic_ai::cli_failure_message(harness, code, &joined, &stderr_text);
                         pump.fail(format!(
                             "The {} turn ended unexpectedly: {why}",
                             harness.label()
@@ -1079,7 +1225,7 @@ pub(crate) fn start_ai_session(
 
     // Before the spawn, because afterwards it is unrecognisable: the OS returns
     // a generic failure and the arm below blames the installation.
-    if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
+    if let Some(why) = schemaic_ai::oversize_reason(harness, &args, schemaic_ai::arg_limit()) {
         let _ = ai_tx.send(AiStreamMsg {
             segs: vec![schemaic_core::transcript::Seg::Text(why)],
             done: true,
@@ -1184,7 +1330,8 @@ pub(crate) fn start_ai_session(
                         let raw = raw_output.join("\n");
                         if code != Some(0) || !stderr_text.trim().is_empty() || !raw.trim().is_empty()
                         {
-                            let why = schemaic_ai::cli_failure_message(code, &raw, &stderr_text);
+                            let why =
+                                schemaic_ai::cli_failure_message(harness, code, &raw, &stderr_text);
                             let _ = ai_tx.send(AiStreamMsg {
                                 segs: vec![schemaic_core::transcript::Seg::Text(format!(
                                     "The AI session ended unexpectedly: {why}"
@@ -3625,6 +3772,9 @@ mod tests {
             "claude-opus-5",
             schemaic_ai::CliSeal::ALL,
         );
-        assert_eq!(schemaic_ai::oversize_reason(&args, 30_000), None);
+        assert_eq!(
+            schemaic_ai::oversize_reason(Harness::Claude, &args, 30_000),
+            None
+        );
     }
 }

@@ -157,10 +157,10 @@ production data, or any data you care about.
   back. How much it may see is set **per connection**, not globally: schema only,
   on request, or full.
 
-  One limit worth knowing before you switch: the one-shot generators (Ctrl+K, AI
-  Fill, AI Seed) always run Claude Code, whichever CLI drives the chat panel.
-  Their prompt is built from Claude's flags, so with another CLI selected they
-  look for Claude and report it missing if it isn't there.
+  All of it runs on the CLI you picked — the one-shot generators (Ctrl+K, AI
+  Fill, AI Seed) build their own harness's command line rather than borrowing
+  Claude's, and each is a closed request: no server, no session to resume, and
+  no tool to reach for, because the whole question is in the prompt.
 - **Themeable** — dark / light UI themes, multiple editor color schemes, and an
   interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
 

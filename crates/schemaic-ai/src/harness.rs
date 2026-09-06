@@ -885,24 +885,7 @@ pub fn opencode_config_json(exe: &str, endpoint_file: &str, allowed: &[&str]) ->
     // while a name the CLI gains and this list has not heard of is live. That
     // asymmetry is why the list is deliberately over-inclusive, and why it sits
     // next to the probe that can confirm what actually resolved.
-    let builtins = [
-        "bash",
-        "read",
-        "edit",
-        "write",
-        "glob",
-        "grep",
-        "webfetch",
-        "websearch",
-        "task",
-        "todowrite",
-        "lsp",
-        "skill",
-    ];
-    let tools: serde_json::Map<String, serde_json::Value> = builtins
-        .iter()
-        .map(|t| ((*t).to_string(), serde_json::Value::Bool(false)))
-        .collect();
+    let tools = sealed_tools();
     // The allow-list rides in the agent's description rather than a permission
     // rule: OpenCode allows MCP tools by default (see `turn_args`), so there is
     // no per-tool approval to set, and the server itself refuses anything this
@@ -933,6 +916,195 @@ pub fn opencode_config_json(exe: &str, endpoint_file: &str, allowed: &[&str]) ->
         }
     })
     .to_string()
+}
+
+/// Where a one-shot generation's reply comes back from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineOutput {
+    /// The child's stdout **is** the reply, verbatim.
+    Stdout,
+    /// The reply is in the file whose path [`InlineSpec::last_message`] put in
+    /// argv; stdout is the CLI's own human-facing rendering and is discarded.
+    LastMessageFile,
+}
+
+/// Everything one inline (Ctrl+K / AI Fill / AI Seed) generation needs.
+pub struct InlineSpec {
+    /// What the user asked for.
+    pub intent: String,
+    /// Schema outline and house rules.
+    pub system: String,
+    /// Model id, verbatim. Empty = the harness's own default.
+    pub model: String,
+    /// Claude's seal flags, from the probe. Ignored by every other harness,
+    /// whose constraint is a sandbox flag baked into the argv below.
+    pub seal: crate::CliSeal,
+    /// Pass Codex's `--ignore-user-config`, when the probe saw it.
+    pub isolate_config: bool,
+    /// Where Codex should write its last message. Ignored by the three
+    /// harnesses whose [`inline_output`] is [`InlineOutput::Stdout`].
+    pub last_message: String,
+}
+
+/// Where to read the reply for `h`.
+pub fn inline_output(h: Harness) -> InlineOutput {
+    match h {
+        Harness::Codex => InlineOutput::LastMessageFile,
+        Harness::Claude | Harness::Antigravity | Harness::OpenCode => InlineOutput::Stdout,
+    }
+}
+
+/// The argv for one inline generation on any harness.
+///
+/// **The closed counterpart of [`turn_args`].** A chat turn is given a server
+/// and may resume a thread; this is neither. Ctrl+K, AI Fill and AI Seed each
+/// want one string back and read it with a parser — none has a surface that
+/// could render a tool call, and each discards everything but the value it
+/// parses out, so a tool call here would leave no trace anywhere. The whole
+/// request is in the prompt, which is why no `--mcp-config`, no `-c` override
+/// carrying a server, and no resume id appears below on any harness
+/// (`no_inline_generation_is_given_a_server_or_a_session`).
+///
+/// **Claude's is [`crate::inline_args`], unchanged.** It was the only one of
+/// these for as long as the other three spawned Claude regardless of the
+/// picker; it is now one arm of four rather than the path all of them took.
+pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
+    // Trimmed for the reason `turn_args` trims: the field is free text the user
+    // can clear, and `--model " "` dies as an unknown model under "couldn't
+    // launch the CLI" — the one explanation that is not the problem.
+    let model = spec.model.trim();
+    match h {
+        Harness::Claude => crate::inline_args(&spec.intent, &spec.system, model, spec.seal),
+        Harness::Codex => {
+            let mut a: Vec<String> = vec![
+                "exec".into(),
+                // No session file for a request with nothing to resume.
+                "--ephemeral".into(),
+                // The session cwd is a private app directory, not a git repo.
+                "--skip-git-repo-check".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+                // stdout is a human rendering here, not a stream we decode; keep
+                // the escapes out of the file we do read.
+                "--color".into(),
+                "never".into(),
+            ];
+            if spec.isolate_config {
+                a.push("--ignore-user-config".into());
+            }
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            // The constraint, as on the session path: `--sandbox` alone is not
+            // enough, because the config key is the mechanism accepted on every
+            // Codex path. Nothing a caller adds can displace it — there is no
+            // caller-supplied override on this path at all.
+            a.push("-c".into());
+            a.push("sandbox_mode=\"read-only\"".into());
+            // **The reply, and why it is a file.** `codex exec` without
+            // `--json` prints for a person: measured, this build writes the
+            // final message alone, but that is an observation about a
+            // human-facing surface rather than a promise. `-o` is the promise —
+            // its help says "file where the last message from the agent should
+            // be written" — so the parser reads that and never the pipe.
+            a.push("-o".into());
+            a.push(spec.last_message.clone());
+            // Prompt last: it is the positional argument.
+            a.push(prefixed_prompt(&spec.system, &spec.intent));
+            a
+        }
+        Harness::Antigravity => {
+            let mut a: Vec<String> = vec![
+                "-p".into(),
+                prefixed_prompt(&spec.system, &spec.intent),
+                // `text` is the default, and named anyway: the session path asks
+                // this same binary for `stream-json`, and a default that moved
+                // would put a JSONL envelope where a parser expects SQL.
+                "--output-format".into(),
+                "text".into(),
+                "--sandbox".into(),
+                "--disable-slash-commands".into(),
+            ];
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            a
+        }
+        Harness::OpenCode => {
+            let mut a: Vec<String> = vec![
+                "run".into(),
+                "--pure".into(),
+                "--agent".into(),
+                OPENCODE_AGENT.into(),
+                // `default` is the formatted mode, and formatted is exactly what
+                // it is not: measured, the decoration and the model banner go to
+                // **stderr** and stdout carries the answer alone.
+                "--format".into(),
+                "default".into(),
+            ];
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            a.push(prefixed_prompt(&spec.system, &spec.intent));
+            a
+        }
+    }
+}
+
+/// The OpenCode config for an inline generation: the sealed agent, and no
+/// server at all.
+///
+/// **The difference from [`opencode_config_json`] is the whole `mcp` block, and
+/// it is deliberate.** That one registers Schemaic's server because a chat turn
+/// is meant to reach the database; this one answers from the prompt alone, so
+/// registering a server would hand a tool to the one path with nowhere to show
+/// that it was called. The agent is still named and its tool map is still empty
+/// — without the config the `--agent` in [`inline_argv`] selects nothing and
+/// OpenCode falls back to `build`, which has every built-in.
+pub fn opencode_inline_config_json() -> String {
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "agent": {
+            OPENCODE_AGENT: {
+                "mode": "primary",
+                "description": "Schemaic's one-shot SQL generator. No tools; answer from the prompt.",
+                "tools": sealed_tools(),
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Every built-in `opencode agent create --permissions` lists, all off.
+///
+/// One list, shared by the session config and the inline one, so the two cannot
+/// come to disagree about which built-ins are shut off — the same reason
+/// `seal_args` is shared by Claude's two argv builders.
+fn sealed_tools() -> serde_json::Map<String, serde_json::Value> {
+    // **Twelve are written and eleven come back, and the direction of that gap
+    // is the point.** The map is a denylist by omission — a name absent from it
+    // stays *enabled* — so a name here the CLI no longer has costs nothing,
+    // while a name the CLI gains and this list has not heard of is live.
+    [
+        "bash",
+        "read",
+        "edit",
+        "write",
+        "glob",
+        "grep",
+        "webfetch",
+        "websearch",
+        "task",
+        "todowrite",
+        "lsp",
+        "skill",
+    ]
+    .iter()
+    .map(|t| ((*t).to_string(), serde_json::Value::Bool(false)))
+    .collect()
 }
 
 /// Fold the system context into the prompt for harnesses with no
@@ -2328,6 +2500,209 @@ Options:
                 notice.contains("Updating the CLI"),
                 h.seals_by_flag(),
                 "{h:?}: {notice}"
+            );
+        }
+    }
+}
+
+/// The inline (one-shot) argv, which every harness now builds for itself.
+///
+/// The property under test throughout is the one the feature turns on: an
+/// inline generation is a *closed* request — no server, no session to resume,
+/// no tool the model could reach for — on whichever CLI the user picked. Before
+/// this, three of the four spawned Claude regardless.
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+    use crate::CliSeal;
+
+    fn spec() -> InlineSpec {
+        InlineSpec {
+            intent: "count the rows".into(),
+            system: "tables: users(id)".into(),
+            model: "some-model".into(),
+            seal: CliSeal::ALL,
+            isolate_config: true,
+            last_message: "C:/tmp/last.txt".into(),
+        }
+    }
+
+    fn flag_value(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .map(|i| args[i + 1].clone())
+    }
+
+    /// The invariant, on every harness at once: nothing here can reach a tool,
+    /// a server or an earlier session.
+    #[test]
+    fn no_inline_generation_is_given_a_server_or_a_session() {
+        // Flags that would hand the model a server, or resume a thread whose
+        // contents this one-shot never sees.
+        let forbidden = [
+            "--mcp-config",
+            "--allowedTools",
+            "--conversation",
+            "--session",
+            "--resume",
+            "resume",
+            "--continue",
+            "-c",
+        ];
+        for h in Harness::ALL {
+            let a = inline_argv(h, &spec());
+            assert!(!a.is_empty(), "{h:?} built no argv");
+            for f in forbidden {
+                // Codex's constraint rides on `-c sandbox_mode=…`, which is the
+                // one `-c` that may appear: it closes the sandbox rather than
+                // opening anything.
+                if h == Harness::Codex && f == "-c" {
+                    let bad = a
+                        .iter()
+                        .zip(a.iter().skip(1))
+                        .any(|(k, v)| k == "-c" && !v.starts_with("sandbox_mode="));
+                    assert!(!bad, "{h:?} passes a -c that is not the sandbox: {a:?}");
+                    continue;
+                }
+                assert!(!a.contains(&f.to_string()), "{h:?} passes {f}: {a:?}");
+            }
+        }
+    }
+
+    /// Each harness asks for its own plain-text answer, never the streaming
+    /// dialect the chat panel decodes — there is no parser on this path.
+    #[test]
+    fn every_inline_generation_asks_for_plain_text() {
+        for h in Harness::ALL {
+            let a = inline_argv(h, &spec());
+            assert!(
+                !a.iter().any(|s| s == "stream-json" || s == "--json"),
+                "{h:?} asked for a stream: {a:?}"
+            );
+        }
+        assert_eq!(
+            flag_value(
+                &inline_argv(Harness::Antigravity, &spec()),
+                "--output-format"
+            )
+            .as_deref(),
+            Some("text")
+        );
+        assert_eq!(
+            flag_value(&inline_argv(Harness::OpenCode, &spec()), "--format").as_deref(),
+            Some("default")
+        );
+    }
+
+    /// Codex is the one harness whose reply is a file, because its stdout is a
+    /// human-facing rendering rather than a contract.
+    #[test]
+    fn codex_writes_its_last_message_where_it_was_told_to() {
+        assert_eq!(inline_output(Harness::Codex), InlineOutput::LastMessageFile);
+        let a = inline_argv(Harness::Codex, &spec());
+        assert_eq!(flag_value(&a, "-o").as_deref(), Some("C:/tmp/last.txt"));
+        // Everything else reads the pipe it already has open.
+        for h in [Harness::Claude, Harness::Antigravity, Harness::OpenCode] {
+            assert_eq!(inline_output(h), InlineOutput::Stdout, "{h:?}");
+        }
+    }
+
+    /// The sandbox is not optional on the two harnesses that only ever reach
+    /// `Restricted`: it is the whole of their constraint.
+    #[test]
+    fn the_restricted_harnesses_still_carry_their_sandbox() {
+        let cx = inline_argv(Harness::Codex, &spec());
+        assert_eq!(flag_value(&cx, "--sandbox").as_deref(), Some("read-only"));
+        assert!(
+            cx.iter().any(|s| s == "sandbox_mode=\"read-only\""),
+            "{cx:?}"
+        );
+        assert!(cx.contains(&"--skip-git-repo-check".to_string()), "{cx:?}");
+        // Left no session file behind: a one-shot has nothing to resume.
+        assert!(cx.contains(&"--ephemeral".to_string()), "{cx:?}");
+        assert!(cx.contains(&"--ignore-user-config".to_string()), "{cx:?}");
+
+        let ag = inline_argv(Harness::Antigravity, &spec());
+        assert!(ag.contains(&"--sandbox".to_string()), "{ag:?}");
+        // A prompt is user text and must not expand a slash command or skill.
+        assert!(
+            ag.contains(&"--disable-slash-commands".to_string()),
+            "{ag:?}"
+        );
+    }
+
+    /// OpenCode's seal is its agent, and the agent only exists in the config —
+    /// naming it is what selects the empty tool map.
+    #[test]
+    fn opencode_runs_the_sealed_agent_with_no_plugins() {
+        let a = inline_argv(Harness::OpenCode, &spec());
+        assert_eq!(a[0], "run");
+        assert!(a.contains(&"--pure".to_string()), "{a:?}");
+        assert_eq!(flag_value(&a, "--agent").as_deref(), Some(OPENCODE_AGENT));
+    }
+
+    /// The inline config defines the same sealed agent as a session's, and
+    /// **no** `mcp` block: a one-shot is answered from the prompt alone.
+    #[test]
+    fn the_inline_opencode_config_defines_the_agent_and_no_server() {
+        let v: serde_json::Value =
+            serde_json::from_str(&opencode_inline_config_json()).expect("valid json");
+        assert!(
+            v.get("mcp").is_none(),
+            "inline config registers a server: {v}"
+        );
+        let tools = v["agent"][OPENCODE_AGENT]["tools"]
+            .as_object()
+            .expect("the sealed agent's tool map");
+        assert!(!tools.is_empty());
+        assert!(
+            tools.values().all(|b| b == &serde_json::Value::Bool(false)),
+            "a built-in is left on: {tools:?}"
+        );
+    }
+
+    /// The prompt carries the schema outline on the three harnesses with no
+    /// `--append-system-prompt`, and Claude keeps its own flag.
+    #[test]
+    fn the_system_context_reaches_every_harness() {
+        for h in Harness::ALL {
+            let a = inline_argv(h, &spec());
+            let joined = a.join("\u{1}");
+            assert!(
+                joined.contains("tables: users(id)"),
+                "{h:?} dropped the system context: {a:?}"
+            );
+            assert!(
+                joined.contains("count the rows"),
+                "{h:?} dropped the intent: {a:?}"
+            );
+        }
+        assert!(
+            inline_argv(Harness::Claude, &spec()).contains(&"--append-system-prompt".to_string())
+        );
+    }
+
+    /// The same trim `turn_args` needed: the field is free text the user can
+    /// clear, and `--model " "` is an unknown model reported as a launch
+    /// failure — the one cause that is not the problem.
+    #[test]
+    fn a_blank_model_is_not_passed_to_anyone() {
+        for h in Harness::ALL {
+            let s = InlineSpec {
+                model: "   ".into(),
+                ..spec()
+            };
+            let a = inline_argv(h, &s);
+            assert!(!a.contains(&"--model".to_string()), "{h:?}: {a:?}");
+            assert!(!a.contains(&"-m".to_string()), "{h:?}: {a:?}");
+        }
+        // And it *is* passed when the user set one.
+        for h in Harness::ALL {
+            let a = inline_argv(h, &spec());
+            assert_eq!(
+                flag_value(&a, "--model").as_deref(),
+                Some("some-model"),
+                "{h:?}: {a:?}"
             );
         }
     }
