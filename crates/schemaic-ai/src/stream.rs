@@ -64,6 +64,24 @@ use std::collections::HashMap;
 /// suffix instead, and falls back to the whole string when the text is not an
 /// extension of what came before (a rewritten message, or a new run reusing the
 /// key), so a non-monotonic update loses nothing.
+///
+/// **Measured on codex-cli 0.153.4: it does not restate.** Three real
+/// `codex exec --json` turns — 394, 439 and 209 output tokens — produced **no
+/// `item.updated` line at all**, and no `item.started` either; every
+/// `agent_message` arrived as a single `item.completed` carrying the whole
+/// answer. So on that build `advance` is called once per message, with no prior
+/// text to compare against, and the Θ(N·K) this once looked like is Θ(N) with
+/// K = 1.
+///
+/// **Kept anyway, and that is a decision rather than an oversight.** The
+/// alternative to coalescing is a transcript that renders every prefix again the
+/// day a build starts streaming — a data-loss-shaped bug arriving from a CLI
+/// upgrade, with nothing here to catch it, and the streaming shape is one Codex
+/// documents. What the measurement changes is the *cost* of keeping it (one
+/// hash lookup per message) and the standing of the tests that drive it: they
+/// exercise a shape this build never emits, which
+/// `the_coalescer_emits_only_what_is_new` now says out loud rather than
+/// implying it is a capture.
 #[derive(Default)]
 struct Coalescer {
     sent: HashMap<String, String>,
@@ -79,11 +97,10 @@ impl Coalescer {
     /// allocated when it is genuinely new.
     ///
     /// The remaining Θ(N·K) is the `starts_with` compare, which is the price of
-    /// detecting a rewrite and is not removable without knowing whether Codex
-    /// restates at all — see `review/release-v0.23.0/user-verify-fix.md`, which
-    /// has the capture that settles it. No fixture in this file contains an
-    /// `item.updated`, so `K` is unmeasured and tuning further would be
-    /// optimising a path that may never execute.
+    /// detecting a rewrite. **K is 1 on codex-cli 0.153.4** — that build never
+    /// restates, so this is called once per message against no prior text (the
+    /// measurement is on [`Coalescer`]). Tuning it further would be optimising a
+    /// path that does not execute.
     fn advance(&mut self, key: &str, full: &str) -> Option<String> {
         match self.sent.get_mut(key) {
             Some(p) if full.starts_with(p.as_str()) => {
@@ -255,6 +272,16 @@ impl StreamParser {
     ///   staples `ls` output, or the contents of a file, onto whatever
     ///   `run_query` chip happened to be open, and the user reads it as the
     ///   answer to their query.
+    ///
+    /// **The completed-only shape is the measured normal case, not an edge
+    /// case.** Three real `codex exec --json` turns on codex-cli 0.153.4 carried
+    /// no `item.started` at all — every item arrived bare, as one
+    /// `item.completed`. So the second failure above was not the unlikely half
+    /// of this finding; it was the half that fires every time an item this arm
+    /// handles occurs. `command_execution` itself stayed uncaptured — that
+    /// environment refuses shell execution before an item is created — so the
+    /// guard is written to be right for both shapes rather than for the one that
+    /// was observed.
     ///
     /// The done-key is the same `id + NUL + "done"` shape, so one id can announce
     /// once and resolve once.
@@ -839,6 +866,29 @@ fn mcp_result_text(item: &serde_json::Value) -> String {
 /// `duration_ms` stays `None` rather than being invented: the panel's live
 /// counter already shows elapsed time while the turn runs, and a fabricated
 /// total would silently disagree with it.
+///
+/// **`cached_input_tokens` and `reasoning_output_tokens` are deliberately not
+/// added, and this is the opposite call from the one OpenCode's arm makes.**
+/// That is worth writing down because the two look alike and the wrong
+/// inference is one line away: OpenCode's footer really did drop its cache
+/// reads, and its own `total` field proved the four parts sum to it, so
+/// `push_opencode` adds them. Codex publishes no `total`, and its numbers say
+/// the fields *nest* rather than partition — measured across three turns on
+/// codex-cli 0.153.4, `cached_input_tokens` was 9,984 of 12,595 input, 34,048
+/// of 38,134, and 22,016 of 25,058: always a fraction of the input beside it,
+/// never a sibling of it. Adding them would double-count the cache on every
+/// turn, overstating a Codex conversation by roughly the amount the OpenCode
+/// fix stopped understating one.
+///
+/// Not proven, and it does not need to be to justify the direction: with no
+/// `total` to reconcile against, the conservative reading is the one that
+/// cannot invent tokens the user never spent. A `total` appearing in a future
+/// build settles it.
+///
+/// (`CODEX_REAL_TURN` reports `cached_input_tokens: 9984` as well, against a
+/// different `input_tokens` and a five-token answer. Coincidence rather than a
+/// transcription slip: 9,984 is 78 × 128, and these land on cache-block
+/// boundaries — worth saying so once rather than having the next reader check.)
 fn codex_stats(v: &serde_json::Value) -> TurnStats {
     let at = |k: &str| v.pointer(&format!("/usage/{k}")).and_then(|n| n.as_u64());
     TurnStats {
@@ -963,14 +1013,14 @@ mod tests {
         assert_eq!(Harness::from_key(""), None);
     }
 
-    /// **Every branch of the accumulator, driven directly.** It is the sole
-    /// reason this parser is stateful, and everything that exercises it goes
-    /// through `item.updated` lines written by hand — no captured Codex fixture
-    /// contains one, so whether Codex restates *cumulatively* is an assumption
-    /// (`review/release-v0.23.0/user-verify-fix.md` has the capture that settles
-    /// it). What is testable without that capture is the state machine itself,
-    /// including the in-place extension that replaced three allocations per
-    /// update with one.
+    /// **Every branch of the accumulator, driven directly** — and every input
+    /// here is **hand-written, because the shape does not occur.** Measured on
+    /// codex-cli 0.153.4, three real turns emitted no `item.updated` at all (see
+    /// [`Coalescer`]), so this drives a contract Codex documents rather than one
+    /// this build exercises. That is worth stating on the test rather than
+    /// leaving a reader to assume these lines were captured: if a future build
+    /// starts streaming, *this* is the specification it will be held to, and
+    /// nobody should discover only then that it was written from the docs.
     #[test]
     fn the_coalescer_emits_only_what_is_new() {
         let mut c = Coalescer::default();
