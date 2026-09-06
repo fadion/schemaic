@@ -494,16 +494,88 @@ impl Harness {
 
     /// Does one process serve the whole conversation?
     ///
-    /// Claude holds a bidirectional `stream-json` pipe, so a turn is a line on
-    /// stdin. The others exit after each turn and are resumed by id, which is
-    /// why [`crate::StreamEvent::SessionStarted`] exists.
+    /// Claude and Antigravity both hold a bidirectional `stream-json` pipe, so a
+    /// turn is a line on stdin. The other two exit after each turn and are
+    /// resumed by id, which is why [`crate::StreamEvent::SessionStarted`]
+    /// exists.
+    ///
+    /// **Antigravity's was measured before it was driven**, which is what the
+    /// flag's own help promises and not the same thing: `--input-format
+    /// stream-json` reads one NDJSON message per line and runs a turn for each,
+    /// and a two-turn probe against the installed binary kept one process alive,
+    /// held the same `conversation_id`, counted `num_turns` up, and answered the
+    /// second question from the first one's context.
     pub fn is_persistent(self) -> bool {
-        matches!(self, Harness::Claude)
+        matches!(self, Harness::Claude | Harness::Antigravity)
     }
 
     /// Can a previous turn be continued by id?
+    ///
+    /// **No longer the complement of [`Harness::is_persistent`], and the reason
+    /// is [`Harness::session_interrupt`].** While Claude was the only persistent
+    /// harness the two were the same question asked twice: a process that holds
+    /// the conversation has no id to resume from. Antigravity holds the
+    /// conversation *and* has no way to interrupt a turn in flight, so Stop ends
+    /// the process — and the next turn has to pick the conversation back up by
+    /// id, exactly as it did when every turn was its own process. It needs both
+    /// answers, so the two can no longer be one.
     pub fn supports_resume(self) -> bool {
-        !self.is_persistent()
+        match self {
+            // The pipe is the continuity, and Stop is a control message that
+            // leaves the process running.
+            Harness::Claude => false,
+            Harness::Codex | Harness::OpenCode | Harness::Antigravity => true,
+        }
+    }
+
+    /// The stdin line that delivers one turn, for a [`Harness::is_persistent`]
+    /// harness.
+    ///
+    /// Empty for the two that take their prompt in argv — there is no stdin
+    /// protocol to encode for, and a caller reaching here for one is asking the
+    /// wrong question.
+    pub fn session_turn_line(self, text: &str) -> String {
+        match self {
+            Harness::Claude => crate::user_message_line(text),
+            // **Its own envelope, not Claude's.** Measured: the shape is
+            // `{"event":…}` mirroring what it *writes*, and Claude's
+            // `{"type":"user"}` is refused with `stream input message is missing
+            // the "event" field`. `role` is accepted but optional.
+            Harness::Antigravity => {
+                let v = serde_json::json!({
+                    "event": "user",
+                    "message": { "content": text }
+                });
+                format!("{v}\n")
+            }
+            Harness::Codex | Harness::OpenCode => String::new(),
+        }
+    }
+
+    /// The stdin line that ends a turn in flight, or `None` where the only way
+    /// to stop one is to end the process.
+    ///
+    /// **Antigravity has no such message, and that was measured rather than
+    /// assumed**: an unrecognised event on its stdin is *silently ignored*, so a
+    /// guessed `interrupt` would not error — it would hang, with the turn still
+    /// running and the panel waiting on a stop that never came. `None` is the
+    /// honest answer, and the caller kills the child instead.
+    pub fn session_interrupt(self) -> Option<String> {
+        match self {
+            Harness::Claude => Some(crate::interrupt_line("stop")),
+            Harness::Antigravity | Harness::Codex | Harness::OpenCode => None,
+        }
+    }
+
+    /// Does the system context have to ride in the first turn's own text?
+    ///
+    /// Claude has `--append-system-prompt`; Antigravity has no such flag, and on
+    /// the per-turn path [`turn_args`] folds the context into every prompt. One
+    /// process holding the conversation only needs it once — repeating it would
+    /// re-send the whole schema outline on every question, which is most of what
+    /// persistence was for.
+    pub fn session_system_in_first_turn(self) -> bool {
+        matches!(self, Harness::Antigravity)
     }
 }
 
@@ -702,35 +774,11 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
             a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
             a
         }
-        Harness::Antigravity => {
-            // `-p <prompt>` takes the prompt as its value, not as a positional,
-            // so unlike Codex the prompt is not last.
-            let mut a: Vec<String> = vec![
-                "-p".into(),
-                prefixed_prompt(turn_system(spec), &spec.prompt),
-                "--output-format".into(),
-                "stream-json".into(),
-                // The constraint: terminal restrictions. It does not empty the
-                // tool set — nothing here can — so the grade stays `Restricted`.
-                "--sandbox".into(),
-                // Print mode expands slash commands and skills by default; a
-                // prompt is user text and must not be able to invoke either.
-                "--disable-slash-commands".into(),
-            ];
-            if !model.is_empty() {
-                a.push("--model".into());
-                a.push(model.to_string());
-            }
-            if !spec.effort.is_empty() {
-                a.push("--effort".into());
-                a.push(spec.effort.clone());
-            }
-            if let Some(id) = spec.resume.as_deref().filter(|s| !s.is_empty()) {
-                a.push("--conversation".into());
-                a.push(id.into());
-            }
-            a
-        }
+        // Antigravity took a per-turn command line until its bidirectional mode
+        // was measured; it is spawned once per conversation now, by
+        // `session_args`. One harness, one spawn shape — a second one kept
+        // "just in case" is a command line nothing builds and nobody re-measures.
+        Harness::Antigravity => Vec::new(),
         Harness::OpenCode => {
             let mut a: Vec<String> = vec![
                 "run".into(),
@@ -782,6 +830,66 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
             a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
             a
         }
+    }
+}
+
+/// The argv for a **persistent** session — one process for the whole
+/// conversation, with turns arriving on stdin.
+///
+/// The counterpart of [`turn_args`], which is what the two per-turn harnesses
+/// take instead; each returns an empty vector for a harness that uses the other,
+/// so a caller that asks the wrong one gets nothing rather than a plausible
+/// command line for the wrong shape.
+///
+/// **Antigravity carries no prompt here, and that is the whole difference.** Its
+/// `-p` takes the prompt as the flag's *value*, so leaving the flag in with
+/// nothing to give it makes the CLI read the next flag as the prompt — measured,
+/// and it says so itself: *"-p took `--input-format` as its prompt"*. In
+/// bidirectional mode the prompt comes from stdin, so the flag goes entirely.
+pub fn session_args(
+    h: Harness,
+    spec: &TurnSpec,
+    seal: crate::CliSeal,
+    mcp_tools: &[&str],
+) -> Vec<String> {
+    let model = spec.model.trim();
+    match h {
+        Harness::Claude => crate::build_session_args(
+            &spec.system,
+            Some(model),
+            Some(spec.effort.trim()),
+            spec.mcp_config.as_deref(),
+            mcp_tools,
+            seal,
+        ),
+        Harness::Antigravity => {
+            let mut a: Vec<String> = vec![
+                "--input-format".into(),
+                "stream-json".into(),
+                // Its own help: `stream-json` on stdin *requires* this on stdout.
+                "--output-format".into(),
+                "stream-json".into(),
+                "--sandbox".into(),
+                "--disable-slash-commands".into(),
+            ];
+            if !model.is_empty() {
+                a.push("--model".into());
+                a.push(model.to_string());
+            }
+            if !spec.effort.trim().is_empty() {
+                a.push("--effort".into());
+                a.push(spec.effort.trim().to_string());
+            }
+            // **Only after a Stop.** The pipe is the continuity while the process
+            // lives; this is how the conversation is picked back up once Stop has
+            // had to end it, since there is no interrupt to send instead.
+            if let Some(id) = spec.resume.as_deref().filter(|s| !s.is_empty()) {
+                a.push("--conversation".into());
+                a.push(id.into());
+            }
+            a
+        }
+        Harness::Codex | Harness::OpenCode => Vec::new(),
     }
 }
 
@@ -1615,13 +1723,20 @@ mod tests {
         }
     }
 
+    /// **This used to assert the complement, and that rule is deliberately
+    /// gone.** It held while Claude was the only persistent harness — a process
+    /// that owns the conversation has no id to resume from. Antigravity holds
+    /// the conversation *and* cannot interrupt a turn, so Stop ends the process
+    /// and the next turn resumes by id: it needs both answers. What survives is
+    /// the weaker rule that actually matters, which is that every harness has at
+    /// least one way to continue a conversation. See
+    /// `persistence_and_resume_are_no_longer_complements`.
     #[test]
-    fn resume_is_the_complement_of_a_persistent_pipe() {
+    fn every_harness_can_continue_a_conversation_somehow() {
         for h in Harness::ALL {
-            assert_eq!(
-                h.supports_resume(),
-                !h.is_persistent(),
-                "{h:?} needs one or the other, never both"
+            assert!(
+                h.supports_resume() || h.is_persistent(),
+                "{h:?} can neither hold a conversation nor resume one"
             );
         }
     }
@@ -1790,7 +1905,10 @@ mod tests {
     /// carries the outline, and on which turns.
     #[test]
     fn the_schema_outline_rides_the_first_turn_of_a_thread_and_not_the_rest() {
-        for h in [Harness::Codex, Harness::Antigravity] {
+        // The harnesses that still take a per-turn argv. Antigravity used to be
+        // one of them and now holds the outline in the first stdin message
+        // instead (`session_system_in_first_turn`).
+        for h in [Harness::Codex, Harness::OpenCode] {
             let mut first = spec();
             first.system = "tables: users(id)".into();
             first.resume = None;
@@ -1844,7 +1962,7 @@ mod tests {
         let mut s = spec();
         s.system = "tables: users(id)".into();
         s.resume = Some(String::new());
-        for h in [Harness::Codex, Harness::Antigravity] {
+        for h in [Harness::Codex, Harness::OpenCode] {
             let a = turn_args(h, &s);
             assert!(a.iter().any(|x| x.contains("users(id)")), "{h:?}: {a:?}");
         }
@@ -2469,15 +2587,17 @@ Options:
     #[test]
     fn a_model_with_surrounding_space_is_sent_trimmed() {
         for h in Harness::ALL {
-            if h == Harness::Claude {
-                continue; // no per-turn argv; `build_session_args` covers it
-            }
             let spec = TurnSpec {
                 prompt: "hi".into(),
                 model: "  provider/some-model  ".into(),
                 ..Default::default()
             };
-            let args = turn_args(h, &spec);
+            // Whichever spawn shape this harness has — the trim is a property of
+            // the field, not of one builder, and both builders have to make it.
+            let args = match h.is_persistent() {
+                true => session_args(h, &spec, crate::CliSeal::ALL, &[]),
+                false => turn_args(h, &spec),
+            };
             let i = args.iter().position(|a| a == "--model").expect("--model");
             assert_eq!(args[i + 1], "provider/some-model", "{h:?}");
         }
@@ -2776,5 +2896,165 @@ mod inline_tests {
                 "{h:?}: {a:?}"
             );
         }
+    }
+}
+
+/// Antigravity's bidirectional mode: one process for the conversation, turns on
+/// stdin.
+///
+/// Every fact pinned here was measured against the installed `agy` before any of
+/// it was driven — the protocol shape, the flag that must not be passed, and the
+/// interrupt that does not exist.
+#[cfg(test)]
+mod bidirectional_tests {
+    use super::*;
+    use crate::CliSeal;
+
+    fn spec() -> TurnSpec {
+        TurnSpec {
+            prompt: "count rows".into(),
+            system: "tables: users(id)".into(),
+            model: "gemini-3".into(),
+            effort: "high".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two harnesses hold the conversation now, and two are still a process per
+    /// turn.
+    #[test]
+    fn antigravity_holds_the_conversation_like_claude_does() {
+        assert!(Harness::Antigravity.is_persistent());
+        assert!(Harness::Claude.is_persistent());
+        assert!(!Harness::Codex.is_persistent());
+        assert!(!Harness::OpenCode.is_persistent());
+    }
+
+    /// **The pair that used to be one question.** Antigravity is the harness
+    /// that needs both answers: it holds the conversation, and it still has to
+    /// be resumable because Stop can only end it.
+    #[test]
+    fn persistence_and_resume_are_no_longer_complements() {
+        assert!(Harness::Antigravity.is_persistent() && Harness::Antigravity.supports_resume());
+        assert!(Harness::Claude.is_persistent() && !Harness::Claude.supports_resume());
+        for h in [Harness::Codex, Harness::OpenCode] {
+            assert!(!h.is_persistent() && h.supports_resume(), "{h:?}");
+        }
+    }
+
+    /// The measured envelope. Claude's `{"type":"user"}` is refused by `agy`
+    /// with *"stream input message is missing the \"event\" field"*, so the two
+    /// dialects cannot share one encoder.
+    #[test]
+    fn each_persistent_harness_encodes_a_turn_its_own_way() {
+        let agy: serde_json::Value =
+            serde_json::from_str(&Harness::Antigravity.session_turn_line("count rows"))
+                .expect("one JSON object per line");
+        assert_eq!(agy["event"], "user");
+        assert_eq!(agy["message"]["content"], "count rows");
+
+        let claude: serde_json::Value =
+            serde_json::from_str(&Harness::Claude.session_turn_line("count rows"))
+                .expect("one JSON object per line");
+        assert_eq!(claude["type"], "user");
+
+        // Newline-terminated, or the reader never sees the line.
+        for h in [Harness::Claude, Harness::Antigravity] {
+            assert!(h.session_turn_line("x").ends_with('\n'), "{h:?}");
+        }
+        // The two per-turn harnesses take their prompt in argv.
+        for h in [Harness::Codex, Harness::OpenCode] {
+            assert!(h.session_turn_line("x").is_empty(), "{h:?}");
+        }
+    }
+
+    /// **Measured, not assumed.** An unrecognised event on `agy`'s stdin is
+    /// ignored in silence, so a guessed interrupt would not fail loudly — it
+    /// would hang with the turn still running. `None` sends the caller to the
+    /// only mechanism that works.
+    #[test]
+    fn only_claude_can_interrupt_a_turn_in_flight() {
+        assert!(Harness::Claude.session_interrupt().is_some());
+        for h in [Harness::Antigravity, Harness::Codex, Harness::OpenCode] {
+            assert_eq!(h.session_interrupt(), None, "{h:?}");
+        }
+    }
+
+    /// The prompt flag must be gone, not empty: `-p` takes the prompt as its
+    /// *value*, so left in with nothing to give it the CLI reads the next flag
+    /// as the prompt and says so.
+    #[test]
+    fn a_persistent_antigravity_is_spawned_with_no_prompt_flag() {
+        let a = session_args(Harness::Antigravity, &spec(), CliSeal::ALL, &[]);
+        assert!(!a.contains(&"-p".to_string()), "{a:?}");
+        assert!(!a.contains(&"--print".to_string()), "{a:?}");
+        assert!(!a.iter().any(|s| s.contains("count rows")), "{a:?}");
+        // Both halves of the protocol, which its help says go together.
+        let pos = |f: &str| a.iter().position(|x| x == f).map(|i| a[i + 1].clone());
+        assert_eq!(pos("--input-format").as_deref(), Some("stream-json"));
+        assert_eq!(pos("--output-format").as_deref(), Some("stream-json"));
+        // The constraint and the settings it must not expand.
+        assert!(a.contains(&"--sandbox".to_string()), "{a:?}");
+        assert!(a.contains(&"--disable-slash-commands".to_string()), "{a:?}");
+        assert_eq!(pos("--model").as_deref(), Some("gemini-3"));
+        assert_eq!(pos("--effort").as_deref(), Some("high"));
+    }
+
+    /// A fresh session carries no `--conversation`: that flag is how a Stop is
+    /// recovered from, and passing it unasked would reopen an old thread.
+    #[test]
+    fn a_conversation_is_resumed_only_when_one_was_kept() {
+        let a = session_args(Harness::Antigravity, &spec(), CliSeal::ALL, &[]);
+        assert!(!a.contains(&"--conversation".to_string()), "{a:?}");
+        let resumed = TurnSpec {
+            resume: Some("conv-7".into()),
+            ..spec()
+        };
+        let b = session_args(Harness::Antigravity, &resumed, CliSeal::ALL, &[]);
+        let i = b.iter().position(|x| x == "--conversation").expect("flag");
+        assert_eq!(b[i + 1], "conv-7");
+        // An empty id is not an id.
+        let blank = TurnSpec {
+            resume: Some(String::new()),
+            ..spec()
+        };
+        assert!(
+            !session_args(Harness::Antigravity, &blank, CliSeal::ALL, &[])
+                .contains(&"--conversation".to_string())
+        );
+    }
+
+    /// `session_args` and `turn_args` are the two halves of one question, and
+    /// each declines the harnesses the other owns.
+    #[test]
+    fn the_two_spawn_shapes_do_not_overlap() {
+        for h in Harness::ALL {
+            let session = session_args(h, &spec(), CliSeal::ALL, &[]);
+            let turn = turn_args(h, &spec());
+            assert_eq!(
+                session.is_empty(),
+                !h.is_persistent(),
+                "{h:?} session_args disagrees with is_persistent"
+            );
+            assert_eq!(
+                turn.is_empty(),
+                h.is_persistent(),
+                "{h:?} turn_args disagrees with is_persistent"
+            );
+        }
+    }
+
+    /// Antigravity has no `--append-system-prompt`, so the schema outline has to
+    /// travel in the text — once, not on every turn, which is most of what
+    /// holding the process was for.
+    #[test]
+    fn only_the_harness_without_a_system_flag_folds_it_into_the_first_turn() {
+        assert!(Harness::Antigravity.session_system_in_first_turn());
+        assert!(!Harness::Claude.session_system_in_first_turn());
+        let a = session_args(Harness::Antigravity, &spec(), CliSeal::ALL, &[]);
+        assert!(
+            !a.iter().any(|s| s.contains("tables: users(id)")),
+            "the system context went in the argv: {a:?}"
+        );
     }
 }

@@ -5130,8 +5130,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   installed. `harness.rs` and `stream.rs` model four of them (`claude`, `codex`, `antigravity`,
   `opencode`), and **all four are driven, with database tools**. Each is selectable from the settings
   modal's *Agent CLI* dropdown, persisted as `UiState::ai_harness`, carried on `AiSettings::harness`,
-  resolved and interrogated by `app/agent_cli.rs`, and spawned by `app/ai.rs` — Claude as one
-  persistent child per conversation, the other three as one process per turn.
+  resolved and interrogated by `app/agent_cli.rs`, and spawned by `app/ai.rs` — Claude and
+  Antigravity as one persistent child per conversation, Codex and OpenCode as one process per turn.
   **A fourth, `gemini`, was modelled here and refused, and it has now been deleted rather than left
   as a menu entry that says no.** Google withdrew OAuth for personal accounts, so `gemini` needs an
   API key to authenticate at all, and the CLI's own sign-in points at Antigravity as its successor —
@@ -5384,6 +5384,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the one place the user can read it. Everything else is asked as a
     **capability** and never as a variant
     (`supports_effort`, `effort_levels`, `effort_arg`, `supports_resume`, `is_persistent`,
+    `session_turn_line`, `session_interrupt`, `session_system_in_first_turn`,
     `streams_deltas`, `supports_model_choice`, `suggested_models`, `restricted_means_sandbox`,
     `seals_by_flag`, `help_args`) — the same reason the engine
     predicates exist:
@@ -5624,12 +5625,49 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the tool *source* — and collapsing them is how one rename quietly becomes two.
     `TurnSpec` and `turn_args` build one turn's command line — one struct rather than eight
     positional arguments, because the harnesses draw on overlapping subsets of it and a positional
-    list is how `--model`'s value ends up in `--effort`'s slot. Claude's argv stays
-    `build_session_args`: it is spawned once per *conversation* with its prompt arriving on stdin,
-    where the other three are spawned per turn. **Where the prompt sits differs and is not a detail
-    to generalise from one of them**: Codex and OpenCode take it as the last *positional*, last on
-    purpose since a flag after it reads as part of it; Antigravity's is `-p`'s value and therefore
-    first.
+    list is how `--model`'s value ends up in `--effort`'s slot. **There are two spawn shapes and one
+    struct feeds both**: `turn_args` for the harnesses spawned per turn, `session_args` for the ones
+    spawned once per *conversation* with their turns arriving on stdin. Each returns an empty vector
+    for a harness belonging to the other, so a caller that asks the wrong one gets nothing rather
+    than a plausible command line for the wrong shape, and
+    `the_two_spawn_shapes_do_not_overlap` walks `Harness::ALL` holding both builders to
+    `is_persistent`. Claude's `session_args` arm delegates to `build_session_args`, which is what
+    that function always was. **Where the prompt sits differs and is not a detail to generalise from
+    one of them**: Codex and OpenCode take it as the last *positional*, last on purpose since a flag
+    after it reads as part of it, while neither persistent harness carries a prompt in argv at all.
+    **Antigravity is a persistent harness now, and that was measured before it was driven.**
+    `--input-format stream-json` reads one NDJSON message per line and runs a turn for each, which is
+    what the flag's own help promises and not the same thing as having watched it work: a two-turn
+    probe against the installed binary kept one process alive across both turns, held the same
+    `conversation_id`, counted `num_turns` up, answered the second question from the first one's
+    context, and took 4.96 s for the pair. That was then repeated end to end through this code's own
+    path — `session_args`, the app's session loop, the parser — before any of it was written down
+    (`antigravity_holds_the_conversation_like_claude_does`).
+    **`supports_resume` is no longer the complement of `is_persistent`, and the reason is that this
+    harness has no interrupt.** While Claude was the only persistent one the two were a single
+    question asked twice — a process that holds the conversation has no id to resume from — so
+    resume was literally `!is_persistent()`. Antigravity holds the conversation *and* has no stdin
+    message that ends a turn in flight, so Stop has to end the process and the next turn picks the
+    conversation back up with `--conversation <id>`: it needs both answers true. Each is an explicit
+    per-harness match now (Claude alone answers `false` to resume), and the old
+    `resume_is_the_complement_of_a_persistent_pipe` is replaced by the weaker rule that survives it,
+    `every_harness_can_continue_a_conversation_somehow` — every harness has one of the two
+    mechanisms — plus `persistence_and_resume_are_no_longer_complements`, which pins the combination
+    that used to be impossible.
+    **Three capabilities exist only for the persistent shape, and each was measured rather than
+    guessed.** `session_turn_line` is the stdin encoding: Antigravity's envelope is
+    `{"event":"user","message":{"content":…}}`, mirroring what it *writes*, and Claude's
+    `{"type":"user"}` is refused outright — *"stream input message is missing the `event` field"* —
+    so the two dialects cannot share an encoder
+    (`each_persistent_harness_encodes_a_turn_its_own_way`). `session_interrupt` answers `Some` for
+    Claude and **`None` for everyone else**, which is the honest answer and not a gap: an
+    unrecognised event on `agy`'s stdin is ignored *in silence*, so a guessed `interrupt` would not
+    fail loudly — the turn would run on with the panel waiting for a stop that never came
+    (`only_claude_can_interrupt_a_turn_in_flight`). `None` sends the caller to killing the child,
+    which is what makes `supports_resume` true above. `session_system_in_first_turn` is true for
+    Antigravity alone, which has no `--append-system-prompt`: the outline travels in the first turn's
+    text, once, since re-sending the whole schema outline on every question is most of what holding
+    one process was for (`only_the_harness_without_a_system_flag_folds_it_into_the_first_turn`).
     **The model is trimmed once at the top of `turn_args`, because the field it comes from is free
     text the user can clear.** Typing a space and closing the settings modal leaves `" "`, which an
     `!is_empty()` waves through as `--model " "` — an unknown model, killing the spawn and reported to
@@ -5638,10 +5676,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     between the two argv builders was the whole bug.
     `a_whitespace_only_model_is_no_model_on_every_harness` loops `Harness::ALL` and also asserts no
     *other* blank argument reached argv, while `a_model_with_surrounding_space_is_sent_trimmed` holds
-    the direction that would break by over-trimming.
+    the direction that would break by over-trimming — and that one picks its builder off
+    `is_persistent`, because `session_args` trims at its own top for the same reason and the property
+    belongs to the field rather than to either builder.
     **The system context rides the first turn of a thread and none of the rest**, which is
-    `turn_system`. Neither Codex nor Antigravity has an `--append-system-prompt` and none is passed
-    to OpenCode either, so for all three `prefixed_prompt` folds
+    `turn_system`. Codex has no `--append-system-prompt` and none is passed
+    to OpenCode either, so for both `prefixed_prompt` folds
     the schema outline into the prompt itself (with a blank line between, or the outline's last table
     name reads as the first word of the question) — and a resumed turn makes the CLI replay the whole
     prior thread, every turn of which already carries its own copy. Sent every time, turn N put the
@@ -5650,7 +5690,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     catalogue that never changed. The rule lives here beside the argv rather than at the call site
     that fills in `TurnSpec`, so the caller cannot forget it, and the tests run the composition
     rather than the predicate
-    (`the_schema_outline_rides_the_first_turn_of_a_thread_and_not_the_rest`; an empty
+    (`the_schema_outline_rides_the_first_turn_of_a_thread_and_not_the_rest`, which loops those two —
+    Antigravity was a third until it became persistent and now reaches the same rule by the other
+    road, `session_system_in_first_turn` above; an empty
     `resume` is not a resume and still carries the outline —
     `an_empty_resume_id_still_carries_the_outline`). **Every flag in the Codex argv was verified
     against the installed binary's `codex exec --help`**: `exec`, `--json`, `-s/--sandbox` with
@@ -5670,23 +5712,35 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     command-specific flags parsed after a subcommand"*, which is to say a **later** `-c` wins. Put
     before `mcp_overrides`, a caller passing its own `sandbox_mode` would silently outrank the
     constraint.
-    **The Antigravity argv is two flags of evidence and three of documentation**, and the difference
-    is the same one the dialects have. `--sandbox` (*"Run in a sandbox with terminal restrictions
-    enabled"*) and `--disable-slash-commands` (*"Disable slash command and skill expansion in print
-    mode"*) are both verbatim in the captured `agy --help` **and** were passed in every live run,
-    including the two that produced the stream fixtures — each exited 0 and returned normal output,
-    so they are accepted rather than merely advertised. That matters twice for `--sandbox`: it is
-    precisely because it was passed in those runs that the 56-tool `init` listing is evidence of a
-    ceiling rather than of a flag nobody set. The second is passed because print mode expands slash
-    commands and skills by default, and a prompt is *user text* that must not be able to invoke
-    either. `--model`, `--effort` (`low|medium|high`, which is this harness's `effort_levels`, and a
-    level only Claude takes is dropped by `effort_arg` before it reaches here) and
-    `--conversation <ID>` (*"Resume a previous conversation by ID"*, with
-    `-c/--continue` beside it for the most recent) are **help only — never passed in a live run**.
-    For the resume that leaves three things unverified at once: the argv position, whether it
-    composes with `-p`, and whether the id we would feed it — the top-level `conversation_id` off
-    `init` — is the id it wants. That is documentation-only status, and not Codex's, whose every
-    flag was checked against the installed binary. And the help itself is read
+    **The Antigravity argv lives in `session_args` now and leads with `--input-format stream-json
+    --output-format stream-json`** — the second required by the first, on that flag's own help. Its
+    two flags of evidence carry over unchanged from the per-turn argv it replaced: `--sandbox`
+    (*"Run in a sandbox with terminal restrictions enabled"*) and `--disable-slash-commands`
+    (*"Disable slash command and skill expansion in print mode"*) are both verbatim in the captured
+    `agy --help` **and** were passed in every live run, including the two that produced the stream
+    fixtures — each exited 0 and returned normal output, so they are accepted rather than merely
+    advertised. That matters twice for `--sandbox`: it is precisely because it was passed in those
+    runs that the 56-tool `init` listing is evidence of a ceiling rather than of a flag nobody set.
+    The second is passed because a prompt is *user text* that must not be able to invoke a slash
+    command or a skill.
+    **`-p` is gone rather than emptied, and that is measured.** It takes the prompt as the flag's own
+    *value*, so leaving it in with nothing to give makes the CLI read the next flag as the prompt —
+    the binary says so itself: *"-p took `--input-format` as its prompt"*. In bidirectional mode the
+    prompt arrives on stdin, so the flag goes entirely
+    (`a_persistent_antigravity_is_spawned_with_no_prompt_flag`). `--model` and `--effort`
+    (`low|medium|high`, which is this harness's `effort_levels`, and a level only Claude takes is
+    dropped by `effort_arg` before it reaches here) ride along as they did.
+    **`--conversation <ID>` is measured against the installed binary now, and so is the whole
+    Stop-then-resume path** (*"Resume a previous conversation by ID"*, with `-c/--continue` beside it
+    for the most recent). It is emitted only when `TurnSpec::resume` is non-empty, which on this path
+    means only after a Stop had to kill the process — so the probe did exactly that: turn one on one
+    process stored a number and reported `conversation_id` `dad00e0a-…`, that process was killed,
+    which is what Stop does, and a fresh one spawned with `--conversation <that id>` last in the argv,
+    after `--model` and `--effort`, where `session_args` emits it. It answered the follow-up with the
+    remembered number, reporting `num_turns: 2` and the *same* `conversation_id`. So the id we feed
+    it — the top-level `conversation_id` off `init` — is the id it wants, and the flag composes with
+    the bidirectional flags rather than being refused beside them; the recovery is verified end to
+    end rather than inferred from the two halves. And the help itself is read
     off **stderr**, where `agy` writes it while exiting 0 — a stdout-only probe finds it empty and
     refuses a working install, which is why `agent_cli::probe` folds both streams.
     **The OpenCode argv is `run --pure --agent schemaic --format json`, and two of those flags do
@@ -5781,8 +5835,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     order because the CLI writes some fatal errors (an expired OAuth session among them) to stdout
     with an empty stderr, so surfacing stderr alone yields a blank.
     With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` are the four, and every
-    argv here is for a binary somebody has run: what remains unverified is a *flag* on a driven
-    harness — the Antigravity resume above — rather than a whole harness nobody could sign in to.
+    argv here is for a binary somebody has run — and with the Antigravity resume measured above,
+    nothing on any of the four is now carried on its help page alone.
   - `stream.rs` — one transcript vocabulary, four CLI dialects. Every harness decodes into the same
     `StreamEvent`s the panel already renders, so the dialect stops at this module and nothing
     downstream learns which CLI produced a turn. **They do not even agree on where the discriminator
@@ -5805,17 +5859,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     "Hi" + "Hi there" + "Hi there!"; the private `Coalescer` emits only the unseen suffix instead,
     and falls back to the whole string when the text is *not* an extension of what came before, so a
     rewritten message loses nothing rather than being diffed against a string it shares no prefix
-    with. It is keyed by ids unique only within one stream, so a parser must not be shared between
-    two concurrent ones — one per turn for the process-per-turn harnesses, one per session for
-    Claude.
+    with. It is keyed by ids unique only within one *turn* — the narrower unit, and see the
+    turn-boundary reset below for what made that distinction load-bearing — so a parser must not be
+    shared between two concurrent streams either: one per turn for Codex and OpenCode, one per
+    session for the two persistent harnesses.
     **OpenCode sends neither, and that is structural rather than a sampling artefact.** Its printer
     emits a `text` part only once `time.end` is set — once the part is *finished* — so a whole answer
     arrives in one event, a measured 2964-character reply among them. `streams_deltas` is false for
     it, and no amount of coalescing would help, because no partial text is ever written to decode.
     The visible cost is that there is no "it has started" moment to report: the panel's spinner runs
     until the text lands.
-    **There are two pieces of that state now, and the second is `seen_tools`.** Two of the three
-    per-turn dialects restate a tool call while it is still running, neither marking the repeat —
+    **There are two pieces of that state now, and the second is `seen_tools`.** Two dialects restate
+    a tool call while it is still running, neither marking the repeat —
     Codex on every `item.updated` for the item id, Antigravity on every `state: "ACTIVE"` for the
     `step_index` — while `TurnState::apply` pushes a chip for every `ToolUse` it is handed and
     attaches a `ToolResult` to the *last* pending one. So a restated call left the earlier chip
@@ -5830,6 +5885,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     chip and fills it from one line. It is keyed on `callID` all the same — the part id changes
     between restatements where the call id does not — and the `running` status is handled, so a build
     that starts streaming its calls costs one chip rather than a duplicate per event.
+    **All of that state is cleared at a turn boundary, and it only began mattering when a stream
+    could hold more than one Antigravity turn.** `StreamParser::push` looks at the events it has just
+    produced and, if any of them is a `TurnDone`, resets `seen_tools`, the `Coalescer` and the
+    `OpenCodeTurn`. The ids `seen_tools` holds are whatever the dialect gives a call, and they are
+    unique only *within* a turn — Antigravity numbers its steps from zero on each one. That was
+    invisible while every multi-turn stream was Claude's, whose ids are unique for the life of the
+    process: on a persistent Antigravity the second turn's first tool call carries `step_index` 0
+    again, the set already holds it, and the chip announcing it is dropped — a tool call running with
+    nothing on screen to say so, which is the one failure this dialect is decoded carefully to avoid.
+    **`a_second_turn_reuses_step_ids_and_still_gets_its_chips` pins it, and it takes two turns to
+    do so** — every other tool test here drives one, which is exactly why the collision was
+    invisible. It feeds a tool call at `step_index` 0, a `result` closing the turn, then a
+    *different* call that is `step_index` 0 again through a single parser, and asserts the second
+    turn's chip is announced: with the reset disabled it fails with *"the second turn's tool ran
+    with no chip to show for it: []"*. It then restates that second call and asserts no second chip,
+    so the reset cannot be "fixed" by simply never de-duplicating.
     **Both halves of a Codex `mcp_tool_call` are guarded now, and the result half was not.**
     `seen_tools` kept a restated call from opening a second chip, but the completion path emitted its
     `ToolResult` unconditionally — so a call whose *only* event is `item.completed` produced a result
@@ -5848,7 +5919,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Codex's session model differs in kind, not in field names** — one process per *turn*, resumed
     by id (`codex exec resume <id>`), against Claude's one persistent bidirectional process per
     conversation. `StreamEvent::SessionStarted { id }` exists to carry the `thread.started`/`init`
-    id a resume needs; it holds no transcript content and `TurnState` ignores it.
+    id a resume needs; it holds no transcript content and `TurnState` ignores it. The `init` half of
+    that is Antigravity's, and it still matters now that harness is persistent: its session reads the
+    id for one purpose only, picking the conversation back up after a Stop that had to kill the
+    process. Claude's dialect emits no `SessionStarted` at all, having nothing to resume from.
     **A side-effecting Codex item is surfaced, never dropped.** `command_execution` and `file_change`
     become tool chips even though the read-only sandbox should make them impossible, and the
     temptation is to treat them as noise from a path we do not use: rendering them means a
@@ -6183,8 +6257,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the per-turn harnesses — and a whitespace-only one, which is the same clear a keystroke short and
     the divergence between the builders described under `harness.rs`
     (`an_empty_model_lets_the_harness_keep_its_own_default`, which loops
-    `Harness::ALL` — and whose Claude arm asserts nothing at all, because `turn_args` returns
-    `Vec::new()` for the one harness whose argv is `build_session_args`). That builder passed
+    `Harness::ALL` — and whose Claude and Antigravity arms assert nothing at all, because `turn_args`
+    returns `Vec::new()` for both persistent harnesses; `a_model_with_surrounding_space_is_sent_trimmed`
+    is the one that reaches every builder, picking between `turn_args` and `session_args` off
+    `is_persistent` so neither can drift out of the loop). The session builder passed
     `Some(&model)` straight through, so the clear this paragraph describes spawned
     `claude … --model ""`, killed on a rejected id and reported as an installation problem. Both
     `--model` and `--effort` are now filtered there through
@@ -9390,18 +9466,52 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   both halves — a runnable grade refuses nobody, and `Unknown` refuses everybody — rather than
   naming the harnesses by hand, so a harness added to the enum is covered the moment it compiles.
   **There are two session models behind one channel, and the seam is `SessionMsg`.**
-  `start_ai_session` branches on `harness.is_persistent()`: Claude keeps its one bidirectional child
-  per conversation, while Codex, Antigravity and OpenCode spawn **one process per turn**, continuity
-  coming from an id captured off `StreamEvent::SessionStarted` (`thread.started`/`init`/`sessionID`)
-  and handed to the next turn as `TurnSpec::resume`. **The interface upstream did not change**, and that is the point:
+  `start_ai_session` branches on `harness.is_persistent()`: Claude and Antigravity each keep one
+  bidirectional child per conversation, while Codex and OpenCode spawn **one process per turn**,
+  continuity coming from an id captured off `StreamEvent::SessionStarted`
+  (`thread.started`/`sessionID`) and handed to the next turn as `TurnSpec::resume`.
+  **The interface upstream did not change**, and that is the point:
   `AiSession::stdin_tx` carries a typed `SessionMsg::{Turn, Interrupt}` rather than the raw stdin
   JSON line `main.rs` used to build, because that made the app's send path fluent in one CLI's wire
   protocol — and a process-per-turn harness has no such protocol at all. The encoding now belongs to
-  whichever task owns the child. `Interrupt` mid-turn kills it and the turn is closed by the
-  not-`ended` arm; between turns it is a no-op, because nothing is running to stop. **The child's
-  stdin is `Stdio::null()`, never piped**: measured, `codex exec` prints *"Reading additional input
-  from stdin…"* and appends piped stdin to the prompt as a `<stdin>` block, so a pipe we never wrote
-  to would silently append itself to every turn. And every harness folds its events through **one**
+  whichever task owns the child. On the per-turn branch `Interrupt` mid-turn kills it and the turn is
+  closed by the not-`ended` arm; between turns it is a no-op, because nothing is running to stop.
+  **Nothing on the persistent branch is Claude's by construction any more.** It was written when
+  Claude was the only harness that reached it, so it took its argv from `build_session_args`, built
+  its stdin lines itself, and decoded with `parse_stream_line` — Claude's own decoder, called
+  directly. All three are asked of the harness now: `harness::session_args` for the argv,
+  `harness.session_turn_line` for each stdin line, and `StreamParser::new(harness)` for the stream,
+  which is also what brings the parser's turn-boundary reset onto this path and is what keeps a
+  second Antigravity turn's tool chips from being swallowed (see `stream.rs`). `owes_system` is the
+  fourth piece: `harness.session_system_in_first_turn()` decides it, and where it is true the schema
+  context is folded into the first turn's text and taken, so the outline is sent once for the life of
+  the process rather than with every question. And the launch-failure message names `harness.bin()`
+  and `harness.label()` instead of a hardcoded `claude`/"Claude Code", for the reason
+  `cli_failure_message` takes a harness at all: sending a user who picked Antigravity off to check
+  their Claude installation is a wrong cause stated confidently.
+  **Stop, on a persistent harness with no interrupt, kills and respawns in place.** Antigravity has
+  no stdin message that ends a turn in flight (`Harness::session_interrupt` is `None`, and the
+  measurement behind that is under `harness.rs`), so that arm kills the child, calls `pump.stop()` —
+  which sends the prose already accumulated, not a bare "Stopped." — and spawns a fresh child with
+  `session_args(…, resume: conversation)`, rebinding `child`, `stdin`, `reader` and the parser and
+  carrying on round the loop. The session therefore survives a Stop rather than ending on one, and
+  the id it resumes with is the one captured off `SessionStarted`, which on this branch fills only
+  for Antigravity because Claude's dialect emits none. If the respawn itself fails the session
+  **ends**: a task still holding `rx` with no child behind it accepts questions nothing can answer,
+  which is the silent-swallow failure `refuse_every_turn` exists further up to prevent.
+  **The MCP setup moved with the harness rather than being left where it was.** Claude still gets
+  `write_mcp_config`; Antigravity's `AgyRegistration` — the endpoint file, the `agy mcp add`
+  registration and the allow-rules — is gathered on this persistent path and installed inside the
+  session task on a blocking thread, exactly as it was on the per-turn path and for the same reason:
+  it is two `agy` invocations and a settings rewrite, and `start_ai_session` runs on the Floem UI
+  thread. The first turn's `rx.recv()` has not been reached by then, so nothing races it. The
+  per-turn branch's Antigravity arm and its `_registration` block were **deleted rather than left
+  unreachable**, because configuration for a harness that no longer takes that path is the copy that
+  quietly stops matching the one that runs.
+  **The per-turn child's stdin is `Stdio::null()`, never piped**: measured, `codex exec` prints
+  *"Reading additional input from stdin…"* and appends piped stdin to the prompt as a `<stdin>`
+  block, so a pipe we never wrote to would silently append itself to every turn.
+  And every harness folds its events through **one**
   `TurnPump` — prose and chips accumulate, a snapshot goes out when anything changed, `TurnDone`
   closes the turn and resets, and `fail()` always sends so the panel cannot spin. Claude was
   refactored onto it rather than left alongside: it briefly had its own copy, and two copies drift
@@ -9411,8 +9521,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   reason alone is not a smaller version of that: the consumer assigns `last.segs = msg.segs`
   wholesale, so a one-segment message threw away every word already on screen. That was invisible on
   Claude, whose `result` event carries the accumulated turn so the final snapshot is complete, and
-  wrong on the three harnesses that end a turn by *exiting* — press Stop on a long Codex, Antigravity
-  or OpenCode answer and the prose you were reading vanished, replaced by "Stopped.". The consumer's
+  wrong wherever a turn ends by the process *exiting* — press Stop on a long Codex or OpenCode
+  answer, or on an Antigravity one, whose Stop kills the child because there is no interrupt to send
+  it, and the prose you were reading vanished, replaced by "Stopped.". The consumer's
   own comment already promised the opposite, which is what made the two halves look consistent.
   **The per-turn child is released before it is waited on, and the wait is bounded.** After a decoded
   `TurnDone` the loop breaks and the child is reaped — but the loop owns the read half of stdout, and
