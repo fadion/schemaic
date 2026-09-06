@@ -10944,12 +10944,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     by `SCHEMAIC_NO_REPO=1`, and for rpm automatically on a machine with neither `dnf` nor
     `zypper`, which has no repository support worth the source-list entry. Those two are the route
     with nothing behind it, so the tail messaging names the real update route per family rather
-    than one line for all of them. **As of this commit none of it has run against the real site.**
-    The prerequisites are in place — Pages is on the Actions source, and `GPG_PRIVATE_KEY` and
-    `GPG_PASSPHRASE` are set — but until the first publish lands, the URLs `install.sh` writes into
-    a source list resolve to nothing, and the RPM half (`rpmsign`, `createrepo_c`, the
-    `repomd.xml.asc` signature) has been reasoned about rather than executed: no machine involved
-    in building it had `createrepo_c`. Delete this note once a publish has succeeded.
+    than one line for all of them. The first publish landed 2026-09-06 and was checked from the
+    outside rather than declared: `InRelease` and `repomd.xml.asc` verify under `gpgv` against the
+    published keyring, and `install.sh` was run from `main` in a clean `debian:12` and a clean
+    `fedora:41` container, each resolving the hand-written dependency list and installing 0.24.0 —
+    then downgraded and carried back up by `apt-get upgrade` / `dnf upgrade`, which is the whole
+    claim. On the rpm side `dnf` did that with `gpgcheck=1` and `repo_gpgcheck=1` in force, so it
+    verified the package signature and the index signature and would have refused either way round.
     **Both packages hand-write their dependency lists, and no scanner can replace them**: `readelf
     -d` on the binary lists glibc and nothing else, because winit reaches X11, Wayland and xkbcommon
     through `libloading` and wgpu reaches Vulkan and EGL the same way. An automatically derived list
