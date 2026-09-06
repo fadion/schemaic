@@ -8,11 +8,6 @@ intelligence, built to feel instant.
   <img src="assets/screenshot.png" alt="Schemaic — SQL editor and results grid" width="820">
 </p>
 
-## Notice
-
-Schemaic is in active development. It should **not** be used or trusted with
-production data, or any data you care about.
-
 ## Why
 
 - **Fast** — GPU-rendered UI ([Floem](https://github.com/lapce/floem)); scrolls
@@ -136,31 +131,17 @@ production data, or any data you care about.
   line, and for SQLite starting in the database file's own directory so `.output`
   and `.read` land where you'd expect.
 - **AI assistant** — an agent-CLI session wired into the app rather than bolted
-  beside it, driving **your own** installed CLI: **Claude Code, Codex, Antigravity
-  or OpenCode**, picked in Settings → AI along with the model id — a free text
-  field with suggestions, not a list this build happens to know, so a model
-  released after it still works — and a reasoning-effort setting where the CLI has
-  one. What each is allowed to do differs, and the settings screen says so before
-  you start: Claude Code and OpenCode can be given no built-in tools at all, the
-  other two run read-only, and Schemaic will not open a session on a binary it
-  could not confirm it can restrict.
-
-  Then: **AI Fix** on a failed query, which hands it the error and the statement
-  and offers the correction as a diff; rewrite the statement under the caret and
-  accept or reject that diff yourself (Ctrl+K); explain or optimize it from the
-  right-click menu; ask about an `EXPLAIN` plan without retyping it; summarize a
-  column or a single value; or generate realistic rows for a table from the shape
-  of the data already in it. A built-in MCP server lets the assistant read your
-  schema and query the database — on every harness — so answers are about your
-  data rather than a generic guess, and it can propose a table change as a patch
-  that lands in the same preview any hand edit does, never as SQL run behind your
-  back. How much it may see is set **per connection**, not globally: schema only,
-  on request, or full.
-
-  All of it runs on the CLI you picked — the one-shot generators (Ctrl+K, AI
-  Fill, AI Seed) build their own harness's command line rather than borrowing
-  Claude's, and each is a closed request: no server, no session to resume, and
-  no tool to reach for, because the whole question is in the prompt.
+  beside it, driving **your own** installed CLI — Claude Code, Codex, Antigravity
+  or OpenCode — picked in Settings → AI with the model id and reasoning effort,
+  and never started on a binary Schemaic could not confirm it can restrict. Fix a
+  failed query from its error, rewrite the statement under the caret and accept or
+  reject the diff (Ctrl+K), explain or optimize it, ask about an `EXPLAIN` plan,
+  summarize a column or a value, or generate realistic rows for a table from the
+  shape of the data already in it. A built-in MCP server lets it read your schema
+  and query the database, so answers are about your data rather than a generic
+  guess — and it proposes a table change as a patch that lands in the same
+  preview any hand edit does, never as SQL run behind your back. How much it may
+  see is set **per connection**: schema only, on request, or full.
 - **Themeable** — dark / light UI themes, multiple editor color schemes, and an
   interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
 
