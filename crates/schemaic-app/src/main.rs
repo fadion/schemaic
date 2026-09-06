@@ -19,6 +19,7 @@ mod dump;
 mod heap;
 mod logging;
 mod mcp;
+mod opencode;
 mod script;
 mod secrets;
 mod update;
@@ -1433,7 +1434,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // same cache and a second way to warm an entry nobody reads.
     create_effect(move |_| {
         let h = ai_harness.get();
-        agent_cli::warm_probe_cache(h, harness_bin(h, &ai_cli_path.get()));
+        let path = ai_cli_path.get();
+        agent_cli::warm_probe_cache(h, harness_bin(h, &path));
+        // **And the Claude entry the one-shot generators read, which is a
+        // different key whenever another harness is selected.** Ctrl+K, AI Fill
+        // and AI Seed always run Claude (`inline_claude_bin`), so with Codex,
+        // Antigravity or OpenCode chosen they probe `(Claude, <claude bin>)` —
+        // a key the line above never fills. That is verbatim the regression this
+        // effect's own doc says it exists to prevent, reintroduced through the
+        // second key: every Ctrl+K paid a blocking, timeout-free `claude --help`
+        // on the Floem UI thread. Warming it costs one thread at startup, and
+        // nothing when the entry is already there.
+        if h != Harness::Claude {
+            agent_cli::warm_probe_cache(Harness::Claude, agent_cli::inline_claude_bin(h, &path));
+        }
     });
     // Antigravity is the one harness Schemaic configures by writing into the
     // *user's* files, so a session that never ran its cleanup leaves an MCP
@@ -1464,8 +1478,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // **Effort is clamped rather than cleared**, because unlike the other two it
     // has no "the harness's default" value — the setting is a closed enum and
     // every level in it means something. `Extra` is Claude's `xhigh` and
-    // Antigravity's flag stops at `high`, so the switch moves the selection down
-    // to the highest level the new harness advertises. The argv is already
+    // Antigravity's flag stops at `high`, so the switch moves the selection to
+    // the *nearest* level the new harness advertises — nearest, not highest;
+    // taking the highest is what sent a default `Medium` to OpenCode's `Max`.
+    // The argv is already
     // clamped by `Harness::effort_arg`, so this is about what the modal *shows*:
     // the closed dropdown renders the selected level unconditionally, and a box
     // reading "Extra" over a harness that neither offers nor sends it is the
@@ -1483,9 +1499,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         {
             ai_cli_path.set(String::new());
             ai_model.set(String::new());
-            if let Some(e) = ai_effort.get_untracked().clamped_to(now.effort_levels()) {
-                ai_effort.set(e);
-            }
+        }
+        // **Clamped on every run, including the first.** The path and the model
+        // are cleared only on an actual *switch* — the comment above says why —
+        // but the effort level is a different question: it is not "did the user
+        // change harness", it is "is the level in the box one this harness
+        // takes". Gating it on a change meant the restore from `ui_state.json`
+        // never clamped, so a file pairing `opencode` with `medium` (a hand
+        // edit, a build that changes a harness's levels, any path writing the
+        // two fields independently) came back showing "Medium" in a closed
+        // dropdown whose list offers only Minimal/High/Max, while `effort_arg`
+        // sent no flag at all. That stale caption is the exact thing
+        // `clamped_to` was added to prevent.
+        if let Some(e) = ai_effort.get_untracked().clamped_to(now.effort_levels())
+            && e != ai_effort.get_untracked()
+        {
+            ai_effort.set(e);
         }
         now
     });
@@ -8989,6 +9018,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             stats: None,
                             pending: false,
                             attachment: None,
+                            // Schemaic's own refusal, not an agent's answer — no
+                            // CLI was reached, so none is named over it.
+                            harness: None,
                         });
                     });
                     return;
@@ -9010,7 +9042,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ai_attachment.set(None);
             ai_messages.update(|v| {
                 v.push(ChatMessage::user_with(msg.clone(), attachment.clone()));
-                v.push(ChatMessage::pending());
+                // The harness *this* turn runs on, stamped now rather than read
+                // back at render time: the setting can change before the next
+                // draw, and the transcript has to keep saying who actually
+                // answered.
+                v.push(ChatMessage::pending(Some(
+                    ai_harness.get_untracked().key().to_string(),
+                )));
             });
             ai_input.set(String::new());
             ai_busy.set(true);

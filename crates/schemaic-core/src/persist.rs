@@ -202,6 +202,9 @@ pub struct UiState {
     /// `gemini` was a fourth and is gone; a settings file still naming it takes
     /// the unrecognised-value path below rather than a migration of its own.
     ///
+    /// One of `claude` / `codex` / `antigravity` / `opencode`
+    /// (`Harness::key`), written by Settings → AI.
+    ///
     /// Defaults to `claude`, which is what every settings file written before
     /// this field existed meant — the app drove that CLI and nothing else. An
     /// unrecognised value is **not** silently replaced with the default; the app
@@ -215,10 +218,27 @@ pub struct UiState {
     /// path behind would point the new CLI's spawn at the old CLI's binary.
     #[serde(default)]
     pub ai_cli_path: String,
-    /// AI Assistant — model alias: `haiku` / `sonnet` / `opus`.
+    /// AI Assistant — model id, passed to the selected harness verbatim.
+    ///
+    /// **Free text, not a closed set.** This used to be documented as
+    /// `haiku` / `sonnet` / `opus` and backed by an enum that narrowed every
+    /// unrecognised value to Haiku; it is now whatever string the chosen CLI
+    /// accepts, and the accepted shapes differ — Claude takes bare aliases,
+    /// OpenCode requires `provider/model`. Empty means "the harness's own
+    /// default" and omits the flag entirely, which is the only value that is
+    /// correct on all four; the field is cleared on a harness switch for exactly
+    /// that reason.
+    ///
+    /// The default is still `haiku` because the harness default beside it is
+    /// `claude`, where that alias is valid. The two are only meaningful as a
+    /// pair — a file naming one without the other is the case
+    /// `default_ai_model` cannot get right, and clearing on switch is what keeps
+    /// the pair consistent in practice.
     #[serde(default = "default_ai_model")]
     pub ai_model: String,
-    /// AI Assistant — effort: `low` / `medium` / `high` / `xhigh`.
+    /// AI Assistant — effort: `minimal` / `low` / `medium` / `high` / `xhigh` /
+    /// `max`, clamped to the levels the selected harness actually advertises
+    /// (`Harness::effort_levels`, and `AiEffort::clamped_to` for the clamp).
     #[serde(default = "default_ai_effort")]
     pub ai_effort: String,
     /// AI Assistant — extra instructions appended to the system prompt.

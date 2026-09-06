@@ -287,6 +287,14 @@ const MCP_FILE_PREFIX: &str = "schemaic-mcp-";
 /// touched — those are deleted by that instance's own `Drop`.
 const MCP_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+/// How long a per-turn child gets to exit after its turn has been decoded.
+///
+/// The turn is already rendered by this point, so this is only about reaping the
+/// process — generous enough that a healthy CLI flushing and shutting down is
+/// never killed mid-cleanup, short enough that one which never exits cannot
+/// wedge the session against every later question.
+const CHILD_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Write the `claude` MCP config to a per-session temp file and return its path.
 /// The DB endpoint (with credentials) rides in the config's `env`, so it never
 /// appears on a command line where another same-user process could read it
@@ -424,9 +432,14 @@ fn mcp_config_json(exe: &str, endpoint: &str) -> String {
 /// the Claude config beside it already does. Moving it would buy nothing and
 /// would put it outside the sweeper that collects the other.
 ///
-/// **One caveat that is Antigravity's alone**: its registration writes this path
-/// into that CLI's *own* config, so unlike a `-c` override it survives our
-/// process. `crate::antigravity::sweep` exists partly for that.
+/// **Two harnesses write this path somewhere that outlives the process**, and
+/// only one of them is a hazard. Antigravity's registration puts it into that
+/// CLI's *own* config, which is why `crate::antigravity::sweep` exists.
+/// OpenCode's goes into `crate::opencode`'s reused config directory — Schemaic's
+/// own, deliberately persistent so the CLI's plugin bootstrap is paid once. In
+/// both cases what survives is the *path*; the file it names is swept here, so a
+/// stale pointer resolves to nothing rather than to an old endpoint. That is
+/// exactly why the endpoint is not written into either of those files directly.
 fn write_endpoint_file(endpoint: &str) -> Option<PathBuf> {
     sweep_stale_mcp_configs();
     let dir = std::env::temp_dir();
@@ -560,15 +573,81 @@ impl TurnPump {
 
     /// End the turn with a message of our own — a spawn that failed, a child
     /// that died, a refusal. Always sends, so the panel never keeps spinning.
+    ///
+    /// **Appended to what streamed in, not substituted for it.** The consumer
+    /// assigns `last.segs = msg.segs` wholesale, so sending only the reason threw
+    /// away every word already on screen. That was invisible on Claude — its
+    /// `result` event carries the accumulated turn, so the final snapshot is
+    /// complete — and wrong on the three harnesses that end a turn by *exiting*:
+    /// press Stop on a long Codex, Antigravity or OpenCode answer and the prose
+    /// you were reading vanished, replaced by "Stopped.". The consumer's own
+    /// comment already promised the opposite ("keeping whatever partial answer
+    /// had streamed in").
     fn fail(&mut self, why: String) {
+        let mut segs = self.turn.segments();
+        segs.push(schemaic_core::transcript::Seg::Text(why));
+        self.end(segs);
+    }
+
+    /// End the turn with only what streamed in, adding nothing.
+    ///
+    /// For the user pressing Stop, which `main.rs`'s `mark_stopped` already
+    /// settles — it clears `pending`, puts the role back to `Assistant` so the
+    /// turn is not filed as an error, and appends the `(stopped)` marker. A
+    /// `fail("Stopped.")` here as well left the bubble reading
+    /// *answer* / "Stopped." / "(stopped)": two markers for one action, the
+    /// second of which is the one the panel actually owns.
+    fn stop(&mut self) {
+        let segs = self.turn.segments();
+        self.end(segs);
+    }
+
+    /// Send a final snapshot and reset for the next turn.
+    fn end(&mut self, segs: Vec<schemaic_core::transcript::Seg>) {
         let _ = self.ai_tx.send(AiStreamMsg {
-            segs: vec![schemaic_core::transcript::Seg::Text(why)],
+            segs,
             done: true,
             is_error: true,
             stats: None,
         });
         self.turn = schemaic_ai::TurnState::default();
     }
+}
+
+/// Answer every turn on a session that was refused before it started.
+///
+/// **A refused session still has to keep answering.** The refusal paths return
+/// their `tx` and spawn nothing, which drops `rx` and closes the channel — and
+/// `needs_respawn` does *not* rebuild a session whose settings have not changed,
+/// so `start_ai_session` is never re-entered and the next question is a
+/// discarded `Err` on a dead sender. The pending bubble spins until the user
+/// presses Stop, and nothing anywhere says why. That contradicted the comment at
+/// the refusal itself, which claimed "the next question re-enters here, where the
+/// same check applies".
+///
+/// This task is the cheap way to make that comment true: it holds `rx` open and
+/// re-states the reason for every turn, so the explanation is in front of the
+/// user each time they ask rather than once before silence.
+fn refuse_every_turn(
+    handle: &tokio::runtime::Handle,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionMsg>,
+    ai_tx: crossbeam_channel::Sender<AiStreamMsg>,
+    why: String,
+) {
+    handle.spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            // Stop on an idle panel is not a question, and needs no answer.
+            if matches!(msg, SessionMsg::Interrupt) {
+                continue;
+            }
+            let _ = ai_tx.send(AiStreamMsg {
+                segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+                done: true,
+                is_error: true,
+                stats: None,
+            });
+        }
+    });
 }
 
 /// Why a session must not start on this harness, or `None` to go ahead.
@@ -596,7 +675,7 @@ fn spawn_refusal(harness: Harness, constraint: Constraint) -> Option<String> {
     // off documentation, which dies on its first unknown flag and is reported as
     // an installation problem — the one thing that would not be wrong with it.
     match harness {
-        Harness::Claude | Harness::Codex | Harness::Antigravity => None,
+        Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode => None,
     }
 }
 
@@ -632,14 +711,16 @@ pub(crate) fn start_ai_session(
     let checked = probe(harness, &bin);
     if let Some(why) = spawn_refusal(harness, checked.constraint) {
         let _ = ai_tx.send(AiStreamMsg {
-            segs: vec![schemaic_core::transcript::Seg::Text(why)],
+            segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
             done: true,
             is_error: true,
             stats: None,
         });
-        // A live sender with no process behind it, exactly as the oversize arm
-        // below does: the panel shows the reason and the next question re-enters
-        // here, where the same check applies.
+        // **A task, not a bare sender.** Returning `tx` with nothing behind it
+        // closes the channel, and `needs_respawn` will not rebuild a session
+        // whose settings have not changed — so the *second* question was
+        // swallowed in silence and the panel spun. See `refuse_every_turn`.
+        refuse_every_turn(handle, rx, ai_tx, why);
         return (tx, None);
     }
 
@@ -673,6 +754,7 @@ pub(crate) fn start_ai_session(
         // global state written instead, which `AgyRegistration` owns and removes.
         let mut overrides = Vec::new();
         let mut agy_install: Option<(String, String)> = None;
+        let mut oc_config: Option<crate::opencode::OpenCodeConfig> = None;
         match (harness, ep_file.as_ref()) {
             (Harness::Codex, Some(p)) => {
                 overrides =
@@ -703,6 +785,56 @@ pub(crate) fn start_ai_session(
             // unconditionally, and Antigravity has none to lose.
             (Harness::Codex, None) => {
                 overrides = schemaic_ai::harness::codex_isolation_only();
+            }
+            // **OpenCode's whole configuration is a directory**, written here
+            // rather than per turn: the contents do not change between turns of
+            // one session, and the directory is deliberately reused across
+            // sessions so the CLI's plugin bootstrap is paid at most once. It is
+            // one `create_dir_all` and one small write, so unlike the
+            // Antigravity arm above there is nothing worth deferring off this
+            // thread.
+            //
+            // `None` for the endpoint file falls through to the arm below and
+            // refuses, rather than configuring an agent with no server: on this
+            // harness the config is also the *seal*, so there is no useful
+            // half-configured state the way there is for Codex.
+            (Harness::OpenCode, Some(p)) => {
+                oc_config =
+                    crate::opencode::OpenCodeConfig::write(&exe, &p.to_string_lossy(), allowed);
+            }
+            _ => {}
+        }
+        // **The one harness that refuses rather than degrading.** Every other
+        // path above has a meaningful reduced state — Codex keeps its isolation
+        // without our server, Antigravity runs with its tools denied and says so.
+        // OpenCode has none, because the file that would be missing is the same
+        // file that empties its built-in tools: `--agent schemaic` naming an
+        // agent that does not exist does not fail, it leaves the run on
+        // OpenCode's own `build` agent, which has `bash`. Refusing is the only
+        // direction that keeps `Constraint::Sealed` an honest answer.
+        let mut oc_env: Vec<(String, String)> = Vec::new();
+        match (harness, oc_config.as_ref()) {
+            (Harness::OpenCode, Some(c)) => {
+                tracing::debug!(dir = %c.root().display(), "opencode config written");
+                oc_env = c.env();
+            }
+            (Harness::OpenCode, None) => {
+                let why = "Schemaic could not write the configuration that restricts \
+                           OpenCode, so the assistant is disabled — running it without \
+                           that file would give the session a shell. Check that the \
+                           app's data directory is writable."
+                    .to_string();
+                let _ = ai_tx.send(AiStreamMsg {
+                    segs: vec![schemaic_core::transcript::Seg::Text(why.clone())],
+                    done: true,
+                    is_error: true,
+                    stats: None,
+                });
+                // Same reason as the constraint refusal above: without a task
+                // holding `rx`, every question after this one is dropped in
+                // silence rather than told why.
+                refuse_every_turn(handle, rx, ai_tx, why);
+                return (tx, ep_file);
             }
             _ => {}
         }
@@ -773,8 +905,21 @@ pub(crate) fn start_ai_session(
                     pump.fail(why);
                     continue;
                 }
-                let child = Command::new(&bin)
-                    .args(&args)
+                let mut cmd = Command::new(&bin);
+                cmd.args(&args);
+                // **Clear before set, and both are OpenCode's alone.** A child
+                // inherits our environment, so `OPENCODE_CONFIG` exported in the
+                // user's shell merges their file back into a session
+                // `XDG_CONFIG_HOME` was supposed to have isolated — the seal
+                // undone by the lever `crate::opencode` rejected for merging.
+                // Empty for every other harness, whose configuration is flags.
+                if harness == Harness::OpenCode {
+                    for k in crate::opencode::OpenCodeConfig::env_remove() {
+                        cmd.env_remove(k);
+                    }
+                }
+                cmd.envs(oc_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                let child = cmd
                     .current_dir(session_cwd())
                     // **Never piped.** `codex exec` reads stdin when it is a
                     // pipe and appends it to the prompt as a `<stdin>` block —
@@ -859,7 +1004,24 @@ pub(crate) fn start_ai_session(
                         },
                     }
                 }
-                let code = child.wait().await.ok().and_then(|s| s.code());
+                // **Release stdout before waiting, and bound the wait.** The
+                // loop above owns the read half; leaving it alive means a child
+                // that keeps writing past its terminal event fills the pipe and
+                // blocks forever in `wait()`, and `kill_on_drop` cannot help
+                // because `child` is not dropped until `wait()` returns. The
+                // task would never reach the outer `rx.recv()` again, so the
+                // session accepted no further questions and Stop could not reach
+                // it either — the inner `select!` was already gone. Dropping the
+                // reader closes the pipe, and the timeout covers a child that
+                // hangs for its own reasons.
+                drop(reader);
+                let code = match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+                    Ok(st) => st.ok().and_then(|s| s.code()),
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        None
+                    }
+                };
                 if !ended {
                     // The panel is still waiting either way, so the turn has to
                     // be closed here or it spins forever — but *why* it ended
@@ -867,7 +1029,7 @@ pub(crate) fn start_ai_session(
                     // stopped; reaching for the exit status there would blame the
                     // CLI for doing exactly what it was told.
                     if stopped {
-                        pump.fail("Stopped.".to_string());
+                        pump.stop();
                     } else {
                         let stderr_text = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
                         let joined = raw.join("\n");
@@ -2690,6 +2852,9 @@ mod tests {
                 stats: None,
                 pending: false,
                 attachment: None,
+                // These tests are about recap and history text, which the
+                // speaker label plays no part in.
+                harness: None,
             },
         }
     }

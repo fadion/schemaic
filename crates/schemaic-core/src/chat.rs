@@ -4,7 +4,7 @@
 //! resets it — so the store is keyed the same way and a switch back restores
 //! what was there instead of a blank panel.
 //!
-//! **A restored conversation is transcript, not memory.** The `claude` session
+//! **A restored conversation is transcript, not memory.** The agent-CLI session
 //! it belonged to is long gone; the next message spawns a fresh one. The app
 //! replays [`ChatMessage::prose`] into that session's system prompt so
 //! follow-ups still resolve, but tool calls and their results are not replayed
@@ -163,11 +163,71 @@ mod tests {
             stats: None,
             pending: false,
             attachment: None,
+            harness: None,
         }
     }
 
     fn turn(q: &str, a: &str) -> Vec<ChatMessage> {
         vec![user(q), reply(a)]
+    }
+
+    /// **Who answered survives being stored.** The speaker label is read off
+    /// `ChatMessage::harness`, so a conversation that comes back from
+    /// `chats.json` without it would restore correctly-worded answers under the
+    /// wrong name — or under none. This runs the real path (`save` → `ChatFile::of`
+    /// → JSON → back → `for_conn`) rather than a bare serde round-trip, because
+    /// `of` rebuilds every message to strip tool results and that is exactly the
+    /// kind of rebuild a field goes missing in.
+    #[test]
+    fn who_answered_each_turn_survives_the_round_trip_to_disk() {
+        let stamped = |h: &str, text: &str| ChatMessage {
+            harness: Some(h.to_string()),
+            ..reply(text)
+        };
+        // One conversation, three harnesses — the shape the user actually
+        // produced by switching CLI mid-thread.
+        let msgs = vec![
+            user("first"),
+            stamped("claude", "from claude"),
+            user("second"),
+            stamped("antigravity", "from antigravity"),
+            user("third"),
+            stamped("opencode", "from opencode"),
+        ];
+        let mut chats = Vec::new();
+        save(&mut chats, 7, &msgs);
+
+        let json = serde_json::to_string(&ChatFile::of(&chats)).expect("serialises");
+        let back: ChatFile = serde_json::from_str(&json).expect("parses");
+        let restored = for_conn(&back.chats, 7);
+
+        let names: Vec<Option<String>> = restored.iter().map(|m| m.harness.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                None,
+                Some("claude".to_string()),
+                None,
+                Some("antigravity".to_string()),
+                None,
+                Some("opencode".to_string()),
+            ]
+        );
+    }
+
+    /// A conversation written by a build that had no such field still loads, and
+    /// its answers are simply unattributed rather than misattributed.
+    #[test]
+    fn a_chats_file_from_before_the_harness_field_still_loads() {
+        let old = r#"{"chats":[{"conn_id":7,"messages":[
+            {"role":"User","text":"hi"},
+            {"role":"Assistant","text":"","segs":[{"Text":"hello"}]}
+        ]}]}"#;
+        let f: ChatFile = serde_json::from_str(old).expect("old chats.json still parses");
+        let restored = for_conn(&f.chats, 7);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[1].prose(), "hello");
+        assert_eq!(restored[1].harness, None);
     }
 
     /// **An attachment's cells never reach the file**, and the rule rested on
@@ -251,7 +311,7 @@ mod tests {
         let mut chats = Vec::new();
         let mut msgs = turn("done", "answered");
         msgs.push(user("interrupted"));
-        msgs.push(ChatMessage::pending());
+        msgs.push(ChatMessage::pending(None));
         save(&mut chats, 1, &msgs);
         let got = for_conn(&chats, 1);
         // Only the completed exchange survives.
@@ -262,7 +322,7 @@ mod tests {
     #[test]
     fn a_conversation_with_nothing_answered_is_not_stored() {
         let mut chats = Vec::new();
-        save(&mut chats, 1, &[user("hi"), ChatMessage::pending()]);
+        save(&mut chats, 1, &[user("hi"), ChatMessage::pending(None)]);
         assert!(chats.is_empty());
     }
 

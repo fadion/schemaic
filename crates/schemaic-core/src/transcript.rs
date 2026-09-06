@@ -1,9 +1,10 @@
 //! Rendered shape of one assistant turn in the AI panel.
 //!
-//! The AI crate accumulates a `claude` stream into these segments; the UI
-//! renders them (prose as markdown, tool calls as chips) and shows the
-//! per-turn [`TurnStats`] footer. Keeping the type here lets both crates share
-//! it without the UI depending on the CLI-integration crate.
+//! The AI crate decodes whichever harness's stream into these segments; the UI
+//! renders them (prose as markdown, tool calls as chips) and shows the per-turn
+//! [`TurnStats`] footer. Keeping the type here lets both crates share it without
+//! the UI depending on the CLI-integration crate — and is why
+//! [`ChatMessage::harness`] is a `String` rather than the `Harness` it names.
 //!
 //! These types are serializable so a conversation can outlive the process —
 //! see [`crate::chat`], which persists them per connection.
@@ -87,6 +88,21 @@ pub struct ChatMessage {
     /// Result rows the user attached to this question (user messages only).
     #[serde(default)]
     pub attachment: Option<Attachment>,
+    /// Which agent CLI produced this turn, as `Harness::key` (assistant/error
+    /// messages only).
+    ///
+    /// **Stamped when the turn starts, because a conversation can span several.**
+    /// The user switches CLI in Settings and asks the next question, so the panel
+    /// cannot label a reply from the *live* setting without relabelling every
+    /// earlier one — see `schemaic_ai::harness::speaker_label`, which is the only
+    /// thing that turns this back into a name.
+    ///
+    /// A `String` rather than the `Harness` itself: this crate is below
+    /// `schemaic-ai` and does not know that type. `None` means a transcript
+    /// written before this field existed, and is rendered neutrally rather than
+    /// guessed — `serde(default)` is what lets those keep loading.
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 impl ChatMessage {
@@ -98,6 +114,8 @@ impl ChatMessage {
             stats: None,
             pending: false,
             attachment: None,
+            // The user's own turn has no author to record.
+            harness: None,
         }
     }
 
@@ -110,7 +128,12 @@ impl ChatMessage {
     }
 
     /// Placeholder assistant message shown while the CLI runs.
-    pub fn pending() -> ChatMessage {
+    ///
+    /// Takes the harness rather than defaulting it, so the one place a turn
+    /// begins is the one place its author is recorded. A caller that does not
+    /// know passes `None` and the transcript says "ASSISTANT" instead of naming
+    /// the wrong CLI.
+    pub fn pending(harness: Option<String>) -> ChatMessage {
         ChatMessage {
             role: Role::Assistant,
             text: String::new(),
@@ -118,6 +141,7 @@ impl ChatMessage {
             stats: None,
             pending: true,
             attachment: None,
+            harness,
         }
     }
 
@@ -207,6 +231,31 @@ impl ChatMessage {
                 mix(3);
                 mix(a.summary.len() as u64);
                 mix(a.rows.len() as u64);
+            }
+        }
+        // The harness, which the speaker label above the bubble is drawn from.
+        // It is stamped once when the turn is created and never mutated, so by
+        // this function's own rule it need not be here at all — it is, because
+        // "immutable" is a property of today's call sites rather than of the
+        // type, and a label that froze on the wrong CLI's name is precisely the
+        // bug this field was added to fix. Cheap: a length, like everything else
+        // here.
+        match &self.harness {
+            None => mix(ABSENT),
+            Some(h) => {
+                mix(4);
+                mix(h.len() as u64);
+                // **The bytes, not just the length.** Everything else here is a
+                // length because the strings only ever *grow*; a harness key is
+                // swapped whole, so two keys of equal length would fingerprint
+                // identically and the bubble would keep its old speaker name —
+                // the exact bug this field exists to fix. Today's four keys have
+                // distinct lengths, which is luck, not a design: a fifth named
+                // `crush` or `cline` collides with `codex` on length alone.
+                // Keys are a handful of bytes; this costs nothing.
+                for b in h.as_bytes() {
+                    mix(*b as u64);
+                }
             }
         }
         MessageFingerprint {
@@ -530,6 +579,7 @@ mod tests {
             stats: None,
             pending: false,
             attachment: None,
+            harness: None,
         }
     }
 
@@ -688,11 +738,11 @@ mod tests {
     }
 
     /// **What the fingerprint has to catch**, because missing one freezes a
-    /// bubble's content on screen: every mutation the `claude` stream makes to a
+    /// bubble's content on screen: every mutation a harness's stream makes to a
     /// message in place.
     #[test]
     fn fingerprint_changes_on_every_mutation_the_stream_makes() {
-        let base = ChatMessage::pending();
+        let base = ChatMessage::pending(None);
         let fp = |m: &ChatMessage| m.fingerprint();
         let changed = |edit: fn(&mut ChatMessage)| {
             let mut m = base.clone();

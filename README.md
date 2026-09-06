@@ -84,12 +84,13 @@ production data, or any data you care about.
   line, and for SQLite starting in the database file's own directory so `.output`
   and `.read` land where you'd expect.
 - **AI assistant** — an agent-CLI session wired into the app rather than bolted
-  beside it, driving **your own** installed CLI: Claude Code, Codex or
-  Antigravity, picked in Settings → AI along with the model id, which is a free
-  text field rather than a list this build happens to know. What each one is
-  allowed to do differs and the panel says so — only Claude Code can be given no
-  built-in tools at all; the others run read-only, and Schemaic will not start a
-  session on a binary it could not confirm it can restrict. Then: **AI Fix** on a
+  beside it, driving **your own** installed CLI: Claude Code, Codex,
+  Antigravity or OpenCode, picked in Settings → AI along with the model id, which
+  is a free text field rather than a list this build happens to know. What each
+  one is allowed to do differs and the panel says so — Claude Code and OpenCode
+  can be given no built-in tools at all; the other two run read-only, and
+  Schemaic will not start a session on a binary it could not confirm it can
+  restrict. Then: **AI Fix** on a
   failed query, which hands it the error and the query
   and offers you the corrected SQL as a diff; rewrite the statement
   under the caret and accept or reject that diff yourself (Ctrl+K); explain or
@@ -99,7 +100,7 @@ production data, or any data you care about.
   lets it read your schema and query the database, so answers are about your data
   rather than a generic guess — on every harness, and never beyond what that
   connection's data-access setting allows. The one-shot generators (Ctrl+K, AI
-  Fill, AI Seed) run Claude Code whichever harness the chat panel is using.
+  Fill, AI Seed) run whichever harness the chat panel is using.
 - **Themeable** — dark / light UI themes, multiple editor color schemes, and an
   interface scale (80% / 100% / 130% / 160%) for the app's own text and rows.
 
