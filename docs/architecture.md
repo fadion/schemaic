@@ -5143,14 +5143,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   had: it returns `None` for a key this build does not know, and `main.rs` warns and falls back to
   Claude rather than coercing, so a `ui_state.json` still saying `"gemini"` takes the path that was
   built for exactly this (`gemini_is_gone_and_its_persisted_key_resolves_to_nothing`).
-  `Constraint::notice` reaches the user in two places and no third: under the settings modal's
+  `Constraint::notice` reaches the user in three places and no fourth: under the settings modal's
   *Agent CLI* dropdown, where it describes the grade the selected binary would run at before a
-  session is started, and in what `spawn_refusal` prints when the session is refused outright. It
+  session is started, in what `spawn_refusal` prints when the session is refused outright, and — since
+  the one-shot paths gained that same gate — in what `ai::inline_plan` hands back when it refuses. It
   does not reach the AI panel itself, so a *runnable but weaker* session that was configured in an
-  earlier sitting carries no reminder. Inline generation (Ctrl+K, AI Fill, AI Seed) stays Claude-only
-  through `inline_claude_bin` **and `inline_claude_model`** whatever the picker says, because that
-  argv is `inline_args` — the binary and the model id are the two halves of one rule, and for a
-  while only the first half existed. A
+  earlier sitting carries no reminder. **Inline generation (Ctrl+K, AI Fill, AI Seed) runs on the
+  harness the picker names**, on that harness's own flags: `harness::inline_argv` is the closed
+  counterpart of `turn_args`, and Claude's arm of it is `inline_args`, which was the whole of this
+  path for as long as all three features spawned `claude` regardless of the selection. Why they did,
+  and the bug that made that the safe answer at the time, is under `app/agent_cli.rs`. A
   harness key `main.rs` does not recognise is `tracing::warn!`ed and falls back to Claude.
   **Getting the tools to each harness is four different mechanisms, and only Claude's is per
   invocation.** Claude gets a temp `--mcp-config` file; Codex gets `-c` overrides on its own command
@@ -5268,9 +5270,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   CLI lacking every sealing flag. A non-zero exit yields `CliSeal::ALL`; stderr is folded in beside
   stdout only as a fallback for a CLI that prints its usage there.
   `build_session_args` and `inline_args` both take one and
-  turn it into argv through the single private `seal_args`, so the session and the one-shot paths
+  turn it into argv through the single private `seal_args`, so Claude's session and one-shot paths
   cannot come to seal themselves differently — the one-shot paths being the ones with no surface
-  that would show it if they did. A version number would only stand in for the answer `--help`
+  that would show it if they did. `CliSeal` is Claude's alone: the other three are sealed by their
+  own arm of `harness::turn_args` or `harness::inline_argv`, and `InlineSpec::seal` is carried past
+  them unread. A version number would only stand in for the answer `--help`
   gives directly, and would need a table mapping releases to flags that nothing in this repository
   can keep true.
   **The failure direction is deliberate and is the security-relevant half.** An empty or unreadable
@@ -5324,20 +5328,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   rather than once at startup, so changing the override re-warms the key that will actually be
   used — and the effect reads the **harness** signal as well, since that is the other half of the
   key and a second way to warm an entry nobody reads.
-  **The effect warms two entries, because the inline paths do not use the selected harness.** Ctrl+K,
-  AI Fill and AI Seed always probe `(Claude, inline_claude_bin(..))`, which is a different key from
+  **One key now covers every AI entry point, and it took two goes to get there.** Ctrl+K, AI Fill and
+  AI Seed used to probe `(Claude, <claude bin>)` whatever was selected, which is a different key from
   `(selected harness, its bin)` whenever the selection is not Claude — so with Codex, Antigravity or
   OpenCode chosen, every Ctrl+K paid a blocking, timeout-free `claude --help` on the Floem UI thread.
-  That is verbatim the regression this function's own doc says it prevents, reintroduced through the
-  second key rather than through the path. The effect now warms the Claude entry as well when the
-  selection is something else; it costs one thread at startup, and nothing once the entry is there.
-  **`inline_args` is sealed the same way, and its case is sharper.** Ctrl+K, AI Fill and AI Seed
-  each want one string back that a parser then reads, and none of them has a surface that could
-  render a tool call — so where the chat panel merely stalls on a tool it cannot prompt for, those
-  three would have run one *invisibly*. They pass no `--mcp-config` at all, so `--strict-mcp-config`
-  leaves them with no servers, which is correct: the whole request is in the prompt
-  (`a_one_shot_generation_is_given_no_tools_and_no_servers`, and `inline_args_flags_in_order` holds
-  the exact argv).
+  That was verbatim the regression this function's own doc says it prevents, reintroduced through a
+  second key rather than through the path, and the effect was made to warm the Claude entry alongside.
+  The one-shot paths build their own harness's argv now (`ai::inline_plan`), so they read the key the
+  effect already warms and the second warm is **deleted rather than kept as insurance** — an entry
+  nobody reads is the thing this whole passage is about.
+  **The one-shot argv is sealed the same way a session's is, and its case is sharper.** Ctrl+K, AI
+  Fill and AI Seed each want one string back that a parser then reads, and none of them has a surface
+  that could render a tool call — so where the chat panel merely stalls on a tool it cannot prompt
+  for, those three would have run one *invisibly*. So `harness::inline_argv` hands no harness a
+  server: no `--mcp-config` (Claude's `--strict-mcp-config` then leaves it with none), no `-c`
+  carrying `mcp_servers` on Codex, and an OpenCode config with the `mcp` block left out. The whole
+  request is in the prompt (`no_inline_generation_is_given_a_server_or_a_session` over
+  `Harness::ALL`, `a_one_shot_generation_is_given_no_tools_and_no_servers` for Claude's arm, and
+  `inline_args_flags_in_order` holds its exact argv).
   - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
     `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`) is **a dialect rather than a vendor**: the
     variant names the wire format a binary speaks, which is the only thing decoding needs to know,
@@ -5695,6 +5703,58 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     reason `AgyRegistration`'s allow-rules exist. Its own help calls the flag dangerous, and passing
     it would buy nothing while pre-approving whatever a future build adds to the tool set
     (`a_turn_never_passes_the_auto_approve_flag`).
+    **`inline_argv` is the closed counterpart of `turn_args`, and "closed" is the whole
+    specification.** Ctrl+K, AI Fill and AI Seed each want one string back that a parser then reads,
+    so `InlineSpec` carries intent, system, model, seal, `isolate_config` and Codex's `last_message`
+    and nothing else — there is no field for a server, an approval map or a resume id, because no arm
+    may have one. On every harness the argv is free of `--mcp-config`, of a `-c` carrying
+    `mcp_servers`, and of anything that resumes a thread this one-shot never saw
+    (`no_inline_generation_is_given_a_server_or_a_session` runs the forbidden list over
+    `Harness::ALL`, narrowing Codex's one permitted `-c` to `sandbox_mode=` rather than exempting the
+    flag). Claude's arm delegates to `crate::inline_args` unchanged: it was the whole of this path for
+    as long as the other three spawned Claude regardless of the picker, and is now one of four.
+    Measured against the installed binaries, Codex is `exec --ephemeral --skip-git-repo-check
+    --sandbox read-only --color never`, then `--ignore-user-config` when the probe saw it, then
+    `--model`, then `-c sandbox_mode="read-only"`, then `-o <file>`, then the prompt as the last
+    positional; Antigravity is `-p <prompt> --output-format text --sandbox --disable-slash-commands`
+    plus `--model`; OpenCode is `run --pure --agent schemaic --format default` plus `--model`, prompt
+    last. **`--output-format text` is named on Antigravity although it is the default**, because the
+    session path asks that same binary for `stream-json` and a default that moved would put a JSONL
+    envelope where a parser expects SQL.
+    **Codex is the only harness whose reply is read from a file, and that is a contract rather than an
+    observation.** `inline_output` is where that lives — `LastMessageFile` for Codex, `Stdout` for the
+    other three — and the reason is that `codex exec` without `--json` prints *for a person*:
+    measured, this build writes the final message alone, but that is a statement about a human-facing
+    surface and not a promise, while `-o/--output-last-message` is documented as the file the last
+    message is written to. `--color never` rides along for the same reason: escapes in a rendering
+    nobody parses cost nothing, and escapes in a reply that lands in the editor do. OpenCode needs no
+    such split — measured, its decoration and model banner go to **stderr** and stdout carries the
+    answer alone (`codex_writes_its_last_message_where_it_was_told_to`,
+    `every_inline_generation_asks_for_plain_text`).
+    **OpenCode's one-shot gets its own config, and the difference from the session's is the whole
+    `mcp` block.** `opencode_inline_config_json` defines the same sealed `schemaic` agent and
+    registers no server at all: a chat turn is meant to reach the database, while a one-shot answers
+    from the prompt and has nowhere to render a tool call, so a server here would be a tool handed to
+    the one path that could not show it had been used. The agent is still defined, because without it
+    the `--agent` in the argv selects nothing and OpenCode falls back to `build`, which has every
+    built-in (`the_inline_opencode_config_defines_the_agent_and_no_server`). The twelve-name tool map
+    is `sealed_tools`, extracted so this config and `opencode_config_json` cannot come to disagree
+    about which built-ins are off — the same reason `seal_args` is shared by Claude's two argv
+    builders — and the denylist-by-omission caveat above applies to both of them equally.
+    **One hole the argv cannot close, and it is Antigravity's.** Everything above is a guarantee about
+    a command line, and Antigravity is the harness with no per-invocation configuration at all: its
+    server is registered *globally* by `AgyRegistration` for the life of a chat session. A one-shot
+    fired while an Antigravity chat session is open therefore runs against a live registration and its
+    standing `permissions.allow` rules, and no flag in this argv can take them away. That is reasoned
+    from the mechanism rather than measured, and it is written down because "no inline generation is
+    given a server" is exactly the sentence that would otherwise be read as covering it.
+    **`cli_failure_message` takes the harness now, and that is not decoration.** Its last-resort arm
+    said *"the claude CLI exited with status N"* whatever had run, so a user who had picked Codex was
+    sent to check an installation that was not the one that failed — the same wrong-cause report the
+    Claude-only inline rule existed to prevent, arriving by a different door the moment all four
+    harnesses could run a one-shot. The stderr → stdout → status order is unchanged, and it is that
+    order because the CLI writes some fatal errors (an expired OAuth session among them) to stdout
+    with an empty stderr, so surfacing stderr alone yields a blank.
     With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` are the four, and every
     argv here is for a binary somebody has run: what remains unverified is a *flag* on a driven
     harness — the Antigravity resume above — rather than a whole harness nobody could sign in to.
@@ -9388,15 +9448,32 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (`the_inline_editor_block_cannot_be_closed_from_inside_it`, which also counts the fences so a
   payload's own three-backtick line reaches no margin). And at `SchemaScope::None` the
   withheld-schema note tells the model to use **only what the editor already names** rather than to
-  ask the user: Ctrl+K is one `claude -p` with no stdin and no session, under a preamble whose
+  ask the user: Ctrl+K is one one-shot spawn with no stdin and no session, under a preamble whose
   first sentence is "Output ONLY SQL — no prose", so a question is the one thing it cannot carry
   out. Given an instruction it cannot obey beside one it can, it obeyed the one it could and
   invented `orders(placed_at)`, and the invented SQL landed at the caret with nothing on screen
   marking it as ungrounded (`the_withheld_schema_note_is_something_a_one_shot_can_do`). The chat
   panel's wording is right *there*, where the model can answer back.
+  **One spawn shared by all three one-shot features, because they had drifted apart.** `inline_plan`
+  resolves the selected harness into a runnable `InlinePlan` — binary, argv, where the reply comes
+  back from, and OpenCode's environment — or hands back the reason it will not run, and `run_inline`
+  executes it. Each of Ctrl+K, AI Fill and AI Seed carried its own copy of that before: two passed
+  `Stdio::null()` and Ctrl+K did not, so Ctrl+K alone paid the CLI's wait on a stdin that was never
+  going to arrive. **It also carries the gate the inline paths never had.** They read the probe for
+  Claude's seal flags and spawned whatever it said about the *constraint*, which was survivable while
+  they were Claude-only — an unsealed Claude is a refusal at `start_ai_session`, and inline never
+  reached that function — but a one-shot can be Codex or Antigravity now, whose constraint *is* the
+  sandbox flag, so `spawn_refusal` is asked here for the same reason it is asked there, and the
+  oversize check sits beside it. `inline_reply_path` is Codex's `-o` temp file, named with
+  `MCP_FILE_PREFIX` so the existing `sweep_stale_mcp_configs` collects it if the process dies between
+  the spawn and the read; `run_inline` reads and removes it whatever the exit status, so a failed run
+  that still wrote one leaves nothing for the sweeper.
   **What comes back is gated, not trusted**: `inline_outcome` runs `extract_sql` (fences off) and
   then `intel::sql_reply` (the parse gate above), and a reply that will not parse becomes
-  `Failed("The model did not return SQL")` rather than an edit. The composition is what the caller
+  `Failed("The model did not return SQL")` rather than an edit. It takes the runner's
+  `Result<String, String>` rather than the raw `(success, stdout, stderr)` it used to, because reading
+  the reply is no longer one thing — three harnesses answer on stdout and Codex answers in a file —
+  and that decision belongs with the argv that made it. The composition is what the caller
   relies on, so it is pinned *here* as well as in `intel` —
   `inline_outcome_drops_a_tool_diagnostic_riding_on_the_sql` puts the chatter inside the fences,
   where neither function alone would have to deal with it, and
@@ -9525,25 +9602,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     assistant for the rest of the run, saying the constraint could not be confirmed and offering no
     retry path anywhere. `probe` now returns that answer early without inserting it, so the next
     attempt is free to ask again.
-    **Inline generation is Claude-only, and `inline_claude_bin` is where that is enforced.** Ctrl+K,
-    AI Fill and AI Seed build their argv with `schemaic_ai::inline_args`, which is Claude's flag set,
-    so all three spawn Claude whatever drives the chat panel. The override is honoured **only when
-    Claude is the selected harness**: `ai_cli_path` follows the selection, so on Codex it is a path
-    to `codex`, and handing that to a Claude-flagged spawn runs the wrong binary with flags it has
-    never heard of (`the_inline_paths_never_spawn_another_harnesss_binary`). With another harness
-    selected it auto-detects Claude and fails with the ordinary "not installed" message, which is the
-    truth: those three features need Claude and it is not there.
-    **`inline_claude_model` is the other half of that rule, and for a while only the first half
-    existed.** `ai_model` follows the selection as well — under Codex the suggestion chips are
-    `gpt-5.4`, `gpt-5.4-codex`, `o3` — so the binary was guarded against another harness while the
-    model id travelled anyway, and Ctrl+K after picking one spawned `claude` with
-    `--model gpt-5.4-codex`, dying on an unknown model under the same "check your installation"
-    message covering the same wrong cause. It answers empty unless Claude is the selected harness, and
-    `inline_args` omits an empty `--model`, so the generation falls back to Claude's own default;
-    guessing a Claude equivalent for the id the user picked would be inventing a mapping between two
-    vendors' catalogues (`the_inline_paths_never_pass_another_harnesss_model_id`, and
-    `the_inline_binary_and_the_inline_model_agree_on_who_is_selected`, which holds the two
-    functions to one answer about who is selected rather than testing each alone).
+    **Inline generation follows the picker now, and for a while it deliberately did not.** Ctrl+K, AI
+    Fill and AI Seed build their argv with `harness::inline_argv` and resolve their binary through the
+    same `harness_bin(selected, override)` the chat panel uses, so the AI CLI override and the model
+    id belong to whichever CLI is selected, exactly as they do everywhere else
+    (`the_inline_paths_use_the_selected_harnesss_own_binary`, which holds the override for every
+    harness in `Harness::ALL`).
+    **What that replaced was `inline_claude_bin` and `inline_claude_model`, and the bug behind them is
+    why this paragraph is still here.** While all three features spawned `claude` whatever drove the
+    chat panel, the override and the model followed the selection anyway: `ai_cli_path` on Codex is a
+    path to `codex`, and handing that to a Claude-flagged spawn runs the wrong binary with flags it
+    has never heard of. `inline_claude_bin` withheld the override for that reason, and the second half
+    took longer to arrive — `ai_model` follows the selection too, so under Codex the suggestion chips
+    are `gpt-5.4`, `gpt-5.4-codex`, `o3`, and Ctrl+K after picking one spawned `claude` with
+    `--model gpt-5.4-codex`, dying on an unknown model under a "check your installation" message
+    naming the wrong cause. Both functions and their three tests are gone, because the rule they
+    enforced — withhold the override path *and* the model id from every harness but Claude — is not a
+    rule any more: the argv is the selected harness's own. The failure they guarded is not gone with
+    them, and it is now answered in two other places: each arm of `inline_argv` is built for the
+    harness it names, and `cli_failure_message` takes a `Harness` rather than reporting every failure
+    as Claude's.
   - `antigravity.rs` — the two pieces of that CLI's **global** state a Schemaic session needs, owned
     for the life of the session and taken back out again. It is the only harness configured by
     writing into the user's *own* files — the others take a flag, a `-c` override, or (OpenCode) a
@@ -9611,8 +9689,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     a registration that did not take is `tracing::warn!`ed rather than left to be discovered.
   - `opencode.rs` — the config directory an OpenCode session is sealed by, and the environment that
     points the CLI at it. `OpenCodeConfig::write` puts `harness::opencode_config_json` on disk and
-    hands back the root; `env()` is what the child `Command` gets, `env_remove()` is what it must
-    *clear*; `root()` is for logging and tests.
+    hands back the root, `write_inline` does the same for a one-shot with
+    `harness::opencode_inline_config_json`; `env()` is what the child `Command` gets, `env_remove()`
+    is what it must *clear*; `root()` is for logging and tests.
+    **The two configs get separate roots, and that is not tidiness.** Both are the file
+    `<root>/opencode/opencode.json`, so one shared root would leave whichever ran last deciding
+    whether a server is registered — a Ctrl+K quietly stripping the server from a chat session running
+    beside it, or a chat session handing its server to the one path with nowhere to render a tool
+    call. `write` takes `private_dir("opencode")` and `write_inline` takes
+    `private_dir("opencode-inline")`; two roots cannot race. The inline root is reused on the same
+    terms as the session's, and `harness::inline_argv` passes `--pure` for the same reason `turn_args`
+    does. `write_inline` returning `None` must refuse just as hard, and for the same reason —
+    `--agent schemaic` naming an agent that does not exist runs on `build`, which has `bash` — which
+    is the refusal `ai::inline_plan` makes.
     **A directory rather than a file, because the file levers are additive.** That CLI has no
     `--config` flag, and the two environment variables that look like the answer are not one:
     measured against the installed binary, `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` both
@@ -10176,10 +10265,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   had deliberately attached under this gate were one tool call away from leaving anyway — and tools
   from that set were measured *executing inside a turn without raising a permission request at all*,
   so nothing would have stood between the attachment and the send.
-  `schemaic_ai::build_session_args` and `inline_args` close that with `--tools ""` on every CLI
+  `schemaic_ai::build_session_args` and `inline_args` close that with `--tools ""` on a `claude`
   whose `--help` advertises the flag, and fall back to the twenty-nine-name denylist on one that
   does not rather than dying on an unknown option — see `schemaic-ai`, which is also where the
-  reason the denylist could not do it on its own is written down.
+  reason the denylist could not do it on its own is written down. The other three harnesses close it
+  by their own mechanism rather than by that flag, on the session path through `harness::turn_args`
+  and on the one-shot path through `harness::inline_argv`, and how far each gets is `Constraint`.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where

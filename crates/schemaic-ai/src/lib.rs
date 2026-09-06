@@ -314,10 +314,12 @@ pub fn inline_args(intent: &str, system: &str, model: &str, seal: CliSeal) -> Ve
         "--append-system-prompt".into(),
         system.into(),
     ];
-    // Empty means Claude's own default — see [`build_session_args`]. It arrives
-    // here whenever another harness drives the chat panel, because the model the
-    // user picked there is that harness's and `agent_cli::inline_claude_model`
-    // declines to hand it to a Claude spawn.
+    // Empty means Claude's own default — see `build_session_args`. It arrives
+    // here when the user has cleared the model field: this arm is reached only
+    // with Claude selected, so the id it would carry is Claude's own. (It used
+    // to arrive whenever *another* harness was selected, back when all three
+    // one-shot features spawned Claude regardless and the model id was withheld
+    // to keep another vendor's id off Claude's command line.)
     if !model.trim().is_empty() {
         a.push("--model".into());
         a.push(model.into());
@@ -345,29 +347,45 @@ pub const fn arg_limit() -> usize {
 ///
 /// The message names the lever the user actually has. The system prompt carries
 /// the schema outline, and the AI schema scope is a setting.
-pub fn oversize_reason(args: &[String], limit: usize) -> Option<String> {
+pub fn oversize_reason(
+    harness: crate::harness::Harness,
+    args: &[String],
+    limit: usize,
+) -> Option<String> {
     // Roughly what the OS sees: the arguments plus a separator each.
     let total: usize = args.iter().map(|a| a.len() + 1).sum();
     let longest = args.iter().map(String::len).max().unwrap_or(0);
     if total <= limit && longest <= limit {
         return None;
     }
+    let name = harness.label();
     Some(format!(
-        "The context sent to Claude is too large for one command line \
+        "The context sent to {name} is too large for one command line \
          ({total} characters; this platform allows about {limit}). Narrow \
          Settings → AI → schema scope to the active database (or None), or \
          shorten the query in the editor."
     ))
 }
 
-/// Build a legible error message for a failed one-shot `claude` invocation.
+/// Build a legible error message for a failed CLI invocation, on any harness.
+///
+/// **`harness` is not decoration.** The fallback arm used to say "the claude CLI
+/// exited with status N" whatever had run, which put the wrong CLI's name in
+/// front of a user who had picked another one — the same wrong-cause failure the
+/// deleted `agent_cli::inline_claude_bin` was written to prevent, arriving by a
+/// different door once all four harnesses could run a one-shot.
 ///
 /// The CLI writes some fatal errors — notably `Failed to authenticate: OAuth
 /// session expired …` — to **stdout**, not stderr, and often with an empty
 /// stderr. Surfacing stderr alone therefore yields a blank error, so prefer
 /// stderr, fall back to stdout, and finally to the exit status. Pure so it's
 /// unit-tested; both AI grid callbacks (fill / seed) use it.
-pub fn cli_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+pub fn cli_failure_message(
+    harness: crate::harness::Harness,
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> String {
     let err = stderr.trim();
     if !err.is_empty() {
         return err.to_string();
@@ -376,9 +394,10 @@ pub fn cli_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> Str
     if !out.is_empty() {
         return out.to_string();
     }
+    let name = harness.label();
     match code {
-        Some(c) => format!("the claude CLI exited with status {c}"),
-        None => "the claude CLI was terminated by a signal".to_string(),
+        Some(c) => format!("the {name} CLI exited with status {c}"),
+        None => format!("the {name} CLI was terminated by a signal"),
     }
 }
 
@@ -1047,11 +1066,16 @@ mod tests {
 
     #[test]
     fn cli_failure_prefers_stderr_then_stdout_then_status() {
+        use crate::harness::Harness;
         // stderr wins when present.
-        assert_eq!(cli_failure_message(Some(1), "out", "boom"), "boom");
+        assert_eq!(
+            cli_failure_message(Harness::Claude, Some(1), "out", "boom"),
+            "boom"
+        );
         // The real-world case: auth error on stdout, empty stderr → show stdout.
         assert_eq!(
             cli_failure_message(
+                Harness::Claude,
                 Some(1),
                 "Failed to authenticate: OAuth session expired and could not be refreshed\n",
                 "   "
@@ -1060,12 +1084,35 @@ mod tests {
         );
         // Both empty → fall back to the exit status (never a blank message).
         assert_eq!(
-            cli_failure_message(Some(2), "", ""),
-            "the claude CLI exited with status 2"
+            cli_failure_message(Harness::Claude, Some(2), "", ""),
+            "the Claude Code CLI exited with status 2"
         );
         assert_eq!(
-            cli_failure_message(None, "", ""),
-            "the claude CLI was terminated by a signal"
+            cli_failure_message(Harness::Claude, None, "", ""),
+            "the Claude Code CLI was terminated by a signal"
+        );
+    }
+
+    /// **The message named Claude whatever had actually failed**, which is the
+    /// same wrong-cause failure `inline_claude_bin` was written for: a user who
+    /// picked Codex, whose Codex spawn died silently, was told to check an
+    /// installation of a CLI they may not even have. Now that all four harnesses
+    /// run inline generations, the one message they share has to say which one.
+    #[test]
+    fn a_failure_names_the_harness_that_actually_failed() {
+        use crate::harness::Harness;
+        for h in Harness::ALL {
+            let m = cli_failure_message(h, Some(3), "", "");
+            assert!(
+                m.contains(h.label()),
+                "{h:?} was reported as something else: {m}"
+            );
+        }
+        // And a harness with something to say still says it, rather than being
+        // replaced by its own name.
+        assert_eq!(
+            cli_failure_message(Harness::Codex, Some(1), "", "no such model"),
+            "no such model"
         );
     }
 
@@ -1224,7 +1271,10 @@ mod tests {
             &[],
             CliSeal::ALL,
         );
-        assert_eq!(oversize_reason(&args, arg_limit()), None);
+        assert_eq!(
+            oversize_reason(crate::harness::Harness::Claude, &args, arg_limit()),
+            None
+        );
     }
 
     #[test]
@@ -1234,9 +1284,26 @@ mod tests {
         // installation that is fine.
         let huge = "x".repeat(40_000);
         let args = build_session_args(&huge, None, None, None, &[], CliSeal::ALL);
-        let why = oversize_reason(&args, 30_000).expect("must refuse");
+        let why =
+            oversize_reason(crate::harness::Harness::Claude, &args, 30_000).expect("must refuse");
         assert!(why.contains("schema scope"), "{why}");
         assert!(!why.contains("installed"), "{why}");
+    }
+
+    /// The same wrong-cause failure [`cli_failure_message`] was fixed for, one
+    /// door over: every harness reaches this now that the one-shot paths build
+    /// their own argv, and telling a Codex user their context is "too large for
+    /// Claude" names a CLI they may not have installed.
+    #[test]
+    fn an_oversize_refusal_names_the_harness_it_was_built_for() {
+        let args = vec!["-p".to_string(), "y".repeat(200)];
+        for h in crate::harness::Harness::ALL {
+            let why = oversize_reason(h, &args, 150).expect("must refuse");
+            assert!(
+                why.contains(h.label()),
+                "{h:?} was named as something else: {why}"
+            );
+        }
     }
 
     #[test]
@@ -1245,6 +1312,6 @@ mod tests {
         // at `MAX_ARG_STRLEN` — a total-only check would pass and the spawn
         // would still fail.
         let args = vec!["-p".to_string(), "y".repeat(200)];
-        assert!(oversize_reason(&args, 150).is_some());
+        assert!(oversize_reason(crate::harness::Harness::Claude, &args, 150).is_some());
     }
 }

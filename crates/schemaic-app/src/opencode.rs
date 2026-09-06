@@ -79,6 +79,28 @@ impl OpenCodeConfig {
         Some(Self { root })
     }
 
+    /// The same, for a one-shot generation: the sealed agent and **no** server.
+    ///
+    /// **A directory of its own, and that is not tidiness.** Both configs are
+    /// the file `<root>/opencode/opencode.json`, so writing one into the other's
+    /// root would leave whichever ran last deciding whether a server is
+    /// registered — an inline generation could hand the session's server to a
+    /// path with nowhere to show a tool call, or a Ctrl+K could quietly strip
+    /// the server from a chat session running beside it. Two roots cannot race.
+    ///
+    /// `None` for the same reason [`OpenCodeConfig::write`] returns it, and the
+    /// caller must refuse just as hard: `--agent schemaic` naming an agent that
+    /// does not exist runs on `build`, which has every built-in including
+    /// `bash`.
+    pub(crate) fn write_inline() -> Option<Self> {
+        let root = schemaic_core::persist::private_dir("opencode-inline")?;
+        let dir = root.join("opencode");
+        std::fs::create_dir_all(&dir).ok()?;
+        let cfg = schemaic_ai::harness::opencode_inline_config_json();
+        std::fs::write(dir.join("opencode.json"), cfg).ok()?;
+        Some(Self { root })
+    }
+
     /// The environment a turn's child process needs.
     ///
     /// **`XDG_CONFIG_HOME` must be absolute.** A relative value made the CLI try
