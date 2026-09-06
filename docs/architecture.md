@@ -5178,11 +5178,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   Antigravity session sees every server they have registered alongside ours. The per-tool
   `permissions.allow` rules cover only the four `mcp(schemaic/<tool>)` names, so a user whose own
   settings already allow their own servers' tools has those live inside Schemaic's SQL assistant.
-  Written down rather than fixed, because an undocumented gap is the one that gets assumed shut.
+  Written down rather than fixed, because an undocumented gap is the one that gets assumed shut —
+  and it is asked as `harness::Harness::isolates_mcp_servers` so the surface that matters to the
+  *user* can read it too: `Constraint::notice` says in the panel that this harness's MCP surface is
+  not Schemaic's to restrict.
   **OpenCode displaces them as well, and is the one that does it without touching anything of the
   user's** — `XDG_CONFIG_HOME` pointed at Schemaic's own directory takes their registered servers
   out of the resolved config entirely (measured: they vanish from `opencode debug config`), and
-  because nothing of theirs was edited there is nothing to put back and no startup sweep. Note what
+  because nothing of theirs was edited there is nothing to put back. It does have a startup sweep,
+  but for a different currency: the roots are Schemaic's own, so a leftover costs disk rather than a
+  standing grant in somebody else's config. Note what
   does **not** do this: `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` both **merge** with the
   user's own file rather than replacing it, so a config naming only our server resolved to ours
   *alongside* theirs. They are the obvious lever and the wrong one, which is why that is written here
@@ -5401,12 +5406,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`supports_effort`, `effort_levels`, `effort_arg`, `supports_resume`, `is_persistent`,
     `session_turn_line`, `session_interrupt`, `session_system_in_first_turn`,
     `streams_deltas`, `supports_model_choice`, `suggested_models`, `restricted_means_sandbox`,
-    `seals_by_flag`, `help_args`) — the same reason the engine
+    `seals_by_flag`, `isolates_mcp_servers`, `help_args`) — the same reason the engine
     predicates exist:
     `== Harness::Claude` compiles cleanly while sorting the next CLI onto whichever side it happens
     to fall. **There is no exception left.** `Constraint::notice` was documented here as the one
     deliberate `h == Harness::Claude`, and OpenCode is exactly the fourth CLI that shape sorts wrong;
-    it is now two capabilities, described below.
+    it is now three capabilities, described below, and there is no `== Harness::` left in that
+    `match` — the comment paragraph that used to defend the identity check as "a harness question"
+    went with it, since it stood next to the paragraph explaining why it was not.
     **`suggested_models` is a menu, never a permitted set**, and the distinction is the whole reason
     it returns a slice rather than the field being a dropdown: the model id is a free string, so a
     list here is the aliases each CLI documents as stable and anything dated, private or newer than
@@ -5478,9 +5485,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     returns `None` for `Sealed` — a banner on every sealed session is how a user learns to ignore
     the two grades that mean something.
     **A notice says what *this* harness gives you and stops there.** `Restricted` reads
-    *"`<Harness>` runs read-only: it cannot write files or run commands, but its built-in tools can
-    still read this machine"*, and it used to close with *"Only Claude Code can be given no built-in
-    tools at all"* — a statement about the grade turned into an advertisement for the
+    *"`<Harness>` runs sandboxed: its own built-in tools cannot write files or run commands, though
+    they can still read this machine"*, and it used to close with *"Only Claude Code can be given no
+    built-in tools at all"* — a statement about the grade turned into an advertisement for the
     harness the user had just declined, printed in the one place they were exercising the choice.
     `the_weaker_grades_say_so_and_the_strongest_stays_quiet` pins both halves, the second over every
     harness × every non-`Sealed` grade: a notice may name Claude only when the harness *is* Claude.
@@ -5497,15 +5504,38 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     justification.** OpenCode is the fourth CLI it sorts onto the wrong side: its seal is a `tools` map
     and it has no sandbox at all, so the fallthrough would have promised an OS-enforced read-only that
     nothing enforces — the strongest kind of false claim, made to the user as a positive assurance. The
-    question is now two capabilities. `restricted_means_sandbox` (Codex, Antigravity) picks the sandbox
-    sentence, and `only_a_sandboxed_harness_is_told_the_os_is_stopping_it` holds the two to each other
-    over `Harness::ALL`. `seals_by_flag` (Claude alone) picks the denylist line, because *"updating the
+    question is now three capabilities. `restricted_means_sandbox` (Codex, Antigravity) picks the
+    sandbox sentence. `seals_by_flag` (Claude alone) picks the denylist line, because *"updating the
     CLI restores the full seal"* is advice that fixes nothing where the seal is configuration —
-    OpenCode reaches `Sealed` too, and by a file
-    (`only_a_flag_sealed_harness_is_told_an_update_would_help`). A third arm catches a harness that is
+    OpenCode reaches `Sealed` too, and by a file. A third arm catches a harness that is
     neither and **promises nothing**, saying only that Schemaic could not fully restrict it. No harness
     reaches that arm today, and it is worded rather than left unreachable precisely because
     "unreachable" is what the Claude arm assumed too.
+    **The sandbox covers the CLI's own tools, and the sentence used to claim more than that.** It read
+    *"it cannot write files or run commands"* flat, while `harness.rs`'s own header records that MCP
+    tools execute *under* `--sandbox` and that one harness has no MCP isolation at all — a positive
+    assurance the module contradicts eleven paragraphs above it, which is the asymmetry the grade
+    exists to prevent. The claim is now scoped to *"its own built-in tools"*, and the third capability
+    is `isolates_mcp_servers`: true for Claude (`--strict-mcp-config`), Codex (the whole `mcp_servers`
+    table assigned out from under it) and OpenCode (`XDG_CONFIG_HOME` redirection), false for
+    Antigravity, measured rather than assumed. When it is false the notice appends *"Any MCP servers
+    you have registered with it are also available to this session, and Schemaic cannot restrict
+    them"*, so the user-global gap this document records above and again under `app/antigravity.rs`
+    is disclosed in the panel rather than only in this file
+    (`a_harness_that_lets_other_mcp_servers_in_says_so`).
+    **The two tests that used to pin all this asserted the notice against the predicate it branches
+    on, and that is why the replacement spells its table out by hand.**
+    `only_a_sandboxed_harness_is_told_the_os_is_stopping_it` computed
+    `notice.contains("cannot write files or run commands") == h.restricted_means_sandbox()` — the
+    substring compared to the very predicate that produced it — so flipping `restricted_means_sandbox`
+    to include OpenCode, the exact regression the capability split was written for, left the suite
+    green, and nothing pinned OpenCode's `Restricted` notice at all.
+    `each_harness_is_told_what_is_actually_restricting_it` replaces both it and
+    `only_a_flag_sealed_harness_is_told_an_update_would_help`, spelling out a
+    `(sandbox, update, other-servers)` triple **per harness** in a `match`: Antigravity
+    `(true, false, true)`, Codex `(true, false, false)`, Claude `(false, true, false)`, OpenCode
+    `(false, false, false)`. A change to any of the three predicates now has to be argued for in that
+    table.
     **`Constraint::Unknown` refuses the spawn** (`is_runnable` is false), which is the opposite
     failure direction from `CliSeal`/`seal_from_help` above, and both are right for the same
     underlying fact: an unknown flag *kills* the child. An unreadable Claude probe therefore yields
@@ -5605,8 +5635,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     else's in its place (`losing_our_server_does_not_hand_the_session_somebody_elses`, which holds
     both overrides to assigning the table rather than to two hand-copied strings).
     **Antigravity's two pieces of global state are shaped here and written by `app/antigravity.rs`.**
-    `antigravity_allow_rules` builds one `mcp(schemaic/<tool>)` rule per tool from the same
-    connection allow-list, through the same `bare_tool_name`; `antigravity_settings_with_rules` and
+    `antigravity_allow_rules` builds one `mcp(<MCP_SERVER>/<tool>)` rule per tool from the same
+    connection allow-list, through the same `bare_tool_name` — it interpolated the literal
+    `schemaic` until the rules and the registration were found to be two independent spellings of
+    one name, which is the `SERVER` story under `app/antigravity.rs`;
+    `antigravity_settings_with_rules` and
     `_without_rules` are the `settings.json` surgery, pure so that the part that can destroy a
     user's file is the part that is unit-tested. **Merged, never rewritten**: it is the user's file,
     it holds their `trustedWorkspaces`, and that CLI rewrites it itself, so the document is parsed,
@@ -5656,7 +5689,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     to decode a name Schemaic itself wrote**: OpenCode flattens the server into the tool name, so
     `stream.rs` reads `schemaic_run_query` back as `mcp__schemaic__run_query` off this prefix. They
     are the same string today and answer different questions — the agent is the tool *set*, this is
-    the tool *source* — and collapsing them is how one rename quietly becomes two.
+    the tool *source* — and collapsing them is how one rename quietly becomes two. It has a third
+    consumer now: `antigravity_allow_rules` interpolates it, and `app/antigravity::SERVER` **is** it,
+    so the name `agy mcp add` registers and the name every allow-rule points at are one definition.
     `TurnSpec` and `turn_args` build one turn's command line — one struct rather than eight
     positional arguments, because the harnesses draw on overlapping subsets of it and a positional
     list is how `--model`'s value ends up in `--effort`'s slot. **There are two spawn shapes and one
@@ -5860,12 +5895,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **And there is no per-invocation fix in that CLI to reach for, so the limit stands as
     described.** It has no config flag for this, and no definable agent the way OpenCode has —
     `agy agent` only lists agents, and lists none. The one alternative was to refuse a one-shot
-    while an Antigravity chat session is live, and that is decided against: the exposure is exactly
-    the window in which a chat session holds the registration and no wider, the inline prompt asks
+    while an Antigravity chat session is live, and that is decided against: the inline prompt asks
     for SQL and nothing else, and Ctrl+K, AI Fill and AI Seed are keystrokes — refusing one because
     a panel happens to be open would cost more, on every press, than the narrow overlap it removes.
     So this is a settled limit rather than unfinished wiring, and nothing in the code gates on it:
     this paragraph is the whole of the record.
+    **What this paragraph used to get wrong is who else is inside that window.** It bounded the
+    exposure as "the window in which a chat session holds the registration and no wider", which is
+    true of *time* and was silently read as a statement about *processes* — it asked which of
+    Schemaic's own spawns could see the server and never asked which other ones could. The
+    registration is in the user's own MCP config and `permissions.allow` is an allow-list rather than
+    a prompt-list, so for as long as that window is open **any** `agy` run by this user, in any
+    directory, started by anything, finds the `schemaic` server registered and its database tools
+    pre-approved with no prompt: `cd ~/work/some-repo && agy -p "explain this build failure"` can
+    reach the database, steered by a `README` or `AGENTS.md` the user did not write. No lever was
+    found that scopes either half to one process, and a per-session server *name* was considered and
+    rejected — an unrelated run inherits whatever name is registered, so it would close the
+    name-collision limit under `app/antigravity.rs` and not this one. What is left is to keep the
+    window as narrow as it can be (installed at session start, withdrawn at session end, covering
+    only the tools that connection's access level offers) and to say so, which
+    `Constraint::notice` now does in the panel.
     **`cli_failure_message` takes the harness now, and that is not decoration.** Its last-resort arm
     said *"the claude CLI exited with status N"* whatever had run, so a user who had picked Codex was
     sent to check an installation that was not the one that failed — the same wrong-cause report the
@@ -9666,7 +9715,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   reads per
   `(harness, path)`; its own entry is below), `antigravity.rs` (that CLI's two pieces of global
   state, also below), `liveness.rs` (whether the process that left something behind is still
-  running, which `antigravity.rs`'s sweep and `ai.rs`'s own sweep both ask — also below),
+  running, which `antigravity.rs`'s sweep and `ai.rs`'s own sweep both ask through `may_sweep`, and
+  `opencode.rs`'s asks more directly through `process_start` — also below),
   `opencode.rs` (the config directory that harness is sealed by, and the
   environment pointing it there — also below) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
@@ -10001,13 +10051,41 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     claim that governs one remover and not the other governs nothing. `may_release` answers no three
     ways, each a bug that happened: a session that never installed, a session that never claimed, and
     a claim that is no longer the one on disk.
+    **A limit recorded rather than guarded: the grant is user-global while it stands, and cannot be
+    narrowed.** `agy mcp add` writes into the user's own MCP config and `permissions.allow` is an
+    allow-list rather than a prompt-list, so for as long as a Schemaic AI session is open, *any*
+    `agy` run by this user — in any directory, started by anything — finds the `schemaic` server
+    registered and its database tools pre-approved, with no prompt:
+    `cd ~/work/some-repo && agy -p "explain this build failure"` can reach the database through a
+    `README` or `AGENTS.md` the user did not write. No lever was found that scopes either half to one
+    process; the registration is per user by construction, and a per-session server *name* was
+    considered and rejected, since an unrelated run inherits whatever name is registered and it would
+    therefore close the *next* limit rather than this one. What is left is to keep the window as
+    narrow as it can be — installed when a session starts, withdrawn when it ends, covering only the
+    tools that connection's access level offers, so a schema-only connection never grants
+    `run_query` — and to say so rather than let it be assumed shut, which is why
+    `harness::Constraint::notice` tells the user in the panel that this harness's MCP surface is not
+    Schemaic's to restrict. The `inline_argv` entry above bounded the same exposure in *time* and
+    never asked which other processes were in that window; it says so now.
     **A second limit, recorded rather than guarded: the server name is not ours to reserve.**
     `agy mcp add` is an upsert and `agy mcp remove` is unconditional, so a user who has registered
     their *own* MCP server under the name `schemaic` — or one pointing at a different Schemaic build
     — has it replaced on the first AI turn and deleted by the next `sweep`. Telling ours from theirs
     needs a read of that CLI's registry (`agy mcp list`) whose output nobody has measured, and
     guessing at a format in order to decide whether to delete somebody's configuration is worse than
-    the collision. The name is a single `SERVER` constant, so a future check has one place to hook.
+    the collision.
+    **And the name really is one constant now — the claim that it always was is what made this worth
+    fixing.** This paragraph, and `SERVER`'s own doc, said "a single `SERVER` constant, so a future
+    check has one place to hook" while `SERVER` was a private `const &str = "schemaic"` here and
+    `harness::antigravity_allow_rules` emitted the literal `mcp(schemaic/…)` in a crate that cannot
+    see it: two independent spellings of one name, documented as one. Renaming either half leaves the
+    registration standing while every rule points at a server that is not there, which Antigravity
+    answers by *denying* the call — and a denied turn still reports `"status":"SUCCESS"` with an
+    empty response, so the failure would have had no symptom at all. `SERVER` is now
+    `schemaic_ai::harness::MCP_SERVER`, and
+    `the_allow_rules_name_the_server_that_was_registered` asserts the **composition**
+    (`rules == vec![format!("mcp({SERVER}/list_schema)")]`) rather than `SERVER == MCP_SERVER`,
+    because the rule string is what `agy` matches the registration against.
     The settings file's location is `~/.gemini/antigravity-cli/settings.json`, and **the `.gemini`
     is not a leftover from the harness that was removed**: `agy` is Google's and keeps its own
     settings under the same home-directory root the Gemini CLI used, which the function's own doc
@@ -10065,8 +10143,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `<root>/opencode/opencode.json`, so one shared root would leave whichever ran last deciding
     whether a server is registered — a Ctrl+K quietly stripping the server from a chat session running
     beside it, or a chat session handing its server to the one path with nowhere to render a tool
-    call. `write` takes `private_dir("opencode")` and `write_inline` takes
-    `private_dir("opencode-inline")`; two roots cannot race. The inline root is reused on the same
+    call. `write` takes `instance_root("opencode")` and `write_inline` takes
+    `instance_root("opencode-inline")`; two roots cannot race. That was argued in a paragraph and
+    asserted nowhere, and the decision is two string literals inlined between a `create_dir_all` and
+    an `fs::write` — changing `"opencode-inline"` to `"opencode"` is a plausible tidy-up, since the
+    subdirectory under each is already `opencode/`, and it would leave a Ctrl+K during a live chat
+    overwriting that session's config with the server-less inline one, with the suite green.
+    `no_two_configs_that_must_differ_can_land_on_one_path` pins it, and pins the instance component
+    below with it. The inline root is reused on the same
     terms as the session's, and `harness::inline_argv` passes `--pure` for the same reason `turn_args`
     does. `write_inline` returning `None` must refuse just as hard, and for the same reason —
     `--agent schemaic` naming an agent that does not exist runs on `build`, which has `bash` — which
@@ -10078,7 +10162,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     server resolved to ours *and* theirs. `XDG_CONFIG_HOME` is the one that replaces — pointed at a
     directory of ours, the user's globally registered servers vanish from `opencode debug config`
     entirely. That is this harness's `--strict-mcp-config`, and unlike `antigravity.rs` it edits
-    nothing of the user's, so there is no `Drop`, no teardown and no startup sweep in this module.
+    nothing of the user's, so there is no `Drop` and no teardown here — the directory is still ours
+    to collect, which is what `sweep` below does, and the difference is that leaving one behind costs
+    disk rather than a standing grant.
     **Rejecting those two as the lever left them able to reopen the seal, which is what `env_remove`
     is for.** Setting `XDG_CONFIG_HOME` says nothing about what the child *inherits*, and both merging
     variables merge just as well when the parent's environment supplied them: measured with
@@ -10094,7 +10180,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`nothing_the_seal_depends_on_is_cleared_by_accident` holds both halves at once: everything `env()`
     sets survives `env_remove()`, and `XDG_DATA_HOME`/`HOME`/`USERPROFILE`/`OPENCODE_API_KEY` are
     untouched; `every_config_lever_the_module_rejected_is_cleared_from_the_child` is the other
-    direction).
+    direction, and it asserts the **whole slice** now rather than the two entries it used to check —
+    with `OPENCODE_CONFIG_DIR` unasserted it could have been dropped or misspelled with the suite
+    green, which is exactly what that entry's own doc warns is how the other two got missed).
+    **`env()` returns `OsString`s, and that is the third way the seal could silently open.** It
+    returned `String`s built with `to_string_lossy`, so a config root that is not valid UTF-8 — a
+    home directory in a legacy encoding, a Windows path with an unpaired surrogate — pointed
+    `XDG_CONFIG_HOME` at a directory with the invalid bytes replaced by U+FFFD: *not* where the
+    config was written. `--agent schemaic` then names an agent that does not exist, OpenCode falls
+    back to its own `build` agent with every built-in including `bash`, and the panel reports
+    `Sealed`. `write`'s contract is that a failure to seal must **refuse**, and it is honoured for a
+    failed write and for a missing `private_dir`; a root that could not survive a `String` round trip
+    was the one way past it. `Command::env` takes `AsRef<OsStr>`, so the round trip was imposed by
+    the signature alone. `ai.rs`'s `InlinePlan::env` and `oc_env` carry the same type, and
+    `nothing_the_seal_depends_on_is_cleared_by_accident` now also asserts that the value reaching the
+    child is the root path itself rather than a rendering of it.
     Three further details in it are load-bearing. **Only `XDG_CONFIG_HOME`, never `XDG_DATA_HOME`** — the two
     are easy to set together and the second breaks the session, because `auth.json` lives under the
     *data* directory and moving it logs the user out of the CLI they just signed into, failing on
@@ -10115,20 +10215,50 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     indistinguishable from a hang; `--pure` brought the same first turn to **four seconds**. Both
     mitigations are kept because they answer different halves: `--pure` (in `harness::turn_args`)
     skips the install outright, and reusing one directory pays whatever bootstrap does happen at most
-    once per machine rather than once per session. The consequence is the reason the endpoint is not
+    once per **running app** rather than once per session. The consequence is the reason the endpoint is not
     in this file — a reused directory **outlives the session**, so the config carries only the
     *path* of the per-session endpoint file (`ai::write_endpoint_file`, `O_EXCL`, owner-only, swept
     with the others) and the credential never enters the reused directory at all. The `opencode.json`
     itself is written plainly rather than through `create_private_new`: it holds no secret, and it is
     rewritten every session, so an existing path is the normal case and not the collision `O_EXCL`
     refuses.
+    **But the reuse stops at the instance boundary, and it did not — which was a bug rather than a
+    trade.** The root was `persist::private_dir(kind)` with no per-instance component, and the file
+    inside it carries exactly the two things that differ per connection: the path of the endpoint
+    file, and the tool names this connection's access level offers. OpenCode is a process *per turn*,
+    so a second window's session re-pointed the first window's **next question** at its own database,
+    with its credentials and its access level, while the first window's panel, transcript and deltas
+    all named the first connection. `instance_root(kind)` is
+    `persist::private_dir(kind)?.join(instance_tag())` with `instance_tag()` = `pid-<pid>`, and both
+    `write` and `write_inline` go through it. One correction worth keeping, because the first telling
+    of this got it wrong: the file was under `persist::private_dir` throughout, so it was per-*user*
+    and never machine-wide, which is why the fix is a per-instance subdirectory rather than a move
+    out of a shared location. The pid is the discriminator because that is what a running instance has and a
+    dead one does not, and the reuse the paragraph above argues for survives: a directory per
+    instance is still one the CLI has usually seen before within that instance's life.
+    **`sweep` collects the roots of instances that are gone**, at startup, on the same detached thread
+    as `antigravity::sweep` (both shell out or walk the disk, and neither is wanted on the UI thread —
+    see `main.rs`). It is tidiness rather than a permission being withdrawn, because nothing under
+    these roots is a secret, but a per-instance directory nothing collects is a directory per launch,
+    forever. It asks `liveness::process_start(pid)` for **any** live process on that pid rather than
+    for ours specifically, since a second window's root must survive and the cost of being wrong the
+    other way is one directory kept until the next launch; it also removes the pre-instance
+    `opencode/` directory an older build left directly under the base. And it removes
+    **recursively**, unlike `ai`'s session working directories, which is stated rather than assumed:
+    everything under a root here was written by Schemaic or by an OpenCode bootstrap into a directory
+    Schemaic made for it, and nothing here is a credential.
     **`write` returning `None` must refuse the session, and `ai::start_ai_session` does.** This is the
     one harness where a missing config does not fail closed: `--agent schemaic` naming an agent that
     does not exist leaves the run on OpenCode's own `build` agent, which has `bash`. So there is no
     degraded mode here of the kind the Codex path takes with `codex_isolation_only` — the user gets a
     message saying the assistant is disabled because the file that restricts it could not be written.
-    The tests here are over the pure JSON (`harness::opencode_config_json`) rather than the IO, and
-    the one worth knowing is `the_agent_the_config_defines_is_the_one_the_argv_selects`, which walks
+    Most of the tests here are over the pure JSON (`harness::opencode_config_json`) rather than the
+    IO. The two that are not pin a *path* and an *environment*:
+    `no_two_configs_that_must_differ_can_land_on_one_path` calls the real `instance_root` and returns
+    early rather than asserting when this machine has no config directory, and
+    `nothing_the_seal_depends_on_is_cleared_by_accident` builds an `OpenCodeConfig` over a literal
+    root and touches no disk at all. The one worth knowing
+    is still `the_agent_the_config_defines_is_the_one_the_argv_selects`, which walks
     `--agent`'s value out of `turn_args` and back into the document: both sides read `OPENCODE_AGENT`
     so a rename can never break the lookup, but the JSON growing a different shape around the name
     can, and that failure is silent.
