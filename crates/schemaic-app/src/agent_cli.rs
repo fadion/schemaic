@@ -305,14 +305,7 @@ pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
     // the rest of the run, reporting "could not confirm … so the assistant is
     // disabled" with no retry path anywhere. Returning early leaves the next
     // attempt free to ask again.
-    // `Harness::help_args`, not a literal `--help`: Codex keeps
-    // `--ignore-user-config` off its top-level page, so asking the wrong one
-    // silently dropped that harness's whole config isolation.
-    let Some(o) = std::process::Command::new(bin)
-        .args(h.help_args())
-        .output()
-        .ok()
-    else {
+    let Some(o) = help_command(h, bin).output().ok() else {
         return Probe {
             seal: CliSeal::ALL,
             constraint: Constraint::Unknown,
@@ -348,6 +341,27 @@ pub(crate) fn probe(h: Harness, bin: &str) -> Probe {
     probe
 }
 
+/// The `--help` invocation [`probe`] runs, built rather than spawned so the
+/// **argv** has a test.
+///
+/// `Harness::help_args`, never a literal `--help`: Codex keeps
+/// `--ignore-user-config` off its top-level page, so asking the wrong one
+/// silently dropped that harness's whole config isolation and every session
+/// loaded the user's own `~/.codex/config.toml` — their MCP servers and their
+/// hooks. The test written for that regression asserted `help_args()`'s
+/// *return*, which is the answer and not the question: reverting this line to
+/// `.arg("--help")` left the whole workspace green.
+///
+/// It is still one function away from being compile-forced — nothing stops a
+/// future edit spawning its own `Command` — so the value of the extraction is
+/// that the revert now has to be made in two places, and the second is here,
+/// where the comment is.
+fn help_command(h: Harness, bin: &str) -> std::process::Command {
+    let mut c = std::process::Command::new(bin);
+    c.args(h.help_args());
+    c
+}
+
 /// The `(harness, resolved path) -> Probe` memo, shared by [`probe`] and
 /// [`probe_cached`].
 fn probe_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(Harness, String), Probe>> {
@@ -365,7 +379,8 @@ fn probe_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(Harness
 /// key by construction — switching harness *clears* `cli_path`, so the memo and
 /// the warming thread were started in the same update pass and both missed. The
 /// modal shows nothing until [`warm_probe_cache`] has an answer, and
-/// [`probe_generation`] is what tells it to look again.
+/// the app bumps a signal when [`warm_probe_cache`] finishes, which is what
+/// tells the memo to look again.
 pub(crate) fn probe_cached(h: Harness, bin: &str) -> Option<Probe> {
     let cache = probe_cache();
     let c = cache.lock().ok()?;
@@ -397,6 +412,36 @@ pub(crate) fn warm_probe_cache(h: Harness, bin: String, done: impl FnOnce() + Se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The argv the probe actually runs**, which is what the regression was.
+    /// Codex keeps `--ignore-user-config` off its top-level `--help`, so
+    /// probing the wrong page reported no config isolation on every real
+    /// machine and every session loaded the user's own `~/.codex/config.toml`.
+    /// The test written for it lives in `schemaic-ai` and asserts
+    /// `help_args()`'s *return* — the answer, not the question — so reverting
+    /// the caller to `.arg("--help")` left the workspace green. This module's
+    /// tests never reached `probe` at all.
+    #[test]
+    fn the_probe_asks_each_harness_for_the_page_that_answers_both_questions() {
+        let args = |h: Harness| -> Vec<String> {
+            help_command(h, "zz-bin")
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(Harness::Codex), vec!["exec", "--help"]);
+        for h in Harness::ALL {
+            if h == Harness::Codex {
+                continue;
+            }
+            assert_eq!(args(h), vec!["--help"], "{h:?}");
+        }
+        // The binary is the one it was handed, not a re-resolved one.
+        assert_eq!(
+            help_command(Harness::Claude, "zz-bin").get_program(),
+            std::ffi::OsStr::new("zz-bin")
+        );
+    }
 
     #[test]
     fn each_harness_looks_for_its_own_binary_name() {

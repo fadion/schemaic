@@ -1376,22 +1376,49 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Which agent CLI drives the panel. An unrecognised persisted key falls back
     // to Claude *and says so* — `Harness::from_key` refuses to guess precisely so
     // this decision is made where there is a UI to report it.
-    if Harness::from_key(&ui_state.ai_harness).is_none() {
-        // Said out loud rather than swallowed. The substitution is otherwise
-        // invisible: the panel would drive Claude while `ui_state.json` names
-        // something else, and the only symptom is an assistant behaving unlike
-        // the CLI the user believes they picked.
-        tracing::warn!(
-            harness = %ui_state.ai_harness,
-            "unknown AI harness in ui_state.json; falling back to Claude Code"
-        );
-    }
+    //
+    // **The key the file names, kept.** The field's doc promises the
+    // unrecognised value is not silently replaced with the default — and it was,
+    // one save later: the persist site writes `ai_harness.get().key()`, which is
+    // the fallback, so the name the user's file carried was overwritten by the
+    // next thing that touched the settings. A build that later grows that
+    // harness would then have nothing to restore. Held here and written back
+    // until the user picks something themselves.
+    let ai_harness_unknown: RwSignal<Option<String>> =
+        RwSignal::new(match Harness::from_key(&ui_state.ai_harness) {
+            Some(_) => None,
+            None => {
+                // Said out loud rather than swallowed. The substitution is
+                // otherwise invisible: the panel would drive Claude while
+                // `ui_state.json` names something else, and the only symptom is
+                // an assistant behaving unlike the CLI the user believes they
+                // picked.
+                tracing::warn!(
+                    harness = %ui_state.ai_harness,
+                    "unknown AI harness in ui_state.json; falling back to Claude Code"
+                );
+                Some(ui_state.ai_harness.clone())
+            }
+        });
     let ai_harness =
         RwSignal::new(Harness::from_key(&ui_state.ai_harness).unwrap_or(Harness::Claude));
-    let ai_cli_path = RwSignal::new(ui_state.ai_cli_path.clone());
+    let ai_cli_path = RwSignal::new(match ai_harness_unknown.get_untracked() {
+        Some(_) => String::new(),
+        None => ui_state.ai_cli_path.clone(),
+    });
     // Verbatim from disk. No `from_cli` narrowing any more — the value the file
     // names is the value that runs, including one this build has never heard of.
-    let ai_model = RwSignal::new(ui_state.ai_model.clone());
+    //
+    // **Except when the harness beside it is one this build has never heard
+    // of.** The harness-switch effect clears the model on a *switch*, and a
+    // restore is not one — so an unknown harness paired with, say,
+    // `opencode/claude-sonnet-5` started a Claude session with that model id and
+    // died on an unknown model under "check your installation". The path goes
+    // with it, for the reason `harness_switch` gives.
+    let ai_model = RwSignal::new(match ai_harness_unknown.get_untracked() {
+        Some(_) => String::new(),
+        None => ui_state.ai_model.clone(),
+    });
     let ai_effort = RwSignal::new(AiEffort::from_cli(&ui_state.ai_effort));
     let ai_instructions = RwSignal::new(ui_state.ai_instructions.clone());
     let ai_schema_scope = RwSignal::new(SchemaScope::from_key(&ui_state.ai_schema_scope));
@@ -1537,6 +1564,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         if let Some(p) = prev
             && p != now
         {
+            // The user has chosen, so the file should start naming what runs.
+            ai_harness_unknown.set(None);
             let held = (ai_cli_path.get_untracked(), ai_model.get_untracked());
             harness_fields.update(|m| {
                 m.insert(p, held);
@@ -6285,7 +6314,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             schema_w: schema_w.get_untracked(),
             right_w: right_w.get_untracked(),
             editor_h: editor_h.get_untracked(),
-            ai_harness: ai_harness.get_untracked().key().to_string(),
+            // **The unknown key survives the save**, or the field's own promise
+            // — "an unrecognised value is *not* silently replaced with the
+            // default" — is false one save later. Cleared the moment the user
+            // picks a harness themselves, which is the point at which the file
+            // should start naming what is actually running.
+            ai_harness: persist::ai_harness_to_persist(
+                ai_harness_unknown.get_untracked().as_deref(),
+                ai_harness.get_untracked().key(),
+            ),
             ai_cli_path: ai_cli_path.get_untracked(),
             ai_model: ai_model.get_untracked(),
             ai_effort: ai_effort.get_untracked().cli().to_string(),

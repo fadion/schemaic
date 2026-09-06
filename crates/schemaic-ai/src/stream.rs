@@ -71,21 +71,41 @@ struct Coalescer {
 
 impl Coalescer {
     /// The unseen tail of `full` for `key`, or `None` when there is nothing new.
+    ///
+    /// **One allocation per update, not three.** It built the tail, then
+    /// allocated a fresh `String` for `full` *and* a fresh `String` for `key` on
+    /// every call, replacing an entry that was almost always already there. The
+    /// accumulated text is extended in place instead, and the key is only
+    /// allocated when it is genuinely new.
+    ///
+    /// The remaining Θ(N·K) is the `starts_with` compare, which is the price of
+    /// detecting a rewrite and is not removable without knowing whether Codex
+    /// restates at all — see `review/release-v0.23.0/user-verify-fix.md`, which
+    /// has the capture that settles it. No fixture in this file contains an
+    /// `item.updated`, so `K` is unmeasured and tuning further would be
+    /// optimising a path that may never execute.
     fn advance(&mut self, key: &str, full: &str) -> Option<String> {
-        let prev = self.sent.get(key);
-        let out = match prev {
+        match self.sent.get_mut(key) {
             Some(p) if full.starts_with(p.as_str()) => {
                 if full.len() == p.len() {
                     return None;
                 }
-                full[p.len()..].to_string()
+                let out = full[p.len()..].to_string();
+                p.push_str(&out);
+                Some(out)
             }
             // Not an extension: the text was rewritten, so send it whole rather
             // than diffing two strings that share no prefix.
-            _ => full.to_string(),
-        };
-        self.sent.insert(key.to_string(), full.to_string());
-        if out.is_empty() { None } else { Some(out) }
+            Some(p) => {
+                p.clear();
+                p.push_str(full);
+                (!full.is_empty()).then(|| full.to_string())
+            }
+            None => {
+                self.sent.insert(key.to_string(), full.to_string());
+                (!full.is_empty()).then(|| full.to_string())
+            }
+        }
     }
 
     /// Drop the accumulated text for `key` so a later run starts clean.
@@ -943,6 +963,52 @@ mod tests {
         assert_eq!(Harness::from_key(""), None);
     }
 
+    /// **Every branch of the accumulator, driven directly.** It is the sole
+    /// reason this parser is stateful, and everything that exercises it goes
+    /// through `item.updated` lines written by hand — no captured Codex fixture
+    /// contains one, so whether Codex restates *cumulatively* is an assumption
+    /// (`review/release-v0.23.0/user-verify-fix.md` has the capture that settles
+    /// it). What is testable without that capture is the state machine itself,
+    /// including the in-place extension that replaced three allocations per
+    /// update with one.
+    #[test]
+    fn the_coalescer_emits_only_what_is_new() {
+        let mut c = Coalescer::default();
+        // First sight: the whole thing.
+        assert_eq!(c.advance("a", "Hel"), Some("Hel".to_string()));
+        // An extension: the tail only.
+        assert_eq!(c.advance("a", "Hello"), Some("lo".to_string()));
+        // Restated unchanged: nothing.
+        assert_eq!(c.advance("a", "Hello"), None);
+        // …and the accumulated text is still right after an in-place extension,
+        // which is what the next tail is measured against.
+        assert_eq!(c.advance("a", "Hello there"), Some(" there".to_string()));
+
+        // **Not an extension: sent whole.** A rewritten message shares no
+        // prefix, and diffing two such strings would drop the difference
+        // silently. The stored text has to become the *new* one, or the next
+        // update is measured against text that is no longer on screen.
+        assert_eq!(c.advance("a", "Goodbye"), Some("Goodbye".to_string()));
+        assert_eq!(c.advance("a", "Goodbye now"), Some(" now".to_string()));
+
+        // Keys are independent — Codex numbers items per turn.
+        assert_eq!(c.advance("b", "Hel"), Some("Hel".to_string()));
+        assert_eq!(c.advance("a", "Goodbye now"), None);
+
+        // An empty update is nothing, first sight or not.
+        assert_eq!(c.advance("c", ""), None);
+        assert_eq!(c.advance("c", ""), None);
+        assert_eq!(c.advance("c", "x"), Some("x".to_string()));
+
+        // Cleared, a key starts over rather than treating the old text as a
+        // prefix — which is what the turn boundary relies on.
+        c.clear("a");
+        assert_eq!(
+            c.advance("a", "Goodbye now"),
+            Some("Goodbye now".to_string())
+        );
+    }
+
     #[test]
     fn every_harness_ignores_blank_and_malformed_lines() {
         for h in Harness::ALL {
@@ -1015,6 +1081,31 @@ mod tests {
         let mut p = StreamParser::new(Harness::Codex);
         p.push(&line);
         assert_eq!(p.last_line(), LineKind::Json);
+    }
+
+    /// **A deeply nested line is refused, not a stack overflow.** `serde_json`
+    /// caps recursion at 128 levels by default, which is the only thing standing
+    /// between a hostile or corrupt line and this parser's stack — and a
+    /// dependency default is not a guarantee until something asks for it. All
+    /// four CLIs write their own JSON to a pipe, so reachability is low; the
+    /// cost of pinning it is one test.
+    #[test]
+    fn a_deeply_nested_line_is_refused_rather_than_overflowing_the_stack() {
+        for depth in [127usize, 200, 5_000] {
+            let line = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            for h in Harness::ALL {
+                let mut p = StreamParser::new(h);
+                // No events either way — a JSON array is not a line any dialect
+                // decodes — but the shallow one parses and the deep one does
+                // not, which is the distinction being pinned.
+                assert!(p.push(&line).is_empty(), "{h:?} at depth {depth}");
+                let want = match depth <= 127 {
+                    true => LineKind::Json,
+                    false => LineKind::Plain,
+                };
+                assert_eq!(p.last_line(), want, "{h:?} at depth {depth}");
+            }
+        }
     }
 
     /// The three answers `last_line` exists to keep apart, so the app does not
@@ -1507,6 +1598,35 @@ mod tests {
             "the server's answer never reached the chip: {out:?}"
         );
         assert_eq!(text_of(&out), "orders  \nwidgets");
+
+        // The composition, which `docs/architecture.md` claimed of all six
+        // verbatim captures and was true of four. A parser that decodes
+        // perfectly into a `TurnState` that renders nothing is a turn the user
+        // reads as empty.
+        let mut st = crate::TurnState::default();
+        for ev in &out {
+            st.apply(ev);
+        }
+        let segs = st.segments();
+        let chip = segs
+            .iter()
+            .find_map(|s| match s {
+                Seg::Tool(t) => Some(t),
+                _ => None,
+            })
+            .expect("a tool chip");
+        assert_eq!(chip.name, "mcp__schemaic__list_schema");
+        assert!(!chip.is_error);
+        assert!(
+            chip.result
+                .as_deref()
+                .is_some_and(|r| r.contains("widgets")),
+            "the chip is still spinning: {chip:?}"
+        );
+        assert!(
+            segs.contains(&Seg::Text("orders  \nwidgets".to_string())),
+            "{segs:?}"
+        );
     }
 
     /// The refusal shape, captured before the approval was configured. Codex
@@ -1624,6 +1744,45 @@ mod tests {
         }
         // And the user is told why, since the response body was empty.
         assert!(text_of(&out).contains("permission"), "{out:?}");
+
+        // **Through `TurnState` as well as the parser**, which
+        // `docs/architecture.md` claimed of all six verbatim captures and was
+        // true of four. This is the fixture the whole "SUCCESS with a refusal"
+        // argument rests on: the response body is empty, so the *only* thing the
+        // user reads is the prose this parser synthesises — and a `TurnState`
+        // regression that swallowed it would restore the silent success with the
+        // parser test still green.
+        let mut st = crate::TurnState::default();
+        for ev in &out {
+            st.apply(ev);
+        }
+        let segs = st.segments();
+        let rendered: String = segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rendered.contains("permission"),
+            "the turn renders as an empty success: {segs:?}"
+        );
+        // The chip is there, named for the database tool, and carries the
+        // refusal rather than spinning.
+        let chip = segs
+            .iter()
+            .find_map(|s| match s {
+                Seg::Tool(t) => Some(t),
+                _ => None,
+            })
+            .expect("a tool chip");
+        assert_eq!(chip.name, "mcp__schemaic__list_schema");
+        assert!(chip.is_error, "{chip:?}");
+        assert!(
+            chip.result.as_deref().is_some_and(|r| r.contains("denied")),
+            "{chip:?}"
+        );
     }
 
     /// **Captured verbatim** from the first turn that completed a database tool

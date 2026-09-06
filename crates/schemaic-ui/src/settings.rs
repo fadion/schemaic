@@ -916,21 +916,29 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             // below.
             //
             // **A path that is not yet a file is not probed.** `constraint_notice`
-            // resolves the binary and runs `--help` on it, synchronously, on this
-            // thread — and this memo tracks the *live* field, so typing
-            // `C:\tools\claude.exe` asked seventeen times, once per keystroke,
-            // each with a different unresolvable path. The comment on the app's
-            // closure said the per-(harness, path) cache made this cheap; the
-            // path being part of the key is exactly what made every keystroke a
-            // miss. There is nothing to say about a binary that is not there
-            // anyway — the red "File doesn't exist." hint above is the whole
-            // answer — so the half-typed states ask nothing at all, and the two
-            // that resolve (empty → auto-detect, or a complete path) are the
-            // stable keys the cache was built for.
+            // resolved the binary and ran `--help` on it, synchronously, on this
+            // thread — and this memo tracks the *live* field, so typing a path
+            // asked a different question on every keystroke, one per prefix,
+            // each an unresolvable path and each a spawn. The comment on the
+            // app's closure said the per-(harness, path) cache made this cheap;
+            // the path being part of the key is exactly what made every
+            // keystroke a miss. There is nothing to say about a binary that is
+            // not there anyway — the red "File doesn't exist." hint above is the
+            // whole answer — so the half-typed states ask nothing at all, and
+            // the two that resolve (empty → auto-detect, or a complete path) are
+            // the stable keys the cache was built for. The rule is
+            // `should_ask_for_a_notice`; this closure only applies it.
+            //
+            // The closure reads the *cache* now and never fills it, so a cold
+            // key costs nothing on this thread either — see the app's
+            // `constraint_notice`.
             let notice = floem::reactive::create_memo(move |_| {
                 let _ = harness.get();
                 let path = cli_path.get();
-                if !path.trim().is_empty() && !notice_ok(path) {
+                // The rule is `should_ask_for_a_notice`, not this closure: a
+                // predicate with a recorded failure history and no test is one
+                // nothing can hold to it. See that function.
+                if !should_ask_for_a_notice(&path, |p| notice_ok(p)) {
                     return None;
                 }
                 (constraint_notice)()
@@ -1060,13 +1068,23 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             // The dropdown is built *inside* the container because a floem view
             // is not `Clone` — it has to be constructed on each keyed rebuild.
             let effort_ring = ring.clone();
-            // **Keyed on the levels, not on `supports_effort()`.** The capability
-            // is a *bool*, and it is true for both Claude and Antigravity — so
-            // switching between those two never flipped the key, the child was
-            // never rebuilt, and the `levels` captured at build time stayed
-            // Claude's. The dropdown went on offering `xhigh` under a harness
-            // whose flag does not take it. The key has to be as fine-grained as
-            // what the child reads.
+            // **Keyed on the levels, not on `supports_effort()`.** The child
+            // reads `levels` from the value it is handed, so the key has to
+            // carry everything the child reads: a `bool` that is true for both
+            // Claude and Antigravity cannot tell the dropdown that the list
+            // behind it changed, and it went on offering `xhigh` under a harness
+            // whose flag does not take it.
+            //
+            // **Not because the key dedups — it does not.** The comment here
+            // used to say the child "was never rebuilt", which is the belief
+            // `docs/architecture.md`'s Floem gotcha exists to correct and the
+            // one that cost the DDL editors their caret: `dyn_container` runs
+            // `create_updater` and there is no equality check on that path
+            // (`floem-0.2.0/src/views/dyn_container.rs`,
+            // `floem_reactive-0.2.0/src/effect.rs`). The key is a *value handed
+            // to the child*, not a change detector, and stating it as one here
+            // — where it reads as the tidiest explanation in the file — teaches
+            // the wrong contract to whoever copies it next.
             let effort_section = dyn_container(
                 move || harness.get().effort_levels(),
                 move |levels| {
@@ -1347,6 +1365,31 @@ fn thousands(n: usize) -> String {
 /// a release build does not have. The row went on naming a file nobody had
 /// written, and a crash report gathered from it comes back empty with nobody able
 /// to say why.
+/// Is this CLI-path field stable enough to be worth a `--help` probe?
+///
+/// `resolves` is "does this path name a runnable binary" — the same predicate
+/// the red *File doesn't exist.* hint below the field uses.
+///
+/// **Two answers are stable and everything between them is a keystroke.** An
+/// empty field means auto-detect, which is one key into the probe cache; a
+/// complete path that resolves is another. A *half-typed* path is neither: the
+/// cache is keyed by `(harness, resolved path)`, so typing
+/// a path asked a different question on every keystroke — one per prefix, each
+/// a miss and each a synchronous subprocess on the Floem UI thread. The
+/// comment on the app's closure said the cache made this cheap; the path being
+/// part of the key is exactly what made every keystroke a miss.
+///
+/// There is nothing to say about a binary that is not there anyway — the red
+/// hint above the notice is the whole answer — so the half-typed states ask
+/// nothing at all.
+///
+/// Pure and separate from the memo because a decision inside a `create_memo`
+/// closure is a decision no test can reach, and this one has a recorded failure
+/// mode.
+fn should_ask_for_a_notice(path: &str, resolves: impl Fn(String) -> bool) -> bool {
+    path.trim().is_empty() || resolves(path.to_string())
+}
+
 fn log_hint(log: Option<&std::path::Path>) -> String {
     match log {
         Some(p) => format!(
@@ -1679,9 +1722,40 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
 mod tests {
     use super::{
         EDITOR_FONT_SIZES, ROW_LIMITS, STATEMENT_TIMEOUTS, editor_font_label, log_hint,
-        row_limit_label, statement_timeout_label, term_font_label, thousands,
+        row_limit_label, should_ask_for_a_notice, statement_timeout_label, term_font_label,
+        thousands,
     };
     use crate::consts::TERM_FONT_SIZES;
+
+    /// **A blocking `--help` spawn per keystroke.** The notice memo tracks the
+    /// live field and the probe cache is keyed by the resolved path, so every
+    /// half-typed state was a fresh key, a fresh miss, and a synchronous
+    /// subprocess on the Floem UI thread. Only two states are stable enough to
+    /// ask about: empty (auto-detect) and a path that resolves.
+    #[test]
+    fn only_a_settled_cli_path_is_worth_a_probe() {
+        // Typing `C:\tools\claude.exe` one key at a time. Nothing resolves until
+        // the last character, and the red "File doesn't exist." hint above the
+        // notice is the whole answer in the meantime.
+        let full = r"C:\tools\claude.exe";
+        let resolves = |p: String| p == full;
+        let asked = (1..full.len())
+            .filter(|n| should_ask_for_a_notice(&full[..*n], resolves))
+            .count();
+        assert_eq!(asked, 0, "{asked} probes while the user was still typing");
+        assert!(should_ask_for_a_notice(full, resolves), "the settled path");
+
+        // Empty is auto-detect, which is the *other* stable key — and it is one
+        // the cache is warmed for, so it must not be gated behind `resolves`.
+        for blank in ["", "   ", "\t"] {
+            assert!(
+                should_ask_for_a_notice(blank, |_| false),
+                "auto-detect asked nothing"
+            );
+        }
+        // A path that will never resolve stays silent however long it gets.
+        assert!(!should_ask_for_a_notice("/nope/claude", |_| false));
+    }
 
     /// The row's whole purpose is to *say where the log is*, so the hint must
     /// carry the full path and the file's name. "In your config directory" is

@@ -560,14 +560,24 @@ impl Harness {
     ///
     /// Claude sends deltas, and so does Antigravity (`step_update.text_delta`).
     /// Codex restates a message cumulatively, which is what
-    /// [`crate::stream::StreamParser`] coalesces; the panel uses this only to
-    /// decide whether a first token means "it has started".
+    /// [`crate::stream::StreamParser`] coalesces.
     ///
     /// **OpenCode is the one that sends neither.** Its printer emits a text part
     /// only after `time.end` is set, so the whole answer arrives in one event
     /// and there is no "it has started" moment to report — the panel's spinner
     /// runs until the text lands. That is a property of the CLI, not something
     /// coalescing can recover: no partial text is ever written to decode.
+    ///
+    /// **Nothing in the app calls this**, and the sentence that used to sit here
+    /// — "the panel uses this only to decide whether a first token means 'it has
+    /// started'" — was not true of any code: the panel decides that from
+    /// `m.pending && m.segs.is_empty()`, which is a better rule anyway, since it
+    /// answers correctly for the harness that streams nothing. Kept because it
+    /// is a fact about the four CLIs that the parser's own design rests on, and
+    /// deleting a documented measurement to satisfy a dead-code warning is how a
+    /// measurement gets taken twice. Its *doc* now says what it is: a record,
+    /// not a lever.
+    #[allow(dead_code)]
     pub fn streams_deltas(self) -> bool {
         matches!(self, Harness::Claude | Harness::Antigravity)
     }
@@ -799,6 +809,20 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
     // that is not the problem. `build_session_args` already trims on Claude's
     // path; these three did not, and that divergence was the whole bug.
     let model = spec.model.trim();
+    // **Clamped here, as `inline_argv` clamps, and it used to be the caller's
+    // job.** The effort setting is one field shared by every harness and it
+    // survives a harness switch, so a level from the previous harness's
+    // vocabulary is the ordinary case: `turn_args(OpenCode, effort: "xhigh")`
+    // returned `--variant xhigh`, which that CLI does not take. Both callers
+    // happened to clamp, so there was no wrong output — the gap was that the
+    // guard lived somewhere no test could see it, and `ai.rs`'s own rule
+    // applies: a gate the caller has to remember is one `return` away from not
+    // existing. Idempotent, so a caller that still clamps costs nothing.
+    //
+    // A local rather than a rebuilt `TurnSpec`: the spec carries the prompt and
+    // the system context, and cloning tens of kilobytes to change one small
+    // field is a cost paid on every turn.
+    let effort = h.effort_arg(spec.effort.trim()).unwrap_or_default();
     match h {
         // Claude does not take a per-turn command line.
         Harness::Claude => Vec::new(),
@@ -888,9 +912,9 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
                 a.push("--model".into());
                 a.push(model.to_string());
             }
-            if !spec.effort.is_empty() {
+            if !effort.is_empty() {
                 a.push("--variant".into());
-                a.push(spec.effort.clone());
+                a.push(effort.to_string());
             }
             if let Some(id) = spec.resume.as_deref().filter(|s| !s.is_empty()) {
                 a.push("--session".into());
@@ -933,11 +957,17 @@ pub fn session_args(
     mcp_tools: &[&str],
 ) -> Vec<String> {
     let model = spec.model.trim();
+    // The same self-clamp `turn_args` and `inline_argv` make, for the same
+    // reason: the effort field is shared by every harness and survives a switch,
+    // so a level from another CLI's vocabulary is the ordinary case. All three
+    // builders answer it themselves now, rather than two of them trusting the
+    // caller to have remembered.
+    let effort = h.effort_arg(spec.effort.trim()).unwrap_or_default();
     match h {
         Harness::Claude => crate::build_session_args(
             &spec.system,
             Some(model),
-            Some(spec.effort.trim()),
+            Some(effort),
             spec.mcp_config.as_deref(),
             mcp_tools,
             seal,
@@ -956,9 +986,9 @@ pub fn session_args(
                 a.push("--model".into());
                 a.push(model.to_string());
             }
-            if !spec.effort.trim().is_empty() {
+            if !effort.is_empty() {
                 a.push("--effort".into());
-                a.push(spec.effort.trim().to_string());
+                a.push(effort.to_string());
             }
             // **Only after a Stop.** The pipe is the continuity while the process
             // lives; this is how the conversation is picked back up once Stop has
@@ -1079,9 +1109,13 @@ pub fn opencode_config_json(exe: &str, endpoint_file: &str, allowed: &[&str]) ->
     // no per-tool approval to set, and the server itself refuses anything this
     // connection's access level does not offer. Naming them keeps the model from
     // spending a turn discovering that.
+    // Through `bare_tool_name`, not a copy of its body: `docs/architecture.md`
+    // said the names came from it, and this duplicated the expression twelve
+    // lines from two call sites that really do — so the single source of truth
+    // it claimed did not exist.
     let offered = allowed
         .iter()
-        .map(|t| t.rsplit("__").next().unwrap_or(t))
+        .map(|t| bare_tool_name(t))
         .collect::<Vec<_>>()
         .join(", ");
     serde_json::json!({
@@ -1200,6 +1234,25 @@ pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
             // caller-supplied override on this path at all.
             a.push("-c".into());
             a.push("sandbox_mode=\"read-only\"".into());
+            // **And the empty server table, which this path did not have.** A
+            // one-shot emitted no `mcp_servers` override at all, so on a Codex
+            // build that advertises `--sandbox` but not `--ignore-user-config`
+            // — still graded `Restricted`, still runnable — Ctrl+K loaded and
+            // launched every server in the user's own `~/.codex/config.toml`
+            // and offered their tools to a generation with **no surface on
+            // which a tool call could appear**. The session path prevents that
+            // unconditionally, and `codex_isolation_only`'s own doc is the
+            // specification this arm was failing: "an empty table is the honest
+            // version of 'no database tools': ours absent, and nobody else's in
+            // its place."
+            //
+            // Emitted whether or not `--ignore-user-config` is available,
+            // because the flag is the one that may be missing and this is the
+            // mechanism that is not.
+            for o in codex_isolation_only() {
+                a.push("-c".into());
+                a.push(o);
+            }
             // **The reply, and why it is a file.** `codex exec` without
             // `--json` prints for a person: measured, this build writes the
             // final message alone, but that is an observation about a
@@ -2019,6 +2072,27 @@ mod tests {
         assert!(!a.contains(&"resume".to_string()), "{a:?}");
     }
 
+    /// The argv this harness is actually spawned with, whichever shape it has.
+    ///
+    /// **`turn_args` alone is `Vec::new()` for half the enum**, so a loop over
+    /// `Harness::ALL` asserting "no `--model` appears" held vacuously for Claude
+    /// and Antigravity while its docstring said "**every** harness". Deleting
+    /// `!model.is_empty()` from `session_args`'s Antigravity arm kept the suite
+    /// green, and `agy … --model ""` then dies as "Couldn't launch the `agy`
+    /// CLI" — the one explanation that is not the problem. The same vacuity is
+    /// named as a past bug a hundred lines away in `ai/lib.rs`.
+    pub(super) fn spawn_argv(h: Harness, s: &TurnSpec) -> Vec<String> {
+        let a = match h.is_persistent() {
+            true => session_args(h, s, crate::CliSeal::ALL, &[]),
+            false => turn_args(h, s),
+        };
+        assert!(
+            !a.is_empty(),
+            "{h:?} built no argv, so nothing below is a test"
+        );
+        a
+    }
+
     #[test]
     fn an_empty_model_lets_the_harness_keep_its_own_default() {
         // **Every** harness, because this is what the settings modal relies on
@@ -2027,8 +2101,19 @@ mod tests {
         let mut s = spec();
         s.model = String::new();
         for h in Harness::ALL {
-            let a = turn_args(h, &s);
+            let a = spawn_argv(h, &s);
             assert!(!a.contains(&"--model".to_string()), "{h:?}: {a:?}");
+        }
+        // …and the guard is not vacuous in the other direction either: a real
+        // id does reach every harness's argv.
+        s.model = "provider/some-model".into();
+        for h in Harness::ALL {
+            let a = spawn_argv(h, &s);
+            let i = a
+                .iter()
+                .position(|x| x == "--model")
+                .unwrap_or_else(|| panic!("{h:?} never sends --model: {a:?}"));
+            assert_eq!(a[i + 1], "provider/some-model", "{h:?}");
         }
     }
 
@@ -2203,6 +2288,94 @@ mod tests {
     fn a_quote_in_a_path_cannot_break_out_of_the_override() {
         let o = codex_mcp_overrides(r#"/opt/we"ird/schemaic"#, "/tmp/ep.json", &[]);
         assert!(o[0].contains(r#"we\"ird"#), "{}", o[0]);
+    }
+
+    /// **Something has to check the *structure*, and nothing did.** Five tests
+    /// assert substrings of a string Codex must parse as TOML, built by a
+    /// `format!` that is a nest of doubled braces — so the braces balancing is
+    /// a property nobody would notice losing until a Codex session came up with
+    /// no server and a parse error on stderr nobody reads.
+    ///
+    /// This is a structural check, not a TOML parser: adding the `toml` crate
+    /// and its four transitive dependencies to answer a Low finding costs more
+    /// than it settles, and the failure the finding names — the braces stopping
+    /// balancing — is exactly what this catches. What it deliberately does not
+    /// claim is that Codex accepts the result; only a real `codex exec` settles
+    /// that, and `docs/architecture.md` records it as measured.
+    #[test]
+    fn the_override_is_structurally_a_toml_value_for_every_access_level() {
+        for allowed in [
+            &[][..],
+            &["mcp__schemaic__list_schema"][..],
+            &[
+                "mcp__schemaic__run_query",
+                "mcp__schemaic__list_schema",
+                "mcp__schemaic__describe_table",
+                "mcp__schemaic__propose_table_change",
+            ][..],
+        ] {
+            for exe in [
+                "/usr/bin/schemaic",
+                r"C:\Program Files\schemaic\schemaic.exe",
+                r#"/opt/we"ird\path/schemaic"#,
+            ] {
+                let o = codex_mcp_overrides(exe, r"C:\tmp\ep.json", allowed);
+                assert_eq!(
+                    o.len(),
+                    1,
+                    "one override, or the caller's `-c` pairing is wrong"
+                );
+                let s = &o[0];
+                let (key, value) = s.split_once('=').expect("key=value");
+                assert_eq!(key, "mcp_servers", "{s}");
+                assert!(balanced(value), "unbalanced braces or brackets: {s}");
+            }
+        }
+        // The isolation-only form is the same shape, since the two are
+        // alternatives at one call site.
+        assert!(balanced(
+            codex_isolation_only()[0]
+                .split_once('=')
+                .expect("key=value")
+                .1
+        ));
+    }
+
+    /// Do `{}`/`[]` nest correctly, ignoring anything inside a TOML basic
+    /// string (where a brace is a character and `\"` is not the end)?
+    fn balanced(s: &str) -> bool {
+        let mut stack: Vec<char> = Vec::new();
+        let mut in_str = false;
+        let mut escaped = false;
+        for c in s.chars() {
+            if in_str {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' | '[' => stack.push(c),
+                '}' if stack.pop() != Some('{') => return false,
+                ']' if stack.pop() != Some('[') => return false,
+                _ => {}
+            }
+        }
+        !in_str && stack.is_empty()
+    }
+
+    /// The checker itself is not vacuous.
+    #[test]
+    fn the_balance_check_rejects_what_it_is_for() {
+        assert!(balanced(r#"{a={b=[1,2]},c="}]"}"#));
+        assert!(balanced(r#"{p="C:\\x\"y"}"#));
+        assert!(!balanced("{a={b=1}"), "a missing brace passed");
+        assert!(!balanced("{a=[1,2}]"), "crossed delimiters passed");
+        assert!(!balanced(r#"{p="unterminated}"#), "an open string passed");
     }
 
     // ---- Antigravity settings surgery ------------------------------------
@@ -2477,22 +2650,58 @@ mod opencode_tests {
         assert_eq!(flag_value(&a, "--variant").as_deref(), Some("high"));
     }
 
+    /// **`turn_args` clamps, so this hands it the raw level.** The test used to
+    /// apply `effort_arg` in its own body and pass the answer in — which is the
+    /// caller's line copied into the test, so it was green whether or not any
+    /// caller clamped. `turn_args(OpenCode, effort: "xhigh")` really did return
+    /// `--variant xhigh` at that point; both callers happened to clamp, so
+    /// nothing was wrong on screen and nothing could have caught it if one
+    /// stopped.
     #[test]
     fn another_harness_effort_level_is_clamped_before_it_reaches_argv() {
-        // The composition the app performs: `effort_arg` first, `turn_args`
-        // second. Claude's `xhigh` and Antigravity's `medium` survive a harness
-        // switch in settings, and neither is a variant this CLI advertises.
+        // Claude's `xhigh` and Antigravity's `medium` survive a harness switch
+        // in settings, and neither is a variant this CLI advertises.
         for level in ["xhigh", "medium", "low"] {
             assert_eq!(Harness::OpenCode.effort_arg(level), None, "{level}");
             let mut s = spec();
-            s.effort = Harness::OpenCode
-                .effort_arg(level)
-                .unwrap_or_default()
-                .into();
+            s.effort = level.into();
             let a = args_of(&s);
             assert!(!a.contains(&"--variant".to_string()), "{level}: {a:?}");
         }
-        assert_eq!(Harness::OpenCode.effort_arg("max"), Some("max"));
+        // …and a level this CLI does advertise still reaches the argv, so the
+        // clamp is not "drop everything".
+        let mut s = spec();
+        s.effort = "max".into();
+        assert_eq!(
+            flag_value(&args_of(&s), "--variant").as_deref(),
+            Some("max")
+        );
+
+        // Every harness, so this is not one arm's habit: nothing a harness does
+        // not advertise reaches its argv, whatever the caller passes.
+        for h in Harness::ALL {
+            for level in ["minimal", "low", "medium", "high", "xhigh", "max", "junk"] {
+                let a = super::tests::spawn_argv(
+                    h,
+                    &TurnSpec {
+                        prompt: "hi".into(),
+                        effort: level.into(),
+                        ..Default::default()
+                    },
+                );
+                let sent = a
+                    .iter()
+                    .zip(a.iter().skip(1))
+                    .find(|(k, _)| *k == "--variant" || *k == "--effort")
+                    .map(|(_, v)| v.as_str());
+                if let Some(sent) = sent {
+                    assert!(
+                        h.effort_levels().contains(&sent),
+                        "{h:?} sent {sent:?}, which it does not advertise (asked {level:?})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2776,6 +2985,10 @@ Options:
     /// The field is free text. Claude's builder trimmed; the other three tested
     /// `!is_empty()`, so `" "` became `--model " "` — an unknown model, reported
     /// as "Couldn't launch the CLI", which is the one cause that is not it.
+    ///
+    /// Driven through each harness's **own** spawn shape: `turn_args` is
+    /// `Vec::new()` for the two persistent ones, so this held vacuously for half
+    /// the enum while claiming "every harness".
     #[test]
     fn a_whitespace_only_model_is_no_model_on_every_harness() {
         for h in Harness::ALL {
@@ -2785,7 +2998,7 @@ Options:
                     model: blank.into(),
                     ..Default::default()
                 };
-                let args = turn_args(h, &spec);
+                let args = super::tests::spawn_argv(h, &spec);
                 assert!(
                     !args.iter().any(|a| a == "--model"),
                     "{h:?} sent --model for {blank:?}: {args:?}"
@@ -2941,24 +3154,77 @@ mod inline_tests {
             "--continue",
             "-c",
         ];
-        for h in Harness::ALL {
-            let a = inline_argv(h, &spec());
-            assert!(!a.is_empty(), "{h:?} built no argv");
-            for f in forbidden {
-                // Codex's constraint rides on `-c sandbox_mode=…`, which is the
-                // one `-c` that may appear: it closes the sandbox rather than
-                // opening anything.
-                if h == Harness::Codex && f == "-c" {
-                    let bad = a
-                        .iter()
-                        .zip(a.iter().skip(1))
-                        .any(|(k, v)| k == "-c" && !v.starts_with("sandbox_mode="));
-                    assert!(!bad, "{h:?} passes a -c that is not the sandbox: {a:?}");
-                    continue;
+        // **Both polarities of `isolate_config`**, because the state
+        // `S2-L5-01` bit in is the one where the flag is *absent*: a Codex build
+        // advertising `--sandbox` but not `--ignore-user-config` is still graded
+        // `Restricted` and still runnable. `spec()` hard-coded `isolate_config:
+        // true`, so no inline test ever built the argv that mattered.
+        for isolate in [true, false] {
+            for h in Harness::ALL {
+                let a = inline_argv(
+                    h,
+                    &InlineSpec {
+                        isolate_config: isolate,
+                        ..spec()
+                    },
+                );
+                assert!(!a.is_empty(), "{h:?} built no argv");
+                for f in forbidden {
+                    // **Codex's `-c` overrides close things rather than open
+                    // them**, and this used to allow exactly one — the sandbox —
+                    // which made the correct fix a test failure. What the rule
+                    // was reaching for is that no `-c` hands the model a server:
+                    // `mcp_servers={}` is an *empty* table and is the honest
+                    // version of "no database tools", ours absent and nobody
+                    // else's in its place.
+                    if h == Harness::Codex && f == "-c" {
+                        let bad = a.iter().zip(a.iter().skip(1)).find(|(k, v)| {
+                            *k == "-c"
+                                && !v.starts_with("sandbox_mode=")
+                                && v.as_str() != "mcp_servers={}"
+                        });
+                        assert!(bad.is_none(), "{h:?} passes {bad:?}: {a:?}");
+                        continue;
+                    }
+                    assert!(!a.contains(&f.to_string()), "{h:?} passes {f}: {a:?}");
                 }
-                assert!(!a.contains(&f.to_string()), "{h:?} passes {f}: {a:?}");
             }
         }
+    }
+
+    /// **The empty server table is not optional, and this path did not have
+    /// it.** A one-shot emitted no `mcp_servers` override at all, so on a build
+    /// without `--ignore-user-config` Ctrl+K loaded every server in the user's
+    /// own `~/.codex/config.toml` and offered their tools to a generation with
+    /// no surface on which a tool call could appear. The session path emits it
+    /// unconditionally; so does this one now, *especially* when the flag that
+    /// would otherwise have covered it is missing.
+    #[test]
+    fn a_codex_one_shot_displaces_the_users_own_servers_with_or_without_the_flag() {
+        for isolate in [true, false] {
+            let a = inline_argv(
+                Harness::Codex,
+                &InlineSpec {
+                    isolate_config: isolate,
+                    ..spec()
+                },
+            );
+            let has = a
+                .iter()
+                .zip(a.iter().skip(1))
+                .any(|(k, v)| k == "-c" && v == "mcp_servers={}");
+            assert!(has, "isolate_config: {isolate} — {a:?}");
+            // …and the flag itself still tracks the probe, so this is not
+            // covering for a flag that silently stopped being passed.
+            assert_eq!(
+                a.iter().any(|s| s == "--ignore-user-config"),
+                isolate,
+                "{a:?}"
+            );
+        }
+        // The same table the session path assigns, from the same function, so
+        // the two cannot drift into different ideas of "no servers".
+        assert_eq!(codex_isolation_only(), vec!["mcp_servers={}".to_string()]);
     }
 
     /// Each harness asks for its own plain-text answer, never the streaming

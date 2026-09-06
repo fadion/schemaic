@@ -564,7 +564,10 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
             return v_stack((
                 // "The assistant", not "Claude": this renderer has no harness to
                 // hand and the panel is driven by whichever CLI the user picked,
-                // so naming one vendor here would be wrong for two of the three.
+                // so naming one vendor here would be wrong for every other one.
+                // (The count that used to stand here was already out of date by
+                // the commit that wrote it, which is the argument for not
+                // keeping one.)
                 text(format!(
                     "The assistant proposed a change that couldn't be read — {e}"
                 ))

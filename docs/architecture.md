@@ -3571,8 +3571,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       whole `ChatMessage`, so every streamed chunk deep-cloned and deep-compared all N of them —
       over segments that include a tool call's untruncated result — and kept a permanent second
       resident copy of the conversation. It is `O(segments)` and allocates nothing, on the stated
-      assumption that a message is only ever *extended*; a test walks every mutation the stream
-      makes, because a fingerprint that misses one freezes a bubble's content on screen. The
+      assumption that a message is only ever *extended*;
+      `fingerprint_changes_on_every_mutation_the_stream_makes` walks every mutation the stream
+      makes, because a fingerprint that misses one freezes a bubble's content on screen — and it
+      enumerated every other field while omitting the one described next, so the arm the paragraph
+      below argues hardest for was the arm nothing drove. It covers `harness` now. The
       `harness` is mixed in too, and that is a **deliberate exception** to the assumption above: the
       field is written once at construction and mutated by nothing, so by the rule it need not be
       there at all. It is there because "immutable" is a property of today's call sites rather than
@@ -3583,6 +3586,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       fingerprint does not move keeps its rendered speaker label. Today's four keys happen to have
       distinct lengths, which is luck rather than design: a fifth named `crush` or `cline` collides
       with `codex` on length alone. A key is a handful of bytes, so the cost is still nothing.
+      **That property is pinned by a test of its own, and it has to use synthetic keys** —
+      `two_harness_keys_of_the_same_length_do_not_fingerprint_alike`, which is separate from the
+      walk above rather than one more assertion inside it because **no test written with real
+      harness keys can catch this**: `claude`/`codex`/`antigravity`/`opencode` are 6, 5, 11 and 8
+      bytes, so a length-only fold passes against all four and would pass against every case an
+      honest reading of today's enum suggests. It holds `codex` apart from `crush` and `cline`,
+      neither of which is a harness, and apart from an absent key and an empty one.
     - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
       every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
       to 200 rows of real table data, and writing it verbatim exported user data to a plaintext
@@ -5132,7 +5142,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   modal's *Agent CLI* dropdown, persisted as `UiState::ai_harness`, carried on `AiSettings::harness`,
   resolved and interrogated by `app/agent_cli.rs`, and spawned by `app/ai.rs` — Claude and
   Antigravity as one persistent child per conversation, Codex and OpenCode as one process per turn.
-  **A fourth, `gemini`, was modelled here and refused, and it has now been deleted rather than left
+  **A fifth, `gemini`, was modelled here and refused, and it has now been deleted rather than left
   as a menu entry that says no.** Google withdrew OAuth for personal accounts, so `gemini` needs an
   API key to authenticate at all, and the CLI's own sign-in points at Antigravity as its successor —
   which is a harness this crate does drive. Because the adapter was already refused rather than
@@ -5369,6 +5379,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   argv and not about the run**: its server is registered globally, and a one-shot fired while a chat
   session holds that registration sees it — measured, and written up under `harness.rs`'s
   `inline_argv` entry with the reason no flag there can take it away.
+  **A command line too long to spawn is refused before the spawn, and the refusal counts in the
+  platform's own units.** `arg_limit` is 30,000 on Windows (headroom under `CreateProcess`'s 32,767
+  for the executable path and the runtime's quoting) and 128 KiB elsewhere, where the binding
+  constraint is `MAX_ARG_STRLEN` on a *single* argument — and the system prompt, carrying the schema
+  outline, is a single argument. `oversize_reason` is checked ahead of every spawn because the
+  failure it prevents is unrecognisable afterwards: the OS returns a generic error and the app's
+  handler sends the user off to check an installation that is fine. It measures with the private
+  `arg_units`, which is **UTF-16 code units on Windows and bytes elsewhere**. It was `str::len()` —
+  UTF-8 bytes — on both, while `arg_limit`'s own doc correctly calls the Windows cap *characters*,
+  which for `CreateProcessW` means UTF-16 units: a CJK schema outline costs three bytes and one unit
+  per character, so a ~12,000-character outline was refused at "36,0xx characters" when the real
+  command line was ~12,000 units. Conservative in direction, but the number in the refusal was wrong
+  by 3× and the one lever it suggests — narrowing the AI schema scope — could not close a gap that
+  was not there. Elsewhere `MAX_ARG_STRLEN` really is bytes and `str::len()` is exact, which is why
+  this is a per-platform answer rather than one unit for both
+  (`an_argument_is_measured_in_the_units_the_platform_caps`).
+  **The refusal names that unit too, and fixing only the measurement left the wording behind.** The
+  message said *"({total} characters; this platform allows about {limit})"* on every platform, so
+  once the count was right it was a byte count labelled "characters" everywhere but Windows — the
+  same error one step further on, and the step that reaches the user. A number in a refusal is only
+  useful if the reader can compare it to the limit printed beside it, and they cannot compare two
+  figures whose unit they have been told wrongly. `arg_unit_name()` sits beside `arg_units()` and
+  answers `"characters"` on Windows and `"bytes"` elsewhere — the count and the word that labels it
+  reading the same `cfg!(windows)` four lines apart, so a platform added to one has to be added to
+  the other in the same edit.
   - `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
     `Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`) is **a dialect rather than a vendor**: the
     variant names the wire format a binary speaks, which is the only thing decoding needs to know,
@@ -5387,6 +5422,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     settings file written before the field existed carries no key at all and loads as Claude,
     because Claude was the only harness there was
     (`a_ui_state_from_before_multiple_harnesses_loads_as_claude`).
+    **Serde kept the key and the app then overwrote it, so the promise held for exactly one
+    session.** The save site wrote `ai_harness.get().key()` — the *fallback's* key — so the name
+    the user's file carried was replaced by the next thing that touched the settings, and a build
+    that later grew that harness had nothing to restore. The rule is
+    `persist::ai_harness_to_persist(unknown, running)`: `main.rs` holds the raw key in
+    `ai_harness_unknown` and writes it back
+    until the user picks a harness themselves, at which point the harness-switch effect clears it
+    and the file starts naming what runs. **The same load also clears `ai_model` and
+    `ai_cli_path`**, which were chosen for a CLI this build does not have: the switch effect clears
+    those on a *switch* and a restore is not one, so an unknown harness paired with
+    `opencode/claude-sonnet-5` started a Claude session with that model id and died on an unknown
+    model under "check your installation". The test above was green throughout, because it drove
+    serde in isolation and never the composition with the caller that overwrote; it calls the rule
+    now, which is the only reason it can fail.
     **`speaker_name` is a fourth string, and it differs from `label` in exactly one place on
     purpose**: `label` is "Claude Code", the product you install and point a path at, while a
     transcript header is naming a speaker and reads "Claude" — which is also the name that header
@@ -5451,8 +5500,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     with anyone else's: that help text calls the accepted set provider-specific, so it is not even
     constant across OpenCode's own models, and `effort_arg` clamping to what the flag documents sends
     no flag rather than an invented level when `xhigh` or `medium` arrives from another harness
-    (`another_harness_effort_level_is_clamped_before_it_reaches_argv`, which drives the
-    `effort_arg` → `turn_args` composition rather than the predicate alone). The knock-on is in
+    (`another_harness_effort_level_is_clamped_before_it_reaches_argv`). **That test used to apply
+    `effort_arg` in its own body and pass the answer in**, which is the caller's line copied into
+    the test: it was green whether or not any caller clamped, and `turn_args(OpenCode, effort:
+    "xhigh")` really did return `--variant xhigh` at the time. It hands the argv builder the *raw*
+    level now and loops every harness × every level — see the clamp's move into the builders,
+    below, and the gap widening it found on Claude. The knock-on is in
     `schemaic-ui`: a four-variant `AiEffort` intersected this list at exactly `High`, so see the
     settings-modal entry for why the enum is now the six-way union.
     **The seal is graded here, because the four do not answer it equally well.** `Constraint` is
@@ -5586,7 +5639,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     passed alone and neither was wrong on its own. It answers `["exec", "--help"]` for Codex and
     `["--help"]` for the other three, and the last element is always the help flag itself, since every
     harness's page still has to answer the grade question
-    (`codex_is_probed_on_the_subcommand_that_documents_its_isolation`). `codex exec --help` also
+    (`codex_is_probed_on_the_subcommand_that_documents_its_isolation`, which pins this function's
+    *return* — the answer, not the question the probe asks; the argv itself is pinned in
+    `agent_cli.rs`, and why it had to be is under that entry). `codex exec --help` also
     carries `--sandbox`, so one page still answers both — and
     `the_codex_help_page_answers_the_grade_and_the_isolation_together` keeps the *old* page as a
     fixture beside the new one, holding it to a resolved grade and a silently absent isolation, so the
@@ -5613,7 +5668,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Its values go through a private TOML string escaper, since every separator in
     `C:\Users\…\schemaic.exe` is a TOML escape introducer and an unescaped one is either a parse
     error or, worse, a different path (`a_windows_path_survives_the_toml_override_intact` walks the
-    output and asserts no lone backslash survives). Registering the server is **not** enough to make
+    output and asserts no lone backslash survives).
+    **Something also checks the *structure*, and for a while nothing did.** Five tests asserted
+    substrings of a string Codex has to parse as TOML, built by a `format!` that is a nest of
+    doubled braces — so the braces balancing was a property nobody would notice losing until a
+    session came up with no server and a parse error on a stderr nobody reads.
+    `the_override_is_structurally_a_toml_value_for_every_access_level` walks the access levels
+    against three exe shapes (a Unix path, a Windows one, and one with an embedded quote), splits
+    `key=value`, and checks `{}`/`[]` balance with a small string-aware scanner that is itself
+    pinned by `the_balance_check_rejects_what_it_is_for`. It is **deliberately not the `toml`
+    crate**: four transitive dev-dependencies to settle a Low costs more than it buys, and the named
+    failure — the braces stopping balancing — is exactly what a balance check catches. And it
+    explicitly does **not** claim Codex accepts the result; only a real `codex exec` settles that,
+    and the sentences here that say *measured* are where that lives. Registering the server is
+    **not** enough to make
     it callable: measured, with the server registered and no approval set, `codex exec` refuses
     every call with *"MCP tool call requires approval, but approval policy is never"* — `exec` has
     nobody to prompt, so the default `auto` denies. So the override carries
@@ -5678,7 +5746,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the `agent` entry whose `tools` map is the seal — which is Claude's `--mcp-config` plus
     `--tools ""` folded into a single document. The connection's access level reaches it the way it
     reaches every other harness: the tools it may call are named, by their **bare** names via
-    `bare_tool_name`, in the agent's `description` rather than in a permission rule, because OpenCode
+    `bare_tool_name` — which this sentence claimed while the function inlined that helper's body
+    twelve lines from the two call sites that really did call it, so the single source of truth the
+    claim rests on did not exist; it calls it now — in the agent's `description` rather than in a
+    permission rule, because OpenCode
     allows MCP tools by default and there is no per-tool approval to set; the server itself still
     refuses anything the level does not offer, and naming them only saves the model a turn spent
     discovering that (`a_read_only_connection_never_advertises_run_query`).
@@ -5748,6 +5819,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the direction that would break by over-trimming — and that one picks its builder off
     `is_persistent`, because `session_args` trims at its own top for the same reason and the property
     belongs to the field rather than to either builder.
+    **A loop over `Harness::ALL` that calls `turn_args` is vacuous for half the enum, and two tests
+    here were.** `turn_args` answers `Vec::new()` for Claude and Antigravity, so "no `--model`
+    appears" held by there being no argv at all, under docstrings that said *every* harness —
+    deleting `!model.is_empty()` from `session_args`'s Antigravity arm kept the whole suite green,
+    and `agy … --model ""` then dies as "Couldn't launch the CLI". The test helper `spawn_argv(h,
+    spec)` is the fix: it picks each harness's **own** shape (`session_args` for the persistent two,
+    `turn_args` for the others) and asserts the argv is non-empty *before* anything else is checked,
+    so a loop over it cannot go vacuous again. Both tests above go through it, and
+    `an_empty_model_lets_the_harness_keep_its_own_default` now also asserts the positive direction —
+    a real id does reach every harness's argv — so the guard cannot be satisfied by dropping the
+    flag altogether.
     **The system context rides the first turn of a thread and none of the rest**, which is
     `turn_system`. Codex has no `--append-system-prompt` and none is passed
     to OpenCode either, so for both `prefixed_prompt` folds
@@ -5781,6 +5863,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     command-specific flags parsed after a subcommand"*, which is to say a **later** `-c` wins. Put
     before `mcp_overrides`, a caller passing its own `sandbox_mode` would silently outrank the
     constraint.
+    **What that measurement did *not* establish is the rest of that page.** `--sandbox`'s absence
+    from `codex exec resume` is the one thing anybody read off the binary; a resumed turn also
+    carries `--json`, `--skip-git-repo-check`, `--model` and, when the probe saw it,
+    `--ignore-user-config`, and nothing in the code, the tests or this document records whether that
+    subcommand takes them. If one of them is missing, every Codex turn after the first dies and is
+    reported as *"The Codex turn ended unexpectedly"*. It is a one-command check that no session can
+    run, so it is written up as a hand check in `review/release-v0.23.0/user-verify-fix.md` rather
+    than asserted here.
     **The Antigravity argv lives in `session_args` now and leads with `--input-format stream-json
     --output-format stream-json`** — the second required by the first, on that flag's own help. Its
     two flags of evidence carry over unchanged from the per-turn argv it replaced: `--sandbox`
@@ -5833,31 +5923,64 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     specification.** Ctrl+K, AI Fill and AI Seed each want one string back that a parser then reads,
     so `InlineSpec` carries intent, system, model, effort, seal, `isolate_config` and Codex's
     `last_message` and nothing else — there is no field for a server, an approval map or a resume id,
-    because no arm may have one. On every harness the argv is free of `--mcp-config`, of a `-c` carrying
-    `mcp_servers`, and of anything that resumes a thread this one-shot never saw
+    because no arm may have one. On every harness the argv is free of `--mcp-config`, of any `-c`
+    that names a server, and of anything that resumes a thread this one-shot never saw
     (`no_inline_generation_is_given_a_server_or_a_session` runs the forbidden list over
-    `Harness::ALL`, narrowing Codex's one permitted `-c` to `sandbox_mode=` rather than exempting the
-    flag). Claude's arm delegates to `crate::inline_args`, which gained an `effort` parameter and is
+    `Harness::ALL`, narrowing Codex's permitted `-c`s to `sandbox_mode=` and the empty
+    `mcp_servers={}` rather than exempting the flag; it drives **both polarities** of
+    `isolate_config`, and the reason is the finding below). Claude's arm delegates to
+    `crate::inline_args`, which gained an `effort` parameter and is
     otherwise what it was: it was the whole of this path for as long as the other three spawned Claude
     regardless of the picker, and is now one of four.
     Measured against the installed binaries, Codex is `exec --ephemeral --skip-git-repo-check
     --sandbox read-only --color never`, then `--ignore-user-config` when the probe saw it, then
-    `--model`, then `-c sandbox_mode="read-only"`, then `-o <file>`, then the prompt as the last
-    positional; Antigravity is `-p <prompt> --output-format text --sandbox --disable-slash-commands`
+    `--model`, then `-c sandbox_mode="read-only"`, then `-c mcp_servers={}`, then `-o <file>`, then
+    the prompt as the last positional;
+    Antigravity is `-p <prompt> --output-format text --sandbox --disable-slash-commands`
     plus `--model` and `--effort`; OpenCode is `run --pure --agent schemaic --format default` plus
     `--model` and `--variant`, prompt last. **`--output-format text` is named on Antigravity although
     it is the default**, because the session path asks that same binary for `stream-json` and a
     default that moved would put a JSONL envelope where a parser expects SQL.
+    **`-c mcp_servers={}` is on this path now, and its absence was the release review's `S2-L5-01`.**
+    A Codex one-shot emitted `-c sandbox_mode="read-only"` and no `mcp_servers` override at all, so
+    on a build advertising `--sandbox` but not `--ignore-user-config` — still graded `Restricted`,
+    still runnable, and exactly the build the flag is conditional *for* —
+    Ctrl+K loaded and launched **every server in the user's own `~/.codex/config.toml`** and offered
+    their tools to a generation with no surface on which a tool call could appear. The session path
+    prevents that unconditionally. It is emitted here whether or not `--ignore-user-config` is
+    available, because the flag is the one that may be missing and the config key is the mechanism
+    that is not, and it is the same `codex_isolation_only()` the session's fallback assigns, so the
+    two cannot drift into different ideas of "no servers"
+    (`a_codex_one_shot_displaces_the_users_own_servers_with_or_without_the_flag`, which also holds
+    the flag itself to tracking the probe, so this is not covering for a flag that quietly stopped
+    being passed).
+    **The test that should have caught it rejected the fix instead, which is `S2-L6-01`.**
+    `no_inline_generation_is_given_a_server_or_a_session` asserted that every Codex `-c` starts with
+    `sandbox_mode=`, so the correct argv made it panic; and `inline_tests::spec()` hard-coded
+    `isolate_config: true`, so no inline test ever built the un-isolated argv — which is precisely
+    the state the bug bit in. The forbidden-flag rule was reaching for "no `-c` hands the model a
+    server", and an empty table is the honest version of *no database tools*: ours absent, and
+    nobody else's in its place. Both polarities of `isolate_config` are looped now, and the empty
+    table is allowed by name rather than by prefix.
     **Effort reaches a one-shot now, and `inline_argv` clamps it itself.** It never did on Claude's
     path, so a setting the modal presents as the assistant's applied to the chat panel alone; each
     harness takes it in its own flag — `--effort` on Claude and Antigravity, `--variant` on OpenCode,
     nothing at all on Codex, whose `effort_levels()` is empty and which therefore gets no flag rather
-    than a dropped one (`effort_reaches_each_harness_in_its_own_flag`). **The clamp lives here rather
-    than at the caller, and that is a deliberate divergence from `turn_args`**, which is handed an
-    already-answered `effort_arg` by its single caller in `ai.rs`: three call sites reach this
-    function and each would have had to remember. So `InlineSpec::effort` is the level as the user
-    set it, in whatever vocabulary the harness they set it under uses, and `inline_argv` asks
-    `h.effort_arg(spec.effort.trim())` before any arm sees it. The setting outlives a harness switch,
+    than a dropped one (`effort_reaches_each_harness_in_its_own_flag`). **The clamp lives in the
+    argv builder rather than at the caller, and all three builders do it now.** It was this one
+    alone — three call sites reach `inline_argv` and each would have had to remember — while
+    `turn_args` and `session_args` were handed an already-answered `effort_arg` by their callers in
+    `ai.rs`. That divergence is gone: each of the three asks `h.effort_arg(spec.effort.trim())` at
+    its own top, idempotently, so a caller that still clamps costs nothing and one that stops costs
+    nothing either. The gap was not theoretical — `turn_args(OpenCode, effort: "xhigh")` really did
+    return `--variant xhigh`; both callers happened to clamp, so there was no wrong output and
+    nothing that could have caught it if one stopped. **And widening the test to every harness ×
+    every level found a second gap the review had not predicted**: it failed on Claude, because
+    `session_args` did not clamp at all, so a Claude session would have been spawned with
+    `--effort minimal` — a level that flag does not advertise, Claude's list being
+    `low|medium|high|xhigh` — the moment the setting carried `minimal` over from OpenCode. So
+    `InlineSpec::effort` is the level as the user set it, in whatever vocabulary the harness they
+    set it under uses. The setting outlives a harness switch,
     so Claude's `xhigh` under Antigravity is the ordinary case and not the exotic one, and it is
     dropped rather than sent (`an_effort_the_harness_never_advertised_is_not_sent`). `inline_args`
     says in its own doc that the value arrives clamped, because `inline_argv` is its only caller and
@@ -5892,6 +6015,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     genuinely does not hold for Antigravity while a chat session holds the registration. It does hold
     for the other three, which are configured per invocation, and this is written down because that
     sentence is exactly the one that would otherwise be read as covering all four.
+    **It did not hold for Codex either, and this paragraph said it did.** Stating the seal as settled
+    fact "for the other three" was false whenever `isolate_config` was false: with no
+    `--ignore-user-config` and no `mcp_servers` override, the user's own servers loaded into a
+    one-shot. That is the `-c mcp_servers={}` fix above, and the sentence is only true now because
+    of it — which is the point of recording it here rather than only there. Antigravity remains the
+    one genuine exception, for the reason no flag can take away.
     **And there is no per-invocation fix in that CLI to reach for, so the limit stands as
     described.** It has no config flag for this, and no definable agent the way OpenCode has —
     `agy agent` only lists agents, and lists none. The one alternative was to refuse a one-shot
@@ -5924,7 +6053,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     with an empty stderr, so surfacing stderr alone yields a blank.
     With the Gemini adapter deleted, `claude`, `codex`, `agy` and `opencode` are the four, and every
     argv here is for a binary somebody has run — and with the Antigravity resume measured above,
-    nothing on any of the four is now carried on its help page alone.
+    nothing on any of the four is now carried on its help page alone. The one exception is the
+    `codex exec resume` flag list described above, which is carried on *neither*: no page was read
+    and no run was recorded.
   - `stream.rs` — one transcript vocabulary, four CLI dialects. Every harness decodes into the same
     `StreamEvent`s the panel already renders, so the dialect stops at this module and nothing
     downstream learns which CLI produced a turn. **They do not even agree on where the discriminator
@@ -5943,7 +6074,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     what a partial chunk looks like and a cumulative restatement never does
     (`real_antigravity_deltas_are_partial_chunks_and_append`). Codex re-sends a message's whole text
     on every `item.updated` for the
-    same item id. Appended as they arrive, a three-chunk reply renders as
+    same item id — and that one, unlike the Antigravity half beside it, is **not** measured; see the
+    confidence-boundary paragraph at the end of this entry. Appended as they arrive, a three-chunk reply renders as
     "Hi" + "Hi there" + "Hi there!"; the private `Coalescer` emits only the unseen suffix instead,
     and falls back to the whole string when the text is *not* an extension of what came before, so a
     rewritten message loses nothing rather than being diffed against a string it shares no prefix
@@ -5957,6 +6089,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     it, and no amount of coalescing would help, because no partial text is ever written to decode.
     The visible cost is that there is no "it has started" moment to report: the panel's spinner runs
     until the text lands.
+    **`streams_deltas` is a record, not a lever, and its doc now says so.** Nothing in the app calls
+    it: it claimed the panel used it to decide whether a first token means "it has started", and the
+    panel decides that from `m.pending && m.segs.is_empty()` — the better rule, since it answers
+    correctly for the harness that streams nothing. It is kept with `#[allow(dead_code)]` rather
+    than deleted because it is a measured fact about four CLIs that this parser's whole design rests
+    on, and deleting a measurement to satisfy a warning is how a measurement gets taken twice.
+    `supports_resume` and `supports_model_choice` are uncalled the same way and were left alone.
     **There are two pieces of that state now, and the second is `seen_tools`.** Two dialects restate
     a tool call while it is still running, neither marking the repeat —
     Codex on every `item.updated` for the item id, Antigravity on every `state: "ACTIVE"` for the
@@ -6066,6 +6205,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     decode a name Schemaic itself wrote — back to the qualified `mcp__schemaic__run_query` every other
     harness produces, and leaves anything unprefixed alone so a built-in still shows under its own
     name rather than being dressed up as an MCP call.
+    **`push` strips a leading U+FEFF before anything else, because `trim` does not.** A byte-order
+    mark is not `White_Space`, so a BOM on the first line — what a Windows console redirect or a shim
+    that re-encodes a pipe prepends — made `from_str` fail and the line was filed as prose. On the
+    two dialects that carry the session id on their *opening* line that costs the whole
+    conversation's continuity rather than one event: `resume` never learns the id, so every later
+    turn opens a fresh conversation with no memory of the last
+    (`a_byte_order_mark_does_not_swallow_the_session_id`, which also checks the line is reported as
+    JSON rather than kept as a diagnostic).
+    **`last_line` is the other half of that**, and it exists so a caller need not re-parse: both
+    session tasks have to tell "no events because this is not JSON" — a fatal error the CLI printed
+    as prose, and the only diagnostic there will be — from "no events because this is JSON I ignore",
+    and they were answering it by running `serde_json::from_str` a second time on every line of
+    every turn. `LineKind::{Blank, Plain, Json}` are the three answers, and JSON this dialect has
+    nothing to say about is **not** prose: filing it as such put protocol noise in the failure
+    message (`a_line_reports_what_it_was_without_being_parsed_again`).
+    **The adversarial-input surface is enumerated rather than sampled.**
+    `every_harness_ignores_blank_and_malformed_lines` drives sixteen inputs over `Harness::ALL`,
+    widened from a handful of blanks and one unparseable line: non-object JSON (`[]`, `null`, `0`, a
+    bare string), a `type` that is null, numeric or an object, a missing, `null` or array `item`,
+    and a `type` nothing decodes — because a dialect decoder's failure mode is not a panic but a
+    chip or a `TurnDone` conjured out of a line that meant nothing. The one deliberate exception is now a named test of its own rather than an
+    absence inside that loop, `an_opencode_step_finish_with_no_readable_reason_ends_the_turn`: this
+    printer never says a turn is over, so of the two ways to be wrong about a `reason` that cannot be
+    read, ending the turn truncates one only if a *tool* step ever omits it, while the other stamps
+    an error on every ordinary turn.
     **Which dialects are measured and which are read is the real confidence boundary.** Codex,
     Antigravity and OpenCode are pinned by fixtures captured **verbatim** from the installed binaries
     (`codex exec --json`, `agy -p --output-format stream-json`,
@@ -6077,10 +6241,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     OpenCode one, and it is the fixture carrying the two facts that dialect turns on: a `step_finish`
     whose `reason` is `tool-calls` is not the end, and the one whose reason is `stop` is. Each capture also has a second
     test driving the same bytes through `TurnState`, so the *composition* is covered and not only the
-    parser. Keep them byte-for-byte: tidying an id or a usage key turns evidence back into a fixture
+    parser. **That sentence claimed all six and was true of four**, and the two it was not true of
+    included `AGY_REAL_DENIED_TOOL` — the fixture the whole "SUCCESS with a refusal" argument rests
+    on. Its response body is empty, so the *only* thing the user reads is the prose this parser
+    synthesises, and a `TurnState` regression that swallowed that prose would have restored the
+    silent success with the parser test still green. Both
+    `a_real_denied_antigravity_tool_call_names_the_tool_and_fails_the_turn` and
+    `a_real_codex_tool_cycle_fills_its_chip_and_answers` fold their events through `TurnState` now
+    and assert on the rendered segments and on the chip — its name, its result, and that it is no
+    longer spinning — rather than on the event list alone. Keep them byte-for-byte: tidying an id or a usage key turns evidence back into a fixture
     that agrees with the code that produced it. The one dialect no binary had ever produced was
-    Gemini's, and deleting that harness took it with it, so nothing decoded here is now read off
-    documentation alone.
+    Gemini's, and deleting that harness took it with it.
+    **One shape inside a measured dialect is still unmeasured, and it is the `Coalescer`'s.** No
+    captured Codex fixture contains an `item.updated` line — `CODEX_REAL_TURN`'s answer was one
+    word — so *whether Codex restates a message cumulatively* is an assumption this module is built
+    on rather than something a binary has shown, and every test that exercises the accumulator feeds
+    it hand-written cumulative strings. The two ways it could be wrong are opposite and both silent:
+    no `item.updated` at all makes the `Coalescer` dead weight to delete rather than tune, while an
+    `item.updated` carrying a *delta* makes `advance` take its whole-string fallback every time and
+    renders every chunk twice, with all four tests green because they feed it the shape it expects.
+    Only a live capture settles it, so the capture is written up as a hand check in
+    `review/release-v0.23.0/user-verify-fix.md` and named in the test's own doc; it is not something
+    a session can measure.
 - `schemaic-term` — terminal panel + shell (`shell.rs`).
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
@@ -6283,6 +6465,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     before the gaps are distributed (the mechanism `erd_view::toolbar_metrics` leans on), so hiding
     costs nothing. The notice is held in a `create_memo` keyed on `(harness, cli_path)` rather than
     computed inside the container, because the *style* has to ask the same question the child does.
+    **A path that is not yet a file is not probed, and the predicate deciding that is pure.**
+    `constraint_notice` resolves the binary and runs `--help` on it *synchronously on the Floem UI
+    thread*, and this memo tracks the live field — so typing a path asked a different question on
+    every keystroke, one per prefix, each an unresolvable path and each a blocking spawn. **No count
+    here on purpose**: the figure the review carried was the length of one path somebody happened to
+    type, and pinning it to the literal in a test would make a property of the predicate out of a
+    property of that string. The probe cache is keyed by `(harness,
+    resolved path)`, so the very thing that was supposed to make this cheap is what made every
+    keystroke a miss. Only two states are stable enough to ask about: empty, which means auto-detect
+    and is the key the app already warms, and a complete path that resolves. There is nothing to say
+    about a binary that is not there anyway — the red *File doesn't exist.* hint above the notice is
+    the whole answer. The rule is `settings::should_ask_for_a_notice(path, resolves)`, lifted out
+    because three lines inside a `create_memo` closure are three lines no test can reach and these
+    three had a failure history; `only_a_settled_cli_path_is_worth_a_probe` walks every prefix of a
+    typed path and asserts none of them asks.
     **Model is a *field* with suggestion chips under it, not a dropdown**, because any id the CLI
     accepts is valid — an alias, or a dated snapshot pinned across upgrades — and the closed
     three-variant `AiModel` this replaced could not name a model released after the build. The chips
@@ -6312,11 +6509,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     greyed control still claims *this exists for you and is off*, which is a different statement and
     a false one. The row builds its dropdown **inside** a `dyn_container` because a floem view is not
     `Clone` and each keyed rebuild has to construct its own — and the key is **`effort_levels()`,
-    not `supports_effort()`**. The capability is a `bool`, and it is true for both Claude and
-    Antigravity, so switching between those two never flipped the key: the child was never rebuilt,
-    the level list captured at build time stayed Claude's, and the box went on offering `xhigh`
-    under a harness whose flag does not take it. A key has to be as fine-grained as what the child
-    reads. That container also carries `Display::None` in the unsupported case, for the reason the
+    not `supports_effort()`**. The child builds its dropdown out of the value it is *handed*, so the
+    key has to carry everything the child reads: a `bool` that answers `true` for both Claude and
+    Antigravity cannot tell the dropdown that the list behind it changed, and the box went on
+    offering `xhigh` under a harness whose flag does not take it.
+    **That is not because the key dedups — it does not**, and the comment here said it did ("the
+    child was never rebuilt") until a review caught it. `dyn_container` runs `create_updater` and
+    there is no equality check on that path (`floem-0.2.0/src/views/dyn_container.rs`,
+    `floem_reactive-0.2.0/src/effect.rs`), which is the *Floem 0.2 gotchas* entry below and the
+    belief that cost the DDL editors their caret. A key is a value handed to the child, never a
+    change detector; stated as one here — where it reads as the tidiest explanation in the file — it
+    teaches the wrong contract to whoever copies it next.
+    **The filter the child applies is `AiEffort::offered_by(levels)`, not an expression in the
+    closure.** It was inline, and the test that claimed to guard it re-performed the same filter in
+    its own body, so changing the view to `.take(3)` — or to an unfiltered `AiEffort::ALL` — left the
+    workspace green while the dropdown offered a level the harness never advertised. A decision
+    inside a view closure is a decision no test can reach: the rule is in `lib.rs` beside
+    `clamped_to`, the test calls it, and the view calls nothing else.
+    That container also carries `Display::None` in the unsupported case, for the reason the
     harness notice does: an empty container sitting between two 25px section gaps reads as one 50px
     hole, which is what Codex showed between Model and Custom instructions. Three containers in this
     modal are hidden that way now rather than rendered empty — the harness notice, the model
@@ -6345,10 +6555,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the per-turn harnesses — and a whitespace-only one, which is the same clear a keystroke short and
     the divergence between the builders described under `harness.rs`
     (`an_empty_model_lets_the_harness_keep_its_own_default`, which loops
-    `Harness::ALL` — and whose Claude and Antigravity arms assert nothing at all, because `turn_args`
-    returns `Vec::new()` for both persistent harnesses; `a_model_with_surrounding_space_is_sent_trimmed`
-    is the one that reaches every builder, picking between `turn_args` and `session_args` off
-    `is_persistent` so neither can drift out of the loop). The session builder passed
+    `Harness::ALL` — and whose Claude and Antigravity arms used to assert nothing at all, because
+    `turn_args` returns `Vec::new()` for both persistent harnesses; it goes through the `spawn_argv`
+    helper described under `harness.rs` now, which picks each harness's own builder and refuses an
+    empty argv, and it asserts the positive direction as well;
+    `a_model_with_surrounding_space_is_sent_trimmed` is the other one that reaches every builder,
+    picking between `turn_args` and `session_args` off `is_persistent` so neither can drift out of
+    the loop). The session builder passed
     `Some(&model)` straight through, so the clear this paragraph describes spawned
     `claude … --model ""`, killed on a rejected id and reported as an installation problem. Both
     `--model` and `--effort` are now filtered there through
@@ -7703,6 +7916,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     panel was next drawn, so the transcript would be wrong about *history* rather than merely wrong
     about now. `switching_harness_does_not_relabel_the_answers_already_given` builds exactly that
     three-harness conversation and asserts the labels stay put.
+    **It is `ai_panel::bubble_speaker_label(m)`, a function `message_bubble` calls, and that matters
+    because of what the tests were doing.** The two lines were inline in the view and the test
+    module kept its own `label_of` — the same two lines, copied by hand — so changing the view to
+    `speaker_label(Some(ai_harness.get().key()))`, which is precisely the tempting fix this
+    paragraph exists to rule out, left both tests green while the transcript relabelled its history.
+    `label_of` is now a `use` alias for the real function, so the tests and the view cannot say
+    different things.
     **The panel's own words name the selected harness, or nobody.** The empty state reads
     *"`<Harness>` not connected."*: `available` has answered per harness since the picker existed
     while that string stayed literal, so Codex selected with no `codex` on `PATH` read "Claude not
@@ -9887,6 +10107,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     top-level page this used to ask, so `codex_isolates_config` was `false` on every real machine and
     every Codex session loaded the user's own `~/.codex/config.toml`. `exec` carries `--sandbox` too,
     so one spawn still answers all three. `schemaic-ai` states the measurement and names the tests.
+    **The invocation is built by `help_command(h, bin)` rather than spawned inline, so that argv has
+    a test of its own.** The regression's own test lives in `schemaic-ai` and asserts
+    `help_args()`'s *return* — which is the answer, not the question — so reverting this line to
+    `.arg("--help")` left the entire workspace green, and this module's tests never reached `probe`
+    at all. `the_probe_asks_each_harness_for_the_page_that_answers_both_questions` reads
+    `Command::get_args()` back, and also checks the program is the binary it was handed rather than
+    a re-resolved one. Say plainly what it does not buy: it is still **one function away from
+    compile-forced**, since nothing stops a future edit building its own `Command` here. What the
+    extraction buys is that the revert now has to be made in two places, and the second is the one
+    carrying the comment.
     It folds **stdout and
     stderr** together: `agy --help` writes to *stderr* and exits 0, so reading stdout alone found an
     empty help and refused a working binary. A non-zero exit yields `Constraint::Unknown` without
@@ -10643,9 +10873,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     half-initialised when the process dies mid-hook. With no hook args it returns immediately, so a
     normal launch pays nothing. It sits deliberately *after* the `--mcp-serve` early exit, which is a
     different program — a stdio JSON-RPC server whose stdout is the protocol stream, so nothing may
-    write to stdout ahead of it. The two flag sets never co-occur (one comes from the installer, the
-    other from the `claude` CLI), so the ordering between them is free, and this way the protocol
-    stream stays clean.
+    write to stdout ahead of it. The two flag sets never co-occur: `--veloapp-*` comes from the
+    installer or the updater, and `--mcp-serve` comes from **whichever agent CLI the user picked** —
+    Claude spawning this binary out of the `--mcp-config` file Schemaic writes it, and Codex,
+    Antigravity and OpenCode out of their own configuration with `--endpoint-file` beside it. So the
+    ordering between them is free, and this way the protocol stream stays clean whichever of the
+    four opened it.
 
 ## Architecture invariants (don't regress these)
 

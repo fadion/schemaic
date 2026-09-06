@@ -209,7 +209,7 @@ fn edit_settings(create: bool, edit: impl Fn(&str) -> Option<SettingsEdit>) -> b
 
 /// Which *session* holds Antigravity's global state, as the marker records it.
 ///
-/// The [`Owner`] half answers "is the holder still running", and the reasoning
+/// The [`crate::liveness::Owner`] half answers "is the holder still running", and the reasoning
 /// for carrying a start time beside the pid lives with it in
 /// [`crate::liveness`]. The `nonce` answers the question a pid cannot: **two
 /// sessions in the same process.** Changing a setting respawns the AI session,
@@ -273,7 +273,7 @@ fn parse_claim(s: &str) -> Option<Claim> {
 ///   anything to give back.
 /// - `on_disk != mine` — somebody claimed after us. On a respawn that somebody
 ///   is the *next session in this very process*, which is why the comparison is
-///   the whole [`Claim`] and not its [`Owner`].
+///   the whole [`Claim`] and not its [`crate::liveness::Owner`].
 fn may_release(mine: Option<Claim>, on_disk: Option<Claim>, installed: bool) -> bool {
     installed && mine.is_some() && on_disk == mine
 }

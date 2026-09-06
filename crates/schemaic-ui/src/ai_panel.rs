@@ -997,6 +997,26 @@ fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
 // turn is prose on the panel itself, ruled at its right edge. User messages are
 // plain text; assistant/error turns render their segments (prose as light
 // markdown, tool calls as chips) plus a cost footer; pending renders "Thinking…".
+/// The name printed above one bubble.
+///
+/// **The harness that produced *this* turn, not the one selected now.** It was
+/// the literal "CLAUDE", which sat over Antigravity's and OpenCode's answers
+/// too — and the tempting fix, reading the live setting, would have relabelled
+/// every earlier reply the moment the user switched CLI. A conversation spans
+/// several harnesses in ordinary use, so the name travels on the message.
+///
+/// **A function rather than two lines in the view**, because the tests for that
+/// rule went through a helper that hand-copied those two lines: changing the
+/// view to read the live signal — the worse bug, the one the paragraph above
+/// exists to rule out — left both of them green. They call this now, and so does
+/// the view.
+fn bubble_speaker_label(m: &ChatMessage) -> String {
+    match m.role == Role::User {
+        true => "YOU".to_string(),
+        false => schemaic_ai::harness::speaker_label(m.harness.as_deref()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn message_bubble(
     m: ChatMessage,
@@ -1015,11 +1035,7 @@ fn message_bubble(
     // relabelled every earlier reply the moment the user switched CLI. A
     // conversation can span several harnesses, so the name travels on the
     // message. See `schemaic_ai::harness::speaker_label`.
-    let label_txt = if is_user {
-        "YOU".to_string()
-    } else {
-        schemaic_ai::harness::speaker_label(m.harness.as_deref())
-    };
+    let label_txt = bubble_speaker_label(&m);
 
     let body: AnyView = if is_user {
         // User's own message: a dim recap, under whatever data went with it —
@@ -1424,19 +1440,16 @@ mod attach_preview_tests {
 
 #[cfg(test)]
 mod speaker_label_tests {
-    use schemaic_ai::harness::{Harness, speaker_label};
-    use schemaic_core::transcript::{ChatMessage, Role};
+    use schemaic_ai::harness::Harness;
+    use schemaic_core::transcript::ChatMessage;
 
-    /// The label `message_bubble` draws, as the composition it actually
-    /// performs: the message a turn creates, read back the way the view reads
-    /// it.
-    fn label_of(m: &ChatMessage) -> String {
-        if m.role == Role::User {
-            "YOU".to_string()
-        } else {
-            speaker_label(m.harness.as_deref())
-        }
-    }
+    /// The label `message_bubble` draws — **the function it calls**, not a copy
+    /// of the expression it used to contain. This was two lines lifted out of
+    /// the view by hand, so changing the view to
+    /// `speaker_label(Some(ai_harness.get().key()))` — the tempting fix the
+    /// doc names as the *worse* bug, because it relabels history — left both
+    /// tests below green.
+    use super::bubble_speaker_label as label_of;
 
     #[test]
     fn a_turn_is_labelled_with_the_harness_that_produced_it() {
