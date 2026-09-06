@@ -13028,10 +13028,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`edit_untyped`, accept).
 - **`Editor::points_of_offset` returns *content* coords, not viewport-relative** (`.y` is `vline_y`,
   the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
-  `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `char_box`
-  (bracket matching), `underline_seg_at`, `statement_line_boxes_at`, all tested against a scrolled
-  viewport. The caret-anchored popups do it one step later: `completion::set_anchor` stores the
-  caret line in content coords and `completion_popup`/`signature_popup` subtract the viewport
+  `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `span_box_at`
+  (bracket matching, identifier occurrences), `underline_seg_at`, `statement_line_boxes_at`, all
+  tested against a scrolled viewport. The caret-anchored popups do it one step later:
+  `completion::set_anchor` stores the caret line in content coords and
+  `completion_popup`/`signature_popup` subtract the viewport
   *inside their style closures*, because those are placed once per edit and would otherwise stay
   pinned to the scroll position the popup opened at. The signature hint's own two placement
   numbers are closures over `theme::scaled` for the same class of reason — it is lifted by its own
@@ -13040,9 +13041,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   the caret's line top and covered the statement being typed, which is the one thing a hint about
   that statement must not do. **`editor_area` also doesn't clip**, so an
   overlay must bound itself: a box wider than the visible code column paints straight out of the
-  editor and over the panel beside it, which is what `statement_line_boxes_at` clamps against
-  `vp.width()` (a zero width means "not laid out yet", so it clamps nothing rather than blanking the
-  overlay). For the *text* overlays the vertical half needs no clamp — floem won't place an offset
+  editor and over the panel beside it. **All three text-overlay geometries clamp horizontally**, to
+  one shared fold — `visible_hi(content_x, vp)`, which is `content_x + vp.width()`, or infinity when
+  the width is still `0` ("not laid out yet", so it clamps nothing rather than blanking the
+  overlay). `statement_line_boxes_at` was clamped first, when a statement's border drew across the
+  panel; `span_box_at` and `underline_seg_at` share that same unclipped container and were left
+  unclamped, so they did the same thing one token at a time — scroll a query right until a
+  highlighted identifier leaves the viewport and its occurrence box painted at a **negative** x,
+  over the schema panel. The panel clips its own children, but it is painted *before* the editor, so
+  a sibling overlay's stray rectangle lands on top of it regardless. Both therefore take the viewport
+  `Rect` rather than just its origin — the clamp needs the width — clamp left to `content_x` and
+  right to the fold, and return `None` when nothing of the span is left inside it, rather than a stub
+  pinned to whichever edge it fell off. `geometry_tests` pins all four cases (past the fold, scrolled
+  off to the left, the half-visible trim, the unmeasured viewport) for both functions, and
+  `horizontal_scroll_shifts_every_overlay_left` deliberately measures a token far enough right that
+  it does *not* clamp at the offset it scrolls to: a token that clamps cannot also demonstrate the
+  translation. For the *text* overlays the vertical half needs no clamp — floem won't place an offset
   outside its screen lines, and `editor_points` drops what it won't place. The suggestion list is
   the exception on **both** axes, since it occupies space no line does, and it bounds itself against
   `editor_area`'s tracked size (`area_h`/`area_w`) rather than against the text. Vertically,
