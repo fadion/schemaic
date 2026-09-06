@@ -2409,7 +2409,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     } else {
                         pe.delta.x
                     };
-                    if pe.modifiers.control() {
+                    if crate::shortcuts::primary_held(pe.modifiers) {
                         // Ctrl+wheel → zoom about the cursor (up = in, down = out).
                         if dy != 0.0 {
                             let factor = if dy < 0.0 { 1.1 } else { 1.0 / 1.1 };
@@ -2739,7 +2739,9 @@ fn modal_frame(
                 }
                 EventPropagation::Stop
             }
-            Key::Character(c) if ke.modifiers.control() && c.eq_ignore_ascii_case("f") => {
+            Key::Character(c)
+                if crate::shortcuts::primary_held(ke.modifiers) && c.eq_ignore_ascii_case("f") =>
+            {
                 match find {
                     // Its input autofocuses on mount, as the grid's does.
                     Some(find) => {

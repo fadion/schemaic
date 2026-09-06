@@ -5,6 +5,7 @@
 //! the generic results-grid popup menu, the Find-Anywhere palette, and the editor
 //! error modal. Each takes the `Ui` bundle and reads/writes its own overlay signal.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -2862,7 +2863,7 @@ struct PaletteItem {
     /// would read as belonging to "One Dark Pro" rather than to the command it
     /// is a choice of — and there is nowhere on the row to say which. The keycap
     /// belongs where the command's name is.
-    keys: Option<&'static str>,
+    keys: Option<Cow<'static, str>>,
 }
 
 /// The schema-style leading icon for a Find-Anywhere hit — mirrors the schema
@@ -3915,7 +3916,7 @@ fn cycle_tab(
 /// Takes `keys` because a hint is one of the states an argument-command's row
 /// passes through while you type — see [`PaletteItem::keys`] on why the keycap
 /// has to survive all of them.
-fn hint_item(primary: &str, secondary: &str, keys: Option<&'static str>) -> PaletteItem {
+fn hint_item(primary: &str, secondary: &str, keys: Option<Cow<'static, str>>) -> PaletteItem {
     PaletteItem {
         keys,
         primary: primary.to_string(),
@@ -4563,7 +4564,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         if item.keys.is_some() || item.right_icon.is_some() {
                             cells.push(empty().style(|s| s.flex_grow(1.0_f32)).into_any());
                         }
-                        if let Some(keys) = item.keys {
+                        if let Some(keys) = item.keys.as_deref() {
                             // The Shortcuts modal's keycap, one size down: same
                             // mono face, surface and radius, so a binding looks
                             // like itself wherever the app shows it.

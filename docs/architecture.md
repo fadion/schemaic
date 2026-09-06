@@ -2811,7 +2811,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (Windows/Linux/macOS): `draws_own_controls`, `own_control_count`, `draws_own_resize_border`,
     `wants_drop_shadow`, `leading_inset`. **Ask the capability, never `cfg!(target_os = …)` at the
     use site** — the same
-    rule the engines follow, for the same reason. The split is not cosmetic: floem reads that one
+    rule the engines follow, for the same reason. `ui::shortcuts::PRIMARY_IS_CMD` is the second
+    holder of it: one `cfg!` for whether the primary shortcut modifier is Cmd, read by both the
+    Shortcuts modal's labels and the key handlers so the two cannot disagree. The split is not
+    cosmetic: floem reads that one
     flag as *undecorated* on Windows/Linux but as a *transparent* title bar over a full-size content
     view on macOS, so the traffic lights, the native resize border and the move behaviour all
     survive there. What macOS costs us instead is space — the lights are drawn over our header, so
@@ -6758,6 +6761,36 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     other half — that each name still names a live command — can only be checked against a built
     registry, so it rides `overlays::assert_names_match_labels`' `debug_assert`, without which a
     renamed command would drop its keycap in silence.
+    **The primary modifier is asked for, never spelled at the use site.** The modal said `Ctrl+…`
+    everywhere, and simply relabelling it for macOS would have been worse than the wrong word: the
+    grid and the terminal already took `.control() || .meta()`, but the editor pane, the ER diagram,
+    the window-root Global-nav dispatch and the AI panel's Ctrl+↑/↓ recall were `.control()`-only,
+    so a `Cmd+K` row would have documented a key that does nothing on most of the surfaces it names.
+    Both halves therefore hang off one capability — `PRIMARY_IS_CMD =
+    cfg!(target_os = "macos")`, the single `cfg!` for this concern, per *Ask the capability, never
+    `cfg!(target_os = …)` at the use site* (`core::window_chrome` above). What the modal **says**
+    goes through `keys_label`, called from `settings::shortcut_row` (the one choke point for every
+    row the modal draws) and from `command_keys`, so the palette's keycap is respelled the same way
+    — `PaletteItem::keys` is a `Cow<'static, str>` for exactly that. The tables stay Ctrl-spelled: a
+    second Cmd-spelled table would drift, and `every_command_key_is_a_real_shortcut` works by
+    comparing the two byte for byte, so respelling at the source would have dissolved that
+    guarantee. What the handlers **accept** goes through `primary_held`, which is *additive* — Ctrl
+    everywhere, Cmd as well on macOS, so the Ctrl bindings a macOS user already learned keep
+    working. Off macOS it ignores Meta deliberately, because there it is the Windows/Super key and
+    answering to it would take over shortcuts that belong to the desktop
+    (`cmd_counts_as_the_primary_modifier_only_where_cmd_is_the_modifier` pins that direction).
+    Both pure halves take the capability as an argument (`keys_label_on`, `primary_from`) so either
+    platform is testable from whichever one runs the suite — and that is also what makes the blast
+    radius provable rather than argued: `primary_from(c, m, false) == c`, so off macOS the whole
+    change cannot behave differently, and on macOS it acts on keys that previously did nothing.
+    **The negative checks are the ones to be careful with.** `!primary_held(mods)` is how the editor
+    pane asks *is this plain typing* — the soft-tab indent, the auto-pair block and the `ctrl`
+    argument it hands `completion::types_a_character` — so one left as `!mods.control()` would let a
+    Cmd chord both fire a shortcut and insert a character. Two surfaces stay hand-spelled on
+    purpose: the terminal's `encode_key` and its Ctrl+Shift+C/V, and the grid's two
+    `control() || meta()` reads. They answer as `primary_held` does on macOS and a shade wider
+    elsewhere, since they also take Super; and `encode_key`'s `!mods.control()` on the Alt branch is
+    byte encoding for AltGr rather than an app shortcut, so converting that one would be a bug.
   - `connection_form.rs` — Manage Connections modal + password-mask (+ tests). The form is built
     **once per open** while the list on its left keeps loading a different connection into the same
     `DraftSignals` — so every control the form owns a *separate* signal for has to be synced back
@@ -12981,7 +13014,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   line) and Ctrl+Z opened a list wherever the caret happened to land, and Enter opened the
   `auto_show` list on the new blank line: three basic edits that never asked for a suggestion.
   `Ctrl`/`Alt` mean command, never text — the same test the auto-pair block applies, with the same
-  AltGr cost — while Space is typing however the platform reports it (`Named(Space)` or `" "`),
+  AltGr cost, and the `ctrl` argument is `shortcuts::primary_held` so Cmd counts as command too on
+  macOS rather than firing a shortcut *and* typing a character — while Space is typing however the
+  platform reports it (`Named(Space)` or `" "`),
   because the empty-prefix list after `WHERE ` hangs off it. A list already open keeps recomputing
   on any edit, so Backspace still refines it and closes it when the prefix goes; the rule governs
   what may **start** showing one. `Completion::typed` is **a one-shot**, cleared by

@@ -1264,7 +1264,9 @@ fn shortcut_row(keys: &'static str, desc: &'static str) -> impl IntoView {
     h_stack((
         text(desc).style(|s| s.color(theme::text()).font_size(theme::font_body())),
         empty().style(|s| s.flex_grow(1.0_f32).min_width(12.0)),
-        text(keys).style(|s| {
+        // Respelled for the platform here rather than in the table: one choke
+        // point for every row the modal shows. See `shortcuts::keys_label`.
+        text(crate::shortcuts::keys_label(keys)).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::font_label())
                 .font_family("IBM Plex Mono".to_string())
