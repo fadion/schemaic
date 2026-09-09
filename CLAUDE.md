@@ -13,10 +13,13 @@ rather than unfinished work (`db::session::Session::open` carries the reason). W
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
 `supports_column_reorder`, `supports_change`, `alter_column_disturbs_checks`,
-`stats::supports_table_stats`. Ask a **capability**, never an engine: a `dialect == Postgres` or
-`!= MySql` compiles cleanly while silently sorting a third engine onto whichever side it happens to
-fall — and a *constant* in place of a capability is the same failure with no comparison to grep for,
-which is why the predicates that do answer the same for all three engines today
+`stats::supports_table_stats` — and, for the *comparison* rather than any editor,
+`ddl::ref_schema_is_database` and `view_definition_is_qualified`, which ask whether a field the
+differ reads names the object or the database it was read from. Ask a **capability**, never an
+engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third
+engine onto whichever side it happens to fall — and a *constant* in place of a capability is the
+same failure with no comparison to grep for, which is why the predicates that do answer the same
+for all three engines today
 (`supports_view_editing`, `supports_trigger_editing`, `supports_table_design`) *compute* that answer
 from `supports_change` rather than returning `true`.
 

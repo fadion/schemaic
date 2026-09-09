@@ -1368,6 +1368,17 @@ pub enum TriggerOrder {
     Precedes(String),
 }
 
+impl TriggerOrder {
+    /// The trigger this clause names — the one thing both arms have, and the
+    /// one thing a reader deciding whether the clause can be *resolved* needs.
+    /// See [`TriggerInfo::with_resolvable_order`].
+    pub fn target(&self) -> &str {
+        match self {
+            TriggerOrder::Follows(n) | TriggerOrder::Precedes(n) => n.as_str(),
+        }
+    }
+}
+
 /// What the trigger runs when it fires — the one place the two engines differ in
 /// *kind* rather than in spelling, which is why this is an enum and not a
 /// `String` both sides pretend to understand.
@@ -1614,6 +1625,70 @@ impl Default for TriggerInfo {
 }
 
 impl TriggerInfo {
+    /// This trigger with an ordering clause **the server could not resolve**
+    /// taken off, judged by `exists`.
+    ///
+    /// **`FOLLOWS`/`PRECEDES` is a statement about the group as it stands when
+    /// the statement runs, not a property of the trigger.** MySQL and MariaDB
+    /// both refuse a clause naming a trigger that is not there yet
+    /// (`ERROR 3011` / `ERROR 4031`, *"Referenced trigger … for the given action
+    /// time and event type does not exist"*), and the catalogue always gives the
+    /// **leader** of a group `PRECEDES <successor>` — which is right for the
+    /// caller that replaces one trigger inside a group that already exists, and
+    /// impossible for the caller that creates the whole group from nothing.
+    /// Emitted in catalogue order that way, a dump of any table with two
+    /// triggers in one timing/event group died on its *first* `CREATE TRIGGER`,
+    /// on both servers, after the `DROP TABLE` above it had already run.
+    ///
+    /// Dropping the leader's clause is sufficient rather than approximate: every
+    /// non-leader carries `FOLLOWS <predecessor>`, so a group created in order
+    /// reconstructs its own chain, and a trigger created alone into an empty
+    /// group is its leader whatever it says.
+    ///
+    /// `exists` is the caller's, because only the caller knows what "yet" means:
+    /// [`TriggerInfo::create_set_sql`] asks whether the name comes earlier in
+    /// the same set, and [`crate::compare::SchemaComparison`] asks whether the
+    /// other database already holds it.
+    ///
+    /// Borrows when there is nothing to take off, which is every trigger on the
+    /// other two engines — neither has the clause.
+    pub fn with_resolvable_order(
+        &self,
+        exists: impl Fn(&str) -> bool,
+    ) -> std::borrow::Cow<'_, TriggerInfo> {
+        let Some(named) = self.order.as_ref().map(TriggerOrder::target) else {
+            return std::borrow::Cow::Borrowed(self);
+        };
+        if exists(named) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut out = self.clone();
+        out.order = None;
+        std::borrow::Cow::Owned(out)
+    }
+
+    /// The `CREATE TRIGGER`s that rebuild `triggers` as a **set**, in the order
+    /// given — each one's ordering clause kept only where the trigger it names
+    /// is created earlier in the same set.
+    ///
+    /// The whole-set counterpart of [`TriggerInfo::create_sql`]; see
+    /// [`TriggerInfo::with_resolvable_order`] for what the difference costs.
+    /// Comparison is case-insensitive because a trigger name is the server's.
+    pub fn create_set_sql(
+        triggers: &[TriggerInfo],
+        dialect: crate::intel::SqlDialect,
+    ) -> Vec<String> {
+        triggers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let before = &triggers[..i];
+                t.with_resolvable_order(|n| before.iter().any(|e| e.name.eq_ignore_ascii_case(n)))
+                    .create_sql(dialect)
+            })
+            .collect()
+    }
+
     /// The `CREATE TRIGGER` that recreates this trigger exactly — the **one**
     /// trigger emitter, shared by Copy DDL, the round-trip gate and the apply
     /// path, for the same reason [`crate::ddl::view_ddl`] is one.

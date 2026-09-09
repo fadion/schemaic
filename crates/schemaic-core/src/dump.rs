@@ -946,9 +946,15 @@ pub fn plan(
             // died at the first `BEGIN … END` trigger with ERROR 1064 — after the
             // `DROP` above it had already run against the target. The routine and
             // event path has always gone through this; the trigger path did not.
+            // **Through the set emitter, not one `create_sql` per trigger.**
+            // The catalogue gives a group's leader `PRECEDES <successor>`, and
+            // a restore reads the file top to bottom — so the first
+            // `CREATE TRIGGER` named a trigger the file had not created yet and
+            // both servers refused it (`ERROR 3011` / `ERROR 4031`), after the
+            // `DROP TABLE` above had already run. See
+            // `TriggerInfo::with_resolvable_order`.
             if !t.triggers.is_empty() {
-                let bodies: Vec<String> =
-                    t.triggers.iter().map(|tr| tr.create_sql(dialect)).collect();
+                let bodies = crate::schema::TriggerInfo::create_set_sql(&t.triggers, dialect);
                 text!(crate::ddl::client_script(&bodies, dialect));
             }
         }
@@ -2607,6 +2613,58 @@ mod tests {
         ));
         assert!(file.contains("DELIMITER $$"), "{file}");
         assert!(file.contains("DELIMITER ;"), "{file}");
+    }
+
+    /// **A group's leader carries `PRECEDES <successor>`, and a file is read top
+    /// to bottom.** The catalogue anchors the leader forwards because that is
+    /// the right answer for the caller that *replaces* one trigger inside a
+    /// group that already exists; a dump replays the whole set into nothing, so
+    /// the first `CREATE TRIGGER` named a trigger the file had not created yet
+    /// and both servers refused it — MySQL 8.4.11 `ERROR 3011`, MariaDB
+    /// 10.11.14 `ERROR 4031`, *"Referenced trigger … does not exist"* — after
+    /// the `DROP TABLE` above it had already run against the target. The dump
+    /// itself reported success.
+    ///
+    /// Two triggers in one timing/event group is the ordinary case: it is *why*
+    /// anyone writes `FOLLOWS`.
+    #[test]
+    fn a_dumped_trigger_group_names_nothing_the_file_has_not_created_yet() {
+        use crate::schema::TriggerOrder;
+        let trg = |name: &str, order: Option<TriggerOrder>| TriggerInfo {
+            name: name.to_string(),
+            table: "orders".to_string(),
+            timing: TriggerTiming::Before,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Body("SET NEW.id = 1".to_string()),
+            order,
+            ..Default::default()
+        };
+        let mut t = table("orders");
+        t.triggers = vec![
+            trg("t_a", Some(TriggerOrder::Precedes("t_b".to_string()))),
+            trg("t_b", Some(TriggerOrder::Follows("t_a".to_string()))),
+        ];
+        let s = schema_of(vec![t]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        let a_at = file
+            .find("TRIGGER `t_a`")
+            .unwrap_or_else(|| panic!("{file}"));
+        let b_at = file
+            .find("TRIGGER `t_b`")
+            .unwrap_or_else(|| panic!("{file}"));
+        assert!(a_at < b_at, "{file}");
+        assert!(
+            !file.contains("PRECEDES"),
+            "the leader forward-references t_b:\n{file}"
+        );
+        // And the chain the file does carry rebuilds the order on its own.
+        assert!(file.contains("FOLLOWS `t_a`"), "{file}");
     }
 
     /// PostgreSQL has no FK guard an ordinary role can throw, so a bare `DROP`

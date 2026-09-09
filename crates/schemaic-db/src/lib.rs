@@ -7017,6 +7017,57 @@ mod tests {
         assert!(out[0].order.is_none());
     }
 
+    /// **And the composition, which is where the leader's anchor became a
+    /// defect.** `Precedes` is the right answer for the caller that *replaces*
+    /// one trigger inside a group that already exists — the test above is that
+    /// caller, and it is why testing `mysql_triggers` alone cannot see this. The
+    /// other caller replays the whole set into nothing, and there the leader's
+    /// clause names a trigger no statement has created yet: measured, MySQL
+    /// 8.4.11 answers `ERROR 3011` and MariaDB 10.11.14 `ERROR 4031`,
+    /// *"Referenced trigger … for the given action time and event type does not
+    /// exist"*. A structure dump of any table with two triggers in one group
+    /// died on its first `CREATE TRIGGER`, after the `DROP TABLE` above it had
+    /// already run against the target.
+    #[test]
+    fn a_trigger_set_never_names_a_trigger_a_later_statement_creates() {
+        let rows = [
+            tr("orders", "a", "BEFORE", "INSERT", 1),
+            tr("orders", "b", "BEFORE", "INSERT", 2),
+            tr("orders", "c", "BEFORE", "INSERT", 3),
+        ];
+        let triggers = mysql_triggers(&rows);
+        // The premise: the model really does anchor the leader forwards, so this
+        // cannot pass because there was nothing to fix.
+        assert_eq!(
+            triggers[0].order,
+            Some(TriggerOrder::Precedes(s("b"))),
+            "{:?}",
+            triggers[0].order
+        );
+
+        let stmts = schemaic_core::schema::TriggerInfo::create_set_sql(
+            &triggers,
+            schemaic_core::intel::SqlDialect::MySql,
+        );
+        assert_eq!(stmts.len(), 3);
+        for (i, stmt) in stmts.iter().enumerate() {
+            for later in &triggers[i + 1..] {
+                for kw in ["FOLLOWS", "PRECEDES"] {
+                    assert!(
+                        !stmt.contains(&format!("{kw} `{}`", later.name)),
+                        "statement {i} names {} before it exists:\n{stmt}",
+                        later.name
+                    );
+                }
+            }
+        }
+        // And the chain the file *does* carry is enough to rebuild the order:
+        // every non-leader still follows its predecessor.
+        assert!(!stmts[0].contains("PRECEDES"), "{}", stmts[0]);
+        assert!(stmts[1].contains("FOLLOWS `a`"), "{}", stmts[1]);
+        assert!(stmts[2].contains("FOLLOWS `b`"), "{}", stmts[2]);
+    }
+
     #[test]
     fn mysql_triggers_treat_zero_action_order_as_no_information() {
         // A server too old to report the column sends 0 for every row. Inventing
