@@ -2685,6 +2685,11 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     } else {
         schemaic_core::schema::ServerFlavour::MySql
     };
+    // And where it was read from, for the same kind of reason: a foreign key's
+    // `REFERENCED_TABLE_SCHEMA` and a view's rewritten `VIEW_DEFINITION` both
+    // name this database, and the one reader that compares two databases has to
+    // subtract it. See `DbSchema::database`.
+    schema.database = Some(database.to_string());
     Ok(schema)
 }
 

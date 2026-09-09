@@ -2072,6 +2072,13 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         // makes the emitter withhold MariaDB-specific behaviour rather than
         // assume it.
         flavour: schemaic_core::schema::ServerFlavour::Unknown,
+        // Not recorded, and not a gap: the only reader of `DbSchema::database`
+        // subtracts an object's own address, and nothing PostgreSQL reports
+        // carries one — `ref_schema` here is a real namespace inside the
+        // database and `pg_get_viewdef` qualifies with that namespace, both of
+        // which are part of the object. Filling it would cost a
+        // `current_database()` round trip to change no answer.
+        database: None,
     })
 }
 

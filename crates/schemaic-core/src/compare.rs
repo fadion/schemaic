@@ -54,6 +54,7 @@
 //! [`ServerFlavour`]: crate::schema::ServerFlavour
 //! [`IndexInfo::lossy`]: crate::schema::IndexInfo::lossy
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::ddl::{
@@ -505,6 +506,15 @@ impl SchemaComparison {
         // diverges from MySQL's in ways that lose a column's own CHECK, and it
         // is the *left* server that will read the statements.
         let target = Target::new(dialect, left.flavour);
+        // The right side read as if it had come from the left side's database.
+        // Two identical databases are identical here and not one object earlier;
+        // see [`as_read_from`] for what rides on the difference. Every read below
+        // — the entries, the drafts they diff, and the two `CREATE` texts a
+        // reader sees side by side — is of these, so the verdict and the text
+        // under it stay the same fact.
+        let left = &*without_definer(left);
+        let right = &*without_definer(right);
+        let right = &*as_read_from(right, left, dialect);
         let mut entries: Vec<CompareEntry> = Vec::new();
 
         // ── tables and views ────────────────────────────────────────────────
@@ -1320,6 +1330,170 @@ fn fk_rank(
         })
         .collect();
     (rank, cycles)
+}
+
+/// Read the **right** side as if it had been read from the left side's
+/// database, so that comparing two databases compares the schema in them.
+///
+/// A comparison is between two *databases*, and on MySQL two of the fields the
+/// differ reads carry the name of the database they were read from rather than
+/// anything about the object:
+///
+/// - a foreign key's [`ForeignKeyInfo::ref_schema`] is `REFERENCED_TABLE_SCHEMA`,
+///   which on that engine *is* the database ([`ddl::ref_schema_is_database`]);
+/// - a view's [`TableInfo::view_definition`] is the server's rewritten body,
+///   qualified throughout ([`ddl::view_definition_is_qualified`]).
+///
+/// Left alone, every table holding a key and every view came out `Differing`
+/// between two identical databases, and — the half that costs data — the plan
+/// runs against the **left** database while naming the **right** one:
+/// `ADD CONSTRAINT … REFERENCES <right>.parent` puts the left database's
+/// referential integrity in another database, and `CREATE OR REPLACE VIEW`
+/// re-points the left view at the right database's rows. Neither is named
+/// anywhere in the preview; `destructive()` is empty for both.
+///
+/// **Re-addressed rather than stripped**, and the difference matters twice.
+/// Stripping loses the distinction the fix has to keep — MySQL allows a key into
+/// another database, one of those *is* a difference, and
+/// [`ddl::fks_equal`]'s rule that an absent namespace matches an explicit one
+/// would have made a cross-database key compare equal to a local one. And a
+/// re-addressed right side is the side the plan is *built from*, so the
+/// statement that comes out already names the database it will run against
+/// instead of leaving the server to guess.
+///
+/// The left side is never touched: it is the target, and it is already in its
+/// own terms.
+///
+/// [`ViewOptions::definer`] is cleared on both sides, and that is a different
+/// judgement — see [`without_definer`].
+///
+/// Borrows when there is nothing to re-address, which is every PostgreSQL and
+/// SQLite comparison, a pair whose two databases are named the same, and any
+/// side that did not record where it came from.
+fn as_read_from<'a>(
+    right: &'a DbSchema,
+    left: &DbSchema,
+    dialect: SqlDialect,
+) -> Cow<'a, DbSchema> {
+    let from = right.database.as_deref().filter(|d| !d.is_empty());
+    let to = left.database.as_deref().filter(|d| !d.is_empty());
+    let (fk, body) = (
+        ddl::ref_schema_is_database(dialect),
+        ddl::view_definition_is_qualified(dialect),
+    );
+    let Some(from) = from.filter(|f| Some(*f) != to && (fk || body)) else {
+        return Cow::Borrowed(right);
+    };
+    let mut out = right.clone();
+    for t in &mut out.tables {
+        if fk {
+            for k in &mut t.foreign_keys {
+                if k.ref_schema.as_deref() == Some(from) {
+                    k.ref_schema = to.map(str::to_string);
+                }
+            }
+        }
+        if body && t.is_view && let Some(def) = t.view_definition.as_mut() {
+            *def = requalify(def, from, to, dialect);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Clear every view's `DEFINER`, on both sides, before the two are compared.
+///
+/// It is a **server** account, so it does not compare across two servers at all
+/// — the same reading [`CompareEntry::uncertain`] takes of an index the model
+/// only partly read. And the consequence of comparing it is not a spurious row:
+/// the `CREATE OR REPLACE DEFINER = <the other server's account> VIEW …` that
+/// follows is *accepted* by the left server, after which every `SELECT` on the
+/// view is `ERROR 1449 … does not exist` and the view is permanently unusable
+/// (measured on MariaDB 10.11.14).
+///
+/// The cost of the other side of the trade — a deliberate definer change is not
+/// migrated, and a view replaced for some other reason takes the running account
+/// — is a feature not offered rather than an object destroyed.
+///
+/// `definer` is `None` on every engine but MySQL's, so this is a no-op elsewhere
+/// and needs no predicate of its own; it borrows when no view carries one.
+fn without_definer(side: &DbSchema) -> Cow<'_, DbSchema> {
+    if !side
+        .tables
+        .iter()
+        .any(|t| t.view_options.as_ref().is_some_and(|o| o.definer.is_some()))
+    {
+        return Cow::Borrowed(side);
+    }
+    let mut out = side.clone();
+    for t in &mut out.tables {
+        if let Some(o) = t.view_options.as_mut() {
+            o.definer = None;
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Rewrite every `<from>.` qualifier in `sql` to `<to>.`, dropping it entirely
+/// when there is no `to`.
+///
+/// Three things it must not do, each of which is a way to corrupt a body while
+/// making it *look* normalised:
+///
+/// - **Not inside a string literal or a comment.** The one boundary lexer
+///   answers that, through [`crate::intel::code_word_hits`] — the same call
+///   [`crate::dump::order_tables`] makes for the same reason.
+/// - **Not a column of the same name.** `` `t`.`shop` `` is a column; a
+///   qualifier is the hit with no `.` in front of it and a `.` behind it.
+/// - **Not a bare word that happens to match.** A hit must be the whole
+///   identifier, quoted or not, which is what `code_word_hits`' boundary rule
+///   gives — and for the quoted form the quote bytes are checked here, since the
+///   needle is the name without them.
+///
+/// Leaves `` `db`.`t`.`col` `` addressed at `t`.`col`: only the leading
+/// qualifier is the address, and the two behind it are the object.
+fn requalify(sql: &str, from: &str, to: Option<&str>, dialect: SqlDialect) -> String {
+    let b = sql.as_bytes();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for (lo, hi) in crate::intel::code_word_hits(sql, from, dialect) {
+        // The quoted spelling takes its quote bytes with it; the bare one is the
+        // hit as found. Asked of the one per-byte quote table, so SQLite's three
+        // spellings — including `[x]`, which does not close with the byte it
+        // opened with — all answer.
+        let quoted = lo
+            .checked_sub(1)
+            .and_then(|i| crate::intel::ident_quote(dialect, b[i]).map(|(close, _)| (i, close)))
+            .filter(|(_, close)| b.get(hi) == Some(close));
+        let (lo, hi) = match quoted {
+            Some((open, _)) => (open, hi + 1),
+            None => (lo, hi),
+        };
+        // A `.` in front means this is the qualified half, not the qualifier.
+        if lo > 0 && b[lo - 1] == b'.' {
+            continue;
+        }
+        // A `.` behind is what makes it a qualifier at all.
+        if b.get(hi) != Some(&b'.') {
+            continue;
+        }
+        cuts.push((lo, hi + 1));
+    }
+    if cuts.is_empty() {
+        return sql.to_string();
+    }
+    // Through the one identifier quoter, which on MySQL is the backtick form the
+    // server wrote the rest of the body in.
+    let replacement = to.map(|t| format!("{}.", crate::export::ident_sql(t, dialect)));
+    let mut out = String::with_capacity(sql.len());
+    let mut at = 0usize;
+    for (lo, hi) in cuts {
+        out.push_str(&sql[at..lo]);
+        if let Some(r) = replacement.as_deref() {
+            out.push_str(r);
+        }
+        at = hi;
+    }
+    out.push_str(&sql[at..]);
+    out
 }
 
 // ── per-kind entries ────────────────────────────────────────────────────────
@@ -3913,6 +4087,274 @@ mod tests {
         assert!(c.entries.is_empty());
         assert_eq!(c.counts(), CompareCounts::default());
         assert!(!c.cycles());
+    }
+
+    // ── two databases, one schema ───────────────────────────────────
+    //
+    // Every "these two agree" fixture above builds one expression and compares
+    // it with itself, so none of them can see a field carrying *where the side
+    // was read from* rather than what is in it — which is the only thing a real
+    // comparison ever holds two different values of. These build the two sides
+    // separately, as two databases.
+
+    /// The side as a real read of `db` hands it over: the tables, plus the
+    /// address the server stamps on them.
+    fn from_db(db: &str, tables: Vec<TableInfo>) -> DbSchema {
+        DbSchema {
+            tables,
+            database: Some(db.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn fk(name: &str, ref_schema: &str, ref_table: &str) -> ForeignKeyInfo {
+        ForeignKeyInfo {
+            name: name.to_string(),
+            columns: vec!["parent_id".to_string()],
+            ref_schema: Some(ref_schema.to_string()),
+            ref_table: ref_table.to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn child_of(db: &str) -> DbSchema {
+        let mut child = table("child", &[("id", "int"), ("parent_id", "int")]);
+        child.foreign_keys = vec![fk("fk_p", db, "parent")];
+        from_db(db, vec![table("parent", &[("id", "int")]), child])
+    }
+
+    /// **The bug, at the field it lives in.** `REFERENCED_TABLE_SCHEMA` on
+    /// MySQL/MariaDB *is* the database, so two structurally identical databases
+    /// disagree about every table holding a foreign key — and the plan, ticked
+    /// by default, emits `ADD CONSTRAINT fk_p … REFERENCES sc_cmp_b.parent`
+    /// against `sc_cmp_a`. MariaDB 10.11.14 refuses that statement (errno 121)
+    /// and MySQL 8.4.11 refuses it (1826); run as the two statements Copy hands
+    /// the user, both accept it, and `sc_cmp_a.child`'s referential integrity
+    /// then lives in `sc_cmp_b`.
+    #[test]
+    fn two_databases_holding_one_foreign_key_compare_the_same() {
+        let c = mysql(child_of("sc_cmp_a"), child_of("sc_cmp_b"));
+        let e = find(&c, "table:child");
+        assert_eq!(e.status, ObjectStatus::Same, "changes: {:?}", e.changes);
+        assert!(c.plan(|_| true).emit().is_empty());
+    }
+
+    /// And the premise, so the test above cannot pass for the wrong reason: it
+    /// is the `ref_schema` field alone that used to differ, and clearing it on
+    /// both sides is the control run that isolated it.
+    #[test]
+    fn the_foreign_key_pair_differs_only_in_where_it_was_read_from() {
+        let (mut l, mut r) = (child_of("sc_cmp_a"), child_of("sc_cmp_b"));
+        assert_ne!(l.tables[1].foreign_keys, r.tables[1].foreign_keys);
+        for s in [&mut l, &mut r] {
+            s.tables[1].foreign_keys[0].ref_schema = None;
+        }
+        assert_eq!(l.tables[1].foreign_keys, r.tables[1].foreign_keys);
+    }
+
+    /// **What the normalisation must not swallow, and the reason it
+    /// re-addresses rather than strips.** MySQL allows a key into another
+    /// database, and one of those is a real difference — but `fks_equal` reads
+    /// an absent namespace as "the same one", so a right side cleared to `None`
+    /// would have compared equal to *any* left namespace, turning this Differing
+    /// into a Same. Rewriting `sc_cmp_b` to `sc_cmp_a` keeps the field explicit
+    /// on both sides and the comparison honest.
+    #[test]
+    fn a_genuinely_cross_database_foreign_key_still_differs() {
+        let side = |own: &str, points_at: &str| {
+            let mut child = table("child", &[("id", "int"), ("parent_id", "int")]);
+            child.foreign_keys = vec![fk("fk_p", points_at, "parent")];
+            from_db(own, vec![child])
+        };
+        let c = mysql(side("sc_cmp_a", "sc_cmp_a"), side("sc_cmp_b", "warehouse"));
+        assert_eq!(find(&c, "table:child").status, ObjectStatus::Differing);
+    }
+
+    /// A side that never said where it came from is left exactly as it arrived
+    /// — the normaliser guesses at no address.
+    #[test]
+    fn a_side_with_no_recorded_database_is_not_normalised() {
+        let mut anonymous = child_of("sc_cmp_a");
+        anonymous.database = None;
+        let c = mysql(anonymous, child_of("sc_cmp_a"));
+        assert_eq!(
+            find(&c, "table:child").status,
+            ObjectStatus::Same,
+            "both still name sc_cmp_a, so nothing differs either way"
+        );
+    }
+
+    /// PostgreSQL's `ref_schema` is a real namespace inside one database — part
+    /// of the object, not its address — so a difference there stays a
+    /// difference whatever the sides call themselves.
+    #[test]
+    fn a_postgres_namespace_is_not_an_address_to_subtract() {
+        let side = |ns: &str| {
+            let mut child = table("child", &[("id", "int"), ("parent_id", "int")]);
+            child.schema = Some("public".to_string());
+            child.foreign_keys = vec![fk("fk_p", ns, "parent")];
+            DbSchema {
+                tables: vec![child],
+                database: Some("shop".to_string()),
+                ..Default::default()
+            }
+        };
+        let c = SchemaComparison::of(&side("public"), &side("archive"), SqlDialect::Postgres);
+        assert_eq!(find(&c, "table:child").status, ObjectStatus::Differing);
+    }
+
+    /// **The same bug on views, and this one nothing later refuses.**
+    /// `VIEW_DEFINITION` is the server's rewritten body, qualified with the
+    /// database it lives in, so two databases holding a byte-identical
+    /// `CREATE VIEW` disagree — and `CREATE OR REPLACE VIEW` succeeds, leaving
+    /// `sc_cmp_a.v` reading `sc_cmp_b`'s rows.
+    #[test]
+    fn two_databases_holding_one_view_compare_the_same() {
+        let side = |db: &str| {
+            from_db(
+                db,
+                vec![view(
+                    "v",
+                    &format!("select `{db}`.`t`.`id` AS `id` from `{db}`.`t`"),
+                )],
+            )
+        };
+        let c = mysql(side("sc_cmp_a"), side("sc_cmp_b"));
+        let e = find(&c, "view:v");
+        assert_eq!(e.status, ObjectStatus::Same, "changes: {:?}", e.changes);
+        assert!(c.plan(|_| true).emit().is_empty());
+    }
+
+    /// A view body that really differs still differs — and the statement that
+    /// migrates it names the database it will run against, not the one it was
+    /// read from. That second half is what re-addressing buys over stripping:
+    /// the emitted body is correct on the left server rather than merely
+    /// unqualified.
+    #[test]
+    fn a_real_view_difference_survives_the_subtraction() {
+        let side = |db: &str, cols: &str| {
+            from_db(
+                db,
+                vec![view("v", &format!("select {cols} from `{db}`.`t`"))],
+            )
+        };
+        let c = mysql(
+            side("sc_cmp_a", "`sc_cmp_a`.`t`.`id` AS `id`"),
+            side(
+                "sc_cmp_b",
+                "`sc_cmp_b`.`t`.`id` AS `id`,`sc_cmp_b`.`t`.`n` AS `n`",
+            ),
+        );
+        assert_eq!(find(&c, "view:v").status, ObjectStatus::Differing);
+        let sql = c.plan(|_| true).emit().join("\n");
+        assert!(sql.contains("`n`"), "{sql}");
+        assert!(!sql.contains("sc_cmp_b"), "{sql}");
+        assert!(sql.contains("`sc_cmp_a`.`t`"), "{sql}");
+    }
+
+    /// **`DEFINER` is a server account, so it does not compare across servers.**
+    /// Two servers' `shop.v` differ in it, and the emitted
+    /// `CREATE OR REPLACE DEFINER = deploy@10.0.0.7` is *accepted* by the left
+    /// server — after which every `SELECT` on the view is
+    /// `ERROR 1449 … does not exist` and the view is permanently unusable.
+    #[test]
+    fn a_view_definer_neither_differs_nor_rides_into_the_statement() {
+        let side = |definer: &str| {
+            let mut v = view("v", "select `t`.`id` AS `id` from `t`");
+            v.view_options = Some(ViewOptions {
+                definer: Some(definer.to_string()),
+                ..Default::default()
+            });
+            from_db("shop", vec![v])
+        };
+        let c = mysql(side("schemaic@localhost"), side("deploy@10.0.0.7"));
+        assert_eq!(find(&c, "view:v").status, ObjectStatus::Same);
+
+        // And when something else *does* differ, the replacement takes the
+        // running account rather than the other server's.
+        let mut right = side("deploy@10.0.0.7");
+        right.tables[0].view_definition =
+            Some("select `t`.`id` AS `id`,`t`.`n` AS `n` from `t`".to_string());
+        let d = mysql(side("schemaic@localhost"), right);
+        let sql = d.plan(|_| true).emit().join("\n");
+        assert!(sql.contains("`n`"), "{sql}");
+        assert!(!sql.contains("DEFINER"), "{sql}");
+    }
+
+    /// A column named after the database is not a qualifier: the qualifier is
+    /// the one with no `.` in front of it.
+    #[test]
+    fn a_column_named_after_the_database_is_left_alone() {
+        let out = requalify(
+            "select `shop`.`t`.`shop` AS `shop` from `shop`.`t`",
+            "shop",
+            None,
+            SqlDialect::MySql,
+        );
+        assert_eq!(out, "select `t`.`shop` AS `shop` from `t`");
+    }
+
+    /// The re-address half: the new name is written through the one identifier
+    /// quoter, in the form the server wrote the rest of the body in.
+    #[test]
+    fn a_qualifier_is_rewritten_to_the_other_database() {
+        let out = requalify(
+            "select `sc_cmp_b`.`t`.`id` AS `id` from `sc_cmp_b`.`t`",
+            "sc_cmp_b",
+            Some("sc_cmp_a"),
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            out,
+            "select `sc_cmp_a`.`t`.`id` AS `id` from `sc_cmp_a`.`t`"
+        );
+    }
+
+    /// Nor is a string literal that spells it, which is what makes the one
+    /// boundary lexer the right tool rather than a text replace.
+    #[test]
+    fn a_string_literal_spelling_the_database_is_not_a_qualifier() {
+        let out = requalify(
+            "select `shop`.`t`.`id` AS `id` from `shop`.`t` where `t`.`tag` = 'shop.x'",
+            "shop",
+            None,
+            SqlDialect::MySql,
+        );
+        assert_eq!(
+            out,
+            "select `t`.`id` AS `id` from `t` where `t`.`tag` = 'shop.x'"
+        );
+    }
+
+    /// The bare spelling, and a name that merely starts with the database's.
+    #[test]
+    fn stripping_takes_whole_identifiers_only() {
+        assert_eq!(
+            requalify(
+                "select shop.t.id from shop.t",
+                "shop",
+                None,
+                SqlDialect::MySql
+            ),
+            "select t.id from t"
+        );
+        assert_eq!(
+            requalify(
+                "select shopping.t.id from shopping.t",
+                "shop",
+                None,
+                SqlDialect::MySql
+            ),
+            "select shopping.t.id from shopping.t"
+        );
+    }
+
+    /// Nothing to subtract leaves the body untouched, byte for byte.
+    #[test]
+    fn a_body_with_no_qualifier_is_returned_as_it_came() {
+        let body = "select `t`.`id` AS `id` from `t`";
+        assert_eq!(requalify(body, "shop", None, SqlDialect::MySql), body);
     }
 
     #[test]

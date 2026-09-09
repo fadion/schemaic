@@ -3526,6 +3526,25 @@ pub struct DbSchema {
     /// emitter treats it as "don't assume MariaDB", so a missing answer costs a
     /// feature rather than a table's constraints.
     pub flavour: ServerFlavour,
+    /// **Which database this was read from** — the schema's own address.
+    ///
+    /// Not part of the schema, and deliberately not stamped onto the objects in
+    /// it: [`TableInfo::schema`] is `None` on MySQL precisely because a database
+    /// *is* its namespace there. It rides here because one reader needs to
+    /// subtract an object's own address before comparing it against another
+    /// database's, and the model records that address nowhere else.
+    ///
+    /// The reader is [`crate::compare::SchemaComparison::of`] and the case is
+    /// MySQL's, where a foreign key's [`ForeignKeyInfo::ref_schema`] and a
+    /// view's rewritten [`TableInfo::view_definition`] both come back qualified
+    /// with the reading database. Two structurally identical databases then
+    /// differ in every object holding either, and the migration re-points the
+    /// left database's key — and its view's body — at the *right* one.
+    ///
+    /// `None` means the reader did not record it, which is the honest answer for
+    /// a hand-built schema. A side with no address is compared exactly as it
+    /// arrived rather than guessed at.
+    pub database: Option<String>,
 }
 
 /// Which MySQL-family server a schema was introspected from. See

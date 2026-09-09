@@ -7103,6 +7103,54 @@ pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
 }
 
+/// Is the namespace a foreign key reports — [`ForeignKeyInfo::ref_schema`] —
+/// the **database** the key lives in, rather than a namespace inside it?
+///
+/// MySQL and MariaDB fill it from
+/// `information_schema.KEY_COLUMN_USAGE.REFERENCED_TABLE_SCHEMA`, which on those
+/// servers *is* the database — so a key to a table in its own database still
+/// names that database, and the name is where the schema was read from rather
+/// than part of it. PostgreSQL's is a real namespace inside one database, and
+/// SQLite has neither.
+///
+/// The question matters exactly once, and it is not cosmetic: comparing two
+/// databases holding the same schema, every table holding a foreign key differs
+/// on this field alone, and the migration re-points the left database's key at
+/// the right one. [`crate::compare::SchemaComparison::of`] subtracts each side's
+/// own address first, and asks this to know whether there is an address to
+/// subtract.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn ref_schema_is_database(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Does the catalogue hand back a view's body **rewritten and qualified** with
+/// the database it lives in, rather than as the user wrote it?
+///
+/// MySQL and MariaDB do: `information_schema.VIEWS.VIEW_DEFINITION` for
+/// `CREATE VIEW v AS SELECT id FROM t` in `shop` reads
+/// ``select `shop`.`t`.`id` AS `id` from `shop`.`t` ``. PostgreSQL's
+/// `pg_get_viewdef` rewrites too, but qualifies with the *schema*, which is part
+/// of the object rather than its address. SQLite stores the statement verbatim.
+///
+/// Same consequence as [`ref_schema_is_database`] and the same one caller: two
+/// databases holding one view differ in every byte of that qualifier, and the
+/// `CREATE OR REPLACE VIEW` the comparison emits against the **left** database
+/// carries the right one's name into it — so the left view starts reading the
+/// right database's rows, with nothing in the preview naming it.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn view_definition_is_qualified(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+    }
+}
+
 /// Can this materialized view be refreshed **without locking out its readers**
 /// — i.e. does `REFRESH MATERIALIZED VIEW CONCURRENTLY` apply to it?
 ///
