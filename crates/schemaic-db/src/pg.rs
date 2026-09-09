@@ -3722,9 +3722,12 @@ pub(crate) async fn refetch_on(
     {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            // Key then confirming columns, the order `edit::refetch_key` builds
+            // the values in — see `RefetchTemplate::confirm_cols`.
             let where_sql = template
                 .key_cols
                 .iter()
+                .chain(template.confirm_cols.iter())
                 .enumerate()
                 .map(|(i, &kci)| {
                     format!(

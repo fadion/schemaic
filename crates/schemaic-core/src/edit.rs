@@ -311,6 +311,9 @@ pub fn refetch_template(rs: &ResultSet, model: &EditModel) -> Option<RefetchTemp
         table: tbl.table.clone(),
         columns,
         key_cols: tbl.key_cols.clone(),
+        // The write's `WHERE` carries these and the re-fetch's did not — see
+        // `RefetchTemplate::confirm_cols`.
+        confirm_cols: tbl.confirm_cols.clone(),
     })
 }
 
@@ -345,6 +348,11 @@ pub fn refetch_key(
     template
         .key_cols
         .iter()
+        // The confirming columns after the key, in the order every builder
+        // emits the `WHERE` in. Same rule for both: an edited one takes the
+        // value it was changed *to*, since that is what the just-committed
+        // `UPDATE` left in the table.
+        .chain(template.confirm_cols.iter())
         .map(|&kci| match edited.get(&kci) {
             // Bound as text, exactly as the `UPDATE`'s own SET value was.
             Some(CellEdit::Text(text)) => Value::Str(text.clone()),
@@ -2018,6 +2026,80 @@ mod tests {
         let tpl = refetch_template(&r, &m).expect("single base table is spliceable");
         assert_eq!(tpl.columns, vec!["rowid".to_string(), "a".to_string()]);
         assert_eq!(tpl.key_cols, vec![0]);
+        // **And the columns that confirm it**, which the write's `WHERE` has
+        // always carried and this template dropped — see the test below.
+        assert_eq!(tpl.confirm_cols, m.tables[0].confirm_cols);
+        assert!(
+            !tpl.confirm_cols.is_empty(),
+            "a rowid is not a row identity"
+        );
+    }
+
+    /// **The re-fetch is a second statement on a second connection, and it was
+    /// keyed on the rowid alone.**
+    ///
+    /// `EditTable::confirm_cols` says why the write carries them: *"A rowid is
+    /// not a row identity … an `UPDATE` keyed on it affects exactly 1 row, which
+    /// is the number `one_row_verdict` is looking for. The safety net's whole
+    /// premise is that a stale key matches **zero** rows."* The re-fetch runs
+    /// right after the commit, on a **fresh** connection, and re-read
+    /// `WHERE rowid = 7` — so anything that renumbers rowids in that window (a
+    /// `VACUUM`, a twelve-step rebuild from a Table Design tab, a delete of the
+    /// highest rowid then an insert) spliced *another row's* values into the
+    /// grid row and painted them as committed truth. The next edit's confirming
+    /// `WHERE` then matched that other row, affected exactly 1, and passed the
+    /// net: the user's second edit landed on a row they never selected.
+    ///
+    /// The values are asserted through `refetch_key`, not just the template,
+    /// because the pair is the seam: the builder emits `key_cols` then
+    /// `confirm_cols`, and a value list in the other order would be a `WHERE`
+    /// naming the right columns with the wrong values.
+    #[test]
+    fn a_rowid_refetch_carries_the_columns_that_confirm_it() {
+        let r = rs(vec![
+            implicit_col("rowid", "notes"),
+            col("body", "TEXT", "notes", false, false),
+            col("tag", "TEXT", "notes", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "notes").then(|| schema_keyless("notes", &[("body", "text"), ("tag", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        let tpl = refetch_template(&r, &m).expect("single base table is spliceable");
+        assert_eq!(tpl.key_cols, vec![0], "the rowid identifies");
+        assert_eq!(tpl.confirm_cols, vec![1, 2], "and these two confirm");
+
+        // Edit `tag`. The key values are the row as the just-committed `UPDATE`
+        // left it: the rowid and `body` unchanged, `tag` at its **new** value —
+        // the same rule an edited key column already followed.
+        let mut edited: HashMap<usize, CellEdit> = HashMap::new();
+        edited.insert(2, CellEdit::Text("after".to_string()));
+        let key = refetch_key(&tpl, &r, 0, &edited);
+        assert_eq!(key.len(), 3, "one value per key and confirming column");
+        assert_eq!(key[2], Value::Str("after".to_string()));
+    }
+
+    /// A table with a **real** key confirms nothing, so its re-fetch is exactly
+    /// the statement it always was. Without this the fix could be "always AND
+    /// every column", which cannot tell two identical rows apart and would break
+    /// the ordinary case to protect the rowid one.
+    #[test]
+    fn a_real_key_needs_no_confirming_columns() {
+        let r = rs(vec![
+            col("id", "INT", "t", true, false),
+            col("name", "TEXT", "t", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int"), ("name", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        let tpl = refetch_template(&r, &m).expect("single base table is spliceable");
+        assert!(tpl.confirm_cols.is_empty(), "{:?}", tpl.confirm_cols);
+        assert_eq!(
+            refetch_key(&tpl, &r, 0, &HashMap::new()).len(),
+            1,
+            "one value, for the one key column"
+        );
     }
 
     #[test]

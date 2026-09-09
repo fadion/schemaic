@@ -5639,9 +5639,14 @@ fn build_refetch_sql(template: &RefetchTemplate) -> String {
         .map(|c| ident(c))
         .collect::<Vec<_>>()
         .join(", ");
+    // Key first, then the confirming columns — the order `edit::refetch_key`
+    // builds the values in, and the reason they are here at all is
+    // `RefetchTemplate::confirm_cols`: the write's own `WHERE` carries them and
+    // this copy dropped them.
     let where_sql = template
         .key_cols
         .iter()
+        .chain(template.confirm_cols.iter())
         .map(|&kci| format!("{} <=> ?", ident(&template.columns[kci])))
         .collect::<Vec<_>>()
         .join(" AND ");
@@ -6526,6 +6531,7 @@ mod tests {
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_cols: vec![0],
+            confirm_cols: Vec::new(),
         };
         assert_eq!(
             build_refetch_sql(&t),
@@ -6541,6 +6547,7 @@ mod tests {
             table: "t".to_string(),
             columns: vec!["a".to_string(), "b".to_string(), "c".to_string()],
             key_cols: vec![0, 2],
+            confirm_cols: Vec::new(),
         };
         assert_eq!(
             build_refetch_sql(&t),
@@ -6556,6 +6563,7 @@ mod tests {
             table: "t`t".to_string(),
             columns: vec!["a`b".to_string()],
             key_cols: vec![0],
+            confirm_cols: Vec::new(),
         };
         assert_eq!(
             build_refetch_sql(&t),

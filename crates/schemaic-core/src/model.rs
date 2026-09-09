@@ -1446,10 +1446,31 @@ pub struct RefetchTemplate {
     pub columns: Vec<String>,
     /// Indices into `columns` forming the row-identity `WHERE` key.
     pub key_cols: Vec<usize>,
+    /// Indices into `columns` that **confirm** the key, `AND`ed after it — the
+    /// same set the write's own `WHERE` carries, for the same reason.
+    ///
+    /// **A rowid is not a row identity.** On a keyless SQLite table the grid
+    /// edits through the projected `rowid`, and the re-fetch that runs
+    /// immediately after the commit opens a *fresh connection* and re-reads
+    /// `WHERE rowid = 7`. If anything renumbers rowids in that window — another
+    /// client's `VACUUM`, a twelve-step rebuild from a Table Design tab, a
+    /// delete of the highest rowid followed by an insert — the splice writes
+    /// **another row's** values into that grid row and paints them as committed
+    /// truth. The next edit's confirming `WHERE` then matches *that* row,
+    /// affects exactly 1, and passes the safety net, so the user's second edit
+    /// lands somewhere they never selected.
+    ///
+    /// `EditTable::confirm_cols` states the rule the write already followed —
+    /// *"the rowid keeps identifying the row and these columns confirm it"* —
+    /// and this is the copy that dropped it. Empty for a table with a real key,
+    /// which is most of them.
+    pub confirm_cols: Vec<usize>,
 }
 
 /// One row to re-fetch: the grid data-row to splice back into, plus that row's
-/// *post-edit* key values (aligned to [`RefetchTemplate::key_cols`]).
+/// *post-edit* key values — aligned to [`RefetchTemplate::key_cols`] followed by
+/// [`RefetchTemplate::confirm_cols`], which is the order every builder emits the
+/// `WHERE` in.
 #[derive(Clone, Debug)]
 pub struct RefetchRow {
     pub data_row: usize,

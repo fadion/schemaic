@@ -1319,9 +1319,16 @@ pub(crate) async fn refetch_rows(
             .join(", ");
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
+            // Key then confirming columns, the order `edit::refetch_key` builds
+            // the values in. **This engine is the one the finding is about**: a
+            // keyless table is edited through the projected `rowid`, and the
+            // re-fetch runs on a *fresh connection* — so anything that
+            // renumbers rowids between the commit and this read makes `rowid =
+            // 7` another row. See `RefetchTemplate::confirm_cols`.
             let key: Vec<(String, Value)> = template
                 .key_cols
                 .iter()
+                .chain(template.confirm_cols.iter())
                 .zip(&row.key)
                 .map(|(&ci, v)| (template.columns[ci].clone(), v.clone()))
                 .collect();
@@ -5591,6 +5598,76 @@ mod tests {
         );
     }
 
+    /// **The re-fetch is a second statement on a second connection**, and it was
+    /// keyed on the rowid alone.
+    ///
+    /// `EditTable::confirm_cols` states why the *write* carries the confirming
+    /// columns — *"A rowid is not a row identity … the safety net's whole
+    /// premise is that a stale key matches zero rows"* — and the re-fetch that
+    /// runs right after the commit dropped them. Anything that renumbers rowids
+    /// in that window makes `WHERE rowid = 7` another row, and the splice paints
+    /// that row's values into the grid as committed truth.
+    ///
+    /// Renumbering is staged here the way the real world does it: `VACUUM`,
+    /// which SQLite is explicit may change rowids on a table without an
+    /// `INTEGER PRIMARY KEY`. The two surviving rows differ, so a rowid that has
+    /// moved genuinely selects the wrong one — which is the whole test: the
+    /// re-fetch must come back **empty** rather than with somebody else's row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rowid_refetch_does_not_splice_another_row_after_a_renumber() {
+        let (keeper, db) = shared_memory("rowid_refetch");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a TEXT, b TEXT);
+                 INSERT INTO t VALUES ('one', 'x'), ('two', 'y'), ('three', 'z');",
+            )
+            .unwrap();
+
+        let rs = run_query(
+            &keeper,
+            "SELECT rowid, * FROM t",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
+        let tpl = schemaic_core::edit::refetch_template(&rs, &m).expect("spliceable");
+        // The premise: the template really is keyed on the rowid *and* confirms
+        // it, or the assertion below is about nothing.
+        assert_eq!(tpl.key_cols, vec![0]);
+        assert!(!tpl.confirm_cols.is_empty(), "{tpl:?}");
+
+        // Row 2 (`two`) is the one the user is on. Its key is taken before the
+        // renumber, exactly as the commit path takes it.
+        let key = schemaic_core::edit::refetch_key(&tpl, &rs, 1, &std::collections::HashMap::new());
+
+        // Now the rowids move under it: delete row 1 and VACUUM, which SQLite
+        // may renumber a rowid table on. `two` is no longer rowid 2.
+        keeper
+            .execute_batch("DELETE FROM t WHERE a = 'one'; VACUUM;")
+            .unwrap();
+        let moved: i64 = keeper
+            .query_row("SELECT rowid FROM t WHERE a = 'two'", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(moved, 2, "the VACUUM did not renumber; nothing to test");
+
+        let got = refetch_rows(
+            &db,
+            &tpl,
+            &[schemaic_core::model::RefetchRow { data_row: 1, key }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the re-fetch runs");
+        assert!(
+            got.is_empty(),
+            "the re-fetch spliced a row the key no longer identifies: {got:?}"
+        );
+    }
+
     /// **A rowid is not a row identity, and the 1-row net cannot see that on its
     /// own.** The designer's rebuild renumbers a keyless table; nothing re-runs
     /// an open result tab, so the grid still holds the old numbers. Keyed on the
@@ -5871,6 +5948,7 @@ mod tests {
             table: "t".to_string(),
             columns: vec!["id".into(), "v".into()],
             key_cols: vec![0],
+            confirm_cols: Vec::new(),
         };
         let rows = vec![
             RefetchRow {
