@@ -4743,7 +4743,25 @@ pub fn is_column_type(text: &str, dialect: SqlDialect) -> bool {
     let [column] = create.columns.as_slice() else {
         return false;
     };
-    column.name.value == "schemaic_c" && column.options.is_empty()
+    // **All three places a clause can hide, not one.** sqlparser's
+    // `parse_columns` tries `parse_optional_table_constraint` before
+    // `parse_column_def` and returns *two* vectors, so
+    // `CREATE TABLE p (schemaic_c int, PRIMARY KEY (x))` gives one column named
+    // as asked, no options, and a `constraints` vector nothing here read.
+    // `ColumnInfo::definition_sql` splices the type verbatim, so a proposal
+    // whose change list read only *Add column note* emitted
+    // `ADD COLUMN \`note\` int, FOREIGN KEY (customer_id) REFERENCES
+    // customers(id) ON DELETE CASCADE` — one legal two-item `alter_option` list,
+    // installing a cascading delete nobody asked for. `table_options` is the
+    // fourth, closed here for the same reason rather than left for the next one
+    // to find.
+    column.name.value == "schemaic_c"
+        && column.options.is_empty()
+        && create.constraints.is_empty()
+        && matches!(
+            create.table_options,
+            sqlparser::ast::CreateTableOptions::None
+        )
 }
 
 /// A table a statement reads from, as written: the bare name plus whatever
@@ -5898,6 +5916,24 @@ mod tests {
                 "int; DROP TABLE customers; --",
                 "int(11 /*M!100000 ), DROP COLUMN placed_at, ADD COLUMN pad int(1 */)",
                 "int /*M!100000 , DROP COLUMN placed_at */",
+                // **A table constraint is the third place a clause can hide**,
+                // and it was the one the gate never read: sqlparser's
+                // `parse_columns` returns *two* vectors, so
+                // `CREATE TABLE p (schemaic_c int, PRIMARY KEY (x))` gives one
+                // column with no options and a `constraints` vector nothing
+                // asked about. `definition_sql` splices the type verbatim, so a
+                // proposal whose change list read only "Add column note"
+                // emitted `ADD COLUMN \`note\` int, FOREIGN KEY (customer_id)
+                // REFERENCES customers(id) ON DELETE CASCADE` — a legal
+                // two-item alter list installing a cascading delete nobody asked
+                // for. Same class as the `DROP COLUMN placed_at` above, which
+                // this module records as already paid for, through the branch
+                // that fix did not close.
+                "int, PRIMARY KEY (schemaic_c)",
+                "int, UNIQUE (schemaic_c)",
+                "int, FOREIGN KEY (a) REFERENCES b(c) ON DELETE CASCADE",
+                "int, CHECK (1=1)",
+                "int, CONSTRAINT x CHECK (1=1)",
             ] {
                 assert!(!is_column_type(t, d), "{d:?} accepted {t}");
             }
