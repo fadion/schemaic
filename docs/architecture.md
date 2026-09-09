@@ -1574,8 +1574,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     for its *own* execution, because SQLite ignores it inside a transaction; the copy in the plan is
     for the other consumer, since the same list is what the preview's **Copy** and **Open in
     editor** hand to a query tab, whose connection enforces foreign keys with nothing around it
-    (`the_script_guards_itself_when_run_outside_run_ddl`). A table rename is inserted *before* the
-    closing pragma so the whole procedure stays inside the guard.
+    (`the_script_guards_itself_when_run_outside_run_ddl`). **That copy is only worth anything if the
+    runner keeps one connection for the list**, which is the part that was missing: the SQLite arm
+    of `Db::run_batch` opened one per statement, so `FK_OFF` was set on a connection already closed
+    by the time the `DROP TABLE` ran and the cascade fired anyway (`sqlite::run_batch`). A table
+    rename is inserted *before* the closing pragma so the whole procedure stays inside the guard.
     **What the rebuild writes is the model, so the model has to be the table.** Everything the
     declaration says and the pragmas don't report is read out of `sqlite_master.sql` through the
     shared boundary lexer — each column's `COLLATE` (`sqlite::collations_of`), the `AUTOINCREMENT`
@@ -1742,7 +1745,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `generated_stored`, since its default is `VIRTUAL`), `NOT NULL` and `DEFAULT`, parenthesising an
     expression default because `pragma_table_xinfo` strips the parentheses the grammar requires
     (`schema::is_bare_sqlite_default`), and drops `AUTO_INCREMENT`, `ON UPDATE` and the column
-    comment (`ddl::sqlite_create_tests`). Ordering
+    comment (`ddl::sqlite_create_tests`). **That parenthesis question is balanced, not two-ended.**
+    `is_bare_sqlite_default` asked `starts_with('(') && ends_with(')')`, and the pragma strips only
+    the *outer* pair — so `DEFAULT ((1+2)*(3+4))` arrives as `(1+2)*(3+4)` and `DEFAULT (('x')||('y'))`
+    as `('x')||('y')`: a paren at each end, and an expression between them. Called bare,
+    `definition_sql` re-emitted them without the wrapper and SQLite refuses the result (`near "||":
+    syntax error`, measured on SQLite 3.45.1). Since `create_table_sql` builds the rebuild's new
+    table from *every* column's `definition_sql`, editing any column of such a table aborted the
+    whole twelve-step rebuild with a message about a column the user had not touched — the table was
+    permanently uneditable through the designer, and via Run all it landed with the table already
+    dropped. It asks `sql::balanced_paren_span` now, which is the one-boundary-lexer invariant's own
+    helper, so a paren inside a string literal is not a paren
+    (`a_parenthesised_pair_that_is_not_one_group_still_needs_wrapping`). Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after). `normalize_type`/`types_equal` + `defaults_equal` are the reason a designer
     opens clean — `int(11)` ≡ `int`, `character varying(45)` ≡ `varchar(45)`. **The
@@ -4728,7 +4742,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `spawn_blocking` and opens its own connection there — which is not a compromise but exactly the
   one-connection-per-operation invariant, at microsecond cost on a local file; cancellation goes
   through `Connection::get_interrupt_handle`, the analogue of `KILL QUERY` that needs no second
-  connection. **A long read blocks a write here, and on neither other engine** — SQLite takes one
+  connection. **A batch is one operation, not one per statement**, and `sqlite::run_batch` is the
+  arm that makes it so: one connection in one `spawn_blocking`, the whole statement list run on it,
+  each outcome sent over an unbounded mpsc channel so the UI still fills result tabs progressively,
+  and the `InterruptHandle` handed out **before** any work so Stop reaches a mid-flight statement —
+  the same shape `fetch_query` and `run_script` use. `spawn_blocking` rather than `run_script`'s
+  `block_in_place`, because the results have to reach an async `FnMut` as they arrive and the suite
+  runs on a current-thread runtime, where `block_in_place` panics. "Stop on error" is kept as the
+  other two arms keep it: every statement after a failure reports `Cancelled`, those statements
+  having been written against a state that never happened. The arm this replaced looped
+  `fetch_query` — a connection per statement — which made both pragmas the twelve-step rebuild
+  writes into its own plan inert and cost two Criticals; see the connection invariant for what they
+  were, and `the_script_guards_itself_when_run_outside_run_ddl` (which was itself green against the
+  cascade it guards, having opened one connection where the real path opened many) and
+  `a_rebuild_survives_a_view_over_the_table_it_rebuilds` for the tests that pin it now.
+  **A long read blocks a write here, and on neither other engine** — SQLite takes one
   write lock over the whole file, so a whole-table export or import holds a write off until it
   finishes. Measured against a real 53 MB file in rollback-journal mode (`journal_mode = delete`,
   the default for a file not already in WAL): a `stream_query` over 400,000 rows drained slowly,
@@ -11537,6 +11565,28 @@ Re-introducing the anti-patterns these guard against is a regression:
   **SQLite has no exception at all** — every operation opens its own connection inside
   `spawn_blocking`, which is this invariant rather than a concession to a blocking driver, and
   `Session::open` refuses it (see `core::tx` above for why the pinned form needs its own design).
+  **But the unit is the *operation*, and an operation is not a statement.** A batch, a DDL plan, an
+  import and a script are each **one** — which is why `run_ddl` and `import_rows` hold a connection
+  across many statements (as does `run_server_ddl`, on the two engines that have containers to run
+  it against) without any of them being named as exceptions either, and why `Db::run_batch` is not
+  a third: its own doc has always promised one connection for a batch, and the other two engines
+  always gave it. Its SQLite arm read that sentence per-statement instead and opened a connection
+  each, on the reasoning — written into the code — that there is no `USE` to carry and no session
+  state to keep. A `PRAGMA` *is* session state, on the one engine whose session
+  state is `PRAGMA`: `ddl::sqlite_rebuild_sql` puts two of them in the emitted plan deliberately,
+  because that plan is also what the preview's Copy and "Open in editor" hand a query tab, and both
+  were inert under a per-statement runner. `PRAGMA foreign_keys = OFF` is statement 0, and was gone
+  by the `DROP TABLE`, whose implicit `DELETE FROM` then fired every `ON DELETE CASCADE` and emptied
+  a child table the user never touched, on a plan that reported success — measured on SQLite 3.50.4,
+  the same statement list leaves that table with 0 rows a connection per statement and 2 rows on
+  one. `PRAGMA legacy_alter_table = ON` was likewise gone by the shadow table's
+  `ALTER TABLE "t_schemaic_rebuild" RENAME TO "t"`, so a view over the edited table failed that
+  statement *after* the `DROP TABLE` and outside any transaction, leaving no table under the real
+  name and a `t_schemaic_rebuild` under the shadow one that `ddl::REBUILD_SUFFIX`'s own doc says
+  nothing ever sees. `sqlite::run_batch` is that arm now — one connection in one `spawn_blocking`,
+  `sqlite::rebuild_fk_tests` pinning both cases — and the reading to keep is that a deviation
+  towards *more* connections than the rule asks for is exactly as unsanctioned as one towards
+  fewer.
   In-transaction writes nest under a `SAVEPOINT` (`TxScope`) so the 1-row guard can roll back its own
   batch without ending the user's transaction, and the transaction *state* is the pure, tested
   `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on

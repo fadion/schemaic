@@ -1253,35 +1253,22 @@ impl Db {
                 return;
             }
             Engine::Sqlite => {
-                // Statement by statement on a fresh connection each, which is what
-                // `fetch_query` already does. There is no `USE` to carry and no
-                // session state to keep, so a batch here needs nothing a loop
-                // doesn't give it — the `scope` stamping above is a no-op for an
-                // engine with one database.
-                for (i, stmt) in stmts.iter().enumerate() {
-                    if cancel.is_cancelled() {
-                        on_result(i, Err(DbError::Cancelled));
-                        continue;
-                    }
-                    let r = sqlite::fetch_query(
-                        self,
-                        stmt,
-                        &mut RowDest::Capped(row_cap),
-                        cancel.clone(),
-                    )
-                    .await;
-                    let failed = r.is_err();
-                    on_result(i, r);
-                    // A batch stops at its first failure, as the other two do:
-                    // the statements after it were written against a state that
-                    // never happened.
-                    if failed {
-                        for (j, _) in stmts.iter().enumerate().skip(i + 1) {
-                            on_result(j, Err(DbError::Cancelled));
-                        }
-                        return;
-                    }
-                }
+                // **One connection, like the other two arms and like this
+                // method's own doc.** This was a loop over `fetch_query` — a
+                // fresh connection per statement — on the reasoning that there
+                // is no `USE` to carry and no session state to keep. A `PRAGMA`
+                // is session state, and `sqlite_rebuild_sql` puts two of them in
+                // the plan deliberately because that plan is also what Copy and
+                // "Open in editor" hand the user. Both were inert here: the
+                // rebuild's `PRAGMA foreign_keys = OFF` was gone by the
+                // `DROP TABLE`, which then cascade-emptied child tables on a
+                // plan that reported success, and `legacy_alter_table` was gone
+                // by the shadow table's `RENAME TO`, which left the user's table
+                // dropped. See `sqlite::run_batch`.
+                //
+                // The `scope` stamping above is still a no-op for an engine with
+                // one database.
+                sqlite::run_batch(self, stmts, row_cap, cancel, on_result).await;
                 return;
             }
             Engine::MySql => {}

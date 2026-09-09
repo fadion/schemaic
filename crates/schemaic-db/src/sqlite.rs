@@ -866,6 +866,106 @@ pub(crate) async fn fetch_query(
     }
 }
 
+/// Run a statement list in order **on one connection**, delivering each
+/// statement's outcome as it completes.
+///
+/// **The connection is the whole point of this function existing.** The SQLite
+/// arm of [`crate::Db::run_batch`] used to loop [`fetch_query`], which opens and
+/// closes a connection per statement — justified as "there is no `USE` to carry
+/// and no session state to keep". A `PRAGMA` *is* session state, and
+/// `sqlite_rebuild_sql` puts two of them in the plan on purpose, because that
+/// plan is also what the preview's Copy and "Open in editor" hand the user. With
+/// a connection per statement both were inert by the time they mattered:
+///
+/// - `PRAGMA foreign_keys = OFF` (statement 0) was gone when `DROP TABLE`
+///   ran — [`open`] turns foreign keys *on* per connection — so SQLite's
+///   implicit `DELETE FROM` fired every `ON DELETE CASCADE` and emptied child
+///   tables the user never touched, on a plan that reported success.
+/// - `PRAGMA legacy_alter_table = ON` was gone when the shadow table's
+///   `RENAME TO` ran, so a view over the table made statement 5 fail *after* the
+///   `DROP TABLE` and outside any transaction: no table left under the real
+///   name, and a `t_schemaic_rebuild` under the shadow one.
+///
+/// Both are `rebuild_fk_tests`' two red tests. This is not a new exception to
+/// one-connection-per-operation: [`crate::Db::run_batch`]'s own doc has always
+/// promised one connection for a batch, and the other two engines always gave
+/// it.
+///
+/// `spawn_blocking` rather than `block_in_place` (which [`run_script`] uses)
+/// because the results have to reach an async `FnMut` progressively and the
+/// suite runs on a current-thread runtime, where `block_in_place` panics.
+pub(crate) async fn run_batch(
+    db: &Db,
+    stmts: &[String],
+    row_cap: usize,
+    cancel: CancellationToken,
+    mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
+) {
+    let n = stmts.len();
+    let owned: Vec<String> = stmts.to_vec();
+    let db = db.clone();
+    let (handle_tx, handle_rx) = tokio::sync::oneshot::channel();
+    let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker_cancel = cancel.clone();
+
+    let work = tokio::task::spawn_blocking(move || {
+        let conn = match open(&db) {
+            Ok(c) => c,
+            // Couldn't even connect: fail the first statement and let the drain
+            // below cancel the rest, which is what the MySQL arm does.
+            Err(e) => {
+                let _ = res_tx.send((0usize, Err(e)));
+                return;
+            }
+        };
+        // The interrupt handle goes out before any work, the same shape
+        // `fetch_query` and `run_script` use — a mid-flight statement is what
+        // Stop has to reach.
+        let _ = handle_tx.send(conn.get_interrupt_handle());
+        for (i, stmt) in owned.iter().enumerate() {
+            if worker_cancel.is_cancelled() {
+                return;
+            }
+            let mut dest = crate::RowDest::Capped(row_cap);
+            let r = match run_query(&conn, stmt, &mut dest) {
+                // An interrupt surfaces as an ordinary error, so the token is
+                // what tells the two apart: reporting `SQLITE_INTERRUPT` as a
+                // failure would name the user's own Stop as a fault in their
+                // SQL.
+                Err(_) if worker_cancel.is_cancelled() => Err(DbError::Cancelled),
+                other => other,
+            };
+            let failed = r.is_err();
+            if res_tx.send((i, r)).is_err() || failed {
+                return;
+            }
+        }
+    });
+
+    let watcher = tokio::spawn(async move {
+        let Ok(h) = handle_rx.await else { return };
+        cancel.cancelled().await;
+        h.interrupt();
+    });
+
+    // In index order, because the UI fills result tabs as they arrive and the
+    // channel preserves the worker's order.
+    let mut delivered = 0usize;
+    while let Some((i, r)) = res_rx.recv().await {
+        delivered = i + 1;
+        on_result(i, r);
+    }
+    let _ = work.await;
+    watcher.abort();
+    // Whatever the worker stopped short of — a failure, or a cancel — reports
+    // `Cancelled`, the "stop on error" contract the other two arms keep: the
+    // statements after a failure were written against a state that never
+    // happened.
+    for i in delivered..n {
+        on_result(i, Err(DbError::Cancelled));
+    }
+}
+
 /// The blocking half of [`fetch_query`].
 ///
 /// A statement that returns no rows still has to be told apart from one that
@@ -1019,9 +1119,17 @@ pub(crate) async fn commit_writes(
     let work = tokio::task::spawn_blocking(move || {
         let mut conn = open(&db)?;
         let _ = tx.send(conn.get_interrupt_handle());
-        // Foreign keys are **off by default** in SQLite, per connection. A grid
-        // delete that orphans rows would otherwise succeed here and fail nowhere,
-        // which is not what the table declares.
+        // **Redundant against this build, and kept deliberately.** Foreign keys
+        // are off by default in a stock SQLite, per connection, and *on* in the
+        // amalgamation `libsqlite3-sys` bundles
+        // (`-DSQLITE_DEFAULT_FOREIGN_KEYS=1`) — which is a build flag of a
+        // dependency rather than anything this crate states, so it is one
+        // `cargo update` away from being untrue. A grid delete that orphans rows
+        // would then succeed here and fail nowhere, which is not what the table
+        // declares. The comment here said the opposite of the build for as long
+        // as the flag has been set; the assertion that pins the live default is
+        // the premise line inside
+        // `rebuild_fk_tests::the_script_guards_itself_when_run_outside_run_ddl`.
         let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
         let txn = conn.transaction().map_err(query_err)?;
         let mut total = 0u64;
@@ -1982,8 +2090,24 @@ pub(crate) async fn count_rows(
 fn master_entries(conn: &SqliteConn) -> Result<Vec<(String, String, String)>, DbError> {
     let mut stmt = conn
         .prepare(
+            // **`pragma_table_list` is what tells a shadow table from a real
+            // one**, and `sqlite_master` cannot: one
+            // `CREATE VIRTUAL TABLE docs USING fts5(body)` writes six
+            // `type = 'table'` rows — `docs` and the shadows `docs_config`,
+            // `docs_content`, `docs_data`, `docs_docsize`, `docs_idx` — under
+            // names the `sqlite\_%` filter does not match. All six listed as the
+            // user's own tables, and a designer edit on any of them destroyed
+            // the index (see `ddl::rebuild_refuses_a_virtual_table`). The engine
+            // hands the distinction over for free: `type` is `'shadow'` for
+            // those five and `'virtual'` for `docs`.
+            //
+            // This is the same rationale as the `sqlite\_%` filter one clause
+            // over — bookkeeping is hidden because showing it invites editing
+            // something whose corruption breaks the file — applied to the rows
+            // that filter could not see.
             "SELECT name, type, COALESCE(sql, '') FROM sqlite_master \
              WHERE type IN ('table','view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             AND name NOT IN (SELECT name FROM pragma_table_list WHERE type = 'shadow') \
              ORDER BY type = 'view', name",
         )
         .map_err(query_err)?;
@@ -8336,6 +8460,16 @@ mod rebuild_fk_tests {
     /// opens no transaction. So the guard has to be *in* the list; a plan that
     /// relies on the backend setting it out of band empties the child table the
     /// moment it leaves the modal.
+    ///
+    /// **Through `Db::run_batch`, which is what Run all calls.** This test used
+    /// to open one `conn` and loop `execute_batch` over the plan — the one thing
+    /// the real path did not do, since the SQLite arm of `run_batch` gave every
+    /// statement its own connection and `open()` turns foreign keys *on* per
+    /// connection. So `PRAGMA foreign_keys = OFF`, statement 0 of the plan, was
+    /// gone by the time `DROP TABLE "artist"` ran, and this test was green
+    /// against the very cascade it was written to guard. It is the seam — a pure
+    /// statement list composed with the runner — and testing either half alone
+    /// could not see it.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_script_guards_itself_when_run_outside_run_ddl() {
         let (keeper, db) = shared_memory("rebuild_cascade_script");
@@ -8350,32 +8484,164 @@ mod rebuild_fk_tests {
                  INSERT INTO album  VALUES (1, 1), (2, 1);",
             )
             .unwrap();
+        // The premise: a connection opened the way production opens one really
+        // does enforce, so the plan's own guard is the only thing between the
+        // `DROP TABLE` and the children.
+        let probe = open(&db).expect("open");
+        let enforcing: i64 = probe
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(enforcing, 1, "the premise: an editor connection enforces");
+        drop(probe);
 
         let before = table_of(&db, "artist").await;
         let mut draft = TableDraft::from_table(&before);
         draft.columns[1].info.type_name = "BLOB".into();
         let stmts = sqlite_rebuild_sql(&before, &draft);
 
-        // The query tab's connection, opened the way production opens one.
-        let conn = open(&db).expect("open");
-        let enforcing: i64 = conn
-            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(enforcing, 1, "the premise: an editor connection enforces");
-        for sql in &stmts {
-            conn.execute_batch(sql)
-                .unwrap_or_else(|e| panic!("{sql}: {e}"));
-        }
+        run_all(&db, &stmts).await;
 
         let albums: i64 = keeper
             .query_row("SELECT count(*) FROM album", [], |r| r.get(0))
             .unwrap();
         assert_eq!(albums, 2, "the children must not have been cascaded away");
-        // And the script left enforcement as it found it.
-        let after: i64 = conn
+        // And the script left enforcement as it found it, on a *new* connection
+        // as well as on the one it ran on.
+        let after: i64 = open(&db)
+            .expect("open")
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(after, 1, "the guard closes behind itself");
+    }
+
+    /// The second half of the same root cause, and the one with no luck in it:
+    /// `PRAGMA legacy_alter_table = ON` is also a property of the connection, so
+    /// with a connection per statement the rebuild's
+    /// `ALTER TABLE "t_schemaic_rebuild" RENAME TO "t"` failed with *error in
+    /// view v: no such table: main.t* — after the `DROP TABLE` had already run
+    /// and outside any transaction. The database was left with no table named
+    /// `t` at all and a `t_schemaic_rebuild` the code's own doc says nothing
+    /// ever sees.
+    ///
+    /// A view over the edited table is the commonest shape there is, which is
+    /// why this is the fixture rather than something exotic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_survives_a_view_over_the_table_it_rebuilds() {
+        let (keeper, db) = shared_memory("rebuild_view_rename");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);
+                 INSERT INTO t VALUES (1, 'x');
+                 CREATE VIEW v AS SELECT a FROM t;",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "BLOB".into();
+        let stmts = sqlite_rebuild_sql(&before, &draft);
+
+        run_all(&db, &stmts).await;
+
+        let names: Vec<String> = keeper
+            .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            names.contains(&"t".to_string()),
+            "the table survives: {names:?}"
+        );
+        assert!(
+            names.contains(&"v".to_string()),
+            "and so does the view: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains(schemaic_core::ddl::REBUILD_SUFFIX)),
+            "and no shadow table is left behind: {names:?}"
+        );
+        let rows: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "with its rows");
+    }
+
+    /// **An FTS5 table is one table in the tree, not six.** One
+    /// `CREATE VIRTUAL TABLE docs USING fts5(body)` writes six `type = 'table'`
+    /// rows into `sqlite_master` — `docs` plus `docs_config`, `docs_content`,
+    /// `docs_data`, `docs_docsize`, `docs_idx` — and the `sqlite\_%` filter
+    /// matches none of the five, so all six listed as the user's own tables.
+    /// Opening any of them in the designer and applying a rebuild destroyed the
+    /// index while reporting success.
+    ///
+    /// The engine hands the distinction over for free, which is the point:
+    /// `pragma_table_list` answers `'virtual'` for `docs` and `'shadow'` for the
+    /// five, and this module already read that pragma twice for other questions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_virtual_tables_shadow_tables_are_not_listed() {
+        let (keeper, db) = shared_memory("fts5_shadow_listing");
+        keeper
+            .execute_batch(
+                "CREATE VIRTUAL TABLE docs USING fts5(body);
+                 INSERT INTO docs (body) VALUES ('hello world');
+                 CREATE TABLE plain (a INTEGER PRIMARY KEY);",
+            )
+            .expect("fts5 is compiled in");
+        // The premise: `sqlite_master` really does hold all six.
+        let raw: i64 = keeper
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name LIKE 'docs%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, 6, "the premise: fts5 writes six rows");
+
+        let schema = fetch_schema(&db, CancellationToken::new()).await.unwrap();
+        let names: Vec<&str> = schema
+            .tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .filter(|n| n.starts_with("docs"))
+            .collect();
+        assert_eq!(names, ["docs"], "only the virtual table itself: {names:?}");
+        // And nothing ordinary went with them.
+        assert!(schema.tables.iter().any(|t| t.name == "plain"));
+
+        // The virtual table is listed, and refused a rebuild — the other end of
+        // the same hole. `ddl::rebuild_refuses_a_virtual_table` owns the reason.
+        let docs = schema.tables.iter().find(|t| t.name == "docs").unwrap();
+        let mut draft = schemaic_core::ddl::TableDraft::from_table(docs);
+        draft.columns[0].info.type_name = "BLOB".into();
+        let withheld =
+            schemaic_core::ddl::diff(docs, &draft, schemaic_core::intel::SqlDialect::Sqlite)
+                .unsupported();
+        assert!(
+            withheld.iter().any(|w| w.contains("virtual table")),
+            "{withheld:?}"
+        );
+    }
+
+    /// Run a statement list the way **Run all** does, and fail loudly on the
+    /// first statement the runner refuses.
+    ///
+    /// `Db::run_batch` and not a loop over `execute_batch`: the two differ in
+    /// exactly the property these tests are about, and the version that looped
+    /// is why the cascade shipped.
+    async fn run_all(db: &Db, stmts: &[String]) {
+        let mut failures = Vec::new();
+        db.run_batch(None, stmts, 100, CancellationToken::new(), |i, r| {
+            if let Err(e) = r {
+                failures.push(format!("statement {i} (`{}`): {e}", stmts[i]));
+            }
+        })
+        .await;
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
 

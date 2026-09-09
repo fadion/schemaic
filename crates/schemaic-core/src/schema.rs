@@ -514,7 +514,20 @@ pub(crate) fn is_bare_sqlite_default(d: &str) -> bool {
     if t.is_empty() {
         return true;
     }
-    if t.starts_with('(') && t.ends_with(')') {
+    // **One group, closed by the final `)`** — not merely a `(` at each end.
+    // `pragma_table_xinfo.dflt_value` strips the outer pair, so
+    // `DEFAULT ((1+2)*(3+4))` arrives as `(1+2)*(3+4)`: two parens at the ends,
+    // and an expression. A `starts_with`/`ends_with` pair called that bare,
+    // `definition_sql` re-emitted it without the wrapper, and SQLite refuses the
+    // result — which aborted the whole twelve-step rebuild on any edit to any
+    // column of the table. The shared boundary lexer is what answers this, and
+    // it is the same one twelve lines below (a paren inside a literal is not a
+    // paren).
+    // `balanced_paren_span` returns the index *of* the closing paren, so the
+    // last byte is `len - 1`.
+    if crate::sql::balanced_paren_span(t.as_bytes(), 0, crate::intel::SqlDialect::Sqlite)
+        == t.len().checked_sub(1)
+    {
         return true;
     }
     let upper = t.to_ascii_uppercase();
@@ -4610,6 +4623,40 @@ mod sqlite_default_tests {
             "'unterminated",
         ] {
             assert!(!is_bare_sqlite_default(d), "{d}");
+        }
+    }
+
+    /// **Two parentheses at the ends are not one group**, and the test here was
+    /// a two-ended character check rather than a balanced one.
+    ///
+    /// `pragma_table_xinfo.dflt_value` strips the *outer* pair, so
+    /// `DEFAULT ((1+2)*(3+4))` comes back as `(1+2)*(3+4)` and
+    /// `DEFAULT (('x')||('y'))` as `('x')||('y')` — both of which start with `(`
+    /// and end with `)` while being expressions. So `definition_sql` re-emitted
+    /// them bare, and SQLite refuses the result
+    /// (`near "||": syntax error`). Since `create_table_sql` builds the
+    /// rebuild's new table from *every* column's `definition_sql`, editing any
+    /// column of such a table aborted the twelve-step rebuild with a message
+    /// about a column the user had not touched — permanently uneditable through
+    /// the designer, and via Run all it landed with the table already dropped.
+    ///
+    /// Measured on SQLite 3.45.1.
+    #[test]
+    fn a_parenthesised_pair_that_is_not_one_group_still_needs_wrapping() {
+        for d in [
+            "(1+2)*(3+4)",
+            "('x')||('y')",
+            "(1)+(2)",
+            ")1+2(",
+            "(unbalanced",
+        ] {
+            assert!(!is_bare_sqlite_default(d), "{d}");
+        }
+        // One group, closed by the final paren — still bare, including when the
+        // group contains a literal holding a paren of its own, which is the case
+        // only the boundary lexer can answer.
+        for d in ["(datetime('now'))", "((1+2)*(3+4))", "('a)b')", "(1)"] {
+            assert!(is_bare_sqlite_default(d), "{d}");
         }
     }
 }

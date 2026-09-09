@@ -3694,6 +3694,7 @@ impl ChangeSet {
                 })
                 .chain(rebuild_strands_a_trigger(&r.current, &r.draft))
                 .chain(rebuild_cannot_restate(&r.current))
+                .chain(rebuild_refuses_a_virtual_table(&r.current))
                 .collect();
         }
         let mut out: Vec<String> = self
@@ -7744,6 +7745,86 @@ fn rebuild_strands_a_trigger(current: &TableInfo, draft: &TableDraft) -> Option<
         } else {
             "s"
         },
+    ))
+}
+
+/// Is this SQLite declaration a **virtual** table — `CREATE VIRTUAL TABLE …
+/// USING <module>(…)`?
+///
+/// Asked of `sqlite_master.sql`, which is the engine's own verbatim record of
+/// what was declared, so this is reading SQLite's answer rather than guessing at
+/// one. Through the shared boundary lexer, and only over the header before the
+/// module's argument list, so a table with a column called `virtual` or a check
+/// containing the word cannot be mistaken for one.
+pub fn is_sqlite_virtual_table(create_sql: &str) -> bool {
+    use crate::sql::{is_word_byte, is_word_start, skip_noncode};
+    let d = SqlDialect::Sqlite;
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    let mut words = 0usize;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, d) {
+            i = j.max(i + 1);
+            continue;
+        }
+        // The header ends at the module's `(`; nothing after it is a keyword
+        // this question is about.
+        if b[i] == b'(' {
+            return false;
+        }
+        if is_word_start(b[i]) {
+            let start = i;
+            while i < b.len() && is_word_byte(b[i]) {
+                i += 1;
+            }
+            words += 1;
+            // `CREATE VIRTUAL TABLE`: the second word, so a table *named*
+            // `virtual` (word 3) cannot answer yes.
+            if words == 2 && create_sql[start..i].eq_ignore_ascii_case("virtual") {
+                return true;
+            }
+            if words >= 2 {
+                return false;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The refusal for a rebuild of a **virtual** table, whose real storage is not
+/// the thing the rebuild would copy.
+///
+/// **The rebuild would delete an FTS index and report success.** One
+/// `CREATE VIRTUAL TABLE docs USING fts5(body)` puts six `type = 'table'` rows
+/// into `sqlite_master` — `docs` plus the shadow tables `docs_config`,
+/// `docs_content`, `docs_data`, `docs_docsize`, `docs_idx` (measured on 3.50.4).
+/// A rebuild writes `CREATE TABLE "docs_schemaic_rebuild" ("body" …)` — an
+/// *ordinary* table — copies the rows into it, drops `docs`, and renames. The
+/// drop takes all five shadow tables with it, so afterwards the text is still
+/// there and every `MATCH` query fails: the index is gone, the virtual table is
+/// gone, and nothing reported a problem. `rtree`, `geopoly` and every other
+/// module are the same shape.
+///
+/// Refusal rather than a model addition, and for a stronger reason than
+/// [`rebuild_cannot_restate`]'s: a virtual table's columns are a *module's*
+/// interface, not a storage declaration, so there is no faithful `CREATE TABLE`
+/// for a rebuild to write at all. The shadow tables are separately dropped from
+/// the schema listing (`db::sqlite::master_entries`), which is the other end of
+/// the same hole — a designer edit on `docs_data` did the identical damage.
+fn rebuild_refuses_a_virtual_table(current: &TableInfo) -> Option<String> {
+    let sql = current.create_sql.as_deref()?;
+    if !is_sqlite_virtual_table(sql) {
+        return None;
+    }
+    Some(format!(
+        "`{}` is a virtual table. Its columns are a module's interface rather than \
+         a storage declaration, and its real data lives in shadow tables a rebuild \
+         would drop — an FTS5 index would be gone from a table that still held the \
+         text. Change it with a script instead (DROP and CREATE VIRTUAL TABLE), or \
+         edit the tables it indexes.",
+        current.name
     ))
 }
 
@@ -16664,6 +16745,47 @@ mod sqlite_rebuild_tests {
         let w = withheld(&t);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("DEFERRABLE"), "{w:?}");
+    }
+
+    /// **A virtual table's rebuild deletes an index and reports success.** One
+    /// `CREATE VIRTUAL TABLE docs USING fts5(body)` writes six `type = 'table'`
+    /// rows into `sqlite_master`; the rebuild's `DROP TABLE "docs"` takes the
+    /// five shadow tables with it, so the text survives and every `MATCH` fails.
+    ///
+    /// Through `unsupported()`, which is what disables Apply — the predicate
+    /// alone would pass against a chain that never called it.
+    #[test]
+    fn a_virtual_table_is_withheld() {
+        for sql in [
+            "CREATE VIRTUAL TABLE \"docs\" USING fts5(body)",
+            "create virtual table docs using rtree(id, minX, maxX)",
+            "CREATE VIRTUAL TABLE docs USING geopoly()",
+        ] {
+            let w = withheld(&table_declaring(sql));
+            assert_eq!(w.len(), 1, "{sql}: {w:?}");
+            assert!(w[0].contains("virtual table"), "{sql}: {w:?}");
+        }
+    }
+
+    /// And an ordinary table is not one, however the word appears in it — the
+    /// refusal is a `DROP` the user did not ask for if it fires wrongly.
+    #[test]
+    fn an_ordinary_table_is_not_a_virtual_one() {
+        for sql in [
+            "CREATE TABLE \"t\" (a INTEGER, b TEXT)",
+            "CREATE TABLE \"virtual\" (a INTEGER)",
+            "CREATE TABLE t (virtual TEXT)",
+            "CREATE TABLE t (a TEXT CHECK (a <> 'virtual'))",
+            "CREATE TABLE /* virtual */ t (a TEXT)",
+            "CREATE TEMP TABLE t (a TEXT)",
+            "CREATE TABLE IF NOT EXISTS t (a TEXT)",
+        ] {
+            assert!(
+                !is_sqlite_virtual_table(sql),
+                "{sql} was read as a virtual table"
+            );
+            assert!(withheld(&table_declaring(sql)).is_empty(), "{sql}");
+        }
     }
 
     /// A conflict clause changes what a *write* does: rows that were quietly
