@@ -1248,9 +1248,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `false` to a bool and a refresh empties what there is to look at, and the caller passes
     `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
     compared them, so switching connection discarded a hand-built mapping. Pure + unit-tested.
-  - `dump.rs` — the **schema + data dump**: what one replayable `.sql` file holds and in what order,
-    as a `DumpPlan` of `DumpStep::Text`/`DumpStep::Rows` that `schemaic-app`'s `dump.rs` executes. It
-    writes nothing and connects to nothing, so every decision in it is unit-tested.
+  - `core/dump.rs` — the **schema + data dump**: what one replayable `.sql` file holds and in what
+    order, as a `DumpPlan` of `DumpStep::Text`/`DumpStep::Rows` that `schemaic-app`'s `dump.rs`
+    executes. It writes nothing and connects to nothing, so every decision in it is unit-tested.
     **The interface calls this *Export*; the code calls it a dump, and the split is deliberate.**
     `export` is already taken in this crate by `crate::export`, which renders *one result set* to a
     file — a different feature with different inputs, and a reader who meets `export` in
@@ -2968,8 +2968,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     whether to proceed. A **different** connection still refuses, which is the case that matters:
     running an action gated on a server the user has left, or reporting the old one unreachable in a
     modal over the new one.
-  - `window_chrome.rs` — which half of the window frame the app draws itself, now that it launches
-    with `WindowConfig::show_titlebar(false)`. `Chrome::current()` answers per `Host`
+  - `core/window_chrome.rs` — which half of the window frame the app draws itself, now that it
+    launches with `WindowConfig::show_titlebar(false)`. `Chrome::current()` answers per `Host`
     (Windows/Linux/macOS): `draws_own_controls`, `own_control_count`, `draws_own_resize_border`,
     `wants_drop_shadow`, `leading_inset`. **Ask the capability, never `cfg!(target_os = …)` at the
     use site** — the same
@@ -3464,8 +3464,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     re-created database gets a **fresh** id rather than colliding with a live node, that reordering
     the server's list renumbers nothing (the tree keys on id), and that a reload against an empty
     list still works.
-  - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
-    plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
+  - `core/secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of
+    the plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →
     move secrets into the store, blank the disk copy; keep plaintext only if the store is
     unavailable) and `forget` (delete). `RETIRED_SECRET_SUFFIXES` is the fourth transform and the
@@ -3871,8 +3871,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     dialects, so the statement parses, the round-trip happens, and the squiggle is the *server*
     complaining about text the user is still filling in. A placeholder in an identifier position
     (`FROM :tbl`) is the case that does not parse — which is what `neutralize` exists to rescue.
-  - `script.rs` — reading a `.sql` script **back**, as a stream of statements. The counterpart to
-    `dump.rs`: that module decides what a replayable file holds and hands the app a plan to write
+  - `core/script.rs` — reading a `.sql` script **back**, as a stream of statements. The counterpart
+    to `dump.rs`: that module decides what a replayable file holds and hands the app a plan to write
     it, this one takes such a file apart a block at a time, so a dump far larger than memory can be
     replayed. Until it existed the round trip did not close — Schemaic wrote `.sql` files only
     another tool could read, because the import path takes CSV, JSON and Excel and
@@ -4183,8 +4183,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     - `resource.rs` — the status bar's CPU/RAM model. `ResourceSample::new` divides `sysinfo`'s
       per-process CPU% (single-core-relative, so it exceeds 100 on a multi-core box) across the
       logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
-    - `update.rs` — the auto-update state model: `resource.rs`'s neighbour in spirit, and the pure
-      half of the Velopack plumbing in `schemaic-app`'s `update.rs`.
+    - `core/update.rs` — the auto-update state model: `resource.rs`'s neighbour in spirit, and the
+      pure half of the Velopack plumbing in `schemaic-app`'s `update.rs`.
       `check_gate(opt_out, installed)` answers whether a check round may run at all, and both of its
       refusals are ordinary outcomes rather than errors, so neither is shown to anyone: `OptedOut`
       (`SCHEMAIC_NO_UPDATE_CHECK`, read through `opt_out_requested`, which accepts `1`/`true`/`yes`/
@@ -8059,7 +8059,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     form. Its materialized half is `ddl::is_materialized_view`, the same predicate the menu
     asks to *offer* the refresh: two hand-written copies are two chances for the editor and
     the menu to disagree about one node.
-  - `window_chrome.rs` — the client-side window decorations: the caption buttons (minimize /
+  - `ui/window_chrome.rs` — the client-side window decorations: the caption buttons (minimize /
     maximize-restore / close), the drag strip, and the eight resize zones. Draws what
     `core::window_chrome::Chrome` decides, and contains no `cfg!(target_os = …)` of its own.
     `WindowChrome` holds the `WindowId` plus a `maximized` mirror — `is_maximized()` is a query, not
@@ -10622,7 +10622,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   parse (`the_dialect_is_the_engines_own_for_every_engine`). The DDL paths escaped by luck alone:
   `TableInfo::create_ddl` hands back SQLite's own `create_sql` for a real table without consulting
   the dialect, and a **view** fell through to `ddl::view_ddl`'s MySQL shape, which was only cosmetic
-  because SQLite accepts backticks and its views carry no `view_options`. `secrets.rs` is the
+  because SQLite accepts backticks and its views carry no `view_options`. `app/secrets.rs` is the
   keyring-backed `SecretStore` behind `core::secrets`.
   `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
   `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
@@ -11080,8 +11080,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     can be completed must not depend on how its file was found. Four `is_file` checks and one small
     read, cheap enough to run inside a file-picker callback where the two directory walks would
     not be.
-  - `script.rs` — the I/O half of `core::script`, and `dump.rs`'s mirror image: that module reads a
-    database and writes a file, this reads a file and writes a database. Two halves at once — a
+  - `app/script.rs` — the I/O half of `core::script`, and `dump.rs`'s mirror image: that module
+    reads a database and writes a file, this reads a file and writes a database. Two halves at once — a
     **blocking reader** walks the file in `BLOCK`-sized reads, feeds `script::Splitter` and pushes
     completed statements into a bounded channel, while `Db::run_script` pulls from the other end.
     Each reports how it ended and `script::run_outcome` decides which ending the user hears, which is
