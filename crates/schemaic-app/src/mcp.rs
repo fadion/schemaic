@@ -146,11 +146,28 @@ fn reads_row_data(tool: &str) -> bool {
 /// Does this tool read the **catalogue** — the thing *Schema context* governs?
 ///
 /// The same one-predicate-consulted-twice shape [`reads_row_data`] has, and for
-/// the same reason. `propose_table_change` is deliberately not on the list: it
-/// carries the table it is about in the call and reads nothing the model did not
-/// already have.
+/// the same reason.
+///
+/// **`propose_table_change` is on this list, and its absence was a hole.** The
+/// exclusion was justified as "it carries the table it is about in the call and
+/// reads nothing the model did not already have", and both halves were false:
+/// [`propose_change`] calls `db.fetch_schema(database, …)`, a full catalogue
+/// read of an arbitrary database, and `propose::resolve_target`'s hit/miss split
+/// is a working existence oracle over every database and table name a model
+/// cares to guess — at the one setting whose entire purpose is to publish none
+/// of them. On SQLite it is not even an oracle: `AddCheck` is off the native
+/// allowlist, so `ddl::diff` collapses the set into one `RebuildTable`, and the
+/// emitted SQL is the table's complete `CREATE TABLE` followed by an
+/// `INSERT … SELECT` naming every column again. One call on a guessed name
+/// returned the whole declaration.
+///
+/// The hidden-database set is a separate matter and still unconsulted on this
+/// path — it reaches only `listed_databases`.
 fn reads_schema(tool: &str) -> bool {
-    matches!(tool, "list_schema" | "describe_table")
+    matches!(
+        tool,
+        "list_schema" | "describe_table" | "propose_table_change"
+    )
 }
 
 /// What the server says when a schema tool is called at *Schema context: None*.
@@ -158,9 +175,9 @@ fn reads_schema(tool: &str) -> bool {
 /// Names the setting, because the model's next move should be to ask the user
 /// for the table and column names (or to raise the setting) rather than retry.
 const NO_SCHEMA_ACCESS: &str = "Refused: the user's Schema context setting is None, so the \
-     assistant is given no database structure and list_schema and describe_table are \
-     unavailable. Ask the user for the table and column names you need — or tell them to set \
-     Schema context to a database in AI settings.";
+     assistant is given no database structure and list_schema, describe_table and \
+     propose_table_change are unavailable. Ask the user for the table and column names you need \
+     — or tell them to set Schema context to a database in AI settings.";
 
 /// What the server says when a withheld tool is called anyway. It names the
 /// setting, because the model's next move should be to ask the user for the
@@ -943,28 +960,37 @@ mod tests {
             schemaic_db::Engine::Sqlite,
         ] {
             let names = offered_with(engine, true, false);
-            for gone in ["list_schema", "describe_table"] {
+            // **`propose_table_change` is on this list, and it was not.** Its
+            // exclusion was justified as "it carries the table it is about in
+            // the call and reads nothing the model did not already have", and
+            // both halves were false: `propose_change` calls
+            // `db.fetch_schema(database, …)` — a full catalogue read of an
+            // arbitrary database — and `resolve_target`'s hit/miss split is a
+            // working existence oracle over every database and table name a
+            // model cares to guess, at the one setting whose purpose is to
+            // publish none of them. On SQLite it is not an oracle but a dump:
+            // `AddCheck` is off the native allowlist, so `diff` collapses the
+            // set into one `RebuildTable`, whose emitted SQL is the table's
+            // complete `CREATE TABLE` plus an `INSERT … SELECT` naming every
+            // column again.
+            for gone in ["list_schema", "describe_table", "propose_table_change"] {
                 assert!(
                     !names.contains(&gone.to_string()),
                     "{engine:?} still advertises {gone}: {names:?}"
                 );
             }
-            // `run_query` is the connection's decision, not this one, and a
-            // proposal carries its own schema in the call.
-            for kept in ["run_query", "propose_table_change"] {
-                assert!(
-                    names.contains(&kept.to_string()),
-                    "{engine:?} dropped {kept}: {names:?}"
-                );
-            }
+            // `run_query` is the connection's decision, not this one.
+            assert!(
+                names.contains(&"run_query".to_string()),
+                "{engine:?} dropped run_query: {names:?}"
+            );
         }
         // …and a call to one anyway is refused with the setting named.
-        for gone in ["list_schema", "describe_table"] {
+        for gone in ["list_schema", "describe_table", "propose_table_change"] {
             let refusal = refusal_for(gone, true, false).expect("refused");
             assert!(refusal.contains("Schema context"), "{refusal}");
         }
         assert_eq!(refusal_for("run_query", true, false), None);
-        assert_eq!(refusal_for("propose_table_change", true, false), None);
     }
 
     /// The tool's arguments carry `database` alongside the proposal's own

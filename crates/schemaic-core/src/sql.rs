@@ -1446,11 +1446,17 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
 
 // ── AI read-only gate ────────────────────────────────────────────────────────
 
-/// Keywords that make a statement non-read-only or dangerous, matched as whole
-/// top-level tokens (outside strings / identifiers / comments). The AI consumes
-/// untrusted result data, so it must not mutate, lock, sleep, or touch the
-/// filesystem — this is a security boundary (review C7).
-const DENY_KEYWORDS: &[&str] = &[
+/// Keywords that make a statement non-read-only or dangerous on **every**
+/// engine, matched as whole top-level tokens (outside strings / identifiers /
+/// comments). The AI consumes untrusted result data, so it must not mutate,
+/// lock, sleep, or touch the filesystem — this is a security boundary
+/// (review C7).
+///
+/// The engine-specific half is [`deny_keywords_for`], and the split is not
+/// cosmetic: this list *was* the whole gate, and every filesystem entry in it
+/// was a MySQL spelling, so `SELECT pg_read_file('/etc/hostname')` passed on
+/// PostgreSQL and handed a server-side file to the CLI vendor.
+const DENY_ANY_ENGINE: &[&str] = &[
     "INSERT",
     "UPDATE",
     "DELETE",
@@ -1483,16 +1489,87 @@ const DENY_KEYWORDS: &[&str] = &[
     "ROLLBACK",
     "SAVEPOINT",
     "USE",
-    "OUTFILE",
-    "DUMPFILE",
     "ANALYZE",
     "OPTIMIZE",
     "REPAIR",
-    "SLEEP",
-    "BENCHMARK",
-    "GET_LOCK",
-    "RELEASE_LOCK",
 ];
+
+/// The half of the AI deny list that only means something on `dialect`.
+///
+/// **Per dialect for exactly the reason [`read_only_heads`] is** — "the engines
+/// don't have the same statements" — and the gate one hundred lines above it was
+/// not, for a year. Each engine's filesystem, sleep and lock primitives have
+/// nothing in common but their effect: `LOAD_FILE` is MySQL's, `pg_read_file` is
+/// PostgreSQL's, `readfile` is a SQLite CLI extension, and a shared list that
+/// held one engine's spellings silently passed the other two.
+///
+/// Two things to know before adding a name:
+///
+/// - **`_` is a word byte** to [`word_tokens`], so a name with an underscore
+///   must be written out in full. `LOAD` does *not* cover `LOAD_FILE` — it
+///   catches only `LOAD DATA INFILE`, which is how MySQL's own read primitive
+///   stayed open while the list appeared to name it.
+/// - **This list only ever over-blocks a column name**, and the correct
+///   direction for a refusal gate is to over-block. But an entry on the wrong
+///   engine is still a wrong answer, which is why
+///   `the_deny_list_names_only_this_engines_spellings` pins that too.
+fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql => &[
+            "LOAD_FILE",
+            "OUTFILE",
+            "DUMPFILE",
+            "SLEEP",
+            "BENCHMARK",
+            "GET_LOCK",
+            "RELEASE_LOCK",
+        ],
+        // `COPY` is here rather than in the shared list because on PostgreSQL it
+        // reads *and writes* server-side files (`COPY t FROM '/etc/passwd'`),
+        // while MySQL has no such statement and SQLite's is a shell dot-command.
+        SqlDialect::Postgres => &[
+            "PG_READ_FILE",
+            "PG_READ_BINARY_FILE",
+            "PG_LS_DIR",
+            "PG_STAT_FILE",
+            "LO_IMPORT",
+            "LO_EXPORT",
+            "PG_SLEEP",
+            "PG_SLEEP_FOR",
+            "PG_SLEEP_UNTIL",
+            "PG_ADVISORY_LOCK",
+            "PG_ADVISORY_LOCK_SHARED",
+            "PG_ADVISORY_XACT_LOCK",
+            "PG_ADVISORY_XACT_LOCK_SHARED",
+            "PG_TERMINATE_BACKEND",
+            "PG_CANCEL_BACKEND",
+            "PG_RELOAD_CONF",
+            "PG_ROTATE_LOGFILE",
+            "COPY",
+        ],
+        // `ATTACH` is the SQLite hole that has no analogue: it opens *another*
+        // database file by path, so a model that may `SELECT` can read any
+        // SQLite file on the machine and — with a writable page — create one.
+        SqlDialect::Sqlite => &[
+            "ATTACH",
+            "DETACH",
+            "READFILE",
+            "WRITEFILE",
+            "LOAD_EXTENSION",
+            "EDIT",
+            "VACUUM",
+            "REINDEX",
+        ],
+    }
+}
+
+/// Is `word` refused by the AI gate on `dialect`?
+///
+/// The composition of the two halves, in one place, so no caller can check one
+/// and miss the other.
+fn is_denied(word: &str, dialect: SqlDialect) -> bool {
+    DENY_ANY_ENGINE.contains(&word) || deny_keywords_for(dialect).contains(&word)
+}
 
 /// Split SQL into upper-cased word tokens, skipping string/identifier/comment
 /// content. The bool is set once a top-level `;` is followed by more real
@@ -1575,7 +1652,7 @@ pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
             heads.join("/")
         ));
     }
-    if let Some(bad) = words.iter().find(|w| DENY_KEYWORDS.contains(&w.as_str())) {
+    if let Some(bad) = words.iter().find(|w| is_denied(w, dialect)) {
         return Err(format!("`{bad}` is not permitted in an AI query"));
     }
     Ok(())
@@ -1584,7 +1661,7 @@ pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
 /// Keywords that make a statement a write *wherever* they appear in it, not just
 /// at its head — the set that survives the read-head allowlist below.
 ///
-/// Deliberately narrower than [`DENY_KEYWORDS`]: this gate allows several read
+/// Deliberately narrower than [`DENY_ANY_ENGINE`]: this gate allows several read
 /// statements and only needs the ones that change data or write a file, whereas
 /// the AI gate also refuses locks, sleeps and session state. Keeping them
 /// separate is what stops this scan from over-blocking an ordinary query.
@@ -2977,21 +3054,82 @@ mod tests {
             assert!(gate("WITH c AS (SELECT 1) DELETE FROM t").is_err(), "{d:?}");
             // EXPLAIN ANALYZE actually executes the statement.
             assert!(gate("EXPLAIN ANALYZE DELETE FROM t").is_err(), "{d:?}");
-            // SELECT … INTO OUTFILE writes files on the DB host.
-            assert!(
-                gate("SELECT * FROM t INTO OUTFILE '/tmp/x'").is_err(),
-                "{d:?}"
-            );
-            // SLEEP / locks.
-            assert!(gate("SELECT SLEEP(10)").is_err(), "{d:?}");
             // Multi-statement.
             assert!(gate("SELECT 1; DROP TABLE t").is_err(), "{d:?}");
             // A dangerous word inside a *standard* string is inert everywhere.
             assert!(gate("SELECT 'delete from t'").is_ok(), "{d:?}");
         }
+        // `INTO OUTFILE`, `SLEEP` and the `GET_LOCK` pair left this sweep when
+        // the deny list became per-dialect: they are MySQL syntax, and asserting
+        // that PostgreSQL refuses a statement it cannot parse proved nothing
+        // about PostgreSQL while hiding that it had no `pg_read_file` entry at
+        // all. Each engine's own filesystem / sleep / lock primitives are pinned
+        // by `the_gate_refuses_each_engines_own_filesystem_primitive` instead —
+        // which is a strictly larger set than this line ever covered.
+        assert!(read_only_reason("SELECT * FROM t INTO OUTFILE '/tmp/x'").is_err());
+        assert!(read_only_reason("SELECT SLEEP(10)").is_err());
+        assert!(read_only_reason("SELECT GET_LOCK('a', 1)").is_err());
         // The backtick is not standard, so this one is deliberately not in the
         // sweep — see `the_gate_reads_this_engines_identifier_quoting`.
         assert!(read_only_reason("SELECT `update` FROM t").is_ok());
+    }
+
+    /// **The deny list is per-engine for the same reason the heads are, and it
+    /// was not.** Every entry was a MySQL spelling, so
+    /// `SELECT pg_read_file('/etc/hostname')` passed the gate and shipped a
+    /// server-side file to the CLI vendor — measured live against PG 16.15
+    /// through the shipped `schemaic --mcp-serve` binary, where the same batch's
+    /// `SLEEP(1)` *was* refused, which is what showed the gate was running and
+    /// simply did not know these names. `pg_hba.conf`, `~/.ssh/id_rsa` and
+    /// Schemaic's own `connections.json` are the same call.
+    ///
+    /// Asserted through `read_only_reason` rather than against the constant,
+    /// because the tokeniser is where the second half of the bug lived: `_` is a
+    /// word byte, so `LOAD_FILE` tokenises as one word and the `LOAD` entry —
+    /// which covers only `LOAD DATA INFILE` — never matched it. MySQL's own read
+    /// primitive was as open as PostgreSQL's.
+    #[test]
+    fn the_gate_refuses_each_engines_own_filesystem_primitive() {
+        use super::read_only_reason as gate;
+        let cases: &[(SqlDialect, &str)] = &[
+            (SqlDialect::Postgres, "SELECT pg_read_file('/etc/passwd')"),
+            (
+                SqlDialect::Postgres,
+                "SELECT pg_read_binary_file('/etc/passwd')",
+            ),
+            (SqlDialect::Postgres, "SELECT pg_ls_dir('/')"),
+            (SqlDialect::Postgres, "SELECT pg_stat_file('/etc/passwd')"),
+            (SqlDialect::Postgres, "SELECT lo_import('/etc/passwd')"),
+            (SqlDialect::Postgres, "SELECT pg_sleep(10)"),
+            (SqlDialect::Postgres, "SELECT pg_advisory_lock(1)"),
+            (SqlDialect::Postgres, "SELECT pg_terminate_backend(1)"),
+            (SqlDialect::MySql, "SELECT LOAD_FILE('/etc/passwd')"),
+            (SqlDialect::Sqlite, "SELECT readfile('/etc/passwd')"),
+            (SqlDialect::Sqlite, "SELECT writefile('/tmp/x', 'y')"),
+            (SqlDialect::Sqlite, "SELECT load_extension('/tmp/x.so')"),
+        ];
+        for (d, sql) in cases {
+            assert!(gate(sql, *d).is_err(), "{d:?} passed `{sql}`");
+        }
+    }
+
+    /// The other engine's spelling is *not* refused — over-blocking is the safe
+    /// direction on a refusal gate, but it is still a wrong answer, and a shared
+    /// list is how the gate came to give one in the first place.
+    #[test]
+    fn the_deny_list_names_only_this_engines_spellings() {
+        use super::read_only_reason as gate;
+        // `pg_read_file` is not a MySQL function; a column called that is a read.
+        assert!(gate("SELECT pg_read_file FROM t", SqlDialect::MySql).is_ok());
+        // `LOAD_FILE` likewise means nothing on PostgreSQL.
+        assert!(gate("SELECT load_file FROM t", SqlDialect::Postgres).is_ok());
+        // But the shared half holds everywhere.
+        for d in EVERY_DIALECT {
+            assert!(
+                gate("SELECT 1 FROM t WHERE x = (DELETE)", d).is_err(),
+                "{d:?}"
+            );
+        }
     }
 
     /// The allowed heads are the ones the *engine* has. `SHOW` and `DESCRIBE`
