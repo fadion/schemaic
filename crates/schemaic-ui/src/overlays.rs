@@ -423,9 +423,12 @@ pub(crate) fn key_entries(
         drop_index: !is_view
             && supports_change(
                 dialect,
+                // A capability probe, not a plan: `unique` decides only what the
+                // preview *says*, so `false` here asks the same question.
                 &Change::DropIndex {
                     name: String::new(),
                     constraint: constraint.map(str::to_string),
+                    unique: false,
                 },
             ),
     }
@@ -2562,6 +2565,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         schemaic_core::ddl::Change::DropIndex {
                                             name: ix.name.clone(),
                                             constraint: ix.constraint.clone(),
+                                            // Carried so the preview can say
+                                            // duplicates are accepted from now
+                                            // on — `Change::risks`' arm.
+                                            unique: ix.unique,
                                         },
                                     );
                                 })

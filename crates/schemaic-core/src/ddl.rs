@@ -2206,6 +2206,17 @@ pub enum Change {
         /// The constraint the index backs, when it is one — PostgreSQL refuses
         /// `DROP INDEX` on those.
         constraint: Option<String>,
+        /// Was it a **unique** index?
+        ///
+        /// Carried only so [`Change::risks`] can say what stops being
+        /// guaranteed. A non-unique index costs performance, which is not a
+        /// risk sentence; a unique one was refusing duplicate rows a moment
+        /// ago and from now on accepts them, with nothing about the statement
+        /// or the grid afterwards showing it — the same argument
+        /// [`Change::DropCheck`]'s arm is written on. A menu entry that only
+        /// asks `supports_change` may leave this `false`; the answer it wants
+        /// does not depend on it.
+        unique: bool,
     },
     /// An edit to an index [`IndexInfo::lossy`] marks as only partly readable was
     /// **withheld**. Emits no SQL.
@@ -2602,20 +2613,49 @@ fn view_drop_cost(dialect: SqlDialect) -> &'static str {
 /// SQL box did hold the truth, but it is a `no_wrap` field whose tail is off the
 /// right edge; the list is what the modal is built to be read as.
 fn column_clauses(c: &ColumnInfo) -> String {
-    let mut out = String::new();
-    if let Some(d) = &c.default {
-        out.push_str(&format!(", default {d}"));
-    }
-    if let Some(g) = &c.generated {
-        out.push_str(&format!(", generated as ({g})"));
-    }
-    if let Some(u) = &c.on_update {
-        out.push_str(&format!(", on update {u}"));
-    }
-    if let Some(coll) = &c.collation {
-        out.push_str(&format!(", collate {coll}"));
-    }
-    out
+    clause_pairs(c)
+        .into_iter()
+        .filter_map(|(label, value)| value.map(|v| format!(", {label} {v}")))
+        .collect()
+}
+
+/// The same four fields as `(label, value)` pairs, so a *change* to one can be
+/// named rather than only its presence.
+///
+/// **This is what [`column_clauses`] alone could not say.** It renders only what
+/// is present, so *clearing* a default made the two sides differ (the guard in
+/// the `AlterColumn` arm falls through) while `column_clauses(to)` was empty —
+/// and the summary came out byte-identical to the "nothing interesting changed"
+/// case, `Change column qty`, while `emit()` wrote
+/// `MODIFY COLUMN qty INT NOT NULL` and the default was gone. The asymmetry was
+/// exact: an added or edited clause was named, a cleared one was silent, and all
+/// three `AlterColumn` arms shared the same value so a rename or a retype hid it
+/// too.
+fn clause_pairs(c: &ColumnInfo) -> [(&'static str, Option<String>); 4] {
+    [
+        ("default", c.default.clone()),
+        (
+            "generated as",
+            c.generated.as_ref().map(|g| format!("({g})")),
+        ),
+        ("on update", c.on_update.clone()),
+        ("collate", c.collation.clone()),
+    ]
+}
+
+/// Every free-SQL clause that differs between `from` and `to`, named in both
+/// directions — `", default 0 → (none)"`.
+///
+/// Empty when none differs, which is the "nothing to restate" case the
+/// `AlterColumn` arms already had.
+fn clause_changes(from: &ColumnInfo, to: &ColumnInfo) -> String {
+    let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "(none)".to_string());
+    clause_pairs(from)
+        .into_iter()
+        .zip(clause_pairs(to))
+        .filter(|((_, a), (_, b))| a != b)
+        .map(|((label, a), (_, b))| format!(", {label} {} → {}", show(&a), show(&b)))
+        .collect()
 }
 
 impl Change {
@@ -2651,11 +2691,13 @@ impl Change {
                 // The free-SQL clauses are named on every arm that isn't purely
                 // a move, because a `MODIFY`/`ALTER COLUMN` restates them and
                 // the list is where the user reads what is being restated.
-                let clauses = if column_clauses(from) == column_clauses(to) {
-                    String::new()
-                } else {
-                    column_clauses(to)
-                };
+                //
+                // **A *diff*, not the new side.** `column_clauses(to)` renders
+                // only what is present, so a cleared default produced an empty
+                // string and a line byte-identical to "nothing interesting
+                // changed" — while the emitter dropped the default. See
+                // `clause_changes`.
+                let clauses = clause_changes(from, to);
                 // **A rename does not excuse the list from naming the type.**
                 // `ColumnDraft::original` keeps rename+retype as one
                 // `Change::AlterColumn`, so there is no second line to carry it,
@@ -2997,6 +3039,37 @@ impl Change {
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && to.is_empty() => {
                 vec!["Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string()]
             }
+            // **The swap case, which fell through this match to `Vec::new()`.**
+            // A drop-to-nothing was the only guarded arm, so replacing the key
+            // said nothing at all — while the old key's columns stop being
+            // unique from that moment, and on MySQL the statement rebuilds the
+            // clustered index (a table rewrite, not a metadata change).
+            Change::PrimaryKey { from, to, .. } if !from.is_empty() && !to.is_empty() => {
+                vec![format!(
+                    "Replaces the primary key: {} {} no longer unique, and duplicates \
+                     are accepted from now on. On MySQL this rebuilds the clustered \
+                     index, which rewrites the whole table.",
+                    from.join(", "),
+                    if from.len() == 1 { "is" } else { "are" },
+                )]
+            }
+            // Like `DropCheck`, and filed with it: no data is lost, the table
+            // stops guaranteeing something it guaranteed a moment ago, and
+            // nothing on any surface afterwards shows it. From here orphan rows
+            // in the referencing table are simply accepted.
+            Change::DropForeignKey { name } => vec![format!(
+                "Drops foreign key {name}. Rows that no longer have a matching \
+                 parent are accepted from now on, and existing data is not \
+                 re-examined if it's added back."
+            )],
+            // Gated on `unique`: a plain index costs query speed, which is not
+            // this block's business. A unique one was refusing duplicate rows.
+            Change::DropIndex {
+                name, unique: true, ..
+            } => vec![format!(
+                "Drops unique index {name}. Duplicate values are accepted from now \
+                 on, and the grid may lose the key it was editing rows by."
+            )],
             Change::DropView { materialized } => vec![format!(
                 "Drops the {}view. {view_drop_cost}",
                 if *materialized { "materialized " } else { "" }
@@ -3516,6 +3589,31 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
             to.name
         ));
     }
+    // **A generated expression, in either direction.** This function covered a
+    // nullability flip and a type change, and a generated-expression edit is
+    // neither — so `risks()` came back empty, `destructive()` with it, and the
+    // preview's risk block hid itself on the one edit that emitted
+    // `DROP COLUMN, ADD COLUMN` and nulled every row. Which statement PG gets
+    // is `pg_column_clauses`' business; that the user is told is this one's.
+    match (from.generated.as_deref(), to.generated.as_deref()) {
+        (Some(_), None) => out.push(format!(
+            "Column {} stops being generated. Its current values are kept, but \
+             nothing recomputes them from now on.",
+            to.name
+        )),
+        (None, Some(expr)) => out.push(format!(
+            "Column {} becomes generated from {expr}. Every value in it is \
+             replaced by what the expression computes.",
+            to.name
+        )),
+        (Some(a), Some(b)) if a != b => out.push(format!(
+            "Column {}'s expression changes from {a} to {b}. On PostgreSQL this \
+             drops and re-adds the column, so every value is recomputed and the \
+             column moves to the end of the table.",
+            to.name
+        )),
+        _ => {}
+    }
     out.extend(type_change_risk(&from.type_name, &to.type_name, &to.name));
     out
 }
@@ -3640,19 +3738,32 @@ impl ChangeSet {
         // check in place, so *every* edit — and the compensating pair a MySQL
         // column rename needs — is a drop and an add; the `AddCheck` summary is
         // what states the new predicate.
+        //
+        // **Indexes and foreign keys go on the same list**, because `diff`
+        // recreates those the same way (`dropped_ix`/`added_ix`, and the
+        // foreign keys "on the same drop-and-recreate rule" a few lines below
+        // it). Without them, adding the risk sentences a dropped unique index
+        // and a dropped foreign key were missing would have put a false loss on
+        // every ordinary index or FK *edit* — which is the composition
+        // `a_re_added_constraint_is_not_a_loss` pins.
         let re_added: HashSet<&str> = self
             .changes
             .iter()
             .filter_map(|c| match c {
                 Change::AddCheck(ck) => Some(ck.name.as_str()),
+                Change::AddIndex(ix) => Some(ix.name.as_str()),
+                Change::AddForeignKey(fk) => Some(fk.name.as_str()),
                 _ => None,
             })
             .collect();
         self.changes
             .iter()
-            .filter(
-                |c| !matches!(c, Change::DropCheck { name } if re_added.contains(name.as_str())),
-            )
+            .filter(|c| match c {
+                Change::DropCheck { name }
+                | Change::DropIndex { name, .. }
+                | Change::DropForeignKey { name } => !re_added.contains(name.as_str()),
+                _ => true,
+            })
             .flat_map(|c| c.risks(self.dialect))
             .collect()
     }
@@ -4121,6 +4232,7 @@ impl ChangeSet {
             if let Change::DropIndex {
                 name,
                 constraint: None,
+                ..
             } = c
             {
                 // The index lives in its table's schema, and `DROP INDEX
@@ -5482,13 +5594,32 @@ fn comment_on_column(
 ///
 /// Unlike MySQL there's no "replace the column" verb, so each attribute moves on
 /// its own — which is also why nothing is destroyed by omission here. The one
-/// exception is a generated expression, which PostgreSQL can't change in place
-/// at all: that becomes a drop and a re-add of a column whose values were
-/// derived anyway.
+/// exception is a generated expression, which PostgreSQL can't *change* in place:
+/// that becomes a drop and a re-add of a column whose values were derived anyway.
+///
+/// **Except in the direction where they were not going to be derived again.**
+/// This branch was `from.generated != to.generated`, on that same reasoning —
+/// true when `to.generated` is `Some` (the new expression recomputes every
+/// value) and false when it is `None`, where the column becomes plain and there
+/// is nothing left to derive the values *from*. Clearing the designer's
+/// "Generated from" field therefore emitted `DROP COLUMN, ADD COLUMN` and
+/// nulled every row: measured live on PostgreSQL 16.15, a `total` holding 2/4/6
+/// came back as three empty cells, with the column moved to the end of the
+/// table. PostgreSQL 13+ has the statement that does what the user asked and
+/// keeps the values, and it is one clause: `ALTER COLUMN … DROP EXPRESSION`.
+///
+/// The `NOT NULL` variant of that edit was safe by accident —
+/// `to.definition_sql` restates `NOT NULL`, the server refuses
+/// `ADD COLUMN … NOT NULL` on a populated table, and PG rolls the plan back. It
+/// was precisely the ordinary nullable column that was destroyed silently.
 fn pg_column_clauses(from: &ColumnInfo, to: &ColumnInfo, d: SqlDialect) -> Vec<String> {
     let q = |s: &str| ddl_ident_in(s, d);
     let mut out = Vec::new();
-    if from.generated != to.generated {
+    if from.generated.is_some() && to.generated.is_none() {
+        out.push(format!("ALTER COLUMN {} DROP EXPRESSION", q(&to.name)));
+        // Fall through: the same edit may also have changed the type, the
+        // nullability or the default, and each of those moves on its own here.
+    } else if from.generated != to.generated {
         out.push(format!("DROP COLUMN {}", q(&to.name)));
         out.push(format!("ADD COLUMN {}", to.definition_sql(d)));
         return out;
@@ -8486,6 +8617,7 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
         changes.push(Change::DropIndex {
             name: ix.name.clone(),
             constraint: ix.constraint.clone(),
+            unique: ix.unique,
         });
     }
     for ix in added_ix {
@@ -10390,6 +10522,7 @@ mod tests {
             Change::DropIndex {
                 name: "email_ix".into(),
                 constraint: None,
+                unique: false,
             },
         );
         assert_eq!(plain.emit(), vec!["DROP INDEX \"email_ix\";"]);
@@ -10400,6 +10533,7 @@ mod tests {
             Change::DropIndex {
                 name: "email_uq".into(),
                 constraint: Some("users_email_key".into()),
+                unique: true,
             },
         );
         assert_eq!(
@@ -10769,6 +10903,209 @@ mod tests {
         (t, d)
     }
 
+    /// **Clearing a PostgreSQL generated expression destroyed every value in
+    /// the column, and the preview warned about nothing.**
+    ///
+    /// `pg_column_clauses` opened with `if from.generated != to.generated` and
+    /// emitted `DROP COLUMN` + `ADD COLUMN`, justified as "a drop and a re-add
+    /// of a column whose values were derived anyway". True in the direction the
+    /// author had in mind (a *new* expression recomputes every value) and false
+    /// in the other: with `to.generated == None` the column becomes plain and
+    /// there is nothing left to derive the values from. Measured live on PG
+    /// 16.15 — `total` went from 2/4/6 to three empty cells, and the column
+    /// moved to the end of the table.
+    ///
+    /// PostgreSQL 13+ has the statement that does what the user asked and keeps
+    /// the values: `ALTER COLUMN … DROP EXPRESSION`, measured in the same run.
+    ///
+    /// A composition test, and it has to be: the branch is unreachable from any
+    /// unit and `destructive()` is a second function away.
+    #[test]
+    fn clearing_a_generated_expression_drops_the_expression_not_the_column() {
+        let mut t = users();
+        t.columns.push(ColumnInfo {
+            name: "total".into(),
+            type_name: "numeric".into(),
+            nullable: true,
+            generated: Some("id * 2".into()),
+            ..Default::default()
+        });
+        let mut d = TableDraft::from_table(&t);
+        let last = d.columns.len() - 1;
+        d.columns[last].info.generated = None;
+
+        let cs = diff(&t, &d, Postgres);
+        let sql = cs.emit().join("\n");
+        assert!(
+            sql.contains("DROP EXPRESSION"),
+            "the values must survive: {sql}"
+        );
+        assert!(
+            !sql.contains("DROP COLUMN \"total\""),
+            "the column must not be dropped: {sql}"
+        );
+        // And the other direction keeps the drop-and-re-add, which is correct
+        // there — plus a sentence, because the values are recomputed.
+        let mut d = TableDraft::from_table(&t);
+        d.columns[last].info.generated = Some("id * 3".into());
+        let cs = diff(&t, &d, Postgres);
+        let sql = cs.emit().join("\n");
+        assert!(sql.contains("DROP COLUMN"), "{sql}");
+        assert!(
+            !cs.destructive().is_empty(),
+            "recomputing every value is worth a sentence"
+        );
+    }
+
+    /// The other half of the same Critical: whatever the emitter does, the
+    /// preview is the only surface between the user and the loss, and it
+    /// rendered nothing. `alter_risks` covered a nullable→NOT NULL flip and a
+    /// type change; neither fires on a generated-expression edit, so
+    /// `destructive()` was empty and the risk block hid itself.
+    #[test]
+    fn a_generated_expression_edit_is_destructive_on_every_engine() {
+        for d in [MySql, Postgres] {
+            let mut t = users();
+            t.columns.push(ColumnInfo {
+                name: "total".into(),
+                type_name: "numeric".into(),
+                nullable: true,
+                generated: Some("id * 2".into()),
+                ..Default::default()
+            });
+            let mut draft = TableDraft::from_table(&t);
+            let last = draft.columns.len() - 1;
+            draft.columns[last].info.generated = None;
+            let cs = diff(&t, &draft, d);
+            assert!(
+                !cs.destructive().is_empty(),
+                "{d:?} said nothing about losing a generated expression"
+            );
+        }
+    }
+
+    /// **Removing a constraint costs a guarantee, and three removals said
+    /// nothing.** `DropCheck` carries "Rows the constraint refused are accepted
+    /// from now on", introduced on the reasoning that "the table stops
+    /// guaranteeing something it guaranteed a moment ago, and nothing about the
+    /// statement or the grid afterwards shows it". `DropForeignKey`, a unique
+    /// `DropIndex` and a primary-key *swap* fell to `_ => Vec::new()`, so
+    /// `is_destructive` was false and the preview rendered no risk block at all.
+    #[test]
+    fn dropping_a_constraint_is_worth_a_sentence() {
+        let fk = Change::DropForeignKey {
+            name: "fk_orders_user".into(),
+        };
+        assert!(!fk.risks(MySql).is_empty(), "a dropped foreign key");
+        assert!(fk.is_destructive(MySql));
+
+        let unique = Change::DropIndex {
+            name: "email_uq".into(),
+            constraint: None,
+            unique: true,
+        };
+        assert!(!unique.risks(MySql).is_empty(), "a dropped unique index");
+
+        // A non-unique index costs only performance.
+        let plain = Change::DropIndex {
+            name: "email_ix".into(),
+            constraint: None,
+            unique: false,
+        };
+        assert!(plain.risks(MySql).is_empty(), "a plain index is not a risk");
+
+        // A primary-key *swap*: the old key's columns stop being unique. Only
+        // the drop-to-nothing case was in the match.
+        let swap = Change::PrimaryKey {
+            from: vec!["id".into()],
+            to: vec!["email".into()],
+            drop_constraint: None,
+        };
+        assert!(!swap.risks(MySql).is_empty(), "a swapped primary key");
+    }
+
+    /// **The composition a naive fix breaks**, and the reason the check filter
+    /// exists: an *edited* index or foreign key is a drop plus an add of the
+    /// same name, and warning about the drop half would put a false loss on
+    /// every index edit.
+    #[test]
+    fn a_re_added_constraint_is_not_a_loss() {
+        let (t, mut d) = users_and_draft();
+        // Edit the unique index in place — same name, different columns.
+        let ix = d
+            .indexes
+            .iter_mut()
+            .find(|ix| ix.info.name == "email_uq")
+            .expect("the fixture has one");
+        ix.info.columns = vec![IndexColumn::plain("status")];
+        let cs = diff(&t, &d, MySql);
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(c, Change::DropIndex { .. })),
+            "the premise: an edit is a drop plus an add: {:?}",
+            cs.changes
+        );
+        assert!(
+            cs.destructive().is_empty(),
+            "a re-added index is not a dropped one: {:?}",
+            cs.destructive()
+        );
+    }
+
+    /// **A *cleared* free-SQL clause reached `emit()` with no line in the change
+    /// list.** `column_clauses` renders only what is present, so clearing a
+    /// default made the two sides differ (the guard falls through) while
+    /// `column_clauses(to)` was empty — and the summary came out byte-identical
+    /// to the "nothing interesting changed" case, `Change column qty`. The
+    /// emitter then wrote `MODIFY COLUMN qty INT NOT NULL` and the default was
+    /// gone with nothing having said so.
+    ///
+    /// The module's own contract, at `column_clauses`: "**The change list is the
+    /// consent gesture, so nothing may reach `emit()` without reaching it.**"
+    /// The existing test only ever *set* a default, which is why the asymmetry
+    /// survived.
+    #[test]
+    fn clearing_a_columns_default_reaches_the_change_list() {
+        let (t, mut d) = users_and_draft();
+        // `status` has `DEFAULT 'draft'`.
+        d.columns[2].info.default = None;
+        let cs = diff(&t, &d, MySql);
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        let line = cs.changes[0].summary();
+        assert!(
+            line.to_lowercase().contains("default"),
+            "a cleared default must be named: {line}"
+        );
+        // The emitter really does drop it, which is what makes the silence a
+        // consent failure rather than a wording one.
+        assert!(!cs.emit().join("\n").contains("DEFAULT"));
+    }
+
+    /// The same asymmetry for the other three "free SQL by design" fields —
+    /// clearing a `COLLATE` changes comparison and sort semantics for every
+    /// existing row without touching a byte of data.
+    #[test]
+    fn clearing_any_free_sql_clause_reaches_the_change_list() {
+        // `email` carries the collation, `updated` the ON UPDATE.
+        type Clear = fn(&mut ColumnDraft);
+        let cases: [(usize, &str, Clear); 2] = [
+            (1, "collate", |c| c.info.collation = None),
+            (3, "on update", |c| c.info.on_update = None),
+        ];
+        for (at, label, clear) in cases {
+            let (t, mut d) = users_and_draft();
+            clear(&mut d.columns[at]);
+            let cs = diff(&t, &d, MySql);
+            assert_eq!(cs.len(), 1, "{label}: {cs:?}");
+            let line = cs.changes[0].summary().to_lowercase();
+            assert!(
+                line.contains(label) && line.contains("(none)"),
+                "{label} was cleared silently: {line}"
+            );
+        }
+    }
+
     #[test]
     fn clearing_the_engine_or_collation_is_not_a_change() {
         // A MySQL table always has both, so an emptied field means "leave it" —
@@ -10863,13 +11200,15 @@ mod tests {
         let line = diff(&t, &d, MySql).changes[0].summary();
         assert!(line.contains("DROP TABLE customers"), "{line}");
 
-        // An ordinary default stays readable.
+        // An ordinary default stays readable — and now says what it was, since
+        // the clause list became a *diff* so a **cleared** clause could not go
+        // unnamed (`clearing_a_columns_default_reaches_the_change_list`).
         let (t, mut d) = users_and_draft();
         d.columns[1].info.default = Some("CURRENT_TIMESTAMP".into());
         assert!(
             diff(&t, &d, MySql).changes[0]
                 .summary()
-                .contains(", default CURRENT_TIMESTAMP")
+                .contains(", default (none) → CURRENT_TIMESTAMP")
         );
     }
 
@@ -16292,6 +16631,7 @@ mod sqlite_drop_tests {
         Change::DropIndex {
             name: name.into(),
             constraint: constraint.map(str::to_string),
+            unique: constraint.is_some(),
         }
     }
 
