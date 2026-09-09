@@ -3599,9 +3599,9 @@ existing prose was left alone.
     `recovery_notice` is the corrupt-file sentence; `missing_notice` is the vanished-file one, and
     it says the disappearance rather than repairing it quietly, because the sibling the file came
     back from is the only copy until the next save lands and a user who does not know that has no
-    reason to take a backup. `load_json_strict` is the third loader and the one for *security* state
-    rather than configuration: an unreadable trust store is an `Err`, never an empty one, since the
-    default value there is the insecure answer.
+    reason to take a backup. `load_json_strict` is the loader for *security* state rather than for
+    configuration: an unreadable trust store is an `Err`, never an empty one, since the default
+    value there is itself the insecure answer.
     **`write_file_atomic` is the other half of this module and is for a file that is *not* ours** —
     a `.sql` script the user opened, another vendor's settings file, the Antigravity claim marker.
     `fs::write` truncates before it writes, so a full disk, a dropped share or a crash between the
@@ -13181,7 +13181,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   **function rather than a rule in a comment** because the rule was already written down and applied
   at one of fourteen sites: `open_table_col` guards its own `set` under a comment stating it
   verbatim, thirty-five lines from an `open_table` that does not. `no_bare_active_set_gate` (in
-  `ui/lib.rs`) is what keeps the fourteenth from happening — it reads both view crates for a bare
+  `ui/lib.rs`) is what keeps the next one from happening — it reads both view crates for a bare
   `active.set(`, keying on the bare receiver because `gs.active.set(…)` is the grid's *cell*
   selection and a different signal entirely, and admits a write only when that line or the one above
   it carries `active.get_untracked() !=` (rustfmt puts the `if` there). It also asserts it still

@@ -6032,12 +6032,12 @@ pub fn common_types(dialect: SqlDialect) -> &'static [&'static str] {
             "jsonb",
             "bytea",
         ],
-        // **SQLite's own five, spelled the way SQLite reads them.** It used to
-        // fall into MySQL's arm — `tinyint(1)`, `longtext`, `datetime`, `year`
-        // — and to be offered no `INTEGER`, which is the one spelling that
-        // changes what the column *is* (the rowid alias, and the only declared
-        // type `AUTOINCREMENT` is legal on). The rest are the affinity words
-        // plus the two spellings a table written by anything else will carry.
+        // **SQLite's own, spelled the way SQLite reads them.** It used to fall
+        // into MySQL's arm — `tinyint(1)`, `longtext`, `datetime`, `year` — and
+        // to be offered no `INTEGER`, which is the one spelling that changes
+        // what the column *is* (the rowid alias, and the only declared type
+        // `AUTOINCREMENT` is legal on). The five affinity words first, then the
+        // four spellings a table written by anything else commonly carries.
         SqlDialect::Sqlite => &[
             "INTEGER",
             "TEXT",
