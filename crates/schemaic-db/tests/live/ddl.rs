@@ -68,6 +68,22 @@ const SHAPES: &[(&str, &str)] = &[
     ),
 ];
 
+/// **An index whose *method* is not the default**, which is MySQL's alone and is
+/// the shape nothing here covered.
+///
+/// `FULLTEXT` is a different index kind, not a flag on an ordinary one: an
+/// emitter that restates the key without it leaves a plain `KEY` behind, and
+/// every `MATCH … AGAINST` against the table then fails outright. It is the
+/// attribute a rename has to carry across, and the round-trip assertion cannot
+/// see the loss — a table whose FULLTEXT became a KEY round-trips through its
+/// own draft perfectly well.
+///
+/// Kept out of `SHAPES` because it is one engine's: `supports_index_methods` is
+/// not a capability the model has, so the test that uses it asks the dialect
+/// directly and returns elsewhere.
+const FULLTEXT_SHAPE: &str =
+    "(id INTEGER NOT NULL PRIMARY KEY, body TEXT NOT NULL, FULLTEXT KEY ft_body (body))";
+
 /// The table `checks_and_fks` points at. Created before every shape, because a
 /// `REFERENCES` to a table that is not there is refused outright.
 const PARENT: &str = "(id INTEGER NOT NULL PRIMARY KEY)";
@@ -150,7 +166,10 @@ pub async fn an_added_column_lands_and_reads_back_as_drafted(target: &'static Ta
     }));
 
     apply(&scratch, &current, &draft, target).await;
-    assert_settled(&scratch, "t", target, "adding a column").await;
+    assert_round_trips(&scratch, "t", target, "adding a column").await;
+    // …and it is the table that was *drafted*, which the round trip
+    // cannot say: both its sides come from the applied table.
+    assert_matches_draft(&scratch, "t", &draft, target, "adding a column").await;
     let after = table_of(&scratch, "t").await;
     let col = after
         .columns
@@ -232,7 +251,10 @@ pub async fn a_reordered_column_lands_where_it_was_put(target: &'static Target) 
     draft.columns.insert(1, moved);
 
     apply(&scratch, &current, &draft, target).await;
-    assert_settled(&scratch, "t", target, "reordering a column").await;
+    assert_round_trips(&scratch, "t", target, "reordering a column").await;
+    // …and it is the table that was *drafted*, which the round trip
+    // cannot say: both its sides come from the applied table.
+    assert_matches_draft(&scratch, "t", &draft, target, "reordering a column").await;
 
     let after = table_of(&scratch, "t").await;
     assert_eq!(
@@ -294,7 +316,10 @@ pub async fn a_dropped_column_goes_and_the_rest_stays(target: &'static Target) {
     draft.columns.retain(|c| c.info.name != "go");
 
     apply(&scratch, &current, &draft, target).await;
-    assert_settled(&scratch, "t", target, "dropping a column").await;
+    assert_round_trips(&scratch, "t", target, "dropping a column").await;
+    // …and it is the table that was *drafted*, which the round trip
+    // cannot say: both its sides come from the applied table.
+    assert_matches_draft(&scratch, "t", &draft, target, "dropping a column").await;
     assert_eq!(
         column_names(&table_of(&scratch, "t").await),
         ["id", "keep"],
@@ -338,7 +363,10 @@ pub async fn a_renamed_column_keeps_its_data(target: &'static Target) {
     draft.rename_column(idx, "after_name");
 
     apply(&scratch, &current, &draft, target).await;
-    assert_settled(&scratch, "t", target, "renaming a column").await;
+    assert_round_trips(&scratch, "t", target, "renaming a column").await;
+    // …and it is the table that was *drafted*, which the round trip
+    // cannot say: both its sides come from the applied table.
+    assert_matches_draft(&scratch, "t", &draft, target, "renaming a column").await;
 
     let rs = scratch
         .exec(&format!(
@@ -376,7 +404,10 @@ pub async fn a_retyped_column_reads_back_as_the_new_type(target: &'static Target
     col.info.type_name = "VARCHAR(64)".to_string();
 
     apply(&scratch, &current, &draft, target).await;
-    assert_settled(&scratch, "t", target, "retyping a column").await;
+    assert_round_trips(&scratch, "t", target, "retyping a column").await;
+    // …and it is the table that was *drafted*, which the round trip
+    // cannot say: both its sides come from the applied table.
+    assert_matches_draft(&scratch, "t", &draft, target, "retyping a column").await;
 
     // Through `ddl::types_equal` rather than a string compare: `VARCHAR(64)`
     // comes back as `varchar(64)` on one server and `character varying(64)` on
@@ -473,6 +504,77 @@ pub async fn a_refused_plan_says_where_it_stopped(target: &'static Target) {
 
 /// Diff the draft against the server, emit it, run it — the designer's own path,
 /// including its refusal to run an empty plan.
+/// **An edit to an index must carry its kind across with it.**
+///
+/// `FULLTEXT` is a different index *kind*, not a flag on an ordinary one: an
+/// edit that restates the key without it leaves a plain `KEY` behind, and every
+/// `MATCH … AGAINST` against the table then answers `ERROR 1191`. On MySQL any
+/// edit to the index at all is a `DROP INDEX` plus an `ADD INDEX`, so a rename
+/// of the index is the whole gesture.
+///
+/// This is the shape the `assert_settled` finding names, and the coverage the
+/// index-type fix said in its own commit message it could not have — *"the live
+/// tier is unreachable from Windows in this environment"*. It is reachable now.
+/// The round-trip assertion passes over the loss, because a table whose FULLTEXT
+/// became a KEY round-trips through its own draft perfectly well;
+/// `assert_matches_draft` is what sees it, and the `MATCH` at the end is what
+/// sees it on the server rather than in the model.
+pub async fn a_renamed_column_keeps_its_indexs_kind(target: &'static Target) {
+    let dialect = target.engine.dialect();
+    if dialect != schemaic_core::intel::SqlDialect::MySql {
+        // `FULLTEXT` is MySQL's spelling; PostgreSQL's full-text index is a
+        // GIN over an expression, which is a different shape and a different
+        // test.
+        return;
+    }
+    let scratch = Scratch::create(target, "ddl_ft").await;
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} {FULLTEXT_SHAPE}",
+            scratch.qualified("t")
+        ))
+        .await;
+
+    let current = table_of(&scratch, "t").await;
+    // The premise: the model read the method at all. Without it the assertion
+    // below would be comparing `None` with `None`.
+    assert!(
+        current
+            .indexes
+            .iter()
+            .any(|ix| ix.name == "ft_body" && ix.method.is_some()),
+        "{}: the FULLTEXT index came back with no method: {:?}",
+        target.name,
+        current.indexes
+    );
+
+    let mut draft = TableDraft::from_table(&current);
+    // Rename the **index**, which is what makes the emitter restate it. A column
+    // rename alone does not: MySQL carries the index across `CHANGE COLUMN`
+    // itself, so nothing is re-emitted and nothing can be lost.
+    let ix = draft
+        .indexes
+        .iter_mut()
+        .find(|ix| ix.info.name == "ft_body")
+        .expect("the drafted index");
+    ix.info.name = "ft_content".to_string();
+    apply(&scratch, &current, &draft, target).await;
+
+    assert_round_trips(&scratch, "t", target, "renaming a FULLTEXT index").await;
+    assert_matches_draft(&scratch, "t", &draft, target, "renaming a FULLTEXT index").await;
+
+    // And it really does still work as one, which no model comparison can say:
+    // a FULLTEXT restated as a plain KEY answers ERROR 1191 here.
+    scratch
+        .exec(&format!(
+            "SELECT id FROM {} WHERE MATCH(body) AGAINST('anything')",
+            scratch.qualified("t")
+        ))
+        .await;
+
+    scratch.teardown().await;
+}
+
 async fn apply(scratch: &Scratch, current: &TableInfo, draft: &TableDraft, target: &Target) {
     let set = ddl::diff(current, draft, target.engine.dialect());
     assert!(
@@ -499,7 +601,8 @@ async fn apply(scratch: &Scratch, current: &TableInfo, draft: &TableDraft, targe
         });
 }
 
-/// After applying, the table read back must round-trip through its own draft.
+/// After applying, the table read back must round-trip through **its own**
+/// draft.
 ///
 /// **Against a draft re-anchored to the applied table, not the one that was
 /// edited.** A `TableDraft` is anchored to the `TableInfo` it was made from —
@@ -508,7 +611,17 @@ async fn apply(scratch: &Scratch, current: &TableInfo, draft: &TableDraft, targe
 /// never asks, and gets the right answer to it: a column added with
 /// `original: None` reads as "add this", and the applied one as "drop that". The
 /// app re-anchors after applying, and so does this.
-async fn assert_settled(scratch: &Scratch, table: &str, target: &Target, what: &str) {
+///
+/// **This is introspector/emitter symmetry and nothing else** — which is what it
+/// was renamed to say. It was called `assert_settled` and was the *primary*
+/// assertion in five of the seven tests here, which made it look like a check
+/// that the applied table matches the draft. It is not: both sides come from
+/// `after`, so the draft that was edited is not in the comparison at all. Run
+/// against an emitter that dropped `keep`'s `DEFAULT` alongside the column it
+/// was asked to drop, this passes — the resulting table round-trips through its
+/// own draft perfectly well. Two of B2.2's three measured defects went through
+/// it for that reason. [`assert_matches_draft`] is the other half.
+async fn assert_round_trips(scratch: &Scratch, table: &str, target: &Target, what: &str) {
     let after = table_of(scratch, table).await;
     let settled = ddl::diff(
         &after,
@@ -522,6 +635,161 @@ async fn assert_settled(scratch: &Scratch, table: &str, target: &Target, what: &
         target.name,
         settled.changes,
         settled.emit()
+    );
+}
+
+/// After applying, the table read back must be **the table that was drafted** —
+/// every column, every attribute, and the index/key/check sets.
+///
+/// The assertion `assert_round_trips` cannot make, and the one the seven tests
+/// here were missing: they checked the column *names* and, in three cases, three
+/// or four attributes of the single column they had touched. Nothing checked the
+/// columns the test did not touch, and nothing checked the indexes, foreign
+/// keys, checks or table options on any test — so an emitter that lost a
+/// `DEFAULT`, a `NOT NULL`, a collation, a comment, a generated expression or an
+/// index method while doing what it was asked went green.
+///
+/// **Compared field by field, and per field**, so a failure names what moved
+/// rather than printing two structs. The type name goes through
+/// `ddl::types_equal` because a server rewrites a declaration
+/// (`INT` → `int(11)`, `TEXT` → `text`) and that is not a loss; everything else
+/// is compared as the model holds it.
+///
+/// A column the draft *added* has no `original`, and the server may fill in
+/// things nobody asked for — `auto_increment` is the engine's, and an implicit
+/// key's type is its own — so the comparison is over what the draft **stated**:
+/// a field the draft left at its default is not asserted. That is the honest
+/// line, and it is still far more than the names.
+async fn assert_matches_draft(
+    scratch: &Scratch,
+    table: &str,
+    draft: &TableDraft,
+    target: &Target,
+    what: &str,
+) {
+    let after = table_of(scratch, table).await;
+    let dialect = target.engine.dialect();
+    let name = |t: &Target| t.name;
+    let mut lost: Vec<String> = Vec::new();
+
+    assert_eq!(
+        after
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        draft
+            .columns
+            .iter()
+            .map(|c| c.info.name.as_str())
+            .collect::<Vec<_>>(),
+        "{}: after {what} the columns are not the ones drafted",
+        name(target)
+    );
+
+    for want in &draft.columns {
+        let w = &want.info;
+        let Some(got) = after.columns.iter().find(|c| c.name == w.name) else {
+            continue; // the name check above already failed
+        };
+        let mut note = |field: &str, a: String, b: String| {
+            if a != b {
+                lost.push(format!(
+                    "  {}.{field}: drafted {b:?}, server has {a:?}",
+                    w.name
+                ));
+            }
+        };
+        if !ddl::types_equal(&got.type_name, &w.type_name, dialect) {
+            note("type", got.type_name.clone(), w.type_name.clone());
+        }
+        note("nullable", got.nullable.to_string(), w.nullable.to_string());
+        note(
+            "default",
+            format!("{:?}", got.default),
+            format!("{:?}", w.default),
+        );
+        note(
+            "generated",
+            format!("{:?}", got.generated),
+            format!("{:?}", w.generated),
+        );
+        // Only where the draft asked for one: a server fills in a collation and a
+        // comment is not read back on every engine.
+        if w.collation.is_some() {
+            note(
+                "collation",
+                format!("{:?}", got.collation),
+                format!("{:?}", w.collation),
+            );
+        }
+        if w.comment.is_some() {
+            note(
+                "comment",
+                format!("{:?}", got.comment),
+                format!("{:?}", w.comment),
+            );
+        }
+        if w.on_update.is_some() {
+            note(
+                "on_update",
+                format!("{:?}", got.on_update),
+                format!("{:?}", w.on_update),
+            );
+        }
+    }
+
+    // The sets the tests never looked at. Names and the attributes the model
+    // carries — an index that came back as a plain `KEY` where a `FULLTEXT` was
+    // drafted is the shape B2.2 measured, and no assertion here could see it.
+    let want_ix: Vec<(String, bool, Option<String>)> = draft
+        .indexes
+        .iter()
+        .map(|ix| (ix.info.name.clone(), ix.info.unique, ix.info.method.clone()))
+        .collect();
+    let got_ix: Vec<(String, bool, Option<String>)> = after
+        .indexes
+        .iter()
+        .filter(|ix| !ix.is_primary())
+        .map(|ix| (ix.name.clone(), ix.unique, ix.method.clone()))
+        .collect();
+    for w in &want_ix {
+        if !got_ix
+            .iter()
+            .any(|g| g.0 == w.0 && g.1 == w.1 && g.2 == w.2)
+        {
+            lost.push(format!(
+                "  index {:?}: drafted {w:?}, server has {got_ix:?}",
+                w.0
+            ));
+        }
+    }
+    let want_fk: Vec<String> = draft
+        .foreign_keys
+        .iter()
+        .map(|f| f.info.name.clone())
+        .collect();
+    for w in &want_fk {
+        if !after.foreign_keys.iter().any(|f| f.name == *w) {
+            lost.push(format!("  foreign key {w:?} is gone"));
+        }
+    }
+    let want_ck: Vec<String> = draft
+        .check_constraints
+        .iter()
+        .map(|c| c.info.name.clone())
+        .collect();
+    for w in &want_ck {
+        if !w.is_empty() && !after.check_constraints.iter().any(|c| c.name == *w) {
+            lost.push(format!("  check {w:?} is gone"));
+        }
+    }
+
+    assert!(
+        lost.is_empty(),
+        "{}: after {what} the table is not the one that was drafted:\n{}",
+        name(target),
+        lost.join("\n")
     );
 }
 

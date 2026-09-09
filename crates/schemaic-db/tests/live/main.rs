@@ -114,6 +114,7 @@ live_suite!(
         a_reordered_column_lands_where_it_was_put,
         a_dropped_column_goes_and_the_rest_stays,
         a_renamed_column_keeps_its_data,
+        a_renamed_column_keeps_its_indexs_kind,
         a_retyped_column_reads_back_as_the_new_type,
         a_refused_plan_says_where_it_stopped,
         a_partly_read_index_says_so_and_is_emitted_whole,
