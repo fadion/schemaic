@@ -32,6 +32,7 @@ pub mod history;
 pub mod import;
 pub mod intel;
 pub mod jsontree;
+pub mod launch;
 pub mod model;
 pub mod monitor;
 pub mod pairs;

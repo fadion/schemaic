@@ -145,6 +145,7 @@ type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)], &[
 use schemaic_ai::harness::Harness;
 use schemaic_core::filter::{BrowseKey, Order, table_query};
 use schemaic_core::intel::SqlDialect;
+use schemaic_core::launch;
 use schemaic_core::params;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::{SchemaState, TableSource};
@@ -326,11 +327,18 @@ fn resolve_native_cli(prog: &str) -> Option<CliLauncher<'_>> {
 /// Build the terminal shell that launches the MySQL/MariaDB CLI for `conn`,
 /// optionally scoped to `db`. The password rides `MYSQL_PWD` (via `WSLENV` for
 /// the WSL case) so it never appears on the command line or in shell history.
+///
+/// `Err` carries the line the panel shows instead of a session — "no client
+/// found", or whichever refusal [`mysql_shell_config`] reached. The caller has
+/// exactly one arm for all of them, which is why the whole refusal set is
+/// expressed as this one error type rather than an `Option` plus a second gate.
 fn mysql_shell(
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
-) -> Option<schemaic_term::ShellConfig> {
-    resolve_cli(&["mysql", "mariadb"]).map(|l| mysql_shell_config(l, conn, db))
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    let launcher =
+        resolve_cli(&["mysql", "mariadb"]).ok_or("No mysql/mariadb client found (PATH or WSL).")?;
+    mysql_shell_config(launcher, conn, db)
 }
 
 /// The PostgreSQL half of [`mysql_shell`]. `db` is required — see
@@ -338,8 +346,9 @@ fn mysql_shell(
 fn psql_shell(
     conn: &schemaic_core::connection::Connection,
     db: &str,
-) -> Option<schemaic_term::ShellConfig> {
-    resolve_cli(&["psql"]).map(|l| psql_shell_config(l, conn, db))
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    let launcher = resolve_cli(&["psql"]).ok_or("No psql client found (PATH or WSL).")?;
+    psql_shell_config(launcher, conn, db)
 }
 
 /// The SQLite third: `sqlite3 <file>`.
@@ -376,11 +385,25 @@ fn psql_database(explicit: Option<&str>, active: Option<&str>) -> String {
 /// credential env construction, split from the `PATH` probing in [`mysql_shell`]
 /// so it's unit-tested. The password always rides `MYSQL_PWD` (forwarded across
 /// `WSLENV` in the WSL case) and never lands on the argv.
+///
+/// **Two things here are not decoration.** The `--` before the database name is
+/// what stops a *server-supplied* name being read as an option: a database
+/// called `--pager=touch /tmp/PWN` otherwise runs that command on the user's
+/// first query. And the `--ssl-*` flags are mandatory rather than conditional —
+/// omitting them leaves the client on its own `PREFERRED` default, which
+/// accepts a plaintext socket and verifies nothing, so a connection the user
+/// configured for `verify-full` was silently downgraded while the app's header
+/// still said TLS. Both decisions live in [`launch`], with their tests.
 fn mysql_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
-) -> schemaic_term::ShellConfig {
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    if matches!(launcher, CliLauncher::Wsl(_))
+        && let Some(why) = launch::wsl_tls_blocker(&conn.tls)
+    {
+        return Err(why);
+    }
     let mut cli_args: Vec<String> = vec![
         "-h".into(),
         conn.host.clone(),
@@ -389,10 +412,16 @@ fn mysql_shell_config(
         "-u".into(),
         conn.user.clone(),
     ];
+    cli_args.extend(launch::mysql_cli_tls_args(&conn.tls));
     if let Some(d) = db {
+        cli_args.push("--".into());
         cli_args.push(d.to_string());
     }
-    wrap_launcher(launcher, cli_args, Some(("MYSQL_PWD", &conn.password)))
+    Ok(wrap_launcher(
+        launcher,
+        cli_args,
+        vec![("MYSQL_PWD".to_string(), conn.password.clone())],
+    ))
 }
 
 /// The SQLite twin of [`mysql_shell_config`] — pure argv construction, split from
@@ -412,7 +441,7 @@ fn sqlite_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
 ) -> schemaic_term::ShellConfig {
-    let mut cfg = wrap_launcher(launcher, vec![conn.file.clone()], None);
+    let mut cfg = wrap_launcher(launcher, vec![conn.file.clone()], Vec::new());
     cfg.cwd = std::path::Path::new(&conn.file)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -425,11 +454,23 @@ fn sqlite_shell_config(
 /// flag here (`-p`/`-U`/`-d`, against MySQL's `-P`/`-u`/positional) and the
 /// password variable differs too, so the two builders stay separate rather than
 /// growing an engine conditional per argument.
+///
+/// Returns an error rather than a config for the two cases a session cannot be
+/// built honestly: a database name libpq would re-read as a connection string
+/// (see [`launch::psql_target`]) and a TLS file the WSL client cannot open. The
+/// caller already renders an `Err` in the panel — it is the same arm the
+/// "no client found" message takes.
 fn psql_shell_config(
     launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
     db: &str,
-) -> schemaic_term::ShellConfig {
+) -> Result<schemaic_term::ShellConfig, &'static str> {
+    let db = launch::psql_target(db)?;
+    if matches!(launcher, CliLauncher::Wsl(_))
+        && let Some(why) = launch::wsl_tls_blocker(&conn.tls)
+    {
+        return Err(why);
+    }
     let cli_args: Vec<String> = vec![
         "-h".into(),
         conn.host.clone(),
@@ -440,49 +481,54 @@ fn psql_shell_config(
         "-d".into(),
         db.to_string(),
     ];
-    wrap_launcher(launcher, cli_args, Some(("PGPASSWORD", &conn.password)))
+    let mut env = vec![("PGPASSWORD".to_string(), conn.password.clone())];
+    env.extend(launch::psql_cli_tls_env(&conn.tls));
+    Ok(wrap_launcher(launcher, cli_args, env))
 }
 
-/// Turn a client's argv into a spawnable config, native or through WSL, with any
-/// password in `secret`'s variable — the half every engine shares, so none of them
-/// can lose the rule that the password never reaches the command line.
+/// Turn a client's argv into a spawnable config, native or through WSL, with
+/// every variable in `env` carried across the WSL boundary — the half every
+/// engine shares, so none of them can lose the rule that the password never
+/// reaches the command line, nor the rule that a transport setting reaches the
+/// client at all.
 ///
-/// `secret` is `None` for a client that has no credential to pass (SQLite's), which
-/// is not the same as an empty password: it means no variable is set at all, and no
+/// `env` is empty for a client that has nothing to pass (SQLite's), which is not
+/// the same as an empty password: it means no variable is set at all, and no
 /// `WSLENV` entry naming one.
+///
+/// **Every entry is forwarded with `/u` and none with `/p`.** `/p` would be the
+/// flag for a path needing Win→WSL translation, and there is deliberately no
+/// such value here: [`launch::wsl_tls_blocker`] refuses a Windows-shaped
+/// certificate path before a WSL config is built, so everything that survives
+/// to this point is already a path the Linux side can open.
 fn wrap_launcher(
     launcher: CliLauncher,
     cli_args: Vec<String>,
-    secret: Option<(&str, &str)>,
+    env: Vec<(String, String)>,
 ) -> schemaic_term::ShellConfig {
-    let env = |prefix: Vec<(String, String)>| match secret {
-        Some((var, password)) => {
-            let mut env = prefix;
-            env.push((var.into(), password.to_string()));
-            env
-        }
-        None => Vec::new(),
-    };
     match launcher {
         CliLauncher::Native(prog) => schemaic_term::ShellConfig {
             program: prog.into(),
             args: cli_args,
             cwd: None,
-            env: env(Vec::new()),
+            env,
         },
         CliLauncher::Wsl(prog) => {
             let mut args: Vec<String> = vec!["-e".into(), prog.into()];
             args.extend(cli_args);
+            // WSLENV is what carries the variables across the boundary; without
+            // it the password simply doesn't arrive and psql/mysql prompts.
+            let mut wsl_env = Vec::with_capacity(env.len() + 1);
+            if !env.is_empty() {
+                let names: Vec<String> = env.iter().map(|(n, _)| format!("{n}/u")).collect();
+                wsl_env.push(("WSLENV".to_string(), names.join(":")));
+            }
+            wsl_env.extend(env);
             schemaic_term::ShellConfig {
                 program: "wsl.exe".into(),
                 args,
                 cwd: None,
-                // WSLENV is what carries the variable across the boundary; without
-                // it the password simply doesn't arrive and psql/mysql prompts.
-                env: env(match secret {
-                    Some((var, _)) => vec![("WSLENV".into(), format!("{var}/u"))],
-                    None => Vec::new(),
-                }),
+                env: wsl_env,
             }
         }
     }
@@ -9972,15 +10018,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     });
                     let scoped = scoped_database(tab, active_conn.get_untracked(), None);
                     let target = psql_database(db.as_deref(), scoped.as_deref());
-                    psql_shell(&conn, &target).ok_or("No psql client found (PATH or WSL).")
+                    psql_shell(&conn, &target)
                 }
                 // `db` is ignored: a SQLite connection's one database is the file
                 // itself, which the config already names.
                 schemaic_db::Engine::Sqlite => {
                     sqlite_shell(&conn).ok_or("No sqlite3 client found on PATH.")
                 }
-                schemaic_db::Engine::MySql => mysql_shell(&conn, db.as_deref())
-                    .ok_or("No mysql/mariadb client found (PATH or WSL)."),
+                schemaic_db::Engine::MySql => mysql_shell(&conn, db.as_deref()),
             };
             // Badge the panel only for a session that really is a client. The
             // no-client arm spawns a message instead, which is nobody's engine.
@@ -11062,27 +11107,25 @@ fn open_config_dir() {
 }
 
 /// Open an http(s) URL in the OS default browser (clicked terminal link).
+///
+/// The whole decision — may this be opened, and by which program — belongs to
+/// [`launch::url_open_argv`], which is where its tests are. This function does
+/// nothing but spawn what it is given, and that is the point: the previous
+/// spelling built `cmd /C start "" <url>` itself, and `&` in a URL the terminal
+/// had merely *printed* became a second command.
 fn open_url(url: &str) {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    let Some(argv) = launch::url_open_argv(url) else {
         return;
-    }
+    };
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(url).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
+    let _ = cmd.spawn();
 }
 
 #[cfg(test)]
@@ -11508,11 +11551,21 @@ mod app_tests {
 
     #[test]
     fn native_shell_puts_password_in_env_not_argv() {
-        let cfg = mysql_shell_config(CliLauncher::Native("mysql"), &conn(), Some("shop"));
+        let cfg = mysql_shell_config(CliLauncher::Native("mysql"), &conn(), Some("shop")).unwrap();
         assert_eq!(cfg.program, "mysql");
         assert_eq!(
             cfg.args,
-            vec!["-h", "10.0.0.5", "-P", "3307", "-u", "root", "shop"]
+            vec![
+                "-h",
+                "10.0.0.5",
+                "-P",
+                "3307",
+                "-u",
+                "root",
+                "--ssl-mode=DISABLED",
+                "--",
+                "shop"
+            ]
         );
         // Password rides MYSQL_PWD, never the command line.
         assert_eq!(
@@ -11522,20 +11575,176 @@ mod app_tests {
         assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
     }
 
+    /// A **server-supplied** name reaching the client's argv as a bare
+    /// positional is parsed as an *option*: a database literally named
+    /// `--pager=touch /tmp/PWN` runs that command on the user's first query
+    /// (measured against MariaDB 10.11.14). The name is not the user's to
+    /// vouch for — on a shared server anyone who may `CREATE DATABASE` writes
+    /// it — so the fix is positional, not a filter: `--` before the name.
+    #[test]
+    fn the_database_name_can_never_be_read_as_an_option() {
+        for db in ["shop", "--pager=touch /tmp/PWN", "-e", "--help"] {
+            let cfg = mysql_shell_config(CliLauncher::Native("mysql"), &conn(), Some(db)).unwrap();
+            let at = cfg.args.iter().position(|a| a == db).unwrap();
+            assert_eq!(
+                cfg.args[at - 1],
+                "--",
+                "{db} is not behind an option terminator: {:?}",
+                cfg.args
+            );
+            assert_eq!(at, cfg.args.len() - 1, "the name must be last");
+        }
+    }
+
+    /// The composition, not the flag map: a connection the user configured for
+    /// `verify-full` must reach the client *verifying*. Omitting the flag is
+    /// not neutral — the client's own default is `PREFERRED`, which accepts a
+    /// plaintext socket and checks no certificate, while the app's header goes
+    /// on reporting TLS because the app's own socket really is encrypted.
+    #[test]
+    fn a_verifying_connection_reaches_the_mysql_client_verifying() {
+        let c = Connection {
+            tls: schemaic_core::connection::Tls {
+                mode: schemaic_core::connection::SslMode::VerifyFull,
+                ca_path: "/etc/ca.crt".into(),
+                ..Default::default()
+            },
+            ..conn()
+        };
+        let cfg = mysql_shell_config(CliLauncher::Native("mysql"), &c, Some("shop")).unwrap();
+        assert!(
+            cfg.args.contains(&"--ssl-mode=VERIFY_IDENTITY".to_string()),
+            "{:?}",
+            cfg.args
+        );
+        assert!(cfg.args.contains(&"--ssl-ca=/etc/ca.crt".to_string()));
+        // And before the terminator, or the client reads them as the database.
+        let term = cfg.args.iter().position(|a| a == "--").unwrap();
+        let flag = cfg
+            .args
+            .iter()
+            .position(|a| a == "--ssl-mode=VERIFY_IDENTITY")
+            .unwrap();
+        assert!(flag < term);
+    }
+
+    #[test]
+    fn a_verifying_connection_reaches_psql_verifying() {
+        let c = Connection {
+            db_type: "PostgreSQL".into(),
+            tls: schemaic_core::connection::Tls {
+                mode: schemaic_core::connection::SslMode::VerifyFull,
+                ca_path: "/etc/ca.crt".into(),
+                ..Default::default()
+            },
+            ..conn()
+        };
+        let cfg = psql_shell_config(CliLauncher::Native("psql"), &c, "chinook").unwrap();
+        assert!(
+            cfg.env
+                .contains(&("PGSSLMODE".to_string(), "verify-full".to_string())),
+            "{:?}",
+            cfg.env
+        );
+        assert!(
+            cfg.env
+                .contains(&("PGSSLROOTCERT".to_string(), "/etc/ca.crt".to_string()))
+        );
+    }
+
+    /// A plaintext connection must say so too: the same omission in the other
+    /// direction leaves the client negotiating TLS the user turned off, which
+    /// is at best a confusing failure against a server that has none.
+    #[test]
+    fn a_plaintext_connection_says_disabled_rather_than_nothing() {
+        let cfg = mysql_shell_config(CliLauncher::Native("mysql"), &conn(), None).unwrap();
+        assert!(cfg.args.contains(&"--ssl-mode=DISABLED".to_string()));
+        let cfg = psql_shell_config(CliLauncher::Native("psql"), &conn(), "chinook").unwrap();
+        assert!(
+            cfg.env
+                .contains(&("PGSSLMODE".to_string(), "disable".to_string()))
+        );
+    }
+
+    /// psql has no `--` to hide behind: libpq re-reads a `-d` value containing
+    /// `=` as a conninfo string and follows its `host=` elsewhere, with
+    /// `PGPASSWORD` in hand. The refusal lives in the builder, not in
+    /// `open_db_cli`, so no future launcher can reach the argv around it.
+    #[test]
+    fn a_conninfo_shaped_name_never_reaches_psqls_d_flag() {
+        for db in ["dbname=postgres host=192.0.2.1", "postgresql://evil/x"] {
+            assert!(
+                psql_shell_config(CliLauncher::Native("psql"), &conn(), db).is_err(),
+                "{db} was built into an argv"
+            );
+        }
+    }
+
+    /// A cert path only the Windows side can open, handed to a Linux client
+    /// inside WSL, is a mode that cannot be expressed — so refuse rather than
+    /// launch a session that will fail obscurely or, worse, fall back.
+    #[test]
+    fn a_windows_cert_path_refuses_a_wsl_client() {
+        let c = Connection {
+            tls: schemaic_core::connection::Tls {
+                mode: schemaic_core::connection::SslMode::VerifyFull,
+                ca_path: r"C:\certs\ca.crt".into(),
+                ..Default::default()
+            },
+            ..conn()
+        };
+        assert!(mysql_shell_config(CliLauncher::Wsl("mysql"), &c, None).is_err());
+        assert!(psql_shell_config(CliLauncher::Wsl("psql"), &c, "x").is_err());
+        // A path the WSL side can open is fine.
+        let c = Connection {
+            tls: schemaic_core::connection::Tls {
+                ca_path: "/etc/ca.crt".into(),
+                ..c.tls
+            },
+            ..c
+        };
+        assert!(mysql_shell_config(CliLauncher::Wsl("mysql"), &c, None).is_ok());
+    }
+
     #[test]
     fn native_shell_omits_db_when_none() {
-        let cfg = mysql_shell_config(CliLauncher::Native("mariadb"), &conn(), None);
-        assert_eq!(cfg.args, vec!["-h", "10.0.0.5", "-P", "3307", "-u", "root"]);
+        let cfg = mysql_shell_config(CliLauncher::Native("mariadb"), &conn(), None).unwrap();
+        assert_eq!(
+            cfg.args,
+            vec![
+                "-h",
+                "10.0.0.5",
+                "-P",
+                "3307",
+                "-u",
+                "root",
+                "--ssl-mode=DISABLED"
+            ]
+        );
+        assert!(
+            !cfg.args.contains(&"--".to_string()),
+            "no positional, so no terminator to add"
+        );
     }
 
     #[test]
     fn wsl_shell_prepends_client_and_forwards_password_via_wslenv() {
-        let cfg = mysql_shell_config(CliLauncher::Wsl("mysql"), &conn(), Some("shop"));
+        let cfg = mysql_shell_config(CliLauncher::Wsl("mysql"), &conn(), Some("shop")).unwrap();
         assert_eq!(cfg.program, "wsl.exe");
         assert_eq!(
             cfg.args,
             vec![
-                "-e", "mysql", "-h", "10.0.0.5", "-P", "3307", "-u", "root", "shop"
+                "-e",
+                "mysql",
+                "-h",
+                "10.0.0.5",
+                "-P",
+                "3307",
+                "-u",
+                "root",
+                "--ssl-mode=DISABLED",
+                "--",
+                "shop"
             ]
         );
         assert_eq!(
@@ -11555,7 +11764,7 @@ mod app_tests {
 
     #[test]
     fn psql_shell_puts_password_in_env_not_argv() {
-        let cfg = psql_shell_config(CliLauncher::Native("psql"), &conn(), "chinook");
+        let cfg = psql_shell_config(CliLauncher::Native("psql"), &conn(), "chinook").unwrap();
         assert_eq!(cfg.program, "psql");
         assert_eq!(
             cfg.args,
@@ -11565,14 +11774,17 @@ mod app_tests {
         );
         assert_eq!(
             cfg.env,
-            vec![("PGPASSWORD".to_string(), "s3cr3t".to_string())]
+            vec![
+                ("PGPASSWORD".to_string(), "s3cr3t".to_string()),
+                ("PGSSLMODE".to_string(), "disable".to_string()),
+            ]
         );
         assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
     }
 
     #[test]
     fn psql_wsl_shell_prepends_client_and_forwards_password_via_wslenv() {
-        let cfg = psql_shell_config(CliLauncher::Wsl("psql"), &conn(), "world");
+        let cfg = psql_shell_config(CliLauncher::Wsl("psql"), &conn(), "world").unwrap();
         assert_eq!(cfg.program, "wsl.exe");
         assert_eq!(
             cfg.args,
@@ -11583,8 +11795,9 @@ mod app_tests {
         assert_eq!(
             cfg.env,
             vec![
-                ("WSLENV".to_string(), "PGPASSWORD/u".to_string()),
+                ("WSLENV".to_string(), "PGPASSWORD/u:PGSSLMODE/u".to_string()),
                 ("PGPASSWORD".to_string(), "s3cr3t".to_string()),
+                ("PGSSLMODE".to_string(), "disable".to_string()),
             ]
         );
         assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
