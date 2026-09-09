@@ -1393,7 +1393,10 @@ fn as_read_from<'a>(
                 }
             }
         }
-        if body && t.is_view && let Some(def) = t.view_definition.as_mut() {
+        if body
+            && t.is_view
+            && let Some(def) = t.view_definition.as_mut()
+        {
             *def = requalify(def, from, to, dialect);
         }
     }

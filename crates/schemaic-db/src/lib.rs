@@ -3817,10 +3817,18 @@ pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
             // and an explicit `DEFAULT NULL` as the literal text — both mean "no
             // default worth emitting" on a nullable column.
             (d != "NULL").then_some(d)
-        } else if extra_lc.contains("default_generated")
-            || numeric_or_bool
-            || d.to_ascii_uppercase().starts_with("CURRENT_TIMESTAMP")
-        {
+        } else if extra_lc.contains("default_generated") {
+            // **An expression default carries the same extra backslash level
+            // MySQL 8 puts on a `CHECK_CLAUSE`**, and this is the other
+            // catalogue column that has it: `DEFAULT (CONCAT('a','c'))` comes
+            // back as `concat(_utf8mb3\'a\',_utf8mb3\'c\')` (HEX-verified),
+            // and restating that is `ERROR 1064` rather than a subtly different
+            // default. `mysql_check_clause` is the one unescaper and it
+            // short-circuits on MariaDB, which returns `concat('a','c')`
+            // already runnable — unescaping there would eat the backslash out
+            // of `'it\'s'` and change what the default means.
+            Some(mysql_check_clause(&d, mariadb))
+        } else if numeric_or_bool || d.to_ascii_uppercase().starts_with("CURRENT_TIMESTAMP") {
             Some(d)
         } else {
             // This is the MySQL/MariaDB introspection path by construction, and
@@ -6774,6 +6782,71 @@ mod tests {
         )
         .column;
         assert_eq!(c.default.as_deref(), Some("(uuid())"));
+    }
+
+    /// **MySQL 8's expression default carries the same extra backslash level its
+    /// `CHECK_CLAUSE` does**, and this branch used to pass it through. Measured
+    /// on 8.4.11 with `HEX()` so the escaping is not a rendering artefact:
+    /// `b varchar(30) DEFAULT (CONCAT('a','c'))` reports
+    /// `concat(_utf8mb3\'a\',_utf8mb3\'c\')`, while `SHOW CREATE TABLE` — the
+    /// runnable form — prints `concat(_utf8mb3'a',_utf8mb3'c')`.
+    #[test]
+    fn a_mysql8_expression_default_is_unescaped_to_the_runnable_form() {
+        let c = mysql_column(
+            my_row(
+                "varchar(30)",
+                Some(r"concat(_utf8mb3\'a\',_utf8mb3\'c\')"),
+                "DEFAULT_GENERATED",
+            ),
+            false,
+        )
+        .column;
+        assert_eq!(
+            c.default.as_deref(),
+            Some("concat(_utf8mb3'a',_utf8mb3'c')")
+        );
+    }
+
+    /// The half an over-eager fix breaks: MariaDB 10.11.14 returns
+    /// `concat('a','c')` already runnable (HEX-verified), so unescaping there
+    /// would eat the backslash out of `'it\'s'` and change what the default is.
+    #[test]
+    fn a_mariadb_expression_default_is_left_exactly_as_it_came() {
+        let c = mysql_column(
+            my_row(
+                "varchar(30)",
+                Some(r"concat('it\'s','c')"),
+                "DEFAULT_GENERATED",
+            ),
+            true,
+        )
+        .column;
+        assert_eq!(c.default.as_deref(), Some(r"concat('it\'s','c')"));
+    }
+
+    /// **The composition, which is the only thing that says the statement runs.**
+    /// The escaping fix alone still emits `DEFAULT concat(…)` bare and MySQL 8
+    /// answers `ERROR 1064`; the parens fix alone still emits `\'` inside. One
+    /// runnable clause needs both, so the test that guards it has to go from the
+    /// catalogue row all the way to the emitted SQL — asserted against what
+    /// `SHOW CREATE TABLE` prints for the same column on 8.4.11.
+    #[test]
+    fn a_mysql8_expression_default_survives_the_round_trip_to_emitted_ddl() {
+        let c = mysql_column(
+            my_row(
+                "varchar(30)",
+                Some(r"concat(_utf8mb3\'a\',_utf8mb3\'c\')"),
+                "DEFAULT_GENERATED",
+            ),
+            false,
+        )
+        .column;
+        let sql = c.definition_sql(schemaic_core::intel::SqlDialect::MySql);
+        assert!(
+            sql.ends_with("DEFAULT (concat(_utf8mb3'a',_utf8mb3'c'))"),
+            "{sql}"
+        );
+        assert!(!sql.contains('\\'), "{sql}");
     }
 
     /// `EXTRA` is where MySQL keeps the two attributes `MODIFY COLUMN` would

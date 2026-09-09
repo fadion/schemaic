@@ -7615,7 +7615,7 @@ fn sqlite_native_add(column: &ColumnInfo, position: Option<&Position>) -> bool {
 /// and a two-column add half-applies, which is precisely the *"a wrong fast path
 /// is a lie"* this predicate exists to prevent.
 ///
-/// So the question is delegated to [`crate::schema::is_bare_sqlite_default`],
+/// So the question is delegated to [`crate::schema::is_bare_default`],
 /// which states the grammar positively — a literal, a signed number,
 /// `NULL`/`TRUE`/`FALSE`, or one of the `CURRENT_*` keywords — with the
 /// `CURRENT_*` three excluded here, since `ADD COLUMN` does not take those even
@@ -7632,7 +7632,7 @@ fn sqlite_constant_default(default: &str) -> bool {
     if d.starts_with('(') {
         return false;
     }
-    crate::schema::is_bare_sqlite_default(d)
+    crate::schema::is_bare_default(d, SqlDialect::Sqlite)
 }
 
 /// What a rebuild needs: the table as it is, and as it should be.

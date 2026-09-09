@@ -388,16 +388,30 @@ impl ColumnInfo {
             if let Some(d) = &self.default
                 && !self.auto_increment
             {
-                // **SQLite's grammar wants an expression default parenthesised**,
-                // and `pragma_table_xinfo.dflt_value` reports it with the
-                // parentheses already stripped — so a `DEFAULT (datetime('now'))`
-                // read and re-emitted verbatim is `near "(": syntax error`, and
-                // the table is uneditable for as long as the default exists. Only
-                // a literal and the `CURRENT_*` keywords may go bare.
-                if sqlite && !is_bare_sqlite_default(d) {
-                    out.push_str(&format!(" DEFAULT ({d})"));
-                } else {
+                // **Two engines want an expression default parenthesised**, and
+                // neither hands the parentheses back with the value, so an
+                // expression read and re-emitted verbatim is refused:
+                //
+                // - **SQLite** reports `pragma_table_xinfo.dflt_value` with the
+                //   pair already stripped, so `DEFAULT (datetime('now'))` comes
+                //   back bare and re-emits as `near "(": syntax error` — the
+                //   table then uneditable for as long as the default exists.
+                // - **MySQL 8** prints them in `SHOW CREATE TABLE` (the runnable
+                //   form) but not in `information_schema.COLUMNS.COLUMN_DEFAULT`,
+                //   so `b varchar(30) DEFAULT (CONCAT('a','c'))` restates as
+                //   `DEFAULT concat(…)` and is `ERROR 1064` — measured on
+                //   8.4.11, where the parenthesised form is accepted. MariaDB
+                //   10.11.14 accepts both and normalises the pair away, so one
+                //   answer serves the family.
+                //
+                // Which values may go bare is the *grammar's* question and is
+                // asked of one predicate, per dialect: over-wrapping is not free
+                // either, since MySQL reads `DEFAULT (7)` as an expression
+                // default rather than a literal one.
+                if is_bare_default(d, dialect) {
                     out.push_str(&format!(" DEFAULT {d}"));
+                } else {
+                    out.push_str(&format!(" DEFAULT ({d})"));
                 }
             }
             if self.auto_increment && !sqlite {
@@ -494,24 +508,41 @@ fn when_group(guard: &str) -> String {
     format!("\nWHEN (\n{guard}\n)")
 }
 
-/// May this default text stand in a SQLite `DEFAULT` clause **without**
-/// parentheses?
+/// May this default text stand in a `DEFAULT` clause **without** parentheses in
+/// `dialect`'s grammar?
 ///
-/// SQLite's grammar is narrow here: a signed number, a string or blob literal,
-/// `NULL`, `TRUE`/`FALSE`, and the three `CURRENT_*` keywords. Everything else —
-/// a function call, an operator expression, a parenthesised anything — must be
-/// wrapped, and `pragma_table_xinfo` hands the text back with exactly those
-/// parentheses removed. An already-parenthesised value is left alone so a model
-/// built from a designer edit rather than from the pragma doesn't get a second
+/// One predicate for the whole question, because two engines ask it and both
+/// hand the value back without the parentheses they require:
+///
+/// - **SQLite**'s grammar is narrow — a signed number, a string or blob literal,
+///   `NULL`, `TRUE`/`FALSE`, and the three `CURRENT_*` keywords. Everything else
+///   (a function call, an operator expression, a parenthesised anything) must be
+///   wrapped, and `pragma_table_xinfo` strips exactly that pair.
+/// - **MySQL and MariaDB** admit the same literal forms plus MySQL's `b'…'` bit
+///   literal and a character-set introducer (`_utf8mb3'draft'`, which is how
+///   MySQL 8 reports a literal it recorded as an expression default), and the
+///   `CURRENT_TIMESTAMP` family with its optional precision. Nothing else:
+///   `now()` is an expression there, and `SHOW CREATE TABLE` prints it
+///   `DEFAULT (now())`.
+/// - **PostgreSQL** takes an arbitrary expression bare — `nextval('s'::regclass)`
+///   and `now()` are what `pg_get_expr` returns and what the grammar accepts —
+///   so everything answers `true` and nothing is ever wrapped.
+///
+/// An already-parenthesised value is left alone on every engine, so a model
+/// built from a designer edit rather than from a catalogue doesn't get a second
 /// pair.
 ///
-/// `pub(crate)` because `ddl::sqlite_constant_default` asks the same
-/// grammar question for `ADD COLUMN` — the two used to answer it separately, and
-/// the one that guessed sent statements the engine refuses down a path with no
+/// `pub(crate)` because `ddl::sqlite_constant_default` asks the same grammar
+/// question for `ADD COLUMN` — the two used to answer it separately, and the one
+/// that guessed sent statements the engine refuses down a path with no
 /// transaction around it.
-pub(crate) fn is_bare_sqlite_default(d: &str) -> bool {
+pub(crate) fn is_bare_default(d: &str, dialect: crate::intel::SqlDialect) -> bool {
+    use crate::intel::SqlDialect;
     let t = d.trim();
     if t.is_empty() {
+        return true;
+    }
+    if dialect == SqlDialect::Postgres {
         return true;
     }
     // **One group, closed by the final `)`** — not merely a `(` at each end.
@@ -525,9 +556,7 @@ pub(crate) fn is_bare_sqlite_default(d: &str) -> bool {
     // paren).
     // `balanced_paren_span` returns the index *of* the closing paren, so the
     // last byte is `len - 1`.
-    if crate::sql::balanced_paren_span(t.as_bytes(), 0, crate::intel::SqlDialect::Sqlite)
-        == t.len().checked_sub(1)
-    {
+    if crate::sql::balanced_paren_span(t.as_bytes(), 0, dialect) == t.len().checked_sub(1) {
         return true;
     }
     let upper = t.to_ascii_uppercase();
@@ -537,18 +566,46 @@ pub(crate) fn is_bare_sqlite_default(d: &str) -> bool {
     ) {
         return true;
     }
+    // MySQL's `DEFAULT CURRENT_TIMESTAMP(6)` and its two synonyms, which take a
+    // fractional-seconds precision the three bare keywords above do not.
+    if dialect == SqlDialect::MySql
+        && let Some(rest) = ["CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "LOCALTIME"]
+            .iter()
+            .find_map(|k| upper.strip_prefix(k))
+        && let Some(n) = rest
+            .trim()
+            .strip_prefix('(')
+            .and_then(|n| n.strip_suffix(')'))
+        && n.trim().bytes().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
     // A string or blob literal — **the whole value**, which is what the shared
     // boundary lexer answers: it returns the offset just past the literal that
     // starts here, so `'a' || 'b'` correctly is *not* one (the literal ends at
     // 3, the value doesn't).
-    let start = if upper.starts_with("X'") { 1 } else { 0 };
+    //
+    // MySQL adds two prefixes SQLite has no form of: `b'1010'` for a bit
+    // literal, and a character-set introducer, which is what MySQL 8 puts in
+    // front of a string it recorded as an expression default
+    // (`_utf8mb3'draft'`). The literal itself is then the same question.
+    let intro = if dialect == SqlDialect::MySql {
+        mysql_literal_introducer(t)
+    } else {
+        0
+    };
+    let (t, upper) = (&t[intro..], &upper[intro..]);
+    let start = if upper.starts_with("X'") || (upper.starts_with("B'") && intro == 0) {
+        1
+    } else {
+        0
+    };
     if t.as_bytes().get(start) == Some(&b'\'')
         // Terminated, which the lexer alone can't say: an unclosed literal runs
         // to the end of the input and so also "ends" at `t.len()`.
         && t.len() > start + 1
         && t.ends_with('\'')
-        && crate::sql::skip_noncode(t.as_bytes(), start, crate::intel::SqlDialect::Sqlite)
-            == Some(t.len())
+        && crate::sql::skip_noncode(t.as_bytes(), start, dialect) == Some(t.len())
     {
         return true;
     }
@@ -556,6 +613,32 @@ pub(crate) fn is_bare_sqlite_default(d: &str) -> bool {
     // expression, which SQLite's grammar admits nowhere a bare default can go,
     // and a permissive character-set test called it one.
     is_numeric_literal(t.strip_prefix(['+', '-']).unwrap_or(t))
+}
+
+/// How many bytes of `t` are a MySQL **character-set introducer** in front of a
+/// string literal, or 0 when there is none.
+///
+/// `_utf8mb3'draft'` is what MySQL 8's `COLUMN_DEFAULT` holds for a string
+/// recorded as an expression default, and `SHOW CREATE TABLE` prints it back
+/// with the introducer intact — so it is part of the literal, not a reason to
+/// call the value an expression. Shape only (`_` plus word bytes plus a quote);
+/// the set of real charset names is the server's business and a name it doesn't
+/// know is its error to give, not a reason to re-parenthesise.
+fn mysql_literal_introducer(t: &str) -> usize {
+    let b = t.as_bytes();
+    if b.first() != Some(&b'_') {
+        return 0;
+    }
+    let end = b[1..]
+        .iter()
+        .position(|c| !crate::sql::is_word_byte(*c))
+        .map(|i| i + 1)
+        .unwrap_or(b.len());
+    if end > 1 && b.get(end) == Some(&b'\'') {
+        end
+    } else {
+        0
+    }
 }
 
 /// An unsigned SQLite numeric literal: `12`, `1.5`, `.5`, `1e-3`, `0xFF`.
@@ -4589,8 +4672,11 @@ mod browse_key_tests {
     }
 }
 
+/// Which values may stand in a `DEFAULT` clause bare, and which the emitter has
+/// to parenthesise. Two engines require the parentheses and neither hands them
+/// back with the value, so both halves are pinned here.
 #[cfg(test)]
-mod sqlite_default_tests {
+mod default_clause_tests {
     use super::*;
 
     /// Everything SQLite's grammar lets stand without parentheses.
@@ -4620,12 +4706,15 @@ mod sqlite_default_tests {
             "0xFF",
             "0X1a",
         ] {
-            assert!(is_bare_sqlite_default(d), "{d}");
+            assert!(is_bare_default(d, crate::intel::SqlDialect::Sqlite), "{d}");
         }
         // Already parenthesised, so nothing to add.
-        assert!(is_bare_sqlite_default("(datetime('now'))"));
+        assert!(is_bare_default(
+            "(datetime('now'))",
+            crate::intel::SqlDialect::Sqlite
+        ));
         // Nothing at all is nothing to wrap.
-        assert!(is_bare_sqlite_default(""));
+        assert!(is_bare_default("", crate::intel::SqlDialect::Sqlite));
     }
 
     /// **And everything that is an expression, which is where this went wrong.**
@@ -4650,7 +4739,102 @@ mod sqlite_default_tests {
             "1 2",
             "'unterminated",
         ] {
-            assert!(!is_bare_sqlite_default(d), "{d}");
+            assert!(!is_bare_default(d, crate::intel::SqlDialect::Sqlite), "{d}");
+        }
+    }
+
+    /// A column carrying just a type and a default, which is all the
+    /// parenthesising gate reads.
+    fn with_default(ty: &str, d: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: "b".to_string(),
+            type_name: ty.to_string(),
+            nullable: true,
+            default: Some(d.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// **MySQL 8 requires the parentheses and does not hand them back.**
+    /// `information_schema.COLUMNS.COLUMN_DEFAULT` for
+    /// `b varchar(30) DEFAULT (CONCAT('a','c'))` is `concat(…)` with no outer
+    /// pair, while `SHOW CREATE TABLE` prints `DEFAULT (concat(…))` — and
+    /// measured on 8.4.11 the bare form is `ERROR 1064` and the wrapped form is
+    /// accepted. `create_sql` is `None` on MySQL, so `create_ddl` reconstructs
+    /// the column and the bare form reached Copy DDL, the structure dump, MCP
+    /// `describe`, `MODIFY COLUMN`, `ADD COLUMN` and `CREATE TABLE` alike.
+    #[test]
+    fn a_mysql_expression_default_is_parenthesised() {
+        let c = with_default("varchar(30)", "concat(_utf8mb3'a',_utf8mb3'c')");
+        assert!(
+            c.definition_sql(crate::intel::SqlDialect::MySql)
+                .ends_with(" DEFAULT (concat(_utf8mb3'a',_utf8mb3'c'))"),
+            "{}",
+            c.definition_sql(crate::intel::SqlDialect::MySql)
+        );
+    }
+
+    /// **Over-wrapping is not free either**, which is why the gate asks the
+    /// grammar rather than wrapping everything: MySQL reads `DEFAULT (7)` as an
+    /// *expression* default rather than a literal one, and a `TEXT` column's
+    /// defaults are legal only in one of those two forms. Every literal shape
+    /// the two servers hand back stays bare.
+    #[test]
+    fn a_mysql_literal_default_stays_bare() {
+        let bare = [
+            "'draft'",
+            "7",
+            "-1",
+            "1.5",
+            "0xFF",
+            "b'1010'",
+            "NULL",
+            "TRUE",
+            "CURRENT_TIMESTAMP",
+            "CURRENT_TIMESTAMP(6)",
+            "localtimestamp(3)",
+            // MySQL 8's spelling of a string it recorded as an expression
+            // default: the introducer is part of the literal, and
+            // `SHOW CREATE TABLE` prints it back intact.
+            "_utf8mb3'draft'",
+        ];
+        for d in bare {
+            let c = with_default("varchar(30)", d);
+            let sql = c.definition_sql(crate::intel::SqlDialect::MySql);
+            assert!(sql.ends_with(&format!(" DEFAULT {d}")), "{sql}");
+        }
+    }
+
+    /// And the expression shapes, all of which MySQL prints parenthesised.
+    #[test]
+    fn a_mysql_expression_default_is_wrapped_whatever_shape_it_is() {
+        for d in ["now()", "uuid()", "1 + 2", "concat('a','b')", "'a' + 'b'"] {
+            let c = with_default("varchar(30)", d);
+            let sql = c.definition_sql(crate::intel::SqlDialect::MySql);
+            assert!(sql.ends_with(&format!(" DEFAULT ({d})")), "{sql}");
+        }
+    }
+
+    /// An already-parenthesised value does not get a second pair — the model may
+    /// have come from a designer edit rather than a catalogue.
+    #[test]
+    fn a_mysql_default_that_already_carries_its_parens_keeps_one_pair() {
+        let c = with_default("varchar(36)", "(uuid())");
+        assert!(
+            c.definition_sql(crate::intel::SqlDialect::MySql)
+                .ends_with(" DEFAULT (uuid())")
+        );
+    }
+
+    /// **PostgreSQL takes an arbitrary expression bare**, and everything
+    /// `pg_get_expr` returns is one — so nothing there is ever wrapped, and
+    /// widening the gate must not have started.
+    #[test]
+    fn a_postgres_default_is_never_parenthesised() {
+        for d in ["now()", "nextval('s'::regclass)", "'draft'::text", "7"] {
+            let c = with_default("text", d);
+            let sql = c.definition_sql(crate::intel::SqlDialect::Postgres);
+            assert!(sql.ends_with(&format!(" DEFAULT {d}")), "{sql}");
         }
     }
 
@@ -4678,13 +4862,13 @@ mod sqlite_default_tests {
             ")1+2(",
             "(unbalanced",
         ] {
-            assert!(!is_bare_sqlite_default(d), "{d}");
+            assert!(!is_bare_default(d, crate::intel::SqlDialect::Sqlite), "{d}");
         }
         // One group, closed by the final paren — still bare, including when the
         // group contains a literal holding a paren of its own, which is the case
         // only the boundary lexer can answer.
         for d in ["(datetime('now'))", "((1+2)*(3+4))", "('a)b')", "(1)"] {
-            assert!(is_bare_sqlite_default(d), "{d}");
+            assert!(is_bare_default(d, crate::intel::SqlDialect::Sqlite), "{d}");
         }
     }
 }
