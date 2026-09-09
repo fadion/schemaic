@@ -249,14 +249,31 @@ impl AiData {
         }
     }
 
-    /// May the assistant fetch rows **on its own** — `run_query`, and the sample
-    /// rows in `describe_table`?
+    /// May the assistant fetch rows **on its own** — `run_query`, the sample
+    /// rows in `describe_table`, and the bottom-sample behind AI Fill / Seed?
+    ///
+    /// **The Fill/Seed sample belongs here and not to [`AiData::may_attach`]**,
+    /// and the two docs used to disagree about it while the code followed the
+    /// weaker one. Those rows are not attached: the app issues
+    /// `SELECT * FROM <base table> ORDER BY <pk> DESC LIMIT 20` — a query the
+    /// user never ran, over columns they are not looking at, ignoring the filter
+    /// and column selection in front of them — and splices all twenty into the
+    /// prompt. `AiData::Full`'s own variant doc had it right all along, and
+    /// [`crate::prompt`] records the identical gate being moved off `may_attach`
+    /// for the engine-error text, with the rule that settles it: **`Full` is the
+    /// only level whose consent covers a value the user did not hand over.**
     pub fn may_query(self) -> bool {
         self == AiData::Full
     }
 
     /// May rows reach the model **at the user's own request** — the grid's
-    /// attach-to-chat, and the value samples an AI Summary / Fill / Seed carries?
+    /// attach-to-chat, and the values an AI Summary carries out of the cell the
+    /// user asked about?
+    ///
+    /// The gesture is the consent, which is why this is the looser of the two:
+    /// it covers what the user handed over and nothing else. A read the app
+    /// performs on its own is [`AiData::may_query`]'s, however the user started
+    /// it.
     ///
     /// True for [`AiData::Full`] too: a level that lets the assistant fetch what
     /// it likes cannot coherently refuse what the user hands it.

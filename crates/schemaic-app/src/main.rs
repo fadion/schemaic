@@ -650,6 +650,35 @@ fn dialect_of(db: &Db) -> SqlDialect {
 /// the same precedence `edit::resolve_key` uses, so the statement the grid runs
 /// and the key the write path resolves cannot disagree about whether the table
 /// has a key of its own.
+/// The DDL to put in an AI prompt, or `None` where the user's *Schema context*
+/// says to send none.
+///
+/// One place, because it is the same question at every AI surface and three of
+/// them already answer it: the chat panel, the MCP tools and Ctrl+K. Fill and
+/// Seed were written after `render_inline_prompt`'s fix and never received it,
+/// which made them the fourth surface — *Schema context: None* withheld the
+/// schema tools and emptied the system prompt's outline while a right-click ▸
+/// AI Fill Value shipped the whole `CREATE TABLE`, comments included.
+fn ai_ddl_for(ddl: String, scope: schemaic_ui::SchemaScope) -> Option<String> {
+    match scope {
+        schemaic_ui::SchemaScope::None => None,
+        schemaic_ui::SchemaScope::Active | schemaic_ui::SchemaScope::All => Some(ddl),
+    }
+}
+
+/// A connection's AI data level, or the default when the connection is gone.
+///
+/// The same read `grid::ai_data_of` makes, on the app side, because the two
+/// prompt callbacks need it and neither has a `GridState`.
+fn ai_data_of_conn(
+    connections: RwSignal<Vec<schemaic_core::connection::Connection>>,
+    conn_id: u64,
+) -> schemaic_core::connection::AiData {
+    connections
+        .with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).and_then(|c| c.ai_data))
+        .unwrap_or_default()
+}
+
 fn table_ddl_and_pk(
     db_nodes: RwSignal<Vec<ConnNode>>,
     source: &TableSource,
@@ -9608,6 +9637,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // introspection hasn't run — the sample still carries conventions).
                 // The implicit row key is dropped: `sample_sql` doesn't project one.
                 let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
+                // **The two consent settings this path used to walk around.**
+                // `Schema context` decides whether the table's structure goes at
+                // all, and the connection's AI data level decides whether rows
+                // the user never attached are fetched to go with it. Read here,
+                // on the UI thread, like every other setting below.
+                let ddl = ai_ddl_for(ddl, ai_schema_scope.get_untracked());
+                let ai_data = ai_data_of_conn(connections, req.conn_id);
                 // Read off the signals here — the spawn below is not on the UI
                 // thread, and `ai::inline_plan` takes what they say.
                 let harness = ai_harness.get_untracked();
@@ -9622,20 +9658,29 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     ..
                 } = req;
                 handle.spawn(async move {
-                    let token = CancellationToken::new();
-                    // Bottom-sample the base table for enum/format/FK inference.
-                    let sql = sample_sql(db.engine(), &source, &pk_cols);
                     let database = source.database.clone();
-                    let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
-                        Ok(rs) => sample_rows(&rs),
-                        Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
+                    // **Not fetched at all below `may_query`**, rather than
+                    // fetched and dropped: a `SELECT * … LIMIT 20` the user never
+                    // ran is a read of their data whether or not it is sent.
+                    // `build_fill_prompt` drops the rows too, so the decision
+                    // cannot be lost between here and there.
+                    let sample = if ai_data.may_query() {
+                        let token = CancellationToken::new();
+                        let sql = sample_sql(db.engine(), &source, &pk_cols);
+                        match db.fetch_query(Some(&database), &sql, 20, token).await {
+                            Ok(rs) => sample_rows(&rs),
+                            Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
+                        }
+                    } else {
+                        Vec::new()
                     };
                     let prompt = schemaic_core::seed::build_fill_prompt(
                         &format!("{database}.{}", source.display()),
                         &column,
-                        &ddl,
+                        ddl.as_deref(),
                         &sample,
                         &row_context,
+                        ai_data,
                         dialect_for(db.engine()),
                     );
                     let system = "You output only the requested raw value — no quotes, \
@@ -9681,6 +9726,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 };
                 // The implicit row key is dropped: `sample_sql` doesn't project one.
                 let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
+                // The same two consent settings the fill callback above reads.
+                let ddl = ai_ddl_for(ddl, ai_schema_scope.get_untracked());
+                let ai_data = ai_data_of_conn(connections, req.conn_id);
                 // Read off the signals here — see the fill callback above.
                 let harness = ai_harness.get_untracked();
                 let cli_path = ai_cli_path.get_untracked();
@@ -9694,19 +9742,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     ..
                 } = req;
                 handle.spawn(async move {
-                    let token = CancellationToken::new();
-                    let sql = sample_sql(db.engine(), &source, &pk_cols);
                     let database = source.database.clone();
-                    let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
-                        Ok(rs) => sample_rows(&rs),
-                        Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
+                    // Not fetched below `may_query` — see the fill callback.
+                    let sample = if ai_data.may_query() {
+                        let token = CancellationToken::new();
+                        let sql = sample_sql(db.engine(), &source, &pk_cols);
+                        match db.fetch_query(Some(&database), &sql, 20, token).await {
+                            Ok(rs) => sample_rows(&rs),
+                            Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
+                        }
+                    } else {
+                        Vec::new()
                     };
                     let prompt = schemaic_core::seed::build_seed_prompt(
                         &format!("{database}.{}", source.display()),
-                        &ddl,
+                        ddl.as_deref(),
                         &fill_columns,
                         &sample,
                         count,
+                        ai_data,
                         dialect_for(db.engine()),
                     );
                     let system = "You output only a JSON array of row objects — no \

@@ -5064,9 +5064,16 @@ fn stage_fill(gs: GridState, disp: usize, ci: usize, pending: Option<usize>, val
 /// table + runs the one-shot AI call), and stage the parsed result as a normal
 /// green edit. Nothing auto-commits. A no-op unless an editable cell is selected.
 fn ai_fill_value(gs: GridState) {
-    // The prompt carries this row's other values and a sample of the column, so
-    // this is a data path — refused here as well as hidden from the menu, for
-    // the same reason `attach_to_chat` checks twice.
+    // The prompt carries this row's other values, so this is a data path —
+    // refused here as well as hidden from the menu, for the same reason
+    // `attach_to_chat` checks twice.
+    //
+    // **`may_attach`, and only for the row the user is editing.** The bottom
+    // sample of the base table is not attached by anyone and is gated a level
+    // higher, at `AiData::may_query`, inside `seed::build_fill_prompt` and the
+    // app callback that would otherwise fetch it. This entry used to justify
+    // itself with "and a sample of the column", which understated the payload:
+    // the app fetched twenty whole rows of every column.
     if gs.ai_busy.get_untracked() || !ai_data_of(gs).may_attach() {
         return;
     }
