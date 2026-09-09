@@ -499,6 +499,111 @@ async fn seed_rows(scratch: &Scratch, table: &str, ddl: &str) {
         .await;
 }
 
+/// **The statement that runs immediately after a commit, and writes straight
+/// into the grid the user is looking at.**
+///
+/// Ten live tests cover `commit_writes`; nothing covered `refetch_rows`, which
+/// runs next and whose rows are spliced over the ones on screen. `grep -rn
+/// refetch tests/live` found two prose comments and no code — so the whole leg
+/// between the write and the visible cell was untested against a server.
+///
+/// The property is the one the splice exists to keep: **a re-fetched row is the
+/// row a fresh `SELECT` would show.** Anything else and the grid disagrees with
+/// itself about a row nobody edited, and a CSV or clipboard export taken between
+/// the two writes out the wrong text.
+///
+/// Composed the way the app composes it — `edit::refetch_template` +
+/// `edit::refetch_key`, the same two functions `GridState::build_refetch` calls
+/// — because the defect this catches lives in the protocol the *re-fetch* uses,
+/// not in either function alone.
+pub async fn a_spliced_row_is_the_row_a_fresh_select_would_show(target: &'static Target) {
+    let scratch = Scratch::create(target, "refetch").await;
+    let t = scratch.qualified("t");
+    // Shapes whose *text* form the binary protocol does not reproduce on its
+    // own: a datetime with a zero time, a time-of-day, and a 32-bit float.
+    // Deliberately awkward, for the reason the DDL shapes are.
+    let ddl = match target.engine.dialect() {
+        schemaic_core::intel::SqlDialect::Postgres => format!(
+            "CREATE TABLE {t} (id INTEGER PRIMARY KEY, note VARCHAR(20), \
+             due TIMESTAMP, micros TIMESTAMP(3), plain DATE, dur TIME, \
+             ratio REAL, exact DOUBLE PRECISION)"
+        ),
+        _ => format!(
+            "CREATE TABLE {t} (id INT PRIMARY KEY, note VARCHAR(20), \
+             due DATETIME, micros DATETIME(3), plain DATE, dur TIME, \
+             ratio FLOAT, exact DOUBLE)"
+        ),
+    };
+    scratch.exec(&ddl).await;
+    // A zero time on a `DATETIME` (the one `as_sql` drops), a declared
+    // fractional precision (which must be printed, and not to six places), a
+    // bare `DATE` (which must *not* grow a time), a duration past midnight, and
+    // a float whose `f64` widening is visible.
+    scratch
+        .exec(&format!(
+            "INSERT INTO {t} (id, note, due, micros, plain, dur, ratio, exact) \
+             VALUES (1, 'a', '2024-01-15 00:00:00', '2024-01-15 08:09:10.120', \
+             '2024-01-15', '10:30:00', 3.14, 3.14)"
+        ))
+        .await;
+
+    let select =
+        format!("SELECT id, note, due, micros, plain, dur, ratio, exact FROM {t} ORDER BY id");
+    let (rs, model) = scratch.edit_model(&select).await;
+    let template = schemaic_core::edit::refetch_template(&rs, &model).expect("a single base table");
+
+    // Stage a change on the one column the assertion is *not* about, so every
+    // other cell is untouched by the write and can only differ because the
+    // re-fetch read it differently from the load.
+    let note_ci = rs
+        .columns
+        .iter()
+        .position(|c| c.name == "note")
+        .expect("the note column");
+    let mut edited = std::collections::HashMap::new();
+    edited.insert(note_ci, CellEdit::Text("b".to_string()));
+    let key = schemaic_core::edit::refetch_key(&template, &rs, 0, &edited);
+
+    let write = GridWrite {
+        updates: vec![edit(
+            &scratch,
+            "t",
+            &[("note", Some("b"))],
+            &[("id", Value::Int(1))],
+        )],
+        ..Default::default()
+    };
+    commit(&scratch, write).await.expect("the update commits");
+
+    let spliced = scratch
+        .db
+        .refetch_rows(
+            &template,
+            &[schemaic_core::model::RefetchRow { data_row: 0, key }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the re-fetch runs");
+    let (_, cells) = spliced.first().expect("one row came back");
+
+    // What a fresh load shows for the same row — the same path the grid used to
+    // draw it in the first place.
+    let fresh = scratch.exec(&select).await;
+    for (ci, col) in rs.columns.iter().enumerate() {
+        let want = fresh.cell(0, ci).expect("a cell").display().to_string();
+        let got = cells[ci].display();
+        assert_eq!(
+            got, want,
+            "{}: column {} came back from the re-fetch as {got:?} and from a \
+             fresh SELECT as {want:?} — the grid would disagree with itself \
+             about a cell nobody edited",
+            target.name, col.name
+        );
+    }
+
+    scratch.teardown().await;
+}
+
 fn edit(
     scratch: &Scratch,
     table: &str,

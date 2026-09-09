@@ -158,6 +158,7 @@ live_suite!(
         one_of_two_triggers_can_be_dropped_without_the_other,
     ],
     writeback: [
+        a_spliced_row_is_the_row_a_fresh_select_would_show,
         a_staged_update_writes_exactly_the_row_it_names,
         an_update_to_an_unchanged_value_still_counts_as_one_row,
         a_staged_insert_lands_with_defaults_for_what_it_omits,

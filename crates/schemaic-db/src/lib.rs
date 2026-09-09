@@ -4098,6 +4098,10 @@ pub(crate) async fn collect_rows(
     // list; at the 200k-row cap on a wide result that is tens of millions of
     // calls in the row loop, for an answer that cannot change between rows.
     let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
+    // Every value here arrives as `Bytes`, so nothing reads this — hoisted with
+    // its siblings because `convert_row` is one function and a caller that
+    // *could* hit a typed arm must not be the one that forgot to supply it.
+    let scale = fractional_scales(result.columns_ref());
     // Hoisted for the same reason, and asked of the type name only: a bit-field's
     // bytes are a number, and nothing but the column says so.
     let bit: Vec<bool> = columns
@@ -4113,7 +4117,7 @@ pub(crate) async fn collect_rows(
         while let Some(row) = stream.next().await {
             let row = row.map_err(qerr)?;
             if builder.row_count() < row_cap {
-                let cells = convert_row(&row, builder.columns(), &binary, &bit);
+                let cells = convert_row(&row, builder.columns(), &binary, &bit, &scale);
                 builder.push_row(&cells);
                 // A stream hands the block over here and keeps reading into an
                 // empty builder; a capped read never fills a chunk, so this is
@@ -4329,7 +4333,13 @@ fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
 /// re-imported as the wrong bytes. It renders as `binary_display` now, the same
 /// `<n bytes>` SQLite and PostgreSQL show, which says what it is and cannot be
 /// mistaken for the value.
-fn convert_row(row: &Row, columns: &[Column], binary: &[bool], bit: &[bool]) -> Vec<Value> {
+fn convert_row(
+    row: &Row,
+    columns: &[Column],
+    binary: &[bool],
+    bit: &[bool],
+    scale: &[u32],
+) -> Vec<Value> {
     (0..columns.len())
         .map(|i| match row.as_ref(i) {
             None | Some(MyValue::NULL) => Value::Null,
@@ -4358,11 +4368,94 @@ fn convert_row(row: &Row, columns: &[Column], binary: &[bool], bit: &[bool]) -> 
             ),
             Some(MyValue::Int(n)) => Value::Int(*n),
             Some(MyValue::UInt(n)) => Value::UInt(*n),
-            Some(MyValue::Float(f)) => Value::Float(*f as f64),
             Some(MyValue::Double(f)) => Value::Float(*f),
-            Some(other) => Value::Str(other.as_sql(false).trim_matches('\'').to_string()),
+            // **The binary protocol's own shapes, rendered the way the text
+            // protocol renders the same column.** See `binary_as_text`; the
+            // catch-all below is `as_sql`, which is a *SQL literal* and not what
+            // the load produced.
+            Some(other) => match binary_as_text(
+                other,
+                &columns[i].type_name,
+                scale.get(i).copied().unwrap_or(0),
+            ) {
+                Some(text) => parse_typed(text, &columns[i].type_name),
+                None => Value::Str(other.as_sql(false).trim_matches('\'').to_string()),
+            },
         })
         .collect()
+}
+
+/// One binary-protocol value as the **text protocol's** rendering of the same
+/// column — or `None` for a shape that needs no translation.
+///
+/// **The two protocols are two different readings of one row, and this app uses
+/// both.** `collect_rows` loads a result with `query_iter` (text), where every
+/// value arrives as `Bytes` and `parse_typed` keeps the server's own characters;
+/// `refetch_on` re-reads one row with `exec_iter` (binary, because it is a
+/// prepared statement with the key bound), where MySQL sends `DATETIME` as
+/// `Date`, `TIME` as `Time` and `FLOAT` as an `f32`. Those fell to `convert_row`'s
+/// catch-all, `MyValue::as_sql`, which renders a **SQL literal** rather than the
+/// text form: `mysql_common` prints a `Date` with a zero time as `'YYYY-MM-DD'`
+/// and a `Time` as `'{:03}:{:02}:{:02}'`.
+///
+/// So on MariaDB 10.11.14 and MySQL 8.4.11, editing one column of
+/// `(1, 'a', '2024-01-15 00:00:00', '10:30:00', 3.14)` and committing spliced
+/// the row back with `2024-01-15`, `010:30:00` and `3.140000104904175` in three
+/// cells the user never touched — measured. Re-running the query restored them,
+/// so the grid disagreed with itself about the same row, and a CSV, clipboard or
+/// `INSERT` export taken in between wrote the wrong text out.
+///
+/// The fraction follows the **column's declared precision**, which is what the
+/// server's own text form does: a `DATETIME(3)` reads `…:00.000` and a bare
+/// `DATETIME` reads `…:00`. An `f32` goes through its shortest round-tripping
+/// text, which is what MySQL prints for a `FLOAT` and what `3.14f32 as f64`
+/// destroys.
+fn binary_as_text(v: &MyValue, type_name: &str, scale: u32) -> Option<String> {
+    let scale = scale.min(6);
+    let frac = |us: u32| match scale {
+        0 => String::new(),
+        n => format!(".{:0>width$}", us / 10u32.pow(6 - n), width = n as usize),
+    };
+    match v {
+        // A bare `DATE` column has no time to print; every other temporal does,
+        // zero or not.
+        MyValue::Date(y, m, d, h, mi, sec, us) => {
+            Some(if type_name.trim().eq_ignore_ascii_case("date") {
+                format!("{y:04}-{m:02}-{d:02}")
+            } else {
+                format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02}{}", frac(*us))
+            })
+        }
+        // `TIME` is a *duration*: it runs past 24 hours and can be negative, so
+        // the day part folds into the hours rather than being dropped.
+        MyValue::Time(neg, days, h, mi, sec, us) => {
+            let hours = u32::from(*h) + days * 24;
+            Some(format!(
+                "{}{hours:02}:{mi:02}:{sec:02}{}",
+                if *neg { "-" } else { "" },
+                frac(*us)
+            ))
+        }
+        // `{}` on an `f32` is its shortest round-tripping form, which is what the
+        // server prints. Widening to `f64` first is what produced
+        // `3.140000104904175`.
+        MyValue::Float(f) => Some(f.to_string()),
+        _ => None,
+    }
+}
+
+/// The fractional-seconds precision of each column, off the **wire** rather than
+/// off the type name.
+///
+/// The column-definition packet carries it (`decimals`), and the resolved type
+/// name does not: `type_name_of` builds `DATETIME` from the type code with no
+/// precision in it, so a `DATETIME(3)` and a bare `DATETIME` are indistinguishable
+/// by name. The binary protocol always sends microseconds, so without this a
+/// `DATETIME(3)` holding `.120` came back with no fraction at all and a bare
+/// `DATETIME` would have grown six zeroes — both a cell the user never edited,
+/// changing under them.
+fn fractional_scales(columns: &[MyColumn]) -> Vec<u32> {
+    columns.iter().map(|c| u32::from(c.decimals())).collect()
 }
 
 /// Why a DDL run stopped, and — the part that matters — **how much of it
@@ -5421,6 +5514,9 @@ pub(crate) async fn refetch_on(
             .map_err(qerr)?;
         // Column metadata (owned) before consuming the result stream.
         let columns: Vec<Column> = result.columns_ref().iter().map(map_column).collect();
+        // **Before the collect**, which consumes the result and empties
+        // `columns_ref`. The declared fractional precision is only on the wire.
+        let scale = fractional_scales(result.columns_ref());
         let fetched: Vec<Row> = result.collect::<Row>().await.map_err(qerr)?;
         if let Some(r) = fetched.first() {
             let binary: Vec<bool> = columns.iter().map(Column::is_binary).collect();
@@ -5428,7 +5524,10 @@ pub(crate) async fn refetch_on(
                 .iter()
                 .map(|c| schemaic_core::model::type_is_bit(&c.type_name))
                 .collect();
-            out.push((row.data_row, convert_row(r, &columns, &binary, &bit)));
+            out.push((
+                row.data_row,
+                convert_row(r, &columns, &binary, &bit, &scale),
+            ));
         }
     }
     Ok(out)
@@ -6145,6 +6244,93 @@ mod tests {
         assert!(matches!(value_to_param(&Value::UInt(3)), MyValue::UInt(3)));
         assert!(matches!(value_to_param(&Value::Float(1.5)), MyValue::Double(f) if f == 1.5));
         assert!(matches!(value_to_param(&Value::Str("s".into())), MyValue::Bytes(b) if b == b"s"));
+    }
+
+    // ── the two protocols, and the one row read through both ────────────
+
+    /// **The re-fetch reads the same row over a different protocol**, and its
+    /// answer is spliced straight over the cells on screen. `collect_rows` uses
+    /// `query_iter` (text), where every value is `Bytes`; `refetch_on` uses
+    /// `exec_iter` (binary, the statement being prepared with the key bound),
+    /// where MySQL sends `DATETIME` as `Date`, `TIME` as `Time` and `FLOAT` as an
+    /// `f32`. Those fell to `convert_row`'s catch-all, `MyValue::as_sql` — a
+    /// **SQL literal**, not the text form — which prints a `Date` with a zero
+    /// time as `'YYYY-MM-DD'` and a `Time` as `'{:03}:{:02}:{:02}'`.
+    ///
+    /// Measured on MariaDB 10.11.14 and MySQL 8.4.11: editing one column of
+    /// `(1, 'a', '2024-01-15 00:00:00', '10:30:00', 3.14)` spliced the row back
+    /// with `2024-01-15`, `010:30:00` and `3.140000104904175` in three cells
+    /// nobody touched. Re-running the query restored them, so the grid disagreed
+    /// with itself about one row, and any export taken in between wrote the wrong
+    /// text.
+    #[test]
+    fn a_binary_temporal_reads_back_as_the_text_protocol_wrote_it() {
+        // The zero time a `DATETIME` carries and `as_sql` drops.
+        assert_eq!(
+            binary_as_text(&MyValue::Date(2024, 1, 15, 0, 0, 0, 0), "DATETIME", 0).as_deref(),
+            Some("2024-01-15 00:00:00")
+        );
+        // A bare `DATE` has no time to print, and must not grow one.
+        assert_eq!(
+            binary_as_text(&MyValue::Date(2024, 1, 15, 0, 0, 0, 0), "DATE", 0).as_deref(),
+            Some("2024-01-15")
+        );
+        // `TIME` is a duration: `as_sql`'s `{:03}` made this `010:30:00`.
+        assert_eq!(
+            binary_as_text(&MyValue::Time(false, 0, 10, 30, 0, 0), "TIME", 0).as_deref(),
+            Some("10:30:00")
+        );
+        // …which runs past a day, and backwards.
+        assert_eq!(
+            binary_as_text(&MyValue::Time(false, 3, 2, 0, 0, 0), "TIME", 0).as_deref(),
+            Some("74:00:00")
+        );
+        assert_eq!(
+            binary_as_text(&MyValue::Time(true, 0, 1, 2, 3, 0), "TIME", 0).as_deref(),
+            Some("-01:02:03")
+        );
+        // An `f32` widened to `f64` is what produced `3.140000104904175`; the
+        // value here is one whose widening is visible without being a constant
+        // clippy recognises — `0.1f32 as f64` is `0.10000000149011612`.
+        assert_eq!(
+            binary_as_text(&MyValue::Float(0.1), "FLOAT", 0).as_deref(),
+            Some("0.1")
+        );
+        assert_ne!(
+            (0.1f32 as f64).to_string(),
+            "0.1",
+            "if this ever holds, the widening was never the bug"
+        );
+        // A `DOUBLE` was already right and stays out of this.
+        assert_eq!(binary_as_text(&MyValue::Double(1.25), "DOUBLE", 0), None);
+        assert_eq!(binary_as_text(&MyValue::Int(7), "INT", 0), None);
+    }
+
+    /// **The declared precision, and only that.** A `DATETIME(3)` reads
+    /// `…:00.120` and a bare `DATETIME` reads `…:00`, so the fraction cannot come
+    /// from the value — the binary protocol always sends microseconds, and
+    /// `.120` trimmed of trailing zeros would be `.12`. It comes off the wire's
+    /// column definition, which is also the only place it is: `type_name_of`
+    /// builds `DATETIME` from the type code with no precision in it.
+    #[test]
+    fn the_fraction_follows_the_columns_declared_precision() {
+        let at = |scale| {
+            binary_as_text(
+                &MyValue::Date(2024, 1, 15, 8, 9, 10, 120_000),
+                "DATETIME",
+                scale,
+            )
+            .expect("a temporal")
+        };
+        assert_eq!(at(0), "2024-01-15 08:09:10");
+        assert_eq!(at(3), "2024-01-15 08:09:10.120");
+        assert_eq!(at(6), "2024-01-15 08:09:10.120000");
+        // MySQL's own maximum, so a server answering more does not widen it.
+        assert_eq!(at(9), "2024-01-15 08:09:10.120000");
+        assert_eq!(
+            binary_as_text(&MyValue::Time(false, 0, 10, 30, 0, 500_000), "TIME", 1).as_deref(),
+            Some("10:30:00.5")
+        );
     }
 
     #[test]
