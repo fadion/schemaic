@@ -601,7 +601,10 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                                ddl_preview::open_preview(
+                                    ui.ddl,
+                                    preview_from(&target, &draft, &cs),
+                                );
                             },
                         ),
                     ))

@@ -3830,6 +3830,13 @@ impl ChangeSet {
     /// persists in Clipboard History and cloud-syncs. Three doc sites asserted
     /// the opposite ("never persisted, never logged").
     ///
+    /// The first clause of that is enforced on the *other* side, in the view:
+    /// `ddl_preview::open_preview` seeded its SQL box from this function for a
+    /// while, so the modal's last word before an irreversible statement was a
+    /// statement that would not run — and for an account whose password the
+    /// masked field had mangled, the emitted secret appeared on no surface at
+    /// all. `the_sql_box_shows_the_statement_that_runs` is what holds it now.
+    ///
     /// **One function, so a third exit inherits it.** The alternative — each
     /// button remembering — is the shape the write guard's own invariant exists
     /// to rule out.

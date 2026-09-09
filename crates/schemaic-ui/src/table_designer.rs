@@ -447,7 +447,7 @@ pub(crate) fn preview_draft_edit(
         return;
     }
     ddl_preview::open_preview(
-        ui,
+        ui.ddl,
         ddl_preview::preview_of(
             ctx.conn_id,
             database,
@@ -2350,7 +2350,10 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                                ddl_preview::open_preview(
+                                    ui.ddl,
+                                    preview_from(&target, &draft, &cs),
+                                );
                             },
                         ),
                     ))

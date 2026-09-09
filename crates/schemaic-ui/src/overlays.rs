@@ -1709,7 +1709,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             ),
                                         };
                                         crate::ddl_preview::open_preview(
-                                            &ui,
+                                            ui.ddl,
                                             crate::ddl_preview::preview_of(
                                                 ctx.conn_id,
                                                 &db,

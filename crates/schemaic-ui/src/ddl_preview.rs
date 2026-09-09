@@ -106,25 +106,43 @@ pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
 /// Close the preview and drop the script with it.
 ///
 /// The one door, because there are two `set(None)` sites and a third would
-/// otherwise have to remember: `d.sql` is app-lifetime and held the last plan's
-/// script for the life of the process. It is [`ChangeSet::export_script`]'s
-/// output rather than the real statement, so this is defence in depth rather
-/// than the only line — which is the reason it is a one-line helper and not a
-/// larger piece of machinery.
+/// otherwise have to remember: `d.sql` is app-lifetime and would otherwise hold
+/// the last plan's SQL for the life of the process.
+///
+/// **This clear is load-bearing, not defence in depth.** It was the latter while
+/// the box showed [`ChangeSet::export_script`]'s redacted copy; it now holds
+/// [`ChangeSet::emit`]'s statements, which for an account plan carry the real
+/// password — see [`open_preview`] for why the box shows those.
 ///
 /// [`ChangeSet::export_script`]: schemaic_core::ddl::ChangeSet::export_script
+/// [`ChangeSet::emit`]: schemaic_core::ddl::ChangeSet::emit
 pub(crate) fn close_preview(d: crate::DdlUi) {
     d.preview.set(None);
     d.sql.set(String::new());
 }
 
-/// Open the preview on a change set. `from_designer` decides where Cancel goes.
-pub(crate) fn open_preview(ui: &Ui, preview: DdlPreview) {
-    let d = ui.ddl;
-    // The script, so what the box shows is what Copy and "Open in editor" hand
-    // over. Apply still sends `statements` on the wire, where `DELIMITER` — a
-    // client directive the server has never heard of — must not appear.
-    d.sql.set(preview.script.clone());
+/// Open the preview on a change set.
+///
+/// Takes the `DdlUi` rather than the whole [`Ui`] because that is all it uses,
+/// and because a bundle of 250 signals is not constructible in a test — which
+/// is what left `the_sql_box_shows_the_statement_that_runs` unwritten while the
+/// box showed the wrong text.
+pub(crate) fn open_preview(d: crate::DdlUi, preview: DdlPreview) {
+    // **The statements, not the script.** This module's own contract is "one
+    // place that shows the statements and one place that says what they
+    // destroy", and the box read `export_script` — which substitutes
+    // `PUT-THE-PASSWORD-HERE` for an account's secret and prepends a header
+    // about *a copy*. So the last confirmation surface before an irreversible
+    // statement displayed text that would not run, and for the one case where
+    // the emitted password is *wrong* (a `*` in it survives the masked field's
+    // character diff mangled) there was no surface anywhere that showed it.
+    //
+    // Copy and "Open in editor" still hand over `p.script`: both put the text
+    // somewhere durable — a clipboard, and a query tab `tabs.json` writes in the
+    // clear — and that is the distinction `export_script` was written to draw.
+    // A `DELIMITER` wrapper belongs to those two for the same reason; the wire
+    // has never heard of it and neither has this box.
+    d.sql.set(preview.statements.join("\n\n"));
     d.sql_rows.set(SQL_ROWS);
     d.error.set(None);
     d.applied.set(false);
@@ -174,9 +192,11 @@ pub(crate) fn preview_of(
         // clipboard, and a query tab the session file writes to `tabs.json` in
         // the clear. A `CREATE USER … IDENTIFIED BY 'hunter2'` has no business
         // in either. The *preview* renders `statements`, which is unchanged and
-        // is the statement that runs. Read off the change set, like `scope`
-        // below, so a third exit from this modal inherits the rule instead of
-        // having to remember it.
+        // is the statement that runs — true again as of
+        // `the_sql_box_shows_the_statement_that_runs`, and false for as long as
+        // `open_preview` seeded the box from this field instead. Read off the
+        // change set, like `scope` below, so a third exit from this modal
+        // inherits the rule instead of having to remember it.
         script: cs.export_script(),
         read_only,
         // Off the change set, like `scope` above and for the same reason: a
@@ -282,7 +302,7 @@ pub(crate) fn preview_container(
     let ctx = crate::table_designer::edit_ctx(ui);
     let cs = schemaic_core::ddl::server_level(subject, ctx.dialect, change);
     open_preview(
-        ui,
+        ui.ddl,
         preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
     );
 }
@@ -315,7 +335,7 @@ pub(crate) fn preview_account(
 ) {
     let cs = schemaic_core::ddl::account(subject, on.dialect, change);
     open_preview(
-        ui,
+        ui.ddl,
         preview_of(on.conn_id, &on.database, subject, &cs, on.read_only),
     );
 }
@@ -369,7 +389,7 @@ pub(crate) fn preview_change(
     let ctx = crate::table_designer::edit_ctx(ui);
     let cs = schemaic_core::ddl::single(table, schema, ctx.dialect, change);
     open_preview(
-        ui,
+        ui.ddl,
         preview_of(
             ctx.conn_id,
             database,
@@ -438,7 +458,7 @@ pub(crate) fn preview_proposal(
         ));
     }
     open_preview(
-        ui,
+        ui.ddl,
         preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
     );
     Ok(())
@@ -1263,6 +1283,68 @@ mod tests {
             ..Default::default()
         }])
         .remove(0)
+    }
+
+    /// **The SQL box shows what Apply sends, and it did not.** `open_preview`
+    /// seeded the box from `export_script`, which substitutes
+    /// `PUT-THE-PASSWORD-HERE` for the secret and prepends a three-line header
+    /// about *a copy* — so the last confirmation surface before an irreversible
+    /// statement displayed a statement that would not run, and a user reading
+    /// the modal at its word would conclude the account was about to be created
+    /// with the literal placeholder as its password.
+    ///
+    /// It matters most for the case that motivated it: a password containing
+    /// `*` reaches `CREATE USER … IDENTIFIED BY` mangled (the masked field
+    /// reconstructs it from a character diff, and `*` is the mask), and while
+    /// the box redacted it there was **no surface anywhere** on which the real
+    /// emitted secret appeared — the field re-masks to the right length and the
+    /// preview substituted the placeholder. Showing `statements` puts it on
+    /// screen exactly once, in a modal, and nowhere durable: Copy and "Open in
+    /// editor" still hand over `p.script`, which is the distinction
+    /// `export_script` was written to draw.
+    ///
+    /// Through `open_preview`, not over the two `ChangeSet` methods: the defect
+    /// was entirely in *which of them the box reads*, so a test of either one
+    /// alone passes against the bug.
+    #[test]
+    fn the_sql_box_shows_the_statement_that_runs() {
+        let scope = Scope::new();
+        let d = ddl_ui(scope);
+        let cs = schemaic_core::ddl::ChangeSet {
+            table: String::new(),
+            schema: None,
+            dialect: SqlDialect::MySql,
+            flavour: Default::default(),
+            changes: vec![schemaic_core::ddl::Change::CreateAccount(Box::new(
+                schemaic_core::users::AccountDraft {
+                    name: "app".into(),
+                    host: "%".into(),
+                    password: "hunter2".into(),
+                    ..Default::default()
+                },
+            ))],
+        };
+        let p = preview_of(1, "db", "app@%", &cs, false);
+        // The premise: the two really do differ, or the test proves nothing.
+        assert!(
+            p.script.contains("PUT-THE-PASSWORD-HERE") && !p.script.contains("hunter2"),
+            "the copy is redacted: {}",
+            p.script
+        );
+        open_preview(d, p);
+        let shown = d.sql.get_untracked();
+        assert!(
+            shown.contains("hunter2"),
+            "the box must show what Apply sends: {shown}"
+        );
+        assert!(
+            !shown.contains("PUT-THE-PASSWORD-HERE"),
+            "…and not the copy's placeholder: {shown}"
+        );
+        // Closing still drops it — the box now holds the real secret, so that
+        // clear is load-bearing rather than defence in depth.
+        close_preview(d);
+        assert!(d.sql.get_untracked().is_empty());
     }
 
     /// **The one editor a close must leave standing.** A PostgreSQL trigger has

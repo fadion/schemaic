@@ -977,7 +977,7 @@ pub(crate) fn event_editor_overlay(ui: Ui) -> impl IntoView {
                             move || {
                                 let cs = change_set(&target, &draft);
                                 ddl_preview::open_preview(
-                                    &ui,
+                                    ui.ddl,
                                     ddl_preview::preview_of(
                                         target.conn_id,
                                         &target.database,

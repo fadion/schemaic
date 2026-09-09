@@ -1155,5 +1155,5 @@ fn open_plan_preview(ui: &Ui, close: Rc<dyn Fn()>) {
     // was ticked, and leaving the tree open behind it invites editing a
     // selection the preview no longer reflects.
     (close)();
-    crate::ddl_preview::open_preview(ui, preview);
+    crate::ddl_preview::open_preview(ui.ddl, preview);
 }
