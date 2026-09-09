@@ -77,7 +77,12 @@ impl SqlDialect {
 
     /// Are `` `…` `` identifiers accepted? MySQL's own syntax, which SQLite also
     /// takes for compatibility; PostgreSQL doesn't.
-    fn backtick_ident(self) -> bool {
+    ///
+    /// `pub(crate)` because `core::pairs` was asking the same question and could
+    /// not reach this, so it hand-spelled `dialect != SqlDialect::Postgres`
+    /// twice. The two agreed for all three engines; what they could not survive
+    /// is a fourth, or a change here, which would move one and not the other.
+    pub(crate) fn backtick_ident(self) -> bool {
         matches!(self, SqlDialect::MySql | SqlDialect::Sqlite)
     }
 

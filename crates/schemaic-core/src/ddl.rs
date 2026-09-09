@@ -4154,7 +4154,13 @@ impl ChangeSet {
                     cl.push(format!("COLLATE={coll}"));
                 }
                 if let Some(cm) = comment {
-                    cl.push(format!("COMMENT={}", ddl_string(cm, SqlDialect::MySql)));
+                    // `d`, like every other literal in this statement. A constant
+                    // here is the same failure as an engine comparison with no
+                    // comparison to grep for: this function is reached through
+                    // `emit()`'s `_` arm, so a fourth variant in the MySQL family
+                    // would get MySQL's escaping for the table comment while
+                    // every neighbouring literal got its own.
+                    cl.push(format!("COMMENT={}", ddl_string(cm, d)));
                 }
             }
         }
@@ -6026,7 +6032,24 @@ pub fn common_types(dialect: SqlDialect) -> &'static [&'static str] {
             "jsonb",
             "bytea",
         ],
-        _ => &[
+        // **SQLite's own five, spelled the way SQLite reads them.** It used to
+        // fall into MySQL's arm — `tinyint(1)`, `longtext`, `datetime`, `year`
+        // — and to be offered no `INTEGER`, which is the one spelling that
+        // changes what the column *is* (the rowid alias, and the only declared
+        // type `AUTOINCREMENT` is legal on). The rest are the affinity words
+        // plus the two spellings a table written by anything else will carry.
+        SqlDialect::Sqlite => &[
+            "INTEGER",
+            "TEXT",
+            "REAL",
+            "BLOB",
+            "NUMERIC",
+            "VARCHAR(255)",
+            "BOOLEAN",
+            "DATE",
+            "DATETIME",
+        ],
+        SqlDialect::MySql => &[
             "int",
             "bigint",
             "smallint",
@@ -6132,6 +6155,38 @@ fn split_type(t: &str) -> TypeParts {
 /// a phantom change on every column: MariaDB reports `int(11)` where MySQL 8
 /// reports `int`, PostgreSQL reports `character varying(45)` where every human
 /// writes `varchar(45)`, and neither difference means anything.
+/// How much of a declared type's spelling a dialect lets a client rewrite before
+/// comparing two of them.
+///
+/// A capability rather than an engine test, because the answer is not "which
+/// engine" but "how much of this text is noise" — and the engine test that stood
+/// here (`dialect == Postgres`) sorted the third engine onto whichever side it
+/// happened to fall, which is the failure CLAUDE.md's rule names. Exhaustive, so
+/// a fourth engine has to be looked at rather than inheriting MySQL's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TypeAliasing {
+    /// PostgreSQL's own spellings for one type (`int4`/`integer`,
+    /// `character varying`/`varchar`), and a width that always means something.
+    Postgres,
+    /// MySQL's alias table, its meaningless integer display widths, and its
+    /// `BOOLEAN` = `TINYINT(1)`.
+    MySql,
+    /// **None.** SQLite stores the declared text and derives an affinity from
+    /// it; two spellings that differ are two different declarations, and `INT`
+    /// versus `INTEGER` decides whether the column is the rowid alias.
+    Verbatim,
+}
+
+impl TypeAliasing {
+    fn of(dialect: SqlDialect) -> TypeAliasing {
+        match dialect {
+            SqlDialect::Postgres => TypeAliasing::Postgres,
+            SqlDialect::MySql => TypeAliasing::MySql,
+            SqlDialect::Sqlite => TypeAliasing::Verbatim,
+        }
+    }
+}
+
 pub fn normalize_type(t: &str, dialect: SqlDialect) -> String {
     let TypeParts {
         base,
@@ -6141,14 +6196,28 @@ pub fn normalize_type(t: &str, dialect: SqlDialect) -> String {
     if base.is_empty() {
         return String::new();
     }
-    let pg = dialect == SqlDialect::Postgres;
+    // **What this dialect lets a client canonicalise**, asked once, exhaustively.
+    // It used to be `dialect == Postgres`, which put SQLite in MySQL's arm — its
+    // alias table, its display-width rule and its `BOOLEAN` → `TINYINT(1)`
+    // rewrite — and the designer then answered "no change" to `INT` → `INTEGER`,
+    // the edit that makes a SQLite column the rowid alias and the only declared
+    // type under which `AUTOINCREMENT` is legal.
+    let aliasing = TypeAliasing::of(dialect);
+    let pg = aliasing == TypeAliasing::Postgres;
     // Suffixes MySQL appends to a numeric type (`int unsigned zerofill`) travel
     // with the base word, so alias only the leading keyword(s).
     let (word, suffix) = match base.split_once(' ') {
-        Some((w, s)) if !pg => (w.to_string(), format!(" {s}")),
+        Some((w, s)) if aliasing == TypeAliasing::MySql => (w.to_string(), format!(" {s}")),
         _ => (base.clone(), String::new()),
     };
-    let canon: &str = if pg {
+    let canon: &str = if aliasing == TypeAliasing::Verbatim {
+        // Nothing at all. On SQLite the declared spelling *is* the type: the
+        // engine stores the text and derives an affinity from it, and two texts
+        // that differ are two different declarations even where the affinity is
+        // the same. Collapsing them hides an edit, which is the silent
+        // direction.
+        word.as_str()
+    } else if pg {
         match word.as_str() {
             "character varying" | "varchar" => "varchar",
             "character" | "bpchar" | "char" => "char",
@@ -6182,9 +6251,11 @@ pub fn normalize_type(t: &str, dialect: SqlDialect) -> String {
         canon,
         "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
     );
-    let drop_width = !pg && integer && !(canon == "tinyint" && params.first() == Some(&1));
+    let drop_width = aliasing == TypeAliasing::MySql
+        && integer
+        && !(canon == "tinyint" && params.first() == Some(&1));
     // `bool`/`boolean` is a MySQL alias for exactly `tinyint(1)`.
-    if !pg && matches!(word.as_str(), "bool" | "boolean") {
+    if aliasing == TypeAliasing::MySql && matches!(word.as_str(), "bool" | "boolean") {
         return format!("tinyint(1){suffix}");
     }
     // An `ENUM`/`SET` value list is re-emitted verbatim. Comparison is exact,
@@ -10577,6 +10648,47 @@ mod tests {
         assert!(!types_equal("timestamp", "timestamptz", Postgres));
         // A PostgreSQL width is never a display width.
         assert!(!types_equal("int", "int(11)", Postgres));
+    }
+
+    /// **SQLite canonicalises nothing, because on SQLite the declared spelling
+    /// is the thing.** It fell into the `else` arm — MySQL's alias table, MySQL's
+    /// display-width rule and MySQL's `BOOLEAN` → `TINYINT(1)` rewrite — off a
+    /// single `dialect == Postgres` test, so the designer answered "no change"
+    /// to the one edit that matters most on this engine.
+    ///
+    /// `INT` → `INTEGER` is what makes a column the rowid alias and is the only
+    /// declared type under which `AUTOINCREMENT` is legal. Measured on
+    /// SQLite 3: `CREATE TABLE c(id INT PRIMARY KEY AUTOINCREMENT)` is refused
+    /// with *"AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"*, and on
+    /// the `INTEGER` spelling `rowid` and `id` are the same column.
+    #[test]
+    fn a_sqlite_type_is_compared_as_it_was_written() {
+        assert!(!types_equal("INT", "INTEGER", Sqlite));
+        // BOOLEAN has NUMERIC affinity and TINYINT has INTEGER affinity — two
+        // different columns, and MySQL's rewrite collapsed them.
+        assert!(!types_equal("BOOLEAN", "TINYINT(1)", Sqlite));
+        assert!(!types_equal("NUMERIC", "DECIMAL", Sqlite));
+        assert!(!types_equal("REAL", "DOUBLE", Sqlite));
+        // A width is part of the declared type here; nothing may drop it.
+        assert!(!types_equal("INT(11)", "INT", Sqlite));
+        // Case and spacing are still noise, as they are everywhere.
+        assert!(types_equal("integer", "INTEGER", Sqlite));
+        assert!(types_equal("VARCHAR(45)", "varchar( 45 )", Sqlite));
+    }
+
+    /// The shortcut list under the type field had the same `_` arm, so SQLite
+    /// was offered MySQL's types — `tinyint(1)`, `longtext`, `datetime`, `year`
+    /// — and not `INTEGER`, the one spelling that changes what the column *is*.
+    #[test]
+    fn the_type_shortcuts_are_the_engines_own() {
+        assert!(common_types(Sqlite).contains(&"INTEGER"));
+        assert!(common_types(Sqlite).contains(&"TEXT"));
+        assert!(common_types(Sqlite).contains(&"BLOB"));
+        assert!(!common_types(Sqlite).contains(&"tinyint(1)"));
+        assert!(!common_types(Sqlite).contains(&"longtext"));
+        // And the other two are unchanged.
+        assert!(common_types(MySql).contains(&"tinyint(1)"));
+        assert!(common_types(Postgres).contains(&"jsonb"));
     }
 
     #[test]

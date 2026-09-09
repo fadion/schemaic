@@ -59,9 +59,12 @@ fn classify(ch: char, dialect: SqlDialect) -> Option<Cat> {
         ')' => Some(Cat::Close(')')),
         '\'' => Some(Cat::Quote('\'')),
         '"' => Some(Cat::Quote('"')),
-        // Backtick is a MySQL/MariaDB identifier quote; PostgreSQL has no such
-        // syntax, so don't auto-close it there.
-        '`' if dialect != SqlDialect::Postgres => Some(Cat::Quote('`')),
+        // Backtick is a MySQL/MariaDB identifier quote, which SQLite takes too;
+        // PostgreSQL has no such syntax, so don't auto-close it there. The
+        // capability is `sql`'s, and asking it rather than re-spelling the
+        // comparison is the same rule this module's own doc states about never
+        // hand-rolling a second scanner.
+        '`' if dialect.backtick_ident() => Some(Cat::Quote('`')),
         _ => None,
     }
 }
@@ -219,7 +222,7 @@ pub fn backspace_pair(text: &str, caret: usize, dialect: SqlDialect) -> Option<(
     }
     let empty_pair = match (b[caret - 1], b[caret]) {
         (b'(', b')') | (b'\'', b'\'') | (b'"', b'"') => true,
-        (b'`', b'`') => dialect != SqlDialect::Postgres,
+        (b'`', b'`') => dialect.backtick_ident(),
         _ => false,
     };
     empty_pair.then_some((caret - 1, caret + 1))

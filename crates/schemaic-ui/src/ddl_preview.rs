@@ -741,6 +741,21 @@ pub(crate) fn preview_title(connection: &str, p: &DdlPreview) -> String {
     }
 }
 
+/// May an apply in flight be stopped — from the preview's dialect, or from
+/// there being no preview.
+///
+/// **`None` answers for itself.** The engine is what the *capability* is read
+/// off, so with nothing open there is no engine to ask, and the honest answer is
+/// "not cancellable" rather than whatever `SqlDialect::MySql` happens to say
+/// today. That was the shape here, and it worked only by coincidence: MySQL's
+/// answer is `false`, which is the conservative direction. MySQL 8's atomic DDL
+/// is exactly the refinement `ddl_rolls_back_as_a_whole` exists to absorb, and
+/// the day it lands the absent case would have started reporting "cancellable"
+/// with nothing in the diff naming this modal.
+fn exit_cancellable(dialect: Option<SqlDialect>) -> bool {
+    dialect.is_some_and(schemaic_core::ddl::ddl_rolls_back_as_a_whole)
+}
+
 pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
     // Closing returns to the designer when it's still open behind — the draft is
@@ -760,16 +775,23 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     // this modal, which is a single statement that can run for hours (measured
     // 15 s on a toy matview) with `lock_timeout` bounding only the lock, not the
     // rebuild. Refusing every exit over that is a trap, not a guard.
-    let exit_dialect = move || {
-        d.preview
-            .with_untracked(|p| p.as_ref().map(|p| p.dialect))
-            .unwrap_or(SqlDialect::MySql)
-    };
+    //
+    // **The capability is defaulted, not the engine.** With no preview open
+    // there is no engine to ask, and standing `SqlDialect::MySql` in for one
+    // made this guard's correctness rest on a coincidence: `ddl_rolls_back_as_a
+    // _whole(MySql)` happens to be `false`, which is the conservative answer
+    // wanted for the absent case. MySQL 8's atomic DDL is exactly the kind of
+    // refinement that predicate exists to absorb, and the day it lands the
+    // no-preview case would start reporting "cancellable" with nothing in the
+    // diff naming this modal. A constant in place of a capability is the rule's
+    // second clause, and it leaves no comparison to grep for.
+    let cancellable =
+        move || exit_cancellable(d.preview.with_untracked(|p| p.as_ref().map(|p| p.dialect)));
     let cancel_apply = ui.schema_actions.clone();
     // An `Rc` rather than a bare closure: it now holds the actions bundle, so it
     // is no longer `Copy` and the three exits share one.
     let exit: Rc<dyn Fn()> = Rc::new(move || {
-        let cancellable = schemaic_core::ddl::ddl_rolls_back_as_a_whole(exit_dialect());
+        let cancellable = cancellable();
         match exit_action(d.applying.get_untracked(), cancellable) {
             ExitAction::Close => close_preview(d),
             ExitAction::Cancel => (cancel_apply.ddl_cancel)(),
@@ -1163,6 +1185,34 @@ mod tests {
     use schemaic_core::intel::SqlDialect;
 
     use super::test_ddl_ui as ddl_ui;
+
+    /// **With no preview there is no engine to ask**, and the exit guard must
+    /// say so itself rather than borrowing an invented one's answer.
+    ///
+    /// The second assertion is what makes the first one mean anything: a test
+    /// written only against the outcome would be green against the defect,
+    /// because `ddl_rolls_back_as_a_whole(MySql)` is `false` today and that is
+    /// the answer the absent case wants. **This cannot fail against the shape it
+    /// replaces while that stays true** — the day it changes is the day the two
+    /// disagree, and it is written to be red then rather than to be red now.
+    #[test]
+    fn an_exit_with_no_preview_is_not_cancellable_on_anyones_behalf() {
+        assert!(!super::exit_cancellable(None));
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(
+                super::exit_cancellable(Some(dialect)),
+                schemaic_core::ddl::ddl_rolls_back_as_a_whole(dialect),
+                "a preview that is open reads the capability off its own engine ({dialect:?})"
+            );
+        }
+        // And the outcome the guard produces from it: nothing is applying, so
+        // the exit closes either way — which is why the line above is the check
+        // that matters.
+        assert_eq!(
+            super::exit_action(false, super::exit_cancellable(None)),
+            super::ExitAction::Close
+        );
+    }
 
     /// After a successful Apply — and after "Open in editor" — **no** editor may
     /// still be holding its pre-apply draft.
