@@ -349,7 +349,6 @@ fn run_files(ui: Ui, target: DumpTarget) {
         // whole set.
         .select_directories()
         .title(format!("Export to {}", target.format.label()));
-    let actions = ui.schema_actions.clone();
     let asked_at = d.generation.get_untracked();
     let format = target.format;
     floem::action::open_file(dialog, move |file| {
@@ -371,10 +370,6 @@ fn run_files(ui: Ui, target: DumpTarget) {
         if tables.is_empty() {
             return;
         }
-        d.running.set(true);
-        d.error.set(None);
-        d.done.set(None);
-        d.progress.set(None);
         // The folder's own name, for the three sentences below: they are about
         // *this* folder and the outcome carries none of it, so the modal is the
         // only place that still knows. The last component rather than the whole
@@ -384,8 +379,8 @@ fn run_files(ui: Ui, target: DumpTarget) {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| folder.display().to_string());
-        let opened = d.generation.get_untracked();
-        (actions.files_run)(
+        launch_files(
+            ui.clone(),
             FilesRequest {
                 folder,
                 conn_id: target.conn_id,
@@ -393,7 +388,44 @@ fn run_files(ui: Ui, target: DumpTarget) {
                 tables,
                 format,
                 dialect: target.dialect,
+                // **Never true here.** The collision list is only knowable off
+                // the UI thread, so the first run reports `WouldReplace` and the
+                // confirm re-launches — see `FilesRequest::approved`.
+                approved: false,
             },
+            name,
+        );
+    });
+}
+
+/// Start a folder export and report its outcome into the modal.
+///
+/// **Split out of [`run_files`] so it can be re-entered**, which is what the
+/// replace confirm needs: a directory picker has no "replace?" prompt and the
+/// per-table names are `file_plan`'s to choose, so the export's first run
+/// computes the collisions, writes nothing, and comes back
+/// [`FilesOutcome::WouldReplace`]. Yes re-launches through here with the request
+/// approved, which re-reads the folder — the more correct answer anyway, since
+/// it may have changed while the question stood.
+///
+/// The re-launch takes the **same guard** the picker's own launch takes:
+/// `accept_dialog_launch`, with the generation captured before the question, so
+/// a confirm answered after the modal moved to another database cannot start an
+/// export into it.
+fn launch_files(ui: Ui, req: FilesRequest, name: String) {
+    let d = ui.dump;
+    let actions = ui.schema_actions.clone();
+    d.running.set(true);
+    d.error.set(None);
+    d.done.set(None);
+    d.progress.set(None);
+    let opened = d.generation.get_untracked();
+    {
+        let ui_retry = ui.clone();
+        let req_retry = req.clone();
+        let name_retry = name.clone();
+        (actions.files_run)(
+            req,
             Rc::new(move |outcome| {
                 if d.generation.get_untracked() != opened {
                     return;
@@ -429,10 +461,38 @@ fn run_files(ui: Ui, target: DumpTarget) {
                     } => d.error.set(Some(schemaic_core::export::files_failure_note(
                         &message, files, &name, &missing, &replaced,
                     ))),
+                    // **Nothing was written**, so this is a question and not a
+                    // report. `core::dump::folder_replace_prompt` writes it, for
+                    // the same reason the three notes above are not written
+                    // here.
+                    FilesOutcome::WouldReplace { replaced } => {
+                        let ui = ui_retry.clone();
+                        let req = req_retry.clone();
+                        let name = name_retry.clone();
+                        ui_retry.overlay.confirm.set(Some(crate::Confirm {
+                            title: "Replace files".to_string(),
+                            message: schemaic_core::dump::folder_replace_prompt(&name, &replaced),
+                            resolve: Rc::new(move |yes| {
+                                if !yes {
+                                    return;
+                                }
+                                if !crate::widgets::accept_dialog_launch(
+                                    ui.dump.running.get_untracked(),
+                                    false,
+                                    ui.dump.target.get_untracked().is_some(),
+                                    opened,
+                                    ui.dump.generation.get_untracked(),
+                                ) {
+                                    return;
+                                }
+                                launch_files(ui.clone(), req.clone().approved(), name.clone());
+                            }),
+                        }));
+                    }
                 }
             }),
         );
-    });
+    }
 }
 
 /// The dump's two option sections — what goes in the file, and what the file

@@ -275,6 +275,10 @@ pub struct DumpRequest {
 /// `folder` is a directory that already exists — the dialog that produced it
 /// only offers directories — and each table's file name is decided by
 /// [`schemaic_core::dump::file_plan`], never here.
+///
+/// `Clone` because the replace confirm re-launches the same request approved —
+/// see [`FilesRequest::approved`].
+#[derive(Clone)]
 pub struct FilesRequest {
     pub folder: std::path::PathBuf,
     pub conn_id: u64,
@@ -287,6 +291,28 @@ pub struct FilesRequest {
     /// file format.
     pub format: schemaic_core::export::ExportFormat,
     pub dialect: SqlDialect,
+    /// The user has been shown the files this export would replace and said
+    /// yes.
+    ///
+    /// **False on the launch the picker starts**, always: the file names are
+    /// [`schemaic_core::dump::file_plan`]'s to choose and the folder's contents
+    /// are only knowable off the UI thread, so the collision list cannot be in
+    /// hand when the modal launches. So the first run returns
+    /// [`FilesOutcome::WouldReplace`] having written nothing, the view raises
+    /// the shared confirm, and Yes re-launches with this set — which re-reads
+    /// the folder, and is the more correct answer anyway, since the folder may
+    /// have changed while the question stood.
+    pub approved: bool,
+}
+
+impl FilesRequest {
+    /// The same request, approved — what the confirm's Yes re-launches.
+    pub fn approved(self) -> Self {
+        FilesRequest {
+            approved: true,
+            ..self
+        }
+    }
 }
 
 /// How a folder export ended.
@@ -341,6 +367,16 @@ pub enum FilesOutcome {
         missing: Vec<String>,
         replaced: Vec<String>,
     },
+    /// **Nothing was written.** The plan's file names collide with files already
+    /// in the folder, and the request was not approved — so the export stopped
+    /// before its first `rename` and is asking.
+    ///
+    /// The arm the report-only `replaced` field could not be: the collision list
+    /// was computed at exactly the right moment and had nowhere to go but a
+    /// sentence after the fact. `schemaic_core::dump::folder_verdict` is the
+    /// decision; the view raises the shared confirm and re-launches with
+    /// [`FilesRequest::approved`].
+    WouldReplace { replaced: Vec<String> },
 }
 
 pub type FilesDoneFn = Rc<dyn Fn(FilesOutcome)>;

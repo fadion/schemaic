@@ -1014,6 +1014,81 @@ pub struct FilePlan {
     pub missing: Vec<String>,
 }
 
+/// Whether a folder export may write, or must ask the user first.
+///
+/// **The launch guard the folder export did not have.** The single-file export's
+/// consent is the save dialog's own "replace?"; a directory picker has no such
+/// prompt, and the per-table names are *constructed* by [`file_plan`] rather
+/// than typed by the user — so aiming an export at a `sql/` directory holding
+/// hand-written `orders.sql` and `customers.sql` destroyed both, with no prompt,
+/// no `.bak` and no undo. The collision list was already being computed at
+/// exactly the right moment, and used only to *report* the loss afterwards.
+///
+/// Against the app's own invariant: a destructive modal action guards its own
+/// launch, in the same step that launches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderVerdict {
+    /// Nothing in the folder is at risk, or the user has already said yes.
+    Write,
+    /// These files exist and would be replaced. Ask before the first `rename`.
+    Ask(Vec<String>),
+}
+
+/// The plan's file names that already exist in the folder — what this export is
+/// about to destroy.
+///
+/// `exists` answers "is there already a file of this name" rather than being
+/// reached for, so the census is unit-tested without a filesystem (the suite's
+/// rule) and the caller's one-line `folder.join(f).is_file()` is the only
+/// untested part.
+///
+/// Order follows the plan, not the directory: that is the order the export would
+/// replace them in, and the order the prompt should read in.
+pub fn colliding_files(plan: &FilePlan, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    plan.files
+        .iter()
+        .map(|f| f.file.clone())
+        .filter(|f| exists(f))
+        .collect()
+}
+
+/// [`FolderVerdict`] for a folder export whose collisions are already in hand.
+///
+/// Separate from [`colliding_files`] because the caller needs the list for its
+/// *report* whichever way the verdict goes, and computing it twice is how the
+/// two answers come to disagree.
+pub fn folder_verdict(approved: bool, colliding: &[String]) -> FolderVerdict {
+    if approved || colliding.is_empty() {
+        FolderVerdict::Write
+    } else {
+        FolderVerdict::Ask(colliding.to_vec())
+    }
+}
+
+/// The question [`FolderVerdict::Ask`] asks, as the confirm modal wants it.
+///
+/// Here rather than in the view for the reason every other export sentence is:
+/// a report with arms (one file, a few, more than fit) is a decision, and not
+/// one to make inside a callback the suite cannot reach.
+pub fn folder_replace_prompt(folder: &str, replaced: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let n = replaced.len();
+    let named: Vec<&str> = replaced.iter().take(SHOWN).map(String::as_str).collect();
+    let list = named.join(", ");
+    let more = n.saturating_sub(named.len());
+    let tail = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{n} {} in {folder} {} be replaced, and {} cannot be recovered: {list}{tail}.",
+        crate::text::plural(n, "file", "files"),
+        crate::text::plural(n, "will", "will"),
+        crate::text::plural(n, "it", "they"),
+    )
+}
+
 /// Plan a **folder** export — the schema tree's `Export ▸ CSV` and its siblings,
 /// which write one file per table rather than one file for the set.
 ///
@@ -1195,6 +1270,70 @@ mod tests {
             p.files[0].select.contains('*'),
             "every column, not a named list: {}",
             p.files[0].select
+        );
+    }
+
+    /// **The folder export replaced the user's files with no confirmation**,
+    /// after computing the list of what it was about to destroy and using it
+    /// only for a post-mortem. A directory picker has no "replace?" — the
+    /// single-file export's consent is the save dialog's — and the per-table
+    /// names are constructed rather than typed, so aiming an export at a `sql/`
+    /// directory holding hand-written `orders.sql` destroyed it with no prompt,
+    /// no `.bak` and no undo.
+    #[test]
+    fn a_folder_export_asks_before_replacing_a_file() {
+        let schema = schema_of(vec![table("orders"), table("customers")]);
+        let plan = file_plan(
+            &schema,
+            "shop",
+            &all(&schema),
+            ExportFormat::Csv,
+            SqlDialect::MySql,
+        );
+        let census = |exists: fn(&str) -> bool| colliding_files(&plan, exists);
+        // An empty folder is nothing to ask about.
+        assert!(census(|_| false).is_empty());
+        assert_eq!(
+            folder_verdict(false, &census(|_| false)),
+            FolderVerdict::Write
+        );
+        // One collision is.
+        assert_eq!(
+            folder_verdict(false, &census(|f| f == "orders.csv")),
+            FolderVerdict::Ask(vec!["orders.csv".to_string()])
+        );
+        // In the plan's order — the order they would be replaced in.
+        assert_eq!(
+            census(|_| true),
+            ["orders.csv".to_string(), "customers.csv".to_string()]
+        );
+        assert_eq!(
+            folder_verdict(false, &census(|_| true)),
+            FolderVerdict::Ask(vec!["orders.csv".to_string(), "customers.csv".to_string()])
+        );
+        // And once the user has said yes, it writes without asking again —
+        // otherwise the confirm's Yes cannot get past its own guard.
+        assert_eq!(
+            folder_verdict(true, &census(|_| true)),
+            FolderVerdict::Write
+        );
+    }
+
+    #[test]
+    fn the_replace_prompt_names_the_files_and_counts_the_rest() {
+        let one = folder_replace_prompt("sql", &["orders.csv".to_string()]);
+        assert!(one.contains("1 file"), "{one}");
+        assert!(one.contains("orders.csv"), "{one}");
+        assert!(one.contains("it cannot be recovered"), "{one}");
+
+        let many: Vec<String> = (0..12).map(|i| format!("t{i}.csv")).collect();
+        let msg = folder_replace_prompt("sql", &many);
+        assert!(msg.contains("12 files"), "{msg}");
+        assert!(msg.contains("and 4 more"), "{msg}");
+        assert!(msg.contains("t0.csv"), "{msg}");
+        assert!(
+            !msg.contains("t11.csv"),
+            "the tail is counted, not named: {msg}"
         );
     }
 

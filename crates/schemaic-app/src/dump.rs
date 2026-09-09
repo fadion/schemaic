@@ -278,12 +278,18 @@ pub(crate) async fn run_files(
     // Read here, once, ahead of the loop: after the first `rename` the answer is
     // contaminated by this export's own output, and a `Cancelled` or `Failed`
     // arm would report whichever prefix it happened to reach.
-    let replaced: Vec<String> = plan
-        .files
-        .iter()
-        .filter(|step| req.folder.join(&step.file).is_file())
-        .map(|step| step.file.clone())
-        .collect();
+    // **And it is the guard as well as the report now.** The list was computed
+    // here and used only for a post-mortem: `FilesOutcome` had no arm that could
+    // ask, so the files were replaced and then named. The census and the verdict
+    // are `core::dump`'s, which is where their tests are; the one line of this
+    // that touches a filesystem is the closure.
+    let replaced = schemaic_core::dump::colliding_files(&plan, |f| req.folder.join(f).is_file());
+    if let schemaic_core::dump::FolderVerdict::Ask(replaced) =
+        schemaic_core::dump::folder_verdict(req.approved, &replaced)
+    {
+        // Before the first `rename`, so the folder is untouched.
+        return FilesOutcome::WouldReplace { replaced };
+    }
 
     let total = plan.files.len();
     let mut done = 0usize;
