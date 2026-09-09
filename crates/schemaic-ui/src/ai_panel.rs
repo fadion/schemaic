@@ -95,8 +95,54 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let code_actions = CodeActions {
         insert: {
             let oq = ui.tab_actions.open_query.clone();
-            let active_db = ui.tabs_ui.active_db;
-            Rc::new(move |sql: String| (oq)(sql, active_db.get_untracked()))
+            let tabs = ui.tabs_ui.tabs;
+            let active = ui.tabs_ui.active;
+            let active_conn = ui.conn.active_conn;
+            let error_text = ui.overlay.error_modal_text;
+            let error_open = ui.overlay.error_modal_open;
+            Rc::new(move |sql: String| {
+                // **`tabsel::scoped_database`, the same rule `propose` applies
+                // twenty lines below, and for the same reason.** `open_query`
+                // builds the new tab from `default_tab_target()`, whose
+                // `conn_id` is the **active** connection, and took the database
+                // name unconditionally. Switching connections does not move the
+                // focused tab, so a chat about a tab on dev — the `dialect` memo
+                // and `propose` are both scoped to *that* tab's connection —
+                // could hand `app` to a brand-new tab on prod, which also has an
+                // `app`. Run then executed the block there, and `run_verdict`
+                // passes a `DELETE` that has a `WHERE`, so nothing on screen
+                // named the server it went to.
+                //
+                // A refusal rather than a re-target, because `place_tab` does
+                // not switch connections: a tab opened on the *focused* tab's
+                // connection would not appear in the strip at all, which the
+                // user would read as nothing having happened. `propose`'s
+                // comment already says "this is the one caller that can destroy
+                // something" — Run destroys too.
+                let conn = active_conn.get_untracked();
+                let tab = tabs.with_untracked(|v| {
+                    v.iter()
+                        .find(|t| t.id == active.get_untracked())
+                        .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
+                });
+                match schemaic_core::tabsel::scoped_database(tab, conn, None) {
+                    Some(db) => {
+                        (oq)(sql, Some(db));
+                        true
+                    }
+                    None => {
+                        error_text.set(Some(
+                            "This chat is about a tab on a different connection. A new tab \
+                             would open on the connection selected in the tree, so the \
+                             statement would run somewhere else — switch to that tab, or \
+                             pick a database on this connection, first."
+                                .to_string(),
+                        ));
+                        error_open.set(true);
+                        false
+                    }
+                }
+            })
         },
         run: ui.tab_actions.run.clone(),
         // A proposed table change goes to the DDL preview — the same modal, the

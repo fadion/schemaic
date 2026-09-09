@@ -151,8 +151,9 @@ pub fn others_to_close(tabs: &[ClosableRef], conn: u64, keep: usize) -> Vec<usiz
 /// `Db` is how the MCP endpoint ended up asking MariaDB for `chinook`.
 ///
 /// **Here, and not in each caller, because the callers are not all harmless.**
-/// Three ask this question — the AI's turn context, the terminal's DB-CLI
-/// button, and the AI proposal card — and the third pairs the answer with
+/// Four ask this question — the AI's turn context, the terminal's DB-CLI
+/// button, the AI proposal card, and the chat code block's Insert/Run — and the
+/// third pairs the answer with
 /// `edit_ctx`'s *active* connection and stamps that `conn_id` into the plan
 /// `run_ddl` executes: getting it wrong runs an `ALTER` on prod against a
 /// proposal written about dev. That one had the rule spelled out inline,
@@ -194,8 +195,13 @@ mod tests {
             Some("classicmodels".to_string())
         );
         // …and with no default to fall back on, nothing rather than the wrong
-        // connection's database. This is the case the AI proposal card turns
-        // into "switch to that tab first" rather than an `ALTER` on the wrong
+        // connection's database. **Two callers turn this `None` into a
+        // refusal**: the AI proposal card, which would otherwise run an `ALTER`
+        // on the wrong server, and the chat code block's Insert/Run, which
+        // would otherwise open a tab on the *active* connection carrying the
+        // focused tab's database name — a dev/prod pair almost always has the
+        // same database name on both, so a `DELETE … WHERE status = 'draft'`
+        // written about dev ran on prod with nothing on screen naming the
         // server.
         assert_eq!(
             scoped_database(Some((9, Some("chinook".into()))), 7, None),

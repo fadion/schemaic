@@ -453,7 +453,12 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
 /// and run it. (Copy is self-contained via the clipboard.)
 #[derive(Clone)]
 pub(crate) struct CodeActions {
-    pub insert: Rc<dyn Fn(String)>,
+    /// Put the block in a new query tab. **`false` means no tab was opened** —
+    /// the focused tab is on a connection that is not the active one, so the
+    /// only tab this could open would be on the wrong server. The refusal is
+    /// reported by the action itself; the answer here exists so *Run* knows not
+    /// to run afterwards.
+    pub insert: Rc<dyn Fn(String) -> bool>,
     pub run: Rc<dyn Fn(String)>,
     /// Send a proposed table change to the DDL preview. `Err` is what to show on
     /// the card — every failure here is the model being wrong about the table,
@@ -755,8 +760,13 @@ fn code_block(
         let run = actions.run.clone();
         links.push(
             code_action_link("Run", move || {
-                (run_insert)(run_code.clone());
-                (run)(run_code.clone());
+                // **Only if the insert really opened a tab.** `run` targets the
+                // *active* tab, so running after a refused insert would run this
+                // block in whatever tab is in front — which is the connection
+                // the insert just declined to open on.
+                if (run_insert)(run_code.clone()) {
+                    (run)(run_code.clone());
+                }
             })
             .into_any(),
         );
