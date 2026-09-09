@@ -4120,11 +4120,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 handle.spawn_blocking(move || {
                     // A diagram is one document written in one call: there is no
                     // row count, nothing to withhold and nothing to cancel, so an
-                    // empty tally is the whole of its success. `fs::write` writes
-                    // the whole document or fails before it — `partial: false`.
+                    // empty tally is the whole of its success.
+                    //
+                    // **Through `write_file_atomic`, because `fs::write` does
+                    // not** — it is `File::create`, which truncates *and then*
+                    // writes, so a full disk or a dropped share between the two
+                    // leaves the destination empty: last week's exported diagram
+                    // replaced by nothing. That function's own doc is this
+                    // paragraph, and every other user-facing write here already
+                    // uses the staged pattern (the grid export's `.part`
+                    // sibling, the single-file dump's, `.sql` saves). `partial:
+                    // false` is honest now rather than by assertion — a failed
+                    // staged write leaves the previous file exactly as it was.
                     report(
                         match req.doc.into_bytes().and_then(|b| {
-                            std::fs::write(&req.path, b).map_err(|e| format!("Export failed: {e}"))
+                            schemaic_core::persist::write_file_atomic(&req.path, &b)
+                                .map_err(|e| format!("Export failed: {e}"))
                         }) {
                             Ok(()) => schemaic_ui::ExportOutcome::Done(Default::default()),
                             Err(e) => schemaic_ui::ExportOutcome::Failed {
@@ -4318,8 +4329,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 create_ext_action(cx, move |r: Result<String, String>| blob.saved_at(epoch, r));
             handle.spawn_blocking(move || {
                 let shown = req.path.display().to_string();
+                // Staged and renamed, for the reason the ERD export above is:
+                // `fs::write` truncates before it writes, and the file the user
+                // picked is very often one they already had.
                 report(
-                    std::fs::write(&req.path, &req.bytes.bytes)
+                    schemaic_core::persist::write_file_atomic(&req.path, &req.bytes.bytes)
                         .map(|()| shown)
                         .map_err(|e| format!("Save failed: {e}")),
                 );

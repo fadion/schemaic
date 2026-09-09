@@ -1046,6 +1046,17 @@ fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T, saving: Saving) {
 ///
 /// The old `.bak` is removed **after** the new file is in place, never before:
 /// a save that fails must leave the recovery copy it found.
+///
+/// **The `.bak`, not the rename, is what makes this crash-safe**, and it is
+/// worth saying which. A rename is atomic with respect to other *processes*; it
+/// is not, on its own, ordered after the data blocks with respect to a power
+/// loss, and this path does not `sync_data` the temp before renaming the way
+/// [`write_file_atomic`] does. On XFS, btrfs, ZFS, an SMB/NFS share and NTFS the
+/// rename's metadata can reach stable storage while the contents have not — but
+/// a zero-length `connections.json` then fails `serde_json::from_slice`, comes
+/// back as [`Load::Corrupt`], and the backup is read. That is the recovery, and
+/// it is why the sync is not paid for here: [`write_file_atomic`] keeps no
+/// `.bak` by design, so it has nothing else and does sync.
 pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], saving: Saving) {
     store.ensure_parent(path);
     let tmp = sibling(path, ".tmp");

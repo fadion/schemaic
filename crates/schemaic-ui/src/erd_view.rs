@@ -2084,9 +2084,13 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                                     (say)(format!("Saved {name}"), false)
                                 }
                                 crate::ExportOutcome::Cancelled => {}
-                                // A diagram is written whole or not at all
-                                // (`fs::write`), so there is no partial file to
-                                // mention here.
+                                // A diagram is staged beside the destination
+                                // and renamed over it
+                                // (`persist::write_file_atomic`), so a failed
+                                // export leaves the previous file untouched and
+                                // there is no partial file to mention here. It
+                                // used to say `fs::write` wrote it whole, which
+                                // is the opposite of what that call does.
                                 crate::ExportOutcome::Failed { message, .. } => {
                                     (say)(message, true)
                                 }
