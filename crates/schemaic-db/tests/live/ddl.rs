@@ -525,6 +525,124 @@ async fn assert_settled(scratch: &Scratch, table: &str, target: &Target, what: &
     );
 }
 
+/// **An index the model cannot hold whole must say so, and must not be restated
+/// from the parts that were read.**
+///
+/// `IndexInfo::lossy` is the whole guard: `ddl::diff` turns an edit to a lossy
+/// index into `KeepLossyIndex` rather than a `DROP` plus a `CREATE`, and
+/// `TableInfo::create_ddl` emits the server's own statement for one. Read as
+/// `false`, both do the destructive thing quietly — an edit anywhere on the
+/// table recreates the index narrower, and a structure dump rewrites it with **no
+/// edit at all** and reports success.
+///
+/// Three shapes, each of which `pg_index` reports in a place the per-key-column
+/// query cannot see: `INCLUDE` columns live past `indnkeyatts` and are dropped
+/// by the ordinality join before `pg_attribute` is consulted;
+/// `NULLS NOT DISTINCT` is a column of `pg_index` that PostgreSQL 15 added, so
+/// it cannot even be named in a query that must also parse on 13 and 14; and a
+/// storage parameter is `pg_class.reloptions`, which nothing asked for.
+///
+/// Gated on the capability rather than the engine, the way the reorder above is
+/// — but the shapes are **PostgreSQL's**, it being the only leg in this tier
+/// that answers yes, and a fourth engine answering yes would need its own.
+pub async fn a_partly_read_index_says_so_and_is_emitted_whole(target: &'static Target) {
+    let dialect = target.engine.dialect();
+    if !ddl::publishes_index_ddl(dialect) {
+        // MySQL has no per-index `CREATE` to fall back on, so a partly-read
+        // index there can only ever be refused — a different claim, asserted by
+        // `a_refused_plan_says_where_it_stopped`.
+        return;
+    }
+    let scratch = Scratch::create(target, "ddl_lossy_index").await;
+    let t = scratch.qualified("t");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (a INTEGER, b INTEGER, c INTEGER)"
+        ))
+        .await;
+    for sql in [
+        format!("CREATE INDEX ix_inc ON {t} (a, b) INCLUDE (c)"),
+        format!("CREATE UNIQUE INDEX ix_nd ON {t} (b) NULLS NOT DISTINCT"),
+        format!("CREATE INDEX ix_ff ON {t} (c) WITH (fillfactor=70)"),
+    ] {
+        scratch.exec(&sql).await;
+    }
+
+    let current = table_of(&scratch, "t").await;
+    for name in ["ix_inc", "ix_nd", "ix_ff"] {
+        let ix = current
+            .indexes
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no index {name}; have {:?}",
+                    target.name,
+                    current.indexes.iter().map(|i| &i.name).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            ix.lossy,
+            "{}: {name} was read as complete, so an edit would recreate it \
+             narrower and a dump would rewrite it",
+            target.name
+        );
+        assert!(
+            ix.create_sql.is_some(),
+            "{}: {name} is lossy with no text to replay",
+            target.name
+        );
+    }
+
+    // And the emitted DDL keeps what the model has no field for — the dump path,
+    // which reaches `create_ddl` with no edit anywhere.
+    let ddl_text = current.create_ddl(dialect);
+    for clause in ["INCLUDE (c)", "NULLS NOT DISTINCT", "fillfactor"] {
+        assert!(
+            ddl_text.contains(clause),
+            "{}: emitted DDL dropped {clause}:\n{ddl_text}",
+            target.name
+        );
+    }
+
+    // **The dump's own round trip**: drop the table and replay the emitted text,
+    // which is exactly what a structure dump and its restore do. Before the fix
+    // the file came back with an `ix_inc` that no longer covers, an `ix_nd` that
+    // accepts two NULLs and an `ix_ff` at the default fillfactor — with no edit
+    // anywhere and the dump reporting success.
+    let before: Vec<(String, Option<String>)> = current
+        .indexes
+        .iter()
+        .map(|i| (i.name.clone(), i.create_sql.clone()))
+        .collect();
+    scratch.exec(&format!("DROP TABLE {t}")).await;
+    for stmt in ddl_text.split(
+        ";
+",
+    ) {
+        let stmt = stmt.trim().trim_end_matches(';');
+        if !stmt.is_empty() {
+            scratch.exec(stmt).await;
+        }
+    }
+    let back = table_of(&scratch, "t").await;
+    for (name, sql) in before {
+        let got = back
+            .indexes
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("{}: {name} did not come back", target.name))
+            .create_sql
+            .clone();
+        assert_eq!(
+            got, sql,
+            "{}: {name} came back as a different index",
+            target.name
+        );
+    }
+    scratch.teardown().await;
+}
+
 async fn table_of(scratch: &Scratch, name: &str) -> TableInfo {
     let schema = scratch
         .db

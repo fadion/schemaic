@@ -2475,6 +2475,9 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
                 // promise, so the index is marked lossy and the existing refusal
                 // fires instead of a silent drop-and-recreate.
                 lossy: expression,
+                // MySQL publishes no per-index `CREATE`; the model
+                // reconstructs one from the columns it read.
+                create_sql: None,
             }
         })
         .collect();
@@ -3905,6 +3908,11 @@ pub(crate) struct IdxRow {
     /// **functional** key part and nothing else: the index type is read and can
     /// be re-emitted, and a prefix and a direction always could be.
     pub lossy: bool,
+    /// The server's own whole `CREATE INDEX`, where the engine publishes one —
+    /// `pg_get_indexdef` on PostgreSQL, and `None` on MySQL, which has no such
+    /// accessor. See [`schemaic_core::schema::IndexInfo::create_sql`] for the
+    /// one job it does.
+    pub create_sql: Option<String>,
 }
 
 /// One `KEY_COLUMN_USAGE` row for a foreign key: `(table, constraint, column,
@@ -4013,10 +4021,10 @@ pub(crate) fn assemble_schema(
                 // afterwards (PostgreSQL only); the catalogue rows folded here
                 // don't carry it.
                 constraint: None,
-                // Neither engine assembled here keeps a statement per index —
-                // that is SQLite's `sqlite_master`, and SQLite doesn't come
-                // through this fold.
-                create_sql: None,
+                // MySQL keeps no statement per index and leaves this `None`;
+                // PostgreSQL's `pg_get_indexdef` is a real one, and is what
+                // lets an index the model only partly read be emitted whole.
+                create_sql: r.create_sql.clone(),
             });
         }
     }
@@ -6878,6 +6886,7 @@ mod tests {
             method: None,
             predicate: None,
             lossy: false,
+            create_sql: None,
         }
     }
 

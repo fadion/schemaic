@@ -7148,6 +7148,27 @@ pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
 }
 
+/// Does `dialect` publish a whole `CREATE INDEX` statement per index, so an
+/// index the model only **partly** read can be emitted verbatim instead of
+/// reconstructed from the parts that were read?
+///
+/// SQLite keeps the user's own statement in `sqlite_master.sql`, and PostgreSQL
+/// renders one on demand with `pg_get_indexdef`. MySQL has no per-index
+/// accessor at all — `SHOW CREATE TABLE` inlines the keys — so a partly-read
+/// index there can only be refused, never restated.
+///
+/// The question behind [`crate::schema::IndexInfo::create_sql`], asked by name
+/// where a caller needs to know *before* looking, and the reason a partly-read
+/// index is a refusal on one engine and a faithful replay on the other two.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn publishes_index_ddl(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql => false,
+    }
+}
+
 /// Is the namespace a foreign key reports — [`ForeignKeyInfo::ref_schema`] —
 /// the **database** the key lives in, rather than a namespace inside it?
 ///

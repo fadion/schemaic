@@ -1181,9 +1181,12 @@ fn index_list_sql() -> String {
                            JOIN pg_opclass o ON o.oid = q.oid \
                           WHERE NOT o.opcdefault) \
                  OR EXISTS (SELECT 1 FROM unnest(ix.indoption::int2[]) AS p(opt) \
-                             WHERE opt NOT IN (0, 3))) AS lossy, \
+                             WHERE opt NOT IN (0, 3)) \
+                 OR ix.indnatts > ix.indnkeyatts \
+                 OR ic.reloptions IS NOT NULL) AS lossy, \
                 pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS keydef, \
-                (o.opt & 1) <> 0 AS descending \
+                (o.opt & 1) <> 0 AS descending, \
+                pg_get_indexdef(ix.indexrelid) AS idxdef \
          FROM pg_index ix \
          JOIN pg_class c ON c.oid = ix.indrelid \
          JOIN pg_class ic ON ic.oid = ix.indexrelid \
@@ -1199,6 +1202,26 @@ fn index_list_sql() -> String {
          ORDER BY n.nspname, c.relname, iname, k.ord",
         user_schema_filter("n.nspname")
     )
+}
+
+/// Does the server's own `CREATE INDEX` text carry something the model has no
+/// field for, that [`index_list_sql`]'s SQL cannot ask about directly?
+///
+/// One clause today: **`NULLS NOT DISTINCT`**, which is `pg_index.
+/// indnullsnotdistinct` and therefore PostgreSQL **15** and later. The column
+/// cannot go in the query — PostgreSQL parses the whole statement before it runs
+/// it, so naming a column a 13 or 14 server does not have fails the *entire*
+/// introspection, and both are still in support. `pg_get_indexdef` is the
+/// server's own rendering and is available everywhere, so the question is asked
+/// of the text instead.
+///
+/// Uppercase, because that is how `pg_get_indexdef` writes a keyword; matching
+/// case-insensitively would let an index *named* `nulls not distinct` answer
+/// yes. It can still be spelled inside a quoted identifier, and that costs an
+/// edit withheld rather than an index destroyed — the direction
+/// [`schemaic_core::schema::IndexInfo::lossy`] is written to fail in.
+fn pg_indexdef_is_lossy(def: &str) -> bool {
+    def.contains("NULLS NOT DISTINCT")
 }
 
 fn schema_sort_key(name: &str) -> (u8, String) {
@@ -1643,7 +1666,12 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                     // generated statement carries a redundant `USING btree`.
                     method: (method != "btree" && !method.is_empty()).then_some(method),
                     predicate: r.get(7).cloned().flatten(),
-                    lossy: cell(r, 9) == "t",
+                    // The three the SQL can see, plus the one it cannot spell on
+                    // every supported server — see `pg_indexdef_is_lossy`.
+                    lossy: cell(r, 9) == "t" || pg_indexdef_is_lossy(&cell(r, 12)),
+                    create_sql: Some(cell(r, 12))
+                        .map(|d| schemaic_core::sql::terminated(&d, SqlDialect::Postgres))
+                        .filter(|d| !d.trim().is_empty() && d.trim() != ";"),
                 },
             )
         })
@@ -4902,6 +4930,53 @@ mod index_key_tests {
             sql.contains("NOT o.opcdefault"),
             "a non-default operator class is still unreadable per column"
         );
+        // And the three that were read as *absent* while `lossy` said the index
+        // was read in full. `INCLUDE` columns live past `indnkeyatts` and the
+        // ordinality join drops them; a storage parameter is `pg_class.
+        // reloptions`, which nothing asked for.
+        assert!(
+            sql.contains("ix.indnatts > ix.indnkeyatts"),
+            "an INCLUDE list is not something the model can hold"
+        );
+        assert!(
+            sql.contains("ic.reloptions IS NOT NULL"),
+            "a storage parameter is not something the model can hold"
+        );
+        // The whole statement, which is both the fourth answer and the text a
+        // lossy index is emitted from.
+        assert!(
+            sql.contains("pg_get_indexdef(ix.indexrelid) AS idxdef"),
+            "the server's own CREATE INDEX has to come back with the row"
+        );
+    }
+
+    /// **`NULLS NOT DISTINCT` cannot be asked of the catalogue**, and that is
+    /// not a shortcut: `pg_index.indnullsnotdistinct` is PostgreSQL **15** and
+    /// later, PostgreSQL parses a statement whole before running it, and 13 and
+    /// 14 are still in support — so naming the column would fail the *entire*
+    /// introspection on those servers rather than lose one clause. The question
+    /// goes to `pg_get_indexdef`'s text, which every version renders.
+    #[test]
+    fn a_nulls_not_distinct_index_is_read_as_lossy_from_its_own_ddl() {
+        assert!(pg_indexdef_is_lossy(
+            "CREATE UNIQUE INDEX nd_u ON public.nd USING btree (a) NULLS NOT DISTINCT"
+        ));
+        // The clause is not in the query, deliberately — see the doc above.
+        assert!(
+            !index_list_sql().contains("indnullsnotdistinct"),
+            "a PG 15 column in the query fails the read on 13 and 14"
+        );
+        // And an ordinary index is not lossy for it.
+        for def in [
+            "CREATE UNIQUE INDEX u ON public.t USING btree (a)",
+            "CREATE INDEX i ON public.t USING btree (a, b)",
+            // Upper-case, because that is how `pg_get_indexdef` writes a
+            // keyword: matching case-insensitively would let an index *named*
+            // for the clause answer yes.
+            "CREATE INDEX i ON public.t USING btree (nulls_not_distinct)",
+        ] {
+            assert!(!pg_indexdef_is_lossy(def), "{def}");
+        }
     }
 
     // ── Standalone objects ──────────────────────────────────────────────────

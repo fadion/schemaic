@@ -174,11 +174,14 @@ pub struct IndexInfo {
     /// unrelated edit — the same "uncertainty resolves to don't destroy" rule
     /// `ddl::pg_replaceable` follows for views.
     pub lossy: bool,
-    /// The engine's **own** `CREATE INDEX` text for this index, terminated —
-    /// which of the three only SQLite keeps (`sqlite_master.sql`), and only for
-    /// an index the user wrote. `None` for one the engine created itself to back
-    /// a `UNIQUE` or `PRIMARY KEY` constraint, which has a NULL `sql` because it
-    /// is part of the table's declaration.
+    /// The engine's **own** `CREATE INDEX` text for this index, terminated.
+    ///
+    /// Two of the three engines publish one: SQLite keeps the statement the user
+    /// wrote in `sqlite_master.sql` (`None` for an index the engine created
+    /// itself to back a `UNIQUE` or `PRIMARY KEY` constraint, which has a NULL
+    /// `sql` because it is part of the table's declaration), and PostgreSQL
+    /// renders one on demand with `pg_get_indexdef`. MySQL has no such accessor
+    /// and leaves this `None`.
     ///
     /// It exists for the one job [`IndexInfo::lossy`] otherwise makes impossible.
     /// SQLite's twelve-step rebuild drops the table, so every index has to be
@@ -187,6 +190,13 @@ pub struct IndexInfo {
     /// the same fidelity argument [`TableInfo::dependent_ddl`] makes for
     /// triggers, and it is what lets a table with a partial or expression index
     /// be edited at all (`ddl::sqlite_rebuild_sql`).
+    ///
+    /// **On PostgreSQL it is what stops a structure dump rewriting an index
+    /// nobody edited.** [`TableInfo::create_ddl`] emits from the model, and the
+    /// model has no field for an `INCLUDE` list, `NULLS NOT DISTINCT` or a
+    /// storage parameter — so a dump of `CREATE INDEX ix ON t (a, b) INCLUDE
+    /// (c, d)` restored an index that no longer covers, with no edit and no
+    /// warning. A lossy index there is emitted from this text instead.
     ///
     /// **Only ever replayed for an index the plan leaves alone.** The text is a
     /// snapshot of the index as it was; an edited one has to come from the model,
@@ -3468,6 +3478,27 @@ impl TableInfo {
             // Postgres: indexes are separate statements after the table.
             let mut out = format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"));
             for ix in non_pk {
+                // **An index the model only partly read is emitted from the
+                // server's own statement**, because emitting it from the model
+                // is not merely different but wrong: `INCLUDE`, `NULLS NOT
+                // DISTINCT` and a storage parameter have no field here, so the
+                // line below would restore an index that no longer covers, no
+                // longer forbids two NULLs, or is back at the default
+                // fillfactor — on a dump nobody edited, reported as a success.
+                // See `IndexInfo::create_sql`; a fully-read index keeps the
+                // model's emission, which is the one the designer's preview and
+                // the compare pane are written against.
+                if ix.lossy
+                    && let Some(sql) = ix
+                        .create_sql
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    out.push('\n');
+                    out.push_str(sql);
+                    continue;
+                }
                 let uniq = if ix.unique { "UNIQUE " } else { "" };
                 let using = match &ix.method {
                     Some(m) => format!(" USING {m}"),
@@ -5367,6 +5398,41 @@ mod tests {
         assert!(ddl.contains("UNIQUE KEY `email_uq` (`email`)"));
         // The PRIMARY index is emitted via PRIMARY KEY(...), not repeated as KEY.
         assert!(!ddl.contains("KEY `PRIMARY`"));
+    }
+
+    /// **An index the model only partly read is emitted from the server's own
+    /// statement**, because emitting it from the model is not merely different
+    /// but wrong. Measured on PostgreSQL 16.15: `CREATE INDEX ix ON inc (a, b)
+    /// INCLUDE (c, d)` is reported as two key rows and nothing else, so the
+    /// model's emission restored an index that no longer covers — on a
+    /// structure dump with no edit anywhere, reported as a success. `NULLS NOT
+    /// DISTINCT` and a storage parameter are the same shape.
+    #[test]
+    fn create_ddl_postgres_emits_a_lossy_index_from_the_servers_own_text() {
+        let mut t = TableInfo {
+            name: "inc".into(),
+            columns: vec![col("a", "integer", true, false)],
+            indexes: vec![IndexInfo {
+                name: "ix_inc".into(),
+                columns: vec![IndexColumn::plain("a")],
+                lossy: true,
+                create_sql: Some(
+                    "CREATE INDEX ix_inc ON public.inc USING btree (a, b) INCLUDE (c, d);".into(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sql = t.create_ddl(crate::intel::SqlDialect::Postgres);
+        assert!(sql.contains("INCLUDE (c, d)"), "{sql}");
+
+        // And a fully-read one keeps the model's emission, which is the one the
+        // designer's preview and the compare pane are written against — so the
+        // fix does not quietly change every PostgreSQL table's DDL.
+        t.indexes[0].lossy = false;
+        let sql = t.create_ddl(crate::intel::SqlDialect::Postgres);
+        assert!(!sql.contains("INCLUDE"), "{sql}");
+        assert!(sql.contains("CREATE INDEX \"ix_inc\" ON \"inc\" (\"a\");"), "{sql}");
     }
 
     #[test]
