@@ -213,8 +213,25 @@ pub fn rerun_of(
 /// actions, ready to append (with ` AND `) into the filter field. `value` is the
 /// cell's raw text, or `None` for a NULL cell.
 ///
-/// - `value = Some(v)`: `` `col` = 'v' `` (or `<> 'v'` when `negate`).
+/// - `value = Some(v)`: `` `col` = 'v' ``, or `` (`col` <> 'v' OR `col` IS NULL) ``
+///   when `negate`.
 /// - `value = None`: `` `col` IS NULL `` (or `IS NOT NULL` when `negate`).
+///
+/// **Exclude does not mean "and drop the NULLs too".** `NULL <> 'x'` is NULL,
+/// not TRUE, so the plain `<>` failed the `WHERE` for every NULL row and they
+/// left the result with nothing on screen saying so — the filter bar shows a
+/// condition about `'x'`, and a user has no reason to read it as also being
+/// about NULL. Measured on MariaDB 10.11 and PostgreSQL 16, and SQLite's
+/// three-valued logic is the same, so all three engines lost the row. The
+/// conditions are `AND`ed onto whatever is already in the bar, so a user who
+/// excluded two values lost the NULLs once and had no way back short of editing
+/// the fragment by hand.
+///
+/// The `=` arm needs no such term and must not have one: `NULL = 'x'` is also
+/// NULL, and excluding NULLs is exactly what *filter by this value* means.
+///
+/// **Parenthesised**, because the caller `AND`s it onto an existing fragment —
+/// without the parens the `OR` would swallow everything to its left.
 ///
 /// Identifiers and string literals are quoted/escaped per dialect so the fragment
 /// re-parses cleanly (reserved-word columns, embedded quotes/backslashes).
@@ -228,10 +245,13 @@ pub fn eq_condition(col: &str, value: Option<&str>, negate: bool, dialect: SqlDi
                 format!("{ident} IS NULL")
             }
         }
-        Some(v) => {
-            let op = if negate { "<>" } else { "=" };
-            format!("{ident} {op} {}", quote_value(v, dialect))
+        Some(v) if negate => {
+            format!(
+                "({ident} <> {} OR {ident} IS NULL)",
+                quote_value(v, dialect)
+            )
         }
+        Some(v) => format!("{ident} = {}", quote_value(v, dialect)),
     }
 }
 
@@ -1147,9 +1167,13 @@ mod tests {
             eq_condition("country", Some("USA"), false, SqlDialect::MySql),
             "`country` = 'USA'"
         );
+        // **Exclude keeps the NULLs.** `NULL <> 'USA'` is NULL, not TRUE, so a
+        // plain `<>` failed the `WHERE` for every NULL row — measured on
+        // MariaDB 10.11 and PostgreSQL 16, and SQLite is the same. Parenthesised
+        // because the caller `AND`s this onto whatever is already in the bar.
         assert_eq!(
             eq_condition("country", Some("USA"), true, SqlDialect::MySql),
-            "`country` <> 'USA'"
+            "(`country` <> 'USA' OR `country` IS NULL)"
         );
     }
 

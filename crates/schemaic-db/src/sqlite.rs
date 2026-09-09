@@ -9483,3 +9483,72 @@ mod designer_path_tests {
         assert_eq!(ran, 0);
     }
 }
+
+/// **The filter bar's *Exclude this value*, run against an engine.**
+///
+/// `core::filter` is pure and its own tests can only pin the *text* of the
+/// fragment it emits — which is exactly how the bug survived: the text was
+/// wrong, and the assertion agreed with it. Three-valued logic is the engine's
+/// rule, so the rows are the only thing worth asserting, and SQLite is the one
+/// backend this workspace may ask in a unit test.
+#[cfg(test)]
+mod filter_exclusion_tests {
+    use super::tests::shared_memory;
+    use schemaic_core::filter::{build_query, eq_condition};
+    use schemaic_core::intel::SqlDialect;
+
+    /// `NULL <> 'x'` is NULL, not TRUE, so a plain `<>` failed the `WHERE` for
+    /// every NULL row: excluding one value silently took the empty ones with
+    /// it, with nothing on screen saying so. The whole path is exercised —
+    /// `eq_condition` into `build_query`'s rewrite — because the fragment is
+    /// `AND`ed onto the statement and an unparenthesised `OR` would be a second,
+    /// worse bug.
+    #[test]
+    fn excluding_a_value_keeps_the_rows_that_have_none() {
+        let (keeper, _db) = shared_memory("filter_exclude_nulls");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, keep INTEGER);
+                 INSERT INTO t VALUES (1, 'x', 1), (2, 'y', 1), (3, NULL, 1);",
+            )
+            .expect("seed");
+
+        let rows = |sql: &str| -> Vec<i64> {
+            let mut st = keeper.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let it = st.query_map([], |r| r.get::<_, i64>(0)).expect("query");
+            it.map(|r| r.expect("row")).collect()
+        };
+        // The premise: all three rows are in the result to begin with.
+        assert_eq!(rows("SELECT id FROM t ORDER BY id"), [1, 2, 3]);
+
+        // The base statement already has a `WHERE`, so the fragment really is
+        // `AND`ed onto something — the case the parentheses are for.
+        let base = "SELECT id FROM t WHERE keep = 1";
+
+        let sql = build_query(
+            base,
+            &eq_condition("a", Some("x"), true, SqlDialect::Sqlite),
+            &[],
+            SqlDialect::Sqlite,
+        )
+        .expect("rewritable")
+        .expect("the fragment re-parses");
+        assert_eq!(
+            rows(&format!("{sql} ORDER BY id")),
+            [2, 3],
+            "excluding 'x' dropped the NULL row as well: {sql}"
+        );
+
+        // And *filtering by* a value still excludes the NULLs, which is what
+        // that gesture means — the `=` arm must not grow the same term.
+        let sql = build_query(
+            base,
+            &eq_condition("a", Some("x"), false, SqlDialect::Sqlite),
+            &[],
+            SqlDialect::Sqlite,
+        )
+        .expect("rewritable")
+        .expect("the fragment re-parses");
+        assert_eq!(rows(&format!("{sql} ORDER BY id")), [1]);
+    }
+}
