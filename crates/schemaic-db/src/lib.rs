@@ -3810,14 +3810,23 @@ pub(crate) type MyColRow = (
 pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
     let (table, name, type_name, nullable, key, default, extra, collation, comment, generated) = r;
     let extra_lc = extra.to_ascii_lowercase();
-    let numeric_or_bool = {
-        let t = type_name.to_ascii_lowercase();
-        [
-            "int", "dec", "num", "float", "double", "real", "bit", "bool",
-        ]
-        .iter()
-        .any(|p| t.starts_with(p))
-    };
+    // **`classify_column_type`, not a prefix list.** This was eight prefixes
+    // matched with `starts_with`, and MySQL's `COLUMN_TYPE` for four of its six
+    // integer types begins with none of them: `bigint`, `tinyint`, `smallint`
+    // and `mediumint` all fell to the quoting arm below, so on MySQL 8.4.11 a
+    // `BIGINT DEFAULT 7` came back as `'7'` — and `BOOLEAN`, which is
+    // `tinyint(1)`, with it. Nothing broke on apply (the server normalises the
+    // quoted form back to a number), but it is the text the designer shows and
+    // the text a MySQL-to-MariaDB comparison diffs, so every such column
+    // reported a difference that did not exist.
+    //
+    // The classifier is the one place that knows a type keyword from its
+    // spelling, and it is already exhaustive over both engines' vocabularies.
+    let numeric_or_bool = matches!(
+        schemaic_core::schema::classify_column_type(&type_name),
+        schemaic_core::schema::ColumnTypeClass::Numeric
+            | schemaic_core::schema::ColumnTypeClass::Boolean
+    );
     let default = default.and_then(|d| {
         if mariadb {
             // Already SQL text. MariaDB writes a *missing* default as SQL NULL
@@ -6974,10 +6983,54 @@ mod tests {
 
     /// A numeric default is a literal in both servers — quoting it would change
     /// the type of the stored default.
+    ///
+    /// **Every one of MySQL's numeric spellings**, because the list this used to
+    /// match against covered `int` and missed the four that do not begin with
+    /// it. Measured on MySQL 8.4.11: `COLUMN_TYPE` is `bigint` / `tinyint` /
+    /// `smallint` / `mediumint` / `tinyint(1)`, and `COLUMN_DEFAULT` is the bare
+    /// value.
     #[test]
     fn a_numeric_default_is_never_quoted() {
-        let c = mysql_column(my_row("int(11)", Some("0"), ""), false).column;
-        assert_eq!(c.default.as_deref(), Some("0"));
+        for (ty, d) in [
+            ("int(11)", "0"),
+            ("int", "5"),
+            ("bigint", "7"),
+            ("tinyint", "1"),
+            ("smallint", "2"),
+            ("mediumint", "3"),
+            // `BOOLEAN` — the catalogue calls it what it is.
+            ("tinyint(1)", "1"),
+            ("bigint", "-9"),
+            ("bigint unsigned", "9"),
+            ("decimal(10,2)", "1.50"),
+            ("double", "0.5"),
+            ("float", "1"),
+            ("bit(1)", "b'1'"),
+        ] {
+            let c = mysql_column(my_row(ty, Some(d), ""), false).column;
+            assert_eq!(
+                c.default.as_deref(),
+                Some(d),
+                "{ty} DEFAULT {d} came back quoted"
+            );
+        }
+    }
+
+    /// And the other direction, which is what stops the fix from being "never
+    /// quote anything": a string default on MySQL arrives unquoted and
+    /// indistinguishable from a column reference, so it has to be quoted here.
+    #[test]
+    fn a_non_numeric_default_is_still_quoted() {
+        for (ty, d, want) in [
+            ("varchar(20)", "draft", "'draft'"),
+            ("char(2)", "gb", "'gb'"),
+            ("text", "7", "'7'"),
+            ("date", "2026-01-01", "'2026-01-01'"),
+            ("enum('a','b')", "a", "'a'"),
+        ] {
+            let c = mysql_column(my_row(ty, Some(d), ""), false).column;
+            assert_eq!(c.default.as_deref(), Some(want), "{ty} DEFAULT {d}");
+        }
     }
 
     /// The two ways MySQL says "this default is an expression": the 8.0
