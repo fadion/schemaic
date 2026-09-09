@@ -60,6 +60,18 @@ impl<T> Outcome<T> {
             stmt: StmtOutcome::Ok,
         }
     }
+
+    /// This outcome as a **read** on the pinned connection may report it —
+    /// [`tx::read_outcome`], which is where the reasoning is.
+    ///
+    /// Every read path on a `Session` goes through here, so the two that never
+    /// call `ensure_tx` cannot report a transaction they did not open. One
+    /// method rather than a line in each, because a third read path added later
+    /// inherits the rule instead of having to remember it.
+    fn into_read(mut self, in_tx: bool) -> Self {
+        self.stmt = tx::read_outcome(in_tx, self.stmt);
+        self
+    }
 }
 
 enum Backend {
@@ -644,20 +656,25 @@ impl Session {
         // for one more that is specific to this call: the overwhelmingly common
         // cancellation here is the panel being dismissed, which happens far more
         // often than a read is genuinely interrupted mid-flight, and `NotSent`
-        // is the one outcome that leaves the transaction alone with no
-        // bookkeeping at all.
+        // is the one outcome that leaves an *open* transaction alone with no
+        // bookkeeping at all. Between transactions it does not: `NotSent` folds
+        // to `Open { stmts: 0 }`, so a read cancelled before dispatch put a
+        // phantom transaction on the pill — see `Outcome::into_read`.
+        let in_tx = || self.in_tx.load(Ordering::SeqCst);
         if cancel.is_cancelled() {
             return Outcome {
                 result: Err(DbError::Cancelled),
                 stmt: StmtOutcome::NotSent,
-            };
+            }
+            .into_read(in_tx());
         }
         let mut guard = self.inner.lock().await;
         if cancel.is_cancelled() {
             return Outcome {
                 result: Err(DbError::Cancelled),
                 stmt: StmtOutcome::NotSent,
-            };
+            }
+            .into_read(in_tx());
         }
         // See `fence_read`: a cancelled read on this connection would otherwise
         // abort the user's transaction on PostgreSQL.
@@ -685,11 +702,20 @@ impl Session {
                 }
             }
         };
-        if fenced {
+        // **And through `into_read` on the way out.** `fence_read` cannot set a
+        // savepoint when there is no transaction to fence — PostgreSQL answers
+        // `ERROR: SAVEPOINT can only be used in transaction blocks`, which
+        // `run_scope_sql` discards — so this read is unfenced there, and a
+        // cancellation then folded `Idle` to `Poisoned`: a tab reading "Tx
+        // aborted" with Commit hidden and no exit that kept the work which came
+        // next. MySQL accepts the savepoint outside a transaction, which is what
+        // hid it.
+        let out = if fenced {
             Session::classify_fenced(&mut guard, result).await
         } else {
             Session::classify(&mut guard, result).await
-        }
+        };
+        out.into_read(in_tx())
     }
 
     /// Re-read just-edited rows **on this connection** — the only one that can
@@ -733,11 +759,15 @@ impl Session {
                 }
             }
         };
-        if fenced {
+        // The same `into_read` as `fetch_blob`, and for the same reason: this
+        // path calls no `ensure_tx` either, so it must not report a transaction
+        // it did not open.
+        let out = if fenced {
             Session::classify_fenced(&mut guard, result).await
         } else {
             Session::classify(&mut guard, result).await
-        }
+        };
+        out.into_read(self.in_tx.load(Ordering::SeqCst))
     }
 }
 

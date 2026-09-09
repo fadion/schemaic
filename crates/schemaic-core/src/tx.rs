@@ -114,6 +114,31 @@ pub enum StmtOutcome {
     /// [`TxAfter::Ask`] is what routes it to the probe, and this is how the
     /// probe's answer reaches the pill, which cannot ask.
     OkAndClosed,
+    /// **Nothing happened to the transaction, whatever happened to the
+    /// statement** — because there was no transaction for it to happen to.
+    ///
+    /// The answer for the two session entry points that never call
+    /// `ensure_tx`: `fetch_blob` and `refetch_rows`. Every other fold arm rests
+    /// on the premise that "the app issues `BEGIN` lazily, so the first
+    /// statement lands as the first statement of a fresh transaction" — true of
+    /// `fetch_query`, which `ensure_tx` always precedes, and false of a read on
+    /// the pinned connection, which opens nothing. Without this variant those
+    /// reads *invented* a transaction:
+    ///
+    /// * a cancelled read between transactions folded `Idle` to
+    ///   `Poisoned { stmts: 0 }` on PostgreSQL — a tab with no transaction
+    ///   reading "Tx aborted", `Poisoned` sticky for every later outcome
+    ///   including `Ok`, Commit **hidden** by `can_commit()`, and every exit the
+    ///   UI then offered rolling back the real work that followed. MySQL hid it:
+    ///   `SAVEPOINT` outside a transaction is accepted there, so the read was
+    ///   fenced and the fold was harmless.
+    /// * a read cancelled *before dispatch* folded `Idle` to `Open { stmts: 0 }`
+    ///   on both engines, so the pill read "0 Open", `guard_tx` prompted about a
+    ///   transaction on every tab close, mode switch and database switch, and
+    ///   `ddl_blocking_tabs` told a designer Apply to queue behind it.
+    ///
+    /// See [`read_outcome`], which is where a read path asks for this.
+    Untouched,
     /// The connection itself died — idle-in-transaction timeout, server
     /// restart, network drop. Whatever was in the transaction is gone.
     ConnectionLost,
@@ -234,6 +259,8 @@ impl TxState {
                     // The session probed and the server says the transaction is
                     // gone — see [`StmtOutcome::OkAndClosed`].
                     StmtOutcome::OkAndClosed => TxState::Idle,
+                    // There was no transaction, so nothing happened to one.
+                    StmtOutcome::Untouched => self,
                     // A statement that didn't apply doesn't count. On Postgres it
                     // also poisons: both a server error and a cancellation leave
                     // the transaction in the aborted state.
@@ -352,6 +379,31 @@ pub fn tx_open_after(engine: TxEngine, sql: &str) -> Option<bool> {
         TxAfter::Unchanged | TxAfter::Ask => None,
         TxAfter::Closed => Some(false),
         TxAfter::Open => Some(true),
+    }
+}
+
+/// The outcome a read on the pinned connection may report, given whether the
+/// session actually has a transaction open.
+///
+/// **The seam the fold's own premise does not cover.**
+/// [`TxState::on_statement`] merges `Idle` with `Open` because "the app issues
+/// `BEGIN` lazily, so the first statement lands as the first statement of a
+/// fresh transaction" — true of `fetch_query`, which `ensure_tx` always
+/// precedes, and false of `Session::fetch_blob` and `Session::refetch_rows`,
+/// which never call it. Clicking a `bytea` cell in the ordinary state *between*
+/// transactions — right after Commit — and then dismissing the panel therefore
+/// left a PostgreSQL tab reading "Tx aborted" with Commit hidden and every exit
+/// the UI offered rolling back the real work that came next.
+///
+/// `in_tx` is the session's own flag, read under the lock the `BEGIN` goes out
+/// on, so this is the connection's answer rather than a guess about it.
+/// [`StmtOutcome::ConnectionLost`] passes through: a dead connection is a fact
+/// about the connection, not about a transaction, and the tab has to hear it.
+pub fn read_outcome(in_tx: bool, stmt: StmtOutcome) -> StmtOutcome {
+    match stmt {
+        _ if in_tx => stmt,
+        StmtOutcome::ConnectionLost => stmt,
+        _ => StmtOutcome::Untouched,
     }
 }
 
@@ -1620,6 +1672,87 @@ mod tests {
             ),
             TxState::Idle
         );
+    }
+
+    /// **A read on the pinned connection cannot report a transaction it did not
+    /// open**, which is what poisoned a PostgreSQL tab permanently.
+    ///
+    /// The state is the ordinary one *between* transactions — right after
+    /// Commit, with the session still pinned and the grid still showing rows.
+    /// Click a `bytea` cell: `fence_read` sends `SAVEPOINT schemaic_w` and
+    /// PostgreSQL 16.15 answers `ERROR: SAVEPOINT can only be used in
+    /// transaction blocks` (measured), so the read is unfenced. Dismiss the
+    /// panel while the bytes are still coming — Escape, the ✕, the footer, or
+    /// clicking a second binary cell, which `fence_read`'s own doc calls the
+    /// common case — and the fold turned `Idle` into `Poisoned { stmts: 0 }`.
+    /// From there `Poisoned` is terminal for **every** outcome including `Ok`,
+    /// `can_commit()` is false so the Commit segment is *hidden*, and the only
+    /// exits the UI offers — Rollback, closing the tab, switching mode or
+    /// database — all roll back the genuine transaction the user's next
+    /// statements opened. MySQL hid it: `SAVEPOINT` outside a transaction is
+    /// accepted there (measured on MariaDB 10.11.14), so the read was fenced.
+    ///
+    /// Asserted as the **composition** — `read_outcome` then the fold — because
+    /// either half alone is green: `on_statement(Postgres, "SELECT", Cancelled)`
+    /// is *supposed* to poison, and the pinned session has no test seam at all
+    /// (`Session::open` refuses SQLite, so the in-memory backend cannot reach
+    /// it). The one step this cannot cover is the call in `Session::fetch_blob`.
+    #[test]
+    fn a_read_outside_a_transaction_leaves_the_state_alone() {
+        let cancelled = [
+            StmtOutcome::Cancelled,
+            StmtOutcome::Failed,
+            StmtOutcome::NotSent,
+            StmtOutcome::Ok,
+        ];
+        for engine in [TxEngine::MySql, TxEngine::Postgres] {
+            for stmt in cancelled {
+                // No transaction: the pill must not move, whatever happened.
+                let out = read_outcome(false, stmt);
+                assert_eq!(out, StmtOutcome::Untouched, "{engine:?} {stmt:?}");
+                assert_eq!(
+                    TxState::Idle.on_statement(engine, "SELECT", out),
+                    TxState::Idle,
+                    "{engine:?} {stmt:?}: invented a transaction"
+                );
+                // …including the phantom "0 Open" that made `guard_tx` prompt
+                // on every tab close and told a designer Apply to queue.
+                assert!(
+                    !TxState::Idle.on_statement(engine, "SELECT", out).is_open(),
+                    "{engine:?} {stmt:?}"
+                );
+                // A transaction that really is open keeps its own semantics —
+                // the fence and `Poisoned` are right there.
+                assert_eq!(read_outcome(true, stmt), stmt, "{engine:?} {stmt:?}");
+            }
+            // Poisoning still happens where it should: inside a transaction.
+            assert_eq!(
+                TxState::Open { stmts: 2 }.on_statement(
+                    TxEngine::Postgres,
+                    "SELECT",
+                    read_outcome(true, StmtOutcome::Cancelled)
+                ),
+                TxState::Poisoned { stmts: 2 }
+            );
+            // A dead connection is a fact about the connection, and the tab has
+            // to hear it either way.
+            assert_eq!(
+                read_outcome(false, StmtOutcome::ConnectionLost),
+                StmtOutcome::ConnectionLost
+            );
+        }
+        // And `Untouched` really is neutral, from every state.
+        for state in [
+            TxState::Idle,
+            TxState::Open { stmts: 4 },
+            TxState::Poisoned { stmts: 1 },
+            TxState::Lost,
+        ] {
+            assert_eq!(
+                state.on_statement(TxEngine::Postgres, "SELECT", StmtOutcome::Untouched),
+                state
+            );
+        }
     }
 
     /// **The session's flag and the pill agree about the *direction*, which is
