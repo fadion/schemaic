@@ -5432,7 +5432,10 @@ mod tests {
         t.indexes[0].lossy = false;
         let sql = t.create_ddl(crate::intel::SqlDialect::Postgres);
         assert!(!sql.contains("INCLUDE"), "{sql}");
-        assert!(sql.contains("CREATE INDEX \"ix_inc\" ON \"inc\" (\"a\");"), "{sql}");
+        assert!(
+            sql.contains("CREATE INDEX \"ix_inc\" ON \"inc\" (\"a\");"),
+            "{sql}"
+        );
     }
 
     #[test]

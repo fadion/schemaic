@@ -232,6 +232,24 @@ impl Target {
         )
     }
 
+    /// A handle on this server as **some other account**, attached to no
+    /// database.
+    ///
+    /// The one assertion that can tell a created-with-the-right-password
+    /// account from a created-with-a-different-one: both statements are
+    /// accepted by the server, so only a login distinguishes them. See
+    /// `users::a_created_account_can_log_in_with_the_password_it_was_given`.
+    pub fn db_as(&self, user: &str, password: &str) -> Db {
+        Db::from_parts(
+            self.engine,
+            self.var("HOST", "127.0.0.1"),
+            self.port(),
+            user.to_string(),
+            password.to_string(),
+            String::new(),
+        )
+    }
+
     /// The account the suite connects as — which is also the one account every
     /// leg is guaranteed to have, and so the one a read-only test can name.
     pub fn user(&self) -> String {

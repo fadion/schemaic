@@ -242,11 +242,31 @@ impl ScratchAccount {
         suffix: &str,
         kind: PrincipalKind,
     ) -> ScratchAccount {
+        // 32 bytes on MySQL 8, 80 on MariaDB, 63 on PostgreSQL. Checked in
+        // `create_with_password`, which every account goes through.
+        Self::create_with_password(target, scratch, suffix, kind, "").await
+    }
+
+    /// The same path, with a password — the branch of `account_draft_sql` that
+    /// writes a credential to a server, and the one no test in the workspace had
+    /// ever executed against one.
+    ///
+    /// The stated reason for leaving it out was leakage into the statement and
+    /// into a failure message. It does not survive contact with the tier's own
+    /// conventions: `endpoint.rs` already carries the `schemaic`/`schemaic`
+    /// credential for all three legs as a default, and `run` already prints
+    /// `statements: {stmts:?}` verbatim on any refusal. A scratch account's
+    /// throwaway password is strictly less sensitive than the credential the
+    /// suite is already holding.
+    async fn create_with_password(
+        target: &'static Target,
+        scratch: &Scratch,
+        suffix: &str,
+        kind: PrincipalKind,
+        password: &str,
+    ) -> ScratchAccount {
         let name = format!("{PREFIX}{}_{}_{suffix}", std::process::id(), target.name);
         assert_scratch_name(&name);
-        // 32 bytes on MySQL 8, 80 on MariaDB, 63 on PostgreSQL. Caught here
-        // rather than as a truncated name two tests then share — and MySQL's
-        // limit is the one that bites, since the prefix alone is twelve.
         assert!(
             name.len() <= 32,
             "account name {name:?} is {} bytes; shorten the suffix",
@@ -256,8 +276,7 @@ impl ScratchAccount {
         let draft = AccountDraft {
             name: name.clone(),
             kind,
-            // No password: it would be in the statement and in any failure
-            // message, and nothing here logs in as this account.
+            password: password.to_string(),
             ..Default::default()
         };
         let principal = draft.principal(dialect);
@@ -416,6 +435,63 @@ pub async fn a_created_account_is_one_the_server_then_lists(target: &'static Tar
     assert!(
         list.list.iter().any(|p| p.name == account.principal.name),
         "{}: the account this test created is not in the list",
+        target.endpoint()
+    );
+
+    account.teardown().await;
+    scratch.teardown().await;
+}
+
+/// **The one branch that writes a credential to a server, and a login to prove
+/// what landed there.**
+///
+/// `ScratchAccount::create` drafted `password: String::new()`, and
+/// `account_draft_sql` emits the `IDENTIFIED BY` / `PASSWORD` clause only for a
+/// non-empty one — so every `CREATE USER`/`CREATE ROLE` this tier had ever run
+/// was the passwordless form, on all three legs. Two findings sat on exactly
+/// that branch and neither could have been caught here: a `*`-containing
+/// replacement creating a **real account with a mangled password**, and a
+/// backslash doubled unconditionally for MySQL.
+///
+/// **A login is the assertion, not the statement's success.** The server accepts
+/// `CREATE USER u IDENTIFIED BY 'hun'` exactly as readily as
+/// `… BY 'hunter2***'`; only connecting as the account tells the two apart, and
+/// that is precisely the failure mode — an account that exists, with a
+/// credential nobody holds, and no `ALTER USER` path in the app to repair it.
+///
+/// The password carries `'`, `\` and `*` on purpose: the quote and the
+/// backslash are `ddl_string`'s job (and MySQL's `NO_BACKSLASH_ESCAPES` is where
+/// that went wrong), and the asterisk is the character the account editor's mask
+/// is written in.
+pub async fn a_created_account_can_log_in_with_the_password_it_was_given(target: &'static Target) {
+    let scratch = Scratch::create(target, "pwlogin").await;
+    // Awkward rather than representative, for the reason the DDL shapes are.
+    let password = r"p'w\d***x";
+    let account =
+        ScratchAccount::create_with_password(target, &scratch, "p", PrincipalKind::User, password)
+            .await;
+
+    let as_them = target.db_as(&account.principal.name, password);
+    as_them
+        .ping(std::time::Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: the account was created but will not accept the password it \
+                 was given: {e}",
+                target.endpoint()
+            )
+        });
+
+    // And the negative, so the login above cannot be passing because the server
+    // accepts anything: a *different* password must be refused.
+    let wrong = target.db_as(&account.principal.name, "not-the-password");
+    assert!(
+        wrong
+            .ping(std::time::Duration::from_secs(10))
+            .await
+            .is_err(),
+        "{}: the server accepted a password this account was never given",
         target.endpoint()
     );
 
