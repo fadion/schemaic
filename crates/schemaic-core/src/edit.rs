@@ -187,6 +187,37 @@ impl EditModel {
         self.editable(ci) && !row_deleted
     }
 
+    /// May a **generated** text value be staged into this cell — AI Fill Value?
+    ///
+    /// [`EditModel::takes_bytes`]' sibling, and it exists for the same reason
+    /// and the same failure. Marking a row purges it from the staged edits, so a
+    /// value staged afterwards puts one back, and the commit then carries a
+    /// `RowDelete` **and** a `RowEdit` for one row: `GridWrite::plan` runs
+    /// deletes first, the update matches nothing, `one_row_verdict` refuses it,
+    /// and the whole batch rolls back — taking every other row the user marked
+    /// and every other staged edit with it. The error names an `UPDATE` that
+    /// affected 0 rows; nothing on screen says which row, and the offending edit
+    /// is a green cell on a red-washed row the user has already decided is going
+    /// away.
+    ///
+    /// Three of the four staging paths asked and this one did not: `start_edit`
+    /// refuses a marked row, `stage_bytes` refuses one and its doc spells out
+    /// the consequence above verbatim, and paste counts such a cell as
+    /// `skipped_deleted`. AI Fill went through `stage_set`, four lines with no
+    /// gate, and the menu's own `fill_enabled` was `text_editable` alone.
+    ///
+    /// **Down here rather than in the grid** so the offer and the sink cannot
+    /// come to differ: the menu entry and the write ask the same function. A
+    /// test written against `stage_set` could not fail — it is private to a
+    /// struct no test can construct — which is the argument for pushing the
+    /// decision into the model.
+    ///
+    /// A pending new row passes `false`, as it does for bytes: there is no
+    /// committed row to mark.
+    pub fn takes_generated_text(&self, ci: usize, row_deleted: bool) -> bool {
+        self.text_editable(ci) && !row_deleted
+    }
+
     /// The `tables` index that column `ci` writes to, if editable.
     pub fn table_index(&self, ci: usize) -> Option<usize> {
         self.col_table.get(ci).copied().flatten()
@@ -2159,6 +2190,58 @@ mod tests {
         assert!(
             !m.takes_bytes(99, false),
             "and past the end of the result is not a write either"
+        );
+    }
+
+    /// **The fourth staging path, which was the one with no gate.**
+    /// `start_edit` refuses a marked row, `stage_bytes` refuses one (the test
+    /// above), and paste counts such a cell as `skipped_deleted` — AI Fill Value
+    /// went through `stage_set`, four lines with no `del_rows` question, and the
+    /// menu's own entry asked `text_editable` alone. Marking a row leaves the
+    /// selection where it is, so the entry was live on a red-washed row: the
+    /// fill staged a green cell on it, and Ctrl+Enter then carried a `RowDelete`
+    /// and a `RowEdit` for one row — deletes first, the update matching nothing,
+    /// and the whole batch rolled back over every other row the user had marked.
+    ///
+    /// **`text_editable`, not `editable`**, which is the mirror of the blob
+    /// gate's choice: this path puts a model's *text* in a cell, and a binary
+    /// column is precisely what must not take one.
+    #[test]
+    fn a_row_marked_for_deletion_takes_no_generated_text() {
+        let r = rs(vec![
+            col("id", "INT", "docs", true, false),
+            col("note", "VARCHAR(20)", "docs", false, false),
+            col("photo", "BLOB", "docs", false, true),
+            col("computed", "INT", "", false, false), // no base table
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "docs").then(|| {
+                schema_with_pk(
+                    "docs",
+                    &["id"],
+                    &[("id", "int"), ("note", "varchar(20)"), ("photo", "blob")],
+                )
+            })
+        };
+        let m = analyze_edit(&r, schema);
+
+        assert!(
+            m.takes_generated_text(1, false),
+            "a text column of a live row is what the feature is for"
+        );
+        assert!(
+            !m.takes_generated_text(1, true),
+            "and the same column of a row on its way out takes nothing"
+        );
+        assert!(
+            !m.takes_generated_text(2, false),
+            "a binary column takes no generated text, doomed or not — this gate \
+             is text_editable, unlike the blob one beside it"
+        );
+        assert!(!m.takes_generated_text(3, false), "no base table, no write");
+        assert!(
+            !m.takes_generated_text(99, false),
+            "past the end is not one"
         );
     }
 

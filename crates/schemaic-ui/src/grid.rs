@@ -912,7 +912,24 @@ impl GridState {
     /// otherwise, when the model returns a value equal to the current one (common
     /// when editing an already-coherent row), nothing would appear to happen.
     /// Manual inline edits use [`GridState::stage`], which clears when typed back to original.
+    ///
+    /// **Refused on a row marked for deletion**, the way `stage_bytes` and
+    /// `start_edit` already refuse one — through the same predicate the menu's
+    /// own entry asks, so the offer and the sink cannot come to differ. Staging
+    /// here after a Delete puts the row back into `dirty`, and the commit then
+    /// carries a `RowDelete` *and* a `RowEdit` for it: deletes run first, the
+    /// update matches nothing, and the 1-row net rolls the **whole batch** back
+    /// — every other marked row and every other staged edit with it. See
+    /// `EditModel::takes_generated_text`.
     fn stage_set(&self, di: usize, ci: usize, val: Option<String>) {
+        let deleted = self.del_rows.with_untracked(|d| d.contains(&di));
+        if !self
+            .edit_model
+            .get_untracked()
+            .takes_generated_text(ci, deleted)
+        {
+            return;
+        }
         self.dirty.update(|d| {
             d.insert((di, ci), CellEdit::from_opt(val));
         });
@@ -7776,11 +7793,21 @@ fn grid_toolbar(
                     .set(Some(anchor_below(ai_origin.get_untracked())));
                 // AI Fill Value targets the active cell — enabled only when an
                 // editable cell is selected (a read-only/expression cell can't be
-                // filled).
+                // filled) **and its row is not marked for deletion**. Marking a
+                // row leaves the selection where it is, so the entry was live on
+                // a red-washed row; the fill then staged an edit the commit
+                // could not reconcile with the delete and rolled the whole batch
+                // back. The same predicate `stage_set` asks.
                 let fill_enabled = gs
                     .active
                     .get_untracked()
-                    .map(|(_, ci)| gs.edit_model.get_untracked().text_editable(ci))
+                    .map(|(disp, ci)| {
+                        let di = gs.order.get_untracked().get(disp).copied().unwrap_or(disp);
+                        let deleted = gs.del_rows.with_untracked(|d| d.contains(&di));
+                        gs.edit_model
+                            .get_untracked()
+                            .takes_generated_text(ci, deleted)
+                    })
                     .unwrap_or(false);
                 // Every entry in this menu puts real values in a prompt: Fill and
                 // Insert carry the row being completed, Seed samples the table
