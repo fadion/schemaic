@@ -180,7 +180,110 @@ const REDACTION_NOTE: &str = "Values the engine quoted back have been replaced w
 /// user's own SQL back is deliberately left whole: that is what the user typed,
 /// not what the table stores, and it is the most useful error there is.
 pub fn redact_engine_error(msg: &str) -> String {
-    msg.lines().map(redact_line).collect::<Vec<_>>().join("\n")
+    close_split_values(msg)
+        .lines()
+        .map(redact_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The paired anchors whose **value** is attacker-controlled and can therefore
+/// contain a newline. Each is a rule in [`redact_line`] below; the closing
+/// phrase is what tells this pass the value has ended.
+///
+/// `)=(` carries the `Key (` guard its rule does, for the same reason: `)=(` is
+/// also ordinary SQL.
+const SPLIT_VALUE_ANCHORS: &[(&str, &str, Option<&str>)] = &[
+    ("Duplicate entry '", "' for key ", None),
+    (" value: '", "'", None),
+    ("Failing row contains (", ")", None),
+    (")=(", ")", Some("Key (")),
+    ("Token \"", "\" is invalid", None),
+];
+
+/// The closing phrase of a value this line **opens and does not close**.
+fn open_value_end(line: &str) -> Option<&'static str> {
+    SPLIT_VALUE_ANCHORS
+        .iter()
+        .filter(|(_, _, guard)| guard.is_none_or(|g| line.contains(g)))
+        .find_map(|(start, end, _)| {
+            let i = line.find(start)?;
+            let after = i + start.len();
+            (!line[after..].contains(end)).then_some(*end)
+        })
+}
+
+/// Fold a value a newline split across two lines back onto one, before any rule
+/// runs.
+///
+/// **A line boundary is not a message boundary for the value.** Every rule in
+/// [`redact_line`] needs both anchors inside one line — deliberately, so an
+/// anchor cannot reach across into the next line's text — and a stored value
+/// containing a newline is therefore indistinguishable from a truncated message.
+/// Captured live on both engines: a `UNIQUE` violation on
+/// `CONCAT('alice',CHAR(10),'SECRET-TOKEN')` gives MariaDB 10.11.14's
+///
+/// ```text
+/// Duplicate entry 'alice
+/// SECRET-TOKEN' for key 'email'
+/// ```
+///
+/// — line 1 finds the start and no end and passes through, line 2 matches no
+/// anchor at all and is emitted **verbatim** — and PostgreSQL 16.15's
+/// `Key (email)=(alice` / `SECRET-TOKEN) already exists.` and
+/// `Failing row contains (bob` / `OTHER-SECRET, null).` the same way. The rule
+/// that exists to stop a *whole row* leaving is among them, and the leak is
+/// worst on exactly the templates the module names as its coverage.
+///
+/// Joining is what closes the second amplifier too: a stored value whose second
+/// line begins `LINE 1:` exempted itself from **every** rule through
+/// [`is_statement_echo`], and once it is not its own line it cannot. A line that
+/// *is* the user's own echoed statement still cannot open a span, so the
+/// exemption keeps its line anchoring, which is what
+/// [`redact_trailing_quoted_value`]'s inversion rests on.
+///
+/// A span the message never closes is redacted **to the end of it**. That
+/// over-redacts a genuinely truncated message, which is the safe direction: the
+/// start anchor matching at all means this *is* one of the recognised
+/// value-carrying templates.
+fn close_split_values(msg: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut lines = msg.lines();
+    while let Some(line) = lines.next() {
+        let mut cur = line.to_string();
+        if !is_statement_echo(&cur) {
+            while open_value_end(&cur).is_some() {
+                match lines.next() {
+                    Some(next) => {
+                        cur.push(' ');
+                        cur.push_str(next);
+                    }
+                    // The value runs off the end of the message.
+                    None => {
+                        if let Some(at) = open_span_start(&cur) {
+                            cur.truncate(at);
+                            cur.push_str(REDACTED);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        out.push(cur);
+    }
+    out.join("\n")
+}
+
+/// Where the unclosed value starts, for the run-off-the-end case above.
+fn open_span_start(line: &str) -> Option<usize> {
+    SPLIT_VALUE_ANCHORS
+        .iter()
+        .filter(|(_, _, guard)| guard.is_none_or(|g| line.contains(g)))
+        .find_map(|(start, end, _)| {
+            let i = line.find(start)?;
+            let after = i + start.len();
+            (!line[after..].contains(end)).then_some(after)
+        })
 }
 
 /// One line of [`redact_engine_error`]. Line-scoped so an anchor cannot reach
@@ -1193,6 +1296,76 @@ mod tests {
     /// syntax as values, and those are the half worth keeping. None of them is
     /// introduced by `: `, which is what makes the default-deny safe — this test
     /// is what says so.
+    /// **A newline in a stored value walked straight past every rule.** The
+    /// three messages below were captured live this round — MariaDB 10.11.14 and
+    /// PostgreSQL 16.15, on a value written as
+    /// `CONCAT('alice', CHAR(10), 'SECRET-TOKEN')` — and each is one of the
+    /// templates the module names as its coverage, defeated by *data* rather
+    /// than by an unfamiliar shape. Line 2 matched no anchor at all and reached
+    /// the model verbatim, including the `Failing row contains` rule, which
+    /// exists to stop a whole row leaving.
+    #[test]
+    fn a_value_split_over_two_lines_is_still_redacted() {
+        let cases = [
+            "Duplicate entry 'alice\nSECRET-TOKEN' for key 'email'",
+            "DETAIL:  Key (email)=(alice\nSECRET-TOKEN) already exists.",
+            "DETAIL:  Failing row contains (bob\nOTHER-SECRET, null).",
+            "Incorrect integer value: 'alice\nSECRET-TOKEN' for column 'n' at row 1",
+        ];
+        for msg in cases {
+            let out = redact_engine_error(msg);
+            assert!(!out.contains("SECRET-TOKEN"), "{msg:?} -> {out:?}");
+            assert!(!out.contains("OTHER-SECRET"), "{msg:?} -> {out:?}");
+            assert!(!out.contains("alice"), "{msg:?} -> {out:?}");
+            assert!(!out.contains("bob"), "{msg:?} -> {out:?}");
+            // Idempotent, as the whole-message rule already is.
+            assert_eq!(redact_engine_error(&out), out, "{msg:?}");
+        }
+        // What the message is *about* survives, or the redaction has eaten the
+        // diagnosis along with the data.
+        assert!(
+            redact_engine_error(cases[0]).contains("for key 'email'"),
+            "{}",
+            redact_engine_error(cases[0])
+        );
+        assert!(
+            redact_engine_error(cases[1]).contains("Key (email)"),
+            "{}",
+            redact_engine_error(cases[1])
+        );
+        assert!(
+            redact_engine_error(cases[3]).contains("for column 'n'"),
+            "{}",
+            redact_engine_error(cases[3])
+        );
+    }
+
+    /// The second amplifier on the same root: a stored value whose next line
+    /// begins `LINE 1:` exempted **itself** from every rule, because
+    /// `is_statement_echo` is asked of a line without knowing whether that line
+    /// is inside an open value.
+    #[test]
+    fn a_value_cannot_exempt_itself_by_looking_like_a_statement_echo() {
+        let out = redact_engine_error("Duplicate entry 'alice\nLINE 1: SECRET-TOKEN' for key 'e'");
+        assert!(!out.contains("SECRET-TOKEN"), "{out}");
+        // And a real echo is still exempt, which is the only reason the
+        // default-deny in `redact_trailing_quoted_value` is safe.
+        let real = "ERROR: syntax error at or near \"selec\"\nLINE 1: selec * from t where a = 'x'\n              ^";
+        let out = redact_engine_error(real);
+        assert!(out.contains("selec * from t where a = 'x'"), "{out}");
+    }
+
+    /// A value that runs off the end of the message is redacted to the end of
+    /// it. Over-redacting a truncated message is the safe direction, and the
+    /// start anchor matching means this is a recognised value template.
+    #[test]
+    fn a_value_that_never_closes_does_not_survive_the_truncation() {
+        let out = redact_engine_error("Duplicate entry 'alice\nSECRET-TOKEN");
+        assert!(!out.contains("SECRET-TOKEN"), "{out}");
+        assert!(!out.contains("alice"), "{out}");
+        assert!(out.contains("Duplicate entry '"), "{out}");
+    }
+
     #[test]
     fn redaction_keeps_the_identifiers_postgres_quotes_the_same_way() {
         for msg in [
