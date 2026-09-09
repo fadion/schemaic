@@ -227,7 +227,7 @@ pub async fn every_type_renders_as_the_grid_shows_it(target: &'static Target) {
         "rendered wrongly",
         failures,
         ran,
-        target.type_cases().count(),
+        target.expected_cases(),
     );
 }
 
@@ -305,7 +305,7 @@ pub async fn the_text_the_grid_shows_writes_back_unchanged(target: &'static Targ
         "did not survive a write back",
         failures,
         ran,
-        target.type_cases().filter(|c| c.writable).count(),
+        target.expected_writable_cases(),
     );
 }
 
@@ -339,11 +339,25 @@ async fn seed_case(scratch: &Scratch, case: &TypeCase) -> Result<ResultSet, Stri
 /// Fail once, listing every case that did not hold.
 ///
 /// `expected` is how many cases this leg *has*, so "it ran them" is an equality
-/// rather than a floor. It was a single `TYPE_CASE_FLOOR = 20` over legs of 21
-/// and 25: PostgreSQL could lose its entire numeric family and both matrix tests
+/// rather than a floor. It was a single `TYPE_CASE_FLOOR = 20` over legs of 22
+/// and 26: PostgreSQL could lose its entire numeric family and both matrix tests
 /// would still pass, which is the exact failure the floor was added to catch
-/// one size down. The count is derivable from the leg's own slices and needs no
-/// maintenance, so there is nothing to be gained by weakening it.
+/// one size down.
+///
+/// **It must come from [`Target::expected_cases`], not from
+/// `type_cases().count()`.** This paragraph used to end "the count is derivable
+/// from the leg's own slices and needs no maintenance, so there is nothing to be
+/// gained by weakening it" — and that derivation was the weakening. `ran` is
+/// counted while walking `type_cases()` and `expected` was `type_cases().count()`
+/// over the same two `&'static` slices, so both sides were one pure function of
+/// one input and the equality was a tautology: delete PostgreSQL's numeric
+/// family and both numbers fall together while six leg-tests report green having
+/// asserted nothing about the types that vanished. The guard the floor provided
+/// was replaced with none, and documented as the stronger check.
+///
+/// The number is hand-maintained now, and
+/// `endpoint::every_leg_declares_the_number_of_cases_it_has` — which needs no
+/// server — is what makes forgetting to maintain it loud.
 fn report(target: &Target, what: &str, failures: Vec<String>, ran: usize, expected: usize) {
     assert_eq!(
         ran, expected,

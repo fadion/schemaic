@@ -117,6 +117,32 @@ pub struct Target {
     /// agree on and still each own the one they do not — see [`cases`].
     types: &'static [TypeCase],
     extra_types: &'static [TypeCase],
+    /// How many type cases this leg **has**, written out.
+    ///
+    /// **A hand-maintained number, deliberately, and it is the whole guard.**
+    /// `report`'s "it ran them all" assertion took `expected` as
+    /// `type_cases().count()` — the same iterator `ran` counted while walking —
+    /// so both sides were the same pure function of the same data and
+    /// `ran == expected` was a tautology. Delete PostgreSQL's whole numeric
+    /// family and `ran` falls from 25 to 20, `expected` falls from 25 to 20 in
+    /// the same step, and both matrix tests report green having asserted nothing
+    /// about the five types that vanished — the *exact* scenario `report`'s own
+    /// doc says it exists to catch. (The `TYPE_CASE_FLOOR = 20` it replaced
+    /// would have caught that one; the equality that replaced the floor caught
+    /// nothing, and was documented as the stronger check.)
+    ///
+    /// So it has to be a value the leg's own data cannot move. Adding a case
+    /// means editing this number too, and
+    /// `every_leg_declares_the_number_of_cases_it_has` is what says so.
+    expected_cases: usize,
+    /// The same, for the write-back matrix, which runs only the cases marked
+    /// [`TypeCase::writable`] — a raw-bytes cell shows a placeholder and refuses
+    /// to be edited, so only its rendering is asserted.
+    ///
+    /// A second number rather than `expected_cases` minus a computed count, for
+    /// the reason the first one exists: anything derived from the slices moves
+    /// with them.
+    expected_writable_cases: usize,
 }
 
 pub static MARIADB: Target = Target {
@@ -137,6 +163,8 @@ pub static MARIADB: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MARIADB_ONLY,
+    expected_cases: 22,
+    expected_writable_cases: 21,
 };
 
 pub static MYSQL: Target = Target {
@@ -157,6 +185,8 @@ pub static MYSQL: Target = Target {
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%schemaicItCancel', 'Marker%')",
     types: cases::MYSQL_FAMILY,
     extra_types: cases::MYSQL_ONLY,
+    expected_cases: 22,
+    expected_writable_cases: 21,
 };
 
 pub static POSTGRES: Target = Target {
@@ -179,6 +209,8 @@ pub static POSTGRES: Target = Target {
     running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%schemaicItCancel' || 'Marker%'",
     types: cases::POSTGRES,
     extra_types: &[],
+    expected_cases: 26,
+    expected_writable_cases: 25,
 };
 
 /// Every leg, in the order the suite reports them.
@@ -209,6 +241,18 @@ impl Target {
     /// Every type case this server answers for.
     pub fn type_cases(&self) -> impl Iterator<Item = &'static TypeCase> {
         self.types.iter().chain(self.extra_types)
+    }
+
+    /// How many cases the matrix must run for this leg — see
+    /// [`Target::expected_cases`], and do **not** replace this with
+    /// `type_cases().count()`: that is the tautology it exists to end.
+    pub fn expected_cases(&self) -> usize {
+        self.expected_cases
+    }
+
+    /// [`Target::expected_cases`] for the write-back matrix.
+    pub fn expected_writable_cases(&self) -> usize {
+        self.expected_writable_cases
     }
 
     /// The statement that makes this server wait for
@@ -311,4 +355,36 @@ fn engines_var() -> Option<Vec<String>> {
         );
     }
     Some(names)
+}
+
+/// **Every leg's declared case counts match its slices — and needs no server.**
+///
+/// The other half of [`Target::expected_cases`]. The number has to be
+/// hand-maintained or the "it ran them all" assertion is a tautology; this is
+/// what makes forgetting to maintain it loud, and it is the only test in this
+/// tier that asserts something without connecting to anything. So adding a case
+/// fails *here*, with the right number in the message, rather than passing
+/// silently in the matrix.
+#[test]
+fn every_leg_declares_the_number_of_cases_it_has() {
+    for t in ALL {
+        assert_eq!(
+            t.type_cases().count(),
+            t.expected_cases,
+            "{}: expected_cases says {} and the slices hold {} — update the \
+             constant in endpoint.rs, which is what stops the matrix asserting \
+             nothing",
+            t.name,
+            t.expected_cases,
+            t.type_cases().count(),
+        );
+        assert_eq!(
+            t.type_cases().filter(|c| c.writable).count(),
+            t.expected_writable_cases,
+            "{}: expected_writable_cases says {} and the slices hold {}",
+            t.name,
+            t.expected_writable_cases,
+            t.type_cases().filter(|c| c.writable).count(),
+        );
+    }
 }

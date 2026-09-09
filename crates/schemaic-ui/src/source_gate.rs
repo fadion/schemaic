@@ -37,11 +37,10 @@ pub(crate) fn production_code(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut i = 0usize;
     while i < b.len() {
-        let Some(rel) = src[i..].find("#[cfg(test)]") else {
+        let Some(at) = next_cfg_test(src, i) else {
             out.push_str(&src[i..]);
             break;
         };
-        let at = i + rel;
         out.push_str(&src[i..at]);
         i = match item_end(src, at + "#[cfg(test)]".len()) {
             Some(end) => end,
@@ -55,6 +54,57 @@ pub(crate) fn production_code(src: &str) -> String {
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The offset of the next `#[cfg(test)]` reached **as code**, from `from`.
+///
+/// **The one scan in this module that was not comment-aware, and it was the one
+/// that decides what gets cut.** It was a plain `str::find` over the raw text,
+/// while [`item_end`] three lines below carefully skips strings, chars and both
+/// kinds of comment for every byte it reads. So a `///` line *mentioning* the
+/// attribute was treated as a real one, `item_end` ran from inside that comment,
+/// skipped the rest of the comment correctly — and then consumed the next real
+/// item. Four live sites at the time it was found, including `production_code`'s
+/// own body and the whole of `shortcuts.rs`'s `COMMAND_KEYS` table, which is
+/// what all fourteen gates scan: a `views::dropdown(` planted in that span
+/// passed the gate that exists to refuse it.
+///
+/// A silent under-report, which is the direction that matters. The loud
+/// direction was already handled — an unbalanced item makes `item_end` return
+/// `None` and the rest is re-scanned.
+fn next_cfg_test(src: &str, from: usize) -> Option<usize> {
+    const ATTR: &str = "#[cfg(test)]";
+    let b = src.as_bytes();
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i = skip_quoted(b, i, b'"');
+                continue;
+            }
+            b'\'' => {
+                i = skip_char_or_lifetime(b, i);
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = skip_block_comment(b, i);
+                continue;
+            }
+            // To the end of the line — `///`, `//!` and `//` alike. This is the
+            // case that was live: the existing `//`-line filter runs *after* the
+            // cut, so a mention was reachable before anything dropped it.
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i = match find_bytes(&b[i..], b"\n") {
+                    Some(p) => i + p + 1,
+                    None => b.len(),
+                };
+                continue;
+            }
+            b'#' if src[i..].starts_with(ATTR) => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// The offset just past the item beginning at `from` — the byte after its
@@ -222,6 +272,71 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A doc comment that *mentions* `#[cfg(test)]` deleted the item it
+    /// documents from every gate's view.**
+    ///
+    /// The attribute was located with a plain `str::find` over the raw text —
+    /// the one scan in this module that did not use the skip helpers `item_end`
+    /// applies to every other byte. So an occurrence inside a `///` line was
+    /// treated as a real attribute, `item_end` ran from inside the comment,
+    /// skipped the remaining comment lines correctly, and then consumed **the
+    /// next real item**. Measured over the frozen tree at four live sites:
+    ///
+    /// * `shortcuts.rs:160` — the whole `COMMAND_KEYS` table went.
+    /// * `source_gate.rs:25` — `production_code`'s **own body** went, from its
+    ///   own crate's production code.
+    /// * `widgets.rs:3666` — `pub menus: MenuFlags,` went.
+    /// * `contrast.rs:250` — a cut of no net effect.
+    ///
+    /// A silent under-report, and it is what all fourteen gates scan: a
+    /// `views::dropdown(` planted inside `COMMAND_KEYS`' span passed
+    /// `no_floem_dropdown_gate`, and an `inset_left(12.0)` there passed
+    /// `float_inset_gate`.
+    ///
+    /// The synthetic case is the one that pins the rule; the two real files are
+    /// what say the rule was being broken.
+    #[test]
+    fn an_attribute_named_in_a_comment_is_not_an_attribute() {
+        let synthetic = "/// a #[cfg(test)] item, so not linkable\n\
+                         const KEPT: u8 = 1;\n\
+                         fn after() {}\n";
+        let out = production_code(synthetic);
+        assert!(out.contains("KEPT"), "{out}");
+        assert!(out.contains("fn after"), "{out}");
+
+        // `//!` and a plain `//` too, and inside a block comment.
+        for src in [
+            "//! a #[cfg(test)] mention\nconst KEPT: u8 = 1;\n",
+            "// a #[cfg(test)] mention\nconst KEPT: u8 = 1;\n",
+            "/* a #[cfg(test)] mention */\nconst KEPT: u8 = 1;\n",
+            "const S: &str = \"#[cfg(test)]\";\nconst KEPT: u8 = 1;\n",
+        ] {
+            assert!(
+                production_code(src).contains("KEPT"),
+                "{src:?} → {:?}",
+                production_code(src)
+            );
+        }
+
+        // And the two real sites, which is what makes this a regression test
+        // rather than a unit test of a helper.
+        assert!(
+            production_code(include_str!("shortcuts.rs")).contains("COMMAND_KEYS"),
+            "shortcuts.rs lost its COMMAND_KEYS table"
+        );
+        assert!(
+            production_code(include_str!("source_gate.rs"))
+                .contains("String::with_capacity(src.len())"),
+            "source_gate.rs deleted its own production_code body"
+        );
+
+        // The real attribute still cuts, which is the whole job.
+        let real = "#[cfg(test)]\nmod tests { fn t() {} }\nfn after() {}\n";
+        let out = production_code(real);
+        assert!(!out.contains("fn t()"), "{out}");
+        assert!(out.contains("fn after"), "{out}");
+    }
 
     #[test]
     fn code_after_an_inline_test_item_is_still_production_code() {
