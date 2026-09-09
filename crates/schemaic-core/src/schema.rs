@@ -992,6 +992,29 @@ pub struct TableInfo {
     /// didn't survive the parse is gone from a trigger that still looks armed.
     /// Replaying the text SQLite stored cannot lose anything.
     pub dependent_ddl: Vec<String>,
+    /// **The `CREATE` text of triggers on _other_ tables whose SQL names this
+    /// one** — SQLite only, and empty everywhere else.
+    ///
+    /// The sibling of [`TableInfo::dependent_ddl`] and its opposite in both
+    /// directions: these are not dropped by a rebuild and are never replayed,
+    /// but they are also never *rewritten* by one. SQLite's own
+    /// `ALTER TABLE … RENAME COLUMN` rewrites every trigger in the database that
+    /// names the column; the twelve-step rebuild renames the table underneath
+    /// them and leaves their text exactly as it was.
+    ///
+    /// So a trigger on `other` that reads `UPDATE t SET b = 'hit'` survives a
+    /// rebuild of `t` that renamed `b` — and SQLite does not validate a
+    /// trigger's column references when it is created, so the plan *succeeds*,
+    /// the report says it applied, and the next `INSERT INTO other` fails
+    /// *no such column: b*. `other` then rejects every insert and nothing said
+    /// so. That is word for word the failure
+    /// [`crate::ddl::sqlite_rebuild_sql`]'s refusal exists to prevent, one table
+    /// over, and it is what this field lets the refusal see.
+    ///
+    /// Kept as the server's verbatim text for the reason `dependent_ddl` is: the
+    /// refusal reads it, and reading it through a parse Schemaic does not
+    /// round-trip faithfully for triggers would be the same argument against.
+    pub referring_ddl: Vec<String>,
     /// **SQLite `WITHOUT ROWID`.** `false` everywhere else, which has no such
     /// thing.
     ///

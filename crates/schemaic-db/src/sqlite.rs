@@ -1913,6 +1913,11 @@ pub(crate) async fn prepare_check(db: &Db, sql: &str) -> Result<(), DbError> {
 pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<DbSchema, DbError> {
     refuse_if_cancelled(&cancel)?;
     with_conn(db, |conn| {
+        // Every trigger in the database, once. A table needs to know about the
+        // ones that are **not** its own: SQLite's `RENAME COLUMN` rewrites those
+        // and the twelve-step rebuild does not, so the rebuild's refusal has to
+        // be able to see them. See `TableInfo::referring_ddl`.
+        let all_triggers = all_trigger_sql(conn)?;
         let mut tables = Vec::new();
         for (name, kind, sql) in master_entries(conn)? {
             let is_view = kind == "view";
@@ -1980,6 +1985,23 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
             // run — so it is collected here for both, and `ChangeSet` replays it
             // in both places.
             let dependent_ddl = trigger_statements(&trigger_sql);
+            // The other side of the same coin: triggers hanging off *another*
+            // table whose SQL names this one. Not replayed and not dropped by a
+            // rebuild — and not rewritten by one either, which is the whole
+            // reason the refusal needs them. Matched through the one boundary
+            // lexer, so a mention in a comment or a string literal is not one.
+            let referring_ddl: Vec<String> = all_triggers
+                .iter()
+                .filter(|(owner, _)| *owner != name)
+                .filter(|(_, sql)| {
+                    schemaic_core::intel::code_names(
+                        sql,
+                        &name,
+                        schemaic_core::intel::SqlDialect::Sqlite,
+                    )
+                })
+                .map(|(_, sql)| sql.clone())
+                .collect();
             tables.push(TableInfo {
                 name,
                 schema: None,
@@ -2011,6 +2033,7 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
                 check_constraints: if is_view { Vec::new() } else { checks_of(&sql) },
                 triggers,
                 dependent_ddl,
+                referring_ddl,
                 without_rowid,
                 strict,
             });
@@ -2311,6 +2334,28 @@ fn trigger_sql(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
         .query_map([table], |r| r.get::<_, String>(0))
         .map_err(query_err)?;
     rows.collect::<Result<Vec<String>, _>>().map_err(query_err)
+}
+
+/// Every trigger in the database, as `(the table it hangs off, its `CREATE`
+/// text)`, exactly as the catalogue holds it.
+///
+/// [`trigger_sql`]'s whole-database sibling, read once per introspection rather
+/// than once per table: the question it answers — *which triggers name this
+/// table without belonging to it* — is asked of every table, and asking it with
+/// a per-table query would be one scan of `sqlite_master` per table to read the
+/// same rows each time. See [`TableInfo::referring_ddl`].
+fn all_trigger_sql(conn: &SqliteConn) -> Result<Vec<(String, String)>, DbError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tbl_name, sql FROM sqlite_master \
+             WHERE type = 'trigger' AND sql IS NOT NULL \
+             ORDER BY name",
+        )
+        .map_err(query_err)?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(query_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(query_err)
 }
 
 /// The triggers on `table`, as the model holds them.
@@ -7989,6 +8034,105 @@ mod rebuild_fidelity_tests {
                 .query_row("SELECT count(*) FROM log", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    /// **The same failure one table over, which is where the refusal stopped
+    /// looking.** `rebuild_strands_a_trigger` read `dependent_ddl` — the
+    /// triggers *owned by* this table, which is the right set for the replay and
+    /// the wrong set for the question "whose SQL names a column this plan
+    /// moves". The test above builds a second table but puts the trigger on `t`,
+    /// so the refusal fired; declared `ON other`, nothing saw it.
+    ///
+    /// Measured here on the workspace's own SQLite: the plan applies, the report
+    /// says it applied, the trigger still reads `SET b = 'hit'`, and the next
+    /// `INSERT INTO other` fails *no such column: b* — `other` now rejects every
+    /// insert and nothing said so. The engine's own `RENAME COLUMN` rewrites
+    /// that trigger, which is why the rebuild is the strictly worse route the
+    /// refusal exists to steer away from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trigger_on_another_table_is_seen_by_the_rebuilds_refusal() {
+        let (keeper, db) = shared_memory("fid_foreign_trigger");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, scratch INTEGER);
+                 CREATE TABLE other (x INTEGER);
+                 CREATE TRIGGER tr AFTER INSERT ON other
+                   BEGIN UPDATE t SET b = 'hit'; END;",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        assert!(
+            before.dependent_ddl.is_empty(),
+            "the trigger is not t's own, which is the point: {:?}",
+            before.dependent_ddl
+        );
+        assert_eq!(
+            before.referring_ddl.len(),
+            1,
+            "and t has to be told about it: {:?}",
+            before.referring_ddl
+        );
+
+        // A rename beside a retype — a pair only the rebuild can do.
+        let mut draft = TableDraft::from_table(&before);
+        draft.rename_column(1, "c");
+        retype_last(&mut draft);
+        let w = diff(&before, &draft, SqlDialect::Sqlite).unsupported();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("tr"), "the refusal names the trigger: {w:?}");
+        assert!(w[0].contains("other"), "and its table: {w:?}");
+
+        // The engine's own route is still offered, and still rewrites the
+        // trigger — which is what makes the refusal a steer rather than a wall.
+        let mut draft = TableDraft::from_table(&before);
+        draft.rename_column(1, "c");
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("a bare rename must apply");
+        keeper
+            .execute_batch("INSERT INTO other VALUES (1);")
+            .unwrap();
+    }
+
+    /// And the refusal has to stay narrow, or a wider one is just a different
+    /// bug: a trigger elsewhere that names the table but **not** a column this
+    /// plan moves is no reason to withhold the edit, and neither is a mention
+    /// inside a comment or a string literal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreign_trigger_that_names_no_moved_column_withholds_nothing() {
+        let (keeper, db) = shared_memory("fid_foreign_trigger_ok");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, scratch INTEGER);
+                 CREATE TABLE other (x INTEGER, note TEXT);
+                 CREATE TRIGGER tr AFTER INSERT ON other
+                   BEGIN UPDATE t SET scratch = 1; END;
+                 CREATE TRIGGER tr2 AFTER UPDATE ON other
+                   -- b is only mentioned here
+                   BEGIN UPDATE other SET note = 'b'; END;",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.rename_column(1, "c");
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+        keeper
+            .execute_batch("INSERT INTO other VALUES (1, 'x');")
+            .unwrap();
+        assert_eq!(
+            keeper
+                .query_row("SELECT scratch FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0),
+            0,
+            "no rows yet; the insert into other is what had to not fail"
         );
     }
 

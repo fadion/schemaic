@@ -5385,6 +5385,18 @@ pub(crate) fn code_word_hits(sql: &str, needle: &str, dialect: SqlDialect) -> Ve
     code_word_hits_in(sql, &code_mask(sql, dialect), needle)
 }
 
+/// Does `sql` **name** `ident` — as a whole identifier, in code, and not inside
+/// a string literal or a comment?
+///
+/// [`code_word_hits`]' question reduced to a yes/no, and public because the
+/// engine backends ask it too: SQLite's introspection needs to know which
+/// triggers name a table, and a `contains` there would match the word inside a
+/// comment or a `'…'` default and refuse an edit for a trigger that does not
+/// mention the table at all.
+pub fn code_names(sql: &str, ident: &str, dialect: SqlDialect) -> bool {
+    !code_word_hits(sql, ident, dialect).is_empty()
+}
+
 /// Which bytes of `sql` the server would have **parsed** — `false` for every
 /// byte inside a string literal, a comment or a dollar-quoted body.
 ///

@@ -8050,22 +8050,48 @@ fn is_rename_only(from: &ColumnInfo, to: &ColumnInfo) -> bool {
 /// makes for keeping the text verbatim in the first place — so the honest answer
 /// is to say what can't be done, in the preview, before anything runs.
 fn rebuild_strands_a_trigger(current: &TableInfo, draft: &TableDraft) -> Option<String> {
-    if current.dependent_ddl.is_empty() {
+    if current.dependent_ddl.is_empty() && current.referring_ddl.is_empty() {
         return None;
     }
-    let moved = column_moved(current, draft)?;
+    let moved = moved_columns(current, draft);
+    let first = moved.first()?;
+    if !current.dependent_ddl.is_empty() {
+        return Some(format!(
+            "This table has {} trigger{} on it, and their SQL is replayed exactly as \
+             SQLite stored it — which would still name {}. SQLite accepts such a \
+             trigger and then refuses every write to the table. Drop or edit the \
+             trigger first, or rename the column with no other change so SQLite's own \
+             ALTER TABLE can rewrite it.",
+            current.dependent_ddl.len(),
+            if current.dependent_ddl.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            first.phrase,
+        ));
+    }
+    // **A trigger on another table.** Not replayed by the rebuild and not
+    // dropped by it — and not rewritten either, which is the whole problem.
+    // Asked per column, because the first moved column is not necessarily the
+    // one this trigger spells, and per trigger, because refusing on any trigger
+    // that merely names the table would withhold edits that are fine.
+    let (owner, hit) = current.referring_ddl.iter().find_map(|sql| {
+        let m = moved
+            .iter()
+            .find(|m| crate::intel::code_names(sql, &m.name, SqlDialect::Sqlite))?;
+        let owner = sqlite_trigger_info(sql)
+            .map(|t| format!("Trigger {} on {}", t.name, t.table))
+            .unwrap_or_else(|| "A trigger on another table".to_string());
+        Some((owner, m))
+    })?;
     Some(format!(
-        "This table has {} trigger{} on it, and their SQL is replayed exactly as \
-         SQLite stored it — which would still name {moved}. SQLite accepts such a \
-         trigger and then refuses every write to the table. Drop or edit the \
-         trigger first, or rename the column with no other change so SQLite's own \
-         ALTER TABLE can rewrite it.",
-        current.dependent_ddl.len(),
-        if current.dependent_ddl.len() == 1 {
-            ""
-        } else {
-            "s"
-        },
+        "{owner} names {}. A rebuild renames this table underneath that trigger \
+         and leaves its SQL exactly as it was, so the trigger would go on naming a \
+         column that is gone — SQLite accepts such a trigger and then refuses every \
+         write to *that* table. Drop or edit the trigger first, or rename the \
+         column with no other change so SQLite's own ALTER TABLE can rewrite it.",
+        hit.phrase,
     ))
 }
 
@@ -8316,19 +8342,32 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
     out
 }
 
-/// The first column this plan renames or drops, named the way a message wants
-/// it — or `None` when every column of `current` is still there under its own
-/// name.
+/// A column this plan renames or drops: the name it is known by in SQL written
+/// before the plan, and the phrase a refusal wants for it.
+struct MovedColumn {
+    /// The **old** name, which is the one another statement still spells.
+    name: String,
+    phrase: String,
+}
+
+/// Every column this plan renames or drops, each named the way a message wants
+/// it — empty when every column of `current` is still there under its own name.
 ///
 /// Only these two edits invalidate SQL that refers to a column: a retype, a
 /// default, a new column or a constraint all leave every existing name pointing
 /// at the same thing.
-fn column_moved(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+///
+/// All of them rather than the first, because a caller asking *"does this other
+/// statement name one"* has to ask about each: the first moved column is not
+/// necessarily the one a given trigger spells.
+fn moved_columns(current: &TableInfo, draft: &TableDraft) -> Vec<MovedColumn> {
+    let mut out: Vec<MovedColumn> = Vec::new();
     for c in &draft.columns {
         match &c.original {
-            Some(o) if *o != c.info.name => {
-                return Some(format!("{o}, which this plan renames to {}", c.info.name));
-            }
+            Some(o) if *o != c.info.name => out.push(MovedColumn {
+                name: o.clone(),
+                phrase: format!("{o}, which this plan renames to {}", c.info.name),
+            }),
             _ => {}
         }
     }
@@ -8337,11 +8376,26 @@ fn column_moved(current: &TableInfo, draft: &TableDraft) -> Option<String> {
         .iter()
         .filter_map(|c| c.original.as_deref())
         .collect();
-    current
+    for c in current
         .columns
         .iter()
-        .find(|c| !kept.contains(c.name.as_str()))
-        .map(|c| format!("{}, which this plan drops", c.name))
+        .filter(|c| !kept.contains(c.name.as_str()))
+    {
+        out.push(MovedColumn {
+            name: c.name.clone(),
+            phrase: format!("{}, which this plan drops", c.name),
+        });
+    }
+    out
+}
+
+/// The first entry of [`moved_columns`]' phrase, for a caller that only needs
+/// something to say.
+fn column_moved(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+    moved_columns(current, draft)
+        .into_iter()
+        .next()
+        .map(|m| m.phrase)
 }
 
 /// Step 1 of SQLite's twelve-step procedure, as a statement rather than as a
