@@ -104,6 +104,16 @@ pub enum StmtOutcome {
     /// server can tell those two apart, which is why this variant exists rather
     /// than a wider reading of `implicit_commit`: see [`failure_committed`].
     FailedAndCommitted,
+    /// It **succeeded**, and the transaction it was inside is gone — as reported
+    /// by the connection rather than read off the statement.
+    ///
+    /// [`FailedAndCommitted`](Self::FailedAndCommitted)'s twin for the success
+    /// path, and it exists for the same reason: the text cannot decide it. The
+    /// one statement that reaches it is `SET autocommit`, whose effect on the
+    /// current transaction depends on the value the variable *had* —
+    /// [`TxAfter::Ask`] is what routes it to the probe, and this is how the
+    /// probe's answer reaches the pill, which cannot ask.
+    OkAndClosed,
     /// The connection itself died — idle-in-transaction timeout, server
     /// restart, network drop. Whatever was in the transaction is gone.
     ConnectionLost,
@@ -201,15 +211,29 @@ impl TxState {
             TxState::Idle | TxState::Open { .. } => {
                 let stmts = self.stmts();
                 match outcome {
-                    StmtOutcome::Ok => {
-                        if implicit_commit(engine, sql) {
-                            // MySQL DDL committed the transaction out from under
-                            // us — back to no transaction, not to `stmts + 1`.
-                            TxState::Idle
-                        } else {
-                            TxState::Open { stmts: stmts + 1 }
-                        }
-                    }
+                    StmtOutcome::Ok => match tx_after(engine, sql) {
+                        // MySQL DDL committed the transaction out from under
+                        // us, or the user typed `COMMIT` — back to no
+                        // transaction, not to `stmts + 1`.
+                        TxAfter::Closed => TxState::Idle,
+                        // **A new transaction, so the count starts over rather
+                        // than the pill going blank.** This arm read
+                        // `implicit_commit` alone, which is `true` for `BEGIN`,
+                        // so a typed `BEGIN` folded to `Idle` while the session
+                        // and the server both kept a transaction open — and
+                        // `ddl_blocking_tabs`, which asks `is_open()`, then
+                        // reported nothing and let a schema Apply queue behind
+                        // the tab's own metadata lock until the lock-wait
+                        // timeout.
+                        TxAfter::Open => TxState::Open { stmts: 0 },
+                        // The pill cannot ask the server. It keeps counting
+                        // until the session tells it, which it does by
+                        // upgrading the outcome to `OkAndClosed`.
+                        TxAfter::Unchanged | TxAfter::Ask => TxState::Open { stmts: stmts + 1 },
+                    },
+                    // The session probed and the server says the transaction is
+                    // gone — see [`StmtOutcome::OkAndClosed`].
+                    StmtOutcome::OkAndClosed => TxState::Idle,
                     // A statement that didn't apply doesn't count. On Postgres it
                     // also poisons: both a server error and a cancellation leave
                     // the transaction in the aborted state.
@@ -324,16 +348,98 @@ pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
 ///
 /// [`schemaic_db::Session::ensure_tx`]: https://docs.rs/schemaic-db
 pub fn tx_open_after(engine: TxEngine, sql: &str) -> Option<bool> {
-    if !implicit_commit(engine, sql) {
-        return None;
+    match tx_after(engine, sql) {
+        TxAfter::Unchanged | TxAfter::Ask => None,
+        TxAfter::Closed => Some(false),
+        TxAfter::Open => Some(true),
     }
-    // `implicit_commit` is false for every non-MySQL engine, so reaching here
-    // means MySQL and the dialect is settled.
-    let opens = matches!(
-        crate::sql::leading_keyword(sql, crate::intel::SqlDialect::MySql).as_deref(),
-        Some("BEGIN") | Some("START")
-    );
-    Some(opens)
+}
+
+/// What running `sql` **successfully** leaves the connection's transaction in.
+///
+/// The whole of the question `tx_open_after`'s `Option<bool>` could not put:
+/// there is a fourth answer, and leaving it out is how a `SET autocommit = 1`
+/// that committed nothing came to clear the session's flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxAfter {
+    /// Nothing about whether a transaction is open changed — the ordinary case.
+    Unchanged,
+    /// No transaction is open now.
+    Closed,
+    /// A transaction is open now, and it is a **new** one. Both the statements
+    /// that open one (`BEGIN`, `START TRANSACTION`) and the ones that close one
+    /// and open another in the same breath (`COMMIT AND CHAIN`).
+    Open,
+    /// **The statement's text cannot decide it.** Ask the connection —
+    /// `Session::tx_alive`, the probe a failed DDL already uses. The only
+    /// statement here is `SET autocommit`, whose effect depends on the value the
+    /// variable *had*, which no text carries.
+    Ask,
+}
+
+/// [`TxAfter`] for `sql` — the one predicate the session's flag and the pill's
+/// [`TxState`] both read, so the two cannot drift.
+///
+/// Three groups, and the first is the one that was missing entirely:
+///
+/// 1. **The statements that close a transaction on purpose** — `COMMIT`,
+///    `ROLLBACK`, `END`, `ABORT` — on **either** engine, because the flag is
+///    engine-independent. `implicit_commit` names the openers and every MySQL
+///    statement that commits as a *side effect*, and none of these; so a typed
+///    `COMMIT` in a Manual tab left `in_tx` true, `ensure_tx` issued no `BEGIN`
+///    for the next statement, and that statement was permanent the instant it
+///    landed while the pill counted and Rollback reported an undo that never
+///    happened. Measured on MariaDB 10.11.14 and PostgreSQL 16.15.
+///    A `ROLLBACK TO [SAVEPOINT] s` is **not** one of these — it discards work
+///    inside the transaction and leaves it open — and neither is
+///    `RELEASE SAVEPOINT`.
+/// 2. **The statements that leave a new transaction open** — `BEGIN`, `START`,
+///    and `COMMIT`/`ROLLBACK … AND CHAIN`. This is `tx_open_after`'s original
+///    carve-out: treating them as plain closers would clear the flag, the next
+///    statement would decide it needed its own `BEGIN`, and on MySQL that second
+///    `BEGIN` would implicitly commit everything in between.
+/// 3. **Everything [`implicit_commit`] names** — MySQL's non-transactional DDL
+///    and `SET PASSWORD`.
+pub fn tx_after(engine: TxEngine, sql: &str) -> TxAfter {
+    // The dialect only decides how the *lexer* reads the head keyword, and both
+    // engines spell these the same, so MySQL's rules answer for both — the
+    // superset (backslash escapes, `#` comments) can only end a token earlier,
+    // never later.
+    let dialect = crate::intel::SqlDialect::MySql;
+    let Some(kw) = crate::sql::leading_keyword(sql, dialect) else {
+        return TxAfter::Unchanged;
+    };
+    let rest = crate::sql::leading_keyword_end(sql, dialect).map_or("", |e| &sql[e..]);
+    let word = |n: usize| {
+        rest.split(|c: char| c.is_whitespace() || matches!(c, ';' | ',' | '=' | '(' | ')'))
+            .filter(|w| !w.is_empty())
+            .nth(n)
+            .map(|w| w.to_ascii_uppercase())
+    };
+    match kw.as_str() {
+        // `AND CHAIN` starts the next transaction immediately; `TO [SAVEPOINT]`
+        // is not a close at all.
+        "COMMIT" | "ROLLBACK" | "END" | "ABORT" => {
+            let next = word(0);
+            match next.as_deref() {
+                Some("TO") => TxAfter::Unchanged,
+                Some("AND") if word(1).as_deref() == Some("CHAIN") => TxAfter::Open,
+                // `WORK`/`TRANSACTION` are noise words; `AND NO CHAIN` is the
+                // default.
+                _ => TxAfter::Closed,
+            }
+        }
+        // The one statement whose effect the text cannot carry.
+        "SET" if engine == TxEngine::MySql && set_touches_autocommit(sql, dialect) => TxAfter::Ask,
+        // **Both engines**, and not through `implicit_commit`, which is
+        // MySQL-only: on PostgreSQL a `BEGIN` opens a transaction just as
+        // surely, and one issued inside an open transaction warns and leaves it
+        // open. Either way there is a transaction afterwards, which is the whole
+        // of what this answers.
+        "BEGIN" | "START" => TxAfter::Open,
+        _ if implicit_commit(engine, sql) => TxAfter::Closed,
+        _ => TxAfter::Unchanged,
+    }
 }
 
 /// Did a statement that **did not apply** nonetheless end the transaction it was
@@ -446,14 +552,36 @@ fn set_commits(sql: &str, dialect: crate::intel::SqlDialect) -> bool {
         .filter(|w| !w.is_empty())
         .map(|w| w.trim_start_matches('@').to_ascii_uppercase());
 
+    matches!(words.next().as_deref(), Some("PASSWORD"))
+}
+
+/// Does this `SET` name the session's `autocommit`?
+///
+/// **Split off [`set_commits`], which used to answer `true` for
+/// `SET autocommit = 1|ON|TRUE`.** That reading was wrong on every connection
+/// Schemaic opens: the app never sets `autocommit`, it issues an explicit
+/// `BEGIN`, so the variable is the server default of **1** — and MySQL commits
+/// on `SET autocommit = 1` only when the value *was* 0. So the statement
+/// committed nothing, the transaction stayed open, and clearing `in_tx` on the
+/// strength of it made the next statement's `BEGIN` implicitly commit the user's
+/// uncommitted work. Measured on MariaDB 10.11.14.
+///
+/// Both values are named, and `= 0` is here for the same reason `= 1` is: what
+/// the statement does to the *current* transaction depends on the value the
+/// variable had, which is a fact about the connection. [`TxAfter::Ask`] is the
+/// honest answer to all of them.
+///
+/// `GLOBAL`/`PERSIST` are excluded rather than skipped — they set a variable
+/// this session's transaction does not read.
+fn set_touches_autocommit(sql: &str, dialect: crate::intel::SqlDialect) -> bool {
+    let after = crate::sql::leading_keyword_end(sql, dialect).map_or("", |e| &sql[e..]);
+    let mut words = after
+        .split(|c: char| c.is_whitespace() || matches!(c, '=' | '.' | ',' | ';' | ':'))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.trim_start_matches('@').to_ascii_uppercase());
     let Some(first) = words.next() else {
         return false;
     };
-    if first == "PASSWORD" {
-        return true;
-    }
-    // An optional scope word. `GLOBAL`/`PERSIST` set a variable this session's
-    // transaction doesn't read, so they're excluded rather than skipped.
     let name = match first.as_str() {
         "SESSION" | "LOCAL" => match words.next() {
             Some(w) => w,
@@ -461,10 +589,7 @@ fn set_commits(sql: &str, dialect: crate::intel::SqlDialect) -> bool {
         },
         _ => first,
     };
-    if name != "AUTOCOMMIT" {
-        return false;
-    }
-    matches!(words.next().as_deref(), Some("1" | "ON" | "TRUE"))
+    name == "AUTOCOMMIT"
 }
 
 /// A pinned session has finished connecting — does the tab that asked for it
@@ -902,34 +1027,61 @@ mod tests {
         }
     }
 
+    /// `SET` can't be matched wholesale — most of it is session state that
+    /// leaves the transaction alone, and claiming a commit that didn't happen is
+    /// the mirror-image lie (the pill would go quiet over open work).
+    ///
+    /// **`SET autocommit` has moved off this predicate**, and the `= 1` rows
+    /// that used to assert `implicit_commit` now assert the opposite. That
+    /// reading was wrong on every connection Schemaic opens: the app never sets
+    /// `autocommit`, so the variable is the server default of 1, and MySQL
+    /// commits on `SET autocommit = 1` only when the value *was* 0. The
+    /// statement committed nothing while the flag was cleared on the strength of
+    /// it, and the next statement's `BEGIN` then implicitly committed the user's
+    /// work. It is [`TxAfter::Ask`] now — see
+    /// `setting_autocommit_asks_the_server_rather_than_guessing`.
     #[test]
-    fn only_the_two_set_forms_that_commit_are_matched() {
-        // `SET` can't be matched wholesale — most of it is session state that
-        // leaves the transaction alone, and claiming a commit that didn't happen
-        // is the mirror-image lie (the pill would go quiet over open work).
+    fn only_set_password_commits_unconditionally() {
+        assert!(implicit_commit(MY, "SET PASSWORD FOR u = 'x'"));
         for sql in [
             "SET autocommit = 1",
             "SET AUTOCOMMIT=1",
             "SET @@autocommit = 1",
             "SET SESSION autocommit = ON",
             "SET @@session.autocommit = TRUE",
-            "SET PASSWORD FOR u = 'x'",
-        ] {
-            assert!(implicit_commit(MY, sql), "{sql} should implicitly commit");
-        }
-        for sql in [
+            "SET autocommit = 0",
             "SET @x = 1",
             "SET @autocommit_backup = 1",
             "SET NAMES utf8mb4",
             "SET SESSION sql_mode = ''",
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-            // Turning autocommit *off* inside a transaction commits nothing…
-            "SET autocommit = 0",
-            // …and the global variable isn't this session's.
             "SET GLOBAL autocommit = 1",
             "SET",
         ] {
-            assert!(!implicit_commit(MY, sql), "{sql} must not commit");
+            assert!(!implicit_commit(MY, sql), "{sql} must not claim a commit");
+        }
+        // The autocommit rows are not "unchanged" either — they are the ones the
+        // text cannot decide.
+        for sql in [
+            "SET autocommit = 1",
+            "SET AUTOCOMMIT=1",
+            "SET @@autocommit = 1",
+            "SET SESSION autocommit = ON",
+            "SET @@session.autocommit = TRUE",
+            "SET autocommit = 0",
+        ] {
+            assert_eq!(tx_after(MY, sql), TxAfter::Ask, "{sql}");
+        }
+        // …and the ones that really are session noise stay unchanged, including
+        // the global variable, which is not this session's.
+        for sql in [
+            "SET @x = 1",
+            "SET @autocommit_backup = 1",
+            "SET NAMES utf8mb4",
+            "SET GLOBAL autocommit = 1",
+            "SET",
+        ] {
+            assert_eq!(tx_after(MY, sql), TxAfter::Unchanged, "{sql}");
         }
     }
 
@@ -1255,10 +1407,13 @@ mod tests {
             "DROP TABLE t",
             "TRUNCATE TABLE t",
             "FLUSH TABLES",
-            "SET autocommit = 1",
+            "SET PASSWORD FOR u = 'x'",
         ] {
             assert_eq!(tx_open_after(TxEngine::MySql, sql), Some(false), "{sql}");
         }
+        // `SET autocommit = 1` was in this list and is not a commit —
+        // see `only_set_password_commits_unconditionally`.
+        assert_eq!(tx_open_after(TxEngine::MySql, "SET autocommit = 1"), None);
     }
 
     /// The carve-out this function exists for, and the one with teeth.
@@ -1297,24 +1452,214 @@ mod tests {
         }
     }
 
+    /// **A typed `COMMIT` or `ROLLBACK` left the session believing the
+    /// transaction was still open**, so everything after it auto-committed while
+    /// the pill counted, and Rollback reported an undo that never happened.
+    ///
+    /// `implicit_commit`'s keyword list names the statements that *open* a
+    /// transaction (`BEGIN`, `START`) and every MySQL statement that commits one
+    /// as a side effect — and none of the statements whose whole purpose is to
+    /// **close** one. So on
+    /// `UPDATE …; COMMIT; DELETE FROM orders WHERE id = 5;` in a Manual tab, the
+    /// `DELETE` ran with no transaction at all (`ensure_tx` saw `in_tx` still
+    /// true and issued no `BEGIN`, and both engines default to autocommit) and
+    /// was permanent the instant it landed. Measured on MariaDB 10.11.14 and PG
+    /// 16.15 with the exact sequence the session emits: `v = 99` after the
+    /// `ROLLBACK`, and on PG a `WARNING: there is no transaction in progress`
+    /// that `batch_execute` returns `Ok` over, so the UI reported a clean end.
+    ///
+    /// Engine-independent, which is why it is not a widening of
+    /// `implicit_commit` — that models MySQL's implicit-commit list, and
+    /// PostgreSQL has to answer here too.
     #[test]
-    fn the_flag_rule_agrees_with_implicit_commit_by_construction() {
-        // `tx_open_after` says "unchanged" exactly when `implicit_commit` says
-        // no. The two are read together by the session and the pill; a
-        // disagreement is the drift the shared predicate exists to prevent.
+    fn the_statements_that_close_a_transaction_close_it() {
+        for engine in [TxEngine::MySql, TxEngine::Postgres] {
+            for sql in [
+                "COMMIT",
+                "commit",
+                "COMMIT;",
+                "COMMIT WORK",
+                "ROLLBACK",
+                "rollback;",
+                "ROLLBACK WORK",
+                "END",
+                "END TRANSACTION",
+                "ABORT",
+                "/* x */ COMMIT",
+            ] {
+                assert_eq!(tx_after(engine, sql), TxAfter::Closed, "{engine:?} {sql}");
+            }
+            // `AND CHAIN` closes one and opens another in the same breath —
+            // `BEGIN`'s carve-out, arriving from the other side.
+            for sql in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN"] {
+                assert_eq!(tx_after(engine, sql), TxAfter::Open, "{engine:?} {sql}");
+            }
+            // And a rollback *to a savepoint* does not close the transaction.
+            for sql in [
+                "ROLLBACK TO SAVEPOINT s1",
+                "ROLLBACK TO s1",
+                "RELEASE SAVEPOINT s1",
+                "SAVEPOINT s1",
+            ] {
+                assert_eq!(
+                    tx_after(engine, sql),
+                    TxAfter::Unchanged,
+                    "{engine:?} {sql}"
+                );
+            }
+        }
+    }
+
+    /// The seam, not the predicate: the pill folds on the same answer, so it
+    /// stops counting when the user closes the transaction by hand.
+    #[test]
+    fn the_pill_follows_a_typed_commit() {
+        for engine in [TxEngine::MySql, TxEngine::Postgres] {
+            let open = TxState::Open { stmts: 3 };
+            assert_eq!(
+                open.on_statement(engine, "COMMIT", StmtOutcome::Ok),
+                TxState::Idle,
+                "{engine:?}"
+            );
+            assert_eq!(
+                open.on_statement(engine, "ROLLBACK", StmtOutcome::Ok),
+                TxState::Idle,
+                "{engine:?}"
+            );
+            // A failed `COMMIT` changed nothing about the transaction.
+            assert_ne!(
+                open.on_statement(engine, "COMMIT", StmtOutcome::Failed),
+                TxState::Idle,
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// **A typed `BEGIN` folded the pill to `Idle` while the session and the
+    /// server both kept a transaction open**, so `is_open()` was false,
+    /// `ddl_blocking_tabs` reported nothing, and a schema Apply queued behind
+    /// the tab's metadata lock and failed after the lock-wait timeout — the
+    /// exact outcome the prompt exists to prevent. `guard_tx` let a database
+    /// switch through unasked for the same reason.
+    ///
+    /// The two consumers of one predicate had diverged deliberately —
+    /// `tx_open_after` carved `BEGIN` out and `on_statement` did not — and the
+    /// test that was supposed to hold them together asserted only that the two
+    /// *agreed about having an opinion*, never about the direction.
+    #[test]
+    fn a_typed_begin_starts_the_count_over_rather_than_ending_it() {
+        for engine in [TxEngine::MySql, TxEngine::Postgres] {
+            for sql in ["BEGIN", "START TRANSACTION"] {
+                assert_eq!(tx_after(engine, sql), TxAfter::Open, "{engine:?} {sql}");
+                let folded = TxState::Open { stmts: 3 }.on_statement(engine, sql, StmtOutcome::Ok);
+                assert_eq!(
+                    folded,
+                    TxState::Open { stmts: 0 },
+                    "{engine:?} {sql}: the transaction is still open"
+                );
+                assert!(folded.is_open(), "{engine:?} {sql}");
+            }
+        }
+    }
+
+    /// **`SET autocommit = 1` is a no-op on every connection Schemaic opens**,
+    /// and the session read it as a commit.
+    ///
+    /// Schemaic never sets `autocommit`; it issues an explicit `BEGIN`, so the
+    /// variable is the server default, **1**. MySQL commits on
+    /// `SET autocommit = 1` only when the value *was* 0 — so the statement
+    /// committed nothing and the transaction stayed open, while `set_commits`
+    /// said `true`, `in_tx` was cleared, and the pill went blank. The user's
+    /// next statement then found `in_tx == false` and `ensure_tx` sent a second
+    /// `BEGIN`, which on MySQL **implicitly commits** the open transaction: the
+    /// uncommitted work became permanent and a later Rollback undid only the
+    /// last statement. Measured on MariaDB 10.11.14 — the app's own sequence
+    /// ends with `v = 7`, the write the user never committed and cannot roll
+    /// back.
+    ///
+    /// The text cannot decide it, so it no longer pretends to: `TxAfter::Ask`
+    /// routes to `Session::tx_alive`, the probe that already exists for a failed
+    /// DDL. `SET PASSWORD` stays unconditional.
+    #[test]
+    fn setting_autocommit_asks_the_server_rather_than_guessing() {
+        for sql in [
+            "SET autocommit = 1",
+            "SET AUTOCOMMIT=ON",
+            "SET SESSION autocommit = TRUE",
+            "SET autocommit = 0",
+        ] {
+            assert_eq!(tx_after(TxEngine::MySql, sql), TxAfter::Ask, "{sql}");
+            assert!(
+                !implicit_commit(TxEngine::MySql, sql),
+                "{sql} must stop claiming a commit the server may not have made"
+            );
+        }
+        // Postgres has no such variable, and nothing there commits out of band.
+        assert_eq!(
+            tx_after(TxEngine::Postgres, "SET autocommit = 1"),
+            TxAfter::Unchanged
+        );
+        // The unconditional one is unchanged.
+        assert!(implicit_commit(TxEngine::MySql, "SET PASSWORD = 'x'"));
+        assert_eq!(
+            tx_after(TxEngine::MySql, "SET PASSWORD = 'x'"),
+            TxAfter::Closed
+        );
+        // And the pill, which cannot ask, keeps counting until the session
+        // tells it otherwise through `OkAndClosed`.
+        let open = TxState::Open { stmts: 3 };
+        assert_eq!(
+            open.on_statement(TxEngine::MySql, "SET autocommit = 1", StmtOutcome::Ok),
+            TxState::Open { stmts: 4 }
+        );
+        assert_eq!(
+            open.on_statement(
+                TxEngine::MySql,
+                "SET autocommit = 1",
+                StmtOutcome::OkAndClosed
+            ),
+            TxState::Idle
+        );
+    }
+
+    /// **The session's flag and the pill agree about the *direction*, which is
+    /// the part that was never asserted.**
+    ///
+    /// This test used to say `tx_open_after(..).is_some() == implicit_commit(..)`
+    /// — true of `BEGIN` and silent about what either side then *did* with it.
+    /// The two consumers had diverged on exactly that statement:
+    /// `tx_open_after` carved it out and kept the flag true, `on_statement`
+    /// folded the pill to `Idle`, and in that window `is_open()` was false while
+    /// the server held a transaction and its locks. Both read `tx_after` now, so
+    /// the property worth pinning is that the pill's fold and the flag say the
+    /// same thing about whether a transaction is open afterwards.
+    #[test]
+    fn the_pill_and_the_sessions_flag_never_disagree() {
         for sql in [
             "CREATE TABLE t (a INT)",
             "UPDATE t SET a = 1",
             "BEGIN",
+            "START TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
+            "COMMIT AND CHAIN",
+            "ROLLBACK TO SAVEPOINT s",
+            "SAVEPOINT s",
             "SET NAMES utf8mb4",
             "SET autocommit = 0",
             "FLUSH TABLES",
+            "SELECT 1",
         ] {
             for engine in [TxEngine::MySql, TxEngine::Postgres] {
+                // The pill's answer, from an open transaction.
+                let pill = TxState::Open { stmts: 3 }.on_statement(engine, sql, StmtOutcome::Ok);
+                // The session's, from the same predicate: `None` means it leaves
+                // the flag as it found it, which here is `true`.
+                let flag = tx_open_after(engine, sql).unwrap_or(true);
                 assert_eq!(
-                    tx_open_after(engine, sql).is_some(),
-                    implicit_commit(engine, sql),
-                    "{engine:?} {sql}"
+                    pill.is_open(),
+                    flag,
+                    "{engine:?} {sql}: pill {pill:?} vs flag {flag}"
                 );
             }
         }

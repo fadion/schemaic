@@ -473,12 +473,31 @@ impl Session {
         // tested, and it is built on the same `implicit_commit` the pill folds
         // on, so the session's view and the pill's can't drift. `None` = the
         // statement changed nothing about whether a transaction is open.
-        if result.is_ok()
-            && let Some(open) = tx::tx_open_after(self.tx_engine(), sql)
-        {
-            self.in_tx.store(open, Ordering::SeqCst);
+        let after = tx::tx_after(self.tx_engine(), sql);
+        let ok = result.is_ok();
+        if ok {
+            match after {
+                tx::TxAfter::Closed => self.in_tx.store(false, Ordering::SeqCst),
+                tx::TxAfter::Open => self.in_tx.store(true, Ordering::SeqCst),
+                tx::TxAfter::Unchanged | tx::TxAfter::Ask => {}
+            }
         }
         let mut out = Session::classify(&mut guard, result).await;
+        // **The one successful statement whose text cannot decide this**, so it
+        // asks the server instead of guessing: `SET autocommit`, whose effect on
+        // the current transaction depends on the value the variable *had*.
+        // Schemaic never sets it, so it is the server default of 1 and
+        // `SET autocommit = 1` commits nothing — while the old reading cleared
+        // the flag, and the next statement's `BEGIN` then implicitly committed
+        // the user's uncommitted work (measured on MariaDB 10.11.14).
+        //
+        // `None` from the probe is the conservative reading: leave the flag
+        // alone, which says the transaction is still open. The pill cannot ask,
+        // so `OkAndClosed` is how the answer reaches it.
+        if ok && after == tx::TxAfter::Ask && Session::tx_alive(&mut guard).await == Some(false) {
+            self.in_tx.store(false, Ordering::SeqCst);
+            out.stmt = tx::StmtOutcome::OkAndClosed;
+        }
         // **And the same thing when the statement did not apply.** The implicit
         // commit happens before the DDL runs, so an `ALTER` the server rejected —
         // or one this range's statement timeout killed halfway through — has
