@@ -430,14 +430,17 @@ pub(crate) fn preview_draft_edit(
     database: &str,
     schema: Option<&str>,
     table: &str,
-    edit: impl FnOnce(&mut TableDraft),
+    // The dialect comes with the draft, because a draft edit can need it: see
+    // `TableDraft::remove_column`, which asks the engine's own quoting and case
+    // rules which checks stand on the column being removed.
+    edit: impl FnOnce(&mut TableDraft, SqlDialect),
 ) {
     let Some(info) = loaded_table(ui, database, schema, table) else {
         return;
     };
     let ctx = edit_ctx(ui);
     let mut draft = TableDraft::from_table(&info);
-    edit(&mut draft);
+    edit(&mut draft, ctx.dialect);
     let cs = ddl::diff(
         &info,
         &draft,
@@ -1287,8 +1290,15 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
             },
             move || {
                 let ui = del_ui.clone();
+                // The dialect, read the way `can_reorder` reads it just above:
+                // removing a column takes the checks that stand on it, and which
+                // predicates *name* a column is the engine's question (quoting
+                // and case). No target means no draft to edit.
+                let Some(dialect) = ui.ddl.designer.get_untracked().map(|t| t.dialect) else {
+                    return;
+                };
                 let i = ui.ddl.selected.get_untracked();
-                ui.ddl.draft.update(|d| d.remove_column(i));
+                ui.ddl.draft.update(|d| d.remove_column(i, dialect));
                 clamp_selection(&ui, |d| d.columns.len());
             },
             // Which engines can place a column, and why each can or can't, is

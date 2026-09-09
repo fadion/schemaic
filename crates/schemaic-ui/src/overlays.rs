@@ -2458,11 +2458,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     &src.database,
                                     src.schema.as_deref(),
                                     &src.table,
-                                    move |d| {
+                                    move |d, dialect| {
                                         if let Some(i) =
                                             d.columns.iter().position(|c| c.info.name == col)
                                         {
-                                            d.remove_column(i);
+                                            d.remove_column(i, dialect);
                                         }
                                     },
                                 );

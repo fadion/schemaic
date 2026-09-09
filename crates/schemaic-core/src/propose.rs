@@ -414,7 +414,7 @@ pub fn apply(
 
     let mut draft = TableDraft::from_table(current);
     for op in &proposal.ops {
-        apply_op(&mut draft, op)?;
+        apply_op(&mut draft, op, dialect)?;
     }
 
     let problems = draft.validate(dialect);
@@ -433,7 +433,11 @@ fn column_index(draft: &TableDraft, name: &str) -> Option<usize> {
         .position(|c| c.info.name.eq_ignore_ascii_case(name))
 }
 
-fn apply_op(draft: &mut TableDraft, op: &ProposedOp) -> Result<(), ProposeError> {
+fn apply_op(
+    draft: &mut TableDraft,
+    op: &ProposedOp,
+    dialect: SqlDialect,
+) -> Result<(), ProposeError> {
     let table = draft.name.clone();
     let missing = |name: &str| ProposeError::NoSuchColumn(table.clone(), name.to_string());
 
@@ -473,7 +477,7 @@ fn apply_op(draft: &mut TableDraft, op: &ProposedOp) -> Result<(), ProposeError>
         }
         ProposedOp::DropColumn { name } => {
             let idx = column_index(draft, name).ok_or_else(|| missing(name))?;
-            draft.remove_column(idx);
+            draft.remove_column(idx, dialect);
         }
         ProposedOp::RenameColumn { from, to } => {
             let idx = column_index(draft, from).ok_or_else(|| missing(from))?;

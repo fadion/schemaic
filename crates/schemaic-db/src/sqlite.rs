@@ -7706,6 +7706,62 @@ mod rebuild_fidelity_tests {
         assert!(!plan.contains("_schemaic_rebuild"), "{plan}");
     }
 
+    /// **The SQLite half of a dropped column's checks, which was a dead end
+    /// rather than a silent loss.** A check left standing in the draft goes into
+    /// the rebuild's step-2 `CREATE TABLE` verbatim, so the very first statement
+    /// of the twelve is `no such column` and the whole plan rolls back — no data
+    /// destroyed, and no route to the edit through the app at all. SQLite's own
+    /// `DROP COLUMN` refuses it too (*error in table t after drop column*), so
+    /// there was no second way round.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_columns_check_does_not_reach_the_rebuilds_create() {
+        let (keeper, db) = shared_memory("fid_drop_col_check");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER, qty INTEGER, CONSTRAINT qty_pos CHECK (qty > 0)); \
+                 INSERT INTO t VALUES (1, 5);",
+            )
+            .unwrap();
+        // The engine's own refusal, so the premise is measured rather than
+        // assumed.
+        assert!(
+            keeper
+                .execute_batch("ALTER TABLE t DROP COLUMN qty")
+                .is_err(),
+            "SQLite accepted the native drop; there would be nothing to fix"
+        );
+
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.remove_column(1, schemaic_core::intel::SqlDialect::Sqlite);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let plan = cs.emit();
+        assert!(
+            !plan.iter().any(|s| s.contains("qty_pos")),
+            "the check reached the plan: {plan:#?}"
+        );
+        db.run_ddl(MAIN, &plan, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {plan:#?}"));
+
+        let sql: String = keeper
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("qty"), "{sql}");
+        assert_eq!(
+            keeper
+                .query_row("SELECT a FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "and the row came across"
+        );
+    }
+
     /// **A primary key's own `COLLATE` really is enforced**, and the model has
     /// no field for it — so the rebuild wrote `PRIMARY KEY ("email")` and the
     /// key started comparing in `BINARY`: the constraint gone from a table that
@@ -8329,7 +8385,7 @@ mod rebuild_bystander_tests {
         let mut draft = TableDraft::from_table(&before);
         // A drop *and* a retype, so the plan is the rebuild rather than SQLite's
         // own `DROP COLUMN` — which the engine would refuse for us.
-        draft.remove_column(2);
+        draft.remove_column(2, schemaic_core::intel::SqlDialect::Sqlite);
         draft.columns[1].info.type_name = "BLOB".into();
 
         let err = db
@@ -8368,7 +8424,7 @@ mod rebuild_bystander_tests {
             .unwrap();
         let before = table_of(&db, "t").await;
         let mut draft = TableDraft::from_table(&before);
-        draft.remove_column(2);
+        draft.remove_column(2, schemaic_core::intel::SqlDialect::Sqlite);
         draft.columns[1].info.type_name = "BLOB".into();
         db.run_ddl(
             MAIN,

@@ -460,10 +460,38 @@ impl TableDraft {
         }
     }
 
-    /// Drop the column at `idx` and every key, index and foreign key that stood
-    /// on it — an index over a column that no longer exists can't be created,
-    /// and both engines drop one on the user's behalf anyway.
-    pub fn remove_column(&mut self, idx: usize) {
+    /// Drop the column at `idx` and every key, index, foreign key and **check**
+    /// that stood on it — a constraint over a column that no longer exists can't
+    /// be created, and two of the three engines drop one on the user's behalf
+    /// anyway.
+    ///
+    /// **The check arm is not symmetry, it is the difference between a silent
+    /// loss and a dead end.** A check left standing in the draft compares equal
+    /// to the identical current one, so [`diff`] emitted nothing for it and the
+    /// plan was a bare `DROP COLUMN`. Measured at the SHA this was found on:
+    ///
+    /// - MySQL 8.4.11 and MariaDB 10.11.14 **succeed and delete the constraint**
+    ///   when it names only the dropped column, and refuse the statement
+    ///   (`ERROR 3959` / `ERROR 1054`) when it names another column too.
+    /// - PostgreSQL 16.15 deletes it **either way** — including checks that name
+    ///   other columns, which is the worst case.
+    /// - SQLite refuses whichever route the plan takes, and the rebuild's
+    ///   `CREATE TABLE` is `no such column` on step 2, so the column could not be
+    ///   removed through the app at all.
+    ///
+    /// Nothing said so: the footer read "1 change", the preview held one
+    /// statement, and its only risk line was *"Drops column … and all the data in
+    /// it."*
+    ///
+    /// **By a column *reference* test, not a name match**, because a check's
+    /// predicate is free SQL: `CHECK (qty > 0)` is a check on `qty` whatever the
+    /// constraint is called. [`repoint_check_column`] answers that question
+    /// through the one SQL boundary lexer and with the engine's own quoting and
+    /// case rules, which is why this takes a dialect where the three arms above
+    /// it do not — a case-insensitive guess would drop a PostgreSQL check on
+    /// `"Qty"` when the user removed `qty`, and dropping a constraint nobody
+    /// asked about is the same class of bug in the other direction.
+    pub fn remove_column(&mut self, idx: usize, dialect: SqlDialect) {
         if idx >= self.columns.len() {
             return;
         }
@@ -475,6 +503,9 @@ impl TableDraft {
             .retain(|ix| !ix.info.columns.iter().any(|c| c.name == name));
         self.foreign_keys
             .retain(|fk| !fk.info.columns.contains(&name));
+        self.check_constraints.retain(|ck| {
+            repoint_check_column(&ck.info.expression, &name, &name, dialect).is_none()
+        });
         // Removing a column frees its name for anyone mid-rename onto it.
         self.settle_key_names();
     }
@@ -10609,7 +10640,7 @@ mod tests {
         let mut draft = TableDraft::from_table(&t);
         // Removing the column takes the foreign key standing on it with it —
         // leaving that behind would emit a key over a column that's gone.
-        draft.remove_column(2);
+        draft.remove_column(2, MySql);
         assert!(draft.foreign_keys.is_empty());
         let cs = diff(&t, &draft, MySql);
         let sql = cs.script();
@@ -11189,7 +11220,7 @@ mod tests {
     fn deleting_a_column_frees_its_name_for_one_mid_rename() {
         let mut d = TableDraft::from_table(&ab_table());
         d.rename_column(1, "a"); // blocked by column 0
-        d.remove_column(0);
+        d.remove_column(0, MySql);
         assert_eq!(d.column_names(), vec!["a"]);
         assert_eq!(d.primary_key, vec!["a"]);
         assert_eq!(d.foreign_keys[0].info.columns, vec!["a"]);
@@ -11395,7 +11426,7 @@ mod tests {
         for keystroke in ["", "a", "ab"] {
             d.rename_column(1, keystroke);
         }
-        d.remove_column(1);
+        d.remove_column(1, MySql);
         assert_eq!(d.column_names(), vec!["a"]);
         assert_eq!(d.primary_key, vec!["a"], "only ab's membership goes");
         assert!(d.foreign_keys.is_empty());
@@ -12485,6 +12516,118 @@ mod tests {
                 check_constraints: checks,
                 ..Default::default()
             }
+        }
+
+        /// **Removing a column has to take the checks standing on it.** A check
+        /// left in the draft compares equal to the identical current one, so the
+        /// plan was a bare `DROP COLUMN` whose only risk line was *"Drops column
+        /// qty and all the data in it."* Measured at the SHA this was found on:
+        /// MySQL 8.4.11 and MariaDB 10.11.14 succeed and **delete the
+        /// constraint** when it names only that column and refuse the statement
+        /// (`ERROR 3959` / `ERROR 1054`) when it names another too; PostgreSQL
+        /// 16.15 deletes it either way; SQLite refuses whichever route the plan
+        /// takes, and its rebuild's `CREATE TABLE` is `no such column` on step 2,
+        /// so the column could not be removed through the app at all.
+        #[test]
+        fn removing_a_column_drops_the_checks_that_stood_on_it() {
+            let t = TableInfo {
+                name: "t".into(),
+                columns: vec![col("a", "int"), col("qty", "int")],
+                check_constraints: vec![ck("qty_pos", "qty > 0")],
+                ..Default::default()
+            };
+            let mut d = TableDraft::from_table(&t);
+            d.remove_column(1, MySql);
+            assert!(
+                d.check_constraints.is_empty(),
+                "the draft still holds it: {:?}",
+                d.check_constraints
+            );
+
+            let cs = diff(&t, &d, MySql);
+            assert!(
+                cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::DropCheck { name } if name == "qty_pos")),
+                "{:#?}",
+                cs.changes
+            );
+            // And the order the server needs: the constraint comes off before
+            // the column it names, which is the same sequence the emitter's
+            // MySQL-8 *rename* arm already produces.
+            let sql = cs.emit().join("\n");
+            let drop_ck = sql
+                .find("DROP CONSTRAINT")
+                .unwrap_or_else(|| panic!("{sql}"));
+            let drop_col = sql.find("DROP COLUMN").unwrap_or_else(|| panic!("{sql}"));
+            assert!(drop_ck < drop_col, "{sql}");
+        }
+
+        /// It is a column **reference** test, not a name match: a check is on
+        /// `qty` because its predicate names `qty`, whatever the constraint is
+        /// called — and one that names another column as well still has to go,
+        /// which is the half MySQL and MariaDB refuse outright.
+        #[test]
+        fn a_check_is_matched_by_what_its_predicate_names() {
+            let t = TableInfo {
+                name: "t".into(),
+                columns: vec![col("a", "int"), col("qty", "int")],
+                check_constraints: vec![
+                    ck("named_nothing_like_it", "`qty` > 0"),
+                    ck("two_columns", "qty < a"),
+                    ck("untouched", "a > 0"),
+                ],
+                ..Default::default()
+            };
+            let mut d = TableDraft::from_table(&t);
+            d.remove_column(1, MySql);
+            let left: Vec<&str> = d
+                .check_constraints
+                .iter()
+                .map(|c| c.info.name.as_str())
+                .collect();
+            assert_eq!(left, vec!["untouched"], "{left:?}");
+        }
+
+        /// **And dropping a constraint nobody asked about is the same bug in the
+        /// other direction**, which is why the test goes through the engine's own
+        /// quoting and case rules rather than a case-insensitive guess:
+        /// PostgreSQL's `"Qty"` is not `qty`, and its check must survive.
+        #[test]
+        fn a_postgres_check_on_a_differently_cased_column_survives() {
+            let t = TableInfo {
+                name: "t".into(),
+                columns: vec![col("qty", "int"), col("Qty", "int")],
+                check_constraints: vec![ck("upper_pos", "\"Qty\" > 0")],
+                ..Default::default()
+            };
+            let mut d = TableDraft::from_table(&t);
+            d.remove_column(0, Postgres);
+            assert_eq!(d.check_constraints.len(), 1, "{:?}", d.check_constraints);
+            // And removing the column it really names does take it.
+            let mut d = TableDraft::from_table(&t);
+            d.remove_column(1, Postgres);
+            assert!(d.check_constraints.is_empty(), "{:?}", d.check_constraints);
+
+            // MySQL folds a bare identifier's case, so there `QTY` does name
+            // `qty` — and `"Qty"` is a *string literal* on that engine, not an
+            // identifier at all, which is the other half the shared lexer gets
+            // right for free.
+            let bare = TableInfo {
+                check_constraints: vec![ck("upper_pos", "QTY > 0")],
+                ..t.clone()
+            };
+            let mut d = TableDraft::from_table(&bare);
+            d.remove_column(0, MySql);
+            assert!(d.check_constraints.is_empty(), "{:?}", d.check_constraints);
+            let mut d = TableDraft::from_table(&t);
+            d.remove_column(0, MySql);
+            assert_eq!(
+                d.check_constraints.len(),
+                1,
+                "a double-quoted string is not a column reference on MySQL: {:?}",
+                d.check_constraints
+            );
         }
 
         /// Three sources, one stored shape — so the emitter wraps exactly once
@@ -15156,7 +15299,7 @@ mod tests {
                 // dropping an indexed column is legitimately two changes.
                 (
                     "drop column",
-                    |d| d.remove_column(2),
+                    |d| d.remove_column(2, MySql),
                     "DROP COLUMN `description`",
                 ),
                 (
@@ -15192,7 +15335,7 @@ mod tests {
         fn dropping_an_indexed_column_takes_its_index_first() {
             let t = film();
             let mut draft = TableDraft::from_table(&t);
-            draft.remove_column(1); // `title`, which `idx_title` stands on
+            draft.remove_column(1, MySql); // `title`, which `idx_title` stands on
             let cs = diff(&t, &draft, MySql);
             assert_eq!(cs.len(), 2, "{:#?}", cs.changes);
             let sql = cs.script();
