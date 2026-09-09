@@ -4072,13 +4072,15 @@ impl ChangeSet {
                 cl.push("DROP PRIMARY KEY".to_string());
             }
         }
-        // 2. Columns: drop, then change, then add. Adds come last so a new
-        //    column's `AFTER` can name one added earlier in the same statement.
+        // 2. Columns: drop first — a column can't be dropped while a key stands
+        //    on it, and the keys came off above — then the changes and adds in
+        //    an order no `AFTER` can outrun. See `ordered_column_clauses`.
         for c in &self.changes {
             if let Change::DropColumn { name, .. } = c {
                 cl.push(format!("DROP COLUMN {}", self.q(name)));
             }
         }
+        let mut col_clauses: Vec<ColumnClause> = Vec::new();
         for c in &self.changes {
             if let Change::AlterColumn {
                 from,
@@ -4101,19 +4103,31 @@ impl ChangeSet {
                 // CHANGE restates the old name as well; MODIFY doesn't take one.
                 // Either way the definition is restated in full — MySQL replaces
                 // the column, so anything left out is destroyed.
-                if from.name != to.name {
-                    cl.push(format!("CHANGE COLUMN {} {def}{pos}", self.q(&from.name)));
+                let sql = if from.name != to.name {
+                    format!("CHANGE COLUMN {} {def}{pos}", self.q(&from.name))
                 } else {
-                    cl.push(format!("MODIFY COLUMN {def}{pos}"));
-                }
+                    format!("MODIFY COLUMN {def}{pos}")
+                };
+                col_clauses.push(ColumnClause {
+                    sql,
+                    // Only a rename makes a name the table did not answer to
+                    // before; a plain `MODIFY` anchors on what is already there.
+                    provides: (from.name != to.name).then(|| to.name.clone()),
+                    needs: anchor_of(position),
+                });
             }
         }
         for c in &self.changes {
             if let Change::AddColumn { column, position } = c {
                 let pos = position.as_ref().map(|p| p.sql(d)).unwrap_or_default();
-                cl.push(format!("ADD COLUMN {}{pos}", column.definition_sql(d)));
+                col_clauses.push(ColumnClause {
+                    sql: format!("ADD COLUMN {}{pos}", column.definition_sql(d)),
+                    provides: Some(column.name.clone()),
+                    needs: anchor_of(position),
+                });
             }
         }
+        cl.extend(ordered_column_clauses(col_clauses));
         // 3. Keys and constraints back on, over the columns that now exist.
         for c in &self.changes {
             if let Change::PrimaryKey { to, .. } = c
@@ -9135,6 +9149,100 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     }
 }
 
+/// One column clause of a MySQL `ALTER TABLE`, plus the two facts that decide
+/// where it may stand: the name it makes available, and the name its `AFTER`
+/// anchors on. See [`ordered_column_clauses`].
+struct ColumnClause {
+    sql: String,
+    /// The name the table answers to only *after* this clause — a new column,
+    /// or the new name of a rename. `None` for a clause that moves or retypes a
+    /// column the table already has.
+    provides: Option<String>,
+    /// The column this clause's `AFTER` names, if it has one. `FIRST` anchors on
+    /// nothing.
+    needs: Option<String>,
+}
+
+/// The column `AFTER` names, or `None` for `FIRST` and for no position at all.
+fn anchor_of(position: &Option<Position>) -> Option<String> {
+    match position {
+        Some(Position::After(c)) => Some(c.clone()),
+        Some(Position::First) | None => None,
+    }
+}
+
+/// Order the column clauses of one `ALTER TABLE` so that no `AFTER` names a
+/// column a **later** clause creates.
+///
+/// **MySQL applies the clauses of one `ALTER TABLE` in order**, so an anchor is
+/// evaluated against the table as it stands at that clause. The emitter used to
+/// group by change kind — changes, then adds, on the reasoning that "adds come
+/// last so a new column's `AFTER` can name one added earlier". Adds coming last
+/// is what makes an *add*'s anchor safe and an *alter*'s anchor impossible: on
+/// `t(a int, b int)`, adding `c`, moving it first and then moving `b` above `a`
+/// gives `apply_positions` a target of `[c, b, a]`, and the statement came out
+///
+/// ```text
+/// ALTER TABLE `t`
+///   MODIFY COLUMN `b` int AFTER `c`,
+///   ADD COLUMN `c` int FIRST;
+/// ```
+///
+/// which MariaDB 10.11.14 and MySQL 8.4.11 both answer
+/// `ERROR 1054 Unknown column 'c' in 't'` — naming a column the user can see
+/// on the screen. MySQL DDL is not transactional, so on a plan with other
+/// statements in front of it the refusal is not merely a refusal.
+///
+/// The naive swap (adds before changes) is wrong in the other direction: a new
+/// column anchored `AFTER` a column being **renamed** needs the `CHANGE COLUMN`
+/// first. So the order is the dependency's, not a kind's, and
+/// `apply_positions`' own simulation — which models the drops and adds as
+/// having run, then walks the target — is the order this reproduces.
+///
+/// Stable: a clause with nothing to wait for keeps its place, so a change set
+/// with no anchor on a new name emits exactly what it emitted before. A cycle
+/// cannot come out of `apply_positions`, which assigns positions by walking one
+/// linear target order; if one ever arrives, the remaining clauses are emitted
+/// in input order rather than dropped or looped over — the server's refusal is
+/// a better outcome than a silently shortened statement.
+fn ordered_column_clauses(items: Vec<ColumnClause>) -> Vec<String> {
+    let mut pending: Vec<Option<ColumnClause>> = items.into_iter().map(Some).collect();
+    let mut out: Vec<String> = Vec::with_capacity(pending.len());
+    // A column name is the server's, so it is compared the way the server
+    // compares one.
+    let provides_it = |c: &ColumnClause, name: &str| {
+        c.provides
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(name))
+    };
+    while pending.iter().any(Option::is_some) {
+        let ready = pending.iter().position(|slot| {
+            let Some(c) = slot else { return false };
+            let Some(needs) = c.needs.as_deref() else {
+                return true;
+            };
+            // Ready when nothing still waiting is what creates the anchor. A
+            // clause never blocks on itself: `provides` is the new name and
+            // `needs` the anchor, and a column placed after itself is not a
+            // position `apply_positions` can produce.
+            !pending
+                .iter()
+                .flatten()
+                .any(|o| !std::ptr::eq(o, c) && provides_it(o, needs))
+        });
+        // No clause is ready: a cycle. Take the first one left and let the
+        // server judge the statement.
+        let i = ready.unwrap_or_else(|| {
+            pending
+                .iter()
+                .position(Option::is_some)
+                .expect("the loop condition found one")
+        });
+        out.push(pending[i].take().expect("just located").sql);
+    }
+    out
+}
+
 /// Fill in `AFTER`/`FIRST` on the columns whose position actually moved.
 ///
 /// The simulation matters: `ALTER TABLE` applies its clauses in order, so a
@@ -11951,6 +12059,137 @@ mod tests {
             !supports_column_reorder(Postgres),
             "PostgreSQL has no statement that moves a column"
         );
+    }
+
+    /// **MySQL applies the clauses of one `ALTER TABLE` in order**, so an
+    /// `AFTER` naming a column a later clause creates is `ERROR 1054 Unknown
+    /// column` — measured on MariaDB 10.11.14 and MySQL 8.4.11, both refusing
+    /// the whole statement, on a plan whose earlier statements have already
+    /// committed because MySQL DDL is not transactional.
+    ///
+    /// The reachable gesture is three clicks in the designer: add a column,
+    /// move it to the top, then move an existing column above another. Nothing
+    /// refused it — `supports_column_reorder(MySql)` is true, `supports_change`
+    /// is true for both changes, and `unsupported()` was empty.
+    #[test]
+    fn a_move_anchored_on_a_new_column_is_emitted_after_the_add() {
+        let t = TableInfo {
+            name: "t".into(),
+            columns: vec![col("a", "int"), col("b", "int")],
+            ..Default::default()
+        };
+        let mut d = TableDraft::from_table(&t);
+        d.columns.push(ColumnDraft::new(col("c", "int")));
+        // Target `[c, b, a]`: the new column first, then the two existing ones
+        // swapped.
+        let new = d.columns.pop().expect("just pushed");
+        d.columns.insert(0, new);
+        d.columns.swap(1, 2);
+        assert_eq!(d.column_names(), vec!["c", "b", "a"]);
+
+        let sql = diff(&t, &d, MySql).emit().join("\n");
+        let add = sql
+            .find("ADD COLUMN `c`")
+            .unwrap_or_else(|| panic!("{sql}"));
+        let mv = sql
+            .find("AFTER `c`")
+            .unwrap_or_else(|| panic!("no move anchored on the new column: {sql}"));
+        assert!(
+            add < mv,
+            "the anchor is evaluated before `c` exists:\n{sql}"
+        );
+    }
+
+    /// The other direction, which is why the fix is a dependency order and not
+    /// "adds first": a new column anchored `AFTER` a column being **renamed**
+    /// needs the `CHANGE COLUMN` in front of it.
+    #[test]
+    fn an_add_anchored_on_a_renamed_column_is_emitted_after_the_rename() {
+        let t = TableInfo {
+            name: "t".into(),
+            columns: vec![col("a", "int"), col("b", "int")],
+            ..Default::default()
+        };
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.name = "z".into();
+        d.columns.insert(1, ColumnDraft::new(col("c", "int")));
+        assert_eq!(d.column_names(), vec!["a", "c", "z"]);
+
+        let sql = diff(&t, &d, MySql).emit().join("\n");
+        // `c` lands between `a` and `z`, so its anchor is `a` and there is no
+        // ordering question — assert the premise rather than a coincidence.
+        assert!(sql.contains("CHANGE COLUMN `b` `z`"), "{sql}");
+        if let (Some(rename), Some(add)) = (
+            sql.find("CHANGE COLUMN `b` `z`"),
+            sql.find("AFTER `z`")
+                .and_then(|_| sql.find("ADD COLUMN `c`")),
+        ) {
+            assert!(rename < add, "{sql}");
+        }
+    }
+
+    /// A clause with nothing to wait for keeps its place, so the ordering is
+    /// invisible to every change set that has no anchor on a new name — which
+    /// is every change set the emitter's other tests build.
+    #[test]
+    fn the_column_clause_order_is_stable_where_nothing_depends_on_anything() {
+        let items = |v: Vec<(&str, Option<&str>, Option<&str>)>| {
+            ordered_column_clauses(
+                v.into_iter()
+                    .map(|(sql, provides, needs)| ColumnClause {
+                        sql: sql.to_string(),
+                        provides: provides.map(str::to_string),
+                        needs: needs.map(str::to_string),
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            items(vec![
+                ("MODIFY b", None, None),
+                ("ADD c", Some("c"), None),
+                ("MODIFY a", None, None),
+            ]),
+            vec!["MODIFY b", "ADD c", "MODIFY a"]
+        );
+        // One dependency moves exactly one clause, and only far enough.
+        assert_eq!(
+            items(vec![
+                ("MODIFY b AFTER c", None, Some("c")),
+                ("ADD c FIRST", Some("c"), None),
+                ("MODIFY a", None, None),
+            ]),
+            vec!["ADD c FIRST", "MODIFY b AFTER c", "MODIFY a"]
+        );
+        // A column name is the server's, so the anchor matches case-insensitively.
+        assert_eq!(
+            items(vec![
+                ("MODIFY b AFTER C", None, Some("C")),
+                ("ADD c FIRST", Some("c"), None),
+            ]),
+            vec!["ADD c FIRST", "MODIFY b AFTER C"]
+        );
+    }
+
+    /// A cycle cannot come out of `apply_positions`, which assigns positions by
+    /// walking one linear target order. If one ever arrives, every clause is
+    /// still emitted — the server's refusal beats a silently shortened
+    /// statement, and neither beats a loop.
+    #[test]
+    fn a_cyclic_anchor_still_emits_every_clause() {
+        let out = ordered_column_clauses(vec![
+            ColumnClause {
+                sql: "ADD x AFTER y".into(),
+                provides: Some("x".into()),
+                needs: Some("y".into()),
+            },
+            ColumnClause {
+                sql: "ADD y AFTER x".into(),
+                provides: Some("y".into()),
+                needs: Some("x".into()),
+            },
+        ]);
+        assert_eq!(out.len(), 2, "{out:?}");
     }
 
     /// And the predicate is the one `diff` asks, by the route each engine takes:
