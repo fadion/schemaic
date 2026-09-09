@@ -132,8 +132,48 @@ fn scrollbar_geo(lines: usize, line_h: f64, viewport_h: f64) -> Option<(f64, f64
 /// rule every future programmatic edit has to be told about. **Typed** edits —
 /// auto-pair insertion, the paired backspace — deliberately do not come through
 /// here: there the popup *should* follow the caret.
-fn edit_untyped(ed: &Editor, comp: Completion, sel: Selection, text: &str, ty: EditType) {
+fn edit_untyped(ed: &Editor, comp: Completion, sel: Selection, text: &str, ty: EditType) -> bool {
+    // **`read_only` does not gate this path, so the funnel has to.** In floem
+    // 0.2 the flag is read at exactly two entry points —
+    // `TextDocument::receive_char` and `run_command` — and `Document::edit`
+    // takes no `Editor` at all; floem's own doc calls it *"for use by code that
+    // wants to modify the document from 'outside' the usual keybinding/command
+    // logic"*. Every programmatic edit in this pane is outside it.
+    //
+    // The freeze that matters is the Ctrl+K preview's. Its own contract says
+    // why: *"The phantom rows are anchored to line numbers and the plan was
+    // computed against the text as it was, so an edit underneath would leave
+    // the rows sitting on lines they no longer describe and Accept splicing at
+    // offsets that have moved."* And the editor **holds the keyboard** while
+    // the preview is up, so Ctrl+/, Alt+Up, Tab, Ctrl+D on a bare caret,
+    // Ctrl+Alt+L, the find bar's Replace and the snippet library all reached
+    // the document through here — each moving every byte after it while
+    // `cmdk.start`/`end` stayed where they were. Accept then spliced the
+    // approved suggestion into the middle of a different token.
+    //
+    // One check in the funnel rather than ten at the callers, because "every
+    // future programmatic edit has to be told about it" is the failure mode
+    // this function's own doc already names for `comp.suppress`. The auto-pair
+    // handler is the one site that had it, and says the same thing.
+    if ed.read_only.get_untracked() {
+        return false;
+    }
+    edit_untyped_frozen(ed, comp, sel, text, ty);
+    true
+}
+
+/// [`edit_untyped`] **past the freeze**, for the one edit the freeze exists to
+/// protect.
+///
+/// Accept is the whole point of the Ctrl+K preview: it splices the suggestion
+/// the user just approved while `read_only` is still set, and clears the popup
+/// afterwards. Spelled as its own function rather than a flag so the exception
+/// is one name a reader can grep for, and so nothing acquires it by passing
+/// `true`.
+fn edit_untyped_frozen(ed: &Editor, comp: Completion, sel: Selection, text: &str, ty: EditType) {
     comp.suppress.set(true);
+    // FREEZE-EXEMPT: this *is* the unchecked half, and `edit_untyped` above is
+    // the checked one that calls it. Accept is the only other caller.
     ed.doc().edit_single(sel, text, ty);
 }
 
@@ -387,7 +427,9 @@ fn cmdk_popup(
                     // The same `inline_splice` the preview used, so what lands is
                     // what the plan described — line endings included.
                     let (text, _) = diff::inline_splice(&full, s, e, &sql);
-                    edit_untyped(&ed, comp, Selection::region(s, e), &text, EditType::Paste);
+                    // The freeze is this preview's own, and this is the edit it
+                    // was protecting — see `edit_untyped_frozen`.
+                    edit_untyped_frozen(&ed, comp, Selection::region(s, e), &text, EditType::Paste);
                     ed.cursor
                         .update(|c| c.set_offset(s + text.len(), false, false));
                 }
@@ -2731,6 +2773,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let Some((s, en)) = pairs::backspace_pair(&full, off, dia) else {
                     return false;
                 };
+                // The auto-pair *insert* branch above checks the freeze and this
+                // one did not, though it reaches the document by the same
+                // ungated route. See `edit_untyped`.
+                if e.read_only.get_untracked() {
+                    return false;
+                }
                 e.doc()
                     .edit_single(Selection::region(s, en), "", EditType::Delete);
                 e.cursor.update(|c| c.set_offset(s, false, false));
@@ -4811,13 +4859,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 };
                 off
             };
-            edit_untyped(
+            // Refused while the editor is frozen — and then the index must not
+            // advance either, or Replace would walk the find bar forward over a
+            // document it did not change.
+            if !edit_untyped(
                 &ed,
                 comp,
                 Selection::region(off, off + q.len()),
                 &repl,
                 EditType::Other,
-            );
+            ) {
+                return;
+            }
             let text = ed.doc().text().to_string();
             let new_hits = find_matches(&text, &q);
             if new_hits.is_empty() {
@@ -6129,6 +6182,131 @@ mod cmdk_open_gate {
         assert!(
             opens >= 4,
             "the scan found only {opens} openers — has `cmdk.open` been renamed?"
+        );
+    }
+}
+
+/// **Every programmatic edit in this pane goes through the one funnel that asks
+/// whether the editor is frozen.**
+///
+/// `read_only` gates exactly two entry points in floem 0.2 —
+/// `TextDocument::receive_char` and `run_command` — and `Document::edit` takes
+/// no `Editor` at all: floem's own doc calls it *"for use by code that wants to
+/// modify the document from 'outside' the usual keybinding/command logic"*.
+/// Everything here is outside it. Meanwhile the Ctrl+K preview sets `read_only`
+/// **and hands the editor the keyboard**, so Ctrl+/, Alt+Up, Tab, Ctrl+D on a
+/// bare caret, Ctrl+Alt+L, the paired Backspace, the find bar's Replace and the
+/// snippet library all reached the document while the phantom rows were up —
+/// each moving every byte after it while `cmdk.start`/`end` stayed put, so
+/// Accept spliced the approved suggestion into the middle of a different token.
+///
+/// A scan rather than a unit test, and deliberately: the decision is one line,
+/// and a `fn may_edit(read_only: bool) -> bool` would be a decoration that
+/// passes whatever the call sites do. What went wrong was that nine of ten
+/// sites did not ask — a *census*, which is what a census can check. Against the
+/// unfixed tree this reports nine offenders.
+#[cfg(test)]
+mod editor_freeze_gate {
+    use crate::source_gate::production_code;
+    use std::path::Path;
+
+    /// How far back a raw `edit_single` may have asked, in logical lines. The
+    /// auto-pair insert branch reads the flag 20 lines before its edit; the
+    /// paired backspace reads it 3 lines before.
+    const WINDOW: usize = 30;
+
+    /// The marker a deliberate bypass carries, on or above the edit. There are
+    /// two, both in the funnel's own pair, and each says why in the same line.
+    const EXEMPT: &str = "FREEZE-EXEMPT";
+
+    fn logical_lines(src: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for raw in src.lines() {
+            let t = raw.trim_start();
+            match out.last_mut() {
+                Some(prev) if t.starts_with('.') => prev.push_str(t),
+                _ => out.push(t.to_string()),
+            }
+        }
+        out
+    }
+
+    fn source() -> String {
+        production_code(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("editor_pane.rs"),
+            )
+            .expect("this file"),
+        )
+    }
+
+    /// **The funnel asks.** This is the load-bearing half: every programmatic
+    /// edit but two goes through `edit_untyped`, so one missing check there is
+    /// nine bypasses. Asserted on the function's own body rather than on a
+    /// predicate, because `fn may_edit(read_only: bool) -> bool` would be a
+    /// decoration that passes whatever the call sites do.
+    #[test]
+    fn the_edit_funnel_asks_whether_the_editor_is_frozen() {
+        let src = source();
+        let body = src
+            .split_once("fn edit_untyped(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body.to_string())
+            .expect("the funnel is still called `edit_untyped`");
+        assert!(
+            body.contains("read_only.get_untracked()"),
+            "`edit_untyped` reaches the document through `Document::edit`, which \
+             floem's `read_only` does not gate — so if it does not ask, nothing \
+             does:\n{body}"
+        );
+        assert!(
+            body.contains("return false"),
+            "and it has to *refuse*, not merely look"
+        );
+    }
+
+    /// **And nothing goes round it.** `Document::edit` takes no `Editor` at all
+    /// — floem's own doc calls it *"for use by code that wants to modify the
+    /// document from 'outside' the usual keybinding/command logic"* — so a raw
+    /// `edit_single` is a second door, and the paired-backspace branch was
+    /// standing in it while its own insert twin twenty lines above checked.
+    ///
+    /// A census rather than a unit test, deliberately: what went wrong was that
+    /// nine of ten sites did not ask, which is the kind of thing only a census
+    /// can check.
+    #[test]
+    fn no_raw_document_edit_goes_round_the_funnel() {
+        let lines = logical_lines(&source());
+        let mut edits = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(".edit_single(") {
+                continue;
+            }
+            edits += 1;
+            let lo = i.saturating_sub(WINDOW);
+            let asked = lines[lo..=i].iter().any(|l| {
+                l.contains(EXEMPT)
+                    || l.contains("read_only.get_untracked()")
+                    || l.contains("ro.get_untracked()")
+            });
+            if !asked {
+                offenders.push(format!("  {line}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these edit the document without asking whether the editor is \
+             frozen:\n{}",
+            offenders.join("\n")
+        );
+        // The scan has to still be finding the sites, or a rename makes it pass
+        // by seeing nothing at all.
+        assert!(
+            edits >= 3,
+            "the scan found only {edits} document edits — has `edit_single` been renamed?"
         );
     }
 }
