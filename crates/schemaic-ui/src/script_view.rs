@@ -134,9 +134,25 @@ fn pick_file(ui: Ui) {
             return; // Dismissed.
         };
         // floem's open dialog is not window-modal, so the modal that asked may
-        // be closed or reopened on another database by now — the same hazard
-        // `dump_view` names at its save dialog.
-        if s.generation.get_untracked() != asked_at || s.target.get_untracked().is_none() {
+        // be closed, reopened on another database, **or running a file** by now
+        // — the same hazard `dump_view` names at its save dialog, and the same
+        // predicate it asks.
+        //
+        // The `running` term is the one that was missing, and the check above
+        // was the only place it was read: a Run pressed while this dialog stood
+        // open left the callback free to replace the panel's counts and its red
+        // destruction sentence with the newly-picked file's, over the running
+        // file's progress. Worse, the failure and cancel reports read
+        // `s.probe` — so a stopped run of `a.sql` printed *a.sql* over
+        // **b.sql**'s transaction structure, and told the user 412 durable
+        // statements had been rolled back.
+        if !crate::widgets::accept_dialog_launch(
+            s.running.get_untracked(),
+            false,
+            s.target.get_untracked().is_some(),
+            asked_at,
+            s.generation.get_untracked(),
+        ) {
             return;
         }
         s.path.set(Some(path.clone()));
@@ -148,7 +164,16 @@ fn pick_file(ui: Ui) {
             path,
             target.dialect,
             Rc::new(move |res| {
-                if s.generation.get_untracked() != asked_at {
+                // The same three terms. A probe is slow enough on a large file
+                // for a Run to start under it, and this callback is the second
+                // writer of `s.probe`.
+                if !crate::widgets::accept_dialog_launch(
+                    s.running.get_untracked(),
+                    false,
+                    s.target.get_untracked().is_some(),
+                    asked_at,
+                    s.generation.get_untracked(),
+                ) {
                     return;
                 }
                 s.probing.set(false);
@@ -230,7 +255,7 @@ fn run_script(ui: Ui) {
                 RunOutcome::Cancelled { ran } => s.error.set(Some(format!(
                     "Stopped after {ran} {}. {}",
                     schemaic_core::text::plural(ran, "statement", "statements"),
-                    durability_sentence(s.probe.get_untracked().as_ref(), &name),
+                    durability_sentence(s.probe.get_untracked().as_ref(), &name, ran),
                 ))),
                 RunOutcome::Failed { message, ran, at } => {
                     let where_ = match at {
@@ -242,7 +267,7 @@ fn run_script(ui: Ui) {
                     s.error.set(Some(format!(
                         "Failed{where_}: {message} — {ran} {} ran before it. {}",
                         schemaic_core::text::plural(ran, "statement", "statements"),
-                        durability_sentence(s.probe.get_untracked().as_ref(), &name),
+                        durability_sentence(s.probe.get_untracked().as_ref(), &name, ran),
                     )))
                 }
             }
@@ -254,8 +279,13 @@ fn run_script(ui: Ui) {
 ///
 /// The decision is `script::durability`; this is only its words, so the two
 /// reports cannot say different things about the same fact.
-fn durability_sentence(probe: Option<&Probe>, name: &str) -> String {
-    match schemaic_core::script::durability(probe) {
+///
+/// `ran` is what makes the answer about *this* run rather than about the file:
+/// a statement that failed after the file's own `COMMIT` — or in its second
+/// transaction — leaves the earlier ones durable, and the sentence used to say
+/// the opposite.
+fn durability_sentence(probe: Option<&Probe>, name: &str, ran: usize) -> String {
+    match schemaic_core::script::durability(probe, ran) {
         Durability::RolledBack => format!(
             "{name} opened its own transaction, so the server rolled the whole run back — \
              nothing was applied, including the statements that succeeded."

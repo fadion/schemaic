@@ -497,13 +497,27 @@ pub enum Durability {
 /// missing probe is an absence of evidence, and the two wrong answers here cost
 /// very differently (re-running a rolled-back file is free; re-running an
 /// applied one is duplicate rows).
-pub fn durability(probe: Option<&Probe>) -> Durability {
-    match probe {
-        Some(p) if p.own_transaction => Durability::RolledBack,
-        // The probe read the file whole and found no `BEGIN`, so there is none.
-        Some(p) if !p.more => Durability::Applied,
-        _ => Durability::Unknown,
+/// `ran` is how many statements completed before the run stopped, so the one
+/// that failed (or was cut off) is statement `ran + 1`. **It is what turns
+/// "the file has a transaction somewhere" into "the run was inside it"** —
+/// without it, one `BEGIN` anywhere in the file was read as "the file wraps
+/// itself", and a two-transaction migration whose second half failed was
+/// reported as *"nothing was applied, including the statements that
+/// succeeded"* over rows that were durably committed.
+pub fn durability(probe: Option<&Probe>, ran: usize) -> Durability {
+    let Some(p) = probe else {
+        return Durability::Unknown;
+    };
+    // Inside the one transaction the file opened: statement `ran + 1` is at or
+    // before the `COMMIT` that closes it.
+    if p.atomic_through.is_some_and(|through| ran < through) {
+        return Durability::RolledBack;
     }
+    // The probe read the file whole and found no `BEGIN`, so there is none.
+    if !p.own_transaction && !p.more {
+        return Durability::Applied;
+    }
+    Durability::Unknown
 }
 
 /// Which of the three states a probe is in. See [`ProbeSummary`].
@@ -556,6 +570,28 @@ pub struct Probe {
     /// the file, and nesting is not what either engine does with a second
     /// `BEGIN`.
     pub own_transaction: bool,
+    /// **How far into the run the file's own transaction reaches** — `Some(k)`
+    /// meaning statements 1..=`k` are inside it, so a run that stopped at or
+    /// before `k` left nothing behind.
+    ///
+    /// A different question from [`Probe::own_transaction`], and the reason the
+    /// two are separate fields. That one asks *"must the runner avoid wrapping
+    /// this in another transaction"*, which one `BEGIN` anywhere genuinely
+    /// settles. [`durability`] needs *"is the whole run atomic"*, and reusing
+    /// the flag for it claimed far more:
+    ///
+    /// * a migration with **two** transactions reported "nothing was applied"
+    ///   over the first one's committed rows — measured on MariaDB 10.11.14;
+    /// * so did a failure at anything **after** the file's own `COMMIT`, which
+    ///   is the commoner shape (a dump's trailing `SET FOREIGN_KEY_CHECKS = 1;`,
+    ///   an `ANALYZE`, a hand-appended `CREATE INDEX`).
+    ///
+    /// `None` when the probed prefix opened no transaction or more than one —
+    /// with more than one, the earlier ones are durable and which of them the
+    /// run reached is not a question a count of statements can answer. A
+    /// transaction the probe never saw close covers everything it read, and
+    /// [`durability`] answers `Unknown` past that.
+    pub atomic_through: Option<usize>,
     /// Statements that destroy something. Named in plain language before the
     /// run, the way generated DDL is.
     pub destructive: usize,
@@ -607,8 +643,13 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
 
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut own_transaction = false;
+    // The one transaction's span, if there is exactly one: how many it opened,
+    // and the 1-based index of the statement that closed the outermost one.
+    let mut opens = 0usize;
+    let mut depth = 0usize;
+    let mut closed_at: Option<usize> = None;
     let mut destructive = 0usize;
-    for s in &stmts {
+    for (i, s) in stmts.iter().enumerate() {
         // **Counted, not dropped.** A statement `statement_kind` cannot name is
         // still a statement the run will send, and dropping it from the
         // histogram made the summary and the list beneath it disagree — a
@@ -620,6 +661,13 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
         // `BEGIN` on PostgreSQL and SQLite (`dump::transaction_sql`).
         if kind == "BEGIN" || kind == "START" {
             own_transaction = true;
+            opens += 1;
+            depth += 1;
+        } else if (kind == "COMMIT" || kind == "ROLLBACK") && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                closed_at.get_or_insert(i + 1);
+            }
         }
         if is_destructive(&s.sql, &kind, dialect) {
             destructive += 1;
@@ -634,6 +682,9 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
         kinds,
         more: truncated || capped,
         own_transaction,
+        // Exactly one, or the question a statement count can answer is not the
+        // one being asked — see the field.
+        atomic_through: (opens == 1).then(|| closed_at.unwrap_or(stmts.len())),
         destructive,
         bytes_read,
     })
@@ -1350,10 +1401,71 @@ mod tests {
     #[test]
     fn a_file_that_wraps_itself_is_reported_as_rolled_back() {
         let wrapped = probed("START TRANSACTION;\nINSERT INTO t VALUES (1);\nCOMMIT;");
-        assert_eq!(durability(Some(&wrapped)), Durability::RolledBack);
+        assert_eq!(durability(Some(&wrapped), 1), Durability::RolledBack);
 
         let plain = probed("INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);");
-        assert_eq!(durability(Some(&plain)), Durability::Applied);
+        assert_eq!(durability(Some(&plain), 1), Durability::Applied);
+    }
+
+    /// **One `BEGIN` is not "the file wraps itself".** A migration script with
+    /// two transactions was reported as *"nothing was applied, including the
+    /// statements that succeeded"* while the first transaction's rows were
+    /// durable — measured on MariaDB 10.11.14, where after the second
+    /// transaction's `INSERT` failed and the connection dropped mid-transaction
+    /// the first row was still there. A user who believes the report re-runs the
+    /// file and duplicates every committed transaction, which is the expensive
+    /// direction of the trade `Durability`'s own doc weighs.
+    ///
+    /// The three tests this joins each use a single `BEGIN … COMMIT`, so none
+    /// of them could see it.
+    #[test]
+    fn a_file_with_two_transactions_is_not_reported_as_rolled_back() {
+        let two = probed(
+            "BEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;\n\
+             BEGIN;\nINSERT INTO t VALUES (2);\nCOMMIT;",
+        );
+        assert_eq!(two.atomic_through, None, "two transactions cover nothing");
+        for ran in 0..=6 {
+            assert_ne!(
+                durability(Some(&two), ran),
+                Durability::RolledBack,
+                "after {ran} statements"
+            );
+        }
+    }
+
+    /// The commoner shape: **anything after the file's own `COMMIT`.** A dump's
+    /// trailing `SET FOREIGN_KEY_CHECKS = 1;`, an `ANALYZE`, a hand-appended
+    /// `CREATE INDEX`. Fail there and the run really is applied, while the
+    /// report said nothing was.
+    #[test]
+    fn a_statement_after_the_commit_is_outside_what_the_transaction_covers() {
+        let p = probed(
+            "SET FOREIGN_KEY_CHECKS = 0;\nSTART TRANSACTION;\n\
+             INSERT INTO t VALUES (1);\nCOMMIT;\nSET FOREIGN_KEY_CHECKS = 1;",
+        );
+        assert_eq!(p.statements, 5);
+        assert_eq!(p.atomic_through, Some(4), "up to and including the COMMIT");
+        // A failure inside the transaction: the whole run really is rolled back.
+        assert_eq!(durability(Some(&p), 2), Durability::RolledBack);
+        assert_eq!(durability(Some(&p), 3), Durability::RolledBack);
+        // A failure at the trailing `SET`: the rows are committed, and the
+        // report must not claim otherwise.
+        assert_eq!(durability(Some(&p), 4), Durability::Unknown);
+    }
+
+    /// A transaction the probe never saw close still covers everything it read —
+    /// and a failure past the probed prefix is not something it can answer.
+    #[test]
+    fn an_unclosed_transaction_covers_the_prefix_and_no_further() {
+        let p = probed("BEGIN;\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);");
+        assert_eq!(p.atomic_through, Some(3));
+        assert_eq!(durability(Some(&p), 2), Durability::RolledBack);
+        assert_eq!(
+            durability(Some(&p), 9),
+            Durability::Unknown,
+            "past what the probe read"
+        );
     }
 
     /// The two ways the answer is genuinely unknown, kept apart from
@@ -1362,7 +1474,7 @@ mod tests {
     /// rows.
     #[test]
     fn an_unread_or_truncated_file_says_it_does_not_know() {
-        assert_eq!(durability(None), Durability::Unknown);
+        assert_eq!(durability(None, 0), Durability::Unknown);
         let truncated = Probe {
             statements: 2000,
             more: true,
@@ -1370,16 +1482,18 @@ mod tests {
             ..Probe::default()
         };
         assert_eq!(
-            durability(Some(&truncated)),
+            durability(Some(&truncated), 1),
             Durability::Unknown,
             "a `BEGIN` past the probe's reach is still a `BEGIN`"
         );
-        // …but a truncated probe that *did* see one is certain.
+        // …but a truncated probe that *did* see one, and a failure inside what
+        // it read, is certain.
         let truncated = Probe {
             own_transaction: true,
+            atomic_through: Some(2000),
             ..truncated
         };
-        assert_eq!(durability(Some(&truncated)), Durability::RolledBack);
+        assert_eq!(durability(Some(&truncated), 1), Durability::RolledBack);
     }
 
     /// Past the statement ceiling every count is a floor, and says so.

@@ -25,6 +25,16 @@ kind of bug in a document everyone trusts — `core/tests/doc_coverage.rs` catch
 never written down, and nothing catches a paragraph that has quietly become false. When a change
 lands, route the write through `arch-scribe` rather than leaving it for afterwards.
 
+**A bare basename does not always answer that guard.** It matches on a left word boundary, because
+a plain `contains` could not fail for twelve of the modules it governs — seven basenames are
+suffixes of another module's (`date.rs` ⊂ `update.rs`, `import.rs` ⊂ `conn_import.rs`, and five
+more), and the longer name is itself guaranteed to be written down, so deleting every mention of
+`core/date.rs` left the guard green. And a basename that exists in **two** crates — `dump.rs`,
+`script.rs`, `secrets.rs`, `update.rs`, `window_chrome.rs` — must be named with its crate, since
+`app/secrets.rs` answered for `core/secrets.rs` for free while the failure message told the reader
+to add them per crate. Everywhere else a bare mention is still enough, which is why this document's
+existing prose was left alone.
+
 ## Contents
 
 - [Crates](#crates) — the module map, one entry per source file
@@ -1905,6 +1915,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `validate` refusing an unnamed `CHECK`, and two unnamed checks pairing onto one
     original). Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
     field) and `common_types`. Pure + unit-tested.
+    **How much of a type's spelling may be canonicalised is a capability, `TypeAliasing`**, not a
+    dialect test. It was `dialect == Postgres`, which sorted SQLite onto MySQL's side — its alias
+    table, its meaningless integer display widths, its `BOOLEAN` → `TINYINT(1)` rewrite — and the
+    designer then answered *no change* to `INT` → `INTEGER`, which is the edit that makes a SQLite
+    column the rowid alias and the only declared type `AUTOINCREMENT` is legal on. The third arm is
+    `Verbatim`, and it normalises **nothing**: SQLite stores the declared text and derives an
+    affinity from it, so two spellings that differ are two different declarations even where the
+    affinity agrees, and collapsing them hides an edit. The enum is exhaustive so a fourth engine
+    has to be looked at rather than inheriting MySQL's. `common_types` gained a SQLite arm for the
+    same reason it needed one — it fell into MySQL's, offering `tinyint(1)`, `longtext`, `datetime`
+    and `year`, and no `INTEGER` at all.
     **A `CHECK` is matched to its original by name, and an unnamed one has none.**
     SQLite keeps a constraint unnamed — a bare `CHECK (a > 0)` in the table body is the
     ordinary spelling there and `CheckInfo::clause_sql` emits it back that way — so
@@ -2965,7 +2986,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     never happened: a batch stops at its first failure and reports the rest `Cancelled` without
     dispatching them, so a 60-statement script failing at statement 2 evicted the connection's 50
     real entries in favour of 48 that never ran. Deliberately **not** applied to a single run —
-    one the user cancels *was* dispatched and may have written something. `remove` is the row
+    one the user cancels *was* dispatched and may have written something.
+    **A batch does not get to evict history it did not contribute, so the cap is deferred.** Pushing
+    a Run Everything one statement at a time applied the per-connection cap on each, so a
+    51-statement script cost the connection all 50 of its real entries *plus* its own first
+    statement before anything ran — and the batch then stopped at statement 1, so `drop_runs`
+    removed the 50 that never happened and the log came back **completely empty**, from an ordinary
+    Run Everything, with nothing asked and nothing said. Neither function could see it alone: `push`
+    knew about one statement and `drop_runs` about the tail, which is why the test is
+    `a_script_that_stops_early_does_not_empty_the_connections_history` and drives the whole chain.
+    `push_batch` records the batch whole at launch and `trim` applies the cap in `finish_history`,
+    once the outcomes are known — the only moment anything can tell a statement that ran from one
+    that was never sent. The overshoot is bounded by capping the batch's own contribution at
+    `MAX_PER_CONN`, so a connection holds at most twice that between launch and verdict, and the
+    statements kept under that bound are the **first** ones, because those are the ones that can
+    already have run. `trim` is over the *whole* store rather than one connection because the caller
+    applying it knows run ids and not connections, and a cap that is idempotent and total needs
+    neither; being idempotent is also what lets a batch that fitted report no change and cost no
+    file write. `remove` is the row
     menu's single-entry delete, and its key is **`(conn_id, sql)` because that is the identity
     `push` maintains**: `push` drops any earlier entry with the same pair before inserting, so at
     most one can be in the log at a time, and `remove` is that predicate read backwards. The
@@ -3503,6 +3541,89 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     re-created database gets a **fresh** id rather than colliding with a live node, that reordering
     the server's list renumbers nothing (the tree keys on id), and that a reload against an empty
     list still works.
+  - `persist.rs` — the small on-disk state that survives a restart, and the one place that decides
+    **how a config file is written and how it comes back**. `config_dir` is `%APPDATA%/schemaic` or
+    `$XDG_CONFIG_HOME`/`~/.config`; `UiState`/`ui_state.json` is the original tenant and
+    `tabs.json`, `connections.json`, `history.json`, `chats.json`, `snippets.json`,
+    `favorites.json`, `db_colors.json`, `diagrams.json`, `search_history.json` and
+    `ssh_known_hosts.json` all arrived behind it. Every decision in it is pure and testable because
+    **the filesystem is an argument**: `FileStore` is the seam `write_bytes` and `read_bytes` take,
+    the way `secrets::SecretStore` does for the keyring and for the same reason. What had no test
+    was never `classify` or `sibling` but the *composition* — that what a save produces is what a
+    load can recover from — and that composition is what decides whether a user's connections, tabs
+    and history survive a crash or a full disk, including the failures a real disk will not stage on
+    demand.
+    **The save ordering.** `write_bytes` stages the new bytes in a `.tmp` sibling, copies the
+    previous generation to `.bak`, renames the `.tmp` over the target, and falls back to a direct
+    write only when the rename is refused. The `.bak` is **re-written rather than `fs::copy`d**,
+    which would carry the old file's mode onto the backup — including a 0644 left by a build from
+    before this — and the old one is never removed before the new file is in place, because a save
+    that fails must leave the recovery copy it found.
+    **`Saving { Replacing, Erasing }` is an argument to that save, because every deletion this app
+    confirms was undone at rest without it.** The history panel's trash asks *"Delete N recorded
+    queries for this connection? This can't be undone"*, and the save that answered Yes copied the
+    pre-clear file to `history.json.bak` on its way past — so every statement the user had just
+    confirmed the deletion of sat in a sibling until the *next* save of that store, which needs
+    another query run; a clear followed by a quit left it there indefinitely. The user's own SQL is
+    content this module already treats as sensitive (`open_private_append` narrows the log for
+    exactly that reason) and the Settings modal's **Log file** row is an explicit invitation to open
+    that folder and share it. An erasing save takes no `.bak` and removes any earlier one **after**
+    the new file lands. It is a property of the save and not of a particular store, which is why it
+    is a parameter rather than a `clear_*_backup` per file; `save_json_erasing` is the public entry,
+    and the callers are the history panel's trash, one history row removed from its menu, a deleted
+    connection's history and chats, and the AI panel's New chat — `persist_chat` takes a `Saving`,
+    so the caller says whether a turn finished or a transcript was replaced with nothing.
+    **An absent primary is not a first run**, and treating it as one was silent data loss.
+    `recover(primary, staged, backup)` returns the value *and* a `Recovered` — `Primary`,
+    `FirstRun`, `Corrupt(err)` or `Restored(sibling)` — and an absent primary walks `.tmp` then
+    `.bak` before it concedes. That order, because `write_bytes` stages the *new* value into `.tmp`
+    and copies the *old* primary into `.bak`, so where both survive the staged one is the newer; a
+    sibling that does not parse is stepped over rather than believed, which is what stops a
+    half-written `.tmp` shadowing an intact `.bak`. Before this the absent case defaulted with
+    nothing said, the next save wrote the defaults over the primary, and the save *after* that
+    copied the now-defaulted primary onto `.bak` — the last copy gone within two ordinary saves, and
+    saves are frequent (a tab change, a history entry). The two ways to arrive there are a crash
+    between the staged write and the rename on a *first* save, which leaves a `.tmp` holding
+    everything, and the file being removed from outside: the Settings modal's own *Open folder*
+    button puts the user in that directory, and a roaming-profile sync, a backup restore or an AV
+    quarantine reach it too. **`read_bytes` classifies before it sweeps**, and sweeps the orphan
+    `.tmp` only behind a healthy primary — the sweep used to run first and unconditionally, so on
+    the one load where that copy was the only one the loader destroyed it and then reported a first
+    run. A **corrupt** primary still consults `.bak` alone and is preserved as `.corrupt`; widening
+    that arm is a separate decision from the one the absent arm is about, and tests pin it.
+    **`queue_notice` is the shared startup-notice channel**, over the `RECOVERIES` list the
+    config-recovery modal drains with `take_recoveries`. Everything loaded before the window is
+    drawn has the same problem — there is no surface yet to say anything on — so one channel beats
+    each loader inventing its own, and `app/secrets.rs` is the second caller (a locked keyring is
+    *the* reason connections stop authenticating and used to reach neither a banner nor a log line).
+    `recovery_notice` is the corrupt-file sentence; `missing_notice` is the vanished-file one, and
+    it says the disappearance rather than repairing it quietly, because the sibling the file came
+    back from is the only copy until the next save lands and a user who does not know that has no
+    reason to take a backup. `load_json_strict` is the third loader and the one for *security* state
+    rather than configuration: an unreadable trust store is an `Err`, never an empty one, since the
+    default value there is the insecure answer.
+    **`write_file_atomic` is the other half of this module and is for a file that is *not* ours** —
+    a `.sql` script the user opened, another vendor's settings file, the Antigravity claim marker.
+    `fs::write` truncates before it writes, so a full disk, a dropped share or a crash between the
+    two leaves the user's file empty with the only copy of the text in a tab about to close. It
+    keeps **no `.bak`** (leaving `orders.sql.bak` after every Ctrl+S is not ours to do) and it has
+    four load-bearing parts a tidy-up would drop. `resolved_target` follows a symlink first, because
+    `fs::rename` acts on the *link*: a dotfile manager's `settings.json` → a chezmoi/stow repo was
+    replaced by an ordinary file and the managed copy silently stopped receiving writes — a
+    regression the atomicity introduced, since the `fs::write` it replaced followed the link
+    correctly. `stage_beside` uses a **unique** staging name opened `create_new`: the fixed
+    `<path>.schemaic-tmp` was a pure function of the target, so two windows launching together
+    staged the same sibling and the loser's rename returned `NotFound` and fell through to the
+    truncating write this exists to avoid — and `create_new` closes the other half, since
+    `fs::write` is `File::create`, which follows a symlink and truncates, so another local account
+    pre-creating that sibling as a link redirected the victim's text at the victim's privileges. It
+    carries the **target's mode onto the staged file** (Unix), because the rename swaps the inode
+    and without it a `chmod 600 seed.sql` came back 0644. And it `sync_data`s before the rename,
+    with a directory sync after it where the platform allows: a rename is atomic with respect to
+    other *processes* and is not, on its own, ordered after the data blocks with respect to a power
+    loss, and this path has no `.bak` to fall back on. **What it does not pretend to keep** is a
+    second hard link — the new inode is a new inode, and there is no way to have both that and a
+    one-step replacement; atomicity wins, because the file being protected is often the only copy.
   - `core/secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of
     the plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →
@@ -3516,6 +3637,45 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     undeletable through the app. The real keyring-backed store lives in `schemaic-app`'s
     `secrets` module (the heavy `keyring`/D-Bus dep stays out of core); pure + unit-tested via an
     in-memory fake.
+    **Both directions of a store failure now come back as a sentence, because the machine where the
+    keyring rule is quietly untrue is exactly the machine whose user needs to hear it.**
+    `SecretStore::delete` returns a `bool` — *definitely gone*, which covers a delete that succeeded
+    and one that found nothing — where it used to return `()` under "best effort", while its sibling
+    `set` already returned `bool` for the very same reason. That asymmetry was the defect:
+    `sanitize_file`'s own promise is that clearing a password cannot be undone by a later hydrate,
+    and that promise rests entirely on this call, so a delete that quietly failed left the entry in
+    the keyring while the disk copy said empty and the next launch hydrated the cleared password
+    back in. `Hydration` therefore carries `stored` (the secrets the store actually held a value for
+    at load) and `error` (one backend message from the failed reads), and a refused delete is
+    reported **only** for a field this load read a value out of — on a machine with no keyring at
+    all, every empty field asks for a delete and every refusal is meaningless, which would be three
+    false alarms per connection on exactly the machines that already have a real problem.
+    `Hydration::notice` is the read-side sentence and both halves of it are load-bearing:
+    *unavailable this session* is why the connections stopped working, *were not deleted* is what
+    stops the user retyping a half-remembered password over a stored one that is perfectly intact.
+    `Sanitized { file, in_the_clear, undeleted }` is the write-side counterpart — the sanitized file
+    plus the two facts the save established, which used to be discarded at the only call site — and
+    its `notice()` names the consequence rather than the mechanism: *your passwords are in a file
+    you are about to send someone* (the folder Settings → General's **Open folder** button opens,
+    beside the log), and *the next launch will fill this cleared field back in*. `forget` returns
+    whether a deleted connection's entries are all definitely gone, which matters because ids are
+    reused.
+    **`app/secrets.rs`'s two classifications are free functions so they can be tested**, which is
+    the whole reason they were pulled out of the trait impl. `classify_get` decides that `NoEntry`
+    alone means *there is no secret here* and everything else — a locked keyring, a denied prompt, a
+    platform failure — means *we could not read it*; `classify_delete` is the same rule the other
+    way. Core pins both consequences, but only ever against a fake that reports errors correctly by
+    construction, so collapsing the match at the real backend left every one of those tests green
+    while credentials were destroyed — the seam at a trait impl rather than at a function call, and
+    that file was at zero coverage. On the app side `load_connections` puts `Hydration::notice` on
+    `persist::queue_notice` (the startup channel the config-recovery modal drains),
+    `save_connections` returns `Option<String>` and `main.rs`'s `persist_conns` shows it in the
+    error modal — once per session per distinct notice, because the alternative is a modal on every
+    read-only toggle and every connection switch for as long as the keyring is down. And the
+    process-level `last_hydration` is read with `into_inner` rather than `unwrap_or_default`: a
+    poisoned mutex used to hand the save a *default* `Hydration` with nothing marked unreadable, so
+    the save read every empty field as a password the user had cleared and deleted it. The failure
+    direction of a lock has to be *keep what we knew*, not *know nothing*.
   - `rowjson.rs` — the per-field model behind the grid's whole-row **view/edit panel**. A `ColSpec`
     per result column carries what the panel needs (name, editability, nullability, current value);
     `field_value_text` renders a cell into its editable text and `update_changes` diffs the panel's
@@ -3880,7 +4040,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     paren adjacent to the caret + its partner, ignoring parens in strings/comments),
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
-    (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware (no backtick on PG).
+    (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware, and its two "is a
+    backtick an identifier quote here" sites ask `SqlDialect::backtick_ident` (`pub(crate)` for
+    them) rather than re-spelling `!= Postgres`, which is the capability rule one module over.
   - `params.rs` — `:name` query parameters: `scan`/`names` (every placeholder and its byte range,
     built on `skip_noncode` so a `:id` inside a string, comment, dollar-quoted body or quoted
     identifier is not one), `bindings_for` (the parameters bar's rows, re-derived from the SQL on
@@ -4013,9 +4175,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     records that it happened (free — `from_utf8_lossy` already allocates only when it substituted),
     persists across a relaunch, and the app confirms before such a save. The `.sql` file is the one
     artefact in this application Schemaic cannot regenerate, which is also why the write is
-    `persist::write_file_atomic` (stage beside, rename over — no `.bak` and no mode change, since it
-    is the user's own file) and why the save re-reads the bytes immediately before the rename and
-    refuses when they are not what the tab read.
+    `persist::write_file_atomic` (stage beside, rename over — no `.bak`, since it is the user's own
+    file, and the mode it had carried onto the new inode; see `persist.rs` for the four parts of
+    that which read as tidiable) and why the save re-reads the bytes immediately before the rename
+    and refuses when they are not what the tab read.
     **Size is asked before the bytes are.** `open_verdict` confirms past 1 MB and refuses past 64
     MB, and the reason is the editor rather than the read: `fs::read` and `decode` are cheap even at
     256 MB, while `intel::diagnostics` runs over the whole document on the UI thread 120 ms after
@@ -4156,6 +4319,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       file written before this and applies its names to **every** connection — the only honest
       reading of a set that had no connection dimension, since re-scoping it to whichever connection
       happened to be active would silently unhide databases on all the others.
+      **It returns `Option<Vec<DbHiddenRule>>`, and `None` means *not yet*.** The migration runs at
+      most once and `save_ui` writes the flat field empty from then on, so a launch with no
+      connection ids — `connections.json` failed to load, or the user deleted their last connection
+      — produced no rules and lost the legacy list by the first save, turning every previously
+      hidden database permanently visible with nothing said and no way to retry. `Some(vec![])` and
+      `None` are therefore different answers: *there was nothing to migrate* against *there was
+      nobody to migrate it for*. `main.rs` carries the unconsumed flat list back out to disk rather
+      than writing the field empty. The regression test that missed this asserted the opposite
+      (`is_empty()`, which the bug satisfied), which is why the pinned one is named
+      `no_connections_is_not_yet_rather_than_nothing_to_migrate`.
     - `db_color.rs` — identity colours: a per-`(connection, database)` one and a
       per-`(connection, database, table)` one. Display-only — a dot in the tree, the active-DB
       selector and tabs for a database; a dot on the table row and a tint on that table's card
@@ -4718,6 +4891,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   *warms* the slot when it does have to fetch, so the modal and the tree spare each other in both
   directions. Another connection's target still fetches on its own: `db_nodes` is the active
   connection's tree, which is why the target carries a `conn_id` at all.
+  **The warm is `schemaic_ui::warm_stats_slot`, and it reads the slot with `try_with_untracked`.**
+  It captures a `ConnNode::stats` signal and comes back to it *after an await*, which is longer than
+  a render: switching connection in between has `nodes_scope_cb` swap in a fresh scope and dispose
+  the old one, freeing every slot signal — and floem defines `get_untracked` as
+  `try_get_untracked().unwrap()`, so the read was a panic that takes the window and every tab's
+  uncommitted edits with it. `DbStatsSlot`'s own rule — *anything that keeps the slot across renders
+  tracks the list too* — is what this site broke, at a longer range than the rule's wording covers.
+  `with` rather than `get` for the second reason as well: the question has two answers and
+  `get_untracked` cloned a whole `SchemaStats` (a `Vec<TableStats>` plus its `HashMap`) to reach it.
+  Only a **vacant** slot is warmed — `Idle` or `Unavailable`, never `Loading` (a fetch of its own
+  will land) and never `Loaded` (substituting one reading for another with nothing to say which is
+  newer). `warming_a_disposed_slot_does_nothing` panics rather than fails against the old body.
   **`count_rows` takes a `CancellationToken` like every other unbounded operation.** It was the one
   that didn't, and the scan it starts is a full one: closing the modal abandoned the *answer* while
   the query ran on for minutes holding a connection, and reopening offered the button again, so N
@@ -7186,7 +7371,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Ctrl/Alt + letter** with (the `"x" | "X"` case pair, `eq_ignore_ascii_case`, `NavKeys`'
     `Some("x") =>` *and* its `ch == Some("x")`, and `KeyCode::KeyX` for the physical match
     Ctrl+Alt+L needs) and fail when one has no row, with `EXEMPT` the justified-baseline
-    escape hatch in the spirit of `contrast::UI_SHORTFALL`. The equality form is where **both**
+    escape hatch in the spirit of `contrast::UI_SHORTFALL`. **`EXEMPT` is `(file, letter, reason)`
+    and is scoped to one file, for the reason `KEY_FILES` is**: a crate-wide exemption goes blind
+    everywhere at once, so exempting Ctrl+Z for the masked secret field's sake would have vouched
+    for a real editor undo binding added later, in a different file, doing a different thing. Its
+    two entries are `lib.rs`'s `z` and `y` — a masked field's undo/redo, *suppressed* rather than
+    bound, because the document's history is a history of mask characters. The equality form is where **both**
     Ctrl+Shift+letter bindings live and was missed; the gate was green only because `p`/`t` are
     bound a second time in the unshifted arms. `KEY_FILES` pairs each file with the `SHORTCUTS`
     **groups** its bindings may be documented in, because a table-wide lookup let the editor's
@@ -7256,6 +7446,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     That is also what stopped opening the form from rewriting a `MariaDB` label to `MySQL` — the
     write used to be unconditional, and the picker has one name per engine where `db_type` has
     several.
+    **The mask is replayed from the editor's own delta, never diffed out of the buffer.** The
+    document holds `MASK_CH` throughout, so comparing the text before and after an edit cannot tell
+    a mask character the *user* typed from one that was already there — and the ambiguity was not
+    academic: replacing `hunter2` with a pasted `***` stored `hun`, three characters of the secret
+    being replaced, into the OS keyring and, through the account editor which shares this widget,
+    into a real `CREATE USER … IDENTIFIED BY`. Nothing showed it — the mask re-rendered at the right
+    length and the DDL preview redacts the literal. So the field asks the editor instead:
+    `runs_of_delta` translates floem's `RopeDelta` into `MaskRun::Keep(a, b)` / `MaskRun::Insert(t)`
+    over the buffer that was there before, and `splice_real` replays exactly those runs onto the
+    real value. Both are pure and unit-tested here; `diff_edit` and `reconstruct_real` are gone.
+    Two invariants hold it up. `disp` and `real` **always share a char count**, which is what makes
+    a `Keep` run's offsets index both — and when they have drifted, or a run reaches past the end,
+    `splice_real` returns `None` and the caller restores the mask from the real value rather than
+    guessing, because the wrong guess here is a password nobody holds written to the keyring or to a
+    server. And a `MaskEdit` carries a monotonic `seq`, because two edits describing the same runs
+    are still two edits and pasting `***` over a three-character mask must not read as *nothing
+    happened*; its `edit` is `None` when one update carried several deltas at once, whose later
+    offsets are relative to a buffer this side never saw.
     A right-click in the list on the left **selects on the action taken, not on the click**: its
     menu's Duplicate and Delete carry the connection id themselves, and selecting up front meant
     merely *opening* the menu ran `draft.load` over every field the user had typed, with no undo and
@@ -7330,7 +7538,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     through `widgets::action_button_dyn`, whose label is reactive while the button around it is
     not. The "Added N connections." line shows only while nothing is selected, which is exactly the
     window between an import finishing and the user asking for another — so it can never sit beside
-    an enabled Import describing a *previous* press. `skipped_sentence` (pure, tested) names up to
+    an enabled Import describing a *previous* press. **It has its own full-width wrapping row above
+    the button row**, where it used to share that row as a `text_ellipsis()` slot about 350 px wide:
+    the sentence it carries runs to ~190 characters, so the user read `Added 3 connections.
+    Read-only and the en…` and the warning the line exists to deliver — that read-only and the
+    environment badge are *not* carried over — never reached the screen at all. The slot had been
+    sized for the sentence it was first given. `skipped_sentence` (pure, tested) names up to
     three left-out entries and counts the rest, returning `None` for an empty list so a stray
     "0 entries were not imported" can't reach the screen.
   - `dividers.rs` — the two **panel** dividers: `h_resize_handle` (the schema tree's and the right
@@ -7424,6 +7637,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     module exists to end. `crate_sources` closes the same hole at the other end with
     `assert!(out.len() > 20)`: a moved or renamed `src` would otherwise pass every gate by finding
     no files at all.
+    **`no_continuation_typed_as_newline_gate` lives in this module rather than beside a subject**,
+    because its subject is the whole tree: Rust's `\`-before-newline strips the newline *and* the
+    next line's indentation, while `\n` inserts a newline and keeps the indentation, so a sentence
+    meant to be one line renders with a hard break and twenty-odd spaces in the middle of it. Three
+    shipped, in three files, each byte-verified with `cat -A` — `app/main.rs`'s warning that
+    read-only and the environment badge are not carried over (`\n` + 17 spaces), `ui/users_view.rs`'s
+    grant-statement cap note (+ 25), `ui/lib.rs`'s pinned-results memory tooltip (+ 21). None is
+    testable on its own: each is a literal inside a view and the damage is what a renderer does with
+    it, which is exactly the case for a lint instead. **Eight spaces is the threshold** — a
+    deliberate `\n` in prose is followed by the next word, and a wrapped string literal nested in a
+    view is indented well past eight columns; the only matches outside the two crates' production
+    code are a CLI-help fixture, a synthetic source fixture and two live-test SQL strings, all of
+    which mean their newline. A deliberate break puts the next line at column 0.
   - `snippet_panel.rs` — the **Snippet Library** right-column panel (`RightPanel::Snippets`, the
     toolbar's bookmark toggle): the saved queries that apply to the active connection, under the
     scope bands `core::snippet::grouped` returns, over the History panel's chrome. It decides
@@ -8392,8 +8618,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `connection_form::masked_edit_field`**, the same one the four saved-connection secrets wear:
     this was the app's only *unmasked* secret field, so its real characters were on screen and a
     Ctrl+A/Ctrl+C from the clipboard. That helper is `pub(crate)` precisely so there is one of them
-    — a second masking widget is how the two come to disagree about `reconstruct_real`'s deletion
-    rule, which is the part that is easy to get subtly wrong.
+    — a second masking widget is how the two come to disagree about the replay rule, which is the
+    part that is easy to get subtly wrong, and it is the same widget that reaches
+    `CREATE USER … IDENTIFIED BY`.
     **Every fixed-list choice in both forms is the app's `<select>`** — `settings::focusable_dropdown`,
     the control the settings modals wear, so the popup, the keyboard, the tinted current value and
     the chevron box are one implementation. Four rows moved onto it: the account form's **Kind**, and
@@ -9872,7 +10099,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     vanished until the next keystroke repaints against the grown box. The repaint is deferred a tick
     so it runs against settled layout.
     (`FieldCfg::min_rows` is the floor such a box starts at — 1 by default, 3 for a snippet body,
-    clamped against `max_rows` at use because `clamp` panics when the floor exceeds the cap.) The shared types living in the crate root is what stalls further splitting: the
+    clamped against `max_rows` at use because `clamp` panics when the floor exceeds the cap.)
+    **`FieldCfg::masked` is where a field whose buffer stands in for a value it does not hold
+    reports each edit**, as the editor's own copy/insert runs over the buffer that was there before
+    it — `connection_form::MaskEdit`, and `connection_form::masked_edit_field` is the app's one
+    consumer. It is not a convenience: a masked buffer is mask characters throughout, so *comparing*
+    it before and after cannot tell a mask character the user typed from one that was already there,
+    and the field that tried stored three characters of the previous secret when a `*`-containing
+    password replaced it. The delta is the editor saying what it did, which is the only unambiguous
+    answer, and it covers every path into the buffer — keys, clipboard, IME commit — not only the
+    ones a key handler sees. Two consequences a caller has to know. Setting it **takes undo and redo
+    away from the field**: the document's history is a history of *masks*, so replaying one puts
+    mask characters into the value, and Ctrl+Z/Ctrl+Y are swallowed rather than left unbound so
+    nothing else claims them (which is why `shortcuts`' `EXEMPT` carries `lib.rs`'s `z` and `y`).
+    And the report is filtered by a plain `syncing: Cell<bool>` set around the signal→doc reconcile,
+    because the field's own re-mask arrives through the same `update` hook and reporting it back
+    would loop the pair of effects that produced it — a flag suffices because `on_update` runs
+    synchronously inside `edit_single`.
+    The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
     **`modals.rs` is the first cut that did move**, and it is the shape the rest should follow: not
@@ -9896,6 +10140,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     first connection should connect on save rather than wait to be selected. That last arm was
     unreachable while the seed existed and read `unwrap_or(1)`; the number is the same and the
     coupling to `next_id` is the part under test.
+    **`Connection::rebind_tab(saved, &known, fallback)` is the same question for a restored *tab*,
+    and an empty list is deliberately not the same answer.** The saved id wins while it names a
+    connection; when it does not, the tab's connection was deleted and the tab moves to the
+    fallback, which is what stops a session pointing at a connection nobody can select. But
+    "deleted" and "the connection file did not load" both present as *the id is not in this list*
+    and want opposite things — on a load failure the saved id is right and the list is wrong.
+    Collapsing them rebound twelve tabs across three connections onto one id (that same
+    forward-looking `next_id(&[])`, which a *future* connection will occupy), and the debounced
+    session save wrote it to disk before the user touched anything, so restoring `connections.json`
+    from its `.bak` afterwards did not undo it. A tab naming a connection that does not exist is a
+    state the app already handles — `db_for` answers "connection no longer exists" — while a tab
+    silently re-pointed at someone else's server is not.
     The header's **connection trigger** is one slot with two occupants, chosen by
     `connections.is_empty()`: the switcher normally, and on a first run with nothing saved a
     `New connection` button in the accent that drafts a connection and opens Manage Connections in
@@ -11741,7 +11997,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   takes its environment as a `Vec` and treats an empty one as meaningful — a client with no
   credential sets no variable and names none in `WSLENV`, which is not the same as passing an empty
   password. (It was `Option<(var, password)>` until the TLS settings had to travel the same road;
-  see `core::launch`.) **No exceptions** —
+  see `core::launch`.)
+  **A *constant* standing in for a capability is the same failure with no comparison left to grep
+  for**, and three of that shape fell together. `ddl::normalize_type`'s `dialect == Postgres` became
+  the private, exhaustive `TypeAliasing` (see `ddl.rs`), which is what stopped SQLite being
+  canonicalised by MySQL's alias table. `ddl_preview::exit_cancellable` takes an
+  `Option<SqlDialect>` where it had `.unwrap_or(SqlDialect::MySql)`: with no preview open there is
+  no engine to ask, and the guard was correct only by coincidence, `ddl_rolls_back_as_a_whole(MySql)`
+  happening to be `false` — MySQL 8's atomic DDL is exactly the refinement that predicate exists to
+  absorb, and the day it lands the absent case would have begun reporting *cancellable* with nothing
+  in the diff naming that modal. And `emit_mysql`'s table-comment literal takes the function's own
+  `d` like every other literal in the statement, since it is reached through `emit()`'s `_` arm and
+  a fourth variant of the MySQL family would otherwise have got MySQL's escaping for the comment
+  while its neighbours got their own. `SqlDialect::backtick_ident` is the other half of the tidy:
+  `pub(crate)` so `core::pairs` can ask it at its two sites rather than hand-spelling
+  `!= SqlDialect::Postgres`, which agreed for all three engines today and could survive neither a
+  fourth nor a change at the definition, since it would move one and not the other.
+  **No exceptions** —
   `intel::tokenize_range` (the mid-edit byte-position *fallback*) is dialect-aware too, and so are the
   `intel` entry points that reach it (`clause_context`/`clause_continuation`/`join_targets`/
   `expand_star`/`signature_help` all take a `SqlDialect`). It additionally lifts a **quoted identifier**
@@ -11885,7 +12157,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   through the app's `secrets::{load,save}_connections`/`forget_connection` (which wrap
   `persist::{load,save}_connections`) — never call `persist::save_connections` directly from the app,
   or you reintroduce plaintext. Plaintext in the JSON is a *fallback only* for a machine with no
-  working keyring.
+  working keyring — **and the app now says so when it happens**, rather than letting a stated
+  invariant be quietly false on someone's machine: `Sanitized::notice` names the file the passwords
+  landed in and the button that opens its folder, `Hydration::notice` names a keyring that would not
+  answer and says the stored secrets were *not* deleted, and both reach the user (the startup ones
+  through `persist::queue_notice`, a mid-session save's through `save_connections`' return value and
+  `main.rs`'s `persist_conns`). A refused *delete* is the third case and is reported only for a
+  secret this session actually read a value out of. See `core/secrets.rs`.
 - **Own per-entity signals in a child `Scope`; dispose it *deferred*.** A `Tab`/`ConnNode` creates
   its signals in `parent.create_child()`; removal disposes that scope via
   `exec_after(Duration::ZERO, …)` — one tick later, after the keyed `dyn_container` has unmounted
@@ -12889,6 +13167,25 @@ Re-introducing the anti-patterns these guard against is a regression:
   discard had already put in flight. `grid::clear_if_any` is the guard (`Clearable`, over `Option`
   as well as the collections, so "the editor is already closed" is the same case), and
   `grid::clear_tests` pins the floem fact itself by counting effect runs.
+  **`set` doesn't dedup either, and the active tab is where that costs most.** `RwSignal::set` to the
+  value already there still notifies every dependent (floem 0.2 compares nothing, in `set` or in
+  `create_updater`), and `TabsUi::active` is `results_area`'s and `editor_area`'s `dyn_container`
+  key — so a redundant write disposes the grid's child scope and rebuilds the editor's `Document`,
+  costing the caret, the undo stack, the scroll position and the cell selection. Every no-op
+  spelling of "go to this tab" did exactly that: clicking the chip you are already on, Ctrl+Tab with
+  one tab open (`tabsel::cycle` over `n == 1` returns the current id), Ctrl+1 on the first chip,
+  Find-Anywhere opening the tab that is already active, double-clicking a table already open, and
+  *Close other tabs* on the tab you are on — the one tab that action promises to keep. (Staged edits
+  and pending rows went with it too; they live on `PanelView` now and survive it, which is a
+  different fix.) `schemaic_ui::activate(active, id)` is the one guarded writer, and it is a
+  **function rather than a rule in a comment** because the rule was already written down and applied
+  at one of fourteen sites: `open_table_col` guards its own `set` under a comment stating it
+  verbatim, thirty-five lines from an `open_table` that does not. `no_bare_active_set_gate` (in
+  `ui/lib.rs`) is what keeps the fourteenth from happening — it reads both view crates for a bare
+  `active.set(`, keying on the bare receiver because `gs.active.set(…)` is the grid's *cell*
+  selection and a different signal entirely, and admits a write only when that line or the one above
+  it carries `active.get_untracked() !=` (rustfmt puts the `if` there). It also asserts it still
+  finds at least two guarded writes, so a rename cannot make it pass by seeing nothing.
   **A `dyn_container` key re-runs on notification, not on change**, which is the same fact where it
   costs most. The view has no equality check of its own — `create_updater` calls `on_change` on every
   re-run and `swap_val` then disposes the child scope and rebuilds it unconditionally — so a key
@@ -12966,6 +13263,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   `(target, done, error)` for exactly that reason — keyed on `target` alone, which is the one signal
   that says whether the modal is up, a finished export went on showing a red Stop over a file that
   was already written.
+- **`create_effect` runs its body once immediately, so an effect that *saves* what it watches saves
+  what it has just loaded.** The Find-Anywhere search history is the one store the app persists
+  through an effect rather than through an explicit saver, and that first run wrote
+  `search_history.json` back before the window was drawn — so its `.bak` was always exactly one
+  launch old even in normal operation, and on a launch that loaded defaults (a read failure, a
+  removed file) the write put an empty primary on disk and the launch after that rotated the empty
+  file over the last real copy. The guard is the effect's own `prev` argument, `None` on the first
+  run and nothing else: the same shape the routine editor's write-back uses so seeding is never
+  mistaken for an edit, and the resize hint's poke uses so no bar flashes on mount. A signal that is
+  *loaded* and then *watched* is the general case — the first run establishes tracking and has
+  nothing to report.
 - **An effect that writes the signals it reads must read them untracked — and an outside write to
   them is then invisible, so it needs a generation counter.** The schema tree's size-column effect
   scans every `ConnNode::stats` slot for `Idle` and writes `Loading` into each one it fetches;
