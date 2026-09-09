@@ -2,9 +2,19 @@
 //! (`conn_form`), including the password fields' `*`-masking.
 //!
 //! Masking keeps the real secret out of the native input's buffer (which we can't
-//! fully control): the field shows `MASK_CH × len`, and each edit is mapped back
-//! onto the real value by diffing the masked display (`reconstruct_real`) — pure
-//! logic, unit-tested below.
+//! fully control): the field shows `MASK_CH × len`, and each edit is replayed onto
+//! the real value from the editor's own delta (`runs_of_delta` → `splice_real`) —
+//! pure logic, unit-tested below.
+//!
+//! **The delta, not a diff of the buffer.** The buffer is mask characters
+//! throughout, so comparing the text before and after an edit cannot tell a mask
+//! character the user typed from one that was already there — and the ambiguity
+//! is not academic: replacing `hunter2` with a pasted `***` stored `hun`, three
+//! characters of the secret being replaced, into the OS keyring and (through the
+//! account editor, which shares this widget) into a real `CREATE USER … IDENTIFIED
+//! BY`. Nothing showed it: the mask re-rendered at the right length and the DDL
+//! preview redacts the literal. The editor already knows which stretches it kept
+//! and which it inserted, so the field asks it instead of guessing.
 
 use std::rc::Rc;
 
@@ -407,51 +417,106 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
     .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
-/// Char-diff `old` → `new`: shared-prefix char count, shared-suffix char count,
-/// and the text inserted between them. Used to turn a masked-buffer edit back
-/// into the same structural change on the real (unmasked) value.
-fn diff_edit(old: &str, new: &str) -> (usize, usize, String) {
-    let o: Vec<char> = old.chars().collect();
-    let n: Vec<char> = new.chars().collect();
-    let mut p = 0;
-    while p < o.len() && p < n.len() && o[p] == n[p] {
-        p += 1;
-    }
-    let mut s = 0;
-    while s < o.len() - p && s < n.len() - p && o[o.len() - 1 - s] == n[n.len() - 1 - s] {
-        s += 1;
-    }
-    let inserted: String = n[p..n.len() - s].iter().collect();
-    (p, s, inserted)
+/// One stretch of a masked field's buffer *after* an edit, said in terms of the
+/// buffer that was there *before* it. This is the editor's own delta in the two
+/// shapes that reach a single-line field.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum MaskRun {
+    /// Chars `[start, end)` of the previous buffer survived the edit — and so
+    /// do the real characters standing behind them.
+    Keep(usize, usize),
+    /// Text the edit put in, in the clear: these are the user's real characters,
+    /// seen once here before the field re-masks the buffer.
+    Insert(String),
 }
 
-/// Apply a masked-buffer edit (`prev_disp` → `cur_disp`) to the real value.
-/// `prev_disp` and `prev_real` always share a char count, so the diff's prefix/
-/// suffix offsets index both. Insertions are localized exactly (the typed char
-/// is non-mask, so the diff pins its position); a **pure deletion** of identical
-/// mask chars can't be localized, so it collapses at the prefix/suffix boundary
-/// — a mid-string backspace removes a boundary char rather than the one under
-/// the caret. Acceptable for password fields (end-editing is the common case),
-/// and selection-replace stays correct because the inserted char re-anchors it.
-fn reconstruct_real(prev_real: &str, prev_disp: &str, cur_disp: &str) -> String {
-    let (p, s, inserted) = diff_edit(prev_disp, cur_disp);
+/// One edit of a masked field's buffer, as [`crate::edit_field`] hands it over.
+///
+/// A plain `RwSignal<Vec<MaskRun>>` would not do: two edits describing the same
+/// runs are still two edits, and pasting `***` over a three-character mask must
+/// not read as "nothing happened". `seq` is what separates them.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) struct MaskEdit {
+    /// Monotonic per field. `0` is the value no edit has been recorded into.
+    pub seq: u64,
+    /// What the edit did, or `None` when the field could not describe it —
+    /// an update carrying several deltas at once, whose later offsets are
+    /// relative to a buffer this side never saw. The field restores the mask
+    /// from the real value rather than guessing (see [`splice_real`]).
+    pub edit: Option<MaskDelta>,
+}
+
+/// The mappable half of a [`MaskEdit`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct MaskDelta {
+    /// Char count of the buffer the runs are relative to.
+    pub prev_len: usize,
+    pub runs: Vec<MaskRun>,
+}
+
+/// Translate one editor delta into [`MaskRun`]s.
+///
+/// The base document is a masked buffer — ASCII mask characters throughout — so
+/// the delta's byte offsets are char offsets. Inserted text is stripped of line
+/// breaks for the reason [`crate::edit_field`] strips them from a single-line
+/// buffer: a pasted newline is not part of the secret, and the re-mask puts the
+/// document back in step.
+pub(crate) fn runs_of_delta(
+    delta: &floem::views::editor::core::xi_rope::RopeDelta,
+) -> Vec<MaskRun> {
+    use floem::views::editor::core::xi_rope::DeltaElement;
+    delta
+        .els
+        .iter()
+        .map(|el| match el {
+            DeltaElement::Copy(a, b) => MaskRun::Keep(*a, *b),
+            DeltaElement::Insert(node) => {
+                let t = node.to_string();
+                MaskRun::Insert(if t.contains(['\n', '\r']) {
+                    t.replace(['\n', '\r'], "")
+                } else {
+                    t
+                })
+            }
+        })
+        .collect()
+}
+
+/// Replay a masked-buffer edit onto the real value the mask stands for.
+///
+/// `prev_real` and the buffer the runs are relative to always share a char
+/// count — that is the whole invariant this widget rests on — so a `Keep` run's
+/// offsets index both. Returns `None` when they have drifted, or when a run
+/// reaches past the end. **A drifted mirror is not something to guess at**: the
+/// wrong guess here is a password nobody holds, written to the keyring or to a
+/// server, so the caller restores the mask from the real value instead.
+pub(crate) fn splice_real(prev_real: &str, prev_len: usize, runs: &[MaskRun]) -> Option<String> {
     let rc: Vec<char> = prev_real.chars().collect();
-    let p = p.min(rc.len());
-    let keep = rc.len().saturating_sub(s).max(p);
-    let mut next = String::with_capacity(rc.len() + inserted.len());
-    next.extend(rc[..p].iter());
-    next.push_str(&inserted);
-    next.extend(rc[keep..].iter());
-    next
+    if rc.len() != prev_len {
+        return None;
+    }
+    let mut next = String::new();
+    for run in runs {
+        match run {
+            MaskRun::Keep(a, b) => {
+                if a > b || *b > prev_len {
+                    return None;
+                }
+                next.extend(rc[*a..*b].iter());
+            }
+            MaskRun::Insert(t) => next.push_str(t),
+        }
+    }
+    Some(next)
 }
 
 // A password field on the shared `edit_field`: the editor doc holds only `*`s
-// (a hidden `disp` buffer mirrors it), and each masked edit is diffed back onto
-// the real value (`sig`). The real characters never enter the doc, so copy/cut
-// only ever yield `*`s and the password can't leak via the clipboard. External
-// changes to `sig` (loading a saved connection) re-mask the buffer to match.
-// `disp` and `real` always share a char count, which is what makes the diff in
-// `reconstruct_real` map masked-buffer edits back to the right real positions.
+// (a hidden `disp` buffer mirrors it), and each masked edit is replayed onto the
+// real value (`sig`) from the editor's own delta. The real characters never stay
+// in the doc, so copy/cut only ever yield `*`s and the password can't leak via
+// the clipboard. External changes to `sig` (loading a saved connection) re-mask
+// the buffer to match. `disp` and `real` always share a char count, which is what
+// makes a `Keep` run's offsets index both.
 fn masked_field(
     lbl: &'static str,
     sig: RwSignal<String>,
@@ -471,8 +536,8 @@ fn masked_field(
 /// editor's Password was the app's only *unmasked* secret field — the four
 /// others here all went through this — so its real characters were on screen
 /// and a Ctrl+A/Ctrl+C away from the clipboard. A second masking widget beside
-/// this one is how the two come to disagree about `reconstruct_real`'s
-/// deletion rule, which is the part that is easy to get subtly wrong.
+/// this one is how the two come to disagree about the replay rule, which is the
+/// part that is easy to get subtly wrong.
 pub(crate) fn masked_edit_field(
     sig: RwSignal<String>,
     ring: FocusRing,
@@ -480,30 +545,46 @@ pub(crate) fn masked_edit_field(
 ) -> impl IntoView {
     let real = sig;
     let disp = RwSignal::new(mask_of_len(real.get_untracked().chars().count()));
-    // Untracked mirrors of the last state each effect committed, so an effect
-    // can tell an external change from its own write and not loop.
-    let mirror_disp = RwSignal::new(disp.get_untracked());
+    // Untracked mirror of the last real value this field committed, so the
+    // external-change effect can tell someone else's write from its own.
     let mirror_real = RwSignal::new(real.get_untracked());
+    // Where `edit_field` reports what each buffer edit did. Only *user* edits
+    // land here: the field's own re-mask writes are filtered out at the source,
+    // which is what stops this pair of effects looping.
+    let edits = RwSignal::new(MaskEdit::default());
 
-    // Masked buffer edited (via the editor) → apply the same structural edit to
-    // the real value, then re-mask.
-    create_effect(move |_| {
-        let cur = disp.get();
-        if cur == mirror_disp.get_untracked() {
-            return; // our own re-mask, or genuinely unchanged
+    // Buffer edited → replay the same runs onto the real value, then re-mask.
+    create_effect(move |prev: Option<u64>| {
+        let ed = edits.get();
+        // The first run only establishes tracking; a repeat of the same edit is
+        // a re-render, not a second keystroke.
+        if prev.is_none() || prev == Some(ed.seq) {
+            return ed.seq;
         }
-        let next = reconstruct_real(
-            &mirror_real.get_untracked(),
-            &mirror_disp.get_untracked(),
-            &cur,
-        );
-        let masked = mask_of_len(next.chars().count());
-        mirror_real.set(next.clone());
-        mirror_disp.set(masked.clone());
-        real.set(next);
-        if cur != masked {
-            disp.set(masked);
+        let next = ed
+            .edit
+            .as_ref()
+            .and_then(|d| splice_real(&mirror_real.get_untracked(), d.prev_len, &d.runs));
+        match next {
+            Some(next) => {
+                let masked = mask_of_len(next.chars().count());
+                mirror_real.set(next.clone());
+                real.set(next);
+                if disp.get_untracked() != masked {
+                    disp.set(masked);
+                }
+            }
+            // Unmappable: put the buffer back to what the real value says, so
+            // the two never drift. The user sees the edit refused, which is the
+            // loud direction — the quiet one stores a secret nobody typed.
+            None => {
+                let masked = mask_of_len(mirror_real.get_untracked().chars().count());
+                if disp.get_untracked() != masked {
+                    disp.set(masked);
+                }
+            }
         }
+        ed.seq
     });
 
     // Real value changed from the outside (e.g. loading a saved connection) →
@@ -515,7 +596,6 @@ pub(crate) fn masked_edit_field(
         }
         let masked = mask_of_len(r.chars().count());
         mirror_real.set(r);
-        mirror_disp.set(masked.clone());
         disp.set(masked);
     });
 
@@ -524,6 +604,7 @@ pub(crate) fn masked_edit_field(
         FieldCfg {
             background: theme::bg_deepest,
             focus: Some((ring.clone(), tabindex)),
+            masked: Some(edits),
             ..Default::default()
         },
     )
@@ -1647,7 +1728,26 @@ fn conn_form(
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_of_len, preset_cursor, reconstruct_real};
+    use super::{MaskRun, mask_of_len, preset_cursor, runs_of_delta, splice_real};
+    use floem::views::editor::core::xi_rope::{Interval, Rope, RopeDelta};
+
+    /// One edit of the masked buffer, driven through the **whole** path the
+    /// widget uses: a real `RopeDelta` of the shape floem hands to
+    /// `edit_field`'s update hook, translated by [`runs_of_delta`] and replayed
+    /// by [`splice_real`].
+    ///
+    /// Testing the two halves apart is what let the old spelling stay green
+    /// over its own defect — the bug was never inside a function, it was in
+    /// what the buffer could and could not say about an edit.
+    fn replay(real: &str, replaced: std::ops::Range<usize>, ins: &str) -> Option<String> {
+        let prev_len = real.chars().count();
+        let delta = RopeDelta::simple_edit(
+            Interval::new(replaced.start, replaced.end),
+            Rope::from(ins),
+            prev_len,
+        );
+        splice_real(real, prev_len, &runs_of_delta(&delta))
+    }
 
     #[test]
     fn the_swatch_cursor_starts_on_the_colour_in_effect() {
@@ -1685,36 +1785,100 @@ mod tests {
         assert_eq!(mask_of_len(3), "***");
     }
 
-    // `cur_disp` models what the native input's buffer becomes after an edit:
-    // an inserted (typed/pasted) char appears verbatim; deletions just shorten
-    // the all-mask string. `reconstruct_real` maps that back onto the real value.
     #[test]
     fn insertions_are_localized() {
-        // Insertions carry the real char, so their position is exact.
-        assert_eq!(reconstruct_real("secret", "******", "******X"), "secretX"); // append
-        assert_eq!(reconstruct_real("secret", "******", "X******"), "Xsecret"); // prepend
-        assert_eq!(reconstruct_real("secret", "******", "***Z***"), "secZret"); // middle
-        assert_eq!(reconstruct_real("", "", "a"), "a"); // first char into empty
+        assert_eq!(replay("secret", 6..6, "X").as_deref(), Some("secretX")); // append
+        assert_eq!(replay("secret", 0..0, "X").as_deref(), Some("Xsecret")); // prepend
+        assert_eq!(replay("secret", 3..3, "Z").as_deref(), Some("secZret")); // middle
+        assert_eq!(replay("", 0..0, "a").as_deref(), Some("a")); // first char into empty
     }
 
     #[test]
     fn selection_replace_is_localized() {
-        // The inserted char re-anchors the edit even when it replaces a range.
-        assert_eq!(reconstruct_real("secret", "******", "N"), "N"); // select-all + type
-        assert_eq!(reconstruct_real("secret", "******", "*Z**"), "sZet"); // replace [1..4]
+        assert_eq!(replay("secret", 0..6, "N").as_deref(), Some("N")); // select-all + type
+        assert_eq!(replay("secret", 1..4, "Z").as_deref(), Some("sZet")); // replace [1..4]
     }
 
     #[test]
-    fn end_deletion_is_correct() {
-        assert_eq!(reconstruct_real("secret", "******", "*****"), "secre"); // backspace at end
-        assert_eq!(reconstruct_real("s", "*", ""), ""); // delete last char
+    fn deletions_take_the_character_they_name() {
+        assert_eq!(replay("secret", 5..6, "").as_deref(), Some("secre")); // backspace at end
+        assert_eq!(replay("s", 0..1, "").as_deref(), Some("")); // delete the last char
+        assert_eq!(replay("secret", 0..1, "").as_deref(), Some("ecret")); // delete-forward at 0
+        // A mid-string backspace used to remove a *boundary* char instead of the
+        // one under the caret — a documented limitation of diffing identical
+        // mask characters, and it goes away with the diff.
+        assert_eq!(replay("secret", 2..3, "").as_deref(), Some("seret"));
     }
 
+    /// **The bug this widget was rewritten for** (B4.2-L1-01 / B8.1-L5-01).
+    ///
+    /// A `*` is an ordinary password character, so a replacement password
+    /// containing one is indistinguishable, in the buffer, from the mask it
+    /// replaced. Diffing the buffer therefore folded the pasted `*`s into the
+    /// runs it believed had survived and spliced the new middle between two
+    /// fragments of the **old** secret: `hunter2` + a pasted `***` was stored as
+    /// `hun`, a prefix of the password being replaced, at the right mask length
+    /// and with the DDL preview redacting the literal — so nothing on any screen
+    /// showed it, and the account editor created a real server account with it.
+    ///
+    /// Measured outputs of the spelling this replaces, for each row below:
+    /// `hun`, `hx2`, `hTr0ub4dor`, `Tr0ub4dor2`.
     #[test]
-    fn mid_deletion_collapses_to_boundary() {
-        // Documented limitation: identical mask chars can't localize a pure
-        // deletion, so a mid-string backspace removes a boundary char (here the
-        // trailing one) instead of the char under the caret.
-        assert_eq!(reconstruct_real("secret", "******", "*****"), "secre");
+    fn a_replacement_password_of_mask_characters_is_stored_verbatim() {
+        assert_eq!(replay("hunter2", 0..7, "***").as_deref(), Some("***"));
+        assert_eq!(replay("hunter2", 0..7, "*x*").as_deref(), Some("*x*"));
+        assert_eq!(
+            replay("hunter2", 0..7, "*Tr0ub4dor").as_deref(),
+            Some("*Tr0ub4dor")
+        );
+        assert_eq!(
+            replay("hunter2", 0..7, "Tr0ub4dor*").as_deref(),
+            Some("Tr0ub4dor*")
+        );
+    }
+
+    /// The typed rows of the same table. `hunter2`, select all, then type
+    /// `*`, `x`, `*` — three edits, each against the buffer the last one left.
+    /// The old spelling stored `hx*`, because an inserted char that **is** the
+    /// mask character does not re-anchor the diff, which is the premise its own
+    /// contract rested on.
+    #[test]
+    fn a_password_typed_one_mask_character_at_a_time_survives() {
+        let a = replay("hunter2", 0..7, "*").expect("select-all + type *");
+        assert_eq!(a, "*");
+        let b = replay(&a, 1..1, "x").expect("type x");
+        assert_eq!(b, "*x");
+        let c = replay(&b, 2..2, "*").expect("type *");
+        assert_eq!(c, "*x*");
+    }
+
+    /// The runs index **chars**, and the real value is not ASCII the way its
+    /// mask is.
+    #[test]
+    fn a_multibyte_secret_keeps_its_characters() {
+        assert_eq!(replay("héllo", 5..5, "ü").as_deref(), Some("hélloü"));
+        assert_eq!(replay("héllo", 1..2, "").as_deref(), Some("hllo"));
+        assert_eq!(replay("héllo", 0..5, "naïve").as_deref(), Some("naïve"));
+    }
+
+    /// A pasted line break is not part of the secret — `edit_field` strips one
+    /// from a single-line buffer, and the value must not keep what the buffer
+    /// dropped.
+    #[test]
+    fn a_pasted_line_break_does_not_reach_the_value() {
+        assert_eq!(replay("", 0..0, "a\r\nb").as_deref(), Some("ab"));
+    }
+
+    /// The mirror and the buffer must agree on a char count or the offsets mean
+    /// nothing. Guessing here writes a password nobody holds, so it refuses.
+    #[test]
+    fn a_drifted_mirror_is_refused_rather_than_guessed_at() {
+        let runs = [MaskRun::Keep(0, 3), MaskRun::Insert("x".into())];
+        assert_eq!(splice_real("abc", 3, &runs).as_deref(), Some("abcx"));
+        // The buffer says four characters, the real value holds three.
+        assert_eq!(splice_real("abc", 4, &runs), None);
+        // A run reaching past the end of the buffer it claims to describe.
+        assert_eq!(splice_real("abc", 3, &[MaskRun::Keep(0, 9)]), None);
+        assert_eq!(splice_real("abc", 3, &[MaskRun::Keep(2, 1)]), None);
     }
 }

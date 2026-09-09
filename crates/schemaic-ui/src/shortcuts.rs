@@ -275,14 +275,30 @@ mod tests {
     ];
 
     /// Letters bound to something that is not a user-facing shortcut, each with
-    /// the reason it is not in the modal. A letter leaves this list the moment it
-    /// becomes something a user would look up.
+    /// the file it is exempt *in* and the reason it is not in the modal. A letter
+    /// leaves this list the moment it becomes something a user would look up.
     ///
     /// Kept as a baseline in the spirit of `contrast::UI_SHORTFALL`: an unlisted
     /// letter must be documented, and a listed one carries its justification.
-    /// Empty today — every modified letter the app binds is in the table — and an
-    /// empty list is the healthy state, not a sign the mechanism is unused.
-    const EXEMPT: &[(&str, &str)] = &[];
+    ///
+    /// **Scoped to one file, for the reason `KEY_FILES` is.** A crate-wide
+    /// exemption goes blind everywhere at once — exempting Ctrl+Z for the
+    /// masked field's sake would have vouched for a real editor undo binding
+    /// added later, in a different file, doing a different thing.
+    const EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "lib.rs",
+            "z",
+            "undo inside a masked secret field, *suppressed* rather than bound: the \
+             document's history is a history of mask characters, so replaying one \
+             writes asterisks into the password. Nothing here for a user to look up.",
+        ),
+        (
+            "lib.rs",
+            "y",
+            "redo — the other half of the same suppression.",
+        ),
+    ];
 
     fn src_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -432,7 +448,11 @@ mod tests {
             missing.extend(
                 letters
                     .iter()
-                    .filter(|c| !EXEMPT.iter().any(|(e, _)| e.starts_with(**c)))
+                    .filter(|c| {
+                        !EXEMPT
+                            .iter()
+                            .any(|(f, e, _)| f == name && e.starts_with(**c))
+                    })
                     .filter(|c| !documented_in(**c, groups))
                     .map(|c| format!("{name}: Ctrl/Alt+{}", c.to_ascii_uppercase())),
             );

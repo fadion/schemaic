@@ -430,9 +430,13 @@ fn account_form(
         // **Masked, like the app's four other secret fields.** This was the one
         // that was not: the real characters were in the editor's own document,
         // so they were on screen and a select-all away from the clipboard.
-        // `masked_edit_field` keeps only `*`s in the document and diffs each
-        // edit back onto the value, which is why there is one of it rather than
-        // a second copy here.
+        // `masked_edit_field` keeps only `*`s in the document and replays each
+        // edit onto the value from the editor's own delta, which is why there is
+        // one of it rather than a second copy here. **This form is why the
+        // replay has to be exact rather than close**: the connection form's
+        // mangled password fails to connect and can be retyped, while this one
+        // reaches `CREATE USER … IDENTIFIED BY` and the app has no `ALTER USER`
+        // to correct it afterwards.
         let pw = floem::reactive::create_rw_signal(seed.password.clone());
         create_effect(move |prev: Option<String>| {
             let v = pw.get();

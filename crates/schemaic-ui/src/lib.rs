@@ -8670,6 +8670,24 @@ pub(crate) struct FieldCfg {
     /// the clearable ×) — e.g. the AI-panel send/stop icon. A factory so the view
     /// is built inside the field.
     pub trailing: Option<Rc<dyn Fn() -> AnyView>>,
+    /// **This field's buffer stands in for a value it does not hold** — the
+    /// app's one masked secret field ([`connection_form::masked_edit_field`]) —
+    /// and this is where every edit of the buffer is reported, as the editor's
+    /// own copy/insert runs over the buffer that was there before it.
+    ///
+    /// It is not a convenience. A masked buffer is mask characters throughout,
+    /// so *comparing* it before and after an edit cannot tell a mask character
+    /// the user typed from one that was already there, and the field that tried
+    /// stored three characters of the previous secret when a `*`-containing
+    /// password replaced it. The delta is the editor saying what it did, which
+    /// is the only unambiguous answer, and it covers every path into the buffer
+    /// — keys, clipboard, IME commit — not just the ones a key handler sees.
+    ///
+    /// Setting it also **takes undo and redo away from the field**: the
+    /// document's history is a history of *masks*, so replaying one puts mask
+    /// characters into the value. There is nothing here worth an undo stack
+    /// that is worth that.
+    pub masked: Option<RwSignal<connection_form::MaskEdit>>,
 }
 
 impl Default for FieldCfg {
@@ -8706,6 +8724,7 @@ impl Default for FieldCfg {
             tab_indents: false,
             caret_end: None,
             trailing: None,
+            masked: None,
         }
     }
 }
@@ -8847,7 +8866,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         tab_indents,
         caret_end,
         trailing,
+        masked,
     } = cfg;
+    // Set while the signal→doc reconcile below is writing, so the field's own
+    // re-mask is not reported back to it as a user edit. `on_update` runs
+    // synchronously inside `edit_single`, which is what makes a plain flag
+    // enough here.
+    let syncing = Rc::new(std::cell::Cell::new(false));
+    let mask_seq = Rc::new(std::cell::Cell::new(0u64));
     // An in-flow trailing action (like the clearable ×) shrinks the editor.
     let has_side = clearable || trailing.is_some();
     // Line height derived from the font so the box height matches the rendered
@@ -8890,6 +8916,20 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let tab = on_tab.clone();
     let key_focus = focus.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
+        // A masked field has no undo. Its document holds `*`s, so the history
+        // floem would replay is a history of masks: an undo re-inserts mask
+        // characters, and the value behind them becomes literal asterisks. The
+        // key is swallowed rather than left unbound so nothing else claims it.
+        if masked.is_some()
+            && crate::shortcuts::primary_held(mods)
+            && matches!(
+                &kp.key,
+                KeyInput::Keyboard(Key::Character(c), _)
+                    if c.eq_ignore_ascii_case("z") || c.eq_ignore_ascii_case("y")
+            )
+        {
+            return CommandExecuted::Yes;
+        }
         // Ctrl+Arrow recall, before the plain-arrow hooks: the modifier is what
         // tells the two apart, and the plain-arrow branch below doesn't look at
         // it.
@@ -9136,6 +9176,8 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // doc → signal: mirror the editor text into `text_sig` and recompute the
     // grown height. Single-line fields strip any pasted newlines.
     let ed_upd = ed.clone();
+    let syncing_upd = syncing.clone();
+    let mask_seq_upd = mask_seq.clone();
     let editor = editor
         .styling(styling)
         // NB: not the editor's built-in `.placeholder()` — it stays visible while
@@ -9154,13 +9196,36 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 // scrollbar shows even when the text fits.
                 .scroll_beyond_last_line(false)
         })
-        .update(move |_| {
+        .update(move |upd| {
             let mut t = ed_upd.doc().text().to_string();
             if !multiline && (t.contains('\n') || t.contains('\r')) {
                 t = t.replace(['\n', '\r'], "");
             }
             if text_sig.get_untracked() != t {
                 text_sig.set(t);
+            }
+            // Report the edit to a masked field — but not the re-mask it makes
+            // in answer, which arrives here through the reconcile below.
+            if let Some(sink) = masked
+                && !syncing_upd.get()
+            {
+                let mut deltas = upd.deltas();
+                let one = deltas.next();
+                // Several deltas in one update: the second's offsets are
+                // relative to a buffer nobody outside floem saw, so this side
+                // says so rather than replaying them in the wrong frame.
+                let edit = match (one, deltas.next()) {
+                    (Some(d), None) => Some(connection_form::MaskDelta {
+                        prev_len: d.base_len,
+                        runs: connection_form::runs_of_delta(d),
+                    }),
+                    _ => None,
+                };
+                mask_seq_upd.set(mask_seq_upd.get() + 1);
+                sink.set(connection_form::MaskEdit {
+                    seq: mask_seq_upd.get(),
+                    edit,
+                });
             }
             // Store the natural (unclamped) line count; the height clamps it to the
             // effective cap so a resizing cap (the viewer) re-clamps reactively.
@@ -9292,6 +9357,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // only on signal changes, never per-keystroke (which would fight the caret).
     {
         let ed_ext = ed.clone();
+        let syncing_ext = syncing.clone();
         create_effect(move |_| {
             let want = text_sig.get();
             let have = untrack(|| ed_ext.doc().text().to_string());
@@ -9315,9 +9381,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                     want.len().saturating_sub(cs)
                 }
                 .min(want.len());
+                // Flagged: this write is the field answering itself (a masked
+                // field's re-mask above all), and reporting it back as a user
+                // edit would loop the pair of effects that produced it.
+                syncing_ext.set(true);
                 ed_ext
                     .doc()
                     .edit_single(Selection::region(0, len), &want, EditType::Delete);
+                syncing_ext.set(false);
                 // Only move the caret when the field actually has focus. An
                 // unfocused field reconciling an external value change (loading a
                 // connection, New/clear) must NOT touch `cursor`: floem resets the
