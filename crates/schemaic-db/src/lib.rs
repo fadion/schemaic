@@ -4461,6 +4461,22 @@ impl Db {
         // Best-effort: a server old enough not to have the variable keeps its own
         // default rather than failing the plan over the bound.
         let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
+        // Best-effort too, and for the same reason the dump writes it into the
+        // file: every literal in `stmts` was written by `export::sql_literal`,
+        // which doubles a backslash because that is what MySQL does with one by
+        // default — and on a session carrying `NO_BACKSLASH_ESCAPES` the doubled
+        // literal stores two. On a `CREATE USER … IDENTIFIED BY` that is an
+        // account nobody can log in to, with no `ALTER USER` in this app to
+        // correct it.
+        //
+        // **Scoped to the plan, never to the connection.** A user who sets that
+        // mode means it for the SQL they *type*, and pinning it at connect time
+        // would quietly change what their own statements mean. This connection
+        // runs one reviewed plan and is disconnected on the way out, per the
+        // one-connection-per-operation rule, so nothing here outlives the call.
+        if let Some(sql) = schemaic_core::export::literal_mode_sql(self.engine.dialect()) {
+            let _ = conn.query_drop(sql).await;
+        }
         let dialect = self.engine.dialect();
         let mut out = Ok(());
         for (i, sql) in stmts.iter().enumerate() {
@@ -4559,6 +4575,12 @@ impl Db {
             .map_err(|e| fail(0, 0, e))?;
         let conn_id = conn.id();
         let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
+        // The same literal-mode pin `run_ddl` sets, for the same reason: a
+        // container plan carries literals too (a `CREATE DATABASE`'s comment,
+        // a collation name), and this connection is as short-lived as that one.
+        if let Some(sql) = schemaic_core::export::literal_mode_sql(self.engine.dialect()) {
+            let _ = conn.query_drop(sql).await;
+        }
         let mut out = Ok(());
         for (i, sql) in stmts.iter().enumerate() {
             let step = tokio::select! {

@@ -793,6 +793,87 @@ pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
     }
 }
 
+/// The one statement that makes a MySQL session read [`sql_literal`]'s output
+/// the way it was written.
+///
+/// [`sql_literal`] doubles a backslash for the MySQL family because that is what
+/// the server does with one *by default*; `NO_BACKSLASH_ESCAPES` turns the
+/// escape off and the doubled literal then means two backslashes. Measured on
+/// MariaDB 10.11.14 and MySQL 8.4.11: a value `a'b\c` written `'a''b\\c'` comes
+/// back `a'b\\c`, one character longer, with no error.
+///
+/// **It takes the one flag out rather than overwriting the mode**, so whatever
+/// strictness the server was configured with survives — this is about what the
+/// literals mean, not about what the statements around them should be allowed
+/// to do. The flag has to be named explicitly to be on: `ANSI` does **not**
+/// imply it (checked on MariaDB 10.11.14, where `sql_mode='ANSI'` still
+/// processes `\`), which is what makes the string surgery exact rather than a
+/// guess. Wrapping in commas before the replace is what stops it matching a
+/// mode name that merely *contains* this one, and the `TRIM` is what stops the
+/// removal leaving `,,` behind; verified against the server for the
+/// only-this-flag, empty-mode and flag-in-the-middle cases.
+pub const MYSQL_LITERAL_MODE_SQL: &str = "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(\
+     CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','))";
+
+/// [`MYSQL_LITERAL_MODE_SQL`] where the dialect needs it, `None` where its
+/// literals already mean one thing.
+///
+/// PostgreSQL has written standard literals since `standard_conforming_strings`
+/// became the 9.1 default, and announces the other setting with a `WARNING` at
+/// every occurrence rather than silently; SQLite has no backslash escape at all,
+/// which is why [`sql_literal`]'s arm splits the way it does.
+pub fn literal_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
+    match dialect {
+        SqlDialect::MySql => Some(MYSQL_LITERAL_MODE_SQL),
+        SqlDialect::Postgres | SqlDialect::Sqlite => None,
+    }
+}
+
+/// A name going into a position the server reads as a **`LIKE` pattern** rather
+/// than as a plain identifier: MySQL's and MariaDB's `GRANT … ON db.*`.
+///
+/// **Third member of the family [`ident_sql`] and [`comment_text`] make, and
+/// there for the same reason.** Quoting answers "where does the name end", not
+/// "how will the server read what is inside it". MySQL and MariaDB both
+/// document the database name in a global- or database-level `GRANT` as a
+/// pattern in which `_` matches any single character and `%` any sequence, and
+/// **backtick quoting does not suppress it** — the manual's own escaped example
+/// is itself backticked. So ``GRANT SELECT ON `app_db`.* TO …`` also grants on
+/// `appXdb`: measured on MariaDB 10.11.14 and MySQL 8.4.11, where an account
+/// granted on `sc_rev_a_b` read rows out of `sc_rev_aXb`. Nothing reveals it
+/// afterwards, because `SHOW GRANTS` prints the stored pattern back unescaped
+/// and it reads exactly like what was typed. Underscored database names are the
+/// common case, not the exotic one.
+///
+/// **Only the pattern positions.** The *table* level is exact-matched —
+/// ``ON `app_db`.`t` `` does not reach `appXdb.t` (ERROR 1142 on both servers)
+/// — so a `db.tbl` qualifier keeps [`ident_sql`]. PostgreSQL and SQLite have no
+/// such position in their grant grammar at all, so they get the plain quoter;
+/// the arm is spelled out rather than defaulted so a fourth engine has to be
+/// looked at.
+///
+/// The backslash is escaped first and unconditionally, since it is the escape
+/// character in the pattern: without that, a database actually named `a\_b`
+/// would come out naming the pattern for `a_b`.
+///
+/// One consequence worth knowing: a grant some *other* client made without the
+/// escape is stored under the pattern `app_db`, and a revoke emitted from here
+/// now names `app\_db`, so the server answers ERROR 1141 rather than removing
+/// it. That is the visible direction of the same disagreement, and it includes
+/// the grants Schemaic itself wrote before this existed.
+pub fn ident_pattern_sql(name: &str, dialect: SqlDialect) -> String {
+    match dialect {
+        SqlDialect::MySql => {
+            let pattern = name
+                .replace('\\', "\\\\")
+                .replace('_', "\\_")
+                .replace('%', "\\%");
+            format!("`{}`", pattern.replace('`', "``"))
+        }
+        SqlDialect::Postgres | SqlDialect::Sqlite => ident_sql(name, dialect),
+    }
+}
+
 /// Server-supplied text made safe to put on a `--` comment line.
 ///
 /// **Quoting an identifier and making it comment-safe are different
@@ -3030,6 +3111,38 @@ mod tests {
                 ident_sql(name, MySql)
             );
         }
+    }
+
+    /// The pattern quoter is not a fifth identifier quoter: on a name holding
+    /// neither wildcard it must be `ident_sql` character for character, so the
+    /// only thing it can ever add is the escape it exists for.
+    #[test]
+    fn the_pattern_quoter_only_differs_where_a_wildcard_is() {
+        for name in ["plain", "MixedCase", "with space", "a`b", "sélect", ""] {
+            for d in [MySql, Postgres, Sqlite] {
+                assert_eq!(
+                    ident_pattern_sql(name, d),
+                    ident_sql(name, d),
+                    "ident_pattern_sql({name:?}, {d:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pattern_quoter_escapes_both_wildcards_and_the_escape_itself() {
+        assert_eq!(ident_pattern_sql("app_db", MySql), "`app\\_db`");
+        assert_eq!(ident_pattern_sql("a%b", MySql), "`a\\%b`");
+        assert_eq!(ident_pattern_sql("_%_", MySql), "`\\_\\%\\_`");
+        // A real backslash has to be escaped *first*, or a database named
+        // `a\_b` would come out naming the pattern for `a_b`.
+        assert_eq!(ident_pattern_sql("a\\_b", MySql), "`a\\\\\\_b`");
+        // Both jobs at once: the backtick still ends the identifier.
+        assert_eq!(ident_pattern_sql("a`_b", MySql), "`a``\\_b`");
+        // No such position exists in the other two grammars, so an underscore
+        // stays an ordinary character there.
+        assert_eq!(ident_pattern_sql("app_db", Postgres), "\"app_db\"");
+        assert_eq!(ident_pattern_sql("app_db", Sqlite), "\"app_db\"");
     }
 
     #[test]

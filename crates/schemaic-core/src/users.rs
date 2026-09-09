@@ -1049,8 +1049,16 @@ impl GrantLevel {
             // `levels_for` already gives SQLite an empty list for the same
             // reason, so the arms below are what a wrong call site gets rather
             // than what a user sees.
+            // **Not `q` on MySQL.** This one position is read by the server as
+            // a `LIKE` pattern, and backtick quoting does not suppress it, so a
+            // grant on `app_db` reached `appXdb` — measured on MariaDB 10.11.14
+            // and MySQL 8.4.11. `ident_pattern_sql` carries the whole of that
+            // reasoning; the *table* arm below stays exact because the table
+            // level is exact-matched on the same servers.
             GrantLevel::Database(d) => match dialect {
-                SqlDialect::MySql => format!("{}.*", q(d)),
+                SqlDialect::MySql => {
+                    format!("{}.*", crate::export::ident_pattern_sql(d, dialect))
+                }
                 SqlDialect::Postgres | SqlDialect::Sqlite => format!("DATABASE {}", q(d)),
             },
             GrantLevel::Schema(s) => format!("SCHEMA {}", q(s)),
@@ -2342,6 +2350,90 @@ mod tests {
         assert_eq!(
             privilege_sql(&c, SqlDialect::MySql, false).unwrap(),
             "GRANT SELECT ON `shop`.`orders` TO 'app'@'%'"
+        );
+    }
+
+    /// **A database-level `GRANT` names a pattern, not an identifier.**
+    ///
+    /// Measured on MariaDB 10.11.14 and MySQL 8.4.11: an account granted
+    /// ``ON `sc_rev_a_b`.*`` could read out of `sc_rev_aXb`, and `SHOW GRANTS`
+    /// printed the pattern back unescaped so nothing in the app revealed the
+    /// extra reach. Asserted here through `privilege_sql` rather than through
+    /// the quoter, because the quoter alone cannot say which of these three
+    /// positions is a pattern — and two of them are not.
+    #[test]
+    fn a_mysql_database_grant_escapes_the_pattern_wildcards() {
+        let c = change(
+            my_account(),
+            GrantLevel::Database("app_db".into()),
+            &["SELECT"],
+        );
+        assert_eq!(
+            privilege_sql(&c, SqlDialect::MySql, false).unwrap(),
+            "GRANT SELECT ON `app\\_db`.* TO 'app'@'%'"
+        );
+        // The revoke direction is the same statement with a different verb, so
+        // it must name the same pattern or it removes nothing.
+        let mut r = c.clone();
+        r.privileges = vec!["SELECT".into()];
+        assert_eq!(
+            privilege_sql(&r, SqlDialect::MySql, true).unwrap(),
+            "REVOKE SELECT ON `app\\_db`.* FROM 'app'@'%'"
+        );
+        // `%` is the other wildcard, and a real backslash has to survive being
+        // the escape character.
+        let c = change(
+            my_account(),
+            GrantLevel::Database("a%b".into()),
+            &["SELECT"],
+        );
+        assert_eq!(
+            privilege_sql(&c, SqlDialect::MySql, false).unwrap(),
+            "GRANT SELECT ON `a\\%b`.* TO 'app'@'%'"
+        );
+        let c = change(
+            my_account(),
+            GrantLevel::Database("a\\_b".into()),
+            &["SELECT"],
+        );
+        assert_eq!(
+            privilege_sql(&c, SqlDialect::MySql, false).unwrap(),
+            "GRANT SELECT ON `a\\\\\\_b`.* TO 'app'@'%'"
+        );
+    }
+
+    /// The **table** level is exact-matched on both MySQL engines — verified
+    /// live, ``ON `sc_rev_a_b`.`t` `` did *not* reach `sc_rev_aXb.t` (ERROR
+    /// 1142) — so escaping the qualifier there would name a table that does not
+    /// exist. One site is a pattern; its neighbour is not.
+    #[test]
+    fn a_mysql_table_grant_leaves_the_qualifier_exact() {
+        let c = change(
+            my_account(),
+            GrantLevel::Table {
+                qualifier: "app_db".into(),
+                name: "orders".into(),
+            },
+            &["SELECT"],
+        );
+        assert_eq!(
+            privilege_sql(&c, SqlDialect::MySql, false).unwrap(),
+            "GRANT SELECT ON `app_db`.`orders` TO 'app'@'%'"
+        );
+    }
+
+    /// PostgreSQL has no pattern position in its grant grammar, so an
+    /// underscore is an ordinary character there and must stay one.
+    #[test]
+    fn a_postgres_database_grant_does_not_escape_an_underscore() {
+        let c = change(
+            pg_account(),
+            GrantLevel::Database("app_db".into()),
+            &["CONNECT"],
+        );
+        assert_eq!(
+            privilege_sql(&c, SqlDialect::Postgres, false).unwrap(),
+            "GRANT CONNECT ON DATABASE \"app_db\" TO \"app\""
         );
     }
 

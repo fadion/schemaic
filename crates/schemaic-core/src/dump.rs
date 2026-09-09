@@ -238,6 +238,27 @@ pub fn fk_guard_sql(dialect: SqlDialect) -> Option<(&'static str, &'static str)>
     }
 }
 
+/// How the file makes its string literals mean, on restore, what they meant
+/// when they were written — or `None` where they always do.
+///
+/// The statement itself is [`crate::export::literal_mode_sql`]'s, which is
+/// where the reasoning lives: it belongs next to the function that writes the
+/// literals, and the live DDL runner needs the same statement without the
+/// save-and-restore a *file* needs around it. `mysqldump` pins the mode at the
+/// head of every file it writes for the same reason this does.
+///
+/// The restore half exists because a `.sql` file is replayed into a session the
+/// user may go on using — `Db::run_script` holds one connection for the whole
+/// file, and the psql/mysql client a user replays it in holds one for the
+/// evening.
+pub fn literal_mode_guard_sql(dialect: SqlDialect) -> Option<(String, &'static str)> {
+    let set = crate::export::literal_mode_sql(dialect)?;
+    Some((
+        format!("SET @SCHEMAIC_OLD_SQL_MODE = @@SESSION.sql_mode;\n{set};"),
+        "SET SESSION sql_mode = @SCHEMAIC_OLD_SQL_MODE;",
+    ))
+}
+
 /// How this dialect opens and closes the load's transaction.
 pub fn transaction_sql(dialect: SqlDialect) -> (&'static str, &'static str) {
     match dialect {
@@ -783,6 +804,19 @@ pub fn plan(
     }
     text!(header);
 
+    // ── The literal guard, outside everything ────────────────────────────────
+    //
+    // Before the container statements, not beside the FK guard below: this one
+    // decides what every `'…'` in the file *means*, and the `CREATE DATABASE`
+    // and `CREATE TABLE`s ahead of the transaction carry literals too (a column
+    // comment, a quoted default). It is also not one of the two optional
+    // scaffolds — those choose how the load behaves, this one is the file
+    // saying what it says.
+    let literal_guard = literal_mode_guard_sql(dialect);
+    if let Some((open, _)) = &literal_guard {
+        text!(open.clone());
+    }
+
     // The container before the thing that enters it: `USE shop` on a server that
     // has no `shop` is ERROR 1049 on line 1, and restoring onto a fresh server is
     // what a dump is mostly for.
@@ -976,6 +1010,11 @@ pub fn plan(
         steps.push(DumpStep::Text(close.to_string()));
     }
     if let Some((_, close)) = guard {
+        steps.push(DumpStep::Text(close.to_string()));
+    }
+    // Outermost open, outermost close — the mode goes back the way the session
+    // had it, after everything that was written under it.
+    if let Some((_, close)) = literal_guard {
         steps.push(DumpStep::Text(close.to_string()));
     }
 
@@ -1861,6 +1900,62 @@ mod tests {
         ));
         assert!(pos(&file, "SET FOREIGN_KEY_CHECKS = 0;") < pos(&file, "START TRANSACTION;"));
         assert!(pos(&file, "COMMIT;") < pos(&file, "SET FOREIGN_KEY_CHECKS = 1;"));
+    }
+
+    /// **The literal guard is the outermost thing in the file**, because it
+    /// decides what every `'…'` after it *means* — including the ones in the
+    /// `CREATE TABLE`s that come before the transaction.
+    ///
+    /// Measured on MariaDB 10.11.14 and MySQL 8.4.11: a value `a'b\c` is
+    /// written `'a''b\\c'`, and replayed on a session carrying
+    /// `NO_BACKSLASH_ESCAPES` it restores as `a'b\\c` — one character longer
+    /// than the row that was dumped, with nothing in the file to say so.
+    #[test]
+    fn a_mysql_dump_pins_the_mode_its_literals_were_written_for() {
+        let s = schema_of(vec![table("orders")]);
+        let file = file_of(&plan(
+            &s,
+            "shop",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        ));
+        let (open, close) = literal_mode_guard_sql(SqlDialect::MySql).expect("mysql has one");
+        assert!(file.contains(&open), "no literal guard in:\n{file}");
+        assert!(pos(&file, &open) < pos(&file, "SET FOREIGN_KEY_CHECKS = 0;"));
+        assert!(pos(&file, &open) < pos(&file, "CREATE TABLE"));
+        assert!(pos(&file, "SET FOREIGN_KEY_CHECKS = 1;") < pos(&file, close));
+    }
+
+    /// It is not scaffolding the user can turn off: the two checkboxes choose
+    /// how the load *behaves*, and this one is about whether the file says what
+    /// it means.
+    #[test]
+    fn the_literal_guard_is_not_one_of_the_optional_scaffolds() {
+        let s = schema_of(vec![table("orders")]);
+        let opts = DumpOptions {
+            wrap_transaction: false,
+            disable_fk_checks: false,
+            ..Default::default()
+        };
+        let file = file_of(&plan(&s, "shop", &all(&s), opts, SqlDialect::MySql));
+        let (open, close) = literal_mode_guard_sql(SqlDialect::MySql).expect("mysql has one");
+        assert!(file.contains(&open));
+        assert!(file.contains(close));
+    }
+
+    /// SQLite has no backslash escape at all and PostgreSQL has written
+    /// standard literals by default since 9.1, so neither file carries a line
+    /// that would only be noise in it.
+    #[test]
+    fn the_other_two_engines_need_no_literal_guard() {
+        assert_eq!(literal_mode_guard_sql(SqlDialect::Sqlite), None);
+        assert_eq!(literal_mode_guard_sql(SqlDialect::Postgres), None);
+        let s = schema_of(vec![table("orders")]);
+        for d in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
+            assert!(!file.contains("sql_mode"), "{d:?}:\n{file}");
+        }
     }
 
     #[test]
