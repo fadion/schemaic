@@ -1256,20 +1256,28 @@ fn xlsx_rows(
         .worksheet_cells_reader(&name)
         .map_err(|e| ImportError::Read(e.to_string()))?;
     let dims = cells.dimensions();
-    let width = sheet_width(dims)?;
+    // The **declared** extent, which is a ceiling and a starting guess and not
+    // the width. See `sheet_width`.
+    let mut width = sheet_width(dims)?;
     // The used range's own left edge. A sheet with a title block starts partway
     // across, and its first data column is the row's column 0 — the same
     // correction `range.start()` used to make, and the reason a cell is placed
     // relative to this rather than at its absolute column.
-    let left = dims.start.1;
+    let mut left = dims.start.1;
+    // **The declaration is advisory, so the first row gets to widen it.**
+    // ECMA-376 makes `<dimension>` optional, and a writer that streams cannot
+    // know the extent in advance — so `ref="A1"`, an omitted element and a stale
+    // `ref="B1:C3"` all exist in the wild, and each of them made a three-column
+    // sheet import as one, silently, in the preview and in the load. Open while
+    // the first row is being assembled and shut the moment it is emitted:
+    // every record has to carry the same field count, and the first row is the
+    // header, which is the full column list by definition.
+    let mut geometry_open = true;
 
     // Records emitted so far. Not the row's index: a skipped blank row advances
     // one and not the other, which is the whole reason the two are separate.
     let mut seen = 0usize;
     let mut took_header = !cfg.dialect.has_header;
-    if !cfg.dialect.has_header {
-        columns.extend((1..=width).map(|i| format!("Column {i}")));
-    }
     // One row at a time. Cells arrive in sheet order and an empty cell is not
     // emitted at all, so a row is complete when a cell for a later row shows up
     // — and a *wholly* empty row never appears, which is exactly the rule the
@@ -1288,7 +1296,17 @@ fn xlsx_rows(
             // `at` is 0-based within the sheet, so the number Excel shows in its
             // margin — the equivalent of a CSV's line number — is one more.
             let line = u64::from(at.take().unwrap_or(0)) + 1;
+            // The first row settles the geometry, and nothing may widen it after
+            // this point: every record has to carry the same field count, or the
+            // mismatch report becomes noise on every row after the widest one.
+            geometry_open = false;
             let full = std::mem::replace(&mut row, vec![None; width]);
+            // A headerless sheet names its columns from that settled width,
+            // here rather than before the loop — before the loop the width was
+            // still only the file's claim.
+            if !cfg.dialect.has_header && columns.is_empty() {
+                columns.extend((1..=width).map(|i| format!("Column {i}")));
+            }
             if !took_header {
                 for (i, c) in full.into_iter().enumerate() {
                     let name = c.unwrap_or_default();
@@ -1322,6 +1340,30 @@ fn xlsx_rows(
         }
         let Some(c) = cell else { break };
         let (r, col) = c.get_position();
+        // **Widen to the cell while the first row is still being assembled.**
+        // Cells arrive in sheet order, so the first one seen is the leftmost of
+        // the first non-empty row: it corrects a declared origin that starts too
+        // far right (a stale `ref="B1:C3"` over data that really begins at A),
+        // and only ever moves `left` *outwards*, so a genuine title block still
+        // reports its own first data column as column 0.
+        if geometry_open {
+            // Moving `left` is safe only while nothing has been placed — the
+            // slots are indexed relative to it — and by the ordering above that
+            // is exactly the first cell of the first row.
+            if col < left && row.iter().all(Option::is_none) {
+                width += (left - col) as usize;
+                left = col;
+            }
+            let need = col.saturating_sub(left) as usize + 1;
+            // `XLSX_MAX_COLS` is still the ceiling `sheet_width` holds a sheet's
+            // claim to; the cells cannot raise it either.
+            if need > width && need as u64 <= XLSX_MAX_COLS {
+                width = need;
+            }
+            if row.len() < width {
+                row.resize(width, None);
+            }
+        }
         at = Some(r);
         let Some(text) = cell_text(&c.get_value().clone().into()) else {
             continue;
@@ -1342,13 +1384,25 @@ fn xlsx_rows(
     Ok(false)
 }
 
-/// How wide a row of this sheet is, from the extent the sheet **declares**.
+/// The starting width and the **ceiling**, from the extent the sheet declares.
 ///
-/// **The width is decided before a cell is read, and it is the only unbounded
-/// thing in an Excel import.** The rows are streamed, so a sheet's height costs
-/// nothing to skip past; a row buffer is the one allocation whose size the file
-/// controls, and Excel's own ceiling is 16,384 columns. A workbook claiming more
-/// is refused here rather than believed.
+/// **Not the width.** `<dimension>` is optional and advisory in ECMA-376 — a
+/// writer that streams cannot know the extent in advance — so `ref="A1"`, an
+/// omitted element and a stale `ref="B1:C3"` all exist, and each of them made a
+/// three-column sheet import as one column: the preview agreed with the load,
+/// `missing_required` had nothing to say (the dropped columns are nullable), and
+/// the import reported the right number of rows having written a third of the
+/// data. The caller widens this to the first row's own cells, which is where the
+/// truth is; the doc that stood here reasoned the absent case to the wrong
+/// answer ("either way one column is the right answer, and the header row is
+/// what names them"), which is true of a one-cell sheet and false of every sheet
+/// anyone imports.
+///
+/// **What it still decides is the only unbounded thing in an Excel import.** The
+/// rows are streamed, so a sheet's height costs nothing to skip past; a row
+/// buffer is the one allocation whose size the file controls, and Excel's own
+/// ceiling is 16,384 columns. A workbook claiming more is refused here rather
+/// than believed, and the cells cannot raise that ceiling either.
 ///
 /// This is what replaced materialising the sheet. `worksheet_range` builds the
 /// **dense** bounding rectangle of every cell present, so a legal 5,461-byte
@@ -1360,8 +1414,8 @@ fn xlsx_rows(
 /// remembers is a guard two of the three do not have.
 fn sheet_width(dims: calamine::Dimensions) -> Result<usize, ImportError> {
     // A sheet with no `<dimension>` element reads as the degenerate (0,0)-(0,0),
-    // which is also what a one-cell sheet reads as — either way one column is
-    // the right answer, and the header row is what names them.
+    // which is also what a one-cell sheet reads as. One column is the right
+    // *start* for both, and the first row's cells settle which it was.
     let width = u64::from(dims.end.1.saturating_sub(dims.start.1)) + 1;
     if width > XLSX_MAX_COLS {
         return Err(ImportError::Read(format!(
@@ -3650,6 +3704,98 @@ mod tests {
         assert_eq!(s.columns[0], "id");
         assert_eq!(s.rows.len(), 1);
         assert_eq!(s.rows[0][16_383].as_deref(), Some("x"));
+    }
+
+    /// A real workbook with its `<dimension ref>` restated — the one thing
+    /// `rust_xlsxwriter` will never write, because it always emits a correct
+    /// one, and therefore the one case no fixture in this suite could produce.
+    ///
+    /// `ref=""` removes the element entirely, which is the other half of the
+    /// same defect: ECMA-376 makes `<dimension>` optional and advisory, and a
+    /// writer that streams cannot know the extent in advance.
+    fn restate_dimension(xlsx: &[u8], reference: &str) -> Vec<u8> {
+        use std::io::{Cursor, Read, Write};
+        let mut zin = zip::ZipArchive::new(Cursor::new(xlsx)).expect("a workbook is a zip");
+        let mut out = Vec::new();
+        let mut zout = zip::ZipWriter::new(Cursor::new(&mut out));
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut patched = false;
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).expect("an entry");
+            let name = f.name().to_string();
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).expect("entry bytes");
+            if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+                let xml = String::from_utf8(bytes).expect("sheet xml is utf-8");
+                let at = xml.find("<dimension ").expect("rust_xlsxwriter writes one");
+                let end = xml[at..].find("/>").expect("a self-closing element") + at + 2;
+                let replacement = if reference.is_empty() {
+                    String::new()
+                } else {
+                    format!("<dimension ref=\"{reference}\"/>")
+                };
+                bytes = format!("{}{replacement}{}", &xml[..at], &xml[end..]).into_bytes();
+                patched = true;
+            }
+            zout.start_file(name, opts).expect("start");
+            zout.write_all(&bytes).expect("write");
+        }
+        zout.finish().expect("finish");
+        assert!(patched, "no worksheet XML in the workbook");
+        out
+    }
+
+    /// **A worksheet's `<dimension>` is advisory, and believing it as the width
+    /// threw away two columns of three — in the preview *and* in the load, with
+    /// every surface reporting success.**
+    ///
+    /// `auto_map` yields one column, `missing_required` returns nothing (the
+    /// dropped columns are nullable, so nothing warns), and the import reports
+    /// the right number of *rows*. The doc that stood here reasoned the absent
+    /// case to the wrong answer — "either way one column is the right answer,
+    /// and the header row is what names them" — which is true of a one-cell
+    /// sheet and false of every sheet anyone imports.
+    ///
+    /// The fixture is the point: every other Excel test in this module is built
+    /// through `rust_xlsxwriter`, which always writes a correct `<dimension>`,
+    /// so the under-declared direction had nothing that could produce it.
+    #[test]
+    fn a_sheet_that_under_declares_its_extent_still_imports_every_column() {
+        let good = workbook(&[(
+            "Sheet1",
+            &[
+                &[Cell::Text("id"), Cell::Text("name"), Cell::Text("email")],
+                &[Cell::Num(1.0), Cell::Text("ann"), Cell::Text("a@x")],
+                &[Cell::Num(2.0), Cell::Text("bob"), Cell::Text("b@x")],
+            ],
+        )]);
+        let cfg = xlsx_cfg(true, None);
+        let want_cols = ["id", "name", "email"];
+        let want_rows = [["1", "ann", "a@x"], ["2", "bob", "b@x"]];
+
+        for reference in ["A1:C3", "A1", "", "B1:C3", "A1:XFD3"] {
+            let bytes = restate_dimension(&good, reference);
+            let s = read_sample(&bytes[..], ImportFormat::Xlsx, &cfg, 10)
+                .unwrap_or_else(|e| panic!("ref={reference:?}: {e}"));
+            assert_eq!(
+                s.columns.len(),
+                // `A1:XFD3` declares the whole sheet; the cells decide the rest,
+                // but the declared ceiling is still honoured as a *ceiling*.
+                if reference == "A1:XFD3" { 16_384 } else { 3 },
+                "ref={reference:?} columns={:?}",
+                &s.columns[..s.columns.len().min(6)]
+            );
+            assert_eq!(&s.columns[..3], &want_cols, "ref={reference:?}");
+            assert_eq!(s.rows.len(), 2, "ref={reference:?}");
+            for (r, want) in want_rows.iter().enumerate() {
+                let got: Vec<&str> = s.rows[r][..3]
+                    .iter()
+                    .map(|f| f.as_deref().unwrap_or(""))
+                    .collect();
+                assert_eq!(got, want, "ref={reference:?} row {r}");
+            }
+        }
     }
 
     /// The one thing a sheet's declared extent can still make unbounded: the row

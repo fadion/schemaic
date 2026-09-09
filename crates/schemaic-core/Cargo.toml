@@ -15,5 +15,10 @@ thiserror = { workspace = true }
 sqlparser = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# One fixture: a real workbook re-zipped with its `<dimension ref>` restated —
+# see the workspace entry. Nothing in `src` uses it.
+zip = { workspace = true }
+
 [lints]
 workspace = true
