@@ -768,17 +768,70 @@ fn classify<T: for<'de> Deserialize<'de>>(bytes: Option<&[u8]>) -> Load<T> {
     }
 }
 
-/// Decide the loaded value and whether the primary file must be preserved as
-/// `.corrupt`, from the primary's classification and a lazily-classified backup.
-/// Pure — the caller performs the file reads/renames. Returns `(value,
-/// corrupt_error)`: `corrupt_error` is `Some` (the primary's parse error) exactly
-/// when the primary was corrupt and so must be preserved before the next save
-/// overwrites it. The `backup` thunk is only consulted for a corrupt primary, so
-/// a healthy or absent primary never reads the `.bak`.
-fn recover<T: Default>(primary: Load<T>, backup: impl FnOnce() -> Load<T>) -> (T, Option<String>) {
+/// What [`recover`] did with the primary, and what the caller owes the user
+/// because of it.
+///
+/// Three of the four arms are news. The one that is not — `Primary` — is the
+/// ordinary load.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Recovered {
+    /// The primary parsed. Nothing to preserve and nothing to say.
+    Primary,
+    /// No primary, and no sibling holding anything either: a genuine first run.
+    /// Defaults, silently.
+    FirstRun,
+    /// The primary did not parse. Preserve it as `.corrupt` before the next save
+    /// overwrites it, and tell the user. Carries the parse error.
+    Corrupt(String),
+    /// **The primary was gone and a sibling still held the data.** There is
+    /// nothing to preserve — no primary to rename — but it is still news: a
+    /// config file that vanished is worth a line whether or not the contents
+    /// came back, and the sibling it came from is the only copy until the next
+    /// save lands. Carries which sibling answered.
+    Restored(&'static str),
+}
+
+/// Decide the loaded value and what the caller owes the user, from the primary's
+/// classification and the lazily-classified siblings that may still hold a copy.
+/// Pure — the caller performs the file reads and renames.
+///
+/// **An absent primary is not a first run.** It used to be treated as one, and
+/// silently: no warning, no `RECOVERIES` entry, the app up with an empty
+/// connection list, and — because the next save writes the primary while
+/// leaving `.bak` alone, and the save *after* that copies the now-defaulted
+/// primary onto it — the last copy gone within two ordinary saves. Saves are
+/// frequent (a tab change, a history entry). The two ways to arrive there are
+/// a crash between the staged write and the rename on a *first* save, which
+/// leaves a `.tmp` holding everything, and the file being removed from outside
+/// — the Settings modal's own *Open folder* button puts the user in that
+/// directory, and a roaming-profile sync, a backup restore or an AV quarantine
+/// reach it too.
+///
+/// The ladder is `.tmp` then `.bak`, because `write_bytes` stages the *new*
+/// value into `.tmp` and copies the *old* primary into `.bak` — so where both
+/// survive, the staged one is the newer. A sibling that does not parse is
+/// stepped over rather than believed, which is what stops a half-written `.tmp`
+/// shadowing an intact `.bak`.
+///
+/// A **corrupt** primary still consults `.bak` alone, as it always has: that
+/// path is pinned by tests and by a shipped `.corrupt` rename, and widening it
+/// is a separate decision from the one this arm is about.
+fn recover<T: Default>(
+    primary: Load<T>,
+    staged: impl FnOnce() -> Load<T>,
+    backup: impl FnOnce() -> Load<T>,
+) -> (T, Recovered) {
     match primary {
-        Load::Ok(v) => (v, None),
-        Load::Absent => (T::default(), None), // first run → defaults, silently
+        Load::Ok(v) => (v, Recovered::Primary),
+        Load::Absent => {
+            if let Load::Ok(v) = staged() {
+                return (v, Recovered::Restored(".tmp"));
+            }
+            if let Load::Ok(v) = backup() {
+                return (v, Recovered::Restored(".bak"));
+            }
+            (T::default(), Recovered::FirstRun)
+        }
         Load::Corrupt(err) => {
             // Do NOT silently reset — that would let the next save overwrite the
             // file with defaults. Recover from `.bak` if it parses, else default;
@@ -787,7 +840,7 @@ fn recover<T: Default>(primary: Load<T>, backup: impl FnOnce() -> Load<T>) -> (T
                 Load::Ok(v) => v,
                 _ => T::default(),
             };
-            (value, Some(err))
+            (value, Recovered::Corrupt(err))
         }
     }
 }
@@ -805,27 +858,48 @@ pub(crate) fn read_bytes<T: Default + for<'de> Deserialize<'de>>(
     store: &dyn FileStore,
     path: &Path,
 ) -> T {
-    // A crash between the staged write and the rename leaves a `.tmp` holding a
-    // full copy of the file — nothing reads it, and only the rename-failure path
-    // removed it, so it would sit there forever. Loading is the natural sweep
-    // point: the next save re-creates its own.
-    store.remove(&sibling(path, ".tmp"));
     let primary = classify::<T>(store.read(path).ok().as_deref());
-    let (value, corrupt) = recover(primary, || {
-        classify::<T>(store.read(&sibling(path, ".bak")).ok().as_deref())
-    });
-    if let Some(err) = corrupt {
-        tracing::warn!(
-            file = %path.display(),
-            error = %err,
-            "config file did not parse; preserving as .corrupt and trying the backup"
-        );
-        // A released GUI build discards stderr, so also queue it for the error
-        // modal — otherwise the user just sees their settings gone.
-        if let Ok(mut v) = RECOVERIES.lock() {
-            v.push(recovery_notice(path, &err));
+    // **Classify before sweeping.** The `.tmp` a crash left holds a full copy of
+    // the file, and the sweep used to run unconditionally, first — so on the one
+    // load where that copy was the *only* one, the loader destroyed it before
+    // reading anything and then reported a first run.
+    let healthy = matches!(primary, Load::Ok(_));
+    let (value, outcome) = recover(
+        primary,
+        || classify::<T>(store.read(&sibling(path, ".tmp")).ok().as_deref()),
+        || classify::<T>(store.read(&sibling(path, ".bak")).ok().as_deref()),
+    );
+    // Only now, and only with a good primary in hand: nothing reads the orphan
+    // otherwise, and only the rename-failure path removed it, so it would sit
+    // there forever. The next save re-creates its own.
+    if healthy {
+        store.remove(&sibling(path, ".tmp"));
+    }
+    match outcome {
+        Recovered::Primary | Recovered::FirstRun => {}
+        Recovered::Corrupt(err) => {
+            tracing::warn!(
+                file = %path.display(),
+                error = %err,
+                "config file did not parse; preserving as .corrupt and trying the backup"
+            );
+            // A released GUI build discards stderr, so also queue it for the error
+            // modal — otherwise the user just sees their settings gone.
+            if let Ok(mut v) = RECOVERIES.lock() {
+                v.push(recovery_notice(path, &err));
+            }
+            let _ = store.rename(path, &sibling(path, ".corrupt"));
         }
-        let _ = store.rename(path, &sibling(path, ".corrupt"));
+        Recovered::Restored(from) => {
+            tracing::warn!(
+                file = %path.display(),
+                from = from,
+                "config file was missing; recovered from its {from} sibling"
+            );
+            if let Ok(mut v) = RECOVERIES.lock() {
+                v.push(missing_notice(path, from));
+            }
+        }
     }
     value
 }
@@ -842,6 +916,25 @@ fn recovery_notice(path: &Path, err: &str) -> String {
         "{name} could not be read ({err}).\n\
          The unreadable file was kept as {name}.corrupt; Schemaic fell back to its backup, or \
          to defaults if the backup was unreadable too."
+    )
+}
+
+/// The user-facing notice for a config file that was **gone** and came back off
+/// a sibling.
+///
+/// Said, rather than repaired quietly, because the disappearance is the news:
+/// something outside Schemaic removed the file, and the copy it was recovered
+/// from is the only one until the next save lands. A user who does not know
+/// that has no reason to take a backup, and no reason to wonder why it went.
+fn missing_notice(path: &Path, from: &str) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    format!(
+        "{name} was missing.\n\
+         Schemaic recovered it from {name}{from}, which was still there. It will be written \
+         back the next time this setting changes — until then that sibling is the only copy."
     )
 }
 
@@ -891,24 +984,56 @@ impl FileStore for Fs {
     }
 }
 
-fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
+/// What a save is doing to the generation that was there.
+///
+/// **Every deletion this app confirms is undone at rest without this.** The
+/// history panel's trash button asks *"Delete N recorded queries for this
+/// connection? This can't be undone"*, and the save that answered Yes copied
+/// the pre-clear file to `history.json.bak` on its way past — so every statement
+/// the user had just confirmed the deletion of sat in a sibling file until the
+/// *next* save of that store, which needs another query run. A clear followed by
+/// a quit left it there indefinitely. The user's own SQL is content this module
+/// already treats as sensitive ([`open_private_append`] narrows the log for
+/// exactly that reason), and the Settings modal's **Log file** row is an
+/// explicit invitation to open that folder and share it.
+///
+/// It is a property of the save, not of a particular store: `chats.json`,
+/// `snippets.json`, `favorites.json`, `db_colors.json`, `diagrams.json` and
+/// `ssh_known_hosts.json` all have it, which is why this is an argument to
+/// [`write_bytes`] rather than a second `clear_*_backup` per file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Saving {
+    /// The ordinary save. The previous generation is kept as `.bak`, which is
+    /// what makes a crash, a corrupt primary or a vanished one recoverable.
+    Replacing,
+    /// **The point of this save is that something is gone.** No `.bak` is taken,
+    /// and any earlier one is removed once the new file is safely in place — so
+    /// the erasure is an erasure on disk too.
+    Erasing,
+}
+
+fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T, saving: Saving) {
     let Some(path) = path else {
         return;
     };
     let Ok(json) = serde_json::to_vec_pretty(value) else {
         return;
     };
-    write_bytes(&Fs, &path, &json);
+    write_bytes(&Fs, &path, &json, saving);
 }
 
 /// The save ordering, over any [`FileStore`].
 ///
 /// Write to a temp file, then atomically rename over the target, so a crash
 /// mid-write can't truncate the real file (this JSON is the only copy). Keep the
-/// prior good version as `.bak` for recovery. All three paths hold the same
-/// bytes, so all three go through the store's `write` — the rename carries the
-/// temp's mode onto the target.
-pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8]) {
+/// prior good version as `.bak` for recovery — unless the save *is* a deletion,
+/// which is what [`Saving`] decides. All three paths hold the same bytes, so all
+/// three go through the store's `write` — the rename carries the temp's mode
+/// onto the target.
+///
+/// The old `.bak` is removed **after** the new file is in place, never before:
+/// a save that fails must leave the recovery copy it found.
+pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8], saving: Saving) {
     store.ensure_parent(path);
     let tmp = sibling(path, ".tmp");
     if store.write(&tmp, json).is_err() {
@@ -916,15 +1041,113 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8]) {
     }
     // Re-write rather than `fs::copy`, which would carry the *old* file's mode
     // onto the backup — including a 0644 left by a build from before this.
-    if let Ok(prev) = store.read(path) {
+    if saving == Saving::Replacing
+        && let Ok(prev) = store.read(path)
+    {
         let _ = store.write(&sibling(path, ".bak"), &prev);
     }
+    let mut landed = true;
     if store.rename(&tmp, path).is_err() {
         // Cross-device or transient rename failure: fall back to a direct write
         // rather than leaving only the temp file.
-        let _ = store.write(path, json);
+        landed = store.write(path, json).is_ok();
         store.remove(&tmp);
     }
+    if saving == Saving::Erasing && landed {
+        store.remove(&sibling(path, ".bak"));
+    }
+}
+
+/// The file a save should actually replace: `path` with any symlink standing in
+/// front of it resolved away.
+///
+/// `fs::rename` acts on the **link**, not on its target, so a dotfile manager's
+/// `~/.antigravity/settings.json` → a chezmoi/stow repo — the common shape for
+/// exactly that kind of file — was replaced by an ordinary file, and the managed
+/// copy silently stopped receiving anything. The plain `fs::write` the atomic
+/// write replaced followed the link correctly, so this is a regression the
+/// atomicity introduced rather than one it inherited.
+///
+/// `canonicalize` rather than one `read_link`, because a chain of links is one
+/// link too, and the resolved path is where the staging sibling has to go for
+/// the rename to stay on one device.
+fn resolved_target(path: &Path) -> PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Stage `bytes` in a fresh sibling of `target` and hand back its path, with the
+/// data already on stable storage.
+///
+/// **A unique name, created exclusively.** The fixed `<path>.schemaic-tmp` this
+/// replaced was a pure function of the target, so every writer of one path
+/// derived the same name — and the Antigravity marker is *machine-global* by
+/// design, with the whole `Claim` mechanism existing because two Schemaic
+/// windows contend for it. Two windows launching together both staged the same
+/// sibling; the loser's rename returned `NotFound` and it fell through to the
+/// truncating write this function exists to avoid. `create_new` closes the other
+/// half at the same time: `fs::write` is `File::create`, which follows a symlink
+/// and truncates, so another local account pre-creating
+/// `/tmp/notes.sql.schemaic-tmp` as a link redirected the victim's own text at
+/// the victim's privileges. The module already owned that rule and documented it
+/// for this scenario ([`create_private_new`]); this path did not use it.
+///
+/// The mode of an existing target is carried onto the staged file before the
+/// rename. The rename swaps the **inode**, so without that the user's
+/// `chmod 600 seed.sql` came back 0644 — [`write_file_atomic`]'s doc promises it
+/// narrows nothing, and widening is the same broken promise in the other
+/// direction.
+///
+/// `sync_data` before returning, because a rename is atomic with respect to
+/// other *processes* and is not, on its own, ordered after the data blocks with
+/// respect to a power loss. On XFS, btrfs, ZFS, an SMB/NFS share and NTFS the
+/// rename's metadata can land while the contents have not, and this function has
+/// no `.bak` to fall back on.
+fn stage_beside(target: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut last = std::io::Error::other("no staging name was tried");
+    for _ in 0..64 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = sibling(target, &format!(".{}-{n}.schemaic-tmp", std::process::id()));
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = e;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let staged = (|| {
+            f.write_all(bytes)?;
+            // Unix only: `Permissions` on Windows carries the read-only bit and
+            // nothing else, and setting it here would make the rename itself
+            // fail. A Windows file inherits the directory's ACL on creation,
+            // which is what the replaced file had unless someone set one by
+            // hand — that case is not recoverable through a rename.
+            #[cfg(unix)]
+            if let Ok(meta) = std::fs::metadata(target) {
+                let _ = f.set_permissions(meta.permissions());
+            }
+            f.sync_data()
+        })();
+        if let Err(e) = staged {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(tmp);
+    }
+    Err(last)
 }
 
 /// Write `bytes` over `path` **atomically**, for a file that isn't ours.
@@ -936,25 +1159,46 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8]) {
 /// tab the app is about to close. Staging beside it and renaming over makes the
 /// replacement a single step.
 ///
-/// Unlike [`write_bytes`] it keeps **no `.bak`** and narrows no permissions:
-/// this is the user's own file in the user's own directory, and leaving
-/// `orders.sql.bak` behind after every Ctrl+S — or changing the mode of a file
-/// checked into their repository — is not ours to do. The temp sibling is
-/// removed on any failure, so a failed save leaves the directory as it was.
+/// Unlike [`write_bytes`] it keeps **no `.bak`**: this is the user's own file in
+/// the user's own directory, and leaving `orders.sql.bak` behind after every
+/// Ctrl+S is not ours to do. It narrows no permissions either — and, since the
+/// rename swaps the inode, it now takes care to *keep* the ones the file had
+/// rather than handing it whatever `umask` would give a fresh one
+/// ([`stage_beside`]). The staging sibling is removed on any failure, so a
+/// failed save leaves the directory as it was.
+///
+/// **What a rename cannot keep, and this does not pretend to.** The new inode is
+/// a new inode: a second hard link to the file goes on pointing at the old
+/// content, and there is no way to have both that and a replacement that is one
+/// step. Atomicity wins, because the file being protected is often the only copy
+/// of the text. A *symlink* is different and is handled — see
+/// [`resolved_target`].
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = sibling(path, ".schemaic-tmp");
-    if let Err(e) = std::fs::write(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+    let target = resolved_target(path);
+    let tmp = stage_beside(&target, bytes)?;
+    match std::fs::rename(&tmp, &target) {
+        Ok(()) => {
+            // Best effort, and unavailable on Windows, where a directory cannot
+            // be opened as a file: without it the rename's own metadata is no
+            // better ordered than the data was.
+            if let Some(dir) = target.parent()
+                && let Ok(d) = std::fs::File::open(dir)
+            {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
         Err(_) => {
-            // Cross-device, or a Windows share that refuses the replace. A
-            // direct write is what the caller asked for and is still better than
-            // failing with the text only in memory.
-            let direct = std::fs::write(path, bytes);
-            let _ = std::fs::remove_file(&tmp);
+            // A Windows share or a scanner refusing the replace — no longer
+            // another writer having consumed the staging file, which is what the
+            // unique name closed. A direct write is what the caller asked for and
+            // is still better than failing with the text only in memory.
+            let direct = std::fs::write(&target, bytes);
+            // Keep the staged copy when the fallback failed too: it is then the
+            // only place on disk the text exists.
+            if direct.is_ok() {
+                let _ = std::fs::remove_file(&tmp);
+            }
             direct
         }
     }
@@ -967,7 +1211,7 @@ pub fn load_ui_state() -> UiState {
 
 /// Persist UI state (best effort — errors are intentionally ignored).
 pub fn save_ui_state(state: &UiState) {
-    write_json(config_path(), state);
+    write_json(config_path(), state, Saving::Replacing);
 }
 
 /// The legacy `ai_run_queries` flag **as a file actually recorded it**, or
@@ -1044,7 +1288,19 @@ pub fn load_json_strict<T: Default + for<'de> Deserialize<'de>>(file: &str) -> R
 
 /// Persist a JSON value to `<config>/<file>` (best effort).
 pub fn save_json<T: Serialize>(file: &str, value: &T) {
-    write_json(config_dir().map(|d| d.join(file)), value);
+    write_json(config_dir().map(|d| d.join(file)), value, Saving::Replacing);
+}
+
+/// [`save_json`] for a save whose point is that something is **gone** — the
+/// history panel's trash, a deleted connection taking its chats and history with
+/// it, one history row removed from its menu.
+///
+/// It does not keep the pre-deletion generation as `.bak`, and it removes any
+/// earlier one. Everything [`Saving::Erasing`] says about why is there; the
+/// short version is that a confirm reading "This can't be undone" has to be
+/// true of the disk as well as of the panel.
+pub fn save_json_erasing<T: Serialize>(file: &str, value: &T) {
+    write_json(config_dir().map(|d| d.join(file)), value, Saving::Erasing);
 }
 
 /// Load saved connections (best effort).
@@ -1054,7 +1310,7 @@ pub fn load_connections() -> ConnectionsFile {
 
 /// Persist saved connections (best effort).
 pub fn save_connections(file: &ConnectionsFile) {
-    write_json(connections_path(), file);
+    write_json(connections_path(), file, Saving::Replacing);
 }
 
 /// Remove the `connections.json.bak` recovery copy (best effort).
@@ -1073,9 +1329,9 @@ pub fn clear_connections_backup() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionsFile, FileStore, Load, RECOVERIES, RightPanelState, UiState,
-        ai_harness_to_persist, classify, legacy_ai_run_queries_in, private_dir_in, read_bytes,
-        recover, recovery_notice, sibling, statement_timeout, statement_timeout_label,
+        ConnectionsFile, FileStore, Load, RECOVERIES, Recovered, RightPanelState, Saving, UiState,
+        ai_harness_to_persist, classify, legacy_ai_run_queries_in, missing_notice, private_dir_in,
+        read_bytes, recover, recovery_notice, sibling, statement_timeout, statement_timeout_label,
         take_recoveries, write_bytes,
     };
     use std::cell::RefCell;
@@ -1297,12 +1553,46 @@ mod tests {
     #[test]
     fn a_second_save_keeps_the_first_as_the_backup() {
         let fs = FakeFs::default();
-        write_bytes(&fs, Path::new(CFG), br#""A""#);
-        write_bytes(&fs, Path::new(CFG), br#""B""#);
+        write_bytes(&fs, Path::new(CFG), br#""A""#, Saving::Replacing);
+        write_bytes(&fs, Path::new(CFG), br#""B""#, Saving::Replacing);
         assert_eq!(fs.get(CFG).as_deref(), Some(&br#""B""#[..]));
         assert_eq!(fs.get("/cfg/ui.json.bak").as_deref(), Some(&br#""A""#[..]));
         // The staging file never survives a successful save.
         assert!(fs.get("/cfg/ui.json.tmp").is_none());
+    }
+
+    /// **"This can't be undone" has to be true of the disk too.** The history
+    /// panel's trash button says exactly that, and the save answering it copied
+    /// the pre-clear file to `history.json.bak` on its way past — where it sat
+    /// until the *next* save of that store, which needs another query run.
+    #[test]
+    fn an_erasing_save_leaves_no_copy_of_what_it_erased() {
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#"["a","b"]"#, Saving::Replacing);
+        write_bytes(&fs, Path::new(CFG), br#"["a"]"#, Saving::Erasing);
+        assert_eq!(fs.get(CFG).as_deref(), Some(&br#"["a"]"#[..]));
+        assert!(
+            fs.get("/cfg/ui.json.bak").is_none(),
+            "the deleted entry is still on disk"
+        );
+        assert!(fs.get("/cfg/ui.json.tmp").is_none());
+    }
+
+    /// The `.bak` an erasing save finds is removed **after** the new file is in
+    /// place, never before — a save that cannot land must leave the recovery
+    /// copy it found, or a full disk turns a deletion into a total loss.
+    #[test]
+    fn an_erasing_save_that_cannot_stage_keeps_the_backup_it_found() {
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#"["a","b"]"#, Saving::Replacing);
+        write_bytes(&fs, Path::new(CFG), br#"["a","b","c"]"#, Saving::Replacing);
+        assert!(fs.get("/cfg/ui.json.bak").is_some());
+        fs.unwritable
+            .borrow_mut()
+            .push(PathBuf::from("/cfg/ui.json.tmp"));
+        write_bytes(&fs, Path::new(CFG), br#"[]"#, Saving::Erasing);
+        assert_eq!(fs.get(CFG).as_deref(), Some(&br#"["a","b","c"]"#[..]));
+        assert!(fs.get("/cfg/ui.json.bak").is_some(), "nothing was erased");
     }
 
     #[test]
@@ -1311,8 +1601,8 @@ mod tests {
         // about where the previous version lives.
         let _guard = recovery_lock();
         let fs = FakeFs::default();
-        write_bytes(&fs, Path::new(CFG), br#""A""#);
-        write_bytes(&fs, Path::new(CFG), br#""B""#);
+        write_bytes(&fs, Path::new(CFG), br#""A""#, Saving::Replacing);
+        write_bytes(&fs, Path::new(CFG), br#""B""#, Saving::Replacing);
         fs.put(CFG, "{ this is not json");
 
         let v: String = read_bytes(&fs, Path::new(CFG));
@@ -1330,9 +1620,9 @@ mod tests {
         // directly, and the thing that must not happen is losing the value *and*
         // leaving a stray `.tmp` holding it.
         let fs = FakeFs::default();
-        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        write_bytes(&fs, Path::new(CFG), br#""A""#, Saving::Replacing);
         *fs.rename_fails.borrow_mut() = true;
-        write_bytes(&fs, Path::new(CFG), br#""B""#);
+        write_bytes(&fs, Path::new(CFG), br#""B""#, Saving::Replacing);
 
         assert_eq!(fs.get(CFG).as_deref(), Some(&br#""B""#[..]));
         assert!(fs.get("/cfg/ui.json.tmp").is_none(), "no orphaned temp");
@@ -1345,11 +1635,11 @@ mod tests {
         // A full disk. Failing before the rename is what makes this safe — the
         // target and its backup must both still hold the last good version.
         let fs = FakeFs::default();
-        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        write_bytes(&fs, Path::new(CFG), br#""A""#, Saving::Replacing);
         fs.unwritable
             .borrow_mut()
             .push(PathBuf::from("/cfg/ui.json.tmp"));
-        write_bytes(&fs, Path::new(CFG), br#""B""#);
+        write_bytes(&fs, Path::new(CFG), br#""B""#, Saving::Replacing);
 
         assert_eq!(fs.get(CFG).as_deref(), Some(&br#""A""#[..]));
         let v: String = read_bytes(&fs, Path::new(CFG));
@@ -1359,11 +1649,83 @@ mod tests {
     #[test]
     fn loading_sweeps_an_orphaned_temp_from_a_crash() {
         let fs = FakeFs::default();
-        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        write_bytes(&fs, Path::new(CFG), br#""A""#, Saving::Replacing);
         fs.put("/cfg/ui.json.tmp", r#""half-written"#);
         let v: String = read_bytes(&fs, Path::new(CFG));
         assert_eq!(v, "A");
         assert!(fs.get("/cfg/ui.json.tmp").is_none());
+    }
+
+    /// **Absence is not evidence of a first run once a sibling still holds the
+    /// data.** A crash between the staged write and the rename on a *first*
+    /// save leaves no primary and a `.tmp` holding everything; a file removed
+    /// from outside (the Settings modal's own *Open folder* button puts the user
+    /// in that directory, and a roaming-profile sync, a backup restore or an AV
+    /// quarantine reach it too) leaves a `.bak` holding the last good version.
+    /// Read as a first run, the app came up empty and **two ordinary saves then
+    /// overwrote the last copy** — and saves are frequent.
+    ///
+    /// Asserted through `read_bytes` rather than through `recover`, because the
+    /// loss is the composition: the unconditional `.tmp` sweep at the top of the
+    /// loader destroyed one of the two copies before anything was classified.
+    #[test]
+    fn an_absent_primary_recovers_from_the_backup_instead_of_reading_as_a_first_run() {
+        let _guard = recovery_lock();
+        let _ = take_recoveries();
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.bak", r#""from-bak""#);
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "from-bak");
+        // Nothing to preserve — there is no primary — so no `.corrupt`.
+        assert!(fs.get("/cfg/ui.json.corrupt").is_none());
+        // And the recovered copy is still there for the next attempt.
+        assert!(fs.get("/cfg/ui.json.bak").is_some());
+        // **Said, not repaired quietly.** The whole recovery apparatus used to
+        // stay silent here: no warning, no notice, no `.corrupt`.
+        let notices = take_recoveries();
+        assert_eq!(notices, vec![missing_notice(Path::new(CFG), ".bak")]);
+        assert!(notices[0].contains("ui.json was missing"), "{notices:?}");
+    }
+
+    #[test]
+    fn an_absent_primary_recovers_from_the_staged_temp_a_crash_left() {
+        let _guard = recovery_lock();
+        let _ = take_recoveries();
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.tmp", r#""from-tmp""#);
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "from-tmp");
+        // **Not swept.** It is the only copy until a save lands.
+        assert!(fs.get("/cfg/ui.json.tmp").is_some());
+        let _ = take_recoveries();
+    }
+
+    /// The staged copy is the *newer* of the two — `write_bytes` writes `.tmp`
+    /// from the new value and `.bak` from the old one — so it wins.
+    #[test]
+    fn a_staged_temp_outranks_the_backup_when_the_primary_is_gone() {
+        let _guard = recovery_lock();
+        let _ = take_recoveries();
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.tmp", r#""newer""#);
+        fs.put("/cfg/ui.json.bak", r#""older""#);
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "newer");
+        let _ = take_recoveries();
+    }
+
+    /// A sibling that does not parse is not a copy. Falling through to the next
+    /// one is what stops a half-written `.tmp` shadowing an intact `.bak`.
+    #[test]
+    fn an_unparsable_sibling_is_stepped_over_rather_than_believed() {
+        let _guard = recovery_lock();
+        let _ = take_recoveries();
+        let fs = FakeFs::default();
+        fs.put("/cfg/ui.json.tmp", r#""half-writt"#);
+        fs.put("/cfg/ui.json.bak", r#""intact""#);
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "intact");
+        let _ = take_recoveries();
     }
 
     #[test]
@@ -1539,39 +1901,70 @@ mod tests {
     }
 
     #[test]
-    fn recover_uses_primary_without_reading_backup() {
-        // A healthy primary must never consult `.bak` (laziness guard).
-        let (v, corrupt) = recover(Load::Ok(5), || panic!("backup must not be read"));
+    fn recover_uses_primary_without_reading_either_sibling() {
+        // A healthy primary must never consult a sibling (laziness guard).
+        let (v, out) = recover(
+            Load::Ok(5),
+            || panic!("the staged copy must not be read"),
+            || panic!("backup must not be read"),
+        );
         assert_eq!(v, 5);
-        assert!(corrupt.is_none());
+        assert_eq!(out, Recovered::Primary);
     }
 
+    /// A first run is `Absent` **and** no sibling holding anything. It used to
+    /// be `Absent` alone — this test asserted that, by name, and so pinned the
+    /// bug it was written to describe. Kept, with the missing half added.
     #[test]
-    fn recover_absent_defaults_without_reading_backup() {
-        let (v, corrupt) = recover::<i32>(Load::Absent, || panic!("backup must not be read"));
+    fn recover_absent_defaults_only_when_no_sibling_answers() {
+        let (v, out) = recover::<i32>(Load::Absent, || Load::Absent, || Load::Absent);
         assert_eq!(v, 0); // i32::default()
-        assert!(corrupt.is_none());
+        assert_eq!(out, Recovered::FirstRun);
+        // The staged copy is the newer of the two, so it is asked first — and
+        // where it answers, the backup is not read at all.
+        let (v, out) = recover::<i32>(Load::Absent, || Load::Ok(7), || panic!("not reached"));
+        assert_eq!(v, 7);
+        assert_eq!(out, Recovered::Restored(".tmp"));
+        // A sibling that does not parse is not a copy.
+        let (v, out) = recover::<i32>(
+            Load::Absent,
+            || Load::Corrupt("half".into()),
+            || Load::Ok(11),
+        );
+        assert_eq!(v, 11);
+        assert_eq!(out, Recovered::Restored(".bak"));
     }
 
     #[test]
     fn recover_corrupt_prefers_valid_backup_and_flags_preserve() {
-        let (v, corrupt) = recover(Load::Corrupt("bad".to_string()), || Load::Ok(9));
+        let (v, out) = recover(
+            Load::Corrupt("bad".to_string()),
+            || panic!("the corrupt path asks the backup, not the staged copy"),
+            || Load::Ok(9),
+        );
         assert_eq!(v, 9);
-        assert_eq!(corrupt.as_deref(), Some("bad")); // primary preserved as .corrupt
+        // Primary preserved as `.corrupt`.
+        assert_eq!(out, Recovered::Corrupt("bad".to_string()));
     }
 
     #[test]
     fn recover_corrupt_falls_back_to_default_when_backup_unusable() {
         // Backup absent → default, still preserve the corrupt primary.
-        let (v, corrupt) = recover::<i32>(Load::Corrupt("e".to_string()), || Load::Absent);
+        let (v, out) = recover::<i32>(
+            Load::Corrupt("e".to_string()),
+            || Load::Absent,
+            || Load::Absent,
+        );
         assert_eq!(v, 0);
-        assert!(corrupt.is_some());
+        assert!(matches!(out, Recovered::Corrupt(_)));
         // Backup also corrupt → default, still preserve.
-        let (v, corrupt) = recover::<i32>(Load::Corrupt("e".to_string()), || {
-            Load::Corrupt("e2".to_string())
-        });
+        let (v, out) = recover::<i32>(
+            Load::Corrupt("e".to_string()),
+            || Load::Absent,
+            || Load::Corrupt("e2".to_string()),
+        );
         assert_eq!(v, 0);
-        assert!(corrupt.is_some());
+        assert!(matches!(out, Recovered::Corrupt(_)));
     }
 
     /// **Widening a consent setting is not a decision to make from an absence.**
@@ -1728,38 +2121,172 @@ mod tests {
         assert_eq!(at(2), 1, "itself, renumbered");
     }
 
+    /// A fresh directory under the system temp dir, removed by `Dir`'s drop.
+    ///
+    /// Shared by the two modules below that must touch a real filesystem —
+    /// a file's *mode* and a rename's *identity* are both properties of the
+    /// filesystem, so there is nothing purer to test them against.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Dir {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir()
+                .join(format!("schemaic-test-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Dir(p)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // ── The atomic save of a file that is not ours ────────────────────────
+    //
+    // Cross-platform, unlike `mod modes` below: the inode swap this asserts
+    // around was measured on Windows 11 / NTFS, and it is a Windows-first
+    // product.
+    mod atomic_writes {
+        use super::super::*;
+        use super::Dir;
+
+        /// Every staging sibling this module's writes could have left.
+        fn leftovers(dir: &Path) -> Vec<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".schemaic-tmp"))
+                .collect()
+        }
+
+        #[test]
+        fn a_successful_save_leaves_no_staging_file_behind() {
+            let dir = Dir::new("atomic-clean");
+            let path = dir.0.join("orders.sql");
+            write_file_atomic(&path, b"V1").unwrap();
+            write_file_atomic(&path, b"V2").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"V2");
+            assert_eq!(leftovers(&dir.0), Vec::<String>::new());
+        }
+
+        /// **The staging name used to be a pure function of the target**, so two
+        /// writers of one path shared one file — and the Antigravity marker is
+        /// machine-global by design, with two Schemaic windows contending for it
+        /// on every launch. The loser's rename found the file gone and fell
+        /// through to `fs::write`, which truncates: verbatim the failure that
+        /// call site's own doc says it uses this function to avoid.
+        ///
+        /// Driven here as the deterministic half of the same defect — a planted
+        /// file of that name, which `fs::write` would have opened and written
+        /// (it is `File::create`: no `O_EXCL`, follows symlinks, truncates).
+        #[test]
+        fn a_planted_staging_file_captures_nothing() {
+            let dir = Dir::new("atomic-plant");
+            let path = dir.0.join("notes.sql");
+            std::fs::write(&path, b"original").unwrap();
+            let planted = dir.0.join("notes.sql.schemaic-tmp");
+            std::fs::write(&planted, b"planted").unwrap();
+
+            write_file_atomic(&path, b"mine").unwrap();
+
+            assert_eq!(std::fs::read(&path).unwrap(), b"mine");
+            assert_eq!(
+                std::fs::read(&planted).unwrap(),
+                b"planted",
+                "the write went into a file someone else owned"
+            );
+        }
+
+        /// Two saves that overlap must not be able to derive one staging name.
+        /// Asserted on the names rather than by racing threads, because the
+        /// race's outcome is timing and the property is not.
+        #[test]
+        fn two_saves_of_one_path_never_stage_through_one_name() {
+            let dir = Dir::new("atomic-unique");
+            let target = dir.0.join("shared.json");
+            let a = stage_beside(&target, b"A").unwrap();
+            let b = stage_beside(&target, b"B").unwrap();
+            assert_ne!(a, b);
+            assert_eq!(std::fs::read(&a).unwrap(), b"A");
+            assert_eq!(std::fs::read(&b).unwrap(), b"B");
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+
+        /// A path with no file behind it is the ordinary "Save As to a new name"
+        /// case, and staging must not need a target to copy anything from.
+        #[test]
+        fn a_first_write_to_a_new_path_works() {
+            let dir = Dir::new("atomic-new");
+            let path = dir.0.join("fresh.sql");
+            write_file_atomic(&path, b"hello").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        }
+
+        /// `fs::rename` acts on the link, not its target, so the managed copy in
+        /// a dotfile repo stopped receiving writes and the link became an
+        /// ordinary file. `~/.antigravity/settings.json` — another vendor's
+        /// config, and the highest-blast-radius write in the app — is exactly
+        /// the shape people symlink.
+        #[cfg(unix)]
+        #[test]
+        fn a_symlinked_target_is_replaced_through_the_link() {
+            let dir = Dir::new("atomic-link");
+            let real = dir.0.join("managed.json");
+            let link = dir.0.join("settings.json");
+            std::fs::write(&real, b"V1").unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+
+            write_file_atomic(&link, b"V2").unwrap();
+
+            assert_eq!(std::fs::read(&real).unwrap(), b"V2", "through the link");
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the link itself must survive"
+            );
+        }
+
+        /// The rename replaces the inode, so a file the user or another vendor
+        /// had narrowed came back at whatever `umask` gives a fresh one — 0644
+        /// under the usual one. A `seed.sql` holding a
+        /// `CREATE USER … IDENTIFIED BY` became world-readable on Ctrl+S.
+        #[cfg(unix)]
+        #[test]
+        fn a_saved_file_keeps_the_mode_it_had() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = Dir::new("atomic-mode");
+            let path = dir.0.join("seed.sql");
+            std::fs::write(&path, b"V1").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            write_file_atomic(&path, b"V2").unwrap();
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the mode the user set");
+            assert_eq!(std::fs::read(&path).unwrap(), b"V2");
+        }
+    }
+
     // ── File modes ────────────────────────────────────────────────────────
     //
-    // The one place the suite touches the filesystem, and deliberately: the mode
-    // a file is created with *is* the boundary, so there is nothing purer to test.
-    // Unix-only — on Windows the file inherits the profile ACL and there is no
-    // mode to assert.
+    // The mode a file is created with *is* the boundary, so there is nothing
+    // purer to test. Unix-only — on Windows the file inherits the profile ACL
+    // and there is no mode to assert.
     #[cfg(unix)]
     mod modes {
         use super::super::*;
+        use super::Dir;
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        /// A fresh directory under the system temp dir, removed by `Dir`'s drop.
-        struct Dir(PathBuf);
-
-        impl Dir {
-            fn new(tag: &str) -> Dir {
-                static SEQ: AtomicU32 = AtomicU32::new(0);
-                let n = SEQ.fetch_add(1, Ordering::Relaxed);
-                let p = std::env::temp_dir()
-                    .join(format!("schemaic-test-{tag}-{}-{n}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&p);
-                std::fs::create_dir_all(&p).unwrap();
-                Dir(p)
-            }
-        }
-
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
 
         fn mode(path: &Path) -> u32 {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777

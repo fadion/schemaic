@@ -962,6 +962,32 @@ impl Connection {
             .unwrap_or_else(|| Connection::next_id(&[]))
     }
 
+    /// Which connection a restored tab belongs to, given the connections that
+    /// actually loaded.
+    ///
+    /// The saved id wins when it still names one. When it does not, the tab's
+    /// connection was **deleted** and the tab moves to `fallback`, which is what
+    /// stops a restored session pointing at a connection nobody can select.
+    ///
+    /// **An empty list is not the same answer.** "Deleted" and "the connection
+    /// file did not load" both present as *the id is not in this list*, and they
+    /// want opposite things: on a load failure the saved id is still right and
+    /// the list is what is wrong. Collapsing them rebound twelve tabs across
+    /// three connections onto one id — [`Connection::startup_active_id`]'s
+    /// forward-looking `next_id(&[])`, which a *future* connection will occupy —
+    /// and the debounced session save then wrote that to disk before the user
+    /// touched anything, so restoring `connections.json` from its `.bak`
+    /// afterwards did not undo it. A tab naming a connection that does not exist
+    /// is already a state the app handles (`db_for` answers "connection no longer
+    /// exists"); a tab silently re-pointed at someone else's server is not.
+    pub fn rebind_tab(saved: u64, known: &[Connection], fallback: u64) -> u64 {
+        if known.is_empty() || known.iter().any(|c| c.id == saved) {
+            saved
+        } else {
+            fallback
+        }
+    }
+
     /// Do these two point at the same server — everything that decides *which*
     /// server the next query reaches, and nothing else?
     ///
@@ -1296,6 +1322,26 @@ mod tests {
         // a schema only for the connection that is active, and the new one takes
         // `next_id(&[])`.
         assert_eq!(Connection::startup_active_id(Some(2), &[]), 1);
+    }
+
+    /// A restored tab whose connection was deleted moves to the fallback — that
+    /// is the whole point of the rebind — but a tab whose connection *list*
+    /// failed to load keeps the id it had. The two look identical to an `any`
+    /// over the list, which is how twelve tabs across three connections came to
+    /// collapse onto one id and get written back before the user acted.
+    #[test]
+    fn a_tab_is_rebound_only_when_its_connection_was_really_deleted() {
+        let cs = vec![
+            Connection { id: 4, ..conn() },
+            Connection { id: 9, ..conn() },
+        ];
+        assert_eq!(Connection::rebind_tab(9, &cs, 4), 9, "still there");
+        assert_eq!(Connection::rebind_tab(77, &cs, 4), 4, "deleted → fallback");
+        // The list did not load. The saved id is right and the list is wrong,
+        // and the fallback here is `startup_active_id`'s forward-looking id —
+        // one a *future* connection will take.
+        assert_eq!(Connection::rebind_tab(77, &[], 1), 77);
+        assert_eq!(Connection::rebind_tab(9, &[], 1), 9);
     }
 
     #[test]

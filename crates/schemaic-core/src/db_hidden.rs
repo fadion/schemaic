@@ -77,16 +77,30 @@ pub fn names_for(rules: &[DbHiddenRule], conn_id: u64) -> HashSet<String> {
 /// to be active would silently *unhide* databases on all the others, and
 /// dropping it would silently unhide them everywhere. From the first toggle
 /// onwards each connection's rules diverge normally.
-pub fn migrate_flat(names: &[String], conn_ids: &[u64]) -> Vec<DbHiddenRule> {
-    conn_ids
-        .iter()
-        .flat_map(|&conn_id| {
-            names.iter().map(move |database| DbHiddenRule {
-                conn_id,
-                database: database.clone(),
+/// **With no connections it answers `None`, and the caller must keep the legacy
+/// list where it found it.** The outer loop is the connection ids, so an empty
+/// one yields no rules for any number of names — and the migration runs *once*,
+/// with the flat field written empty from then on, so a launch where
+/// `connections.json` failed to load (or where the user has simply deleted their
+/// last connection) turned every previously hidden database permanently visible
+/// with nothing said and no way to retry. `Some(vec![])` and `None` are
+/// different answers here: the first is "there was nothing to migrate", the
+/// second is "not yet".
+pub fn migrate_flat(names: &[String], conn_ids: &[u64]) -> Option<Vec<DbHiddenRule>> {
+    if conn_ids.is_empty() {
+        return None;
+    }
+    Some(
+        conn_ids
+            .iter()
+            .flat_map(|&conn_id| {
+                names.iter().map(move |database| DbHiddenRule {
+                    conn_id,
+                    database: database.clone(),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -143,15 +157,26 @@ mod tests {
     /// everywhere — and that is what it has to keep meaning across the upgrade.
     #[test]
     fn a_legacy_flat_list_stays_hidden_on_every_connection() {
-        let r = migrate_flat(&["world".to_string(), "archive".to_string()], &[1, 7]);
+        let r = migrate_flat(&["world".to_string(), "archive".to_string()], &[1, 7])
+            .expect("connections loaded");
         assert_eq!(r.len(), 4);
         for conn_id in [1, 7] {
             assert!(is_hidden(&r, conn_id, "world"));
             assert!(is_hidden(&r, conn_id, "archive"));
         }
         assert!(!is_hidden(&r, 2, "world"));
-        // Nothing hidden, or no connections yet: nothing to migrate.
-        assert!(migrate_flat(&[], &[1]).is_empty());
-        assert!(migrate_flat(&["world".to_string()], &[]).is_empty());
+        // Nothing hidden: the migration ran and there was nothing in it.
+        assert_eq!(migrate_flat(&[], &[1]), Some(vec![]));
+    }
+
+    /// **The migration runs once and the flat field is written empty after it**,
+    /// so answering "no rules" on a launch whose connection list did not load
+    /// unhid every database permanently, with nothing said. This test asserted
+    /// the opposite — `is_empty()`, which the bug satisfied — which is how it
+    /// stayed green over it.
+    #[test]
+    fn no_connections_is_not_yet_rather_than_nothing_to_migrate() {
+        assert_eq!(migrate_flat(&["world".to_string()], &[]), None);
+        assert_eq!(migrate_flat(&[], &[]), None);
     }
 }

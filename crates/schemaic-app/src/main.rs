@@ -1135,12 +1135,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         )
         .entries,
     );
-    create_effect(move |_| {
+    // **Not on the first run.** floem's `create_effect` runs its body once
+    // immediately, so this saved the value it had *just loaded* before the window
+    // was drawn — and this is the only store in this opening that persists
+    // through an effect rather than an explicit saver, so it was the only one
+    // whose `.bak` was always exactly one launch old even in normal operation.
+    // On a launch that loaded defaults, the write put an empty primary on disk
+    // and the launch after that rotated the empty file over the last real copy.
+    create_effect(move |prev: Option<()>| {
         let entries = search_history.get();
-        persist::save_json(
-            "search_history.json",
-            &schemaic_core::search_history::SearchHistoryFile { entries },
-        );
+        if prev.is_some() {
+            persist::save_json(
+                "search_history.json",
+                &schemaic_core::search_history::SearchHistoryFile { entries },
+            );
+        }
     });
 
     // Per-column display formatters (persisted, keyed by connection+table+column;
@@ -1223,11 +1232,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .iter()
                     .enumerate()
                     .map(|(i, s)| {
-                        let conn = if cf.connections.iter().any(|c| c.id == s.conn_id) {
-                            s.conn_id
-                        } else {
-                            active_id
-                        };
+                        let conn = Connection::rebind_tab(s.conn_id, &cf.connections, active_id);
                         let mut t = Tab::new(cx, i + 1, &s.query, conn, s.database.clone());
                         // Numbering restarts per connection (labels aren't
                         // persisted — they're always derived on restore), so a
@@ -1392,14 +1397,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // this means. The rules are the persisted truth; `hidden_dbs` is the set for
     // the connection currently being *looked at*, which is the question every
     // consumer is asking, so it is derived rather than kept in step by hand.
+    //
+    // **The legacy list is only cleared once it has actually been read.** The
+    // migration runs at most once and `save_ui` writes the flat field empty from
+    // then on, so a launch whose `connections.json` did not load — or one where
+    // the user has deleted their last connection — used to turn every previously
+    // hidden database permanently visible: no connection ids, no rules, and the
+    // list gone by the first save. `migrate_flat` answers `None` for "not yet"
+    // now, and what it did not consume is carried back out to disk.
+    let mut pending_legacy_hidden = ui_state.hidden_dbs;
     let hidden_db_rules: RwSignal<Vec<schemaic_core::db_hidden::DbHiddenRule>> = RwSignal::new({
         let mut rules = ui_state.hidden_db_rules;
-        if rules.is_empty() && !ui_state.hidden_dbs.is_empty() {
-            let ids: Vec<u64> = cf.connections.iter().map(|c| c.id).collect();
-            rules = schemaic_core::db_hidden::migrate_flat(&ui_state.hidden_dbs, &ids);
+        if rules.is_empty()
+            && !pending_legacy_hidden.is_empty()
+            && let Some(migrated) = schemaic_core::db_hidden::migrate_flat(
+                &pending_legacy_hidden,
+                &cf.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
+            )
+        {
+            rules = migrated;
+            pending_legacy_hidden = Vec::new();
         }
         rules
     });
+    let pending_legacy_hidden = Rc::new(pending_legacy_hidden);
     let hidden_dbs: floem::reactive::Memo<HashSet<String>> = create_memo(move |_| {
         hidden_db_rules.with(|rules| schemaic_core::db_hidden::names_for(rules, active_conn.get()))
     });
@@ -1766,17 +1787,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // Store the panel's current conversation under `conn_id` and write the file.
     // Called when a turn finishes and when a conversation is cleared — never
     // mid-stream, so a half-written turn can't reach disk.
-    let persist_chat: Rc<dyn Fn(u64)> = Rc::new(move |conn_id: u64| {
-        saved_chats.update(|chats| {
-            schemaic_core::chat::save(chats, conn_id, &ai_messages.get_untracked());
+    //
+    // **The caller says which of those two it is.** A finished turn is an
+    // ordinary save and wants the `.bak` a crash would be recovered from; "New
+    // chat" replaces a transcript with nothing, and the ordinary save left the
+    // whole previous conversation — which keeps row values in the assistant's
+    // own prose — in `chats.json.bak`.
+    let persist_chat: Rc<dyn Fn(u64, persist::Saving)> =
+        Rc::new(move |conn_id: u64, saving: persist::Saving| {
+            saved_chats.update(|chats| {
+                schemaic_core::chat::save(chats, conn_id, &ai_messages.get_untracked());
+            });
+            // `ChatFile::of` is what drops the tool results — query output, i.e.
+            // the user's own rows — on the way to disk.
+            let file = schemaic_core::chat::ChatFile::of(&saved_chats.get_untracked());
+            match saving {
+                persist::Saving::Erasing => persist::save_json_erasing("chats.json", &file),
+                persist::Saving::Replacing => persist::save_json("chats.json", &file),
+            }
         });
-        // `ChatFile::of` is what drops the tool results — query output, i.e. the
-        // user's own rows — on the way to disk.
-        persist::save_json(
-            "chats.json",
-            &schemaic_core::chat::ChatFile::of(&saved_chats.get_untracked()),
-        );
-    });
     let (ai_tx, ai_rx) = crossbeam_channel::unbounded::<AiStreamMsg>();
     let ai_stream = create_signal_from_channel(ai_rx);
 
@@ -1813,30 +1842,37 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     })
                     .unwrap_or_default();
                 let mut ids = Vec::with_capacity(stmts.len());
-                let mut wrote = false;
-                history_entries.update(|v| {
-                    for sql in stmts {
+                // **One batch, not N pushes.** The per-connection cap applied on
+                // each push let a script longer than the cap evict the whole of
+                // the connection's real history — and its own dispatched
+                // statements with it — before anything ran; `finish_history`
+                // then dropped the tail and left nothing at all. `push_batch`
+                // defers the cap to `history::trim`, which runs once the
+                // outcomes are known. See `history::push_batch`.
+                let batch: Vec<_> = stmts
+                    .iter()
+                    .map(|sql| {
                         let run_id = run_ids.get() + 1;
                         run_ids.set(run_id);
                         ids.push(run_id);
-                        wrote |= schemaic_core::history::push(
-                            v,
-                            schemaic_core::history::HistoryEntry {
-                                conn_id,
-                                database: database.clone(),
-                                sql: sql.clone(),
-                                ts,
-                                run_id,
-                                tab_name: tab_name.clone(),
-                                // Filled in by `finish_history` when the run lands.
-                                duration_ms: None,
-                                rows: None,
-                                rows_capped: false,
-                                outcome: schemaic_core::history::Outcome::Unknown,
-                            },
-                            dialect,
-                        );
-                    }
+                        schemaic_core::history::HistoryEntry {
+                            conn_id,
+                            database: database.clone(),
+                            sql: sql.clone(),
+                            ts,
+                            run_id,
+                            tab_name: tab_name.clone(),
+                            // Filled in by `finish_history` when the run lands.
+                            duration_ms: None,
+                            rows: None,
+                            rows_capped: false,
+                            outcome: schemaic_core::history::Outcome::Unknown,
+                        }
+                    })
+                    .collect();
+                let mut wrote = false;
+                history_entries.update(|v| {
+                    wrote = schemaic_core::history::push_batch(v, batch, dialect) > 0;
                 });
                 // Skipped when nothing was recorded — the same skip
                 // `finish_history` documents. A credential-bearing statement
@@ -1874,6 +1910,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 for (run_id, result) in runs {
                     any |= schemaic_core::history::finish(v, *run_id, *result);
                 }
+                // **The cap, now that the outcomes are known.** `push_batch`
+                // deliberately leaves the connection over it at launch so a
+                // script cannot evict history before anything has run; this is
+                // the only moment anything can tell a statement that ran from
+                // one that was never sent. Idempotent, so a batch that fitted
+                // reports no change and costs no write.
+                any |= schemaic_core::history::trim(v);
                 any
             });
             if updated != Some(true) {
@@ -1893,7 +1936,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move || {
             let conn = active_conn.get_untracked();
             history_entries.update(|v| schemaic_core::history::clear_conn(v, conn));
-            persist::save_json(
+            // **Erasing.** The confirm behind this button reads "This can't be
+            // undone", and the ordinary save left every statement it named in
+            // `history.json.bak` until the next query run.
+            persist::save_json_erasing(
                 "history.json",
                 &schemaic_core::history::HistoryFile {
                     entries: history_entries.get_untracked(),
@@ -1912,7 +1958,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 hit = schemaic_core::history::remove(v, entry.conn_id, &entry.sql);
             });
             if hit {
-                persist::save_json(
+                // Erasing: the point of this save is that the row is gone, and
+                // the ordinary one would have left it in `history.json.bak`.
+                persist::save_json_erasing(
                     "history.json",
                     &schemaic_core::history::HistoryFile {
                         entries: history_entries.get_untracked(),
@@ -6345,49 +6393,55 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // ── Persisted expand/collapse + database-visibility state ───────────────
     // Snapshot both sets to disk (best effort).
-    let save_ui: Rc<dyn Fn()> = Rc::new(move || {
-        persist::save_ui_state(&UiState {
-            expanded: expanded.with_untracked(|s| s.iter().cloned().collect()),
-            // The legacy flat field is written empty from here on: it is read
-            // once, at the upgrade, and `hidden_db_rules` is the truth after.
-            hidden_dbs: Vec::new(),
-            hidden_db_rules: hidden_db_rules.get_untracked(),
-            schema_visible: schema_visible.get_untracked(),
-            right_panel: right_panel.get_untracked().into(),
-            activity_intervals: activity_intervals.get_untracked(),
-            schema_w: schema_w.get_untracked(),
-            right_w: right_w.get_untracked(),
-            editor_h: editor_h.get_untracked(),
-            // **The unknown key survives the save**, or the field's own promise
-            // — "an unrecognised value is *not* silently replaced with the
-            // default" — is false one save later. Cleared the moment the user
-            // picks a harness themselves, which is the point at which the file
-            // should start naming what is actually running.
-            ai_harness: persist::ai_harness_to_persist(
-                ai_harness_unknown.get_untracked().as_deref(),
-                ai_harness.get_untracked().key(),
-            ),
-            ai_cli_path: ai_cli_path.get_untracked(),
-            ai_model: ai_model.get_untracked(),
-            ai_effort: ai_effort.get_untracked().cli().to_string(),
-            ai_instructions: ai_instructions.get_untracked(),
-            ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
-            ai_gutter: ai_gutter.get_untracked(),
-            ai_run_queries: legacy_ai_run_queries,
-            ui_theme: ui_theme.get_untracked().key().to_string(),
-            editor_theme: editor_theme.get_untracked().key().to_string(),
-            ui_scale: ui_scale.get_untracked().key().to_string(),
-            editor_font_size: editor_font.get_untracked(),
-            row_limit: row_limit.get_untracked(),
-            statement_timeout_secs: statement_timeout.get_untracked(),
-            confirm_writes: confirm_writes.get_untracked(),
-            tab_width: tab_width.get_untracked(),
-            soft_tabs: soft_tabs.get_untracked(),
-            word_wrap: word_wrap.get_untracked(),
-            restore_tabs: restore_tabs.get_untracked(),
-            live_validate: live_validate.get_untracked(),
-            show_table_sizes: table_sizes.get_untracked(),
-        });
+    let save_ui: Rc<dyn Fn()> = Rc::new({
+        let pending_legacy_hidden = pending_legacy_hidden.clone();
+        move || {
+            persist::save_ui_state(&UiState {
+                expanded: expanded.with_untracked(|s| s.iter().cloned().collect()),
+                // The legacy flat field is written empty **once the migration has
+                // actually read it** — `hidden_db_rules` is the truth after that.
+                // Until then it is carried back out unchanged, so a launch that
+                // could not migrate (no connections loaded) leaves the upgrade to a
+                // later one instead of erasing it.
+                hidden_dbs: (*pending_legacy_hidden).clone(),
+                hidden_db_rules: hidden_db_rules.get_untracked(),
+                schema_visible: schema_visible.get_untracked(),
+                right_panel: right_panel.get_untracked().into(),
+                activity_intervals: activity_intervals.get_untracked(),
+                schema_w: schema_w.get_untracked(),
+                right_w: right_w.get_untracked(),
+                editor_h: editor_h.get_untracked(),
+                // **The unknown key survives the save**, or the field's own promise
+                // — "an unrecognised value is *not* silently replaced with the
+                // default" — is false one save later. Cleared the moment the user
+                // picks a harness themselves, which is the point at which the file
+                // should start naming what is actually running.
+                ai_harness: persist::ai_harness_to_persist(
+                    ai_harness_unknown.get_untracked().as_deref(),
+                    ai_harness.get_untracked().key(),
+                ),
+                ai_cli_path: ai_cli_path.get_untracked(),
+                ai_model: ai_model.get_untracked(),
+                ai_effort: ai_effort.get_untracked().cli().to_string(),
+                ai_instructions: ai_instructions.get_untracked(),
+                ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
+                ai_gutter: ai_gutter.get_untracked(),
+                ai_run_queries: legacy_ai_run_queries,
+                ui_theme: ui_theme.get_untracked().key().to_string(),
+                editor_theme: editor_theme.get_untracked().key().to_string(),
+                ui_scale: ui_scale.get_untracked().key().to_string(),
+                editor_font_size: editor_font.get_untracked(),
+                row_limit: row_limit.get_untracked(),
+                statement_timeout_secs: statement_timeout.get_untracked(),
+                confirm_writes: confirm_writes.get_untracked(),
+                tab_width: tab_width.get_untracked(),
+                soft_tabs: soft_tabs.get_untracked(),
+                word_wrap: word_wrap.get_untracked(),
+                restore_tabs: restore_tabs.get_untracked(),
+                live_validate: live_validate.get_untracked(),
+                show_table_sizes: table_sizes.get_untracked(),
+            });
+        }
     });
 
     // Persist the layout whenever a panel is toggled (the footer chips mutate
@@ -8741,7 +8795,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // …and its saved AI conversation, which would otherwise linger and
             // resurface under whatever connection reuses the id.
             saved_chats.update(|chats| schemaic_core::chat::clear_conn(chats, id));
-            persist::save_json(
+            persist::save_json_erasing(
                 "chats.json",
                 &schemaic_core::chat::ChatFile::of(&saved_chats.get_untracked()),
             );
@@ -8868,9 +8922,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
             // Everything else keyed to this connection goes too. A deleted
             // connection shouldn't be reconstructable from what's left on disk —
-            // its queries, the databases it had, the tables looked at.
+            // its queries, the databases it had, the tables looked at. Which is
+            // also why these two saves are **erasing**: the ordinary one keeps
+            // the pre-deletion generation as `.bak`, and "not reconstructable
+            // from what's left on disk" is exactly the claim that breaks.
             history_entries.update(|v| schemaic_core::history::clear_conn(v, id));
-            persist::save_json(
+            persist::save_json_erasing(
                 "history.json",
                 &schemaic_core::history::HistoryFile {
                     entries: history_entries.get_untracked(),
@@ -8983,7 +9040,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // and a late snapshot must not overwrite the conversation
                     // just restored for the connection switched to.
                     if let Some(id) = ai_session.borrow().as_ref().map(|s| s.conn_id) {
-                        (persist_chat)(id);
+                        (persist_chat)(id, persist::Saving::Replacing);
                     }
                 }
             }
@@ -9288,7 +9345,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // left hanging over the fresh box would attach to a question the
             // user never staged it for.
             ai_attachment.set(None);
-            (persist_chat)(active_conn.get_untracked());
+            // Erasing: the transcript this replaces with nothing would otherwise
+            // sit in `chats.json.bak` until the next finished turn.
+            (persist_chat)(active_conn.get_untracked(), persist::Saving::Erasing);
         })
     };
 

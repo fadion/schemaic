@@ -180,6 +180,61 @@ pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry, dialect: SqlDi
     true
 }
 
+/// Record every statement of one batch at launch — a Run Everything, before any
+/// of them has been dispatched. Returns the number recorded.
+///
+/// **A batch does not get to evict history it did not contribute.** Pushing the
+/// statements one at a time applied the per-connection cap on each, so a
+/// 51-statement script cost the connection all 50 of its real entries *plus*
+/// its own first statement before anything ran — and the batch then stopped at
+/// statement 1, so [`drop_runs`] removed the 50 that never happened and the log
+/// came back **completely empty**, from an ordinary Run Everything, with nothing
+/// asked and nothing said. Neither function could see it alone: `push` knew only
+/// about one statement and `drop_runs` only about the tail.
+///
+/// So the cap is **deferred**. The batch goes in whole and the connection is
+/// trimmed by [`trim`] once the outcomes are known — which is the only moment
+/// anything can tell a statement that ran from one that was never sent. The
+/// overshoot is bounded by capping the batch's own contribution at
+/// [`MAX_PER_CONN`], so a connection holds at most twice that between launch and
+/// verdict; the statements kept under that bound are the **first** ones, because
+/// those are the ones that can already have run.
+pub fn push_batch(
+    entries: &mut Vec<HistoryEntry>,
+    batch: Vec<HistoryEntry>,
+    dialect: SqlDialect,
+) -> usize {
+    let mut wrote = 0usize;
+    for entry in batch.into_iter().take(MAX_PER_CONN) {
+        if entry.sql.trim().is_empty() || sql::carries_credential(&entry.sql, dialect) {
+            continue;
+        }
+        let conn = entry.conn_id;
+        entries.retain(|e| !(e.conn_id == conn && e.sql == entry.sql));
+        entries.insert(0, entry);
+        wrote += 1;
+    }
+    wrote
+}
+
+/// Trim every connection to its newest [`MAX_PER_CONN`] entries. Returns whether
+/// anything went.
+///
+/// The other half of [`push_batch`]'s deferred cap, and the reason it is over
+/// the *whole* store rather than one connection: the caller applying it knows
+/// run ids, not connections, and a cap that is idempotent and total needs
+/// neither.
+pub fn trim(entries: &mut Vec<HistoryEntry>) -> bool {
+    let before = entries.len();
+    let mut kept: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    entries.retain(|e| {
+        let n = kept.entry(e.conn_id).or_insert(0);
+        *n += 1;
+        *n <= MAX_PER_CONN
+    });
+    entries.len() != before
+}
+
 /// Drop the entries for runs that never reached a verdict, by `run_id`. Returns
 /// whether anything went.
 ///
@@ -869,6 +924,114 @@ mod tests {
         assert!(drop_runs(&mut v, &[2, 3]));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].sql, "a");
+    }
+
+    /// **The whole chain, which neither function can see alone: a long script
+    /// that stops early used to empty the connection's log completely.**
+    ///
+    /// Connection 1 has its 50 real entries. Run Everything launches a
+    /// 51-statement migration, which fails at statement 1. The launch pushed all
+    /// 51 — the cap evicted all 50 originals *and* statement 1 — and
+    /// `drop_runs` then removed the 50 undispatched ones. Net: nothing left, no
+    /// prompt, nothing said, on a store the app itself guards with a "This can't
+    /// be undone" confirm. `drop_runs`' own doc describes the eviction half; it
+    /// cannot see that when the script is longer than the cap the statements
+    /// that **did** run were evicted too.
+    #[test]
+    fn a_script_that_stops_early_does_not_empty_the_connections_history() {
+        let mut v = Vec::new();
+        for i in 0..MAX_PER_CONN {
+            push(&mut v, entry(1, &format!("real {i}"), i as u64));
+        }
+        assert_eq!(v.iter().filter(|e| e.conn_id == 1).count(), MAX_PER_CONN);
+
+        // The batch, recorded at launch the way `record_history` does it.
+        let base = 1_000u64;
+        let batch: Vec<HistoryEntry> = (0..=MAX_PER_CONN)
+            .map(|i| entry(1, &format!("s{i}"), base + i as u64))
+            .collect();
+        push_batch(&mut v, batch, SqlDialect::MySql);
+        // Statement 0 ran and failed; every one after it was reported
+        // `Cancelled` without ever being dispatched.
+        let never_ran: Vec<u64> = (1..=MAX_PER_CONN).map(|i| base + i as u64).collect();
+        drop_runs(&mut v, &never_ran);
+        trim(&mut v);
+
+        assert!(
+            v.iter().any(|e| e.sql == "s0"),
+            "the statement that actually ran is gone"
+        );
+        let real = v.iter().filter(|e| e.sql.starts_with("real ")).count();
+        assert_eq!(
+            real,
+            MAX_PER_CONN - 1,
+            "the batch cost the connection more history than it contributed"
+        );
+        assert!(
+            !v.iter().any(|e| e.sql == "s1"),
+            "and no undispatched noise"
+        );
+    }
+
+    /// A batch that runs in full is still capped — the cap is the cap, and the
+    /// newest statements are what a connection's log keeps.
+    #[test]
+    fn a_script_that_runs_in_full_still_trims_to_the_cap() {
+        let mut v = Vec::new();
+        for i in 0..MAX_PER_CONN {
+            push(&mut v, entry(1, &format!("real {i}"), i as u64));
+        }
+        let batch: Vec<HistoryEntry> = (0..10)
+            .map(|i| entry(1, &format!("s{i}"), 1_000 + i))
+            .collect();
+        push_batch(&mut v, batch, SqlDialect::MySql);
+        trim(&mut v);
+        assert_eq!(v.iter().filter(|e| e.conn_id == 1).count(), MAX_PER_CONN);
+        for i in 0..10 {
+            assert!(v.iter().any(|e| e.sql == format!("s{i}")), "s{i}");
+        }
+    }
+
+    /// `trim` is the cap over the whole store, and it is per connection: one
+    /// connection's long script must not touch another's log.
+    #[test]
+    fn trim_caps_each_connection_on_its_own() {
+        let mut v = Vec::new();
+        // Two batches, because one is capped at `MAX_PER_CONN` on its own — the
+        // overshoot `trim` exists for is what a *second* launch adds on top.
+        let half = MAX_PER_CONN - 20;
+        let first: Vec<HistoryEntry> = (0..half)
+            .map(|i| entry(1, &format!("s{i}"), i as u64))
+            .collect();
+        let second: Vec<HistoryEntry> = (half..(MAX_PER_CONN + 10))
+            .map(|i| entry(1, &format!("s{i}"), i as u64))
+            .collect();
+        push_batch(&mut v, first, SqlDialect::MySql);
+        push_batch(&mut v, second, SqlDialect::MySql);
+        push(&mut v, entry(2, "other", 9_999));
+        assert!(trim(&mut v));
+        assert_eq!(v.iter().filter(|e| e.conn_id == 1).count(), MAX_PER_CONN);
+        assert_eq!(v.iter().filter(|e| e.conn_id == 2).count(), 1);
+        // Newest kept, oldest dropped — the same rule `push` applies.
+        assert!(v.iter().any(|e| e.sql == format!("s{}", MAX_PER_CONN + 9)));
+        assert!(!v.iter().any(|e| e.sql == "s0"));
+        assert!(!trim(&mut v), "idempotent");
+    }
+
+    /// The batch is bounded too, or a 10,000-statement migration would hold ten
+    /// thousand entries until its verdicts landed. The **first** statements are
+    /// what survives that bound: they are the ones that can already have run.
+    #[test]
+    fn a_batch_longer_than_the_cap_keeps_the_statements_that_run_first() {
+        let mut v = Vec::new();
+        let batch: Vec<HistoryEntry> = (0..(MAX_PER_CONN * 3))
+            .map(|i| entry(1, &format!("s{i}"), i as u64))
+            .collect();
+        push_batch(&mut v, batch, SqlDialect::MySql);
+        assert_eq!(v.len(), MAX_PER_CONN);
+        assert!(v.iter().any(|e| e.sql == "s0"));
+        assert!(v.iter().any(|e| e.sql == format!("s{}", MAX_PER_CONN - 1)));
+        assert!(!v.iter().any(|e| e.sql == format!("s{}", MAX_PER_CONN)));
     }
 
     #[test]
