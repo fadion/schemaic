@@ -1995,6 +1995,58 @@ impl<R: std::io::Read> Iterator for RowIter<R> {
 /// server round-trips, which is minutes on a remote host.
 pub const INSERT_BATCH_ROWS: usize = 500;
 
+/// And a **byte** ceiling, which a row count alone cannot stand in for.
+///
+/// 500 rows of a 40 KiB text column — routine for an article, a log line, a JSON
+/// payload, a base64 blob — is a 20 MB statement. Measured against MariaDB
+/// 10.11.14 at its ship default `max_allowed_packet` of 16 MiB, the server does
+/// not refuse it: it answers `ERROR 2006 (HY000) Server has gone away` and
+/// **closes the connection**. `import_on`'s error arm then tries to `ROLLBACK`
+/// down a socket that is already gone, so the result is `Rollback::Incomplete` —
+/// the "the rows may still be there" wording, produced rather than merely
+/// disclosed — and on a non-transactional MySQL table the batches already sent
+/// really are durable. All of it lands *after* `validate` has reported the file
+/// clean, because row size is not something it could have checked.
+///
+/// It is engine-divergent, which is why the row bound survived: the same 20 MB
+/// batch is accepted by MySQL 8.4.11, whose default is 64 MiB. The identical
+/// file imports on MySQL 8 and kills the connection on MariaDB 10.11.
+///
+/// Same value and same reasoning as the inverse path's
+/// [`crate::export::INSERT_BATCH_BYTES`], which had this argument written down
+/// and this constant while import had neither: 512 KiB is the smallest bound
+/// that makes the round-trip cost disappear and stays well inside every engine's
+/// limit. A batch is closed **before** the row that would cross it, so one
+/// enormous row still gets a statement of its own rather than being split into
+/// something that would not parse.
+pub const INSERT_BATCH_BYTES: usize = crate::export::INSERT_BATCH_BYTES;
+
+/// A row's contribution to [`INSERT_BATCH_BYTES`], estimated from the values
+/// rather than from the rendered SQL.
+///
+/// The batch is assembled before anything is rendered, so this is what there is
+/// to measure. It counts a string's own bytes plus a fixed allowance per value
+/// for the quotes, the comma and the worst case of escaping — an estimate that
+/// errs *high*, which is the direction that keeps the statement under the
+/// server's limit rather than the one that discovers it.
+pub fn row_bytes(row: &[crate::model::Value]) -> usize {
+    row.iter()
+        .map(|v| match v {
+            crate::model::Value::Str(s) => s.len() * 2 + 8,
+            _ => 24,
+        })
+        .sum()
+}
+
+/// Is this batch full — by either bound?
+///
+/// `bytes` is what the rows already in it come to, and `next` the one about to
+/// be added; the batch closes before a row that would cross the byte ceiling, so
+/// a single row larger than the whole ceiling still goes on its own.
+pub fn batch_is_full(rows: usize, bytes: usize, next: usize) -> bool {
+    rows >= INSERT_BATCH_ROWS || (rows > 0 && bytes + next > INSERT_BATCH_BYTES)
+}
+
 /// One multi-row `INSERT` for `rows`, in the connection's dialect. `None` when
 /// there's nothing to insert.
 ///
@@ -2041,6 +2093,59 @@ mod tests {
     #[test]
     fn only_the_newest_probe_may_write() {
         assert_eq!(probe_verdict((1, 3), (1, 3)), ProbeVerdict::Apply);
+    }
+
+    /// **500 rows is not a bound on a statement.** A 40 KiB text column — an
+    /// article, a log line, a JSON payload — makes 500 of them a 20 MB
+    /// `INSERT`, and MariaDB 10.11.14 at its ship default `max_allowed_packet`
+    /// answers `ERROR 2006` by closing the connection, which is the one channel
+    /// the rollback needs. Measured; MySQL 8.4.11 accepts the same statement, so
+    /// the identical file imports on one engine and kills the other.
+    #[test]
+    fn a_batch_of_long_rows_closes_on_bytes_rather_than_on_the_row_count() {
+        let long = crate::model::Value::Str("x".repeat(40 * 1024));
+        let row = [long];
+        // The shape of the failure: at 500 rows this is far past every engine's
+        // conservative limit, and the row bound alone would have taken all 500.
+        assert!(row_bytes(&row) * INSERT_BATCH_ROWS > 16 * 1024 * 1024);
+
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        let each = row_bytes(&row);
+        while !batch_is_full(rows, bytes, each) {
+            rows += 1;
+            bytes += each;
+        }
+        assert!(rows < INSERT_BATCH_ROWS, "closed on bytes, at {rows} rows");
+        assert!(bytes <= INSERT_BATCH_BYTES, "and inside the ceiling");
+    }
+
+    /// Narrow rows must still fill a batch to the row bound, or the round trips
+    /// the batching exists to remove come back.
+    #[test]
+    fn a_batch_of_narrow_rows_still_closes_on_the_row_count() {
+        let row = [crate::model::Value::Int(1), crate::model::Value::Null];
+        let each = row_bytes(&row);
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        while !batch_is_full(rows, bytes, each) {
+            rows += 1;
+            bytes += each;
+        }
+        assert_eq!(rows, INSERT_BATCH_ROWS);
+    }
+
+    /// One row larger than the whole ceiling gets a statement of its own rather
+    /// than an empty batch or a split that would not parse — the same rule the
+    /// export side states.
+    #[test]
+    fn a_single_oversized_row_is_not_split_and_does_not_stall() {
+        let huge = row_bytes(&[crate::model::Value::Str("x".repeat(INSERT_BATCH_BYTES * 4))]);
+        assert!(
+            !batch_is_full(0, 0, huge),
+            "an empty batch always takes one"
+        );
+        assert!(batch_is_full(1, huge, huge), "and closes right after it");
     }
 
     /// Typing `\t` into the Delimiter box is three edits and so three probes,

@@ -3373,10 +3373,15 @@ async fn import_on(
         .map_err(|e| db_err(&e))?;
 
     let mut total: u64 = 0;
+    // The row the byte ceiling held back from the previous batch — see
+    // `crate::next_batch`. It lives here so it cannot be lost between two of
+    // them. PostgreSQL has no statement-length limit of its own, but the batch
+    // shape is one decision and is taken in one place.
+    let mut held: Option<Vec<schemaic_core::model::Value>> = None;
     loop {
         // Postgres leaves the transaction aborted after any error, so every exit
         // path below rolls back explicitly rather than relying on the drop.
-        let batch = match crate::next_batch_off_executor(rows) {
+        let batch = match crate::next_batch_off_executor(rows, &mut held) {
             Ok(Some(b)) => b,
             Ok(None) => break,
             Err(e) => {

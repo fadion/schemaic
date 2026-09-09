@@ -4867,24 +4867,52 @@ fn order_by_clause(cols: Option<&[String]>, quote: fn(&str) -> String) -> String
 /// and the `--mcp-serve` mode builds one, so the flavour is checked rather than
 /// assumed — the MCP server has no import path today, and this stays correct if
 /// it ever gets one.
-fn next_batch_off_executor(rows: RowSource<'_>) -> Result<Option<Vec<Vec<Value>>>, DbError> {
+fn next_batch_off_executor(
+    rows: RowSource<'_>,
+    held: &mut Option<Vec<Value>>,
+) -> Result<Option<Vec<Vec<Value>>>, DbError> {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| next_batch(rows)),
-        _ => next_batch(rows),
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| next_batch(rows, held)),
+        _ => next_batch(rows, held),
     }
 }
 
 /// Pull the next batch of rows from the source. `Ok(None)` at the end.
-fn next_batch(rows: RowSource<'_>) -> Result<Option<Vec<Vec<Value>>>, DbError> {
+///
+/// **Bounded in bytes as well as rows** ([`schemaic_core::import::batch_is_full`]).
+/// A row count alone let 500 rows of a 40 KiB text column build a 20 MB
+/// statement, and MariaDB at its default `max_allowed_packet` answers that by
+/// closing the connection — taking with it the `ROLLBACK` the caller's error arm
+/// needs. The row that would cross the ceiling is **held back**, never split.
+///
+/// `held` is where it waits. The source is a bare `dyn Iterator`, so a row once
+/// pulled cannot be put back on it; the caller owns the slot and passes it to
+/// every call, which is also what makes a held row impossible to drop between
+/// batches.
+fn next_batch(
+    rows: RowSource<'_>,
+    held: &mut Option<Vec<Value>>,
+) -> Result<Option<Vec<Vec<Value>>>, DbError> {
     let mut batch = Vec::with_capacity(schemaic_core::import::INSERT_BATCH_ROWS);
+    let mut bytes = 0usize;
     // `next()` in a loop rather than `by_ref().take(..)`: `by_ref` isn't callable
     // on a `dyn Iterator`, and the source has to stay borrowed for the next batch.
-    while batch.len() < schemaic_core::import::INSERT_BATCH_ROWS {
-        match rows.next() {
-            Some(row) => batch.push(row.map_err(DbError::Query)?),
-            None => break,
+    loop {
+        let row = match held.take() {
+            Some(row) => row,
+            None => match rows.next() {
+                Some(row) => row.map_err(DbError::Query)?,
+                None => break,
+            },
+        };
+        let size = schemaic_core::import::row_bytes(&row);
+        if schemaic_core::import::batch_is_full(batch.len(), bytes, size) {
+            *held = Some(row);
+            break;
         }
+        bytes += size;
+        batch.push(row);
     }
     Ok(if batch.is_empty() { None } else { Some(batch) })
 }
@@ -4901,11 +4929,14 @@ async fn import_on(
     conn.query_drop("BEGIN").await.map_err(qerr)?;
 
     let mut total: u64 = 0;
+    // The row the byte ceiling held back from the previous batch — see
+    // `next_batch`. It lives here so it cannot be lost between two of them.
+    let mut held: Option<Vec<Value>> = None;
     loop {
         // A reader error (a bad record, a value that wouldn't coerce) has to undo
         // the transaction too — returning straight out would leave it open until
         // the connection drops, which is a lock held for no reason.
-        let batch = match next_batch_off_executor(rows) {
+        let batch = match next_batch_off_executor(rows, &mut held) {
             Ok(Some(b)) => b,
             Ok(None) => break,
             Err(e) => {
