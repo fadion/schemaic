@@ -9542,8 +9542,11 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
             recreate,
             // Only a re-create drops anything, so only a re-create has anything
             // to put back. `dependent_ddl` is the server's own text for the
-            // objects that go down with this one — on SQLite, the view's
-            // `INSTEAD OF` triggers.
+            // objects that go down with this one: the view's `INSTEAD OF`
+            // triggers, on **both** the engines that have them. It was SQLite's
+            // alone until PostgreSQL was found losing them the same way — a
+            // narrowed view there takes the drop-and-create arm, and `DROP VIEW`
+            // takes every trigger on it.
             replay: if recreate {
                 current.dependent_ddl.clone()
             } else {

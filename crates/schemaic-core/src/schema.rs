@@ -1655,10 +1655,12 @@ impl TriggerInfo {
     /// reconstructs its own chain, and a trigger created alone into an empty
     /// group is its leader whatever it says.
     ///
-    /// `exists` is the caller's, because only the caller knows what "yet" means:
-    /// [`TriggerInfo::create_set_sql`] asks whether the name comes earlier in
-    /// the same set, and [`crate::compare::SchemaComparison`] asks whether the
-    /// other database already holds it.
+    /// `exists` is the caller's, because only the caller knows what "yet"
+    /// means. [`TriggerInfo::create_set_sql`] is the one that asks it today:
+    /// whether the name comes earlier in the same set. A comparison between two
+    /// databases would ask whether the other one already holds it — the reason
+    /// the predicate is a parameter and not a field — but nothing does yet, and
+    /// this said `crate::compare::SchemaComparison` did.
     ///
     /// Borrows when there is nothing to take off, which is every trigger on the
     /// other two engines — neither has the clause.

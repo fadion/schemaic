@@ -97,7 +97,11 @@ pub async fn a_pg_redefinition_keeps_a_functions_planner_attributes(target: &'st
     let sql = edited.create_sql(SqlDialect::Postgres, true);
     scratch
         .db
-        .run_ddl(&scratch.database, std::slice::from_ref(&sql), CancellationToken::new())
+        .run_ddl(
+            &scratch.database,
+            std::slice::from_ref(&sql),
+            CancellationToken::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("{}: the redefinition was refused: {e}\n{sql}", target.name));
 

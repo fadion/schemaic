@@ -8095,9 +8095,6 @@ fn selected_data_rows(gs: GridState, pos: usize) -> Vec<usize> {
     schemaic_core::edit::selected_data_rows(&order, selection, pos)
 }
 
-/// Mark (or unmark) every row in `idxs` for deletion, touching only the ones
-/// that would change — `toggle_delete` on a mixed selection would flip half of
-/// it the wrong way.
 /// Mark or unmark `rows` in `set`, in one pass.
 ///
 /// The set operation on its own, so the signal write around it is one write.
