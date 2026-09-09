@@ -565,6 +565,67 @@ fn gate1<A: Clone + 'static>(gate: &ConnGate, action: &Rc<dyn Fn(A)>) -> Rc<dyn 
     })
 }
 
+/// [`gate1`], **pinned to the tab it was started from**.
+///
+/// The gate can hold an action for up to five seconds — `PING_TIMEOUT`, spent
+/// on a health re-check when the connection is `Disconnected` — and every run
+/// action re-resolves its target when it lands: `run_query_core`'s first line is
+/// `let id = active.get_untracked();`, and `run_all` and `run_plan` do the same.
+/// Nothing is on screen during those seconds: the guard bar has just been taken
+/// down and no panel has been opened, so clicking another tab is the natural
+/// response to a Run that appears to have done nothing.
+///
+/// **What was judged is then not what runs.** The write guard's verdict is built
+/// from the active tab at press time — `guard_policy` reads its connection, its
+/// `read_only`, its dialect and whether it has a database — so a `DELETE`
+/// confirmed against a tab bound to `staging` executed against a tab bound to
+/// `production`, reported into its panel and was recorded in history under its
+/// name. And the `no_database` term is per-tab, so a `CREATE TABLE` judged
+/// `Allow` for a database-bound tab could run on a database-less one, past the
+/// `Block("No database selected.")` arm — on PostgreSQL, into the hidden
+/// maintenance database `needs_database`'s own doc says *"nothing in Schemaic
+/// can reach again"*.
+///
+/// This is the *refusal* half of the fix, not the retarget half: the run is
+/// dropped with a message rather than aimed at whatever tab is now in front. The
+/// stronger shape is a `run_on(tab_id, …)` the whole pipeline takes instead of
+/// re-reading `active` — the tab id is already what `tokens`, `begin_run` and
+/// `session_for` are keyed on — and it is deliberately not what this does: it
+/// threads through four entry points in a file no test in this workspace can
+/// drive, and a refusal is *strictly stronger* than a wrong target, which is the
+/// direction the write-guard invariant requires.
+///
+/// The same hazard is already guarded this way 2,400 lines away, in
+/// `commit_edits`' completion: *"`run` targets the active tab, so refreshing
+/// after the user switched away would run this tab's SQL against a different
+/// tab"*.
+///
+/// **Only the tab-bound actions take this.** `add_tab` makes a tab rather than
+/// using one and `ai_send` is bound to the connection, so pinning either would
+/// refuse a gesture that is still correct.
+fn gate1_on_tab<A: Clone + 'static>(
+    gate: &ConnGate,
+    action: &Rc<dyn Fn(A)>,
+    active: RwSignal<usize>,
+    moved_on: &Rc<dyn Fn()>,
+) -> Rc<dyn Fn(A)> {
+    let gate = gate.clone();
+    let action = action.clone();
+    let moved_on = moved_on.clone();
+    Rc::new(move |arg: A| {
+        let started_on = active.get_untracked();
+        let action = action.clone();
+        let moved_on = moved_on.clone();
+        (gate)(Rc::new(move || {
+            if active.get_untracked() != started_on {
+                (moved_on)();
+                return;
+            }
+            action(arg.clone())
+        }));
+    })
+}
+
 fn mark_stopped(messages: RwSignal<Vec<ChatMessage>>) {
     messages.update(|v| {
         if let Some(last) = v.last_mut() {
@@ -6893,10 +6954,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             no_database,
         }
     };
+    // Said when a deferred run lands on a tab the user has since left. It is a
+    // refusal, so it has to be visible: the alternative — running anyway — is
+    // the defect, and running *nothing* silently is how the defect went
+    // unnoticed for as long as it did.
+    let run_moved_on: Rc<dyn Fn()> = Rc::new(move || {
+        error_modal_text.set(Some(
+            "You switched tabs while the connection was being re-checked, so the \
+             statement was not run. It was checked against the tab it was typed \
+             in, and running it here would run it somewhere else. Go back to that \
+             tab and run it again."
+                .to_string(),
+        ));
+        error_modal_open.set(true);
+    });
     // The connection-gated but *unguarded* pair. Only the two wrappers below and
     // "Run anyway" reach them; nothing outside this crate can.
-    let gated_run = gate1(&with_conn, &run);
-    let gated_run_all = gate1(&with_conn, &run_all);
+    //
+    // **Pinned to the tab**, because the gate can hold them for five seconds and
+    // they re-resolve `active` when they land — see `gate1_on_tab`.
+    let gated_run = gate1_on_tab(&with_conn, &run, active, &run_moved_on);
+    let gated_run_all = gate1_on_tab(&with_conn, &run_all, active, &run_moved_on);
 
     // The active tab's parameter values, for the substitution that precedes the
     // guard. Untracked: this reads at the moment of a run, not reactively.
@@ -10410,11 +10488,24 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             set_active_db,
             open_db_cli,
             run_plan: {
+                // Pinned to the tab for the reason `gate1_on_tab` gives:
+                // `run_plan` re-resolves `active` when it lands, and the gate can
+                // hold it for five seconds. Two arguments rather than one, so it
+                // spells the wrapper out instead of taking it.
                 let g = with_conn.clone();
                 let f = run_plan.clone();
+                let moved_on = run_moved_on.clone();
                 Rc::new(move |sql: String, analyze: bool| {
+                    let started_on = active.get_untracked();
                     let f = f.clone();
-                    (g)(Rc::new(move || f(sql.clone(), analyze)))
+                    let moved_on = moved_on.clone();
+                    (g)(Rc::new(move || {
+                        if active.get_untracked() != started_on {
+                            (moved_on)();
+                            return;
+                        }
+                        f(sql.clone(), analyze)
+                    }))
                 })
             },
             validate_stmt,
@@ -11349,14 +11440,123 @@ fn open_url(url: &str) {
 
 #[cfg(test)]
 mod app_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::{
-        CliLauncher, RunTimeout, inline_outcome, mysql_shell_config, psql_database,
-        psql_shell_config, resolve_native_cli, sqlite_shell_config, timeout_message, tx_engine,
-        unique_name,
+        Action, CliLauncher, ConnGate, RunTimeout, gate1, gate1_on_tab, inline_outcome,
+        mysql_shell_config, psql_database, psql_shell_config, resolve_native_cli,
+        sqlite_shell_config, timeout_message, tx_engine, unique_name,
     };
+    use floem::prelude::{SignalGet, SignalUpdate};
+    use floem::reactive::RwSignal;
     use schemaic_core::connection::Connection;
     use schemaic_ui::InlineAiState;
     use tokio_util::sync::CancellationToken;
+
+    /// A gate that behaves like `with_conn` on a **down** connection: it holds
+    /// the action instead of running it, and the caller decides when it lands.
+    /// That five-second hold is the whole window this is about.
+    fn deferring_gate() -> (ConnGate, Rc<RefCell<Option<Action>>>) {
+        let held: Rc<RefCell<Option<Action>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let gate: ConnGate = Rc::new(move |a: Action| *slot.borrow_mut() = Some(a));
+        (gate, held)
+    }
+
+    /// **The write guard judges the active tab at press time; the run resolves
+    /// it again when it lands, and up to five seconds pass in between.**
+    ///
+    /// `with_conn` spends `PING_TIMEOUT` re-checking a `Disconnected`
+    /// connection, and nothing is on screen while it does: the guard bar has
+    /// just been taken down and no panel has been opened, so clicking another
+    /// tab is the natural response to a Run that appears to have done nothing.
+    /// `run_query_core`'s first line is `let id = active.get_untracked();`, so a
+    /// `DELETE` confirmed against a tab bound to `staging` ran against a tab
+    /// bound to `production` — reported into its panel, recorded in its history.
+    ///
+    /// The refusal is the fix, not a re-target: what was judged is no longer
+    /// what would run, and a refusal is *strictly stronger*, which is the
+    /// direction the write-guard invariant requires.
+    #[test]
+    fn a_deferred_run_does_not_land_on_a_tab_the_user_switched_to() {
+        let active = RwSignal::new(7usize);
+        let ran: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let refused = RwSignal::new(0usize);
+
+        let sink = ran.clone();
+        let action: Rc<dyn Fn(String)> = Rc::new(move |sql: String| sink.borrow_mut().push(sql));
+        let moved_on: Rc<dyn Fn()> = Rc::new(move || refused.update(|n| *n += 1));
+
+        let (gate, held) = deferring_gate();
+        let gated = gate1_on_tab(&gate, &action, active, &moved_on);
+
+        // Pressed on tab 7, held by the gate…
+        gated("DELETE FROM sessions".to_string());
+        assert!(ran.borrow().is_empty(), "the gate is holding it");
+        // …the user switches to tab 9, and *then* the health check answers.
+        active.set(9);
+        (held.borrow_mut().take().expect("the gate held it"))();
+
+        assert!(
+            ran.borrow().is_empty(),
+            "the statement ran on a tab it was never judged against: {:?}",
+            ran.borrow()
+        );
+        assert_eq!(refused.get_untracked(), 1, "and the user was told why");
+    }
+
+    /// And the ordinary case is untouched: the tab the run was started on is
+    /// still the active one when the check answers, so it runs. Without this the
+    /// gate could pass by refusing everything.
+    #[test]
+    fn a_deferred_run_still_lands_on_the_tab_it_was_started_from() {
+        let active = RwSignal::new(7usize);
+        let ran: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let refused = RwSignal::new(0usize);
+
+        let sink = ran.clone();
+        let action: Rc<dyn Fn(String)> = Rc::new(move |sql: String| sink.borrow_mut().push(sql));
+        let moved_on: Rc<dyn Fn()> = Rc::new(move || refused.update(|n| *n += 1));
+
+        let (gate, held) = deferring_gate();
+        let gated = gate1_on_tab(&gate, &action, active, &moved_on);
+        gated("DELETE FROM sessions".to_string());
+        // The user goes away and comes back, which is not a change.
+        active.set(9);
+        active.set(7);
+        (held.borrow_mut().take().expect("the gate held it"))();
+
+        assert_eq!(ran.borrow().as_slice(), ["DELETE FROM sessions"]);
+        assert_eq!(refused.get_untracked(), 0);
+    }
+
+    /// **The seam, and the reason the pinned wrapper is a different function.**
+    /// `gate1` is what the tab-bound runs used, and it carries the *argument*
+    /// into the deferred closure and nothing else — no tab, no connection, no
+    /// generation. Fed the same sequence, it runs the statement on tab 9. That
+    /// is the defect, asserted rather than described, and it is also why
+    /// `add_tab` and `ai_send` keep `gate1`: neither is bound to a tab, and
+    /// pinning them would refuse a gesture that is still correct.
+    #[test]
+    fn the_unpinned_gate_is_the_one_that_retargets() {
+        let active = RwSignal::new(7usize);
+        let ran: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = ran.clone();
+        let action: Rc<dyn Fn(String)> = Rc::new(move |sql: String| sink.borrow_mut().push(sql));
+
+        let (gate, held) = deferring_gate();
+        let gated = gate1(&gate, &action);
+        gated("DELETE FROM sessions".to_string());
+        active.set(9);
+        (held.borrow_mut().take().expect("the gate held it"))();
+
+        assert_eq!(
+            ran.borrow().len(),
+            1,
+            "gate1 runs whatever it was handed, wherever the user now is"
+        );
+    }
 
     /// **The pill and the session read one mapping.** These are the two halves of
     /// one tab's transaction decision — this crate's answer drives the footer pill
