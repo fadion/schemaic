@@ -2147,12 +2147,62 @@ pub(crate) const HISTORY_MSG_CHARS: usize = 600;
 /// nothing to replay. Prose only — tool calls and their results are left out, so
 /// the assistant re-runs whatever it actually needs rather than trusting a stale
 /// result.
-pub(crate) fn render_history(messages: &[ChatMessage], max_turns: usize) -> String {
+///
+/// **Prose is not safe merely because it is not a tool result.** At
+/// [`AiData::Full`] the assistant answers "show me the first five customers" by
+/// writing those rows into its reply, so a replayed turn carries data the tool
+/// gate would have refused — and a replay happens on exactly the two gestures
+/// that change who or what is allowed to see it:
+///
+/// - **The level was lowered.** `needs_respawn` fires on `prev.data != now.data`,
+///   so setting the connection to `SchemaOnly` and asking anything re-sent those
+///   rows, under a `tools_line` that reads *"This connection sends no data at
+///   all"*. `data` is the level the *new* session runs at, and below
+///   [`AiData::may_attach`] there is no route by which prose this connection
+///   produced may re-enter a prompt.
+/// - **The vendor changed.** `needs_respawn` fires on `prev.harness !=
+///   now.harness` too, so switching Claude → Codex shipped Claude's answers,
+///   rows included, to OpenAI with no gesture from the user that any data should
+///   cross. Each message is stamped with the harness that produced it
+///   ([`ChatMessage::harness`]), so a turn from another one is left out.
+///
+/// The attachment beside this in `main.rs` is already re-gated at send time on
+/// `may_attach`, under a comment stating the principle — *"Rows are staged
+/// against the connection they came from, and the user can switch connections
+/// before sending"*. This is the same principle, on the section that can carry
+/// the same rows.
+///
+/// **Withheld out loud**, for the reason the schema section is: a follow-up like
+/// "and the other one?" stops resolving either way, and a model told why can say
+/// so instead of inventing an antecedent.
+pub(crate) fn render_history(
+    messages: &[ChatMessage],
+    max_turns: usize,
+    data: AiData,
+    harness: &str,
+) -> String {
     let start = messages.len().saturating_sub(max_turns);
+    let withheld =
+        |why: &str| format!("Earlier turns of this conversation are not being replayed: {why}\n");
+    if !data.may_attach() && messages[start..].iter().any(|m| !m.prose().is_empty()) {
+        return withheld(
+            "this connection's AI data access is set to send no rows, and an \
+             earlier answer may quote some. Ask the user for anything you need \
+             from them.",
+        );
+    }
     let mut lines = String::new();
+    let mut dropped_vendor = false;
     for m in &messages[start..] {
         let prose = m.prose();
         if prose.is_empty() {
+            continue;
+        }
+        // A turn another CLI produced. `None` is a transcript written before the
+        // field existed and is replayed as this session's own, which is the
+        // reading `speaker_label` already takes of it.
+        if m.role != Role::User && m.harness.as_deref().is_some_and(|h| h != harness) {
+            dropped_vendor = true;
             continue;
         }
         let who = match m.role {
@@ -2169,12 +2219,20 @@ pub(crate) fn render_history(messages: &[ChatMessage], max_turns: usize) -> Stri
         };
         lines.push_str(&format!("{who}: {prose}\n"));
     }
+    let note = if dropped_vendor {
+        withheld(
+            "the answers in them came from a different agent CLI, and were not \
+             sent to this one.",
+        )
+    } else {
+        String::new()
+    };
     if lines.is_empty() {
-        return String::new();
+        return note;
     }
     format!(
-        "Earlier in this conversation (restored from a previous session — you did not \
-         see these turns, and any data in them may be stale):\n{lines}"
+        "{note}Earlier in this conversation (restored from a previous session — you \
+         did not see these turns, and any data in them may be stale):\n{lines}"
     )
 }
 
@@ -2197,6 +2255,7 @@ pub(crate) fn ai_context(
     fallback_db: Option<&str>,
     history: &[ChatMessage],
     instructions: &str,
+    harness: &str,
 ) -> String {
     // Name, engine *and* data-access level come from the same lookup: the
     // assistant is told which dialect to write for and what it may read, and
@@ -2222,7 +2281,7 @@ pub(crate) fn ai_context(
         &turn_context(p, fallback_db),
         p.scope,
         data,
-        &render_history(history, HISTORY_TURNS),
+        &render_history(history, HISTORY_TURNS, data, harness),
         instructions,
         dialect,
     )
@@ -3711,6 +3770,102 @@ mod tests {
         assert!(!block.contains("SELECTION"), "{block}");
     }
 
+    /// A message from a named harness, for the replay gates below.
+    fn from_harness(prose: &str, harness: &str) -> ChatMessage {
+        ChatMessage {
+            harness: Some(harness.to_string()),
+            ..msg(Role::Assistant, prose)
+        }
+    }
+
+    /// **Prose is not safe merely because it is not a tool result.** At `Full`
+    /// the assistant answers "show me the first five customers" by writing those
+    /// rows into its reply — so lowering the connection to `SchemaOnly` and
+    /// asking anything re-sent them, under a tools line that reads *"This
+    /// connection sends no data at all"*. `needs_respawn` fires on exactly that
+    /// change, which is what makes the replay happen at the moment it must not.
+    ///
+    /// Through `render_ai_context`, not `render_history` alone: the composition
+    /// is where this sits, and a history section that is empty on its own but
+    /// spliced in below every gate is the shape of the bug.
+    #[test]
+    fn a_lowered_level_does_not_replay_the_rows_it_used_to_allow() {
+        let cx = ctx_of(&[], Some("shop"), "", SchemaScope::None);
+        let history = [
+            msg(Role::User, "show me the first five customers"),
+            msg(Role::Assistant, "ada@example.test, grace@example.test"),
+        ];
+        let at = |data| {
+            render_ai_context(
+                "Local",
+                &cx,
+                SchemaScope::None,
+                data,
+                &render_history(&history, 10, data, "claude"),
+                "",
+                SqlDialect::MySql,
+            )
+        };
+        let out = at(AiData::SchemaOnly);
+        assert!(!out.contains("ada@example.test"), "{out}");
+        // Said out loud, so a follow-up that stops resolving has a reason the
+        // assistant can give.
+        assert!(out.contains("not being replayed"), "{out}");
+
+        // The premise, and the level that is allowed to: `OnRequest` and `Full`
+        // both still carry it, since the user is looking at those turns on
+        // screen and asked the follow-up themselves.
+        for data in [AiData::OnRequest, AiData::Full] {
+            assert!(at(data).contains("ada@example.test"), "{data:?}");
+        }
+    }
+
+    /// The second gesture that respawns a session is switching the agent CLI,
+    /// and it sends the transcript to a **different vendor**. Claude's answers —
+    /// rows included — went to OpenAI with no gesture from the user that any
+    /// data should cross.
+    #[test]
+    fn a_turn_from_another_cli_is_not_shipped_to_this_one() {
+        let cx = ctx_of(&[], Some("shop"), "", SchemaScope::None);
+        let history = [
+            msg(Role::User, "show me the first five customers"),
+            from_harness("ada@example.test", "claude"),
+        ];
+        let to = |harness| {
+            render_ai_context(
+                "Local",
+                &cx,
+                SchemaScope::None,
+                AiData::Full,
+                &render_history(&history, 10, AiData::Full, harness),
+                "",
+                SqlDialect::MySql,
+            )
+        };
+        let out = to("codex");
+        assert!(!out.contains("ada@example.test"), "{out}");
+        assert!(out.contains("different agent CLI"), "{out}");
+        // The user's own turn is theirs and is still replayed, so a follow-up
+        // has something to hang on.
+        assert!(out.contains("show me the first five customers"), "{out}");
+        // And back to the CLI that wrote it, nothing is withheld.
+        assert!(to("claude").contains("ada@example.test"));
+    }
+
+    /// A transcript written before the harness stamp existed replays as this
+    /// session's own — the same reading `speaker_label` takes of `None`, and the
+    /// alternative is silently emptying every restored conversation.
+    #[test]
+    fn an_unstamped_turn_is_replayed_rather_than_guessed_at() {
+        let out = render_history(
+            &[msg(Role::Assistant, "an older answer")],
+            10,
+            AiData::Full,
+            "codex",
+        );
+        assert!(out.contains("an older answer"), "{out}");
+    }
+
     /// The tools line is what the assistant believes it can do. Promising
     /// `run_query` on a connection whose session never got the tool produces an
     /// assistant that keeps trying and apologising; withholding the reason
@@ -4052,7 +4207,7 @@ mod tests {
 
     #[test]
     fn history_replay_is_empty_for_a_fresh_conversation() {
-        assert_eq!(render_history(&[], 10), "");
+        assert_eq!(render_history(&[], 10, AiData::Full, "claude"), "");
     }
 
     #[test]
@@ -4061,7 +4216,7 @@ mod tests {
             msg(Role::User, "how many orders?"),
             msg(Role::Assistant, "1,204"),
         ];
-        let out = render_history(&msgs, 10);
+        let out = render_history(&msgs, 10, AiData::Full, "claude");
         assert!(out.contains("User: how many orders?"));
         assert!(out.contains("Assistant: 1,204"));
         // The model is told these turns aren't in its own context.
@@ -4071,7 +4226,7 @@ mod tests {
     #[test]
     fn history_replay_keeps_only_the_most_recent_turns() {
         let msgs: Vec<ChatMessage> = (0..10).map(|i| msg(Role::User, &format!("q{i}"))).collect();
-        let out = render_history(&msgs, 3);
+        let out = render_history(&msgs, 3, AiData::Full, "claude");
         assert!(out.contains("q7") && out.contains("q9"));
         assert!(!out.contains("q6"));
     }
@@ -4079,7 +4234,7 @@ mod tests {
     #[test]
     fn history_replay_truncates_a_long_message() {
         let long = "x".repeat(HISTORY_MSG_CHARS + 200);
-        let out = render_history(&[msg(Role::Assistant, &long)], 10);
+        let out = render_history(&[msg(Role::Assistant, &long)], 10, AiData::Full, "claude");
         assert!(out.contains(&format!("{}…", "x".repeat(HISTORY_MSG_CHARS))));
         assert!(!out.contains(&"x".repeat(HISTORY_MSG_CHARS + 1)));
     }
@@ -4095,7 +4250,12 @@ mod tests {
             result: None,
             is_error: false,
         })];
-        let out = render_history(&[msg(Role::User, "hi"), tool_only], 10);
+        let out = render_history(
+            &[msg(Role::User, "hi"), tool_only],
+            10,
+            AiData::Full,
+            "claude",
+        );
         assert!(out.contains("User: hi"));
         assert!(!out.contains("Assistant:"));
     }

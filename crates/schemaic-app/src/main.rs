@@ -9192,11 +9192,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // Whatever is on screen predates this session — a restored
                 // conversation, or turns from one that was cancelled/respawned.
                 // Replay it into the prompt so a follow-up still resolves.
+                // The harness the *new* session will run under, which is what
+                // decides whether an earlier turn's prose may be replayed into
+                // it — see `render_history`.
                 let context = ai_context(
                     cx_params,
                     fallback_db.as_deref(),
                     &prior,
                     &ai_instructions.get_untracked(),
+                    ai_harness.get_untracked().key(),
                 );
                 // If the connection's `Db` can't be built yet (SSH tunnel
                 // pending), skip the MCP tools rather than blocking the chat.
