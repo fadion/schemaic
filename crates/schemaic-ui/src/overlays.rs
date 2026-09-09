@@ -1574,6 +1574,23 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(
                             MenuEntry::action_colored("Drop", theme::error, move || {
                                 let (ui, db) = (ui.clone(), db.clone());
+                                // **Captured here, where the menu fired**, not
+                                // read back in `resolve` — the confirmation
+                                // dialog is a window the user can switch
+                                // connections in, and the plan would then be
+                                // built against whichever one they switched to.
+                                // The dialect this closure already reads for the
+                                // risk sentence comes from the same place.
+                                let ctx = crate::table_designer::edit_ctx(&ui);
+                                let on = crate::ddl_preview::PlanTarget {
+                                    conn_id: ctx.conn_id,
+                                    // Server-level: `DdlScope::Server` wants the
+                                    // database the run must *avoid*, and a
+                                    // dropped database is not one to run in.
+                                    database: String::new(),
+                                    dialect: ctx.dialect,
+                                    read_only: ctx.read_only,
+                                };
                                 confirm.set(Some(crate::Confirm {
                                     title: format!(
                                         "Drop {}",
@@ -1589,13 +1606,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         &schemaic_core::ddl::Change::DropDatabase {
                                             name: db.clone(),
                                         },
-                                        crate::table_designer::edit_ctx(&ui).dialect,
+                                        ctx.dialect,
                                     ),
                                     resolve: Rc::new(move |yes| {
                                         if yes {
                                             crate::ddl_preview::preview_container(
                                                 &ui,
-                                                &db,
+                                                on.clone(),
                                                 &db,
                                                 schemaic_core::ddl::Change::DropDatabase {
                                                     name: db.clone(),
@@ -1808,19 +1825,29 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(
                             MenuEntry::action_colored("Drop", theme::error, move || {
                                 let (ui, db, ns) = (ui.clone(), db.clone(), ns.clone());
+                                // Captured at menu-fire time, for the reason the
+                                // Drop-database entry above states.
+                                let ctx = crate::table_designer::edit_ctx(&ui);
+                                let on = crate::ddl_preview::PlanTarget {
+                                    conn_id: ctx.conn_id,
+                                    // A namespace is dropped **in** its database.
+                                    database: db.clone(),
+                                    dialect: ctx.dialect,
+                                    read_only: ctx.read_only,
+                                };
                                 confirm.set(Some(crate::Confirm {
                                     title: format!("Drop {}", crate::ContainerKind::Schema.label()),
                                     message: risk_prompt(
                                         &schemaic_core::ddl::Change::DropSchema {
                                             name: ns.clone(),
                                         },
-                                        crate::table_designer::edit_ctx(&ui).dialect,
+                                        ctx.dialect,
                                     ),
                                     resolve: Rc::new(move |yes| {
                                         if yes {
                                             crate::ddl_preview::preview_container(
                                                 &ui,
-                                                &db,
+                                                on.clone(),
                                                 &ns,
                                                 schemaic_core::ddl::Change::DropSchema {
                                                     name: ns.clone(),

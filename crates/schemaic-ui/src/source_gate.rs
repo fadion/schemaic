@@ -110,6 +110,13 @@ fn next_cfg_test(src: &str, from: usize) -> Option<usize> {
 /// The offset just past the item beginning at `from` — the byte after its
 /// closing `}`, or after the `;` / `,` of an item with no block of its own.
 ///
+/// `pub(crate)` because a gate can be about **one function** rather than a whole
+/// file: `ddl_preview`'s asks that two named functions never reach for the live
+/// connection switcher, while their neighbours in the same file legitimately
+/// do. Pointed at a `fn`'s first byte it returns the byte after that function's
+/// body — the parameter list's `(` is counted, so the `)` cannot end the item
+/// before the block starts.
+///
 /// **Not every `#[cfg(test)]` is on a block.** It can sit on a `use` (ends at
 /// `;`), on a struct field, an enum variant or a match arm (ends at the `,`, or
 /// at the enclosing `}` when it is the last one). Reading only `{`/`}` made the
@@ -120,7 +127,7 @@ fn next_cfg_test(src: &str, from: usize) -> Option<usize> {
 /// `(` and `[` are counted alongside `{` for one reason: without them a `,` at
 /// "depth 0" would land in the middle of `fn f(a: u32, b: u32)` and hand the
 /// body of a test-only function back as production code.
-fn item_end(src: &str, from: usize) -> Option<usize> {
+pub(crate) fn item_end(src: &str, from: usize) -> Option<usize> {
     let b = src.as_bytes();
     let mut i = from;
     let mut depth = 0usize;

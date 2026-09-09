@@ -293,18 +293,29 @@ pub(crate) fn preview_of_plan(
 /// `database` is what the plan is *about*, which under [`crate::DdlScope::Server`]
 /// is deliberately not the database the statements run on — see
 /// [`crate::DdlRunRequest::database`].
+/// **Built against the connection the plan was raised on**, not against
+/// whichever the switcher points at now — the same rule [`preview_account`]
+/// states, and this is where it was missing. `database` comes off the target
+/// too: for a namespace it is the database the plan runs in, and for a database
+/// it is the empty string [`crate::DdlScope::Server`] wants.
 pub(crate) fn preview_container(
     ui: &Ui,
-    database: &str,
+    on: PlanTarget,
     subject: &str,
     change: schemaic_core::ddl::Change,
 ) {
-    let ctx = crate::table_designer::edit_ctx(ui);
-    let cs = schemaic_core::ddl::server_level(subject, ctx.dialect, change);
-    open_preview(
-        ui.ddl,
-        preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
-    );
+    open_preview(ui.ddl, container_preview(&on, subject, change));
+}
+
+/// The plan itself, with no `Ui` in reach — so the claim that it is built
+/// against the *target* can be asserted rather than argued.
+pub(crate) fn container_preview(
+    on: &PlanTarget,
+    subject: &str,
+    change: schemaic_core::ddl::Change,
+) -> DdlPreview {
+    let cs = schemaic_core::ddl::server_level(subject, on.dialect, change);
+    preview_of(on.conn_id, &on.database, subject, &cs, on.read_only)
 }
 
 /// Send an **account** change — a create, a drop, a grant or a revoke — to the
@@ -329,7 +340,7 @@ pub(crate) fn preview_container(
 /// the wrong connection's read-only flag decided whether Apply was offered.
 pub(crate) fn preview_account(
     ui: &Ui,
-    on: AccountPlanTarget,
+    on: PlanTarget,
     subject: &str,
     change: schemaic_core::ddl::Change,
 ) {
@@ -340,21 +351,31 @@ pub(crate) fn preview_account(
     );
 }
 
-/// Which server an account plan is for — captured where the plan is raised.
+/// Which server a plan is for — captured where the plan is **raised**, not read
+/// back where it is previewed.
 ///
-/// A struct rather than three more parameters because all three come from one
-/// place and have to stay together: taking them individually is how one call
-/// site comes to pass the live connection's `read_only` beside the target's
+/// A struct rather than four more parameters because they come from one place
+/// and have to stay together: taking them individually is how one call site
+/// comes to pass the live connection's `read_only` beside the target's
 /// `conn_id`.
+///
+/// **Both plan kinds that have no table take one.** It was the account plans'
+/// alone while [`preview_container`] re-derived all four from the live
+/// `edit_ctx` — so a *Create database* form filled in on MySQL and previewed
+/// after a switch to PostgreSQL was emitted at PostgreSQL's dialect, against
+/// PostgreSQL's `conn_id`, and Apply created the database on the wrong server.
+/// Nothing closes a DDL editor on a connection switch, and the two container
+/// menu entries reach the preview through a confirmation dialog, which is a
+/// second window for the switch to happen in.
 #[derive(Clone, Debug)]
-pub(crate) struct AccountPlanTarget {
+pub(crate) struct PlanTarget {
     pub conn_id: u64,
     pub database: String,
     pub dialect: SqlDialect,
     pub read_only: bool,
 }
 
-impl From<&crate::AccountTarget> for AccountPlanTarget {
+impl From<&crate::AccountTarget> for PlanTarget {
     fn from(t: &crate::AccountTarget) -> Self {
         Self {
             conn_id: t.conn_id,
@@ -365,7 +386,25 @@ impl From<&crate::AccountTarget> for AccountPlanTarget {
     }
 }
 
-impl From<&crate::GrantTarget> for AccountPlanTarget {
+impl From<&crate::DatabaseTarget> for PlanTarget {
+    fn from(t: &crate::DatabaseTarget) -> Self {
+        Self {
+            conn_id: t.conn_id,
+            // Where the resulting plan runs: a namespace is created **in** its
+            // database, a database is created on a server-level connection that
+            // names none. The empty string is not a placeholder standing in for
+            // a real value — under `crate::DdlScope::Server` the field is what
+            // the run must *avoid*, and there is nothing to avoid when nothing
+            // exists yet. (This was `database_editor::plan_database`, called at
+            // the one site that is now this conversion.)
+            database: t.database.clone().unwrap_or_default(),
+            dialect: t.dialect,
+            read_only: t.read_only,
+        }
+    }
+}
+
+impl From<&crate::GrantTarget> for PlanTarget {
     fn from(t: &crate::GrantTarget) -> Self {
         Self {
             conn_id: t.conn_id,
@@ -1904,6 +1943,94 @@ mod tests {
                 exit_action(false, ddl_rolls_back_as_a_whole(d)),
                 ExitAction::Close,
                 "{d:?}"
+            );
+        }
+    }
+}
+/// **Which connection a plan with no table is built against.**
+#[cfg(test)]
+mod plan_target_tests {
+    use super::*;
+    use schemaic_core::ddl::Change;
+
+    fn on(conn_id: u64, dialect: SqlDialect, read_only: bool) -> PlanTarget {
+        PlanTarget {
+            conn_id,
+            database: String::new(),
+            dialect,
+            read_only,
+        }
+    }
+
+    /// The plan carries the **target's** connection, dialect and read-only flag,
+    /// not the switcher's.
+    ///
+    /// This one cannot be made to fail against the unfixed tree: there was no
+    /// function to call — `preview_container` read `edit_ctx(ui)` inline and had
+    /// no target to be given one. That is what the source gate below is for; it
+    /// asserts the shape of the fix rather than its output, and it *does* fail.
+    #[test]
+    fn a_container_plan_is_built_against_the_target_it_was_raised_on() {
+        let p = container_preview(
+            &on(1, SqlDialect::MySql, false),
+            "staging",
+            Change::CreateDatabase(Box::new(schemaic_core::ddl::DatabaseDraft {
+                name: "staging".into(),
+                charset: Some("utf8mb4".into()),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(p.conn_id, 1);
+        assert_eq!(p.dialect, SqlDialect::MySql);
+        assert!(!p.read_only);
+        // The charset the MySQL form collected is in the statement, which is the
+        // user-visible half of building at the wrong dialect: PostgreSQL has no
+        // clause for it and the plan would have gone out without it.
+        assert!(
+            p.statements.iter().any(|s| s.contains("utf8mb4")),
+            "{:?}",
+            p.statements
+        );
+    }
+
+    /// And the read-only flag is the target's too — the switcher's would decide
+    /// whether Apply is offered for a connection the form was never on.
+    #[test]
+    fn a_container_plan_carries_the_targets_read_only_flag() {
+        let p = container_preview(
+            &on(4, SqlDialect::Postgres, true),
+            "shop",
+            Change::DropSchema {
+                name: "shop".into(),
+            },
+        );
+        assert!(p.read_only);
+        assert_eq!(p.conn_id, 4);
+    }
+
+    /// **The gate.** `preview_container` and `container_preview` must not read
+    /// the live switcher — the whole finding was that the first one did, while
+    /// `preview_account` one function below took a target precisely to stop it
+    /// and said so in its doc.
+    ///
+    /// Scoped to those two functions rather than to the file: `preview_change`
+    /// and `preview_proposal` are about the connection the user is looking at
+    /// and read `edit_ctx` correctly, so a file-wide gate would either fail on
+    /// them or be written loosely enough to pass on anything.
+    #[test]
+    fn the_container_preview_does_not_read_the_live_connection() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ddl_preview.rs"))
+                .expect("this file");
+        let body = crate::source_gate::production_code(&src);
+        for name in ["fn preview_container(", "fn container_preview("] {
+            let at = body.find(name).unwrap_or_else(|| panic!("{name} is gone"));
+            let end = crate::source_gate::item_end(&body, at)
+                .unwrap_or_else(|| panic!("{name} has no end"));
+            assert!(
+                !body[at..end].contains("edit_ctx"),
+                "{name} reads the live connection switcher; the plan has to be \
+                 built against the `PlanTarget` it was raised on"
             );
         }
     }

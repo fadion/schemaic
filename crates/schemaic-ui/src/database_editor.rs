@@ -166,16 +166,6 @@ pub(crate) fn change_of(kind: ContainerKind, draft: &DatabaseDraft) -> ddl::Chan
     }
 }
 
-/// Where the resulting plan runs: a namespace is created **in** its database, a
-/// database is created on a server-level connection that names none.
-///
-/// The empty string for a database is not a placeholder standing in for a real
-/// value — under [`crate::DdlScope::Server`] the field is what the run must
-/// *avoid*, and there is nothing to avoid when nothing exists yet.
-fn plan_database(target: &DatabaseTarget) -> String {
-    target.database.clone().unwrap_or_default()
-}
-
 // ── the form ─────────────────────────────────────────────────────────────────
 
 /// A text field bound to one place in the draft. Same contract as the object
@@ -454,9 +444,11 @@ pub(crate) fn database_editor_overlay(ui: Ui) -> impl IntoView {
                             ACTION_TAB + 10,
                             move || {
                                 let name = draft.name.trim().to_string();
+                                // **The target the form was opened on**, not
+                                // the connection the switcher points at now.
                                 ddl_preview::preview_container(
                                     &ui,
-                                    &plan_database(&target),
+                                    (&target).into(),
                                     &name,
                                     change_of(target.kind, &draft),
                                 );
@@ -571,19 +563,28 @@ mod tests {
     /// A new database has no database to run in, and that is the field
     /// `DdlScope::Server` reads as what the run must *avoid* — so it has to be
     /// empty rather than carrying some plausible-looking name.
+    ///
+    /// Asked of the conversion that now owns the rule (this was
+    /// `plan_database`, whose one call site *became* the conversion), so the
+    /// three fields beside it are asserted in the same breath: the whole point
+    /// of the target is that they travel together from the form to the preview.
     #[test]
     fn a_new_database_names_no_database_to_run_in() {
         let target = |kind, database: Option<&str>| DatabaseTarget {
-            conn_id: 1,
+            conn_id: 7,
             kind,
             database: database.map(str::to_string),
             dialect: SqlDialect::Postgres,
-            read_only: false,
+            read_only: true,
         };
-        assert_eq!(plan_database(&target(ContainerKind::Database, None)), "");
-        assert_eq!(
-            plan_database(&target(ContainerKind::Schema, Some("shop"))),
-            "shop"
-        );
+        let on: crate::ddl_preview::PlanTarget = (&target(ContainerKind::Database, None)).into();
+        assert_eq!(on.database, "");
+        assert_eq!(on.conn_id, 7);
+        assert_eq!(on.dialect, SqlDialect::Postgres);
+        assert!(on.read_only);
+
+        let on: crate::ddl_preview::PlanTarget =
+            (&target(ContainerKind::Schema, Some("shop"))).into();
+        assert_eq!(on.database, "shop");
     }
 }

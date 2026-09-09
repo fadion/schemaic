@@ -836,7 +836,7 @@ fn actions_row(
                 if yes {
                     crate::ddl_preview::preview_account(
                         &ui,
-                        crate::ddl_preview::AccountPlanTarget {
+                        crate::ddl_preview::PlanTarget {
                             conn_id: plan_conn_id,
                             database: database.clone(),
                             dialect: risk_dialect,
