@@ -2514,10 +2514,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     Err(DbError::Cancelled) if tx::timeout_reached(stmt, timed_out) => {
                         QueryState::Failed(note(timeout_message(timeout_secs)))
                     }
-                    Err(DbError::Cancelled) => {
-                        tracing::info!("query cancelled");
-                        QueryState::Cancelled
-                    }
+                    // **A Stop is not a smaller timeout.** MySQL commits the
+                    // open transaction before it runs a DDL statement, so
+                    // cancelling a slow `ALTER` inside a Manual one makes
+                    // everything already in it permanent — and the arm above,
+                    // which discloses exactly that, is reached only when the
+                    // *clock* stopped the run. See `tx::cancelled_message`.
+                    Err(DbError::Cancelled) => match tx::cancelled_message(stmt) {
+                        Some(m) => {
+                            tracing::info!("query cancelled after an implicit commit");
+                            QueryState::Failed(m)
+                        }
+                        None => {
+                            tracing::info!("query cancelled");
+                            QueryState::Cancelled
+                        }
+                    },
                     Err(e) => {
                         tracing::error!("query failed: {e}");
                         QueryState::Failed(note(e.to_string()))
@@ -2942,9 +2954,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                                         out.stmt,
                                     ))
                                 }
+                                // The same pair as `run_query_core`'s, and the
+                                // same hole: see `tx::cancelled_message`.
                                 Err(DbError::Cancelled) => {
                                     stopped = true;
-                                    QueryState::Cancelled
+                                    match tx::cancelled_message(Some(out.stmt)) {
+                                        Some(m) => QueryState::Failed(m),
+                                        None => QueryState::Cancelled,
+                                    }
                                 }
                                 Err(e) => {
                                     stopped = true;

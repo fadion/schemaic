@@ -549,6 +549,36 @@ pub fn failed_message(message: &str, stmt: StmtOutcome) -> String {
     )
 }
 
+/// What a **cancelled** run has to say beyond "Cancelled", or `None` when the
+/// bare word is the whole truth.
+///
+/// **A Stop is not a smaller timeout.** MySQL commits the open transaction
+/// before it runs a DDL statement, so pressing Stop on a slow
+/// `ALTER TABLE` inside a Manual transaction makes everything already in that
+/// transaction permanent — `Session::fetch_query` detects it and sets
+/// [`StmtOutcome::FailedAndCommitted`] for a cancel exactly as it does for a
+/// failure. The pill goes quiet, Rollback will succeed and undo nothing, and
+/// that was the only thing on screen that moved.
+///
+/// The run paths had two cancel arms: one for the statement timeout, which
+/// appended [`failed_message`]'s disclosure in full, and a bare one below it
+/// that returned `QueryState::Cancelled` — the single arm that never called
+/// `failed_message`. `timeout_reached` is `timed_out && …`, and a user's Stop
+/// leaves `timed_out` false, so the identical server state disclosed the loss
+/// when the clock ran out and said nothing when the user clicked.
+///
+/// Here rather than at the two call sites, so a third run path cannot arrive
+/// without it — the same argument [`failed_message`] itself makes for being one
+/// function.
+pub fn cancelled_message(stmt: Option<StmtOutcome>) -> Option<String> {
+    (stmt == Some(StmtOutcome::FailedAndCommitted)).then(|| {
+        failed_message(
+            "The statement was cancelled.",
+            StmtOutcome::FailedAndCommitted,
+        )
+    })
+}
+
 /// Did the statement timeout stop the **statement**, or something before it?
 ///
 /// The watchdog is armed around the whole run — connecting, opening the
@@ -1430,6 +1460,80 @@ mod tests {
                 "{stmt:?}"
             );
         }
+    }
+
+    /// **A Stop and a timeout are the same server state and used to get
+    /// different messages.** MySQL commits the open transaction before a DDL
+    /// statement, so cancelling a slow `ALTER` inside a Manual one makes
+    /// everything already in it permanent — `Session::fetch_query` sets
+    /// `FailedAndCommitted` for a cancel exactly as it does for a failure. The
+    /// run paths had a timeout arm that disclosed that in full and a bare cancel
+    /// arm below it that returned `QueryState::Cancelled`: the one arm that
+    /// never called `failed_message`. `timeout_reached` is `timed_out && …`, so
+    /// a user's click fell through it.
+    #[test]
+    fn a_cancel_that_spent_the_transaction_says_so_like_a_timeout_would() {
+        let m = cancelled_message(Some(StmtOutcome::FailedAndCommitted))
+            .expect("a spent transaction has something to say");
+        assert!(m.contains("cancelled"), "{m}");
+        assert!(m.contains("Rollback will not undo them"), "{m}");
+        // The exact sentence the timeout arm appends, so the two disclosures
+        // cannot drift: both come from `failed_message`.
+        assert!(
+            m.ends_with(
+                failed_message("x", StmtOutcome::FailedAndCommitted)
+                    .strip_prefix("x")
+                    .expect("the disclosure is appended")
+            ),
+            "{m}"
+        );
+    }
+
+    /// And nothing else says it. An unconfirmed failure leaves the transaction
+    /// open, and telling the user it is gone would send them to re-run work that
+    /// is still pending — the same reason `failed_message` is narrow.
+    #[test]
+    fn an_ordinary_cancel_is_still_just_cancelled() {
+        for stmt in [
+            None,
+            Some(StmtOutcome::Ok),
+            Some(StmtOutcome::Failed),
+            Some(StmtOutcome::FailedIsolated),
+            Some(StmtOutcome::Cancelled),
+            Some(StmtOutcome::ConnectionLost),
+            Some(StmtOutcome::NotSent),
+            Some(StmtOutcome::Untouched),
+        ] {
+            assert_eq!(cancelled_message(stmt), None, "{stmt:?}");
+        }
+    }
+
+    /// **The composition, which is where the defect was**: the arm order, fed
+    /// the state a user's Stop produces. `timed_out` is false — that is what a
+    /// click means — and the outcome is `FailedAndCommitted`, and the pair must
+    /// not come out a bare cancel. A test of `failed_message` alone was already
+    /// green against the unfixed tree.
+    #[test]
+    fn the_stop_arm_and_the_timeout_arm_disclose_the_same_loss() {
+        let stmt = Some(StmtOutcome::FailedAndCommitted);
+        // What the run paths ask, in the order they ask it.
+        assert!(
+            !timeout_reached(stmt, false),
+            "a Stop leaves the clock alone, which is what sent this to the bare arm"
+        );
+        assert!(
+            cancelled_message(stmt).is_some(),
+            "so the arm below it has to carry the disclosure"
+        );
+        // And with the clock, the message that arm produces still carries it.
+        assert!(timeout_reached(stmt, true));
+        assert!(
+            failed_message(
+                "the statement timeout fired",
+                StmtOutcome::FailedAndCommitted
+            )
+            .contains("Rollback will not undo them")
+        );
     }
 
     /// The session's own flag, on the same evidence: `tx_open_after` answers what
