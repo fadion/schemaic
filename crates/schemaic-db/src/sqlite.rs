@@ -2016,6 +2016,9 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
                 indexes,
                 foreign_keys,
                 is_view,
+                // SQLite has no sequences at all — `sqlite_sequence` is a
+                // bookkeeping table for `AUTOINCREMENT`, and a real one at that.
+                is_sequence: false,
                 implicit_key,
                 create_sql,
                 // The **body**, not the statement — see `view_body_of`.

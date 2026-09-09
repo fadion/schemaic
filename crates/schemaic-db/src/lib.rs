@@ -1521,6 +1521,9 @@ impl Db {
                 |(name, ty): (String, String)| TableInfo {
                     name,
                     is_view: ty.eq_ignore_ascii_case("VIEW"),
+                    // MariaDB lists a sequence here as `SEQUENCE`; see
+                    // `TableInfo::is_sequence`.
+                    is_sequence: ty.eq_ignore_ascii_case("SEQUENCE"),
                     ..Default::default()
                 },
             )
@@ -2298,8 +2301,9 @@ fn map_mysql_stats(
 async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbError> {
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
 
-    // Tables, ordered. `TABLE_TYPE` flags views ('VIEW') vs base tables so the
-    // tree can render them distinctly; the engine/collation/comment behind it are
+    // Tables, ordered. `TABLE_TYPE` separates base tables from views ('VIEW')
+    // and, on MariaDB, from sequences ('SEQUENCE'), so the tree can render them
+    // distinctly; the engine/collation/comment behind it are
     // the table-level options the schema designer edits (and `ALTER TABLE`
     // replaces wholesale, so they have to be readable before they can be shown).
     let table_opt_rows: Vec<MyTableRow> = conn
@@ -3960,6 +3964,11 @@ pub(crate) fn assemble_schema(
             schema: schema.map(str::to_string),
             name: name.clone(),
             is_view: ty.eq_ignore_ascii_case("VIEW"),
+            // **`TABLE_TYPE` has a third answer on MariaDB.** Only `VIEW` was
+            // read, so a sequence — stored as a one-row table of internal
+            // counters — arrived as an editable base table. See
+            // `TableInfo::is_sequence` for what that cost.
+            is_sequence: ty.eq_ignore_ascii_case("SEQUENCE"),
             ..Default::default()
         });
     }

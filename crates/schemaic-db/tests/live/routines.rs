@@ -18,7 +18,7 @@
 //! passes is worth less than no test at all — and it says so on stderr.
 
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::schema::{Parallel, RoutineInfo};
+use schemaic_core::schema::{Parallel, RoutineInfo, TableShape};
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoint::Target;
@@ -151,4 +151,93 @@ async fn routine_of(scratch: &Scratch) -> RoutineInfo {
         .find(|r| r.name == "f")
         .map(|r| (**r).clone())
         .unwrap_or_else(|| panic!("no function f in {}", scratch.database))
+}
+
+/// **A MariaDB sequence is not a base table**, however `information_schema`
+/// lists it.
+///
+/// `CREATE SEQUENCE` there stores a one-row table of internal counters and
+/// reports it as `TABLE_TYPE = 'SEQUENCE'` beside the real tables. Only `VIEW`
+/// was read, so it arrived as an editable base table: eight counter columns in
+/// the Tables folder, the designer opening on it and offering `ALTER TABLE`,
+/// and the structure dump emitting `CREATE TABLE sq1 (…)` **without** the
+/// `SEQUENCE=1` option that is what makes it one — so restoring the dump gave a
+/// plain table and every `NEXTVAL(sq1)` in the restored schema then failed.
+///
+/// Asserted against the server because the whole claim is about what the
+/// catalogue says: a pure test would be asserting the fixture. The sequence is
+/// also *used* first, so the fixture is a working sequence rather than a name.
+///
+/// MySQL 8 has no sequences and PostgreSQL's are not tables, so the other two
+/// legs return early.
+pub async fn a_mariadb_sequence_is_not_read_as_a_base_table(target: &'static Target) {
+    if target.name != "mariadb" {
+        eprintln!(
+            "live: {} has no table-shaped sequence — this test asserted nothing",
+            target.name
+        );
+        return;
+    }
+    let scratch = Scratch::create(target, "sequence_shape").await;
+    scratch
+        .exec("CREATE SEQUENCE sq1 START WITH 5 INCREMENT BY 2")
+        .await;
+    // The premise: it really is a sequence, not a name that looks like one.
+    let rs = scratch.exec("SELECT NEXTVAL(sq1)").await;
+    assert_eq!(
+        rs.cell(0, 0).map(|v| v.display().to_string()).as_deref(),
+        Some("5"),
+        "{}: the fixture is not a working sequence",
+        target.name
+    );
+
+    let schema = scratch
+        .db
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("introspecting {}: {e}", scratch.database));
+    let t = schema
+        .tables
+        .iter()
+        .find(|t| t.name == "sq1")
+        .unwrap_or_else(|| panic!("{}: sq1 is not listed at all", target.name));
+
+    assert_eq!(
+        t.shape(),
+        TableShape::Sequence,
+        "{}: read as {:?}, with columns {:?}",
+        target.name,
+        t.shape(),
+        t.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    // The eight counter columns are still *read* — hiding them would be a
+    // second lie — but nothing downstream may treat them as a table's.
+    assert!(!t.columns.is_empty(), "{}: no columns at all", target.name);
+
+    let ddl = t.create_ddl(schemaic_core::intel::SqlDialect::MySql);
+    assert!(
+        !ddl.contains("CREATE TABLE"),
+        "{}: the dump would restore the sequence as a plain table:\n{ddl}",
+        target.name
+    );
+    assert!(ddl.contains("sq1"), "{}: {ddl}", target.name);
+
+    // And a real table beside it in the same database is unaffected, so the
+    // refusal is about the sequence rather than about the fetch.
+    scratch.exec("CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let schema = scratch
+        .db
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .expect("introspect");
+    let t = schema.tables.iter().find(|t| t.name == "t").expect("t");
+    assert_eq!(t.shape(), TableShape::Table);
+    assert!(
+        t.create_ddl(schemaic_core::intel::SqlDialect::MySql)
+            .contains("CREATE TABLE"),
+        "{}: an ordinary table stopped being dumpable",
+        target.name
+    );
+
+    scratch.teardown().await;
 }

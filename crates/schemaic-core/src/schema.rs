@@ -205,6 +205,25 @@ pub struct IndexInfo {
     pub create_sql: Option<String>,
 }
 
+/// What a [`TableInfo`] actually **is** — the three answers
+/// `information_schema.TABLE_TYPE` gives.
+///
+/// `is_view` alone was the question every menu asked, and it has only two
+/// answers: a MariaDB sequence fell on the "not a view, therefore an ordinary
+/// table" side and was offered every table action there is. Passing `is_view =
+/// true` for one would be no better — it is not a view either, and the
+/// view-only entries (triggers, refresh, *Edit view*) would light up instead.
+/// Three states, so a caller has to say which of the three it means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableShape {
+    #[default]
+    Table,
+    View,
+    /// MariaDB's `CREATE SEQUENCE`, which the catalogue lists as a table. See
+    /// [`TableInfo::is_sequence`].
+    Sequence,
+}
+
 impl IndexInfo {
     /// Is this the table's PRIMARY KEY?
     pub fn is_primary(&self) -> bool {
@@ -972,6 +991,27 @@ pub struct TableInfo {
     pub foreign_keys: Vec<ForeignKeyInfo>,
     /// True if this is a VIEW rather than a base table (`TABLE_TYPE = 'VIEW'`).
     pub is_view: bool,
+    /// True if this is a **MariaDB sequence** (`TABLE_TYPE = 'SEQUENCE'`).
+    ///
+    /// A separate flag rather than a third state of [`TableInfo::is_view`],
+    /// because a sequence is not a view and answers differently to every
+    /// view-shaped question: it takes no trigger, has no definition to edit and
+    /// nothing to refresh. [`TableInfo::shape`] is the question with all three
+    /// answers, and what the menus ask.
+    ///
+    /// **MariaDB stores a sequence as a one-row table**, and
+    /// `information_schema.TABLES` lists it beside the real ones. Read as a base
+    /// table it arrived with eight internal counter columns
+    /// (`next_not_cached_value`, `minimum_value`, …), sat in the Tables folder,
+    /// opened in the table designer offering `ALTER TABLE`, and dumped as
+    /// `CREATE TABLE` **without** the `SEQUENCE=1` option that is what makes it
+    /// one — so restoring the dump gave a plain table and every `NEXTVAL(sq1)`
+    /// in the restored schema failed. Measured on MariaDB 10.11.14.
+    ///
+    /// Always `false` on MySQL, which has no sequences, and on PostgreSQL and
+    /// SQLite, where a sequence is not a table at all — PostgreSQL's are
+    /// modelled properly, in [`DbSchema::sequences`].
+    pub is_sequence: bool,
     /// The name of a row identity this table has that is **not one of its
     /// columns** — SQLite's `rowid`, and nothing on MySQL or PostgreSQL, where
     /// every way of naming a row is a column. `None` for a table that has none,
@@ -3582,6 +3622,19 @@ impl ObjectItem {
 }
 
 impl TableInfo {
+    /// Which of the three things in [`TableShape`] this is — the question the
+    /// menus, the designer and the dump ask, in place of the two-answer
+    /// `is_view`.
+    pub fn shape(&self) -> TableShape {
+        if self.is_view {
+            TableShape::View
+        } else if self.is_sequence {
+            TableShape::Sequence
+        } else {
+            TableShape::Table
+        }
+    }
+
     /// A `CREATE TABLE`/`CREATE VIEW` skeleton from the introspected schema. Not
     /// a round-trip of the server's DDL — no FK references, engine or charset —
     /// but a valid, useful skeleton in the connection's dialect:
@@ -3609,6 +3662,22 @@ impl TableInfo {
             Some(s) => format!("{}.{}", q(s), q(&self.name)),
             None => q(&self.name),
         };
+        // **A sequence's columns are its counter, not its definition.** MariaDB
+        // stores one as an eight-column table whose *row* holds the start,
+        // increment, bounds and cache — none of which is in the catalogue this
+        // model was built from. Emitting the columns produces a `CREATE TABLE`
+        // that restores as a plain table, and every `NEXTVAL` against it then
+        // fails; emitting a `CREATE SEQUENCE` with invented parameters would be
+        // worse. So the script names the object and says what it could not
+        // restate, the way the unreadable-view arm below does — the one thing
+        // that leaves the reader able to fix it.
+        if self.is_sequence {
+            return format!(
+                "-- {qname} is a sequence. Schemaic reads its definition from the row, not the
+                 -- catalogue, so this script cannot restate it. Copy it from
+                 -- `SHOW CREATE SEQUENCE {qname}` on the source server."
+            );
+        }
         if self.is_view {
             // Through `ddl::view_ddl`, so the copy path and the apply path share
             // one emitter: this branch used to build its own statement and drop
@@ -5643,6 +5712,67 @@ mod tests {
             ref_columns: ref_cols.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// **A MariaDB sequence is not a table**, and `create_ddl` must not write
+    /// one as if it were.
+    ///
+    /// The catalogue lists it as `TABLE_TYPE = 'SEQUENCE'` with eight internal
+    /// counter columns, and its actual definition — start, increment, bounds,
+    /// cache — lives in the **row**, which this model does not hold. Emitting
+    /// the columns produced a `CREATE TABLE` that restores as a plain table,
+    /// after which every `NEXTVAL(sq1)` in the restored schema fails; the
+    /// `SEQUENCE=1` option that would have made it a sequence is not read.
+    #[test]
+    fn a_sequence_is_not_dumped_as_a_table() {
+        let t = TableInfo {
+            name: "sq1".into(),
+            is_sequence: true,
+            columns: vec![ColumnInfo {
+                name: "next_not_cached_value".into(),
+                type_name: "bigint(21)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
+        assert!(
+            !ddl.contains("CREATE TABLE"),
+            "a sequence was emitted as a table:\n{ddl}"
+        );
+        assert!(
+            !ddl.contains("next_not_cached_value"),
+            "the counter column reached the script:\n{ddl}"
+        );
+        // It names the object and says where the real statement is, rather than
+        // vanishing from the script: an object silently missing from a restore
+        // is the failure this is replacing, not an improvement on it.
+        assert!(ddl.contains("sq1"), "{ddl}");
+        assert!(ddl.contains("SHOW CREATE SEQUENCE"), "{ddl}");
+        // Every line is a comment, so a script holding it still runs.
+        assert!(
+            ddl.lines().all(|l| l.trim_start().starts_with("--")),
+            "{ddl}"
+        );
+    }
+
+    /// The three-answer question, and that it agrees with the two flags. A
+    /// `TableInfo` cannot be both, and `is_view` wins if one ever is — a view is
+    /// the shape with the most restrictive editor.
+    #[test]
+    fn a_tables_shape_is_one_of_three() {
+        let of = |v: bool, s: bool| TableInfo {
+            name: "t".into(),
+            is_view: v,
+            is_sequence: s,
+            ..Default::default()
+        };
+        assert_eq!(of(false, false).shape(), TableShape::Table);
+        assert_eq!(of(true, false).shape(), TableShape::View);
+        assert_eq!(of(false, true).shape(), TableShape::Sequence);
+        assert_eq!(of(true, true).shape(), TableShape::View);
+        // A default `TableInfo` — what every hand-built draft is — is a table.
+        assert_eq!(TableInfo::default().shape(), TableShape::Table);
     }
 
     #[test]

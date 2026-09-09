@@ -111,6 +111,7 @@ live_suite!(
     ],
     routines: [
         a_pg_redefinition_keeps_a_functions_planner_attributes,
+        a_mariadb_sequence_is_not_read_as_a_base_table,
     ],
     ddl: [
         an_introspected_table_diffs_to_nothing_against_its_own_draft,

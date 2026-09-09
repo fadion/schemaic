@@ -277,11 +277,21 @@ pub(crate) struct ObjectEntries {
 
 /// See [`ObjectEntries`]. `materialized` is only meaningful on PostgreSQL, which
 /// is the only engine that has one.
+///
+/// **`shape`, not `is_view`.** A MariaDB sequence is neither a table nor a view,
+/// and a two-answer parameter had to sort it onto one side: as "not a view" it
+/// was offered Import, Truncate and *Edit table* over eight internal counter
+/// columns whose every `ALTER TABLE` the server refuses; as "a view" it would
+/// have been offered triggers, *Refresh* and *Edit view* instead. Three states,
+/// so a caller has to say which it means.
 pub(crate) fn object_entries(
-    is_view: bool,
+    shape: schemaic_core::schema::TableShape,
     dialect: schemaic_core::intel::SqlDialect,
     materialized: bool,
 ) -> ObjectEntries {
+    use schemaic_core::schema::TableShape;
+    let is_view = shape == TableShape::View;
+    let is_table = shape == TableShape::Table;
     // Three questions that every engine now answers yes to, each for its own
     // reason — SQLite designs a table by rebuilding it, edits a view by dropping
     // and re-creating it, and edits a trigger now that its `CREATE` text can be
@@ -291,15 +301,16 @@ pub(crate) fn object_entries(
     let edits_views = schemaic_core::ddl::supports_view_editing(dialect);
     let edits_triggers = schemaic_core::ddl::supports_trigger_editing(dialect);
     ObjectEntries {
-        // A view is not insertable, and owns no rows to delete.
-        import: !is_view,
+        // A view is not insertable, and owns no rows to delete. Neither is a
+        // sequence: its one row *is* the counter.
+        import: is_table,
         // **Gated on the capability, like every sibling here.** It was the one
         // entry in this struct that wasn't, and Truncate is the entry that can
         // least afford it: on an engine with no arm for it, the menu offered a
         // red enabled item, asked "Delete all ~4.2m rows in orders?", and then
         // opened a preview whose script was empty and whose Apply was inert —
         // an irreversible question for something that was never going to happen.
-        truncate: !is_view
+        truncate: is_table
             && schemaic_core::ddl::supports_change(
                 dialect,
                 &schemaic_core::ddl::Change::TruncateTable,
@@ -311,17 +322,25 @@ pub(crate) fn object_entries(
         // view is excluded even on PostgreSQL: the server refuses outright
         // (`relation "mv" cannot have triggers`), which is the same call
         // `is_editable_view` makes.
+        // A **sequence** takes none on any engine, and it reaches this arm as
+        // "not a view" — which is how it came to be offered them.
         triggers: edits_triggers
-            && (!is_view || (dialect != schemaic_core::intel::SqlDialect::MySql && !materialized)),
+            && (is_table
+                || (is_view
+                    && dialect != schemaic_core::intel::SqlDialect::MySql
+                    && !materialized)),
         // A table's designer, or a view's editor — the entry reads "Edit table"
         // or "Edit view" and they are not the same capability. The table half was
         // a literal `true`, left behind when the predicate it used to ask was
         // deleted; `supports_table_design` is that question restated as the one
         // the designer actually needs answered.
-        edit: if is_view {
-            edits_views
-        } else {
-            schemaic_core::ddl::supports_table_design(dialect)
+        edit: match shape {
+            TableShape::View => edits_views,
+            TableShape::Table => schemaic_core::ddl::supports_table_design(dialect),
+            // There is no sequence editor, and the table designer emits the
+            // `ALTER TABLE` the server refuses on one — so no entry at all,
+            // rather than one that opens a form leading nowhere.
+            TableShape::Sequence => false,
         },
         // **The one entry that is about the view's rows rather than its
         // definition.** A plain view stores nothing, so there is nothing to
@@ -370,7 +389,8 @@ pub(crate) struct KeyEntries {
 /// the table around a retype or a constraint). **Drop** is a shortcut with no
 /// draft behind it, so it needs a statement for that one change, which is a
 /// narrower thing to ask (`ddl::supports_change`).
-/// `is_view` because **a view's columns are not the view's to edit.** The tree
+/// `shape` because **a view's columns are not the view's to edit**, and a
+/// MariaDB sequence's are its counter rather than columns at all. The tree
 /// renders a column row under a view exactly as it does under a table — the flag
 /// only picks a different glyph — so without this the menu offers Edit column
 /// and a red Drop for something that has neither, opens the *table* designer on
@@ -379,13 +399,14 @@ pub(crate) struct KeyEntries {
 /// question [`object_entries`] one level up already asks.
 pub(crate) fn field_entries(
     dialect: schemaic_core::intel::SqlDialect,
-    is_view: bool,
+    shape: schemaic_core::schema::TableShape,
 ) -> FieldEntries {
+    let is_table = shape == schemaic_core::schema::TableShape::Table;
     FieldEntries {
-        edit: !is_view && schemaic_core::ddl::supports_table_design(dialect),
+        edit: is_table && schemaic_core::ddl::supports_table_design(dialect),
         // The predicate reads the *shape* of the change, not its names — a
         // dropped column is expressible or not whatever it is called.
-        drop: !is_view
+        drop: is_table
             && schemaic_core::ddl::supports_change(
                 dialect,
                 &schemaic_core::ddl::Change::DropColumn {
@@ -400,27 +421,28 @@ pub(crate) fn field_entries(
 /// backs one — SQLite can't drop those, because they are part of the table
 /// definition rather than objects of their own.
 ///
-/// `is_view` for the reason [`field_entries`] takes it: a view has no keys and
-/// no indexes of its own, and every route out of these entries is the table
-/// designer.
+/// `shape` for the reason [`field_entries`] takes it: neither a view nor a
+/// sequence has keys or indexes of its own, and every route out of these
+/// entries is the table designer.
 pub(crate) fn key_entries(
     dialect: schemaic_core::intel::SqlDialect,
     constraint: Option<&str>,
-    is_view: bool,
+    shape: schemaic_core::schema::TableShape,
 ) -> KeyEntries {
     use schemaic_core::ddl::{Change, supports_change, supports_table_design};
+    let is_table = shape == schemaic_core::schema::TableShape::Table;
     KeyEntries {
         // The designer, which reaches what these shortcuts can't: dropping a
         // foreign key on SQLite is a rebuild, and the draft is what has one.
-        edit: !is_view && supports_table_design(dialect),
-        drop_foreign_key: !is_view
+        edit: is_table && supports_table_design(dialect),
+        drop_foreign_key: is_table
             && supports_change(
                 dialect,
                 &Change::DropForeignKey {
                     name: String::new(),
                 },
             ),
-        drop_index: !is_view
+        drop_index: is_table
             && supports_change(
                 dialect,
                 // A capability probe, not a plan: `unique` decides only what the
@@ -1964,6 +1986,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             })
                     });
                     let is_view = info.as_ref().is_some_and(|i| i.is_view);
+                    // The three-answer question the entry helpers ask; a
+                    // MariaDB sequence is neither of the two above.
+                    let shape = info.as_ref().map(|i| i.shape()).unwrap_or_default();
                     // Sizes, row estimate and index usage — the one surface that
                     // reports them. Offered for a view too: it has no storage of
                     // its own, and the panel says so rather than the menu hiding
@@ -2175,7 +2200,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // dimmed — see `object_entries`, which owns that split
                         // and is where the PostgreSQL-view-has-triggers case is
                         // stated.
-                        let offers = object_entries(is_view, dialect, materialized);
+                        let offers = object_entries(shape, dialect, materialized);
                         if offers.import {
                             entries.push(
                                 MenuEntry::action("Import", move || {
@@ -2452,7 +2477,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::Separator);
                     let offers = field_entries(
                         crate::table_designer::edit_ctx(&import_ui).dialect,
-                        source_is_view(db_nodes, &source),
+                        source_shape(db_nodes, &source),
                     );
                     if offers.edit {
                         let ui = import_ui.clone();
@@ -2509,7 +2534,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     let offers = key_entries(
                         crate::table_designer::edit_ctx(&import_ui).dialect,
                         index.constraint.as_deref(),
-                        source_is_view(db_nodes, &source),
+                        source_shape(db_nodes, &source),
                     );
                     if offers.edit {
                         let ui = import_ui.clone();
@@ -3005,15 +3030,17 @@ fn is_palette_target(o: &schemaic_core::schema::ObjectItem) -> bool {
     crate::object_editor::is_editable_object(o)
 }
 
-/// Is the object a **view**, as far as the loaded schema knows?
+/// Which of the three things in [`schemaic_core::schema::TableShape`] the object
+/// is, as far as the loaded schema knows.
 ///
-/// `false` when the schema hasn't loaded, which is the same answer the table
-/// arm's own `is_view` gives in that state: nothing is known to be a view, and
-/// the entries that follow are already disabled for want of columns.
-fn source_is_view(
+/// [`TableShape::Table`](schemaic_core::schema::TableShape::Table) when the
+/// schema hasn't loaded, which is the same answer the table arm's own `is_view`
+/// gave in that state: nothing is known to be anything else, and the entries
+/// that follow are already disabled for want of columns.
+fn source_shape(
     db_nodes: RwSignal<Vec<ConnNode>>,
     source: &schemaic_core::schema::TableSource,
-) -> bool {
+) -> schemaic_core::schema::TableShape {
     db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
@@ -3025,10 +3052,10 @@ fn source_is_view(
                     .find(|t| {
                         t.name == source.table && t.schema.as_deref() == source.schema.as_deref()
                     })
-                    .map(|t| t.is_view),
+                    .map(|t| t.shape()),
                 _ => None,
             })
-            .unwrap_or(false)
+            .unwrap_or_default()
     })
 }
 
@@ -5466,12 +5493,50 @@ fn pass_shares(room: usize, want: [usize; 3]) -> [usize; 3] {
 mod object_menu_tests {
     use super::object_entries;
     use schemaic_core::intel::SqlDialect::{MySql, Postgres, Sqlite};
+    use schemaic_core::schema::TableShape as Shape;
+
+    /// **A MariaDB sequence is neither**, and every entry that acts on a table
+    /// has to be absent for one.
+    ///
+    /// The catalogue lists it under `TABLE_TYPE = 'SEQUENCE'` beside the real
+    /// tables, so it arrived here as "not a view" and was offered Import,
+    /// Truncate and *Edit table* over eight internal counter columns whose every
+    /// `ALTER TABLE` the server refuses. The three view-only entries have to
+    /// stay off too — it is not a view either, which is why the parameter grew a
+    /// third state instead of being flipped.
+    #[test]
+    fn a_sequence_offers_nothing_a_table_or_a_view_offers() {
+        // MySQL's dialect, because MariaDB speaks it and is the only engine that
+        // has sequences in this shape.
+        let e = object_entries(Shape::Sequence, MySql, false);
+        assert!(!e.import, "a sequence has nothing to import into");
+        assert!(!e.truncate, "a sequence is not a table of rows");
+        assert!(!e.edit, "the table designer emits ALTER TABLE on it");
+        assert!(!e.triggers, "a sequence carries no trigger");
+        assert!(!e.refresh_view, "and it is not a view");
+        // The premise: on the same engine a real table does offer them, so the
+        // assertions above are about the shape and not about the dialect.
+        let t = object_entries(Shape::Table, MySql, false);
+        assert!(t.import && t.truncate && t.edit);
+    }
+
+    /// The column and index shortcuts are the second door into the same
+    /// designer, and were gated on `!is_view` alone.
+    #[test]
+    fn a_sequences_columns_and_indexes_are_not_editable_either() {
+        let f = super::field_entries(MySql, Shape::Sequence);
+        assert!(!f.edit && !f.drop);
+        let k = super::key_entries(MySql, None, Shape::Sequence);
+        assert!(!k.edit && !k.drop_index && !k.drop_foreign_key);
+        // Again the premise, on the same engine.
+        assert!(super::field_entries(MySql, Shape::Table).edit);
+    }
 
     /// A table offers all four, on either engine with an emitter.
     #[test]
     fn a_table_offers_everything() {
         for d in [MySql, Postgres] {
-            let e = object_entries(false, d, false);
+            let e = object_entries(Shape::Table, d, false);
             assert!(e.import && e.triggers && e.truncate && e.edit, "{d:?}");
         }
     }
@@ -5482,7 +5547,7 @@ mod object_menu_tests {
     #[test]
     fn a_view_never_offers_import_or_truncate() {
         for d in [MySql, Postgres] {
-            let e = object_entries(true, d, false);
+            let e = object_entries(Shape::View, d, false);
             assert!(!e.import, "{d:?}");
             assert!(!e.truncate, "{d:?}");
         }
@@ -5493,9 +5558,12 @@ mod object_menu_tests {
     /// this to `!is_view` would remove a live feature from the PG menu.
     #[test]
     fn only_mysql_views_lose_the_triggers_entry() {
-        assert!(!object_entries(true, MySql, false).triggers, "MySQL view");
         assert!(
-            object_entries(true, Postgres, false).triggers,
+            !object_entries(Shape::View, MySql, false).triggers,
+            "MySQL view"
+        );
+        assert!(
+            object_entries(Shape::View, Postgres, false).triggers,
             "PostgreSQL view"
         );
     }
@@ -5504,7 +5572,7 @@ mod object_menu_tests {
     /// outright (`relation "mv" cannot have triggers`).
     #[test]
     fn a_materialized_view_has_no_triggers_entry() {
-        assert!(!object_entries(true, Postgres, true).triggers);
+        assert!(!object_entries(Shape::View, Postgres, true).triggers);
     }
 
     /// **The whole table of answers, in one place.** Three separate tests used
@@ -5533,7 +5601,7 @@ mod object_menu_tests {
     fn the_object_menu_matrix_is_the_same_everywhere_except_triggers_and_refresh() {
         for d in [MySql, Postgres, Sqlite] {
             // A base table: everything, on every engine.
-            let t = object_entries(false, d, false);
+            let t = object_entries(Shape::Table, d, false);
             assert!(
                 t.edit && t.import && t.truncate && t.triggers,
                 "{d:?}: {t:?}"
@@ -5542,7 +5610,7 @@ mod object_menu_tests {
             // A view: no import, no truncate, and editable everywhere — SQLite
             // included, where every edit is a drop and a create because there is
             // no `CREATE OR REPLACE VIEW`.
-            let v = object_entries(true, d, false);
+            let v = object_entries(Shape::View, d, false);
             assert!(v.edit, "{d:?} view: {v:?}");
             assert!(!v.import && !v.truncate, "{d:?} view: {v:?}");
 
@@ -5553,7 +5621,10 @@ mod object_menu_tests {
 
             // And a materialized view takes none anywhere: the server refuses
             // outright (`relation "mv" cannot have triggers`).
-            assert!(!object_entries(true, d, true).triggers, "{d:?} matview");
+            assert!(
+                !object_entries(Shape::View, d, true).triggers,
+                "{d:?} matview"
+            );
 
             // **The second real disagreement, and the narrowest entry here.**
             // `Refresh view` rebuilds *stored* rows, which only a materialized
@@ -5562,7 +5633,7 @@ mod object_menu_tests {
             // materialized view on exactly one.
             assert!(!t.refresh_view && !v.refresh_view, "{d:?}: {t:?} {v:?}");
             assert_eq!(
-                object_entries(true, d, true).refresh_view,
+                object_entries(Shape::View, d, true).refresh_view,
                 d == Postgres,
                 "{d:?} matview refresh"
             );
@@ -6270,6 +6341,7 @@ mod tests {
 mod row_menu_tests {
     use super::{field_entries, key_entries};
     use schemaic_core::intel::SqlDialect::{MySql, Postgres, Sqlite};
+    use schemaic_core::schema::TableShape as Shape;
 
     /// These two rows open the designer, which every engine now has — SQLite
     /// reaches a retype or a constraint by rebuilding the table. They were once
@@ -6289,8 +6361,8 @@ mod row_menu_tests {
     #[test]
     fn every_engine_designs_from_a_column_or_a_key_row() {
         for d in [MySql, Postgres, Sqlite] {
-            assert!(field_entries(d, false).edit, "Edit column {d:?}");
-            assert!(key_entries(d, None, false).edit, "Edit index {d:?}");
+            assert!(field_entries(d, Shape::Table).edit, "Edit column {d:?}");
+            assert!(key_entries(d, None, Shape::Table).edit, "Edit index {d:?}");
         }
     }
 
@@ -6304,10 +6376,10 @@ mod row_menu_tests {
     #[test]
     fn a_view_offers_no_column_or_key_entry_on_any_engine() {
         for d in [MySql, Postgres, Sqlite] {
-            let f = field_entries(d, true);
+            let f = field_entries(d, Shape::View);
             assert!(!f.edit && !f.drop, "{d:?} column on a view: {f:?}");
             for constraint in [None, Some("uq_email")] {
-                let k = key_entries(d, constraint, true);
+                let k = key_entries(d, constraint, Shape::View);
                 assert!(
                     !k.edit && !k.drop_foreign_key && !k.drop_index,
                     "{d:?} key {constraint:?} on a view: {k:?}"
@@ -6320,19 +6392,19 @@ mod row_menu_tests {
     /// engine performs — it has `ALTER TABLE … DROP COLUMN` and `DROP INDEX`.
     #[test]
     fn sqlite_still_drops_a_column_and_a_plain_index() {
-        assert!(field_entries(Sqlite, false).drop);
-        assert!(key_entries(Sqlite, None, false).drop_index);
+        assert!(field_entries(Sqlite, Shape::Table).drop);
+        assert!(key_entries(Sqlite, None, Shape::Table).drop_index);
     }
 
     /// The two that really do need the twelve-step rebuild.
     #[test]
     fn sqlite_drops_no_constraint() {
         assert!(
-            !key_entries(Sqlite, None, false).drop_foreign_key,
+            !key_entries(Sqlite, None, Shape::Table).drop_foreign_key,
             "no ALTER TABLE … DROP CONSTRAINT"
         );
         assert!(
-            !key_entries(Sqlite, Some("uq_email"), false).drop_index,
+            !key_entries(Sqlite, Some("uq_email"), Shape::Table).drop_index,
             "a UNIQUE index is part of the table definition"
         );
     }
@@ -6340,10 +6412,10 @@ mod row_menu_tests {
     #[test]
     fn the_full_engines_offer_every_row_entry() {
         for d in [MySql, Postgres] {
-            let f = field_entries(d, false);
+            let f = field_entries(d, Shape::Table);
             assert!(f.edit && f.drop, "{d:?} column");
             for constraint in [None, Some("uq_email")] {
-                let k = key_entries(d, constraint, false);
+                let k = key_entries(d, constraint, Shape::Table);
                 assert!(
                     k.edit && k.drop_foreign_key && k.drop_index,
                     "{d:?} key {constraint:?}"
