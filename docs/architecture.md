@@ -620,6 +620,17 @@ existing prose was left alone.
     matches nothing, and the 1-row safety net rolls the whole batch back over an edit the user could
     not see. A pending row passes `false` — it has no committed row to mark, and that its skeleton
     still exists is a different check, belonging where the rows are.
+    **`takes_generated_text(ci, row_deleted)` is its sibling for AI Fill Value** — `text_editable(ci)
+    && !row_deleted`, the text half where `takes_bytes` asks the bytes one — and it exists because
+    that failure had a fourth door. `start_edit` refuses a marked row, `stage_bytes` refuses one and
+    a paste counts such a cell as `skipped_deleted`; AI Fill went through `stage_set`, four lines
+    with no gate, while the sparkle menu's own `fill_enabled` was `text_editable` alone. So filling a
+    cell on a red-washed row staged an edit the commit could not reconcile with the delete, and the
+    net rolled the **whole batch** back — every other marked row and every other staged edit with
+    it — over a green cell on a row the user had already decided was going away. Both the offer and
+    the sink ask this one function, and it is down here for the reason `takes_bytes` is: a test
+    written against `stage_set` cannot fail, that being a private method on a struct no test can
+    construct. A pending row passes `false` here too.
     **`byte_cap(ci)` is a third recorded vector (`col_cap`), filled where the schema is already in
     hand.** `analyze_edit` resolves each table group's schema **once** and both readers take that one
     answer: it records `blob::column_byte_cap` of each binary column's declared type, and hands the
@@ -1292,10 +1303,15 @@ existing prose was left alone.
     name; the module doc is where the two vocabularies are reconciled, and it is what to read before
     "fixing" a `dump_` name that sits behind a menu called Export.
     **It joins two emitters that already existed and adds no third.** Structure is
-    `TableInfo::create_ddl` (which routes a view on to `ddl::view_ddl`), triggers are
-    `TriggerInfo::create_sql`, the closing constraints are a `ddl::ChangeSet` of
-    `Change::AddForeignKey` through `ChangeSet::emit` — the emitter the apply path uses — and the
-    rows are `export::ExportFormat::Sql`, streamed by the app. Identifiers go through
+    `TableInfo::create_ddl` (which routes a view on to `ddl::view_ddl`), the closing constraints are
+    a `ddl::ChangeSet` of `Change::AddForeignKey` through `ChangeSet::emit` — the emitter the apply
+    path uses — and the rows are `export::ExportFormat::Sql`, streamed by the app. Triggers are
+    `TriggerInfo::create_set_sql`, the **whole-set** form and not one `create_sql` per trigger: the
+    catalogue gives a group's leader `PRECEDES <successor>` and a restore reads the file top to
+    bottom, so the first `CREATE TRIGGER` named a trigger the file had not created yet and both
+    servers refused it (`ERROR 3011` on MySQL 8.4.11, `ERROR 4031` on MariaDB 10.11.14) — after the
+    `DROP TABLE` above it had already run against the target. `core::schema`'s entry has that rule in
+    full. Identifiers go through
     `export::ident_sql`/`qualified_table`, so a dump cannot quote differently from the SQL export.
     **The header's own comment lines are *escaped*, not quoted** — `export::comment_text`, and the
     two are different guarantees. Four lines here interpolate a schema-fetched name: the
@@ -1500,7 +1516,7 @@ existing prose was left alone.
     sequence that explicit inserts leave where it was — while MySQL's `AUTO_INCREMENT` and SQLite's
     `rowid` both advance from the data already in the table, so there is nothing to resync;
     `dump::sequence_resync_sql` is the one caller, and this replaced the `!= Postgres` it shipped as.
-    **Two more answer for things outside the designer entirely.** `enforces_declared_byte_length`
+    **Three more answer for things outside the designer entirely.** `enforces_declared_byte_length`
     asks whether a column's *declared* type binds how many bytes a value in it may hold: MySQL's is a
     promise, enforced with `ERROR 1406: Data too long`; PostgreSQL's `bytea` declares no length to
     read, which is the same answer from the other side; and SQLite's is a **note**, that engine
@@ -1512,6 +1528,15 @@ existing prose was left alone.
     MySQL, whose `information_schema` resolves the escapes, yes on PostgreSQL (`pg_get_*`) and SQLite
     (`sqlite_master.sql`), where the eager read is the authority. `compare::CompareEntry::needs_source`
     is its one caller, and it replaced the `dialect == SqlDialect::MySql` that question was spelled as.
+    `publishes_index_ddl` is the newest of the three and asks whether the engine hands back a whole
+    `CREATE INDEX` per index, so an index the model only **partly** read can be replayed verbatim
+    instead of reconstructed from the parts that were read: yes on SQLite (`sqlite_master.sql`) and
+    PostgreSQL (`pg_get_indexdef`), no on MySQL, whose `SHOW CREATE TABLE` inlines the keys and
+    leaves a partly-read index there with nothing to fall back on but a refusal. It is the question
+    behind `IndexInfo::create_sql`, asked by name where a caller needs to know *before* looking, and
+    its one caller today is the live tier's `a_partly_read_index_says_so_and_is_emitted_whole`, which
+    gates on it rather than on the engine — the shapes it plants are PostgreSQL's, that being the
+    only leg answering yes.
     **Two more answer for the *comparison* rather than for any editor**, and both are about the
     difference between an object and its address. `ref_schema_is_database` asks whether the namespace
     a foreign key reports (`ForeignKeyInfo::ref_schema`) is the **database** the key lives in rather
@@ -2200,6 +2225,13 @@ existing prose was left alone.
     together: adjacent pairs collide the moment two triggers swap names, and on MySQL
     statement 1 has already committed when statement 2 fails, so the first trigger is simply
     gone. Same rule, same reason as `GridWrite::plan` in `core::model`.
+    **It emits each trigger's own `create_sql` and *not* `TriggerInfo::create_set_sql`**, which is
+    safe by coupling rather than by construction: a designer plan replaces one trigger inside a group
+    that already exists, which is precisely the caller a `PRECEDES` anchor is right for, and the only
+    caller here that would replay a whole group into nothing is the comparison's migration plan —
+    where `compare::CompareEntry::needs_source` withholds every MySQL trigger anyway, MySQL being the
+    one engine with the clause. Take that withholding away and this emitter inherits the dump's bug;
+    `create_set_sql` is what it would have to switch to.
     `session_wrapped_with` is the MySQL half of that emitter, shared by triggers
     (`session_wrapped_create`) and routines (`session_wrapped`): neither `CREATE TRIGGER` nor
     `CREATE PROCEDURE` has a clause for the `sql_mode`/`character_set_client`/
@@ -2599,8 +2631,10 @@ existing prose was left alone.
     `ddl::schema_body_is_emittable` rather than `dialect == SqlDialect::MySql`, so nobody is sent
     after a body they have no use for and a fourth engine has to be answered for rather than sorted
     silently onto one side. `CompareEntry::uncertain` is a match over
-    an `IndexInfo::lossy` index — a PostgreSQL index whose expression keys or opclasses the model
-    never read, so two of them compare equal whatever the server holds; the verdict stands as the
+    an `IndexInfo::lossy` index — a PostgreSQL index whose expression keys, opclasses, `INCLUDE`
+    columns, storage parameters or `NULLS NOT DISTINCT` the model never read (see `schemaic-db` for
+    what widened that list), so two of them compare equal whatever the server holds; the verdict
+    stands as the
     best the model can do, and a tree drawing it like a fully-read match would be overclaiming. It is
     **counted as well as drawn**, in `CompareCounts::uncertain`, which overlaps the four statuses
     rather than replacing one of them: the flag was a per-row hint only, and an uncertain match is
@@ -3263,7 +3297,17 @@ existing prose was left alone.
     `StmtOutcome::FailedAndCommitted` is the confirmed case and the only outcome `failed_message`
     appends its disclosure to, because that loss is otherwise invisible: the statements folded in are
     already permanent, **Rollback** succeeds and undoes nothing, and the pill going quiet is the
-    only thing on screen that moved. `StmtOutcome::NotSent` is the opposite error — a run cancelled
+    only thing on screen that moved.
+    **`cancelled_message` is the same disclosure for the arm that had none, and a Stop is not a
+    smaller timeout.** MySQL commits before it runs a DDL statement whether the statement finishes or
+    is killed, so pressing Stop on a slow `ALTER` inside a Manual transaction spends it exactly as a
+    timeout does — and the run paths had two cancel arms: the timeout one, which appended
+    `failed_message`'s sentence in full, and a bare one below it returning `QueryState::Cancelled`,
+    the single arm that never called `failed_message`. `timeout_reached` is `timed_out && …` and a
+    user's Stop leaves that flag false, so the identical server state disclosed the loss when the
+    clock ran out and said nothing when the user clicked. It answers `None` where the bare word is
+    the whole truth, and lives in `core::tx` rather than at the two call sites so a third run path
+    cannot arrive without it. `StmtOutcome::NotSent` is the opposite error — a run cancelled
     (by the user or by the statement timeout) while still *queued* behind the tab's own connection,
     which never reached the server at all. It is reported apart from `Cancelled`, which now means
     strictly *dispatched and killed*, because the two have opposite consequences on PostgreSQL:
@@ -3387,6 +3431,25 @@ existing prose was left alone.
     a userinfo. A scheme it doesn't know is `UrlError::UnknownScheme`, *except* when only digits
     follow it — that is `localhost:3306`, and calling its host an unknown engine sends the reader
     looking in the wrong place.
+    **`split_userinfo` is where a URL comes apart, and the order is the whole point.** Everything
+    past `://` is cut at the **last `@`** — an email address is an ordinary username — and only then
+    is the remainder searched for a path, a `?` or a `#`. Both readers used to do it the other way
+    round, cutting at the first `/`, so `admin:sec/ret@db.example.com:5432/app` gave an authority of
+    `admin:sec`: `parse_server_url` read that as a host:port and `UrlError::BadPort` rendered *"sec"
+    is not a port number* — the first three characters of the password, under the paste field — while
+    `redacted` made the identical mistake on the identical string, found no userinfo to redact and
+    put the **whole URL** into the not-imported list, which `merge_skipped` then keeps across every
+    later scan. `/`, `?` and `#` are all legal in a password, and this module's own promise is to
+    accept more than a strict URL parser would, so one function answers for both readers: the entry a
+    parser refuses because of a `/` in the password is exactly the entry whose password would
+    otherwise be shown. **`SkipReason::message` is redacted for the same reason `ImportScan::skip`
+    redacts the name** — it is the render-facing accessor, and every variant carrying text carries
+    text a *parser* chose out of the entry, so doing it at the one place both are rendered is what
+    stops a fourth variant reopening it (`raw_message` is the unredacted form, and this module's own
+    tests are its only caller). The parameter half of `redacted` also spans separators now: ` ` is
+    one of them, so an ODBC-shaped `Pwd = hunter2` — which the paste field invites — put its key, its
+    `=` and its value in three different parts and never reached `split_once('=')` with the pair
+    together, while the unspaced `Password=hunter2` redacted correctly and hid that.
     A driver this app has no engine for is `Skipped` **by name** rather than bent onto the nearest
     engine: a MySQL connection silently pointed at an Oracle server is a worse answer than an
     honest omission, and the modal says how many were left behind. DBeaver names its engine twice
@@ -3452,6 +3515,19 @@ existing prose was left alone.
     tree's reload gates on (see `schema.rs`'s `SchemaState::begin_refresh`) — everything that
     decides which server the next query reaches and nothing else, so a rename or a colour can't
     blank the tree and a repointed host can't leave another server's databases on it.
+    **`invalidates_open_connections` is the wider question beside it, and it is wider by a socket
+    that is not encrypted.** *Which server does the next query reach* is the tree's question; *is
+    anything I have already opened still valid* is `save_conn`'s, and the two part company on the
+    transport. Save a MySQL connection with TLS `Disable`, pin a tab to Manual so `open_session`
+    builds a `Db` from the connection as it then stands, then set the mode to `Require` and press
+    Save: every one of `targets_same_server`'s nine fields is unchanged, so nothing was torn down —
+    the pinned `Session` kept running and every statement in that tab, its `COMMIT` included, went on
+    travelling in the clear while the form, the status bar and every fresh operation reported TLS.
+    So this adds the TLS mode and its three paths, in **both** directions (turning it off leaves a
+    session negotiating it, the same lie the other way), plus `ssh.auth` and `ssh.key_path`, which
+    decide what the tunnel authenticates as. The password stays out for `targets_same_server`'s
+    reason: a corrected one reaches the same server over the same socket, and an already
+    authenticated session is not made wrong by it.
     **`Tls` and `SslMode` are the transport half**, and they live here rather than in
     `schemaic-db` for the reason the module exists: this is the saved connection, and the mode is a
     saved field. Five rungs — `Disable` / `Prefer` / `Require` / `VerifyCa` / `VerifyFull` — asked
@@ -3513,15 +3589,36 @@ existing prose was left alone.
     on SQLite: there the model is genuinely complete (a name and a body), so the shared emitter is
     both correct and consistent with the other engines. The test asserts SQLite takes its own DDL
     back, which is the only assertion that would have caught the `AUTO_INCREMENT` case.
+    **PostgreSQL has a narrower version of the same short-circuit, per index rather than per table.**
+    `create_ddl`'s PG arm emits each non-primary index from the model, except one the model only
+    partly read — an `IndexInfo::lossy` one with a `create_sql` — which is emitted as the server's own
+    `pg_get_indexdef` text instead. Emitting that one from the model is not merely different but
+    wrong: there is no field for an `INCLUDE` list, `NULLS NOT DISTINCT` or a storage parameter, so a
+    structure dump of `CREATE INDEX ix ON t (a, b) INCLUDE (c, d)` restored an index that no longer
+    covers — with no edit anywhere and the dump reporting success. A **fully** read index keeps the
+    model's emission, which is the one the designer's preview and the compare pane are written
+    against, and `create_ddl_postgres_emits_a_lossy_index_from_the_servers_own_text` asserts both
+    halves so the fix cannot quietly change every PostgreSQL table's DDL.
     **`TableInfo::dependent_ddl` is the same fidelity call made for the rebuild**: the `CREATE` text
     of the objects that go down with the table and have to be put back — SQLite's triggers, filled
-    by `sqlite::trigger_statements`, empty on the two engines that alter in place and so never
-    destroy the table their triggers hang off. Deliberately the server's own statement rather than a
+    by `sqlite::trigger_statements`, empty for a **table** on the two engines that alter one in place
+    and so never destroy the table their triggers hang off. **It is no longer SQLite's alone, and the
+    exception is a view.** PostgreSQL has no `CREATE OR REPLACE VIEW` that can narrow a column list,
+    so `ddl::diff_view` takes the drop-and-create arm there — and `DROP VIEW` takes every `INSTEAD OF`
+    trigger on it, which is the only way a PostgreSQL view is written to at all. `Change::ReplaceView`
+    has always emitted its `replay` after the re-create; the field was simply empty by construction on
+    the one engine that takes that arm, so a view with an `INSTEAD OF INSERT` trigger, narrowed in the
+    view editor, came back with none — measured on 16.15, with the plan reporting success and the
+    preview naming nothing. `pg::fetch_schema` fills it from `pg_get_triggerdef` for a view and leaves
+    it empty for a table, and the live tier's `a_recreated_view_keeps_the_triggers_the_drop_took`
+    gates on the arm the plan takes rather than on the engine. Deliberately the server's own statement
+    rather than a
     re-emission from `TriggerInfo` — and that stays the call now that `sqlite::triggers_of` *does*
     read a SQLite trigger into the model. The two are not redundant: the model is what the **editor**
     diffs, the text is what a **rebuild** puts back without depending on the parse being perfect,
     and the failure mode the rebuild has to avoid is the one `IndexInfo::lossy` exists to prevent:
-    the part that didn't survive the parse is gone from a trigger that still looks armed. Views need
+    the part that didn't survive the parse is gone from a trigger that still looks armed. A view that
+    *selects from* the rebuilt table needs
     nothing here — `DROP TABLE` leaves a view that selects from the table in place, SQLite resolving
     a view's references when it runs rather than when it is declared, and the table returns under
     the same name before the transaction ends.
@@ -3573,6 +3670,25 @@ existing prose was left alone.
     body, no definer, no ordering clause, no session state and always `FOR EACH ROW` — so it is
     asked for by name rather than reached by falling off the end of a `!pg`. `update_columns` and
     `condition` are consequently **not** PostgreSQL-only fields: MySQL is the engine with neither.
+    **`create_set_sql` is the whole-set form beside it, and the difference is `FOLLOWS`/`PRECEDES`.**
+    That clause is a statement about the group as it stands when the statement runs, not a property
+    of the trigger: both MySQL and MariaDB refuse one naming a trigger that is not there yet
+    (`ERROR 3011` / `ERROR 4031`, *"Referenced trigger … does not exist"*), and the catalogue always
+    gives a group's **leader** `PRECEDES <successor>` — right for the caller replacing one trigger
+    inside a group that exists, impossible for the caller creating the whole group from nothing. A
+    dump of any table with two triggers in one timing/event group therefore died on its *first*
+    `CREATE TRIGGER`, on both servers, after the `DROP TABLE` above it had already run.
+    `with_resolvable_order(exists)` takes an unresolvable clause off, and `TriggerOrder::target` is
+    the name both arms carry — the one thing a caller deciding whether the clause can be *resolved*
+    has to read, rather than matching the enum for it. `create_set_sql`
+    supplies `exists` as "created earlier in this same set", case-insensitively, because a trigger
+    name is the server's. Dropping the *leader's* clause is sufficient rather than approximate:
+    every non-leader carries `FOLLOWS <predecessor>`, so a group created in order rebuilds its own
+    chain, and a trigger created alone into an empty group is its leader whatever it says. It
+    borrows where there is nothing to take off, which is every trigger on the other two engines —
+    neither has the clause. `core::dump` is its one production caller; the migration plan is the
+    other whole-set emitter and does **not** use it, which `core::ddl`'s `trigger_statements`
+    explains.
     `CheckInfo::validated`/`inherited` are PostgreSQL's `NOT VALID` / `NO INHERIT`, carried and
     restated: they are part of the clause, and `pg_get_constraintdef` prints them *after* the
     parens, which is why `ddl::check_predicate` must strip them before peeling. **An unnamed check
@@ -4069,6 +4185,24 @@ existing prose was left alone.
       of real rows, so enum/format/FK conventions come from data rather than guesswork;
       `parse_fill_response`/`parse_seed_response` read the reply back (fence stripping,
       case-insensitive bare `null`, JSON bool → `"1"`/`"0"` for MySQL `tinyint(1)`).
+      **Both consent questions are answered inside the builder, not at the call site.** `sample_section`
+      takes the `AiData` and drops the rows below `may_query` even when a caller hands them over,
+      because the sample was gated on `may_attach` — true at `OnRequest`, the *default*, whose consent
+      line reads *"Rows you attach from a result leave this machine with that question"*, and nobody
+      attached these. `AiData::Full`'s own variant doc already claimed them (*"and the value samples
+      behind AI Fill / Seed"*), and this is the same move `prompt.rs` records for the engine-error
+      text. The app's two callbacks do not *fetch* the sample below that level either — a
+      `SELECT * … LIMIT 20` the user never ran is a read of their data whether or not it is sent —
+      and the builder drops it as well so the decision cannot be lost between the two.
+      `schema_section` is the other: `ddl` is an `Option`, `None` at `SchemaScope::None`
+      (`main.rs`'s `ai_ddl_for`), where Fill and Seed had been handing the vendor's CLI every column
+      name, type, nullability, default and comment of a table whose structure the user had just asked
+      to keep back. Both are **withheld out loud**, the shape `ai::render_inline_prompt` already uses,
+      because a model told nothing about the omission invents the rest — and the DDL, the rows and
+      the row being filled all ride under `prompt::fenced_as` and `UNTRUSTED_NOTE`, with the table
+      and column names through `prompt::inline_datum`: a column `COMMENT` carrying a newline and an
+      imperative sentence used to land in the prompt's own instruction stream, between *"Fill ONLY
+      these columns"* and *"Return ONLY a JSON array"*.
     - `propose.rs` — the AI's proposed table change, as a **patch**: `Proposal`/`ProposedOp`
       deserialize the model's JSON (`{"add_column": {…}}`, externally tagged, `deny_unknown_fields`
       so an invented key fails loudly instead of being dropped), and `apply` lays the ops over
@@ -4188,6 +4322,21 @@ existing prose was left alone.
       produced the transcript — each message carries its own `harness`, so a conversation restored
       after a switch keeps naming whoever answered each turn while the *next* turn runs on the CLI
       selected now.
+      **Prose is not safe merely because it is not a tool result, and `app/ai.rs`'s `render_history`
+      is where that is enforced.** At `AiData::Full` the assistant answers "show me the first five
+      customers" by writing those rows into its reply, so a replayed turn carries data the tool gate
+      would have refused — and a replay happens on exactly the two gestures that change who may see
+      it. Lower the level and `needs_respawn` fires on `prev.data != now.data`, so setting the
+      connection to `SchemaOnly` and asking anything re-sent those rows under a `tools_line` reading
+      *"This connection sends no data at all"*; below `may_attach` the whole replay is withheld.
+      Switch the vendor and it fires on `prev.harness != now.harness`, so Claude → Codex shipped
+      Claude's answers, rows included, to OpenAI with no gesture from the user that any data should
+      cross; each message's own `harness` is what leaves those turns out, a `None` (written before the
+      field existed) being replayed as this session's own, the reading `speaker_label` already takes.
+      Both are **withheld out loud** — a follow-up like "and the other one?" stops resolving either
+      way, and a model told why can say so instead of inventing an antecedent — and `ai_context` now
+      takes the harness key for it, so the level and the vendor are read at the one seam that knows
+      both.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
     `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
     `selected_text` resolves a mirrored byte range against the buffer for the AI panel: the range
@@ -4541,13 +4690,24 @@ existing prose was left alone.
       fallback. Switching connections doesn't move the focused tab and a tab keeps the connection
       it was opened on, so the focused tab routinely names a database that lives somewhere else;
       handing that name to the active connection's `Db` is how the MCP endpoint came to ask MariaDB
-      for `chinook`. It is here rather than in each of its three callers — the AI's turn context
-      (`app/ai.rs`), the terminal's DB-CLI button (`app/main.rs`) and the AI proposal card
-      (`ui/ai_panel.rs`) — because the third is not harmless: the answer goes to
+      for `chinook`. It is here rather than in each of its four callers — the AI's turn context
+      (`app/ai.rs`), the terminal's DB-CLI button (`app/main.rs`), the AI proposal card and the chat
+      code block's **Insert**/**Run** (both `ui/ai_panel.rs`) — because the last two are not
+      harmless. The card's answer goes to
       `ddl_preview::preview_proposal`, which pairs it with `edit_ctx`'s *active* connection and
       stamps that `conn_id` into the plan `run_ddl` executes, so getting it wrong runs an `ALTER`
       on prod from a proposal written about dev. With no database to name, the card refuses and
-      says to switch to that tab first. That copy had the rule
+      says to switch to that tab first. Insert had the same seam one step earlier: `open_query`
+      builds its tab from `default_tab_target()`, whose `conn_id` is the **active** connection, and
+      it took the focused tab's database name unconditionally — and a dev/prod pair almost always
+      carries the same database name on both, so a `DELETE … WHERE status = 'draft'` written about
+      dev opened on prod — and `run_verdict` passes a `DELETE` that has a `WHERE`, so nothing on
+      screen named the server it went to. It refuses rather than re-targets for a reason of its own:
+      `place_tab` does not switch connections, so a tab opened on the *focused* tab's connection
+      would not appear in the strip at all, which reads as nothing having happened. And
+      `CodeActions::insert` answers `bool` **so that *Run* knows not to run afterwards**: `run`
+      targets the active tab, so running after a refused insert would execute the block in whatever
+      tab is in front — the connection the insert had just declined to open on. That copy had the rule
       spelled out inline, expression for expression and untested, because `schemaic-ui` cannot
       depend on `schemaic-app` — which made it a misplaced function rather than an unavoidable
       duplicate.
@@ -4814,6 +4974,25 @@ existing prose was left alone.
   plus `reloptions` for the storage params a replace would reset (`pg_view_options`) — all
   folded on *after* the shared `assemble_schema` (which both engines share and neither's
   extras belong in).
+  **`index_list_sql` reports one row per key position, and its `lossy` term is what the model
+  admits it did not read.** It was a non-default opclass and a non-default `indoption`; it is now
+  also `ix.indnatts > ix.indnkeyatts` (an `INCLUDE` column, which lives past the key columns and is
+  dropped by the ordinality join before `pg_attribute` is consulted) and `ic.reloptions IS NOT NULL`
+  (a storage parameter such as `fillfactor`, which nothing had asked for). **`NULLS NOT DISTINCT`
+  cannot be asked of the catalogue at all**, and that is the load-bearing part:
+  `pg_index.indnullsnotdistinct` is PostgreSQL **15**, the server parses the whole statement before
+  it runs it, and naming a column a 13 or 14 has not fails the *entire* introspection — both are
+  still in support. So `pg_indexdef_is_lossy` asks the question of `pg_get_indexdef`'s **text**
+  instead, which every supported server renders. It matches uppercase, because that is how the
+  server writes a keyword and a case-insensitive match would let an index *named* `nulls not
+  distinct` answer yes; the clause can still be spelled inside a quoted identifier, and that costs an
+  edit withheld rather than an index destroyed — the direction `IndexInfo::lossy` is written to fail
+  in. The same `pg_get_indexdef` column fills `IdxRow::create_sql`, so PostgreSQL now carries the
+  server's own statement per index the way SQLite always has, which is what `TableInfo::create_ddl`
+  replays for a lossy one. Both new terms are string-tested on the query
+  (`lossy_no_longer_covers_what_the_model_can_hold`), and
+  `a_nulls_not_distinct_index_is_read_as_lossy_from_its_own_ddl` asserts the fourth is answered from
+  the text **and** that the PG 15 column is still absent from the query.
   **One read reports one result set, and both engines now agree on that.** A PostgreSQL simple query
   is one string and the server will happily run every statement in it — the MCP server hands one
   straight through and nothing upstream splits it — so `pg::run_statement` counts the
@@ -5033,6 +5212,31 @@ existing prose was left alone.
   spellings cannot drift. `pg::cell_kinds` is the same hoist on PostgreSQL and answers the numeric
   kind and the binary flag **together**, once per column, replacing a per-cell
   `to_ascii_uppercase()`.
+  **MySQL reads one row through two protocols, and `convert_row` has to make them agree.**
+  `collect_rows` loads a result with `query_iter` (the **text** protocol, every value a `Bytes` that
+  `parse_typed` keeps the server's own characters of), while `refetch_on` re-reads one row with
+  `exec_iter` — the **binary** protocol, because a prepared statement with the key bound is what it
+  is — where MySQL sends `DATETIME` as a `Date`, `TIME` as a `Time` and `FLOAT` as an `f32`. Those
+  fell through to `MyValue::as_sql`, which renders a *SQL literal* rather than the text form: a
+  `Date` with a zero time prints as `'YYYY-MM-DD'` and a `Time` as `'{:03}:{:02}:{:02}'`. So on
+  MariaDB 10.11.14 and MySQL 8.4.11, editing one column of `(1, 'a', '2024-01-15 00:00:00',
+  '10:30:00', 3.14)` and committing spliced the row back with `2024-01-15`, `010:30:00` and
+  `3.140000104904175` in three cells the user never touched — measured; re-running the query
+  restored them, so the grid disagreed with itself about one row and any CSV, clipboard or `INSERT`
+  export taken in between wrote the wrong text. `binary_as_text` is the translation, and it is a
+  third arm before the catch-all rather than a fix inside it: a `TIME` is a *duration*, so the day
+  part folds into the hours and can be negative (`74:00:00`, `-01:02:03`), a bare `DATE` must not
+  grow a time, and an `f32` goes out through its own shortest round-tripping text because widening
+  to `f64` first is what produced `3.140000104904175`. The fractional precision comes from
+  `fractional_scales`, read off the **wire** — the column-definition packet's `decimals` — and not
+  off the type name, since `type_name_of` builds `DATETIME` from the type code with no precision in
+  it and a `DATETIME(3)` is indistinguishable from a bare one by name; the binary protocol always
+  sends microseconds, so without it a `DATETIME(3)` holding `.120` came back with no fraction and a
+  bare `DATETIME` would have grown six zeroes. It is hoisted per column beside the binary and bit
+  masks and passed to `convert_row` as a `scale` slice **from every caller**, including the ones
+  whose values all arrive as `Bytes` and can never reach the typed arm: one function, and a caller
+  that *could* hit that arm must not be the one that forgot. `refetch_on` reads it before the
+  collect, which consumes the result and empties `columns_ref`.
   `fetch_table_stats` fills `core::stats::SchemaStats` for a whole database — one round trip
   either way, and having the set is what feeds the schema tree's size column. It is **lazy and
   deliberately not part of `fetch_schema`**: selecting `DATA_LENGTH` from
@@ -5546,8 +5750,11 @@ existing prose was left alone.
   through `ddl::sqlite_trigger_info`, this being the one engine where introspecting a trigger means
   reading SQL; a statement the parse can't read is left out rather than guessed at, the direction
   `view_body_of` already refuses in. `fetch_schema` fills `triggers` for a **view** as well as a
-  table — an `INSTEAD OF` trigger is the only way a SQLite view is written to — while
-  `dependent_ddl` stays a table's business, nothing rebuilding a view.
+  table — an `INSTEAD OF` trigger is the only way a SQLite view is written to — and it fills
+  `dependent_ddl` for both, since a view's edit is a `DROP VIEW` plus a `CREATE VIEW` on this engine
+  (there is no `CREATE OR REPLACE VIEW`) and SQLite takes the view's `INSTEAD OF` triggers down with
+  it, text and all. So the same one catalogue read feeds the same two consumers whichever it is, and
+  `ChangeSet` replays the statements in both places.
   **`all_trigger_sql` is a third read of the same catalogue, and it is whole-database on purpose.**
   `trigger_sql` answers per table, which is the wrong shape for `TableInfo::referring_ddl`: the
   question there is which triggers *anywhere* name this table, and the table's own are exactly the
@@ -5762,6 +5969,27 @@ existing prose was left alone.
   measured, and the *inversion* is the point: a break that stays reflexive (`a == b`) fails nothing
   at all, because an identity gate compares a value with itself and any reflexive comparator
   satisfies it.
+  **That round trip is `assert_round_trips`, and its name is the fix.** It was called
+  `assert_settled` and was the *primary* assertion in five of the seven tests, which made it read as
+  a check that the applied table matches the draft. It is not: both sides come from the table read
+  back *after* the apply — re-anchored, because a `TableDraft` is anchored to the `TableInfo` it was
+  made from and re-diffing the pre-apply draft would ask a question the designer never asks — so the
+  draft that was edited is not in the comparison at all. Run against an emitter that dropped a
+  neighbouring column's `DEFAULT` alongside the column it was asked to drop, it passes: the
+  resulting table round-trips through its own draft perfectly well. **`assert_matches_draft` is the
+  half that was missing**, comparing the applied table with the **drafted** one field by field and
+  per field, so a failure names what moved rather than printing two structs. The seven tests checked
+  the column *names* and, in three cases, three or four attributes of the one column they had
+  touched; nothing checked the columns they did not touch, and nothing checked indexes, keys, checks
+  or table options at all, so an emitter losing a `DEFAULT`, a `NOT NULL`, a collation, a comment, a
+  generated expression or an index method while doing what it was asked went green. The type name
+  goes through `ddl::types_equal`, a server rewriting `INT` as `int(11)` being no loss, and a column
+  the draft *added* is compared only on what the draft **stated** — `auto_increment` and an implicit
+  key's type are the engine's to fill. `a_renamed_column_keeps_its_indexs_kind` is what that bought:
+  `FULLTEXT` is an index *kind* rather than a flag, any edit to a MySQL index is a drop-and-add, and
+  an edit that restates the key without it leaves a plain `KEY` behind so every `MATCH … AGAINST`
+  answers `ERROR 1191` — which `assert_round_trips` passes over, and which the test closes by making
+  the server run a `MATCH` rather than trusting the model.
   Its `SHAPES` are **deliberately awkward rather than representative**, and the sixth is
   `checks_and_fks`: no shape carried a `CHECK` or a foreign key, so `CheckDraft` and
   `ForeignKeyDraft` went through the identity gate on nothing at all and
@@ -5885,14 +6113,30 @@ existing prose was left alone.
   on both catalogues; the note is present exactly where `grants_are_database_scoped` says and names
   the database it covers; and `no_password_material_survives_the_fetch`, which is the assertion that
   the redaction is on the fetch rather than on one view that happens to call it.
-  **The five write tests go through the real emit-and-run path** — `ddl::account` →
+  **The six write tests go through the real emit-and-run path** — `ddl::account` →
   `ChangeSet::emit` → `Db::run_ddl` — rather than asserting statement text, because a statement no
   engine accepts is exactly what only a server can tell you:
-  `a_created_account_is_one_the_server_then_lists`, `a_created_role_is_one_the_server_accepts`,
+  `a_created_account_is_one_the_server_then_lists`,
+  `a_created_account_can_log_in_with_the_password_it_was_given`,
+  `a_created_role_is_one_the_server_accepts`,
   `a_granted_privilege_comes_back_and_a_revoke_takes_it_off`,
   `a_granted_role_comes_back_and_a_revoke_takes_it_off` and
-  `a_dropped_account_is_gone_from_the_list`, fifteen in all across MariaDB 10.11, MySQL 8.4 and
-  PostgreSQL 16. The grant round trip reads its
+  `a_dropped_account_is_gone_from_the_list`, eighteen in all across MariaDB 10.11, MySQL 8.4 and
+  PostgreSQL 16.
+  **The second of those is the one branch that writes a credential to a server, and until it existed
+  nothing in the workspace took it.** `ScratchAccount::create` drafted an empty password and
+  `account_draft_sql` emits the `IDENTIFIED BY`/`PASSWORD` clause only for a non-empty one, so every
+  `CREATE USER`/`CREATE ROLE` this tier had ever run was the passwordless form on all three legs —
+  with two findings sitting on exactly that branch, a `*`-containing replacement creating a real
+  account with a mangled password and a backslash doubled unconditionally for MySQL.
+  `ScratchAccount::create_with_password` is the path and `Target::db_as` is the assertion: the server
+  accepts `IDENTIFIED BY 'hun'` exactly as readily as `… BY 'hunter2***'`, so **only a login tells
+  the two apart**, and the failure being guarded is an account that exists with a credential nobody
+  holds and no `ALTER USER` path in the app to repair it. A wrong password is asserted to be
+  *refused* beside it, or the login would pass on a server that accepts anything. The password
+  carries `'`, `\` and `*` on purpose — the first two are `ddl_string`'s job (and MySQL's
+  `NO_BACKSLASH_ESCAPES` is where that went wrong) and the third is the character the account
+  editor's mask is written in. The grant round trip reads its
   privilege **off `users::privileges_for`** rather than naming one, and that is the tier earning its
   keep: naming `SELECT` was the first version and PostgreSQL refused the plan, a database being an
   *object* there that carries only `CONNECT`, `CREATE` and `TEMPORARY` rather than a shorthand for
@@ -5919,7 +6163,10 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. With the feature on, an unreachable server is a **failure** —
+  tier stays pure by construction. It is **263 tests** as this is written — 86 suite functions
+  expanded across the three legs by `main.rs`'s macro, plus the five that need no server (the four
+  name-guard cases and `endpoint.rs`'s) — and it is reachable from this Windows environment again,
+  which several fixes in the same range were measured against after being written blind. With the feature on, an unreachable server is a **failure** —
   a harness that noticed a missing endpoint and returned would report a green suite that asserted
   nothing, which is the decoration the testing rules already name. The one exclusion is
   `SCHEMAIC_IT_ENGINES`, which a developer has to type, and which is refused outright when `CI` is
@@ -7333,6 +7580,12 @@ existing prose was left alone.
     not-SQL, because an untagged block is the uncommon case and a missing Run button is the safe
     way to be wrong. Both are unit-tested, including every keyword the list claims — one quietly
     dropped is a Run button that stops appearing with nothing else to notice it.
+    **`CodeActions::insert` answers `bool`, and *Run* is `insert` then `run`.** The insert refuses
+    when the focused tab is on a connection that is not the active one (`tabsel::scoped_database`,
+    under `core::tabsel`), and `run` targets the *active* tab — so running after a refused insert
+    would execute the block in whatever tab is in front, which is the connection the insert had just
+    declined to open on. The `bool` exists for that one question; the refusal itself is reported by
+    the action.
   - `settings.rs` — the three settings modals (the main one's groups are General / Editor / Query /
     **Appearance**, the last holding the two theme pickers and the **interface scale**) **and the
     four shared controls every modal's form is
@@ -7795,7 +8048,9 @@ existing prose was left alone.
   - `source_gate.rs` — **test-only**, and the shared machinery behind the crate's *source gates*:
     the tests that read the crate's own `.rs` files and fail on a spelling production code must not
     contain (a floem `Dropdown`, a captured `Color`, a raw pixel inset, an unguarded `exec_after`,
-    a menu trigger that doesn't close its siblings). `production_code` strips every `#[cfg(test)]`
+    a menu trigger that doesn't close its siblings, a document edit that doesn't ask whether the
+    editor is frozen — `editor_pane`'s `editor_freeze_gate`, two tests, whose subject is under
+    *Floem 0.2 gotchas*). `production_code` strips every `#[cfg(test)]`
     **item** — brace-aware, skipping braces inside strings, chars and comments — and every `//`
     line; `crate_sources` enumerates the files to scan. Both halves exist because the idiom was
     written out eleven times across nine files and every copy had the same two holes. It cut each
@@ -10590,11 +10845,20 @@ existing prose was left alone.
   tint, the menu's marked row and the timer's re-arm all repoint together on a switch. The panel
   writes through `ActivityActions::set_interval` rather than to a signal, so there is no effect
   reading out of the store and another writing back into it.
-  **What an edit invalidates, and how expensive the wrong answer is.** `save_conn` asks
+  **What an edit invalidates, and how expensive the wrong answer is.** `save_conn` asks **two**
+  questions, and which artefact answers to which is the whole of it. The cached SSH tunnel goes on
   `targets_same_server` — the predicate the schema tree already asks, not a second reading of the
-  same fields — and everything that belongs to the *old* server is torn down only when the answer is
-  no: the cached SSH tunnel, every pinned Manual `Session` on the connection, and the live AI
-  session. It used to ask nothing: the tunnel was dropped on **every** save, which is true of an edit
+  same fields — because a TLS change needs no new listener and tearing one down takes the forwarded
+  connections with it. Every pinned Manual `Session` on the connection and the live AI session go on
+  `Connection::invalidates_open_connections`, which is that predicate *plus* the transport: the
+  question there is not which server the next query reaches but whether anything already open is
+  still valid, and changing TLS mode from `Disable` to `Require` moves none of the nine fields the
+  narrow one compares — so the block was skipped, the pinned `Session` kept running, and every
+  statement in that tab and its `COMMIT` went on travelling in the clear while the form and the
+  status bar reported TLS. The MCP subprocess went on serving tool calls over the `Db` it was
+  spawned with, `ai::needs_respawn` being unable to see a transport either. `db_for` rebuilds a `Db`
+  per call, which is why every *other* path picked the change up and only those two long-lived
+  artefacts did not. It used to ask nothing at all: the tunnel was dropped on **every** save, which is true of an edit
   that moved something and quietly destructive of one that didn't, because tearing the listener down
   takes the forwarded connections with it — so changing a connection's *colour* killed the socket
   under a pinned Manual transaction and rolled back uncommitted work while the tab went on offering
@@ -10613,6 +10877,19 @@ existing prose was left alone.
   `active_conn` and so respawns by the side door, `next_id` is `max + 1` — deleting the
   highest-numbered connection frees its id for the next one created, which becomes active under the
   same id with settings unchanged, and nothing asks for a respawn.
+  **Pointing the panel at a connection is `reset_ai_panel`, and it is one closure because
+  `active_conn` moves in two places and only one of them did it.** It drops the live session, clears
+  the staged attachment (rows belong to the connection they were taken from), swaps in the
+  conversation saved for the new id through `chat::for_conn`, marks those messages seen so they
+  reappear without the entrance animation, and clears `ai_busy`/`ai_stopping`. `switch_conn` had all
+  of that inline; `delete_conn_now` reimplemented two of the neighbouring resets (`conn_status`,
+  `health_failures`) and omitted these — so deleting the active connection left its transcript on
+  screen under the fallback's header, the next turn spawned a session on the fallback and replayed
+  the deleted conversation into its system prompt, and `persist_chat` then wrote the whole thread
+  back to `chats.json` **under the fallback's id**, undeleting the one thing the confirm modal says
+  in as many words is unrecoverable. The line that erased it ran two hundred lines before the write
+  that re-created it, which is what made the omission invisible. The delete path calls it with the
+  fallback's id, or with `0` when there is no connection left to restore a conversation from.
   **A killed session may be one of ours, and the tab has to be told.** A Manual tab pins a
   `Session`, that connection is an ordinary row in the panel, and the idle-in-transaction holder
   blocking another tab is very often exactly it. Terminating it left the tab holding a dead socket:
@@ -12017,6 +12294,29 @@ Re-introducing the anti-patterns these guard against is a regression:
   would be reading a statement the engine never receives while `…; DELETE FROM t` is the one it
   does. A parameter with no value stops the run before the guard is consulted at all, as a hard
   hold with no "Run anyway": there is nothing to judge yet.
+  **And the verdict is about a *target* as well as a statement, which is the half that was missing.**
+  `guard_policy` reads the active tab's connection, its `read_only`, its dialect and whether it has a
+  database, while the connection gate can hold the run for `PING_TIMEOUT` — five seconds spent
+  re-checking a `Disconnected` connection — and every run action re-resolves `active` when it lands
+  (`run_query_core`'s first line is `let id = active.get_untracked();`, and `run_all` and `run_plan`
+  do the same). Nothing is on screen during those seconds: the guard bar has just come down and no
+  panel has opened, so clicking another tab is the natural response to a Run that appears to have
+  done nothing — and a `DELETE` confirmed against a tab bound to `staging` then executed against a
+  tab bound to `production`, reported into its panel and recorded in history under its name. The
+  `no_database` term is per-tab too, so a `CREATE TABLE` judged `Allow` for a database-bound tab
+  could run on a database-less one, past the `Block("No database selected.")` arm and, on
+  PostgreSQL, into the maintenance database `needs_database` says nothing in Schemaic can reach
+  again. `gate1_on_tab` pins the wrapped action to the tab it was started from and **refuses** when
+  they differ, with a message rather than silently — running anyway is the defect, and running
+  nothing quietly is how it went unnoticed. A refusal rather than a re-target is deliberate: the
+  stronger shape is a `run_on(tab_id, …)` the whole pipeline takes instead of re-reading `active`,
+  which threads through four entry points in a file no test in this workspace can drive, and a
+  refusal is *strictly stronger* than a wrong target, which is the direction this invariant requires.
+  **Only the tab-bound actions take it** — `add_tab` makes a tab rather than using one and `ai_send`
+  is bound to the connection, so pinning either would refuse a gesture that is still correct. Both
+  halves are pinned in `main.rs`'s tests, over a gate that holds its action until the test releases
+  it (`a_deferred_run_does_not_land_on_a_tab_the_user_switched_to`, and the ordinary case beside it,
+  without which the wrapper could pass by refusing everything).
   This is written down because the guard used to be two closures inside `editor_pane.rs`'s *view
   body*, so it protected exactly one caller: the command palette's `>run` and the AI chat's
   **Insert & Run** both reached the raw action and ran writes past all three protections — the
@@ -12108,6 +12408,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   the user attached them, so the gesture is the consent and there is no setting to forget. And
   what is sent is kept honest at both ends: `result_shape` states out loud that no rows were sent,
   and `result_attachment` states the cap it applied.
+  **Which of the two a path asks is itself a decision, and two paths had it wrong the same way.**
+  The Fill/Seed sample and the engine's error text are `may_query`'s — `Full` alone — because both
+  are values the *user did not hand over*, and `may_attach` is true at `OnRequest`, the default,
+  whose consent line reads *"Rows you attach from a result leave this machine with that question"*.
+  `AiData::may_query`'s and `may_attach`'s own docs now say which owns the sample, so the two cannot
+  be read as answering the same question. The conversation **replay** is the other way about: it is
+  prose the assistant wrote, which at `Full` can quote rows outright, so `ai::render_history`
+  withholds it below `may_attach` — and withholds a turn produced by *another* harness whatever the
+  level, since a vendor switch is not a gesture that any data should cross. **Gate inside the
+  builder, not at the call site**, wherever the builder is pure: `seed::build_fill_prompt` and
+  `build_seed_prompt` take the `AiData` and drop the sample themselves, so a third caller cannot
+  forget, and the app declines to *fetch* it as well — a `SELECT * … LIMIT 20` the user never ran is
+  a read of their data whether or not it is sent.
   **This gate covers what reaches the model, not what the model may then do with it** — that half is
   the spawned CLI session's tool set, and it was open. Measured against the shipped CLI, the
   `claude` child had nineteen built-in tools nobody had allow-listed, `Artifact` (which publishes a
@@ -13352,6 +13665,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   discard had already put in flight. `grid::clear_if_any` is the guard (`Clearable`, over `Option`
   as well as the collections, so "the editor is already closed" is the same case), and
   `grid::clear_tests` pins the floem fact itself by counting effect runs.
+  **That counting is available to any test, and is worth knowing before you decide something is only
+  checkable with the app running:** `RwSignal::new` + `create_effect` + a `Cell` counter work in a
+  plain `#[test]` with no window and no runtime, so *how many times* a write notifies is an ordinary
+  assertion. `grid::mark_rows`' `marking_a_selection_notifies_once_however_many_rows` is the second
+  user — a thousand rows, one notification, where the per-row spelling made it 1,001 — and it counts
+  rather than times, because a wall-clock assertion is a flake on a busy machine and the count is
+  what was wrong. What still needs the app is anything that has to be *laid out* or painted.
   **`set` doesn't dedup either, and the active tab is where that costs most.** `RwSignal::set` to the
   value already there still notifies every dependent (floem 0.2 compares nothing, in `set` or in
   `create_updater`), and `TabsUi::active` is `results_area`'s and `editor_area`'s `dyn_container`
@@ -13571,6 +13891,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   the handler's deferred `set(false)` then cleared the freeze for the rest of the preview. The
   handler now returns early when the flag is already set and restores the value it found. A flag two
   features reach for is not a lock; if a third one arrives, this is the paragraph it has to read.
+  **The answer to the second half is a funnel: `editor_pane::edit_untyped`.** Every programmatic
+  edit in that pane goes through it, it asks `read_only` itself and it **refuses** — it answers
+  `bool` rather than looking and proceeding. That one check replaced nine missing ones: the preview
+  holds the keyboard while it is up, so Ctrl+/, Alt+Up, Tab, Ctrl+D on a bare caret, Ctrl+Alt+L, the
+  paired Backspace, the find bar's Replace and the snippet library all reached the document through
+  it, each moving every byte after the caret while `cmdk.start`/`end` stayed put — so Accept spliced
+  the approved suggestion into the middle of a different token. `edit_untyped_frozen` is the one
+  named exception, for Accept, which *is* the edit the freeze exists to protect and runs while the
+  flag is still set; it is a separate function rather than a `bool` parameter so the exception is a
+  name a reader can grep for and nothing acquires it by passing `true`. Both halves are held by
+  `editor_freeze_gate`, a source gate rather than a unit test because the decision is one line and
+  the thing that went wrong was a *census* — nine of ten sites not asking: one test reads
+  `edit_untyped`'s own body for the check and the refusal, the other scans for a raw `.edit_single(`
+  with no `read_only` question within 30 logical lines above it, `FREEZE-EXEMPT` being the marker the
+  funnel's own pair carries. Against the unfixed tree it reports nine offenders.
 - **Shift+wheel → horizontal scroll in the editor.** The editor owns its scroll internally, so
   `shift_hscroll` can't reach it. Register a `PointerWheel` listener on the internal scroll view —
   reached via `ed.editor_view_id.get_untracked().and_then(|c| c.parent())` (the content view's parent
@@ -15033,7 +15368,16 @@ this bundle's.
   Edit field / Filter by this value there would answer a gesture about rows with actions about a
   column. Its row actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
   `clone_row`) and count them in the label: the same menu naming five rows in one entry and acting
-  on one in the next is how four deletions go missing unnoticed. The grid's app
+  on one in the next is how four deletions go missing unnoticed. **`set_rows_deleted` batches, and
+  it was the one row action in that pair that did not** — the Del key's handler and
+  `add_cloned_rows` both already wrote once for the whole selection while this called
+  `toggle_delete` per row, so each row wrote `del_rows` *and* scanned `dirty`, and every mounted
+  data cell's style closure tracks `del_rows`. Measured on the locked `floem_reactive 0.2.0` against
+  a maximised window's ~1,000 mounted cells: 402.8 ms per-row against 0.48 ms batched at 1,000 rows,
+  1.93 s against 0.64 ms at 5,000, 7.87 s against 1.19 ms at 20,000 — linear, so *Delete N rows*
+  over a Ctrl+A at the default 200,000-row cap extrapolates to about **79 seconds** of frozen
+  window, on the same selection Del handles instantly. The set operation is `mark_rows`, shared with
+  that handler so the two cannot drift, and observable behaviour is unchanged. The grid's app
   context (`source`, `db_nodes`, `connections`/`active_conn`, `popup`, `summarize`, `dismiss`, …) is
   bundled in `GridCtx`, threaded `results_section → results_multi → loaded_view → grid_view`,
   then stashed in `GridState` (whose `Rc` callbacks live in `RwSignal<Option<…>>` since it's `Copy`).
@@ -15273,7 +15617,9 @@ this bundle's.
   unmarks, which reads as the key doing nothing) — that vote is `delete_vote`, and it is applied in
   **one** `del_rows.update` and one `dirty.update`: `toggle_delete` per row was two notifications
   each, so Ctrl+A then Del at the 200k row limit fired 400,000 of them and locked the window, on
-  the two-keystroke gesture the feature exists to enable.
+  the two-keystroke gesture the feature exists to enable. The set write is `mark_rows`, shared with
+  the gutter menu's *Delete N rows* — which followed this rule late, and whose entry above carries
+  the measurements.
   **Which column the arithmetic is about is the *anchor's*** — the one the selection started on, so
   dragging from `price` across to `name` still reports `price`. It reads `gs.anchor` rather than
   `bounds()`, which is a normalised rect and has forgotten which corner you began at. A selection
