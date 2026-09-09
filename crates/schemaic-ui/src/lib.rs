@@ -7606,8 +7606,7 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
                 schemaic_core::resultsel::PinVerdict::Heavy(total) => Some((kept, total)),
             }
         },
-        |heavy| {
-            match heavy {
+        |heavy| match heavy {
             None => empty().into_any(),
             Some((kept, total)) => text(format!(
                 "{kept} pinned · {}",
@@ -7615,7 +7614,8 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
             ))
             .tooltip(|| {
                 text(
-                    "Pinned results are held in memory until you close them. \n                     Close the ones you are done with to give it back.",
+                    "Pinned results are held in memory until you close them. \
+                     Close the ones you are done with to give it back.",
                 )
                 .style(crate::widgets::tooltip_style)
             })
@@ -7626,7 +7626,6 @@ fn result_tab_strip(tab: Tab, gctx: GridCtx) -> impl IntoView {
                     .flex_shrink(0.0_f32)
             })
             .into_any(),
-        }
         },
     );
 

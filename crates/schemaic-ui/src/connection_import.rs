@@ -518,32 +518,38 @@ fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
     // states, which is why that one keys on `is_empty()` too). The count is
     // needed for the label alone, so it gets its own inner container and the
     // buttons keep their identity across a tick.
+    // The "Added N connections." line — shown only while nothing is selected,
+    // which is exactly the window between an import finishing and the user
+    // asking for another. Ticking a fresh row retires it, so the sentence can
+    // never sit beside an enabled Import describing a *previous* press.
+    //
+    // **Its own row, above the buttons, wrapping.** It used to share the button
+    // row as a `text_ellipsis()` slot about 350 px wide, and the sentence it
+    // carries is ~190 characters — so the user read `Added 3 connections.
+    // Read-only and the en…` and the warning the line exists to deliver, that
+    // read-only and the environment badge are *not* carried over, never reached
+    // the screen at all. The slot was sized for the sentence it was first given.
+    let note = dyn_container(
+        move || (imp.chosen.with(|c| c.is_empty()), imp.done.get()),
+        move |(idle, done)| match done.filter(|_| idle) {
+            Some(d) => text(d)
+                .style(|s| {
+                    s.font_size(theme::font_label())
+                        .color(theme::text_dim())
+                        .width_full()
+                })
+                .into_any(),
+            None => empty().into_any(),
+        },
+    )
+    .style(|s| s.width_full().min_width(0.0));
+
     let bar = dyn_container(
         move || imp.chosen.with(|c| !c.is_empty()),
         move |any| {
             let (run, ring, close) = (run.clone(), ring.clone(), close.clone());
-            // The "Added N connections." line — shown only while nothing is
-            // selected, which is exactly the window between an import finishing
-            // and the user asking for another. Ticking a fresh row retires it,
-            // so the sentence can never sit beside an enabled Import describing
-            // a *previous* press.
-            let left = dyn_container(
-                move || (any, imp.done.get()),
-                move |(any, done)| match done.filter(|_| !any) {
-                    Some(d) => text(d)
-                        .style(|s| {
-                            s.font_size(theme::font_label())
-                                .color(theme::text_dim())
-                                .text_ellipsis()
-                        })
-                        .into_any(),
-                    None => empty().into_any(),
-                },
-            )
-            .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
-
             h_stack((
-                left,
+                empty().style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
                 action_button(
                     "Close",
                     ActionKind::Neutral,
@@ -569,7 +575,9 @@ fn footer(ui: Ui, close: Rc<dyn Fn()>, ring: FocusRing) -> impl IntoView {
     )
     .style(|s| s.width_full());
 
-    crate::widgets::modal_footer(bar)
+    crate::widgets::modal_footer(
+        v_stack((note, bar)).style(|s| s.flex_col().width_full().gap(theme::scaled(6.0))),
+    )
 }
 
 /// The affirmative button's label, which counts what it is about to do.

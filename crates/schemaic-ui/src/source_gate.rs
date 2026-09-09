@@ -269,6 +269,59 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
     out
 }
 
+/// **A `\` line continuation typed as `\n`.**
+///
+/// Rust's `\`-before-newline strips the newline *and* the next line's
+/// indentation; `\n` inserts a newline and keeps the indentation, so a sentence
+/// meant to be one line arrives with a hard break and a run of twenty-odd
+/// spaces in the middle of it. Three of them shipped, in three different files,
+/// each byte-verified with `cat -A`:
+///
+/// * `app/main.rs` — the import's one warning that read-only and the
+///   environment badge are not carried over, `\n` + 17 spaces.
+/// * `ui/users_view.rs` — the grant-statement cap note, `\n` + 25 spaces.
+/// * `ui/lib.rs` — the pinned-results memory tooltip, `\n` + 21 spaces.
+///
+/// None of the three is testable on its own: each is a literal inside a view,
+/// and the damage is what a renderer does with it. **Three instances is the
+/// case for a lint**, and this is it — one scan closing a class that would
+/// otherwise be found one screenshot at a time.
+///
+/// Eight spaces is the threshold because a deliberate `\n` in prose is followed
+/// by the next word, and Rust source that wraps a string literal is indented
+/// past eight columns by the time it is nested in a view. The only matches in
+/// the tree outside these two crates' production code are a CLI-help fixture, a
+/// synthetic source fixture and two live-test SQL strings, all of which mean
+/// their newline.
+#[cfg(test)]
+mod no_continuation_typed_as_newline_gate {
+    #[test]
+    fn a_wrapped_sentence_is_continued_not_broken() {
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, code) in super::crate_sources() {
+            for (i, line) in code.lines().enumerate() {
+                let mut from = 0usize;
+                while let Some(at) = line[from..].find("\\n") {
+                    let at = from + at;
+                    from = at + 2;
+                    let spaces = line[from..].bytes().take_while(|b| *b == b' ').count();
+                    if spaces >= 8 {
+                        offenders.push(format!(
+                            "{name}:{} has `\\n` followed by {spaces} spaces — a `\\` line \
+                             continuation typed as `\\n`. `\\` strips the newline and the next \
+                             line's indentation; `\\n` keeps both, so the sentence renders \
+                             broken with a long indent in the middle of it. Write `\\` (or, if \
+                             the break is deliberate, put the next line at column 0).",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
