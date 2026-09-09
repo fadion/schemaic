@@ -493,6 +493,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`EditModel::editable` asks only whether a column maps to a base table), so the `UPDATE` keys on
     the original row while the re-fetch must look for the value it just wrote; there were two
     builders and only one knew that.
+    **`insert_target` counts the result's *origin* tables, not the keyed ones**, and the difference
+    was a row destroyed with nothing on screen naming the table. It read
+    `match self.tables.as_slice() { [only] => Some(only), _ => None }`, and `tables` holds only the
+    base tables that *got* a key — one `resolve_key` refuses is absent rather than counted. So on
+    `SELECT o.id, o.total, l.note FROM orders o JOIN audit_log l ON …`, where `audit_log` has no
+    primary key and no fully-present unique NOT NULL index (a log table — or **any view**, whose
+    columns carry no PK flag, so the no-schema fallback refuses it too), it answered `Some(orders)`.
+    That answer gates the gutter menu's **Delete row** and **Duplicate row** and the row-action
+    strip, so Delete was offered on a row of the join and Commit ran
+    `DELETE FROM db.orders WHERE id <=> 7` with `l.note` beside it; on a 1:many join one selected
+    display row destroys the parent the other display rows also stand for. **The write-back's 1-row
+    safety net structurally cannot catch this** — the statement affects exactly one row, so
+    `one_row_verdict` passes and the report is correct about what it did, which leaves the gate as
+    the only line. Both docs asserted the property they didn't have: this one said `None` "for a
+    multi-table join", and `gutter_menu`'s comment said the actions are offered on rows "of a single
+    writable table". `EditModel::origin_tables` is now taken off `analyze_edit`'s own `groups` —
+    every distinct base table the columns came from — and `insert_target` requires it to be 1. The
+    looseness `tables.len() == 1` was standing in for is kept, because an expression column has
+    `origin: None` and so is not a second table: one base table plus computed columns still answers.
+    `build_inserts` and the grid's `filterable` read the same predicate, and `refetch_template`
+    already verified every column's origin itself.
+    `a_join_with_one_keyless_table_has_no_insert_target` is the fixture that was missing — the only
+    join fixture this family had carried two *writable* tables, which is the half that already
+    worked.
     **The one key column that is never editable is an implicit key** (`ColumnOrigin::implicit_key`).
     `resolve_key` falls back to it only after a primary key and a fully-present unique NOT NULL
     index have *both* failed — a real key is what the user means by the row's identity, and it is
@@ -1358,6 +1382,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `DumpPlan::missing`'s guarantee word for word, and `FileStep` keeps the table's namespace so the
     writer can name the source the way the SQL export does. None of the ordering work above applies
     to it — one file per table, and nothing in one file refers to anything in another.
+    **The folder export asks before it replaces, and the three functions that make it ask are
+    here.** A single-file export's consent is the save dialog's own "replace?";
+    `select_directories()` has none, and the per-table names are constructed by `file_plan` rather
+    than typed — so aiming an export at a project's `sql/` directory holding hand-written
+    `orders.sql` destroyed it with no prompt, no `.bak` and no undo. That is a gap against *a
+    destructive modal action guards its own launch, in the same step that launches it*, and the
+    collision list was already being computed ahead of the loop, with a comment saying why, and had
+    nowhere to go: `FilesOutcome` had no arm that could ask, so the list populated a post-mortem
+    field on three arms that could only report. `colliding_files(plan, exists)` is the census —
+    `exists` is an `exists` **predicate** rather than a filesystem, so it is unit-tested without
+    one, and the order follows the plan because that is the order the files would be replaced in;
+    `folder_verdict(approved, colliding)` is the guard, separate from the census because the caller
+    needs the same list for its *report* whichever way the verdict goes and computing it twice is
+    how the two come to disagree; and `folder_replace_prompt` writes the question, beside the three
+    report sentences and for the same reason — a message with arms (one file, a few, more than fit)
+    is a decision, and not one to make inside a callback the suite cannot reach.
     **Ordering is a topological sort over `TableInfo::foreign_keys`** (`order_tables`): a referenced
     table before the table referencing it, views last — a view's body selects from the tables above
     it and it holds no rows to order against anything — and ties broken by name, so two dumps of one
@@ -1726,11 +1766,54 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Every `Change` answers `summary()` and `risks()`, which is what the preview
     modal renders — `risks()` returns *every* consequence, not the first, because one edit can
     narrow a column **and** make it NOT NULL and the NOT-NULL sentence ("the statement fails")
-    otherwise reads as a promise that nothing is lost. The emitter owns the engine divergence: MySQL coalesces into one
+    otherwise reads as a promise that nothing is lost.
+    **The change list is a *diff*, and `summary()` used to print only the new side.** A column's
+    four free-SQL fields — default, generated expression, `ON UPDATE`, `COLLATE` — are free SQL by
+    design, a default having to be able to say `nextval('s')`, and `column_clauses` renders only
+    what is *present*: so *clearing* a default made the two sides differ (the guard in the
+    `AlterColumn` arm falls through) while `column_clauses(to)` came out empty, and the line was
+    byte-identical to the "nothing interesting changed" case, `Change column qty`, while `emit()`
+    wrote `MODIFY COLUMN qty INT NOT NULL`. That is against `column_clauses`' own stated contract —
+    the change list is the consent gesture, so nothing may reach `emit()` without reaching it.
+    `clause_pairs` gives the four as `(label, Option<value>)` and `clause_changes` names each pair
+    that differs **in both directions**, `, default 0 → (none)`, on all three `AlterColumn` arms;
+    they shared the one value, so a rename or a retype hid it too. The asymmetry was exact — an
+    added or edited clause was named, a cleared one was silent — and clearing a `COLLATE` changes
+    comparison and sort semantics for every existing row without touching a byte of data, which was
+    as silent as the rest. It **changes user-visible text**: an added default now reads
+    `, default (none) → CURRENT_TIMESTAMP` rather than `, default CURRENT_TIMESTAMP`.
+    **`risks()` was systematically incomplete, and an empty answer is the dangerous one** — it
+    empties `destructive()` with it, so the preview's risk block hides itself on the edit that
+    needed it. `alter_risks` covered a nullable→NOT NULL flip and `type_change_risk`, so a
+    **generated-expression** edit fired neither: it now names all three directions of one (gained,
+    lost, changed), and the PostgreSQL destruction below is what that silence was covering. Three
+    constraint removals likewise had **no arm at all** and fell to `_ => Vec::new()`, though
+    `DropCheck` — the same class, losing no data while the table stops guaranteeing something no
+    later surface mentions — has had one with the argument written above it: a dropped **foreign
+    key** (orphan rows accepted from now on), a dropped **unique** index (duplicates accepted, and
+    the grid may lose the key it was editing rows by), and a primary-key *swap*, which fell through
+    because only the drop-to-nothing case was guarded. `Change::DropIndex` carries a `unique: bool`
+    for that one arm alone, so it can tell a lost guarantee from lost query speed; a menu entry that
+    only asks `supports_change` may leave it `false`, the answer it wants not depending on it.
+    The emitter owns the engine divergence: MySQL coalesces into one
     `ALTER TABLE` and restates a whole column via `definition_sql` (`MODIFY` replaces it,
     so anything omitted is destroyed); PostgreSQL splits renames / `DROP INDEX` /
     `CREATE INDEX` / `COMMENT ON` into their own statements and drops a key by
     *constraint* name (`IndexInfo::constraint` — it has no `DROP PRIMARY KEY`).
+    **PostgreSQL's one destructive omission was a generated column becoming plain.** It cannot
+    *change* a generated expression in place, so `pg_column_clauses` turns that into a drop and a
+    re-add — and the branch was `from.generated != to.generated`, justified as a drop and a re-add
+    of a column whose values were derived anyway. True when `to.generated` is `Some`, where the new
+    expression recomputes every value; false when it is `None`, where the column becomes plain and
+    there is nothing left to derive the values *from*. Measured live on PostgreSQL 16.15: clearing
+    the designer's "Generated from" field turned a `total` holding 2/4/6 into three empty cells, and
+    moved the column to the end of the table. PG 13+ has the statement that does what the user asked
+    and keeps the values, measured in the same run — `ALTER COLUMN … DROP EXPRESSION` — and that is
+    the emitted clause for that direction now. It **falls through** rather than returning, because
+    the same edit may also have changed the type, the nullability or the default, and each of those
+    moves on its own here. The `NOT NULL` variant was safe by accident: `to.definition_sql` restates
+    `NOT NULL`, the server refuses `ADD COLUMN … NOT NULL` on a populated table, and PG rolls the
+    plan back — so it was exactly the ordinary nullable column that was destroyed silently.
     **SQLite has its own arm (`emit_sqlite`) rather than the fall-through to MySQL's it used to
     take**, because two shapes there are refusals and not merely infelicities: its `ALTER TABLE`
     takes exactly one operation — there is no clause list — so two dropped columns are two
@@ -1850,7 +1933,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     guaranteeing something and nothing else says so — but `ChangeSet::destructive`
     suppresses it when the same name is re-added in the same plan, since every check
     *edit* is a drop-and-add and "rows the constraint refused are accepted from now on"
-    is simply false about one. `enforced` is MySQL's `NOT ENFORCED` only: PG's
+    is simply false about one. **Index and foreign-key names are on that same re-added
+    list now**, because `diff` recreates both the same way: without them, the two risk
+    sentences a dropped unique index and a dropped foreign key had been missing would
+    have put a false loss on every ordinary index or FK *edit*.
+    `a_re_added_constraint_is_not_a_loss` pins that composition, which is the half
+    neither predicate can be tested for alone. `enforced` is MySQL's `NOT ENFORCED` only: PG's
     `NOT VALID` exempts existing rows and so can't silently change what a write does.
     **`CheckInfo::column_level` is MariaDB's `CHECK_CONSTRAINTS.LEVEL`**, and it is the
     one place a check is not a table-level object: `q INT CHECK (q > 0)` makes a
@@ -2911,7 +2999,40 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ROLLBACK` gets out), MySQL survives a failed statement but silently commits on mid-transaction
     DDL. `implicit_commit` is that list, read through the shared `leading_keyword` lexer; a **miss
     is not harmless** — after one, a Rollback runs as a successful no-op and reports an undo that
-    never happened. **For a statement that *failed*, the list is necessary but not sufficient**, and
+    never happened.
+    **What that list never named is the statements whose whole purpose is to close a transaction**,
+    and three consequences came out of the gap. A typed `COMMIT`/`ROLLBACK` in a Manual tab left the
+    session's `in_tx` true, so `ensure_tx` issued no `BEGIN` for the next statement and it ran with
+    no transaction at all — both engines default to autocommit — permanent the instant it landed,
+    while the pill read `3 Open` and Rollback stayed live, no-oped on the server, and `end_tx` closed
+    the state with no message. Measured with the exact sequence the session emits: MariaDB 10.11.14
+    and PostgreSQL 16.15 both end at `v = 99`, and PG adds a `WARNING: there is no transaction in
+    progress` that `batch_execute` returns `Ok` over, so the UI reported a clean end. A typed
+    `BEGIN` was the mirror — it folded the pill to `Idle` while the session and the server both kept
+    a transaction open, so `is_open()` was false, `ddl_blocking_tabs` reported nothing, and a schema
+    Apply queued behind the tab's own metadata lock until the lock-wait timeout, which is the
+    outcome that prompt exists to prevent; `guard_tx` let a database switch through unasked for the
+    same reason. And `SET autocommit = 1` is a **no-op on every connection Schemaic opens**: the app
+    never sets `autocommit`, it issues an explicit `BEGIN`, so the variable is the server default of
+    1, and MySQL commits on that statement only when the value *was* 0. `set_commits` said `true`,
+    `in_tx` was cleared, the pill went blank, and the next statement's `BEGIN` then implicitly
+    committed the user's uncommitted work — the app's own sequence ends at `v = 7`, measured on
+    MariaDB.
+    **`tx::tx_after` is the one predicate the session's flag and the pill both read**, so the two
+    cannot drift, and it carries the fourth answer `Option<bool>` could not: `TxAfter::Closed` for
+    the deliberate closers on **both** engines (`COMMIT`/`ROLLBACK`/`END`/`ABORT`, but not
+    `ROLLBACK TO [SAVEPOINT]`, which discards work *inside* the transaction and leaves it open, and
+    not `RELEASE SAVEPOINT`); `TxAfter::Open` for the statements that leave a *new* transaction
+    (`BEGIN`, `START`, and `COMMIT`/`ROLLBACK … AND CHAIN`); `TxAfter::Ask` for a MySQL
+    `SET autocommit`, that variable being MySQL's alone and `tx_alive` having no PostgreSQL probe to
+    answer with; and `Unchanged` otherwise. `tx_open_after` is derived from it, `set_commits` is
+    down to `SET PASSWORD`, and `set_touches_autocommit` is the new sibling. `Ask` routes to
+    `Session::tx_alive` — the probe a failed DDL already used, so no new machinery — and the probe's
+    answer reaches the pill, which cannot ask, as the new `StmtOutcome::OkAndClosed`. The old
+    agreement test asserted only that the two consumers *had an opinion*, never which, which is
+    exactly how the `BEGIN` divergence stayed untested; it is
+    `the_pill_and_the_sessions_flag_never_disagree` now, over the direction.
+    **For a statement that *failed*, the list is necessary but not sufficient**, and
     `failure_committed(engine, sql, tx_alive)` is the pair: MySQL's implicit commit sits between the
     parser and the executor, so a parsed-but-rejected `DROP TABLE nosuch` (`ERROR 1051`) has
     committed while a syntax error over the same leading keyword (`ALTER TABLE t GARBAGE`,
@@ -2944,6 +3065,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     being untouched but gaining no statement. It is reported **only** where a savepoint rollback was
     issued and accepted (`Session::classify_fenced`) — a cancellation with no fence around it is
     still `Cancelled`, because nothing then guarantees the transaction survived.
+    **And a read on the pinned connection must not report a transaction it never opened.**
+    `TxState::on_statement` merges `Idle` with `Open` on the stated premise that the app issues
+    `BEGIN` lazily, so the first statement lands as the first statement of a fresh transaction —
+    true of `fetch_query`, which `ensure_tx` always precedes, and false of `Session::fetch_blob` and
+    `Session::refetch_rows`, which never call it. So between transactions, right after Commit with
+    the session still pinned and the grid still showing rows, dismissing the binary-cell panel while
+    the bytes were coming folded `Idle` into `Poisoned { stmts: 0 }`: the pill read "Tx aborted" for
+    a tab with no transaction, `Poisoned` is terminal for **every** later outcome including `Ok`,
+    `can_commit()` is false so the Commit segment is *hidden* rather than dimmed, and every exit the
+    UI offers — Rollback, closing the tab, switching mode or database — rolled back the genuine
+    transaction the user's next statements opened. A read cancelled *before dispatch* folded `Idle`
+    to `Open { stmts: 0 }` on both engines instead, so the pill read "0 Open", `guard_tx` prompted
+    about a transaction on every tab close, mode switch and database switch, and `ddl_blocking_tabs`
+    told a designer Apply to queue behind one the server never opened.
+    `read_outcome(in_tx, stmt)` is the answer, and `StmtOutcome::Untouched` — neutral from every
+    state — is what it returns when there is no transaction to have an opinion about. `in_tx` is the
+    session's own flag, read under the lock the `BEGIN` goes out on, so this is the connection's
+    answer rather than a guess about it, and `ConnectionLost` passes through: a dead connection is a
+    fact about the connection and the tab has to hear it. It is tested as the **composition** —
+    `read_outcome` and then the fold — because either half alone is green:
+    `on_statement(Postgres, "SELECT", Cancelled)` is *supposed* to poison, and the pinned session
+    has no test seam of its own at all, `Session::open` refusing SQLite so the in-memory backend
+    cannot reach it.
     `pill_text` is the status-bar string. It also owns what the user is told
     while a write **waits**: `write_blocking_tabs` (which of our own tabs' transactions a grid
     write could be queued behind — same connection scope as `ddl_blocking_tabs`, but excluding
@@ -4381,8 +4525,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   the `SAVEPOINT` gets the old, honest classification rather than a claim the fence cannot back, and
   `fetch_blob` also gained `fetch_query`'s pre-dispatch `cancel.is_cancelled()` check on **both**
   sides of the connection lock: the overwhelmingly common cancellation there is the panel being
-  dismissed, and `NotSent` is the one outcome that leaves the transaction alone with no bookkeeping
-  at all.
+  dismissed, and `NotSent` is the one outcome that leaves an *open* transaction alone with no
+  bookkeeping at all.
+  **Both reads also leave through `Outcome::into_read`, and that is the half the fence cannot
+  cover.** `fence_read` has no savepoint to set when there is no transaction to fence — PostgreSQL
+  answers `ERROR: SAVEPOINT can only be used in transaction blocks`, so `run_scope_sql` reports
+  `false` and the read runs unfenced, while MySQL accepts a `SAVEPOINT` outside a transaction
+  (measured on MariaDB 10.11.14) and so hid the whole class. Neither of these two paths calls
+  `ensure_tx`, so neither may report a transaction it did not open: `into_read` folds the outcome
+  through `tx::read_outcome` against the session's own `in_tx`, which is one method rather than a
+  line in each so a third read path inherits the rule instead of having to remember it. What that
+  prevents is a phantom transaction on the pill — `Poisoned` between transactions on PostgreSQL,
+  `Open { stmts: 0 }` for a read cancelled before dispatch on either engine — and the reasoning is
+  under `core::tx`.
   **Writing one back is three bindings, one per engine, and each is a decision about the wire rather
   than a spelling.** MySQL's `cell_param` sends `MyValue::Bytes` for both `CellEdit::Text` and
   `CellEdit::Bytes` — the protocol has one length-prefixed octet string and the server coerces it to
@@ -7624,7 +7779,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     live behind it, the launch goes through `accept_dialog_launch` because by then the modal that
     asked may be gone, and the outcome checks `generation` because closing the modal does not stop the
     export. Its three sentences are `export::files_note`/`files_cancel_note`/`files_failure_note`
-    rather than the dump's, because all three are about a folder. The picker is **its own read**
+    rather than the dump's, because all three are about a folder.
+    **Starting the export is `launch_files`, split out of `run_files` so it can be re-entered**,
+    which is what the replace confirm needs: a directory dialog has no "replace?" and the file names
+    are `file_plan`'s to choose, so the first run computes the collisions, writes nothing and comes
+    back `FilesOutcome::WouldReplace`. The view then raises the **shared** `Confirm` — not a fourth
+    bespoke overlay — with `dump::folder_replace_prompt` as its body, and Yes re-launches through
+    `launch_files` with `FilesRequest::approved`, which re-reads the folder and is the more correct
+    answer anyway, since it may have changed while the question stood. `approved` is **never** true
+    on the launch the picker starts, the folder's contents being knowable only off the UI thread.
+    The re-launch takes the same `accept_dialog_launch` the picker's own launch takes, with the
+    generation captured *before* the question, so a confirm answered after the modal moved to
+    another database cannot start an export into it. The picker is **its own read**
     (`SchemaActions::dump_tables` → `Db::fetch_table_list`, names only — `fetch_schema` would read
     every column of every table to print them), because it has to be right for a database the tree
     has never been expanded on, where a picker built from the cached tree would silently offer
@@ -11005,15 +11171,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     single file uses, so one sentence can name what none of them could carry. `FilesOutcome` is its
     own type rather than `DumpOutcome` because all three of its endings count **files in a folder**,
     which is the one thing the dump's three never have to say — and all three now carry
-    `replaced: Vec<String>` as well.
-    **What the export is about to overwrite is collected before it overwrites any of it.** A
-    pre-flight walks the plan's file names against the chosen directory and keeps the ones already
-    there, once, ahead of the loop: after the first `rename` the answer is contaminated by this
-    export's own output, and a `Cancelled` or `Failed` arm would report whichever prefix it happened
-    to reach. `select_directories()` has no overwrite prompt, so this is the folder form's only
-    equivalent of the save dialog's "replace?", and it is a disclosure rather than a refusal —
-    `export::files_note`/`files_cancel_note`/`files_failure_note` take the list and
-    `replaced_clause` renders it.
+    `replaced: Vec<String>` as well. Its fourth arm, `WouldReplace`, is not an ending at all: it is
+    the question below.
+    **What the export is about to overwrite is collected before it overwrites any of it, and it is
+    the guard as well as the report.** A pre-flight walks the plan's file names against the chosen
+    directory and keeps the ones already there, once, ahead of the loop: after the first `rename` the
+    answer is contaminated by this export's own output, and a `Cancelled` or `Failed` arm would
+    report whichever prefix it happened to reach. `select_directories()` has no overwrite prompt, so
+    this is the folder form's only equivalent of the save dialog's "replace?" — and for one range it
+    was a disclosure rather than a refusal, which meant the files were replaced and then named. Now
+    `core::dump::colliding_files` is the census (the one line here that touches a filesystem is the
+    `req.folder.join(f).is_file()` closure it takes) and `folder_verdict` is the decision: an
+    unapproved run with collisions returns `FilesOutcome::WouldReplace` **before the first
+    `rename`**, so the folder is untouched, and the modal asks. The list still reaches all three
+    reporting arms as well — `export::files_note`/`files_cancel_note`/`files_failure_note` take it
+    and `replaced_clause` renders it — because an approved run has still destroyed something worth
+    naming.
     **The per-file resolution is `core::dump::dump_verdict` too, not a second copy of it.** Those
     five arms were written out again here and the copy diverged in the one arm the extraction exists
     to protect: `WriteEnd::Failed` carries the writer's own words, which already begin
@@ -11864,6 +12037,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the
   per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
   a change to `affected != 1` fails a test rather than passing silently.
+  **The net counts rows, and cannot see which table they were in** — a limit worth knowing before
+  relying on it. A statement aimed at the *wrong* table that affects exactly one row passes
+  `one_row_verdict`, and the report is then correct about what it did. That is not hypothetical:
+  `edit::insert_target` counted only the base tables that got a key, so a join with one keyless
+  table read as a single-table result and offered **Delete row** on it, committing
+  `DELETE FROM db.orders WHERE id <=> 7` for a row of the join. The repair is in the gate
+  (`EditModel::origin_tables`, in `core::edit`) because there is nowhere else it could be: the gate
+  deciding *which* table a row action addresses is the only line, and any future widening of what
+  the grid offers to write has to be sound on its own rather than backed by the count.
 - **A destructive modal action guards its own launch, in the same step that launches it.** Import,
   the DDL preview's Apply, Server Activity's kill and the Export modal's own launch are the four,
   and they go through
@@ -11874,6 +12056,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   **two** bulk loads of the same file, both committing, with the second launch overwriting the
   cancellation token so the first could no longer be stopped. A new destructive action asks the same function; a guard re-derived per site
   is one that will be derived differently.
+  **The other way to fail this rule is to have no gesture to guard**, which is where the folder
+  export sat. The single-file export's consent is the save dialog's own "replace?";
+  `select_directories()` has none, and the per-table names are `dump::file_plan`'s rather than the
+  user's — so an export aimed at a directory holding hand-written `orders.sql` destroyed it with no
+  prompt, no `.bak` and no undo, and the collision list computed a line ahead of the loop had
+  nowhere to go but a sentence after the fact. The shape of the repair is the shape to copy where a
+  guard's *input* is only knowable off the UI thread: the first run answers
+  `FilesOutcome::WouldReplace` having written nothing, the view raises the **shared** `Confirm`, and
+  Yes re-launches with `FilesRequest::approved` through `accept_dialog_launch` — the same guard the
+  picker's own launch takes, with the generation captured before the question was asked.
   **`read_only` covers server administration, not only data writes** — an open question the
   codebase had never recorded, until the kill arrived and answered it by asking nothing at all. The
   flag is the protection with no "Run anyway", and terminating a live client session — rolling its
@@ -14950,7 +15142,11 @@ for keyboard nav.
   **deletes → updates → inserts**, each exactly 1 row). A keyless SQLite table opened through its
   rowid qualifies as writable here too, and the rowid column stages nothing: it is never editable,
   so it is absent from a new or cloned row by construction rather than by a rule anyone has to
-  apply.
+  apply. **"Single" means the result's *origin* tables, not its keyed ones**, and it did not for one
+  range: a join whose second table has no usable key read as a single-table result, so Delete row
+  was offered on a row of the join and deleted from the keyed table alone — which affects exactly 1
+  row, so nothing downstream could catch it. The gate is the only line here; `core::edit`'s
+  `insert_target` entry has it in full.
     - **New (INSERT):** toolbar **"+ Row"** appends a blank pending row (`gs.new_rows`), rendered below
       real rows with a `*` gutter marker + faint green wash, first editable cell opened. Cells stage
       via `stage_new` (unset = server default; `Some("")` clears to default). Unset cells preview
