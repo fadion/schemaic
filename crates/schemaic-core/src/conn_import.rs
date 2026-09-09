@@ -182,7 +182,23 @@ pub enum SkipReason {
 
 impl SkipReason {
     /// The explanation shown after the entry's name.
+    ///
+    /// **Redacted here, for the reason [`ImportScan::skip`] redacts the name:**
+    /// this is the render-facing accessor, and every variant that carries text
+    /// carries text a *parser* chose out of the entry. `Unreadable` is the one
+    /// that has already put a password on screen — `UrlError::BadPort` filled it
+    /// from a `postgres://admin:sec/ret@…` whose authority the parser mis-split
+    /// — and `UnsupportedEngine` carries a driver string a DSN wrote. Doing it
+    /// at the one place both are rendered is what stops a fourth variant
+    /// reopening it, which redacting at the constructor would not: the reason is
+    /// built by the caller and the name is not.
     pub fn message(&self) -> String {
+        redacted(&self.raw_message())
+    }
+
+    /// The explanation before redaction — for a caller that already knows the
+    /// text is its own, which is only this module's tests.
+    fn raw_message(&self) -> String {
         match self {
             SkipReason::UnsupportedEngine(d) => format!("unsupported engine ({d})"),
             SkipReason::NoServer => "no server to connect to".to_string(),
@@ -239,6 +255,34 @@ impl ImportScan {
     }
 }
 
+/// Split `after` — everything past a URL's `://` — into `(userinfo, the rest)`
+/// by the **last `@`**, and only then look for the path.
+///
+/// **The order is the whole point, and getting it backwards put a password on
+/// screen.** Both readers used to cut at the first `/` and search for `@` inside
+/// what was left, so `admin:sec/ret@db.example.com:5432/app` gave an authority
+/// of `admin:sec` with no `@` in it: `parse_server_url` read that as a
+/// host:port, `parse_port("sec")` failed, and `UrlError::BadPort` rendered
+/// *"sec" is not a port number* — the first three characters of the password,
+/// under the paste field. `redacted` made the identical mistake on the identical
+/// string, found no userinfo to redact, and put the **whole URL** into the
+/// not-imported list, where `merge_skipped` keeps it across every later scan.
+///
+/// A `/` is legal in a password and this module's doc says it *"Accepts more
+/// than a strict URL parser would, because the strings people actually hold are
+/// not strict URLs"*. `?` and `#` went the same way by a different door — both
+/// were cut before the authority was split — so those are searched here too, and
+/// only the part after the userinfo is treated as query and fragment.
+///
+/// The last `@`, not the first: an email address is a perfectly ordinary
+/// username.
+fn split_userinfo(after: &str) -> (Option<&str>, &str) {
+    match after.rfind('@') {
+        Some(i) => (Some(&after[..i]), &after[i + 1..]),
+        None => (None, after),
+    }
+}
+
 /// `name` with anything that could be a password replaced by `…`.
 ///
 /// Two shapes, because those are the two a failed entry's fallback name can
@@ -252,12 +296,13 @@ fn redacted(name: &str) -> String {
     // next `/`; a `:` inside it separates the login from the secret.
     let rest = match name.split_once("://") {
         Some((scheme, after)) => {
-            let end = after.find('/').unwrap_or(after.len());
-            match after[..end].rfind('@') {
-                Some(at) => {
-                    let userinfo = &after[..at];
-                    out.push_str(scheme);
-                    out.push_str("://");
+            out.push_str(scheme);
+            out.push_str("://");
+            // [`split_userinfo`]'s rule, which is the same one `parse_server_url`
+            // uses — the two must agree, or the entry the parser refused because
+            // of a `/` in the password is the entry whose password is shown.
+            match split_userinfo(after) {
+                (Some(userinfo), tail) => {
                     match userinfo.split_once(':') {
                         Some((user, _)) => {
                             out.push_str(user);
@@ -266,13 +311,9 @@ fn redacted(name: &str) -> String {
                         None => out.push_str(userinfo),
                     }
                     out.push('@');
-                    &after[at + 1..]
+                    tail
                 }
-                None => {
-                    out.push_str(scheme);
-                    out.push_str("://");
-                    after
-                }
+                (None, tail) => tail,
             }
         }
         None => name,
@@ -282,17 +323,45 @@ fn redacted(name: &str) -> String {
     // cannot swallow the rest of the line. `split_inclusive` keeps each
     // separator on the end of its own part, so the text is rebuilt exactly.
     const SEPS: [char; 4] = ['&', '?', ';', ' '];
+    // **A key, its `=` and its value can land in three different parts**, because
+    // ` ` is one of the separators. `Pwd = hunter2` — an ODBC-shaped DSN, which
+    // the paste field invites, `strip_env_assignment` existing to eat its
+    // `Server=` head — therefore never reached `split_once('=')` with the key and
+    // the value together, and passed through whole. `Password=hunter2` unspaced
+    // redacted correctly, which is why nothing caught it.
+    //
+    // `awaiting` is "a password key has been seen and its value has not": set by
+    // a bare `Pwd`, kept across a bare `=` or a `Pwd=` with nothing after it,
+    // and cleared by anything else — so `Pwd x y` redacts `x` and leaves `y`.
+    let mut awaiting = false;
     for part in rest.split_inclusive(SEPS) {
         let (body, sep) = match part.chars().next_back().filter(|c| SEPS.contains(c)) {
             Some(c) => (&part[..part.len() - c.len_utf8()], Some(c)),
             None => (part, None),
         };
         match body.split_once('=') {
-            Some((key, value)) if !value.is_empty() && is_password_key(key) => {
-                out.push_str(key);
-                out.push_str("=…");
+            Some((key, value)) => {
+                // An empty key is the `=` that follows a `Pwd` in the part before.
+                let secret = is_password_key(key.trim()) || (key.trim().is_empty() && awaiting);
+                if secret && !value.trim().is_empty() {
+                    out.push_str(key);
+                    out.push_str("=…");
+                    awaiting = false;
+                } else {
+                    out.push_str(body);
+                    awaiting = secret;
+                }
             }
-            _ => out.push_str(body),
+            None if awaiting && !body.trim().is_empty() => {
+                out.push('…');
+                awaiting = false;
+            }
+            None => {
+                out.push_str(body);
+                if !body.trim().is_empty() {
+                    awaiting = is_password_key(body.trim());
+                }
+            }
         }
         if let Some(c) = sep {
             out.push(c);
@@ -504,19 +573,19 @@ fn parse_sqlite_url(rest: &str) -> Result<Connection, UrlError> {
 
 fn parse_server_url(engine: &str, rest: &str) -> Result<Connection, UrlError> {
     let rest = rest.strip_prefix("//").unwrap_or(rest);
+    // **The userinfo comes off first**, before the fragment, the query and the
+    // path — all three of whose delimiters are legal password characters. See
+    // [`split_userinfo`]: cutting at the first `/` put three characters of a
+    // password into a *port* complaint on screen.
+    let (userinfo, rest) = split_userinfo(rest);
     let rest = rest.split('#').next().unwrap_or("");
     let (before_q, query) = match rest.split_once('?') {
         Some((a, b)) => (a, b),
         None => (rest, ""),
     };
-    let (authority, path) = match before_q.split_once('/') {
+    let (hostport, path) = match before_q.split_once('/') {
         Some((a, b)) => (a, b),
         None => (before_q, ""),
-    };
-
-    let (userinfo, hostport) = match authority.rfind('@') {
-        Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
-        None => (None, authority),
     };
     // libpq accepts `host1:5432,host2:5432`; a connection points at one server.
     let hostport = hostport.split(',').next().unwrap_or("");
@@ -2107,6 +2176,96 @@ mod tests {
             redacted("mysql://root:hunter2@h:3306/shop"),
             "mysql://root:…@h:3306/shop"
         );
+    }
+
+    /// **A `/`, `?` or `#` is a legal password character, and each one used to
+    /// send the parser to the wrong place.** All three were cut out of the
+    /// string before the authority was split, so `admin:sec/ret@host` had an
+    /// authority of `admin:sec` with no `@` in it — read as a host:port, whose
+    /// "port" was the first three characters of the password.
+    #[test]
+    fn a_password_may_hold_a_slash_a_question_mark_or_a_hash() {
+        for (raw, want) in [
+            (
+                "postgres://admin:sec/ret@db.example.com:5432/app",
+                "sec/ret",
+            ),
+            ("postgres://admin:pa?ss@db.example.com:5432/app", "pa?ss"),
+            ("postgres://admin:pa#ss@db.example.com:5432/app", "pa#ss"),
+        ] {
+            let c = url(raw);
+            assert_eq!(c.password, want, "{raw}");
+            assert_eq!(c.user, "admin", "{raw}");
+            assert_eq!(c.host, "db.example.com", "{raw}");
+            assert_eq!(c.port, 5432, "{raw}");
+            assert_eq!(c.database, "app", "{raw}");
+        }
+        // And the query really is still a query when the password has no `?`.
+        let c = url("postgres://admin:plain@h/d?sslmode=require");
+        assert_eq!(c.tls.mode, crate::connection::SslMode::Require);
+    }
+
+    /// The same string on the **display** side, which is the half that put the
+    /// secret on screen: `redacted` made the identical first-`/` mistake, found
+    /// no userinfo, and passed the whole URL through into the not-imported list
+    /// — where `merge_skipped` keeps it across every later scan.
+    #[test]
+    fn a_password_holding_a_delimiter_is_still_redacted() {
+        for raw in [
+            "postgres://admin:sec/ret@db.example.com:5432/app",
+            "postgres://admin:pa?ss@db.example.com/app",
+            "postgres://admin:pa#ss@db.example.com/app",
+        ] {
+            let out = redacted(raw);
+            for secret in ["sec", "ret", "pa?ss", "pa#ss"] {
+                assert!(!out.contains(secret), "{raw} -> {out}");
+            }
+            assert!(out.contains("db.example.com"), "still identifiable: {out}");
+        }
+    }
+
+    /// **A DSN whose `=` is spaced**, which the paste field invites — the module
+    /// has a `strip_env_assignment` precisely because people paste ODBC-shaped
+    /// strings. ` ` is one of the separators the parameter scan splits on, so
+    /// `Pwd = hunter2` landed as three parts and `split_once('=')` never saw the
+    /// key and the value together. `Password=hunter2` unspaced redacted
+    /// correctly, which is why nothing caught it.
+    #[test]
+    fn a_spaced_password_assignment_is_redacted_too() {
+        for raw in [
+            "Server=h;Database=d;Pwd = hunter2",
+            "Server=h;Database=d;Password = hunter2",
+            "Server=h;Database=d;Pwd =hunter2",
+            "Server=h;Database=d;Pwd= hunter2",
+        ] {
+            let out = redacted(raw);
+            assert!(!out.contains("hunter2"), "{raw} -> {out}");
+            assert!(out.contains("Server=h"), "{raw} -> {out}");
+        }
+        // And a bare word after a *non*-password key is left alone, so the
+        // carry-over cannot eat an ordinary value.
+        assert_eq!(
+            redacted("Server=h;Database = shop;User = app"),
+            "Server=h;Database = shop;User = app"
+        );
+    }
+
+    /// **The reason is rendered beside the name and was never redacted.**
+    /// `skip` redacts the name at the point it is made, and says so in its own
+    /// doc; `SkipReason` carries parser-chosen text through a second accessor
+    /// that the modal renders in the same line. `UrlError::BadPort` filled it
+    /// from a password.
+    #[test]
+    fn a_skip_reason_is_redacted_where_it_is_rendered() {
+        let r = SkipReason::Unreadable("could not parse postgres://admin:hunter2@h/d".to_string());
+        assert!(!r.message().contains("hunter2"), "{}", r.message());
+        // The half that must survive: a reason with nothing secret in it reads
+        // exactly as it did.
+        assert_eq!(
+            SkipReason::UnsupportedEngine("oracle.jdbc.OracleDriver".to_string()).message(),
+            "unsupported engine (oracle.jdbc.OracleDriver)"
+        );
+        assert_eq!(SkipReason::NoServer.message(), "no server to connect to");
     }
 
     #[test]
