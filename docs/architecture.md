@@ -287,7 +287,14 @@ existing prose was left alone.
     and wrong when it is handed a script — `near 'FROM t2'` names a word every statement has, so the
     fix scoped to the first one, a working statement that Accept would then overwrite while the
     broken one stayed broken. A token that appears twice identifies nothing, so `repeats_ci` sends
-    it back to the whole-buffer fallback. `problems_in_range` is its companion for the
+    it back to the whole-buffer fallback.
+    **`code_names` is that same scan reduced to a yes/no, and it is `pub` for a caller outside this
+    crate.** `db::sqlite`'s introspection needs to know which triggers name a table — that is
+    `TableInfo::referring_ddl` — and a `contains` there matches the word inside a comment or a `'…'`
+    default and so refuses an edit for a trigger that does not mention the table at all. It is
+    `code_word_hits` and therefore the one boundary lexer, which is what keeps a *backend* from
+    growing a scanner of its own; `ddl::rebuild_strands_a_trigger` is the other caller, asking the
+    same question of a column name. `problems_in_range` is its companion for the
     editor's own diagnostics — every message touching a range, ordered, **deduplicated**, since the
     offline and DB-validated passes report an unknown column in the same words and the count reaches
     the user as "fix these 2 problems". Both of its arms are **half-open**, the zero-width one
@@ -1505,6 +1512,21 @@ existing prose was left alone.
     MySQL, whose `information_schema` resolves the escapes, yes on PostgreSQL (`pg_get_*`) and SQLite
     (`sqlite_master.sql`), where the eager read is the authority. `compare::CompareEntry::needs_source`
     is its one caller, and it replaced the `dialect == SqlDialect::MySql` that question was spelled as.
+    **Two more answer for the *comparison* rather than for any editor**, and both are about the
+    difference between an object and its address. `ref_schema_is_database` asks whether the namespace
+    a foreign key reports (`ForeignKeyInfo::ref_schema`) is the **database** the key lives in rather
+    than a namespace inside one: true on MySQL and MariaDB, whose
+    `KEY_COLUMN_USAGE.REFERENCED_TABLE_SCHEMA` *is* the database, so a key to a table in its own
+    database still names that database; false on PostgreSQL, whose namespace is part of the object,
+    and on SQLite, which has neither. `view_definition_is_qualified` asks whether the catalogue hands
+    a view's body back **rewritten and qualified** with the database it lives in — MySQL's
+    `VIEWS.VIEW_DEFINITION` turns `CREATE VIEW v AS SELECT id FROM t` in `shop` into
+    ``select `shop`.`t`.`id` AS `id` from `shop`.`t` ``, while `pg_get_viewdef` rewrites but
+    qualifies with the *schema* and SQLite stores the statement verbatim. Both are exhaustive
+    `match`es, both have `compare::SchemaComparison::of` as their one caller, and the consequence of
+    getting either wrong is written down where it lands: two identical databases differ in every
+    object holding one, and the migration carries the right database's name into a statement that
+    runs against the left.
     `supports_database_editing` and `supports_namespace_editing` are the newest pair, for the
     **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL and
     PostgreSQL, and PostgreSQL's `CREATE`/`DROP SCHEMA`. They are two predicates rather than one
@@ -1704,14 +1726,46 @@ existing prose was left alone.
     the plan used to *succeed* and the table then rejected every write. The route that does work is
     offered instead: a rename **on its own** is `ALTER TABLE … RENAME COLUMN`
     (`supports_change` + `is_rename_only`), which re-points every view and trigger for us.
+    **And that refusal now looks one table over**, because the identical failure lands there and
+    nothing was watching it. `TableInfo::referring_ddl` is the `CREATE` text of triggers on *other*
+    tables whose SQL names this one — never replayed by a rebuild and never dropped by one, and
+    therefore never *rewritten* by one either. A trigger declared `AFTER INSERT ON other` whose body
+    reads `UPDATE t SET b = 'hit'` survives a rebuild of `t` that renamed `b`, so the plan succeeds,
+    the report says it applied, and the next `INSERT INTO other` fails *no such column: b*: `other`
+    now rejects every insert and nothing said so (`db::sqlite`'s
+    `a_trigger_on_another_table_is_seen_by_the_rebuilds_refusal`, measured against a real in-memory
+    database). That half is asked **per moved column and per trigger** — `moved_columns` returns all
+    of them rather than the first, since the first moved column is not necessarily the one a given
+    trigger spells, and refusing on any trigger that merely names the *table* would withhold edits
+    that are fine — and each match goes through `intel::code_names`, so a mention in a comment or a
+    string literal is not one. `column_moved` stays as the thin first-phrase wrapper for the callers
+    that only need something to say.
     It also withholds a rebuild of a table whose *declaration* says more than the model can restate
     (`rebuild_cannot_restate`, over `unrestatable_sqlite_clauses`): a foreign key's `DEFERRABLE`, a
-    column's `ON CONFLICT`, a `DESC` primary-key column. What introspection doesn't model, the
+    column's `ON CONFLICT`, a `DESC` primary-key column, and a `COLLATE` **inside** a
+    `PRIMARY KEY ( … )` group. What introspection doesn't model, the
     rebuild deletes — and because the draft is built from the same incomplete model, `diff` reads
     the untouched draft as a no-op, so no round-trip check can see the loss either. Each was
     measured deleted by a plan that reported success, and each changes what the table *does*. The
     scan is the shared boundary lexer's and covers the table body only, so an **index** key's `DESC`
     — which the model does carry (`IndexColumn::descending`) and does re-emit — is not a refusal.
+    **And it is positional: each word asks where it is, not merely whether it is there.** A refusal
+    here is permanent — `unsupported()` is non-empty for *every* rebuild of the table, so the
+    designer opens on a table nobody has touched with Apply disabled and a clause named that the
+    declaration does not contain — which is why a false refusal costs far more than a needless
+    rebuild. Measured on 3.50.4, `conflict` and `desc` are both accepted as bare column names and
+    `PRIMARY KEY (desc)` is accepted as a key on one, so `CONFLICT` counts only directly after `ON`
+    and `DESC` only as a non-first word of its comma-separated group (`PRIMARY KEY (a DESC)` is a
+    direction, `PRIMARY KEY (desc)` a column). `COLLATE` is positional for a different reason: a
+    column's own collation is `ColumnInfo::collation` and an index key's is `IndexColumn::collation`,
+    both modelled and both round-tripped, and the *key's* is the one place it has nowhere to go —
+    `is_primary()` filters the key's index out of the draft and the `Vec<String>` that replaces it
+    has no field for one. `PRIMARY KEY (email COLLATE NOCASE)` came back as `PRIMARY KEY ("email")`
+    and the key started comparing in `BINARY`: measured on 3.50.4, with `'A@x'` already present,
+    `'a@x'` is refused *UNIQUE constraint failed* before the rebuild and accepted after it.
+    `DEFERRABLE` needs no position, and not by luck of the scan — SQLite refuses it as a bare column
+    name (*near "deferrable": syntax error*), so the only way it reaches code is as the clause
+    (`a_primary_keys_collation_is_withheld`, `a_column_named_after_a_clause_is_still_a_column`).
     `Change::RebuildTable(Box<Rebuild>)` is how it reaches a plan: `diff` inserts one at the
     **front** of the set the moment that set holds a change SQLite has no statement of its own for,
     and that one change performs the whole set. It sits *beside* the changes it performs rather than
@@ -1735,13 +1789,22 @@ existing prose was left alone.
     therefore drops it for SQLite, so a native add would silently lose the counter the rebuild's
     table builder can place; a constant default if there is one (*"Cannot add a column with
     non-constant default"*); and `NOT NULL` requires a non-null default (*"Cannot add a NOT NULL
-    column with default value NULL"*). Two deliberate non-rules: **uniqueness** isn't on
+    column with default value NULL"*). One deliberate non-rule and one that is narrower than it
+    reads: **uniqueness** isn't on
     `ColumnInfo` at all — it arrives as an index, which has no native arm and takes the set back to
     a rebuild by itself, and that is a fact about *this gate* rather than about SQLite, which
     refuses only an inline `UNIQUE` in the column definition and would take a native add followed by
-    a `CREATE UNIQUE INDEX` quite happily — and a **generated** column *is* addable, since the
-    emitter writes no `VIRTUAL`/`STORED` keyword so SQLite's own default (`VIRTUAL`) applies and
-    `STORED` is the form the engine refuses; it carries its expression instead of a default, so the
+    a `CREATE UNIQUE INDEX` quite happily — while a **`VIRTUAL` generated** column is addable, which
+    is not the same claim as "a generated column is". The justification used to be that the emitter
+    writes no `VIRTUAL`/`STORED` keyword, so SQLite's own default (`VIRTUAL`) applies — and the
+    emitter does write it: `ColumnInfo::definition_sql` emits ` STORED` for a SQLite column whose
+    `generated_stored` is set, a line added deliberately so a `STORED` column survives a rebuild,
+    with the flag round-tripped from `table_xinfo`'s `hidden == 3`. So the predicate and the emitter
+    disagreed about what the statement would say, and the engine refuses *"cannot add a STORED
+    column"* on any table that has rows — through `run_ddl` a rolled-back plan with a confusing
+    message, through Copy or Open in editor a two-column add that half-applies
+    (`a_stored_generated_column_is_not_a_native_add`). Either way a generated column carries its
+    expression instead of a default, so the
     null-default rule has nothing to reach. `sqlite_constant_default` decides the default: the `CURRENT_TIME`/
     `CURRENT_DATE`/`CURRENT_TIMESTAMP` keywords and anything parenthesised are not constants (the
     paren test also catches a bare `now()`, which isn't a legal `DEFAULT` there at all), and the
@@ -1883,9 +1946,28 @@ existing prose was left alone.
     same distinctions — SQLite keeps `COLLATE`, the generated expression (with `STORED` when
     `generated_stored`, since its default is `VIRTUAL`), `NOT NULL` and `DEFAULT`, parenthesising an
     expression default because `pragma_table_xinfo` strips the parentheses the grammar requires
-    (`schema::is_bare_sqlite_default`), and drops `AUTO_INCREMENT`, `ON UPDATE` and the column
-    comment (`ddl::sqlite_create_tests`). **That parenthesis question is balanced, not two-ended.**
-    `is_bare_sqlite_default` asked `starts_with('(') && ends_with(')')`, and the pragma strips only
+    (`schema::is_bare_default`), and drops `AUTO_INCREMENT`, `ON UPDATE` and the column
+    comment (`ddl::sqlite_create_tests`).
+    **That parenthesis is not SQLite's alone**, which is why the predicate is
+    `is_bare_default(d, dialect)` and answers for all three engines rather than for one. MySQL 8
+    prints an expression default parenthesised in `SHOW CREATE TABLE` — the runnable form — and does
+    *not* in `information_schema.COLUMNS.COLUMN_DEFAULT`, so
+    `b varchar(30) DEFAULT (CONCAT('a','c'))` restated from the model as `DEFAULT concat(…)` is
+    `ERROR 1064` (measured on 8.4.11, where the wrapped form is accepted); MariaDB 10.11.14 accepts
+    both and normalises the pair away, so one answer serves the family. Over-wrapping is not free in
+    the other direction — MySQL reads `DEFAULT (7)` as an *expression* default rather than a literal
+    one — so the predicate states the grammar positively per dialect: a string or blob literal, a
+    signed number, `NULL`/`TRUE`/`FALSE` and the `CURRENT_*` keywords everywhere, plus on MySQL its
+    `b'…'` bit literal, the `CURRENT_TIMESTAMP` family's optional precision, and the character-set
+    introducer its own catalogue writes (`_utf8mb3'draft'`, which is how MySQL 8 reports a *literal*
+    it recorded as an expression default — part of the literal, not a reason to re-wrap it). On
+    PostgreSQL everything answers `true` and nothing is ever wrapped, `pg_get_expr` returning what
+    the grammar takes bare. The test module is `schema::default_clause_tests`, no longer SQLite's
+    alone (`a_mysql_expression_default_is_parenthesised`,
+    `a_mysql_expression_default_is_wrapped_whatever_shape_it_is`).
+    **And the question is balanced, not two-ended.**
+    It asked `starts_with('(') && ends_with(')')` back when it was `is_bare_sqlite_default`, and the
+    pragma strips only
     the *outer* pair — so `DEFAULT ((1+2)*(3+4))` arrives as `(1+2)*(3+4)` and `DEFAULT (('x')||('y'))`
     as `('x')||('y')`: a paren at each end, and an expression between them. Called bare,
     `definition_sql` re-emitted them without the wrapper and SQLite refuses the result (`near "||":
@@ -1897,7 +1979,29 @@ existing prose was left alone.
     helper, so a paren inside a string literal is not a paren
     (`a_parenthesised_pair_that_is_not_one_group_still_needs_wrapping`). Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
-    after). `normalize_type`/`types_equal` + `defaults_equal` are the reason a designer
+    after), and **the column clauses inside that are ordered by their dependencies rather than
+    grouped by change kind** — `ColumnClause` carries the name a clause makes available and the name
+    its `AFTER` anchors on, `anchor_of` reads the second off a `Position`, and
+    `ordered_column_clauses` is the walk. MySQL applies the clauses of one `ALTER TABLE` in order, so
+    an anchor is evaluated against the table as it stands at that clause. The emitter used to emit
+    all the changes and then all the adds, under a comment that read the constraint backwards —
+    *"adds come last so a new column's `AFTER` can name one added earlier"* — which is what makes an
+    **add**'s anchor safe and an **alter**'s impossible: on `t(a int, b int)`, adding `c`, moving it
+    first and then moving `b` above `a` gives `apply_positions` a target of `[c, b, a]`, and the
+    statement came out `MODIFY COLUMN b int AFTER c, ADD COLUMN c int FIRST`, which MariaDB 10.11.14
+    and MySQL 8.4.11 both answer `ERROR 1054 Unknown column 'c' in 't'` — naming a column the user
+    can see on the screen, and on an engine whose DDL does not roll back, so on a plan with
+    statements in front of it the refusal is not merely a refusal. The naive swap (adds first) is
+    wrong in the other direction, a new column anchored `AFTER` a column being *renamed* needing the
+    `CHANGE COLUMN` ahead of it — so what this reproduces is `apply_positions`' own simulation rather
+    than any kind's precedence. It is **stable**: a clause with nothing to wait for keeps its place,
+    so a change set with no anchor on a new name emits exactly what it emitted before. A cycle cannot
+    come out of `apply_positions`, which assigns positions by walking one linear target order; if one
+    ever arrives the remaining clauses go out in input order rather than being dropped or looped
+    over, the server's refusal being a better outcome than a silently shortened statement
+    (`a_move_anchored_on_a_new_column_is_emitted_after_the_add`,
+    `an_add_anchored_on_a_renamed_column_is_emitted_after_the_rename`).
+    `normalize_type`/`types_equal` + `defaults_equal` are the reason a designer
     opens clean — `int(11)` ≡ `int`, `character varying(45)` ≡ `varchar(45)`. **The
     round-trip gate is test-enforced**: `TableDraft::from_table(t)` diffed against `t`
     must be empty over captured fixtures from classicmodels/sakila/employees/world +
@@ -2228,6 +2332,43 @@ existing prose was left alone.
     `ChangeSet::flavour` `Unknown`, which is the reading the single-object editors already get and
     costs nothing here because the divergence is `ALTER TABLE`'s. Swapping the pair is the caller's
     job and reverses all of it.
+    **The right side is read as if it had come from the left side's database, before anything is
+    compared.** On MySQL two of the fields the differ reads carry the name of the database they were
+    read from rather than anything about the object: a foreign key's `ForeignKeyInfo::ref_schema` is
+    `REFERENCED_TABLE_SCHEMA`, which on that engine *is* the database, and a view's
+    `TableInfo::view_definition` is the server's rewritten body, qualified throughout. Left alone,
+    every table holding a key and every view came out `Differing` between two identical databases —
+    and the half that costs data is that the plan runs against the **left** database while naming the
+    **right** one: `ADD CONSTRAINT … REFERENCES <right>.parent` puts the left database's referential
+    integrity in another database, and `CREATE OR REPLACE VIEW` re-points the left view at the right
+    database's rows. Neither is named anywhere in the preview, and `destructive()` is empty for both.
+    `as_read_from` is the pass that closes it, and it **re-addresses rather than strips**: MySQL
+    allows a key into another database, so one of those genuinely *is* a difference, and `ddl`'s
+    foreign-key rule that an absent namespace matches an explicit one would have made a
+    cross-database key compare equal to a local one. A re-addressed right side is also the side the
+    plan is *built from*, so the statement that comes out already names the database it will run
+    against instead of leaving the server to guess. The rewrite is `requalify`, over
+    `intel::code_word_hits` — the one boundary lexer — and it takes only a hit with no `.` in front
+    of it and a `.` behind it, so `` `t`.`shop` `` stays the column it is
+    (`a_column_named_after_the_database_is_left_alone`). Which of the two fields to re-address is
+    asked of two capability predicates rather than of the engine (`ddl::ref_schema_is_database`,
+    `ddl::view_definition_is_qualified`), and the whole pass borrows rather than clones when there is
+    nothing to do — every PostgreSQL and SQLite comparison, a pair whose two databases are named the
+    same, and any side that did not record where it came from
+    (`the_foreign_key_pair_differs_only_in_where_it_was_read_from`). Where a schema was read from is
+    `DbSchema::database`, which the model records nowhere else. The **left** side is never touched:
+    it is the target, and it is already in its own terms.
+    **A view's `DEFINER` is deliberately not compared at all**, on either side (`without_definer`),
+    which is a different judgement from the one above — the same "the model cannot vouch for this"
+    reading `CompareEntry::uncertain` takes of a lossy index, a definer being a *server* account that
+    does not compare across two servers. And the consequence of comparing it is not a spurious row:
+    the `CREATE OR REPLACE DEFINER = <the other server's account> VIEW …` that follows is *accepted*
+    by the left server, after which every `SELECT` on the view is `ERROR 1449 … does not exist` and
+    the view is permanently unusable (measured on MariaDB 10.11.14). The other side of the trade is
+    named rather than hidden: a deliberate definer change is not migrated, and a view replaced for
+    some other reason takes the running account — a feature not offered rather than an object
+    destroyed (`a_view_definer_neither_differs_nor_rides_into_the_statement`). `definer` is `None` on
+    every engine but MySQL's, so this needs no predicate of its own.
     **One dialect, so one engine.** `SchemaComparison::of(left, right, dialect)` takes a single
     `SqlDialect` because a `ChangeSet` carries one, and a `DbSchema` has no dialect of its own to
     disagree with it (only `flavour`). That single parameter is the honest encoding of a real limit
@@ -3384,6 +3525,17 @@ existing prose was left alone.
     nothing here — `DROP TABLE` leaves a view that selects from the table in place, SQLite resolving
     a view's references when it runs rather than when it is declared, and the table returns under
     the same name before the transaction ends.
+    **`TableInfo::referring_ddl` is its sibling, and its opposite in both directions**: the `CREATE`
+    text of triggers on *other* tables whose SQL names this one, SQLite only and empty everywhere
+    else, filled by `sqlite::all_trigger_sql` and matched through `intel::code_names`. These are not
+    dropped by a rebuild and never replayed — and they are also never *rewritten* by one, which is
+    the whole reason the field exists: SQLite's own `ALTER TABLE … RENAME COLUMN` rewrites every
+    trigger in the database that names the column, while the twelve-step rebuild renames the table
+    underneath them and leaves their text exactly as it was, so a trigger on `other` goes on naming a
+    column of `t` that is gone and `other` starts refusing every write. `ddl`'s
+    `rebuild_strands_a_trigger` is the one reader, and the text is verbatim for the reason
+    `dependent_ddl`'s is — a refusal built on a parse that doesn't round-trip triggers is the same
+    argument against.
     **The tree's Generate DDL entries are two `DbSchema` methods, one per altitude.**
     `create_ddl_script(schema, dialect)` emits one namespace in **dependency order** — the
     standalone types, then base tables, then views, then the sequences that stand on their own —
@@ -3507,6 +3659,18 @@ existing prose was left alone.
     the one "qualify unless `public`, then quote both halves" builder every one of these (and
     `RoutineInfo::signature_sql`) addresses its object through, and `find_by_ns` the one
     namespace-lookup rule behind every `DbSchema::find_*`.
+    **`DbSchema::database` is the schema's own address, and deliberately not part of the schema.**
+    It is *not* stamped onto the objects in it — `TableInfo::schema` is `None` on MySQL precisely
+    because a database *is* its namespace there — and it rides on the struct because exactly one
+    reader has to subtract an object's own address before comparing it against another database's,
+    and the model records that address nowhere else. MySQL's `collect_schema` stamps it with the
+    database it was handed, that being the engine where a foreign key's `ref_schema` and a view's
+    rewritten `view_definition` both come back qualified with the reading database; PostgreSQL's
+    `collect_schema` leaves it `None` on purpose — and says so in a comment on the literal, since
+    nothing that engine reports carries an address, so filling it would cost a `current_database()`
+    round trip to change no answer. `None` also means "the reader did not record it", which is the honest
+    answer for a hand-built schema, and a side with no address is compared exactly as it arrived
+    rather than guessed at — see `compare.rs`'s `as_read_from`.
     **`SchemaState::begin_refresh` is why a refresh doesn't blank the tree.** Re-introspection
     is whole-database on both engines and always will be — the cost is ~10 catalogue
     round-trips, not the rows, so scoping it to one table would optimise the term that doesn't
@@ -4617,7 +4781,17 @@ existing prose was left alone.
   MySQL's verbatim is a **syntax error**, and unescaping MariaDB's would eat the
   backslash out of `'it\'s'`, so it is gated on the `mariadb` flag and measured against
   `SHOW CREATE TABLE`. It also has to run *before* `ddl::check_predicate`, whose paren
-  scan reads string boundaries that `\'new\'` doesn't have;
+  scan reads string boundaries that `\'new\'` doesn't have.
+  **`CHECK_CLAUSE` is not the only column carrying that extra level**, which is why the unescaper
+  has a second caller: `COLUMN_DEFAULT` carries it too for an *expression* default, the arm `EXTRA`
+  flags `DEFAULT_GENERATED`. `DEFAULT (CONCAT('a','c'))` comes back as
+  `concat(_utf8mb3\'a\',_utf8mb3\'c\')` (HEX-verified), and restating that is `ERROR 1064` rather
+  than a subtly different default — so that arm of `mysql_column` routes through
+  `mysql_check_clause`, which short-circuits on MariaDB for the same reason it always did. The
+  character-set introducer survives the unescaping, and where the whole value is one literal
+  (`_utf8mb3'draft'`, which is how MySQL 8 reports a string it recorded as an expression default)
+  `schema::is_bare_default` reads it as the literal it is rather than wrapping it for having a
+  prefix;
   **The standalone PG objects** come from `pg_types` (enums *and* domains in one `pg_type`
   scan — both live there, `typtype` `e`/`d`) and `pg_sequences`, each folded by a pure,
   tested half (`pg_fold_types`/`pg_sequence_row`). Four decisions are written down because
@@ -5374,6 +5548,13 @@ existing prose was left alone.
   `view_body_of` already refuses in. `fetch_schema` fills `triggers` for a **view** as well as a
   table — an `INSTEAD OF` trigger is the only way a SQLite view is written to — while
   `dependent_ddl` stays a table's business, nothing rebuilding a view.
+  **`all_trigger_sql` is a third read of the same catalogue, and it is whole-database on purpose.**
+  `trigger_sql` answers per table, which is the wrong shape for `TableInfo::referring_ddl`: the
+  question there is which triggers *anywhere* name this table, and the table's own are exactly the
+  ones to leave out. So one `sqlite_master` scan runs ahead of the per-table loop and every table
+  filters that one list — by owner, then through `intel::code_names`, so a mention in a comment or
+  in a `'…'` default is not one. The cost is one extra scan per introspection rather than one query
+  per table, which is what asking the same question N times would have been.
   A view now also gets `view_options: Some(…)` rather than `None`. SQLite has none of the options
   the other two carry — no definer, security type, algorithm, storage parameters or check option —
   and exactly one the re-create behind every view edit would otherwise drop: the explicit column
@@ -11944,7 +12125,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`, and `users::redact_secrets`, where
   a span ended early leaves the tail of a password hash on screen). Never hand-roll a second
-  scanner — five drifting copies was the original bug. **It's dialect-aware:** `skip_noncode`/
+  scanner — five drifting copies was the original bug. **It binds outside `schemaic-core` too**:
+  `intel::code_names` is `pub` so a *backend* can ask "does this SQL name this identifier, in code"
+  through the same lexer rather than reaching for a `contains` — `db::sqlite`'s introspection asks
+  it of every trigger in the database to fill `TableInfo::referring_ddl`.
+  **It's dialect-aware:** `skip_noncode`/
   `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`/
   `first_statement`, `statement_bounds_open` (the resumable form the script splitter feeds),
   `executable_statements`/`executable_range`/`executable_at`,

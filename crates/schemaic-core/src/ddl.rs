@@ -8214,14 +8214,17 @@ fn rebuild_refuses_a_virtual_table(current: &TableInfo) -> Option<String> {
 /// no field to hold it is gone the moment the plan succeeds — and because the
 /// draft is built from the same incomplete model, [`diff`] reads the untouched
 /// draft as a no-op and no round-trip check can see the loss either. Each of the
-/// three below was measured deleted on 3.46.0 by a plan that reported success,
-/// and each changes what the table *does*: a deferred foreign key starts refusing
-/// the mid-transaction insert it exists to allow, a conflict clause turns a
-/// quietly replaced row into an aborted statement, and a descending key column
-/// comes back ascending — which on a lone `INTEGER PRIMARY KEY` is the difference
-/// between the rowid itself and a table with a separate index.
+/// **four** [`unrestatable_sqlite_clauses`] names was measured deleted by a plan
+/// that reported success, and each changes what the table *does*: a deferred
+/// foreign key starts refusing the mid-transaction insert it exists to allow, a
+/// conflict clause turns a quietly replaced row into an aborted statement, a
+/// descending key column comes back ascending — which on a lone
+/// `INTEGER PRIMARY KEY` is the difference between the rowid itself and a table
+/// with a separate index — and a primary key's own `COLLATE` comes back
+/// `BINARY`, so a case-insensitive key starts accepting both spellings. The
+/// first three were measured on 3.46.0 and the fourth on 3.50.4.
 ///
-/// Refusing is the honest half of the pair: the alternative is three model
+/// Refusing is the honest half of the pair: the alternative is four model
 /// additions, and until they exist the preview says which clause it cannot write
 /// rather than writing a table that merely looks like the one that was there.
 fn rebuild_cannot_restate(current: &TableInfo) -> Option<String> {
