@@ -919,6 +919,19 @@ fn recovery_notice(path: &Path, err: &str) -> String {
     )
 }
 
+/// Queue a startup notice for the modal that drains [`RECOVERIES`].
+///
+/// Not only for a config file that failed to parse. Everything loaded before the
+/// window is drawn shares one problem — there is no surface yet to say anything
+/// on — and one channel is better than each loader inventing its own. The
+/// keyring is the second caller: a locked one is *the* reason connections stop
+/// authenticating, and it used to reach neither a banner nor a log line.
+pub fn queue_notice(notice: String) {
+    if let Ok(mut v) = RECOVERIES.lock() {
+        v.push(notice);
+    }
+}
+
 /// The user-facing notice for a config file that was **gone** and came back off
 /// a sibling.
 ///

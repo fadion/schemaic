@@ -1086,7 +1086,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
         }
         if changed {
-            secrets::save_connections(&cf);
+            // Before the window exists, so it goes to the same startup channel
+            // the config-recovery modal drains rather than to a surface that is
+            // not there yet.
+            if let Some(notice) = secrets::save_connections(&cf) {
+                persist::queue_notice(notice);
+            }
         }
     }
     // Settle the AI data-access level for every connection saved before it
@@ -1114,7 +1119,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
         }
         if changed {
-            secrets::save_connections(&cf);
+            // Before the window exists, so it goes to the same startup channel
+            // the config-recovery modal drains rather than to a surface that is
+            // not there yet.
+            if let Some(notice) = secrets::save_connections(&cf) {
+                persist::queue_notice(notice);
+            }
         }
     }
     let active_id = Connection::startup_active_id(cf.active, &cf.connections);
@@ -8219,7 +8229,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             connections: connections.get_untracked(),
             active,
         };
-        secrets::save_connections(&file);
+        // **Every mid-session save funnels through here**, which is why the
+        // keyring's bad news is surfaced here: a save that had to leave a
+        // password in plain text, or could not delete one the user cleared, used
+        // to say nothing at all. `save_connections` returns each distinct notice
+        // once per session, so a keyring that stays down does not raise a modal
+        // on every read-only toggle.
+        if let Some(notice) = secrets::save_connections(&file) {
+            error_modal_text.set(Some(notice));
+            error_modal_open.set(true);
+        }
     };
 
     // Flip a connection's read-only flag and persist (the status-bar shortcut).

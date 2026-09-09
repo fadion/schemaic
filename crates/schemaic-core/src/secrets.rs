@@ -125,8 +125,19 @@ pub trait SecretStore {
     /// Store a secret, returning `false` if the store is unavailable / the write
     /// failed (so the caller can keep the plaintext as a fallback).
     fn set(&self, account: &str, secret: &str) -> bool;
-    /// Remove a stored secret (best effort; a missing entry is not an error).
-    fn delete(&self, account: &str);
+    /// Remove a stored secret, returning whether the entry is now **definitely
+    /// gone** — `true` for a delete that succeeded and for one that found
+    /// nothing, `false` when the store could not be reached.
+    ///
+    /// It used to return `()`, "best effort; a missing entry is not an error",
+    /// while its sibling `set` returned `bool` for exactly the reason this now
+    /// does. The asymmetry was the defect: [`sanitize_file`]'s own doc promises
+    /// that *clearing a password can't be undone by a later hydrate*, and that
+    /// promise rests entirely on this call — a delete that quietly failed left
+    /// the entry in the keyring while the disk copy said empty, so the next
+    /// launch hydrated the deleted password back in and the connection went on
+    /// authenticating with a credential the user had removed.
+    fn delete(&self, account: &str) -> bool;
 }
 
 /// What a load learned about the store, which the matching save needs to know.
@@ -143,6 +154,27 @@ pub struct Hydration {
     /// in-memory fields are empty for a reason that has nothing to do with the
     /// user, so [`sanitize_file`] must not treat them as cleared.
     pub unreadable: Vec<(u64, SecretKind)>,
+    /// Secrets the store actually **held a value for** at load.
+    ///
+    /// What makes a refused delete worth reporting. Every empty field asks the
+    /// store to delete, and on a machine with no keyring at all every one of
+    /// those refusals is meaningless — there was nothing there. A refusal only
+    /// means *your clear did not take* for a field this load read a value out
+    /// of, and saying it for the others would be three false alarms per
+    /// connection on exactly the machines that already have a real problem.
+    pub stored: Vec<(u64, SecretKind)>,
+    /// One backend message from those failed reads, for the sentence the user
+    /// is shown.
+    ///
+    /// [`StoreError`]'s own doc says it *"carries the backend's message for
+    /// display"*, and the only site in the workspace that builds one from a real
+    /// backend used to drop it on a wildcard — so the app opened with every
+    /// password field blank, every connection failing with the server's own
+    /// *Access denied*, and nothing anywhere saying the keyring was the reason.
+    /// The user's rational next move is to conclude the passwords are gone and
+    /// retype them, and a misremembered one is then written over the still-intact
+    /// stored secret.
+    pub error: Option<String>,
 }
 
 impl Hydration {
@@ -151,10 +183,43 @@ impl Hydration {
         self.unreadable.iter().any(|&(i, k)| i == id && k == kind)
     }
 
+    /// Did the store hold a value for this one at load? See [`Hydration::stored`].
+    pub fn was_stored(&self, id: u64, kind: SecretKind) -> bool {
+        self.stored.iter().any(|&(i, k)| i == id && k == kind)
+    }
+
     /// Any secret at all failed to read — the app surfaces this, because it is
     /// the real reason connections stop authenticating.
     pub fn any_unreadable(&self) -> bool {
         !self.unreadable.is_empty()
+    }
+
+    /// What to tell the user when the keyring would not answer, or `None` when
+    /// it answered everything.
+    ///
+    /// **Both halves of the sentence are load-bearing.** "Unavailable this
+    /// session" is why the connections stopped working; "were not deleted" is
+    /// what stops the user retyping a half-remembered password over a stored one
+    /// that is perfectly intact. The wording lives here, with the fact, rather
+    /// than in whichever surface happens to show it — this used to have a
+    /// documented caller that did not exist, and the failure reached neither a
+    /// banner nor a log line.
+    pub fn notice(&self) -> Option<String> {
+        if !self.any_unreadable() {
+            return None;
+        }
+        let n = self.unreadable.len();
+        let reason = match &self.error {
+            Some(e) => format!(" ({e})"),
+            None => String::new(),
+        };
+        Some(format!(
+            "Schemaic could not read {n} saved {} from the OS keyring{reason}.\n\
+             Those passwords are unavailable this session and were **not** deleted — \
+             leave the fields blank and they will come back once the keyring is reachable. \
+             Typing a new one saves over the stored secret.",
+            crate::text::plural(n, "secret", "secrets"),
+        ))
     }
 
     /// Drop the entries `file` has since supplied a value for.
@@ -173,9 +238,11 @@ impl Hydration {
     }
 
     /// Drop every entry for a deleted connection, so a reused id can't inherit
-    /// its protection (the delete-on-empty branch exists for exactly that case).
+    /// its protection (the delete-on-empty branch exists for exactly that case)
+    /// or be reported against a stored secret that was its predecessor's.
     pub fn forget(&mut self, id: u64) {
         self.unreadable.retain(|&(i, _)| i != id);
+        self.stored.retain(|&(i, _)| i != id);
     }
 }
 
@@ -192,11 +259,25 @@ fn hydrate(conn: &mut Connection, store: &dyn SecretStore, out: &mut Hydration) 
     for kind in SecretKind::ALL {
         if field(conn, kind).is_empty() {
             match store.get(&account(conn.id, kind)) {
-                Ok(Some(v)) => set_field(conn, kind, v),
+                Ok(Some(v)) => {
+                    out.stored.push((conn.id, kind));
+                    set_field(conn, kind, v);
+                }
                 Ok(None) => {}
                 // Don't guess. The save path needs to know this field is empty
-                // because we couldn't read it, not because there's nothing there.
-                Err(_) => out.unreadable.push((conn.id, kind)),
+                // because we couldn't read it, not because there's nothing there
+                // — and the *reason* is what the user has to be told, so it is
+                // kept rather than dropped on a wildcard.
+                Err(e) => {
+                    tracing::warn!(
+                        conn = conn.id,
+                        kind = ?kind,
+                        error = %e,
+                        "could not read a secret from the OS keyring"
+                    );
+                    out.error.get_or_insert_with(|| e.0.clone());
+                    out.unreadable.push((conn.id, kind));
+                }
             }
         } else {
             // Plaintext already on disk → needs migration on the next save.
@@ -238,13 +319,20 @@ pub fn sanitize_file(
     file: &ConnectionsFile,
     store: &dyn SecretStore,
     hydration: &Hydration,
-) -> ConnectionsFile {
-    let mut disk = file.clone();
-    for conn in &mut disk.connections {
+) -> Sanitized {
+    let mut out = Sanitized {
+        file: file.clone(),
+        ..Sanitized::default()
+    };
+    for conn in &mut out.file.connections {
         // A secret this app no longer writes still has to be cleaned up on
         // whatever machine an older build wrote it — see
         // `RETIRED_SECRET_SUFFIXES`. Every save, not only a delete: a user who
         // typed a TLS key passphrase may never delete that connection.
+        //
+        // Not reported: this sweep runs on machines that never had one, so it
+        // has nothing to say when it cannot reach a store, and the next save
+        // retries it.
         for suffix in RETIRED_SECRET_SUFFIXES {
             store.delete(&retired_account(conn.id, suffix));
         }
@@ -257,24 +345,100 @@ pub fn sanitize_file(
                     // entry exactly as it was.
                     continue;
                 }
-                store.delete(&acct);
+                if !store.delete(&acct) && hydration.was_stored(conn.id, kind) {
+                    // The disk copy says empty and the keyring still holds the
+                    // old value, so the next hydrate would restore a password
+                    // the user deliberately cleared. The next save retries the
+                    // delete — the field stays empty and stays readable — but
+                    // until one lands the user has to be told the clear did not
+                    // take, or they meet it two launches later.
+                    //
+                    // Only for a field the load *read a value out of*: a refused
+                    // delete of an entry that was never there is not news, and
+                    // on a machine with no keyring every empty field would raise
+                    // one.
+                    out.undeleted.push((conn.id, kind));
+                }
             } else if store.set(&acct, &value) {
                 set_field(conn, kind, String::new());
+            } else {
+                // Store unavailable — keep the plaintext in the disk copy, which
+                // is the sanctioned fallback, and **say so**. It goes into the
+                // same folder the Settings modal offers an *Open folder* button
+                // for, next to the log a support request asks for.
+                out.in_the_clear.push((conn.id, kind));
             }
-            // else: store unavailable — keep the plaintext in the disk copy.
         }
     }
-    disk
+    out
 }
 
-/// Remove every stored secret for a deleted connection (best effort).
-pub fn forget(id: u64, store: &dyn SecretStore) {
+/// What a save learned while moving secrets into the store — the write-side
+/// counterpart of [`Hydration`].
+///
+/// Both lists used to be nothing at all: the sanitized file was returned and the
+/// two facts it had just established were discarded at the only call site. The
+/// app's stated invariant is that connection secrets live in the OS keyring and
+/// not in `connections.json`, so a machine where that is quietly untrue is
+/// exactly the machine whose user needs to hear it.
+#[derive(Clone, Debug, Default)]
+pub struct Sanitized {
+    /// The copy to write to disk.
+    pub file: ConnectionsFile,
+    /// Secrets the store would not take, so the disk copy carries them in the
+    /// clear.
+    pub in_the_clear: Vec<(u64, SecretKind)>,
+    /// Secrets the user cleared that the store would not delete, so the stored
+    /// entry outlives the blanked disk field.
+    pub undeleted: Vec<(u64, SecretKind)>,
+}
+
+impl Sanitized {
+    /// What to tell the user about this save, or `None` when it did what it says
+    /// on the tin.
+    ///
+    /// One sentence per fact, and each names the consequence rather than the
+    /// mechanism: the user cannot act on "the keyring returned an error", and
+    /// can act on "your passwords are in a file you are about to send someone".
+    pub fn notice(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.in_the_clear.is_empty() {
+            let n = self.in_the_clear.len();
+            parts.push(format!(
+                "Schemaic could not reach the OS keyring, so {n} {} \
+                 saved **in plain text** in `connections.json`.\n\
+                 That file is in the folder Settings → General's *Open folder* button opens, \
+                 beside the log — check before sharing it. Saving again once the keyring is \
+                 reachable moves them back in.",
+                crate::text::plural(n, "password was", "passwords were"),
+            ));
+        }
+        if !self.undeleted.is_empty() {
+            let n = self.undeleted.len();
+            parts.push(format!(
+                "{n} cleared {} still in the OS keyring — Schemaic could not delete {}.\n\
+                 The field is blank on disk, but the next launch will fill it back in. \
+                 Save again once the keyring is reachable.",
+                crate::text::plural(n, "password is", "passwords are"),
+                crate::text::plural(n, "it", "them"),
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+}
+
+/// Remove every stored secret for a deleted connection. Returns whether they are
+/// all definitely gone — `false` means at least one entry may still be in the
+/// keyring, which matters because connection ids are reused.
+pub fn forget(id: u64, store: &dyn SecretStore) -> bool {
+    let mut gone = true;
     for kind in SecretKind::ALL {
-        store.delete(&account(id, kind));
+        gone &= store.delete(&account(id, kind));
     }
     for suffix in RETIRED_SECRET_SUFFIXES {
-        store.delete(&retired_account(id, suffix));
+        gone &= store.delete(&retired_account(id, suffix));
     }
+    gone
 }
 
 #[cfg(test)]
@@ -337,8 +501,12 @@ mod tests {
                 .insert(account.to_string(), secret.to_string());
             true
         }
-        fn delete(&self, account: &str) {
+        fn delete(&self, account: &str) -> bool {
+            if !self.available.get() {
+                return false;
+            }
             self.map.borrow_mut().remove(account);
+            true
         }
     }
 
@@ -436,7 +604,7 @@ mod tests {
     /// Sanitize a file that wasn't hydrated from this store (the common case in
     /// these tests) — nothing is known to be unreadable.
     fn sanitize(file: &ConnectionsFile, store: &dyn SecretStore) -> ConnectionsFile {
-        sanitize_file(file, store, &Hydration::default())
+        sanitize_file(file, store, &Hydration::default()).file
     }
 
     fn hydrate_one(c: &mut Connection, store: &dyn SecretStore) -> Hydration {
@@ -503,6 +671,151 @@ mod tests {
         );
     }
 
+    /// **The failure has to reach the user, and with the backend's own words.**
+    /// `StoreError`'s doc says it carries the message for display, and the only
+    /// site in the workspace that builds one from a real backend dropped it on a
+    /// wildcard — so a locked keyring showed up as every password field blank,
+    /// every connection failing with the server's own *Access denied*, and
+    /// nothing anywhere naming the cause. `any_unreadable`'s own doc claimed the
+    /// app surfaced this; it had no caller at all.
+    #[test]
+    fn an_unreadable_keyring_reports_why_and_says_the_secrets_are_still_there() {
+        let store = MemStore::new();
+        let mut c = conn(7);
+        c.password = "s3cret".to_string();
+        let file = ConnectionsFile {
+            connections: vec![c],
+            active: Some(7),
+        };
+        let saved = sanitize(&file, &store);
+        assert_eq!(saved.connections[0].password, "");
+
+        store.set_available(false);
+        let mut reloaded = saved.clone();
+        let hydration = hydrate_file(&mut reloaded, &store);
+
+        assert!(hydration.any_unreadable());
+        assert!(
+            hydration.error.is_some(),
+            "the backend's reason is what the user is told"
+        );
+        let notice = hydration.notice().expect("there is something to say");
+        assert!(
+            notice.contains("not** deleted"),
+            "the half that stops the user retyping over an intact secret: {notice}"
+        );
+        assert!(
+            notice.contains(&hydration.error.clone().unwrap()),
+            "the backend's message reaches the sentence: {notice}"
+        );
+        // A store that answers everything has nothing to say.
+        store.set_available(true);
+        let mut fine = saved.clone();
+        assert_eq!(hydrate_file(&mut fine, &store).notice(), None);
+    }
+
+    /// The write side of the same silence (A3-L5-03). The plaintext fallback is
+    /// sanctioned; the user never being told is not — `connections.json` sits in
+    /// the folder Settings offers an *Open folder* button for, next to the log a
+    /// support request asks for.
+    #[test]
+    fn a_password_left_in_the_clear_is_reported_by_the_save_that_left_it() {
+        let store = MemStore::new();
+        store.set_available(false);
+        let mut c = conn(7);
+        c.password = "s3cret".to_string();
+        let file = ConnectionsFile {
+            connections: vec![c],
+            active: Some(7),
+        };
+        let out = sanitize_file(&file, &store, &Hydration::default());
+        assert_eq!(
+            out.file.connections[0].password, "s3cret",
+            "the fallback itself is unchanged — the credential is not lost"
+        );
+        assert_eq!(out.in_the_clear, vec![(7, SecretKind::DbPassword)]);
+        let notice = out.notice().expect("there is something to say");
+        assert!(notice.contains("plain text"), "{notice}");
+        assert!(notice.contains("connections.json"), "{notice}");
+
+        // And a working store says nothing.
+        store.set_available(true);
+        let out = sanitize_file(&file, &store, &Hydration::default());
+        assert!(out.in_the_clear.is_empty());
+        assert_eq!(out.notice(), None);
+    }
+
+    /// **A delete that quietly failed unclears a cleared password.**
+    /// `sanitize_file`'s own doc promises that clearing a password can't be
+    /// undone by a later hydrate, and that promise rested entirely on a call
+    /// that returned `()`. The disk copy said empty, the keyring still held the
+    /// value, and the next launch filled it back in.
+    #[test]
+    fn a_clear_that_the_keyring_refused_is_reported_and_retried() {
+        let store = MemStore::new();
+        let mut c = conn(7);
+        c.password = "s3cret".to_string();
+        let file = ConnectionsFile {
+            connections: vec![c],
+            active: Some(7),
+        };
+        let saved = sanitize(&file, &store);
+        assert_eq!(store.stored("conn.7.password").as_deref(), Some("s3cret"));
+
+        // Next launch: the load reads the password back, so the store is known
+        // to hold one. Nothing is unreadable — this load *worked* — so a later
+        // empty field really is a deliberate clear.
+        let mut loaded = saved.clone();
+        let hydration = hydrate_file(&mut loaded, &store);
+        assert!(hydration.was_stored(7, SecretKind::DbPassword));
+        assert!(!hydration.any_unreadable());
+
+        // The user clears the field and the store then refuses the delete.
+        store.set_available(false);
+        let cleared = saved.clone(); // password already blank in the disk copy
+        let out = sanitize_file(&cleared, &store, &hydration);
+        assert_eq!(out.undeleted, vec![(7, SecretKind::DbPassword)]);
+        assert!(
+            !out.undeleted.contains(&(7, SecretKind::SshPassword)),
+            "an entry that was never there is not a refused clear"
+        );
+        let notice = out.notice().expect("there is something to say");
+        assert!(notice.contains("still in the OS keyring"), "{notice}");
+        assert_eq!(
+            store.stored("conn.7.password").as_deref(),
+            Some("s3cret"),
+            "and the entry really is still there, which is why it is said"
+        );
+
+        // The next save retries — the field is still empty and still readable —
+        // and this one lands, so there is nothing left to report.
+        store.set_available(true);
+        let out = sanitize_file(&cleared, &store, &hydration);
+        assert!(out.undeleted.is_empty());
+        assert_eq!(out.notice(), None);
+        assert_eq!(store.stored("conn.7.password"), None, "gone for good");
+    }
+
+    /// A connection's id is reused, so a `forget` the keyring refused is worth a
+    /// return value: the next connection to take that id would hydrate the
+    /// deleted one's password.
+    #[test]
+    fn forget_says_whether_the_secrets_are_really_gone() {
+        let store = MemStore::new();
+        let mut c = conn(7);
+        c.password = "s3cret".to_string();
+        let file = ConnectionsFile {
+            connections: vec![c],
+            active: Some(7),
+        };
+        let _ = sanitize(&file, &store);
+        store.set_available(false);
+        assert!(!forget(7, &store));
+        store.set_available(true);
+        assert!(forget(7, &store));
+        assert_eq!(store.stored("conn.7.password"), None);
+    }
+
     /// The finding: a locked keyring at startup leaves every field empty, and the
     /// next ordinary save — a read-only toggle rewrites the whole file — used to
     /// read that as "the user cleared every password" and delete them all.
@@ -520,7 +833,7 @@ mod tests {
         assert!(hydration.is_unreadable(7, SecretKind::DbPassword));
 
         store.set_available(true); // user unlocks it, then edits something else
-        let disk = sanitize_file(&file, &store, &hydration);
+        let disk = sanitize_file(&file, &store, &hydration).file;
 
         assert_eq!(
             store.stored("conn.7.password").as_deref(),
@@ -539,8 +852,8 @@ mod tests {
     #[test]
     fn resolve_against_lifts_protection_once_a_value_is_supplied() {
         let mut hydration = Hydration {
-            needs_resave: false,
             unreadable: vec![(7, SecretKind::DbPassword), (7, SecretKind::SshPassword)],
+            ..Hydration::default()
         };
         let mut c = conn(7);
         c.password = "typed-it-in".to_string(); // ssh password still empty
@@ -560,8 +873,8 @@ mod tests {
     #[test]
     fn resolve_against_drops_entries_for_a_removed_connection() {
         let mut hydration = Hydration {
-            needs_resave: false,
             unreadable: vec![(7, SecretKind::DbPassword)],
+            ..Hydration::default()
         };
         let empty = ConnectionsFile {
             connections: vec![],
@@ -574,8 +887,8 @@ mod tests {
     #[test]
     fn forget_clears_protection_so_a_reused_id_cannot_inherit_it() {
         let mut hydration = Hydration {
-            needs_resave: false,
             unreadable: vec![(7, SecretKind::DbPassword), (8, SecretKind::DbPassword)],
+            ..Hydration::default()
         };
         hydration.forget(7);
         assert!(!hydration.is_unreadable(7, SecretKind::DbPassword));
@@ -726,8 +1039,9 @@ mod tests {
                     .insert(account.to_string(), secret.to_string());
                 true
             }
-            fn delete(&self, account: &str) {
+            fn delete(&self, account: &str) -> bool {
                 self.0.borrow_mut().remove(account);
+                true
             }
         }
         let store = PartialStore(RefCell::new(HashMap::new()));

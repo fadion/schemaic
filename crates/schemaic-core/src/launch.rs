@@ -137,7 +137,8 @@ pub fn psql_target(db: &str) -> Result<&str, &'static str> {
 
 /// The `--ssl-*` argv a MySQL/MariaDB client needs to honour `tls`.
 ///
-/// **Always non-empty, including for [`SslMode::Disable`].** Saying nothing is
+/// **Always non-empty, including for [`SslMode::Disable`][crate::connection::SslMode::Disable].**
+/// Saying nothing is
 /// not neutral: the client's own default is `--ssl-mode=PREFERRED`, which
 /// accepts an unencrypted socket if the server offers one and verifies no
 /// certificate either way — so an omitted flag downgrades a `verify-full`
