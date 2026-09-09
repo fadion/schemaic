@@ -710,8 +710,16 @@ pub fn plan(
         (true, false) => "structure only",
         _ => "data only",
     };
+    // **Every server-supplied name on a comment line goes through
+    // `comment_text`.** A `--` comment ends at the first newline and an
+    // identifier may hold one, so a table named `orders\nDROP TABLE customers;`
+    // otherwise turned this header into a top-level statement in a file the user
+    // takes for a backup — and it runs at *restore*, against whichever database
+    // the restore targets. `ident_sql` is not the fix: it doubles a quote
+    // character and says nothing about `\n`.
     let mut header = format!(
-        "-- Schemaic dump of {database}\n-- {} {}, {what}.",
+        "-- Schemaic dump of {}\n-- {} {}, {what}.",
+        crate::export::comment_text(database),
         order.len(),
         crate::text::plural(order.len(), "table", "tables"),
     );
@@ -736,7 +744,7 @@ pub fn plan(
                 t.columns
                     .iter()
                     .filter(|c| c.is_server_assigned())
-                    .map(|c| format!("{}.{}", t.name, c.name))
+                    .map(|c| crate::export::comment_text(&format!("{}.{}", t.name, c.name)))
             })
             .collect();
         if !lost.is_empty() {
@@ -759,7 +767,7 @@ pub fn plan(
             missing.len(),
             crate::text::plural(missing.len(), "table", "tables"),
             crate::text::plural(missing.len(), "was", "were"),
-            missing.join(", "),
+            crate::export::comment_text(&missing.join(", ")),
         ));
     }
     // Said in the file, because the file is where it will be noticed: a restore
@@ -883,7 +891,12 @@ pub fn plan(
     // ── Each table: structure, then its rows ─────────────────────────────────
     for &i in &order {
         let t = &schema.tables[i];
-        text!(format!("-- {}", display_name(t.schema.as_deref(), &t.name)));
+        // The per-table header, and the site an attacker controls most cheaply —
+        // see the header's `comment_text` note above.
+        text!(format!(
+            "-- {}",
+            crate::export::comment_text(&display_name(t.schema.as_deref(), &t.name))
+        ));
         if opts.structure {
             if opts.drop_if_exists {
                 let kw = if t.is_view { "VIEW" } else { "TABLE" };
@@ -1416,6 +1429,79 @@ mod tests {
         let s = schema_of(vec![table("zebra"), table("apple"), table("mango")]);
         let (order, _) = order_tables(&s.tables, &all(&s), SqlDialect::MySql);
         assert_eq!(names(&s, &order), vec!["apple", "mango", "zebra"]);
+    }
+
+    /// **A newline inside a name injects a statement into the dump, and it runs
+    /// at restore.** A `--` comment ends at the first physical newline and an
+    /// identifier may contain one: PostgreSQL 16 creates a table named
+    /// `orders\nDROP TABLE customers;` and hands it back from
+    /// `information_schema.tables` without complaint (measured). The header
+    /// lines interpolated schema-fetched names raw, so the file the user
+    /// believes is their backup carried
+    ///
+    /// ```text
+    /// -- orders
+    /// DROP TABLE customers;
+    /// ```
+    ///
+    /// — a top-level statement, which runs against whichever database the
+    /// restore targets, typically not the hostile one the name came from.
+    ///
+    /// Everything *executable* in a dump was already guarded; the gap was
+    /// exactly the comment lines, which is why the "one identifier quoter"
+    /// invariant did not cover it — `ident_sql` doubles a quote character and
+    /// says nothing about `\n`, so applying it here would not have helped.
+    ///
+    /// **Asserted over the emitted script, not over `comment_text`.** A test of
+    /// the escaper alone passes against the unfixed tree, since nothing called
+    /// it. The property is structural: every line of the file that is not inside
+    /// a statement begins with `--`.
+    #[test]
+    fn a_newline_in_a_name_cannot_open_a_line_of_its_own() {
+        let hostile = "orders\nDROP TABLE customers;";
+        let mut t = table(hostile);
+        t.schema = Some("pub\nDROP TABLE s;".to_string());
+        t.columns.push(ColumnInfo {
+            name: "seq\nDROP TABLE c;".to_string(),
+            type_name: "int".to_string(),
+            auto_increment: true,
+            ..Default::default()
+        });
+        let s = schema_of(vec![t]);
+        // A ticked name the introspection cannot find, so the "missing" line is
+        // written too — it is a fourth interpolation site.
+        let chosen = {
+            let mut c = all(&s);
+            c.push("gone\nDROP TABLE m;".to_string());
+            c
+        };
+        let p = plan(
+            &s,
+            "shop\nDROP TABLE d;",
+            &chosen,
+            DumpOptions::default(),
+            SqlDialect::MySql,
+        );
+
+        // Every line of a `Text` step that is not the step's own SQL must be a
+        // comment. A header step is entirely comment lines; a `CREATE`/`DROP`
+        // step is entirely SQL. So the check is: no line inside a step that
+        // *starts* as a comment may stop being one.
+        for step in &p.steps {
+            let DumpStep::Text(txt) = step else { continue };
+            if !txt.starts_with("--") {
+                continue;
+            }
+            for line in txt.lines() {
+                assert!(
+                    line.trim_start().starts_with("--") || line.trim().is_empty(),
+                    "a comment block grew a statement line: {line:?}\nin step: {txt:?}"
+                );
+            }
+        }
+        // And the names are still legible in the file, not merely absent.
+        let text = text_of(&p);
+        assert!(text.contains("orders DROP TABLE customers;"), "{text}");
     }
 
     // ── plan: what each option puts in the file ──────────────────────────────

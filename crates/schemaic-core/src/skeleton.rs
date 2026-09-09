@@ -104,19 +104,17 @@ fn placeholders<'a>(columns: impl IntoIterator<Item = &'a str>) -> Vec<String> {
 /// no-key `WHERE` that mattered more than anywhere else: the draft the module's
 /// doc promises twice is *unparseable* became a `DELETE … WHERE 1=1` that
 /// **succeeds**, so a Run Everything went on to whatever statement the name
-/// appended. The `*` and the `/` both survive here — they are simply never
-/// adjacent — and a control character becomes a space so the sentence stays on
-/// its own line.
+/// appended.
+///
+/// **This was a private copy of the rule and is now the shared one.** The dump's
+/// `--` headers hit the same class from the other side (a newline in a name
+/// ending the comment and putting the rest on its own line as a statement, which
+/// runs at *restore*), so the answer lives in [`crate::export::comment_text`]
+/// beside the identifier quoters — where the grep the "one identifier quoter"
+/// rule relies on finds it, and where a second spelling cannot drift from the
+/// first.
 fn comment_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        let c = if c.is_control() { ' ' } else { c };
-        if c == '/' && out.ends_with('*') {
-            out.push(' ');
-        }
-        out.push(c);
-    }
-    out
+    crate::export::comment_text(s)
 }
 
 /// Is this column worth typing a value for in a generated statement?

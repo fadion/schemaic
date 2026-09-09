@@ -99,7 +99,8 @@ substitute for the statement, and none of these is a style preference.
 - **A destructive modal action guards its own launch**, in the same step that launches it
   (`widgets::accept_launch`) — not via the disabled button.
 - **One identifier quoter** — `export::ident_sql` (executed SQL) or `ident_if_needed` (SQL the user
-  reads). Don't write a fifth.
+  reads). Don't write a fifth. **Quoting is not comment-safety**: `export::comment_text` is the
+  second question's answer, and nothing server-supplied reaches a `--` or `/* */` line without it.
 - **A string handed to a process launcher is validated in `core::launch`** — the one place, at the
   boundary where it stops being data; no shell is ever in between, and a refusal is a `Result` the
   caller cannot skip.

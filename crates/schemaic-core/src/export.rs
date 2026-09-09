@@ -793,6 +793,66 @@ pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
     }
 }
 
+/// Server-supplied text made safe to put on a `--` comment line.
+///
+/// **Quoting an identifier and making it comment-safe are different
+/// guarantees, and this project had only the first.** [`ident_sql`] doubles a
+/// backtick or a double quote; it does nothing about a newline, and a `--`
+/// comment ends at the first one. So a table named
+///
+/// ```text
+/// orders
+/// DROP TABLE customers;
+/// ```
+///
+/// — which PostgreSQL 16 creates and returns from `information_schema.tables`
+/// without complaint, measured — turned a dump's own per-table header into
+///
+/// ```text
+/// -- orders
+/// DROP TABLE customers;
+/// ```
+///
+/// where the second line is a **top-level statement** in a file the user
+/// believes is their backup, and it runs at *restore* time against whichever
+/// database the restore targets — typically their own, not the hostile one the
+/// name came from. A payload quieter than a `DROP` (a `CREATE ROLE … SUPERUSER`,
+/// an added trigger) survives a read of the restore's output entirely.
+///
+/// It lives here beside the quoters so the grep the "one identifier quoter"
+/// invariant relies on finds it too, and because the answer is the same for
+/// every caller: nothing that came from a server goes onto a comment line
+/// without passing through this.
+///
+/// **Every control character**, not only `\n` — a lone `\r` is a line
+/// terminator to enough tools to count, and a vertical tab or form feed to
+/// enough others — and `*/`, so the same text is safe inside a block comment
+/// too. Collapsed to a space rather than dropped, so the result still reads as
+/// the name it came from, and the `*` and the `/` both survive: they are simply
+/// never adjacent.
+///
+/// **The `*/` half is a bug of its own, and it was found first.**
+/// `skeleton`'s `/* … */` drafts had a private escaper by this same name for
+/// exactly it: a table name carrying `*/` closed the comment early, and what
+/// followed was SQL — on the no-key `WHERE`, the draft the module promises is
+/// *unparseable* became a `DELETE … WHERE 1=1` that **succeeds**, so Run
+/// Everything went on to whatever the name appended. That function delegates
+/// here now; two escapers of the same name with slightly different rules is the
+/// drift the neighbouring quoter rule exists to prevent.
+pub fn comment_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        // Across the whole output, not within one pair: `*` `/` written as two
+        // separate characters closes a comment just as well.
+        if c == '/' && out.ends_with('*') {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The same, but only when leaving the name bare would name something else.
 ///
 /// A bare identifier is safe exactly when it is a plain lower-case ASCII word and
@@ -2113,11 +2173,19 @@ pub fn export_inserts_chunks<W: Write>(
                 w,
                 "-- NOTE: binary column{} {} exported as NULL — a text export cannot carry raw bytes.",
                 if fresh.len() == 1 { "" } else { "s" },
-                fresh
-                    .iter()
-                    .map(|&ci| q(&c.rs.columns[ci].name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                // **`comment_text` as well as `q`, and the pair is the point:**
+                // quoting an identifier and making it comment-safe are
+                // different guarantees. `q` is `ident_sql`, which doubles a
+                // quote character and does nothing about a newline — and a
+                // `--` comment ends at the first one, so a column name holding
+                // one turned this note into a statement in the file.
+                comment_text(
+                    &fresh
+                        .iter()
+                        .map(|&ci| q(&c.rs.columns[ci].name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             )?;
         }
         for &di in c.order {
@@ -2884,6 +2952,29 @@ mod tests {
         // The two compatibility quotings are ordinary characters on the way out.
         assert_eq!(ident_sql("a`b", Sqlite), "\"a`b\"");
         assert_eq!(ident_sql("a]b", Sqlite), "\"a]b\"");
+    }
+
+    /// The unit half of the dump-header injection — the seam half is
+    /// `dump::tests::a_newline_in_a_name_cannot_open_a_line_of_its_own`, which
+    /// is the one that was red.
+    #[test]
+    fn comment_text_closes_every_way_out_of_a_comment() {
+        assert_eq!(
+            comment_text("orders\nDROP TABLE t;"),
+            "orders DROP TABLE t;"
+        );
+        assert_eq!(comment_text("a\r\nb"), "a  b");
+        assert_eq!(comment_text("a\rb"), "a b");
+        // Safe inside a block comment too, so a future `/* */` header inherits
+        // the guarantee rather than reopening the hole.
+        assert_eq!(comment_text("a*/b"), "a* /b");
+        assert_eq!(comment_text("*/"), "* /");
+        // And an ordinary name is untouched, including one holding a `*` or a
+        // `/` that is not the pair.
+        for name in ["orders", "a*b", "a/b", "sales.q1", "naïve", "a`b", "a\"b"] {
+            assert_eq!(comment_text(name), name, "{name}");
+        }
+        assert_eq!(comment_text(""), "");
     }
 
     /// SQLite has no backslash escape, so doubling one would corrupt the value —

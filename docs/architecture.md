@@ -980,6 +980,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     naming only the newly discovered ones and tracked in a `noted: Vec<bool>`; over a single chunk
     that collapses to exactly the old behaviour, one note before the first `INSERT` naming every
     withheld column (`the_binary_note_finds_a_column_that_only_drops_later`).
+    **That line's column names go through `comment_text` as well as `ident_sql`, and the pair is the
+    point**: quoting an identifier and making it safe on a comment line are different guarantees, and
+    this note is the case that proves the first is not the second. It always quoted, and a column
+    name holding a newline still ended the `--` there and left the rest of the name on the next line
+    of the file as a statement — `ident_sql` doubles a backtick or a double quote and does nothing
+    about `\n`. `comment_text(raw)` is the answer, placed here beside the quoters so the grep the
+    "one identifier quoter" rule relies on finds it too; the dump's four header sites are its other
+    callers, and the invariant is written up under *Architecture invariants*.
     **`ExportTally` is what a renderer returns, because a row count was never the whole result.**
     `rows`, plus three losses the file itself shows no trace of: `withheld` (those binary columns,
     named — empty for Markdown and HTML), `blanked` (`ResultSet::capped_columns`, the cells past a
@@ -1232,6 +1240,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `Change::AddForeignKey` through `ChangeSet::emit` — the emitter the apply path uses — and the
     rows are `export::ExportFormat::Sql`, streamed by the app. Identifiers go through
     `export::ident_sql`/`qualified_table`, so a dump cannot quote differently from the SQL export.
+    **The header's own comment lines are *escaped*, not quoted** — `export::comment_text`, and the
+    two are different guarantees. Four lines here interpolate a schema-fetched name: the
+    `-- Schemaic dump of {database}` opener, the server-assigned-columns note, the "ticked but not
+    found" note, and the per-table `-- {name}` line, which is the cheapest of the four for an
+    attacker to control. A `--` comment ends at the first physical newline and a PostgreSQL name may
+    hold one, so a table called `orders` / `DROP TABLE customers;` put that second line into the file
+    as a **top-level statement**, which then runs at *restore* against whichever database the restore
+    targets. `ident_sql` is not the fix — it doubles a quote character and says nothing about `\n` —
+    and the rule is stated in full under *Architecture invariants*.
+    `a_newline_in_a_name_cannot_open_a_line_of_its_own` asserts it over the emitted plan rather than
+    over the escaper, since a test of the escaper alone was green against the unfixed tree.
     **The row `SELECT` names its columns and is never `SELECT *`.** `exported_columns` projects
     everything `ColumnInfo::is_server_assigned` says the server does *not* fill for itself — the same
     predicate `import::insert_columns` asks, about the same columns. The renderer names every column
@@ -11911,6 +11930,37 @@ Re-introducing the anti-patterns these guard against is a regression:
   They asked the alias set, and on SQLite `CAST`, `IF` and `RAISE` sit in the gap, so a table named
   for one of them produced an `ORDER BY` that would not parse. Right quoter, wrong question. See
   `core::intel` for the measurement and the test that holds both lists to the engine itself.
+  **What no quoter here answers is whether text is safe on a *comment* line** — a separate question
+  with its own function and its own rule, next.
+- **Nothing server-supplied reaches a comment line unescaped**, and that is a different guarantee
+  from quoting: `export::comment_text` answers it and `export::ident_sql` does not. A `--` comment
+  ends at the first physical newline and an identifier may *contain* one — PostgreSQL 16.15 creates
+  a table whose name is the two lines `orders` and `DROP TABLE customers;` and hands it back from
+  `information_schema.tables` without complaint, verified live — so a dump's per-table header
+  emitted `-- orders` and then `DROP TABLE customers;` as a **top-level statement** in a file the
+  user takes for their backup. It executes at *restore*, through Schemaic's own script runner or
+  `psql` or any other client, against whichever database the restore targets, which is typically
+  their own and not the hostile one the name came from; and a payload quieter than a `DROP` (a
+  `CREATE ROLE … SUPERUSER`, an added trigger) survives a read of the restore's output entirely.
+  **Everything executable in the file was already correct** — `create_container_sql`,
+  `target_database_sql`, `sequence_resync_sql` and `export_inserts_chunks` route identifiers through
+  `ident_sql`/`ddl_string` and every cell through `sql_literal` — so the gap was exactly the
+  human-readable lines, and the quoter rule above did not cover it. `export.rs`'s
+  `-- NOTE: binary column…` line is the proof: it *did* call `ident_sql` and was vulnerable anyway,
+  because doubling a backtick or a double quote says nothing about `\n`. Five sites route through
+  the escaper now — the `-- Schemaic dump of {database}` header, the server-assigned-columns note,
+  the "ticked but not found" note, the per-table `-- {name}` line (the site an attacker controls
+  most cheaply) and that binary-column note. It replaces `\n` and `\r` with a space — a lone `\r` is
+  a line terminator to enough tools to count — and rewrites `*/` as `* /` so the same text is safe
+  inside a block comment a future header might use, and it collapses rather than drops so the result
+  still reads as the name it came from. It lives beside the quoters so the grep the rule above relies
+  on finds it too. `skeleton.rs` holds a **second, private escaper of the same name** for the
+  `/* … */` drafts — it maps every control character to a space and breaks `*/` the same way, so it
+  is safe on a `--` line as well; the two have not been unified, and new code calls the public one.
+  Extend `dump::tests::a_newline_in_a_name_cannot_open_a_line_of_its_own` rather than the escaper's
+  own test: it asserts over the whole emitted plan that no line inside a step which *starts* as a
+  comment stops being one, because `comment_text_closes_every_way_out_of_a_comment` passes against
+  the unfixed tree — nothing there having called the escaper.
 - **A string handed to a process launcher is validated in `core::launch`, at the boundary where it
   stops being data.** Two Criticals in one review turned out to be one absent habit: nothing in this
   codebase validated a string at the point where the app stopped *displaying* it and the operating
