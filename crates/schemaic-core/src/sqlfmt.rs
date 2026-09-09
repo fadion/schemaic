@@ -50,10 +50,114 @@ enum Kind {
 
 use crate::sql::is_word_byte;
 
-/// Multi-character operators, longest first, so `->>` beats `->` beats `>`.
-const OPS: &[&str] = &[
-    "->>", "<=>", "->", ">=", "<=", "<>", "!=", ":=", "||", "&&", "<<", ">>",
-];
+/// Multi-character operators of `dialect`, longest first, so `->>` beats `->`
+/// beats `>`.
+///
+/// **Per dialect, and it has to be.** Anything not matched here becomes one
+/// `Punct` token *per byte*, and `need_space` then puts a space between the two
+/// halves — so an operator missing from the table is not laid out badly, it is
+/// **split**, and the buffer Format Code writes back holds SQL the server will
+/// not parse. The list used to be one MySQL-shaped table, which meant
+/// `select id::text from t` came out `select id : : text` and PostgreSQL
+/// 16.15 answered *syntax error at or near ":"* — on a rewrite of the user's
+/// own document, and after a Ctrl+S of the `.sql` file behind it. `::` is not an
+/// exotic operator; it is how PostgreSQL spells every cast.
+///
+/// The same rule as [`crate::sql::skip_noncode`] and
+/// [`crate::intel::ident_quote`]: a lexical table is the one thing that really
+/// is per dialect, and an exhaustive `match` so a fourth arm has to answer.
+///
+/// **PostgreSQL's table is short on purpose** — see
+/// [`operators_are_composable`]. `::` and `:=` are there because `:` is *not*
+/// one of PostgreSQL's operator characters, so the composition rule cannot
+/// reach them.
+fn ops(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql => &[
+            "->>", "<=>", "->", ">=", "<=", "<>", "!=", ":=", "||", "&&", "<<", ">>",
+        ],
+        SqlDialect::Postgres => &["::", ":="],
+        // No user-defined operators and a fixed set, so a table is complete.
+        SqlDialect::Sqlite => &["->>", "->", ">=", "<=", "<>", "!=", "==", "||", "<<", ">>"],
+    }
+}
+
+/// Does `dialect` let an operator be **composed** out of its operator
+/// characters, so that no table of spellings can ever be complete?
+///
+/// PostgreSQL does: `CREATE OPERATOR` builds a name out of
+/// `+ - * / < > = ~ ! @ # % ^ & | ` + "`" + ` ?`, and the built-in set already
+/// spans `@>`, `<@`, `#>>`, `?|`, `!~*`, `||/` and `-|-`. Enumerating them is a
+/// list that is wrong the moment an extension is installed, so the run is
+/// consumed by the engine's own rule instead. MySQL and SQLite have fixed
+/// operator sets and no `CREATE OPERATOR`, so their tables above are complete.
+///
+/// An exhaustive `match`, for the reason [`ops`] gives.
+fn operators_are_composable(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Is `c` one of the characters PostgreSQL builds an operator name from?
+fn is_operator_byte(c: u8) -> bool {
+    matches!(
+        c,
+        b'+' | b'-'
+            | b'*'
+            | b'/'
+            | b'<'
+            | b'>'
+            | b'='
+            | b'~'
+            | b'!'
+            | b'@'
+            | b'#'
+            | b'%'
+            | b'^'
+            | b'&'
+            | b'|'
+            | b'`'
+            | b'?'
+    )
+}
+
+/// How many bytes at `i` are **one** composed operator, or `None` when there is
+/// no run of two or more there.
+///
+/// PostgreSQL's own two rules, and nothing beyond them:
+///
+/// - The run stops where a comment or a quote begins, which is
+///   [`skip_noncode`]'s question — so `a<--b` is `a`, `<`, and then the comment
+///   `--b`, exactly as the server reads it.
+/// - **A name may not end in `+` or `-` unless it also holds one of
+///   `~ ! @ # % ^ & | ` + "`" + ` ?`.** Without the back-off `x=-1` would lex as
+///   `x`, `=-`, `1`, and the formatter would emit `x =- 1` — a token the server
+///   does not have.
+fn composed_operator_len(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
+    let mut end = i;
+    while end < b.len() && is_operator_byte(b[end]) {
+        // A comment or quote inside the run ends it, asked of the one boundary
+        // lexer rather than by re-spelling `--` and `/*` here.
+        if end > i && skip_noncode(b, end, dialect).is_some() {
+            break;
+        }
+        end += 1;
+    }
+    let holds_special = |s: &[u8]| {
+        s.iter().any(|c| {
+            matches!(
+                c,
+                b'~' | b'!' | b'@' | b'#' | b'%' | b'^' | b'&' | b'|' | b'`' | b'?'
+            )
+        })
+    };
+    while end - i > 1 && matches!(b[end - 1], b'+' | b'-') && !holds_special(&b[i..end]) {
+        end -= 1;
+    }
+    (end - i > 1).then_some(end - i)
+}
 
 fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
     let b = sql.as_bytes();
@@ -85,15 +189,44 @@ fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
             while i < n && is_word_byte(b[i]) {
                 i += 1;
             }
+            // **A literal's prefix is part of the literal**, so the two are one
+            // token here as they are in every engine's own lexer. Otherwise
+            // `need_space` puts a space between them, and a space is not
+            // whitespace there: `E'esc\'aped'` is `esc'aped` on PostgreSQL 16
+            // while `E 'esc\'aped'` is *ERROR: unterminated quoted string* —
+            // measured — and `X'ff'`, `B'101'` and MySQL's `_utf8mb4'x'`
+            // introducer are the same shape. Only where the input had them
+            // adjacent: if the user wrote a space the engine already read two
+            // tokens, and this keeps whichever it was.
+            let mut end = i;
+            // PostgreSQL's `U&'…'` is the one prefix not spelled in word bytes.
+            if end < n && b[end] == b'&' && sql[s..end].eq_ignore_ascii_case("U") {
+                end += 1;
+            }
+            if end < n
+                && (b[end] == b'\'' || crate::intel::ident_quote(dialect, b[end]).is_some())
+                && let Some(j) = skip_noncode(b, end, dialect)
+            {
+                toks.push((Kind::Quoted, &sql[s..j]));
+                i = j;
+                continue;
+            }
             toks.push((Kind::Word, &sql[s..i]));
             continue;
         }
-        // Punctuation / operators.
+        // Punctuation / operators. The table first, since its entries are the
+        // spellings the composition rule cannot reach; then the run, for the
+        // engine that composes.
         let rest = &sql[i..];
-        let len = OPS
+        let len = ops(dialect)
             .iter()
             .find(|op| rest.len() >= op.len() && &rest[..op.len()] == **op)
             .map(|op| op.len())
+            .or_else(|| {
+                operators_are_composable(dialect)
+                    .then(|| composed_operator_len(b, i, dialect))
+                    .flatten()
+            })
             .unwrap_or(1);
         toks.push((Kind::Punct, &sql[i..i + len]));
         i += len;
@@ -320,12 +453,14 @@ impl<'a> Fmt<'a> {
             return false;
         };
         let pt = pt.as_str();
-        // prev forces no following space
-        if *pk == Kind::Punct && (pt == "(" || pt == ".") {
+        // prev forces no following space. `::` is a cast, and a cast binds to
+        // what it casts the way `.` binds to what it qualifies: `id :: text` is
+        // legal PostgreSQL and reads like a mistake.
+        if *pk == Kind::Punct && (pt == "(" || pt == "." || pt == "::") {
             return false;
         }
         // cur forces no preceding space
-        if cur_kind == Kind::Punct && matches!(cur, ")" | "," | ";" | ".") {
+        if cur_kind == Kind::Punct && matches!(cur, ")" | "," | ";" | "." | "::") {
             return false;
         }
         if cur_kind == Kind::Punct && cur == "(" {
@@ -640,8 +775,28 @@ mod tests {
 
     /// Every non-whitespace character, in order. Formatting may re-flow
     /// whitespace and nothing else, so this string is an invariant.
+    ///
+    /// **Kept, but it is not the contract.** It cannot see whitespace inserted
+    /// *inside* a token — strip the whitespace and `id : : text` is
+    /// indistinguishable from `id::text` — which is why the assertion below is a
+    /// token-sequence comparison and this one only guards against a *dropped*
+    /// or reordered character, which a token comparison of a mis-tokenized
+    /// input would miss.
     fn tokens(s: &str) -> String {
         s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The module's own tokenizer over a string, as texts.
+    ///
+    /// This is what "without changing any token's text" means, and it is the
+    /// assertion the block was missing: `formatting_preserves_every_token` was
+    /// green while its own corpus line `select data #> '{a,b}' from t` came out
+    /// `data # > '{a,b}'`, which PostgreSQL 16.15 rejects.
+    fn token_texts(s: &str, dialect: SqlDialect) -> Vec<String> {
+        super::tokenize(s, dialect)
+            .into_iter()
+            .map(|(_, t)| t.to_string())
+            .collect()
     }
 
     fn assert_preserves(sql: &str, dialect: SqlDialect) {
@@ -649,7 +804,12 @@ mod tests {
         assert_eq!(
             tokens(&out),
             tokens(sql),
-            "{dialect:?} mangled: {sql}\n{out}"
+            "{dialect:?} lost or moved a character: {sql}\n{out}"
+        );
+        assert_eq!(
+            token_texts(&out, dialect),
+            token_texts(sql, dialect),
+            "{dialect:?} mangled a token: {sql}\n{out}"
         );
     }
 
@@ -662,6 +822,9 @@ mod tests {
             "insert into t values ('multi\nline'), ('x')",
             "select \"quoted\" from t",
             "select a from t where b in (1,2,3) order by a desc",
+            // `=-` is not an operator on any of the three: without the
+            // trailing-sign back-off the run rule would make it one.
+            "select a from t where x=-1",
         ];
         for sql in shared {
             assert_preserves(sql, SqlDialect::MySql);
@@ -672,13 +835,64 @@ mod tests {
             "select `back ticked` from t # trailing\nselect 2",
             SqlDialect::MySql,
         );
+        // MySQL's charset introducer, which is how its own catalogue writes a
+        // string default it recorded as an expression.
+        assert_preserves("select _utf8mb4'draft', X'ff' from t", SqlDialect::MySql);
         for sql in [
             "select E'esc\\'aped' from t",
             "create function f() returns int as $$ select 1; $$ language sql",
             "select data #> '{a,b}' from t",
+            // A prefixed literal, whose prefix is part of the literal: the
+            // spaced form is a syntax error, measured on 16.15.
+            "select E'esc\\'aped', U&'\\0041', B'101', X'ff' from t",
+            // The cast, which is how PostgreSQL spells every cast, and the
+            // operators the old MySQL-shaped table split into single bytes.
+            "select count(*)::int, created_at::date from t where x::text = 'a'",
+            "select '{\"a\":1}'::jsonb #>> '{a}' from t",
+            "select a from t where tags @> '{x}' and '{y}' <@ tags",
+            "select a from t where name ~* 'x' and other !~* 'y'",
+            "select a from t where meta ?| array['x'] and meta ?& array['y']",
+            "select |/ 4.0, ||/ 27.0",
+            "select a from t where r -|- s",
+            // A comment that starts inside what would otherwise be an operator
+            // run — the run has to stop where the server's does.
+            "select a <--b\nfrom t",
         ] {
             assert_preserves(sql, SqlDialect::Postgres);
         }
+        // SQLite's own two: `->>` from JSON, and `==`.
+        for sql in [
+            "select data ->> '$.a' from t where x == 1",
+            "select a from t where b<>1 and c||d = 'x'",
+        ] {
+            assert_preserves(sql, SqlDialect::Sqlite);
+        }
+    }
+
+    /// A prefixed literal comes out as it went in, because the prefix is part
+    /// of the token. `E 'x\\'y'` is not ugly SQL, it is a different statement.
+    #[test]
+    fn a_literals_prefix_stays_attached_to_it() {
+        let out = super::format_sql("select E'esc\\'aped' from t", IND, SqlDialect::Postgres);
+        assert!(out.contains("E'esc\\'aped'"), "{out}");
+        let out = super::format_sql("select _utf8mb4'draft' from t", IND, SqlDialect::MySql);
+        assert!(out.contains("_utf8mb4'draft'"), "{out}");
+        // And a space the user wrote is still a space: two tokens stay two.
+        let out = super::format_sql("select E , 'x' from t", IND, SqlDialect::Postgres);
+        assert!(out.contains("E,"), "{out}");
+    }
+
+    /// And the layout the fix is *for*: a cast binds to what it casts, so the
+    /// output reads like SQL rather than merely parsing as it.
+    #[test]
+    fn a_cast_is_emitted_tight() {
+        let out = super::format_sql(
+            "select count(*)::int from t where x::text = 'a'",
+            IND,
+            SqlDialect::Postgres,
+        );
+        assert!(out.contains("count(*)::int"), "{out}");
+        assert!(out.contains("x::text"), "{out}");
     }
 
     #[test]
