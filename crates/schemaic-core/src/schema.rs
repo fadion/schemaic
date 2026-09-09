@@ -3307,10 +3307,19 @@ impl TableInfo {
             }
             out
         } else {
-            // MySQL: inline KEY / UNIQUE KEY.
+            // MySQL: inline KEY / UNIQUE KEY / FULLTEXT KEY, through the one
+            // clause builder the two emitters in `ddl` use. This branch was the
+            // third site hand-building it, and the third to lose `ix.method` —
+            // so the DDL a user copied out of the schema tree and ran elsewhere
+            // built a table whose `MATCH … AGAINST` fails. The PostgreSQL branch
+            // six lines above restates the method, which is what makes it a
+            // MySQL-only loss; the view arm of this same function was routed
+            // through `ddl::view_ddl` for exactly this reason.
             for ix in non_pk {
-                let kw = if ix.unique { "UNIQUE KEY" } else { "KEY" };
-                lines.push(format!("  {kw} {} ({})", q(&ix.name), ix.key_sql(dialect)));
+                lines.push(format!(
+                    "  {}",
+                    crate::ddl::mysql_index_clause(ix, "KEY", dialect)
+                ));
             }
             format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"))
         }

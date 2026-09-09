@@ -4124,8 +4124,7 @@ impl ChangeSet {
         }
         for c in &self.changes {
             if let Change::AddIndex(ix) = c {
-                let kw = if ix.unique { "UNIQUE INDEX" } else { "INDEX" };
-                cl.push(format!("ADD {kw} {} ({})", self.q(&ix.name), ix.key_sql(d)));
+                cl.push(format!("ADD {}", mysql_index_clause(ix, "INDEX", d)));
             }
         }
         for c in &self.changes {
@@ -5576,6 +5575,58 @@ fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String
     )
 }
 
+/// One MySQL index clause — **the one spelling, for the three places that write
+/// one**.
+///
+/// `create_index_sql` above has restated an index's method since it was written,
+/// and it is the emitter PostgreSQL and SQLite use. MySQL's three sites — the
+/// designer's `ADD INDEX`, the inline `KEY` in a generated `CREATE TABLE`, and
+/// `TableInfo::create_ddl`'s Copy DDL — each hand-built the clause from `unique`,
+/// the name and the key list, and dropped `method` on the floor. So a `FULLTEXT`
+/// index came back as a plain `KEY` from a designer edit, from a schema compare
+/// that carries a table across, and from Copy DDL — measured on MariaDB 10.11,
+/// after which `MATCH … AGAINST` answers `ERROR 1191 (HY000): Can't find
+/// FULLTEXT index matching the column list`. Every full-text query against the
+/// table stops working and nothing in the plan, the change list or the risk
+/// block said so.
+///
+/// **The two shapes are not interchangeable.** `FULLTEXT` and `SPATIAL` are
+/// index *types* and are prefix keywords; `BTREE` and `HASH` are the storage
+/// method and take a `USING` clause. MySQL rejects each in the other's position.
+/// `UNIQUE` is dropped where a prefix keyword applies, because an index cannot
+/// be both. `BTREE` is the default and is left unwritten, which is the rule the
+/// introspector states for when it sets `method` at all.
+///
+/// `word` is `KEY` inline in a `CREATE TABLE` and `INDEX` after an `ADD` — MySQL
+/// treats them as synonyms and the two sites have always spelled them
+/// differently.
+pub(crate) fn mysql_index_clause(ix: &IndexInfo, word: &str, dialect: SqlDialect) -> String {
+    let method = ix
+        .method
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    let prefix = match method {
+        Some(m) if m.eq_ignore_ascii_case("FULLTEXT") => "FULLTEXT ",
+        Some(m) if m.eq_ignore_ascii_case("SPATIAL") => "SPATIAL ",
+        _ => "",
+    };
+    let using = match method {
+        Some(m) if prefix.is_empty() && !m.eq_ignore_ascii_case("BTREE") => format!(" USING {m}"),
+        _ => String::new(),
+    };
+    let uniq = if ix.unique && prefix.is_empty() {
+        "UNIQUE "
+    } else {
+        ""
+    };
+    format!(
+        "{prefix}{uniq}{word} {}{using} ({})",
+        ddl_ident_in(&ix.name, dialect),
+        ix.key_sql(dialect)
+    )
+}
+
 fn comment_literal(c: Option<&str>, dialect: SqlDialect) -> String {
     match c.filter(|s| !s.is_empty()) {
         Some(s) => ddl_string(s, dialect),
@@ -5749,11 +5800,9 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     if !separate_indexes {
         // MySQL inlines its indexes; the other two can't and emit them after.
         for ix in &d.indexes {
-            let kw = if ix.info.unique { "UNIQUE KEY" } else { "KEY" };
             lines.push(format!(
-                "  {kw} {} ({})",
-                q(&ix.info.name),
-                ix.info.key_sql(dialect)
+                "  {}",
+                mysql_index_clause(&ix.info, "KEY", dialect)
             ));
         }
     }
@@ -10509,6 +10558,97 @@ mod tests {
     }
 
     // ── CREATE TABLE ────────────────────────────────────────────────────────
+
+    /// **A `FULLTEXT` index recreated as a plain `KEY` breaks every
+    /// `MATCH … AGAINST` against the table**, and three MySQL emitters wrote the
+    /// clause by hand from `unique`, the name and the key list, dropping
+    /// `ix.method` on the floor. Measured on MariaDB 10.11: after
+    /// `ALTER TABLE art DROP INDEX \`ft_body\`, ADD INDEX \`ft_body\` (\`body\`)`
+    /// — byte-for-byte what the designer emitted — the query answers
+    /// `ERROR 1191 (HY000): Can't find FULLTEXT index matching the column list`.
+    ///
+    /// Asserted on all three routes, because each was its own site: the
+    /// designer's `ADD INDEX`, the generated `CREATE TABLE` a schema compare
+    /// carries a table across with, and the schema tree's Copy DDL.
+    #[test]
+    fn a_mysql_index_keeps_its_method_on_every_route_that_writes_one() {
+        let ft = IndexInfo {
+            name: "ft_body".into(),
+            columns: vec![IndexColumn::plain("email")],
+            unique: false,
+            method: Some("FULLTEXT".into()),
+            ..Default::default()
+        };
+        // 1. The designer's ALTER, through `diff` — the route the change comes
+        // from, not a hand-built change set.
+        let t = users();
+        let mut draft = TableDraft::from_table(&t);
+        draft.indexes.push(IndexDraft::new(ft.clone()));
+        let sql = diff(&t, &draft, MySql).emit().join("\n");
+        assert!(
+            sql.contains("ADD FULLTEXT INDEX `ft_body` (`email`)"),
+            "{sql}"
+        );
+
+        // 2. A generated CREATE TABLE.
+        let clause = mysql_index_clause(&ft, "KEY", MySql);
+        assert_eq!(clause, "FULLTEXT KEY `ft_body` (`email`)");
+
+        // 3. Copy DDL, off a real `TableInfo`.
+        let mut copied = users();
+        copied.indexes = vec![ft.clone()];
+        assert!(
+            copied
+                .create_ddl(MySql)
+                .contains("FULLTEXT KEY `ft_body` (`email`)"),
+            "{}",
+            copied.create_ddl(MySql)
+        );
+
+        // `SPATIAL` is the other prefix keyword; `HASH` is a `USING` suffix, and
+        // MySQL rejects each in the other's position. `UNIQUE` is dropped where
+        // a prefix applies, since an index cannot be both.
+        let spatial = crate::schema::IndexInfo {
+            name: "geo".into(),
+            method: Some("SPATIAL".into()),
+            unique: true,
+            ..ft.clone()
+        };
+        assert_eq!(
+            mysql_index_clause(&spatial, "KEY", MySql),
+            "SPATIAL KEY `geo` (`email`)"
+        );
+        let hash = crate::schema::IndexInfo {
+            name: "h".into(),
+            method: Some("HASH".into()),
+            ..ft.clone()
+        };
+        assert_eq!(
+            mysql_index_clause(&hash, "KEY", MySql),
+            "KEY `h` USING HASH (`email`)"
+        );
+        // The default is left unwritten, and an index with no method is exactly
+        // what it always was.
+        let btree = crate::schema::IndexInfo {
+            name: "b".into(),
+            method: Some("BTREE".into()),
+            unique: true,
+            ..ft.clone()
+        };
+        assert_eq!(
+            mysql_index_clause(&btree, "KEY", MySql),
+            "UNIQUE KEY `b` (`email`)"
+        );
+        let plain = crate::schema::IndexInfo {
+            name: "p".into(),
+            method: None,
+            ..ft
+        };
+        assert_eq!(
+            mysql_index_clause(&plain, "INDEX", MySql),
+            "INDEX `p` (`email`)"
+        );
+    }
 
     #[test]
     fn create_table_emits_columns_key_indexes_and_options() {

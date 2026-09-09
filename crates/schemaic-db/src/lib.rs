@@ -2394,52 +2394,88 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
 
     // Indexes: one row per (index, key-column); fold consecutive columns into
     // the same index, preserving `SEQ_IN_INDEX` order.
+    // `EXPRESSION` is MySQL 8's column and MariaDB has none, so the row *shape*
+    // is held steady with a NULL rather than the parsing branching — the same
+    // trick, for the same reason, as the view query's `ALGORITHM` below: naming
+    // a column that does not exist fails the whole query.
+    let idx_sql = format!(
+        "SELECT CAST(TABLE_NAME AS CHAR) AS t, \
+                CAST(INDEX_NAME AS CHAR) AS i, \
+                CAST(NON_UNIQUE AS SIGNED) AS nu, \
+                CAST(COLUMN_NAME AS CHAR) AS c, \
+                CAST(SUB_PART AS SIGNED) AS sub, \
+                CAST(COLLATION AS CHAR) AS coll, \
+                CAST(INDEX_TYPE AS CHAR) AS ty, \
+                {} AS expr \
+         FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = ? \
+         ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+        if mariadb {
+            "CAST(NULL AS CHAR)"
+        } else {
+            "CAST(EXPRESSION AS CHAR)"
+        }
+    );
+    type MyIdxRow = (
+        String,
+        String,
+        i64,
+        // **`COLUMN_NAME` is nullable.** MySQL 8 gives a functional key part a
+        // NULL name and puts the expression in `EXPRESSION`; bound as `String`,
+        // `from_row` panicked inside the fetch task, so **one** functional index
+        // anywhere in a database made the whole of it unbrowsable — the tree
+        // spun for ever with no error at all. MariaDB cannot reproduce it: it
+        // rejects the syntax.
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let idx_rows: Vec<IdxRow> = conn
-        .exec_map(
-            "SELECT CAST(TABLE_NAME AS CHAR) AS t, \
-                    CAST(INDEX_NAME AS CHAR) AS i, \
-                    CAST(NON_UNIQUE AS SIGNED) AS nu, \
-                    CAST(COLUMN_NAME AS CHAR) AS c, \
-                    CAST(SUB_PART AS SIGNED) AS sub, \
-                    CAST(COLLATION AS CHAR) AS coll \
-             FROM information_schema.STATISTICS \
-             WHERE TABLE_SCHEMA = ? \
-             ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
-            (database,),
-            |r: (String, String, i64, String, Option<i64>, Option<String>)| r,
-        )
+        .exec_map(idx_sql.as_str(), (database,), |r: MyIdxRow| r)
         .await
         .map_err(qerr)?
         .into_iter()
-        .map(|(t, i, nu, c, sub, coll)| IdxRow {
-            table: t,
-            index: i,
-            unique: nu == 0,
-            column: schemaic_core::schema::IndexColumn {
-                name: c,
-                // A prefix index (`KEY (bio(20))`) — recreating it without the
-                // length fails outright on a TEXT column.
-                prefix: sub.and_then(|n| u32::try_from(n).ok()),
-                // `COLLATION` is 'A' ascending, 'D' descending, NULL unsorted.
-                descending: coll.as_deref() == Some("D"),
-                // MySQL 8 does have functional key parts, but `STATISTICS` names
-                // the hidden generated column they create rather than the
-                // expression, so nothing here can read one back — it stays a
-                // column, as it was before this field existed.
-                expression: false,
-                // MySQL collates per column, not per index key.
-                collation: None,
-            },
-            // MySQL's index type is only worth restating when it isn't the
-            // default; BTREE is, so emitting `USING BTREE` everywhere would be
-            // noise in every generated statement.
-            method: None,
-            predicate: None,
-            // MySQL's `STATISTICS` gives the whole key — prefix and direction
-            // included — so nothing is being read past here. (Functional indexes
-            // exist on MySQL 8 / MariaDB 10.5 too, but they appear as hidden
-            // generated columns and so arrive as ordinary column names.)
-            lossy: false,
+        .map(|(t, i, nu, c, sub, coll, ty, expr)| {
+            let expression = c.is_none();
+            IdxRow {
+                table: t,
+                index: i,
+                unique: nu == 0,
+                column: schemaic_core::schema::IndexColumn {
+                    // A functional key part has no column name. The expression
+                    // is what it is *about*, so it is what the schema tree and
+                    // the designer show; `lossy` below is what stops anything
+                    // trying to recreate the index from it.
+                    name: c.or(expr).unwrap_or_else(|| "<expression>".to_string()),
+                    // A prefix index (`KEY (bio(20))`) — recreating it without
+                    // the length fails outright on a TEXT column.
+                    prefix: sub.and_then(|n| u32::try_from(n).ok()),
+                    // `COLLATION` is 'A' ascending, 'D' descending, NULL unsorted.
+                    descending: coll.as_deref() == Some("D"),
+                    expression,
+                    // MySQL collates per column, not per index key.
+                    collation: None,
+                },
+                // **Only when it isn't the default.** BTREE is, so restating it
+                // everywhere would be noise in every generated statement — but
+                // FULLTEXT and SPATIAL are not, and reading them as `None` is
+                // what turned a recreated full-text index into a plain `KEY`
+                // and broke every `MATCH … AGAINST` against the table. The
+                // MySQL emitters can spell all three now
+                // (`ddl::mysql_index_clause`), which is what makes reading it
+                // worth anything.
+                method: ty.filter(|t| !t.eq_ignore_ascii_case("BTREE") && !t.is_empty()),
+                predicate: None,
+                // `STATISTICS` gives the whole key — prefix, direction and now
+                // the type — for an ordinary index. A **functional** one is the
+                // exception: the expression comes back as MySQL 8 stored it and
+                // re-emitting it as a key part is not something this model can
+                // promise, so the index is marked lossy and the existing refusal
+                // fires instead of a silent drop-and-recreate.
+                lossy: expression,
+            }
         })
         .collect();
 
@@ -3852,7 +3888,9 @@ pub(crate) struct IdxRow {
     /// Partial-index predicate (PostgreSQL).
     pub predicate: Option<String>,
     /// This index holds something the model can't represent — see
-    /// [`schemaic_core::schema::IndexInfo::lossy`]. Always false on MySQL.
+    /// [`schemaic_core::schema::IndexInfo::lossy`]. On MySQL that is a
+    /// **functional** key part and nothing else: the index type is read and can
+    /// be re-emitted, and a prefix and a direction always could be.
     pub lossy: bool,
 }
 
