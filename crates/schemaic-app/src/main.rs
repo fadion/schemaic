@@ -8298,9 +8298,45 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     });
 
     // Switch the active connection and reload its schema.
+    // **Point the AI panel at `id`, and leave nothing of the previous
+    // connection's behind.**
+    //
+    // Extracted from `switch_conn` because there are two places `active_conn`
+    // moves and only one of them did this. `delete_conn_now` reimplemented two
+    // of the neighbouring resets (`conn_status`, `health_failures`) and omitted
+    // these, so deleting the active connection left its transcript on screen
+    // under the fallback's header — and the next turn spawned a session on the
+    // fallback, replayed the deleted conversation into its system prompt, and
+    // `persist_chat` then wrote the whole thread back to `chats.json` **under
+    // the fallback's id**. The one line that erased it ran two hundred lines
+    // before the write that re-created it, which is what made the omission
+    // invisible; the delete modal meanwhile says in as many words that the saved
+    // AI conversation is unrecoverable.
+    let reset_ai_panel: Rc<dyn Fn(u64)> = {
+        let ai_session = ai_session.clone();
+        Rc::new(move |id: u64| {
+            // The AI conversation is bound to a connection — swap in the one
+            // saved for this connection (empty when there isn't one). The live
+            // session can't be reused, so the restored turns are transcript;
+            // the next message spawns a session that gets them replayed.
+            *ai_session.borrow_mut() = None;
+            // Staged rows belong to the connection they were taken from. Leaving
+            // the chip up would carry one connection's data into a question
+            // asked on another — past that connection's own data-access level.
+            ai_attachment.set(None);
+            let restored = schemaic_core::chat::for_conn(&saved_chats.get_untracked(), id);
+            // Reappearing, not arriving — mount them without the entrance pop.
+            schemaic_ui::mark_messages_seen(restored.len());
+            ai_messages.set(restored);
+            ai_busy.set(false);
+            // Any in-flight Stop belonged to the conversation just replaced.
+            ai_stopping.set(false);
+        })
+    };
+
     let switch_conn: Rc<dyn Fn(u64)> = {
         let load_schema = load_schema.clone();
-        let ai_session = ai_session.clone();
+        let reset_ai_panel = reset_ai_panel.clone();
         let check_conn = check_conn.clone();
         let last_tab = last_tab.clone();
         let open_tab_on = open_tab_on.clone();
@@ -8326,22 +8362,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // says nothing about this one.
             conn_status.set(ConnStatus::Unknown);
             health_failures.set(0);
-            // The AI conversation is bound to a connection — swap in the one
-            // saved for this connection (empty when there isn't one). The live
-            // session can't be reused, so the restored turns are transcript;
-            // the next message spawns a session that gets them replayed.
-            *ai_session.borrow_mut() = None;
-            // Staged rows belong to the connection they were taken from. Leaving
-            // the chip up would carry one connection's data into a question
-            // asked on another — past that connection's own data-access level.
-            ai_attachment.set(None);
-            let restored = schemaic_core::chat::for_conn(&saved_chats.get_untracked(), id);
-            // Reappearing, not arriving — mount them without the entrance pop.
-            schemaic_ui::mark_messages_seen(restored.len());
-            ai_messages.set(restored);
-            ai_busy.set(false);
-            // Any in-flight Stop belonged to the conversation just replaced.
-            ai_stopping.set(false);
+            (reset_ai_panel)(id);
             if let Some(conn) =
                 connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
             {
@@ -8750,12 +8771,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let repointed = previous
                 .as_ref()
                 .is_some_and(|p| !p.targets_same_server(&conn));
+            // **A wider question than "which server", asked separately.** The
+            // transport is not part of `targets_same_server` — nor should it be,
+            // since the schema tree's question really is only about which server
+            // — but it *is* part of "is anything I have already opened still
+            // valid". Change a connection's TLS mode and every one of those nine
+            // fields is unchanged, so the block below was skipped and a pinned
+            // Manual session went on running, and committing, over the plaintext
+            // socket it was opened on, while the form and the status bar reported
+            // TLS. See `Connection::invalidates_open_connections`.
+            let invalidated = previous
+                .as_ref()
+                .is_some_and(|p| p.invalidates_open_connections(&conn));
             if repointed {
                 // The cached tunnel reaches the old server — drop it (its listener
-                // is torn down) so `load_schema` establishes a fresh one.
+                // is torn down) so `load_schema` establishes a fresh one. **On the
+                // server question, not the wider one:** a TLS change needs no new
+                // listener, and tearing one down takes the forwarded connections
+                // with it.
                 tunnels.borrow_mut().remove(&id);
+            }
+            if invalidated {
                 // Every pinned Manual session on this connection is now either on
-                // a dead socket or on a server the user has left, and its
+                // a dead socket, on a server the user has left, or on a
+                // transport the user has just changed their mind about — and its
                 // transaction is gone either way. This is `delete_conn_now`'s
                 // treatment, for the same reason and with the same absence of a
                 // prompt: the server rolls back on disconnect, and the tab
@@ -8910,10 +8949,23 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 match connections.with_untracked(|cs| cs.first().cloned()) {
                     Some(conn) => {
                         active_conn.set(conn.id);
+                        // **And the AI panel, which this used to leave alone.**
+                        // Deleting the active connection is a connection switch
+                        // by another name; without it the deleted transcript
+                        // stayed on screen under the fallback's header, was
+                        // replayed into the next session's system prompt, and
+                        // was written back to `chats.json` under the fallback's
+                        // id by `persist_chat` — undeleting the one thing the
+                        // confirm modal promised was unrecoverable.
+                        (reset_ai_panel)(conn.id);
                         load_schema(conn);
                     }
                     None => {
                         db_nodes.set(Vec::new());
+                        // No connection left to restore a conversation from, so
+                        // the panel empties — the same reset, with nothing to
+                        // put back.
+                        (reset_ai_panel)(0);
                         // **"The list is empty" has one meaning wherever it is
                         // reached.** Leaving `active_conn` on the deleted id was
                         // invisible until the empty state grew a New-connection

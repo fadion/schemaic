@@ -1049,6 +1049,47 @@ impl Connection {
             && self.ssh.user == other.ssh.user
     }
 
+    /// Does saving `other` over this connection make everything already **open**
+    /// against it invalid — a pinned `Session`, an AI/MCP subprocess?
+    ///
+    /// **Strictly wider than [`targets_same_server`](Connection::targets_same_server),
+    /// and the difference is a socket that is not encrypted.** That predicate
+    /// answers *which server the next query reaches*, which is the schema tree's
+    /// question; `save_conn` was asking a larger one with it — *is anything I
+    /// have already opened still valid* — and the two diverge on the transport.
+    ///
+    /// Save a MySQL connection with TLS **Disabled**, pin a tab to Manual so
+    /// `open_session` builds a `Db` from the connection as it then stands, then
+    /// change TLS mode to `Required` and press Save. Every one of the nine
+    /// fields `targets_same_server` compares is unchanged, so the invalidation
+    /// block was skipped: the pinned `Session` kept running, and every statement
+    /// in that tab — and its `COMMIT` — went on travelling in the clear,
+    /// indefinitely, while the connection form, the status bar and every fresh
+    /// operation reported TLS. The MCP subprocess went on serving tool calls
+    /// over the `Db` it was spawned with; `ai::needs_respawn` cannot see a
+    /// transport either. `db_for` rebuilds a `Db` per call, which is why every
+    /// *other* path picked the change up and only the two long-lived artefacts
+    /// did not.
+    ///
+    /// So this adds the transport, in both directions — turning TLS *off* leaves
+    /// a session negotiating it, which is the same lie the other way — and the
+    /// SSH credentials that decide what the tunnel authenticates as. The tunnel
+    /// itself stays on the *server* question: a TLS change needs no new
+    /// listener.
+    ///
+    /// Password is still out, for the reason `targets_same_server` gives: a
+    /// corrected password reaches the same server over the same socket, and an
+    /// already-authenticated session is not made wrong by it.
+    pub fn invalidates_open_connections(&self, other: &Connection) -> bool {
+        !self.targets_same_server(other)
+            || self.tls.mode != other.tls.mode
+            || self.tls.ca_path != other.tls.ca_path
+            || self.tls.client_cert_path != other.tls.client_cert_path
+            || self.tls.client_key_path != other.tls.client_key_path
+            || self.ssh.auth != other.ssh.auth
+            || self.ssh.key_path != other.ssh.key_path
+    }
+
     /// Is `other` **this same saved connection, still pointing where it did** —
     /// the question the schema tree asks before keeping the databases it is
     /// already showing?
@@ -1790,6 +1831,84 @@ mod tests {
         edited.ssh.password = "also corrected".into();
         edited.ssh.key_passphrase = "and this".into();
         assert!(conn().targets_same_server(&edited));
+    }
+
+    /// **The seam, which is where this went wrong: the two predicates together.**
+    /// A test of `invalidates_open_connections` alone would pass against the
+    /// unfixed tree — the function did not exist, and adding it green proves
+    /// nothing about the caller that was asking the *other* one. What has to
+    /// hold is that a TLS edit is still the same server (so the schema tree
+    /// keeps its rows) **and** invalidates what is already open (so a pinned
+    /// Manual session stops committing over the plaintext socket it was opened
+    /// on, while the form and the status bar report TLS).
+    #[test]
+    fn a_tls_edit_is_the_same_server_and_still_invalidates_what_is_open() {
+        let with = |f: fn(&mut Connection)| {
+            let mut c = conn();
+            f(&mut c);
+            c
+        };
+        for edited in [
+            with(|c| c.tls.mode = SslMode::VerifyFull),
+            with(|c| c.tls.ca_path = "/etc/ssl/ca.pem".into()),
+            with(|c| c.tls.client_cert_path = "/etc/ssl/client.pem".into()),
+            with(|c| c.tls.client_key_path = "/etc/ssl/client.key".into()),
+            with(|c| c.ssh.auth = SshAuth::KeyPair),
+            with(|c| c.ssh.key_path = "/home/me/.ssh/id_ed25519".into()),
+        ] {
+            assert!(
+                conn().targets_same_server(&edited),
+                "the tree must keep its databases"
+            );
+            assert!(
+                conn().invalidates_open_connections(&edited),
+                "but the pinned session and the MCP subprocess must not survive"
+            );
+        }
+        // Both directions: turning TLS *off* leaves a session negotiating it,
+        // which is the same lie the other way round.
+        let mut on = conn();
+        on.tls.mode = SslMode::Require;
+        assert!(on.invalidates_open_connections(&conn()));
+    }
+
+    /// And it must not over-trigger, or an ordinary edit starts destroying
+    /// transactions — the regression the `repointed` gate was introduced to end,
+    /// where changing a connection's **colour** killed the socket under a pinned
+    /// Manual transaction and rolled back uncommitted work.
+    #[test]
+    fn a_cosmetic_or_credential_edit_invalidates_nothing() {
+        let with = |f: fn(&mut Connection)| {
+            let mut c = conn();
+            f(&mut c);
+            c
+        };
+        for edited in [
+            with(|c| c.name = "renamed".into()),
+            with(|c| c.color = Some("#ff0000".into())),
+            with(|c| c.prominent_color = true),
+            with(|c| c.environment = Environment::Production),
+            with(|c| c.read_only = true),
+            with(|c| c.password = "the right one".into()),
+            with(|c| c.ssh.password = "also corrected".into()),
+            with(|c| c.ssh.key_passphrase = "and this".into()),
+        ] {
+            assert!(
+                !conn().invalidates_open_connections(&edited),
+                "{:?} killed an open transaction",
+                edited.name
+            );
+        }
+    }
+
+    /// Everything that moves the *server* still invalidates what is open — the
+    /// wider predicate is a superset, not a replacement.
+    #[test]
+    fn a_repointed_connection_still_invalidates_what_is_open() {
+        let mut edited = conn();
+        edited.host = "elsewhere".into();
+        assert!(!conn().targets_same_server(&edited));
+        assert!(conn().invalidates_open_connections(&edited));
     }
 
     /// A **tripwire**, not a behaviour test. `SshTunnel` grows fields, and the
