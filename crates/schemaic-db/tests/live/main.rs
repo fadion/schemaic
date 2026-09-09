@@ -145,6 +145,7 @@ live_suite!(
         an_introspected_view_diffs_to_nothing_against_its_own_draft,
         an_edited_view_body_lands_and_settles,
         a_view_that_drops_a_column_takes_the_destructive_arm_where_it_must,
+        a_recreated_view_keeps_the_triggers_the_drop_took,
         a_renamed_view_lands_under_the_new_name,
         a_view_is_introspected_as_a_view,
         a_view_is_never_writable_through_a_key_that_does_not_identify_a_row,

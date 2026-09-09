@@ -2063,6 +2063,25 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
                 }
             })
             .collect();
+        // **What a view's re-create would take with it.** PostgreSQL alters a
+        // table in place, so a table's triggers are never destroyed by an edit
+        // and `dependent_ddl` stays empty for one. A **view** has no
+        // `CREATE OR REPLACE` that can narrow its column list, so
+        // `ddl::diff_view` takes the drop-and-create arm — and `DROP VIEW`
+        // takes every `INSTEAD OF` trigger on it, which is the only way a
+        // PostgreSQL view is written to at all. Measured on 16.15: a view with
+        // an `INSTEAD OF INSERT` trigger, narrowed in the view editor, came back
+        // with none, the plan reported success and the preview named nothing.
+        //
+        // The server's own `pg_get_triggerdef` text, verbatim, for the reason
+        // `TableInfo::dependent_ddl` gives on the engine it was written for.
+        if t.is_view {
+            t.dependent_ddl = trigger_all
+                .iter()
+                .filter(|r| cell(r, 0) == ns && cell(r, 1) == t.name)
+                .map(|r| schemaic_core::sql::terminated(&cell(r, 7), SqlDialect::Postgres))
+                .collect();
+        }
         for ix in &mut t.indexes {
             ix.constraint = idx_constraints
                 .get(&(ns.clone(), t.name.clone(), ix.name.clone()))

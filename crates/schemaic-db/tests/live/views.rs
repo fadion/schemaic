@@ -376,6 +376,89 @@ pub async fn a_view_is_never_writable_through_a_key_that_does_not_identify_a_row
 
 /// Create the base table, three rows, and a view `v` over it. `body` carries a
 /// single `{}` for the qualified base table.
+/// **What the `DROP VIEW` half of a re-create takes with it, and has to put
+/// back.**
+///
+/// The recreate arm's other test proves the new column list lands; its fixture
+/// is a bare view over a bare table, so nothing depends on the view and the
+/// arm's whole data-safety half went unasserted. On PostgreSQL an `INSTEAD OF`
+/// trigger is **the only way a view is written to at all**, and `DROP VIEW`
+/// takes every one of them: measured on 16.15, a view with an
+/// `INSTEAD OF INSERT` trigger came back from a narrowing with `0` triggers,
+/// the plan reported success, and the preview named nothing.
+///
+/// `ChangeSet` has always emitted `replay` after the re-create — the field was
+/// simply never filled on the one engine that takes the arm, because
+/// `dependent_ddl` was SQLite's alone and SQLite alters nothing in place.
+///
+/// Gated on the arm the plan actually takes and on the target's own trigger
+/// function, not on the engine: a server that replaces a view in place destroys
+/// nothing, and there is no claim here for it to answer.
+pub async fn a_recreated_view_keeps_the_triggers_the_drop_took(target: &'static Target) {
+    let dialect = target.engine.dialect();
+    let (Some(fn_ddl), Some(fn_name)) = (target.trigger_function_ddl, target.trigger_function_name)
+    else {
+        // No trigger function on this leg means no `INSTEAD OF` trigger to lose.
+        return;
+    };
+    let scratch = Scratch::create(target, "view_replay").await;
+    seed_view(&scratch, "SELECT id, name FROM {} WHERE id > 0").await;
+    scratch.exec(fn_ddl).await;
+    let v = scratch.qualified("v");
+    scratch
+        .exec(&format!(
+            "CREATE TRIGGER v_ins INSTEAD OF INSERT ON {v} \
+             FOR EACH ROW EXECUTE FUNCTION {fn_name}()"
+        ))
+        .await;
+
+    let view = view_of(&scratch).await;
+    // The premise: the model has to *see* the trigger before the plan can put it
+    // back, and this is the field the emitter reads.
+    assert_eq!(
+        view.dependent_ddl.len(),
+        1,
+        "{}: the view's trigger is not in dependent_ddl: {:?}",
+        target.name,
+        view.dependent_ddl
+    );
+
+    let mut draft = ViewDraft::from_table(&view).expect("a view draft");
+    draft.select = format!("SELECT id FROM {}", scratch.qualified("t"));
+    let set = ddl::diff_view(&view, &draft, dialect);
+    if !set
+        .changes
+        .iter()
+        .any(|c| matches!(c, ddl::Change::ReplaceView { recreate: true, .. }))
+    {
+        // Replaced in place: nothing was dropped, so nothing had to come back.
+        scratch.teardown().await;
+        return;
+    }
+    apply_view(&scratch, &view, &draft, target).await;
+
+    let after = view_of(&scratch).await;
+    assert_eq!(
+        after
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id"],
+        "{}: the narrowing did not land",
+        target.name
+    );
+    assert!(
+        after.triggers.iter().any(|t| t.name == "v_ins"),
+        "{}: the re-create dropped the view's only write path and put nothing \
+         back; triggers now {:?}",
+        target.name,
+        after.triggers.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    scratch.teardown().await;
+}
+
 async fn seed_view(scratch: &Scratch, body: &str) {
     scratch
         .exec(&format!("CREATE TABLE {} {BASE}", scratch.qualified("t")))
