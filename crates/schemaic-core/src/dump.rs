@@ -1091,6 +1091,34 @@ pub fn colliding_files(plan: &FilePlan, exists: impl Fn(&str) -> bool) -> Vec<St
         .collect()
 }
 
+/// Of the files this export was going to replace, the ones it actually **has**.
+///
+/// The census ([`colliding_files`]) has to be read before the first rename, or
+/// it is contaminated by the export's own output — but only the *finished* arm
+/// is reached with the loop complete, and the whole-plan census went verbatim to
+/// all three. So pressing Stop while the first table was still streaming
+/// reported
+///
+/// ```text
+/// Export cancelled — no file was finished, so nothing was written to out.
+/// 3 existing files were replaced: orders.csv, items.csv, users.csv.
+/// ```
+///
+/// — two flatly contradictory sentences, of which the second is false and is
+/// also the **only** disclosure that a folder export destroys anything. It is
+/// wrong in the direction that sends a user looking for a backup they do not
+/// need.
+///
+/// Plan order, not `published` order: that is the order the prompt names them in
+/// and the order they would have been replaced in.
+pub fn destroyed(colliding: &[String], published: &[String]) -> Vec<String> {
+    colliding
+        .iter()
+        .filter(|f| published.iter().any(|p| p == *f))
+        .cloned()
+        .collect()
+}
+
 /// [`FolderVerdict`] for a folder export whose collisions are already in hand.
 ///
 /// Separate from [`colliding_files`] because the caller needs the list for its
@@ -1355,6 +1383,42 @@ mod tests {
         assert_eq!(
             folder_verdict(true, &census(|_| true)),
             FolderVerdict::Write
+        );
+    }
+
+    /// **The census is what is at risk; the report is what happened.** Handing
+    /// the whole-plan census to the stopped and failed arms told the user that
+    /// three files had been replaced in a folder the same sentence had just said
+    /// nothing was written to — and that clause is the *only* place a folder
+    /// export ever says it destroyed anything.
+    #[test]
+    fn a_stopped_export_names_only_what_it_actually_replaced() {
+        let census = [
+            "orders.csv".to_string(),
+            "customers.csv".to_string(),
+            "items.csv".to_string(),
+        ];
+        // Stopped before the first table finished.
+        assert!(destroyed(&census, &[]).is_empty());
+        // Stopped after the second.
+        assert_eq!(
+            destroyed(
+                &census,
+                &["orders.csv".to_string(), "customers.csv".to_string()]
+            ),
+            ["orders.csv".to_string(), "customers.csv".to_string()]
+        );
+        // A file the export wrote that was not there before is not a
+        // replacement, however far the run got.
+        assert!(destroyed(&[], &["orders.csv".to_string()]).is_empty());
+        // Plan order, not publication order — the order the prompt named them
+        // in, and the order they would have gone in.
+        assert_eq!(
+            destroyed(
+                &census,
+                &["items.csv".to_string(), "orders.csv".to_string()]
+            ),
+            ["orders.csv".to_string(), "items.csv".to_string()]
         );
     }
 

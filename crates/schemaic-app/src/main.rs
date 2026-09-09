@@ -5923,12 +5923,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
-    // `expect_disk` is what the file's bytes must still be for the write to go
+    // `expect_disk` is what the file must still **say** for the write to go
     // ahead — `Some` only for a Save over a file this tab read, where somebody
     // else's edit would otherwise be discarded without a word. `None` means
     // "write it whatever is there", which is what a Save As the user has already
-    // confirmed the overwrite for means.
-    type FileWriteReq = (std::path::PathBuf, String, Option<Vec<u8>>);
+    // confirmed the overwrite for means. `sqlfile::expected_disk_text` decides
+    // which of the two this is, and carries why it is the text rather than the
+    // bytes.
+    type FileWriteReq = (std::path::PathBuf, String, Option<String>);
     let write_sql_file: Rc<dyn Fn(FileWriteReq, FileWriteDone)> = {
         let handle = handle.clone();
         Rc::new(
@@ -5943,7 +5945,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // file is not one, since Save is how it comes back.
                     if let Some(expected) = expect_disk
                         && let Ok(now) = std::fs::read(&path)
-                        && now != expected
+                        && schemaic_core::sqlfile::changed_on_disk(&now, &expected)
                     {
                         report(Err(format!(
                             "{} has changed on disk since it was opened. \
@@ -5986,18 +5988,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let write_sql_file = write_sql_file.clone();
         let file_error = file_error.clone();
         Rc::new(move |tab: Tab, path: std::path::PathBuf| {
-            let format = tab.file_format.get_untracked();
-            let text = tab.query.get_untracked();
+            // **Every read of the tab is fallible from here down.** The Save As
+            // dialog is not window-modal, so the app goes on taking input while
+            // it stands open: Ctrl+W closes a clean tab with no prompt, the
+            // scope is disposed a tick later, and naming a file in the dialog
+            // then ran this against it. floem defines `get_untracked` as
+            // `try_get_untracked().unwrap()`, so the first line panicked and took
+            // every *other* tab's unsaved work with it. The guard existed
+            // already, on the half of this function that is not behind a dialog.
+            let (Some(format), Some(text), Some(disk), Some(tab_path)) = (
+                tab.file_format.try_get_untracked(),
+                tab.query.try_get_untracked(),
+                tab.disk_sql.try_get_untracked(),
+                tab.path.try_get_untracked(),
+            ) else {
+                return;
+            };
             let contents = schemaic_core::sqlfile::encode(&text, format);
-            // What the file must still hold. Reconstructed from the text this tab
-            // read rather than kept as a second copy of the bytes — `encode` is
-            // `decode`'s inverse for exactly the files this can apply to. A lossy
-            // read has no inverse and a restored-dirty tab never read one, so
-            // both skip the check; the lossy case has its own, louder question.
-            let expect_disk = (!format.lossy)
-                .then(|| tab.disk_sql.get_untracked())
-                .flatten()
-                .map(|disk| schemaic_core::sqlfile::encode(&disk, format).into_bytes());
+            // What the file must still say — `Some` only when this *is* the file
+            // the tab read. `expected_disk_text` carries both halves of why:
+            // that a Save As names somebody else's file, and that the comparison
+            // is the text rather than the bytes.
+            let expect_disk = schemaic_core::sqlfile::expected_disk_text(
+                tab_path.as_deref(),
+                &path,
+                disk.as_deref(),
+            );
             let write: Rc<dyn Fn()> = {
                 let write_sql_file = write_sql_file.clone();
                 let file_error = file_error.clone();

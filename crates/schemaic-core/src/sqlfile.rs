@@ -273,6 +273,57 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     same_path(a, b, PATHS_IGNORE_CASE)
 }
 
+/// What the file at `target` must still **say** for a write from this tab to go
+/// ahead — or `None` to write it whatever is there.
+///
+/// Two questions the app used to get wrong by not asking them here.
+///
+/// **Whose file is it.** The guard exists so somebody else's edit is not
+/// discarded without a word, and that only applies to a Save over *the file this
+/// tab read*. A Save As names a different file, one the user has already
+/// consented to replacing at the OS dialog — and the check was applied to it
+/// anyway, comparing `a.sql`'s remembered contents against `b.sql`'s real ones,
+/// which differ by construction. So **Save As over any existing file was refused
+/// outright**, with a message about changes nobody had made, from any tab that
+/// had ever read a file. The caller had no way to tell the two apart:
+/// `write_tab_to` took `(Tab, PathBuf)` and both call sites passed the same two
+/// arguments, three lines from each other.
+///
+/// **Text, not bytes.** It used to be the bytes, reconstructed as
+/// `encode(disk_text)` on the premise that `encode` is `decode`'s inverse. It is
+/// not: [`is_crlf`] is a majority vote, so a file with mixed line endings
+/// decodes to one flag and re-encodes with the winner's terminator throughout.
+/// Measured — 900 CRLF + 100 LF lines came back 100 bytes longer, and one stray
+/// LF in a 62-byte dump header was enough — with `lossy` false in every case, so
+/// the only gate on that path was open. The save was then refused for the life
+/// of the tab: **a mixed-ending file could never be written back to itself**,
+/// and the recovery the message offered (reload) discards the edit.
+///
+/// Comparing the decoded *text* asks the question the guard is actually for. It
+/// also covers a **lossy** file, which opted out of the check entirely because
+/// it has no byte-exact inverse — its text is deterministic even where its bytes
+/// are not. The cost is that another tool converting the file's line endings, and
+/// changing nothing else, no longer blocks the save: the tab writes its
+/// remembered ending back, which is what it would have done anyway.
+pub fn expected_disk_text(
+    tab_path: Option<&Path>,
+    target: &Path,
+    disk: Option<&str>,
+) -> Option<String> {
+    if !tab_path.is_some_and(|p| same_file(p, target)) {
+        return None;
+    }
+    disk.map(str::to_string)
+}
+
+/// Has the file changed under the tab since it read it?
+///
+/// The bytes as they are now against the text the tab holds — see
+/// [`expected_disk_text`] for why it is the text.
+pub fn changed_on_disk(now: &[u8], expected: &str) -> bool {
+    decode(now).text != expected
+}
+
 /// [`same_file`]'s rule with the platform's answer passed in, so both sides of it
 /// are testable on either platform.
 ///
@@ -697,5 +748,89 @@ mod tests {
                 ignore_case
             ));
         }
+    }
+
+    // ── The stale-file guard ─────────────────────────────────────────────────
+
+    /// **A mixed-ending file must be savable.** `encode(decode(bytes))` is not
+    /// `bytes` — `is_crlf` is a majority vote, so every line comes back with the
+    /// winner's terminator — and the guard that compared them therefore refused
+    /// every save of such a file, for the life of the tab, blaming an edit
+    /// nobody had made. The text is what round-trips, and the text is what the
+    /// guard is actually asking about.
+    #[test]
+    fn a_mixed_ending_file_is_not_read_as_changed_under_the_tab() {
+        let mixed = "SELECT 1;\r\nSELECT 2;\nSELECT 3;\r\n";
+        let read = decode(mixed.as_bytes());
+        // The premise the old guard rested on, stated so its failure is on the
+        // record rather than implied.
+        assert_ne!(
+            encode(&read.text, read.format),
+            mixed,
+            "if this ever becomes an equality the byte comparison was fine after all"
+        );
+        assert!(!changed_on_disk(mixed.as_bytes(), &read.text));
+        // A real edit still is one.
+        assert!(changed_on_disk(
+            b"SELECT 1;\r\nSELECT 99;\nSELECT 3;\r\n",
+            &read.text
+        ));
+    }
+
+    /// The other endings and the BOM, for the same property.
+    #[test]
+    fn every_shape_of_file_reads_as_unchanged_against_its_own_text() {
+        for bytes in [
+            &b"SELECT 1;\nSELECT 2;\n"[..],
+            &b"SELECT 1;\r\nSELECT 2;\r\n"[..],
+            &b"\xEF\xBB\xBFSELECT 1;\r\nSELECT 2;\n"[..],
+            &b""[..],
+            // Not valid UTF-8: the lossy read has no byte-exact inverse, which
+            // is why this case used to skip the check altogether.
+            &b"SELECT 'caf\xE9';\n"[..],
+        ] {
+            let read = decode(bytes);
+            assert!(
+                !changed_on_disk(bytes, &read.text),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    /// **A Save As names somebody else's file**, and the user has already
+    /// consented to replacing it at the OS dialog. Only a Save over the file
+    /// this tab read has anything to protect.
+    #[test]
+    fn only_a_save_over_the_tabs_own_file_is_guarded() {
+        let a = PathBuf::from("/sql/a.sql");
+        let b = PathBuf::from("/sql/b.sql");
+        assert_eq!(
+            expected_disk_text(Some(&a), &a, Some("SELECT 1;\n")).as_deref(),
+            Some("SELECT 1;\n"),
+            "Save over its own file"
+        );
+        assert_eq!(
+            expected_disk_text(Some(&a), &b, Some("SELECT 1;\n")),
+            None,
+            "Save As over an existing file the user chose"
+        );
+        assert_eq!(
+            expected_disk_text(None, &b, Some("SELECT 1;\n")),
+            None,
+            "a tab that never read a file"
+        );
+        assert_eq!(
+            expected_disk_text(Some(&a), &a, None),
+            None,
+            "bound to a path but holding no copy of what was in it"
+        );
+        // The path question is `same_file`'s, so the platform's case rule
+        // applies here too rather than being asked a second way.
+        let upper = PathBuf::from("/sql/A.SQL");
+        assert_eq!(
+            expected_disk_text(Some(&a), &upper, Some("x")).is_some(),
+            PATHS_IGNORE_CASE
+        );
     }
 }

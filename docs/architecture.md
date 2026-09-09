@@ -1012,6 +1012,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     about `\n`. `comment_text(raw)` is the answer, placed here beside the quoters so the grep the
     "one identifier quoter" rule relies on finds it too; the dump's four header sites are its other
     callers, and the invariant is written up under *Architecture invariants*.
+    **A literal only means what it was written to mean on a session that reads it that way**, which
+    is what `MYSQL_LITERAL_MODE_SQL` and its dialect wrapper `literal_mode_sql` are for.
+    `sql_literal` doubles a backslash for the MySQL family because that is what the server does with
+    one *by default*; under `NO_BACKSLASH_ESCAPES` the doubled literal means two backslashes, so a
+    value `a'b\c` written `'a''b\\c'` comes back `a'b\\c` — one character longer, no error, measured
+    on MariaDB 10.11.14 and MySQL 8.4.11. The statement **takes that one flag out of the mode rather
+    than overwriting it**, so whatever strictness the server was configured with survives: this is
+    about what the literals mean, not about what the statements around them may do. The flag has to
+    be named to be on (`ANSI` does not imply it, checked on MariaDB 10.11.14), which is what makes
+    the comma-wrapped `REPLACE` + `TRIM` surgery exact rather than a guess. PostgreSQL and SQLite
+    answer `None` — standard literals since 9.1's `standard_conforming_strings` default, and no
+    backslash escape at all, which is the same split `sql_literal`'s own arms take. Two kinds of
+    caller: a **file**, where `dump::literal_mode_guard_sql` wraps it in a save/restore pair, and a
+    **live plan**, where `Db::run_ddl` and `Db::run_server_ddl` run the bare statement best-effort
+    beside `lock_wait_sql` — scoped to the plan, never pinned at connect time, because a user who
+    sets that mode means it for the SQL they type.
     **`ExportTally` is what a renderer returns, because a row count was never the whole result.**
     `rows`, plus three losses the file itself shows no trace of: `withheld` (those binary columns,
     named — empty for Markdown and HTML), `blanked` (`ResultSet::capped_columns`, the cells past a
@@ -1319,7 +1335,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the whole file rather than on either function — the bug is the composition. **PostgreSQL gets no
     guard**: `session_replication_role` is superuser-only, so offering it would be a checkbox that
     fails the restore for most roles, and the ordering plus the trailing constraints section is the
-    answer there. **`target_database_sql` emits `USE` on MySQL only, and it is load-bearing.**
+    answer there.
+    **`literal_mode_guard_sql` sits outside both, and is not one of the two optional scaffolds.**
+    It is `export::literal_mode_sql` — the statement that takes `NO_BACKSLASH_ESCAPES` off the
+    session so every `'…'` in the file means what `sql_literal` wrote it to mean — with the
+    save-and-restore pair a *file* needs around it, because a `.sql` file is replayed into a session
+    the user goes on using (`Db::run_script` holds one connection for the whole file, and the client
+    a user replays it in holds one for the evening). `plan` emits it **before the container
+    statements**, ahead of the FK guard and the transaction: the `CREATE DATABASE` and `CREATE
+    TABLE`s in front of the transaction carry literals too, a column comment or a quoted default.
+    And it is emitted **unconditionally** — `disable_fk_checks` and `wrap_transaction` choose how the
+    load behaves, while this one is the file saying what it says. `mysqldump` pins the mode at the
+    head of every file for the same reason. **`target_database_sql` emits `USE` on MySQL only, and it is load-bearing.**
     `create_ddl` names a MySQL table bare — a database is not a namespace there, so there is nothing
     to qualify with — while the `INSERT`s come from the export renderer, which addresses a table
     through `qualified_table` and *does* name the database; without that line the file would create
@@ -2825,6 +2852,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     with no `_ =>`: a catch-all there answers for an engine nobody has looked at, so a fourth engine
     would silently take PostgreSQL's spelling rather than failing to compile. SQLite reaches it only
     through a caller that skipped `supports_user_admin`, which is what the arms are for.
+    **One position in that statement is not read as a name, and quoting could not save it.** MySQL
+    and MariaDB document the database in a `GRANT … ON db.*` as a `LIKE` pattern — `_` matches any
+    single character, `%` any sequence — and a backtick does **not** suppress it; the manual's own
+    escaped example is itself backticked. So ``GRANT SELECT ON `app_db`.* TO …`` also granted on
+    `appXdb`, measured on MariaDB 10.11.14 and MySQL 8.4.11 where an account granted on
+    `sc_rev_a_b` read rows out of `sc_rev_aXb`, and nothing afterwards revealed it because
+    `SHOW GRANTS` prints the stored pattern straight back unescaped. Underscored database names are
+    the ordinary case, not the exotic one. So the MySQL `Database` arm calls
+    `export::ident_pattern_sql` — the third member of the quoting family, stated in full under
+    *Architecture invariants* — and the `Table` arm deliberately keeps `ident_sql`, the table level
+    being exact-matched on both servers (a qualified `db`.`tbl` grant answers ERROR 1142 rather than
+    reaching the pattern's other matches).
     **Two decisions the browser used to hold live here now.** `WriteGate::of(dialect, read_only,
     has_database)` answers whether a write is offered and, if not, why — `NoEngineSupport`,
     `ReadOnly`, `NoDatabase`, `Allowed` — and the *ordering* of those four answers is the whole
@@ -11806,6 +11845,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   transactions on the *connection* — Schemaic doesn't track which tables one has touched, so anything
   narrower would miss the case) before applying, and `run_ddl`'s connection carries
   `db::lock_wait_sql` so a lock nobody could ask about comes back as an error instead of never.
+  A second best-effort statement rides beside it on both DDL runners — `export::literal_mode_sql`,
+  so the plan's `sql_literal` output means what it says (see `core::export`) — and it is scoped to
+  the plan for exactly the reason the one-connection rule makes that cheap: this connection runs one
+  reviewed plan and is disconnected on the way out, so nothing it sets outlives the call.
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
   endpoint via a `--mcp-config` file, not argv — or, for a harness whose only configuration
@@ -12122,6 +12165,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   They asked the alias set, and on SQLite `CAST`, `IF` and `RAISE` sit in the gap, so a table named
   for one of them produced an `ORDER BY` that would not parse. Right quoter, wrong question. See
   `core::intel` for the measurement and the test that holds both lists to the engine itself.
+  **A third question earned a third function, and that is not a fifth quoter.**
+  `export::ident_pattern_sql` is for the one position the server reads as a **`LIKE` pattern**
+  rather than as a name: MySQL's and MariaDB's `GRANT … ON db.*`. Quoting answers *where does the
+  name end*, never *how will the server read what is inside it*, and a backtick does not suppress
+  the pattern there — the manual's own escaped example is itself backticked. ``GRANT SELECT ON
+  `app_db`.* TO …`` therefore also granted on `appXdb`: measured on MariaDB 10.11.14 and MySQL
+  8.4.11, where an account granted on `sc_rev_a_b` read rows out of `sc_rev_aXb`, with `SHOW GRANTS`
+  printing the stored pattern back unescaped so nothing afterwards showed it. It escapes `\` first
+  (it is the pattern's own escape character, so a database really named `a\_b` would otherwise come
+  out naming the pattern for `a_b`), then `_` and `%`, then quotes; `users::GrantLevel::object_sql`
+  calls it from the MySQL `Database` arm **only**, because the table level is exact-matched. The
+  family is three because there are three questions, not because quoters may be added freely — a
+  fourth needs a fourth question, and *don't write a fifth* is unchanged. **The cost is named**: a
+  grant some other client wrote unescaped is stored under the pattern `app_db`, and a revoke emitted
+  from here now names `app\_db`, so the server answers ERROR 1141 instead of removing it — which
+  includes the grants Schemaic itself wrote before this existed.
   **What no quoter here answers is whether text is safe on a *comment* line** — a separate question
   with its own function and its own rule, next.
 - **Nothing server-supplied reaches a comment line unescaped**, and that is a different guarantee
@@ -14177,13 +14236,28 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
   `Tab::shown_frozen` is the untracked half of the pair, for callers acting *now* inside an event
   handler; anything answering the question while a grid is mounted takes the memo.
 - **What a panel remembers.** `PanelView` — column widths (with the `grid_char_w` they were measured
-  against), the client-side sort, and the frozen column — as **signals in the panel's own child
-  scope**, not fields in the panel list: the grid writes a width on every mouse-move of a resize
+  against), the client-side sort, the frozen column, and the **staged-edit trio** `dirty` /
+  `new_rows` / `del_rows` — as **signals in the panel's own child scope**, not fields in the panel
+  list: the grid writes a width on every mouse-move of a resize
   drag, and through the list that would clone and re-notify the whole strip each time. `GridState::new`
   seeds from them (length-checked against the column count, so a restore can't leave the header and
   the body disagreeing) and four effects in `grid_view` mirror changes back. Selection is
   deliberately *not* remembered: it is where the user last clicked, not a property of the result.
   Nothing is persisted — a strip is session-only, like the results themselves.
+  **The trio is here because it was not.** `GridState::new` created those three with a bare
+  `RwSignal::new`, so they belonged to the `results_area` `dyn_container`'s child scope — which any
+  change of the active tab disposes. Switching away and back therefore reverted every staged cell,
+  dropped every pending row and unmarked every row set for deletion, silently: the *close* path
+  stops to ask about unsaved `.sql` text and an open transaction and had no third question for this.
+  They are the panel's for the same reason the widths are — they are about the **result**.
+  `GridState::new` adopts them from `gctx.panel` and falls back to fresh signals only where there is
+  no panel yet (`app_view`'s template, which `results_multi` fills in).
+  **They are cleared where the rows are replaced, not where the view is.** The trio is indexed by
+  *data row*, so a re-run returning different rows would leave a staged value pointing at whichever
+  row landed in that position — worse than losing the edit. So the clear lives on the one writer
+  that means "these rows are being replaced", `Tab::bump_panel_load`, calling
+  `PanelView::clear_staged`. A fresh run needs no clear (`begin_run` builds new panels, empty by
+  construction) and a commit splice deliberately bumps nothing, which is why it keeps its state.
   The frozen column is `frozen_col`, spelled out because a *frozen column* and a *frozen result* are
   different things one field apart (`gctx.panel.frozen_col` is an index, `gctx.panel_frozen` is
   whether the result is pinned), and two `.frozen`s in one data path is a wrong-variable bug waiting
@@ -14240,7 +14314,9 @@ its × would be, and "Close all" spares the pins — the query strip's rules, re
 per result set and threaded into every cell/handler. It holds column widths, the selection
 (`active`/`anchor` in **display** coords so selection stays put visually on sort), the display→data-row
 `order`, the value-viewer/freeze/edit toggles, the `dirty` edit map, and `vp`/`scroll_to`/`focus_id`
-for keyboard nav.
+for keyboard nav. **`dirty`, `new_rows` and `del_rows` are not its own**: they are adopted from the
+panel (`PanelView`, under *The results strip*), whose scope survives the tab switch that disposes
+this bundle's.
 
 - **Two panes** side by side (`h_stack`): a **frozen pane** (row-number gutter + optional frozen
   column) and a horizontally-scrolling **data pane**. Rebuilt by a `dyn_container` keyed on

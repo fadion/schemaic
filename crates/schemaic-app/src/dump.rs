@@ -301,6 +301,13 @@ pub(crate) async fn run_files(
     // stopped export is *more* likely to be inspected than a finished one, not
     // less. `FilePlan::missing` used to reach only `Done`.
     let missing = plan.missing.clone();
+    // **What this run has actually replaced**, as against `replaced`, which is
+    // the census of what it was *going* to. Only the finished arm below is
+    // reached with the loop complete, and the census used to go verbatim to all
+    // three — so a Stop during the first table reported three files destroyed in
+    // a folder the same sentence had just said nothing was written to. See
+    // `dump::destroyed`.
+    let mut published: Vec<String> = Vec::new();
 
     for (i, step) in plan.files.iter().enumerate() {
         // **Asked before the table is begun**, so a Stop that landed between two
@@ -311,7 +318,7 @@ pub(crate) async fn run_files(
             return FilesOutcome::Cancelled {
                 files: done,
                 missing,
-                replaced,
+                replaced: schemaic_core::dump::destroyed(&replaced, &published),
             };
         }
         // Best-effort, exactly as the dump's: a full progress channel must never
@@ -401,7 +408,7 @@ pub(crate) async fn run_files(
                 return FilesOutcome::Cancelled {
                     files: done,
                     missing,
-                    replaced,
+                    replaced: schemaic_core::dump::destroyed(&replaced, &published),
                 };
             }
             DumpVerdict::Failed { message, .. } => {
@@ -410,7 +417,7 @@ pub(crate) async fn run_files(
                     message,
                     files: done,
                     missing,
-                    replaced,
+                    replaced: schemaic_core::dump::destroyed(&replaced, &published),
                 };
             }
             DumpVerdict::Done => {
@@ -420,6 +427,10 @@ pub(crate) async fn run_files(
                 if let Some(t) = tally_of {
                     tally.absorb(t);
                 }
+                // The rename has landed, so if this name was in the census it is
+                // now genuinely gone. Recorded here and nowhere else: a failed
+                // write is swept as a `.part` and never reaches the real name.
+                published.push(step.file.clone());
                 done += 1;
             }
         }
@@ -429,7 +440,9 @@ pub(crate) async fn run_files(
         files: done,
         tally,
         missing,
-        replaced,
+        // Every step published, so this equals the census — computed the same
+        // way regardless, so the three arms cannot drift apart again.
+        replaced: schemaic_core::dump::destroyed(&replaced, &published),
     }
 }
 
