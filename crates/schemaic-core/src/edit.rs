@@ -66,6 +66,14 @@ pub struct EditModel {
     col_binary: Vec<bool>,
     col_cap: Vec<Option<u64>>,
     tables: Vec<EditTable>,
+    /// How many distinct base tables the *result* came from, keyable or not.
+    ///
+    /// **Not `tables.len()`, and the difference is a row-destroying bug.**
+    /// `tables` holds only the tables that got a key, so a table `resolve_key`
+    /// refuses — a log table with no primary key, or any view — is *absent*
+    /// rather than counted, and a two-table join then looked like a
+    /// single-table result to [`EditModel::insert_target`]. See that method.
+    origin_tables: usize,
 }
 
 /// Which surface the *open what I am on* gesture aims at — see
@@ -213,12 +221,30 @@ impl EditModel {
             .find(|t| t.database == database && t.schema.as_deref() == schema && t.table == table)
     }
 
-    /// The sole base table an `INSERT` would target, if the result maps to exactly
-    /// one writable table (the destination for a new row). `None` for a
-    /// multi-table join or a non-editable / read-only result.
+    /// The sole base table a row-level gesture would target, if the result maps
+    /// to exactly one writable table. `None` for a multi-table join or a
+    /// non-editable / read-only result.
+    ///
+    /// **Asked over the result's *origin* tables, not over the keyed ones**, and
+    /// this was `match self.tables.as_slice() { [only] => Some(only), _ => None }`.
+    /// `tables` holds only the tables that got a key, so a table `resolve_key`
+    /// refuses is absent rather than counted — and on
+    /// `SELECT o.id, o.total, l.note FROM orders o JOIN audit_log l ON …`, where
+    /// `audit_log` has no primary key, this said `Some(orders)`. It gates the
+    /// gutter's **Delete row** and **Duplicate row**, so Delete was offered on a
+    /// row of the join and issued `DELETE FROM db.orders WHERE id <=> 7` with
+    /// `l.note` on screen and nothing naming the table. It affects exactly one
+    /// row, so the write-back's 1-row safety net **structurally cannot** catch
+    /// it; on a 1:many join one display row destroys the parent the others also
+    /// stand for. Any view is the same shape — a view's columns carry no PK
+    /// flag, so the no-schema fallback refuses it too.
+    ///
+    /// The looseness `tables.len() == 1` was standing in for is kept: an
+    /// expression column has `origin: None` and so is not a second table, which
+    /// is what lets one base table plus computed columns still answer.
     pub fn insert_target(&self) -> Option<&EditTable> {
         match self.tables.as_slice() {
-            [only] => Some(only),
+            [only] if self.origin_tables == 1 => Some(only),
             _ => None,
         }
     }
@@ -430,6 +456,11 @@ pub fn analyze_edit(
         col_binary,
         col_cap,
         tables,
+        // **Off `groups`, not off `tables`.** `groups` is every distinct base
+        // table the result's columns came from; `tables` is the subset that got
+        // a key. `insert_target` needs the former, or a join whose second table
+        // is keyless reads as a single-table result — see that method.
+        origin_tables: groups.len(),
     }
 }
 
@@ -2684,6 +2715,84 @@ mod tests {
 
         // Read-only / non-editable (empty model) → no destination.
         assert!(EditModel::default().insert_target().is_none());
+    }
+
+    /// **The composition that escaped: one keyed table joined to a keyless
+    /// one.** `tables` holds only the tables that *got* a key, so a table
+    /// `resolve_key` refuses is absent rather than counted — and
+    /// `[only] => Some(only)` then read a two-table join as a single-table
+    /// result. That answer gates the gutter's **Delete row** and **Duplicate
+    /// row**, so on
+    /// `SELECT o.id, o.total, l.note FROM orders o JOIN audit_log l ON …`
+    /// Delete was offered on a row of the join and issued
+    /// `DELETE FROM db.orders WHERE id <=> 7` with `l.note` on screen. It
+    /// affects exactly one row, so **the 1-row safety net structurally cannot
+    /// catch it**; on a 1:many join one selected display row destroys the parent
+    /// the other display rows also stand for.
+    ///
+    /// A log table with no primary key is the everyday fixture, and **any
+    /// view** is another: a view's columns carry no PK flag, so the no-schema
+    /// fallback refuses it too. The one case that *was* pinned had two
+    /// *writable* tables, which is the half that already worked.
+    #[test]
+    fn a_join_with_one_keyless_table_has_no_insert_target() {
+        let joined = rs(vec![
+            col("id", "INT", "orders", true, false),
+            col("total", "DECIMAL", "orders", false, false),
+            col("note", "TEXT", "audit_log", false, false),
+        ]);
+        // `audit_log` has no primary key and no unique NOT NULL index, so
+        // `resolve_key` refuses it and it never reaches `tables`.
+        let schema = |_db: &str, _s: Option<&str>, t: &str| match t {
+            "orders" => Some(schema_with_pk(
+                "orders",
+                &["id"],
+                &[("id", "int"), ("total", "decimal")],
+            )),
+            "audit_log" => Some(schema_with_pk("audit_log", &[], &[("note", "text")])),
+            _ => None,
+        };
+        let m = analyze_edit(&joined, schema);
+        // The premise: exactly one table got a key, which is what made the old
+        // `[only]` match say yes.
+        assert_eq!(m.tables.len(), 1, "the premise");
+        assert!(
+            m.insert_target().is_none(),
+            "a join is not an insert destination however few of its tables are keyable"
+        );
+        // The keyed table is still *editable* — this withdraws the row-level
+        // gestures, not the cell-level ones.
+        assert!(m.editable(0), "orders.id is still writable");
+        assert!(!m.editable(2), "audit_log.note never was");
+
+        // And a schema the UI has not loaded at all is the same shape: no key
+        // for either table, so `tables` is empty and there is nothing to aim at.
+        let m = analyze_edit(&joined, |_: &str, _: Option<&str>, _: &str| None);
+        assert!(m.insert_target().is_none());
+    }
+
+    /// The looseness that `tables.len() == 1` was standing in for, and that the
+    /// fix must keep: **one base table plus computed columns**. An expression
+    /// column has no origin at all, so it is not a second table.
+    #[test]
+    fn a_computed_column_is_not_a_second_table() {
+        let mut r = rs(vec![
+            col("id", "INT", "users", true, false),
+            col("name", "VARCHAR", "users", false, false),
+        ]);
+        // `SELECT id, name, upper(name) FROM users` — the third column has no
+        // provenance the server could give.
+        r.columns.push(Column {
+            name: "upper".into(),
+            type_name: "VARCHAR".into(),
+            origin: None,
+        });
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "users")
+                .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert_eq!(m.insert_target().map(|t| t.table.as_str()), Some("users"));
     }
 
     #[test]
