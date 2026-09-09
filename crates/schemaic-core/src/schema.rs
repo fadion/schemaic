@@ -4351,33 +4351,87 @@ pub enum ColumnTypeClass {
 }
 
 /// Classify a column's declared SQL `type_name` (e.g. `varchar(45)`,
-/// `int(11) unsigned`, `decimal(10,2)`) by its leading type keyword. Case- and
-/// modifier-insensitive; note MySQL `bool`/`boolean` is a `tinyint(1)` alias, so
-/// only the literal `bool`/`boolean` spelling maps to [`ColumnTypeClass::Boolean`]
-/// (a bare `tinyint` is [`ColumnTypeClass::Numeric`]).
+/// `int(11) unsigned`, `character varying(45)`, `text[]`) by the type it names.
+/// Case-, modifier- and array-insensitive; note MySQL `bool`/`boolean` is a
+/// `tinyint(1)` alias, so only the literal `bool`/`boolean` spelling maps to
+/// [`ColumnTypeClass::Boolean`] (a bare `tinyint` is
+/// [`ColumnTypeClass::Numeric`]).
+///
+/// **Two passes, because a type name is not one word.** This took the leading
+/// run of `[A-Za-z0-9_]` and matched that alone, which is right for every MySQL
+/// spelling and wrong for PostgreSQL's, where `format_type` writes
+/// `character varying(45)`, `double precision` and `timestamp with time zone`.
+/// The leading word of the first is `character`, which matched nothing — so
+/// [`ColumnTypeClass::Other`] and its "unrecognised type" glyph were what every
+/// PostgreSQL connection showed for its most common column type, in the schema
+/// tree, the ER diagram's cards and tooltips, the completion popup and
+/// Find-Anywhere at once. The whole phrase is tried first and the leading word
+/// second, so a name the second pass already handled (`int unsigned`,
+/// `timestamp with time zone`) still answers exactly as it did.
 pub fn classify_column_type(type_name: &str) -> ColumnTypeClass {
-    // Leading keyword: up to the first `(`, space, or end.
-    let base: String = type_name
-        .trim()
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match base.as_str() {
+    // Anything from the first `(` is a modifier — a width, a precision, an
+    // enum's members — and says nothing about the family. `timestamp(3) with
+    // time zone` loses its tail with it, which is harmless: the leading word
+    // answers that one.
+    let head = type_name.split('(').next().unwrap_or_default();
+    // **An array is its element type.** The icon is about what a cell holds, and
+    // a `text[]` cell holds text; `format_type` writes any number of dimensions
+    // as repeated brackets.
+    let head = head.trim().trim_end_matches("[]").trim();
+    let phrase = head.split_whitespace().collect::<Vec<_>>().join(" ");
+    let phrase = phrase.to_ascii_lowercase();
+    if let Some(c) = type_keyword_class(&phrase) {
+        return c;
+    }
+    type_keyword_class(phrase.split(' ').next().unwrap_or_default())
+        .unwrap_or(ColumnTypeClass::Other)
+}
+
+/// One type name — a whole phrase or a single leading word — to its family, or
+/// `None` for a name this doesn't know.
+///
+/// `None` rather than [`ColumnTypeClass::Other`] because
+/// [`classify_column_type`] asks twice and has to tell "not recognised" from
+/// "recognised as unclassifiable" to know whether the second ask is worth
+/// making.
+fn type_keyword_class(name: &str) -> Option<ColumnTypeClass> {
+    Some(match name {
         "bool" | "boolean" => ColumnTypeClass::Boolean,
         "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "decimal" | "dec"
         | "numeric" | "fixed" | "float" | "double" | "real" | "bit" => ColumnTypeClass::Numeric,
+        // PostgreSQL's own numerics. `money` is a fixed-point currency value,
+        // `oid` an object identifier, and the three `serial`s are the notation a
+        // draft uses for an integer with a sequence behind it.
+        "double precision" | "money" | "oid" | "smallserial" | "serial" | "bigserial"
+        | "bit varying" => ColumnTypeClass::Numeric,
         "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => {
             ColumnTypeClass::Text
         }
+        // PostgreSQL's string family, as `format_type` spells it: `character
+        // varying` and `character` are what `varchar`/`char` come back as,
+        // `bpchar` is the catalogue's internal name for the padded one, and
+        // `name` is the type every identifier column in the catalogue has.
+        // `uuid`, `xml` and the network types are grouped here because a cell of
+        // one is text on screen and text in a filter — the icon says "a string
+        // you can read", which is true of all of them.
+        "character varying" | "character" | "bpchar" | "name" | "uuid" | "xml" | "inet"
+        | "cidr" | "macaddr" | "macaddr8" => ColumnTypeClass::Text,
         "date" | "datetime" | "time" | "timestamp" | "year" => ColumnTypeClass::DateTime,
+        // PostgreSQL's, and the reason `interval` is here rather than under
+        // numerics: it is a span of time, and it renders as one.
+        "interval" | "timestamptz" | "timetz" => ColumnTypeClass::DateTime,
         "json" | "geometry" | "geomcollection" | "geometrycollection" | "point" | "linestring"
         | "polygon" | "multipoint" | "multilinestring" | "multipolygon" => ColumnTypeClass::Json,
+        // `jsonb` is the one PostgreSQL actually stores, and the geometric types
+        // beside it are its own rather than the OpenGIS set above.
+        "jsonb" | "line" | "lseg" | "box" | "path" | "circle" => ColumnTypeClass::Json,
         "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => {
             ColumnTypeClass::Binary
         }
-        _ => ColumnTypeClass::Other,
-    }
+        // PostgreSQL's one binary type.
+        "bytea" => ColumnTypeClass::Binary,
+        _ => return None,
+    })
 }
 
 /// The five affinities SQLite assigns a column from its **declared type text**.
@@ -5483,6 +5537,66 @@ mod tests {
         assert_eq!(classify_column_type("varbinary(16)"), Binary);
         assert_eq!(classify_column_type("weird_custom_type"), Other);
         assert_eq!(classify_column_type(""), Other);
+    }
+
+    /// **Every assertion above is a MySQL spelling**, which is why a whole
+    /// engine's worth of columns rendering as "unrecognised type" was invisible
+    /// to the suite. These four are `format_type`'s output, measured on
+    /// PostgreSQL 16.15, for the four most common column types a PostgreSQL
+    /// database has.
+    #[test]
+    fn classify_column_type_reads_postgresqls_spellings() {
+        use ColumnTypeClass::*;
+        assert_eq!(classify_column_type("character varying(45)"), Text);
+        assert_eq!(classify_column_type("character(2)"), Text);
+        assert_eq!(classify_column_type("bytea"), Binary);
+        assert_eq!(classify_column_type("jsonb"), Json);
+        // The rest of what a PostgreSQL schema routinely holds.
+        assert_eq!(classify_column_type("double precision"), Numeric);
+        assert_eq!(classify_column_type("timestamp with time zone"), DateTime);
+        assert_eq!(
+            classify_column_type("timestamp(3) without time zone"),
+            DateTime
+        );
+        assert_eq!(classify_column_type("interval"), DateTime);
+        assert_eq!(classify_column_type("uuid"), Text);
+        assert_eq!(classify_column_type("bpchar"), Text);
+        assert_eq!(classify_column_type("numeric(10,2)"), Numeric);
+        assert_eq!(classify_column_type("money"), Numeric);
+        assert_eq!(classify_column_type("inet"), Text);
+    }
+
+    /// An array column is its element type — the icon is about what a cell
+    /// holds. `format_type` writes any number of dimensions as repeated
+    /// brackets, and it writes them after the modifier, so the two have to be
+    /// stripped in that order.
+    #[test]
+    fn an_array_column_is_classified_as_its_element_type() {
+        use ColumnTypeClass::*;
+        assert_eq!(classify_column_type("text[]"), Text);
+        assert_eq!(classify_column_type("integer[]"), Numeric);
+        assert_eq!(classify_column_type("character varying(45)[]"), Text);
+        assert_eq!(classify_column_type("bytea[][]"), Binary);
+    }
+
+    /// **The second pass must not shadow the first.** Matching only the whole
+    /// phrase would lose every MySQL type that carries a trailing modifier, and
+    /// matching only the leading word is the bug being fixed — so the two orders
+    /// are asserted against each other here.
+    #[test]
+    fn a_trailing_modifier_still_classifies_by_its_leading_word() {
+        use ColumnTypeClass::*;
+        assert_eq!(classify_column_type("int(11) unsigned"), Numeric);
+        assert_eq!(classify_column_type("bigint unsigned zerofill"), Numeric);
+        assert_eq!(
+            classify_column_type("varchar(20) CHARACTER SET utf8mb4"),
+            Text
+        );
+        assert_eq!(classify_column_type("timestamp with time zone"), DateTime);
+        // And an unknown leading word is still unknown, however many words
+        // follow it: the fallback widens the match, it must not invent one.
+        assert_eq!(classify_column_type("hstore"), Other);
+        assert_eq!(classify_column_type("my_type with trimmings"), Other);
     }
 
     #[test]
