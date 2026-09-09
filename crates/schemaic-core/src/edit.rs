@@ -703,13 +703,16 @@ fn resolve_key(info: Option<&TableInfo>, cis: &[usize], rs: &ResultSet) -> Optio
             // all NOT NULL (so it uniquely identifies a row).
             t.indexes
                 .iter()
-                .filter(|ix| ix.unique && !ix.foreign)
-                // An index with no *column* keys keys nothing — the same guard
-                // `schema::browse_key_columns` states, and for the same
-                // PostgreSQL expression index. Without it `all_present(&[])`
-                // answers `Some(vec![])`, and an empty write key builds
+                // `IndexInfo::identifies_a_row` — the same predicate
+                // `schema::browse_key_columns` and
+                // `ddl::supports_concurrent_refresh` ask, which is the point:
+                // this filtered on `unique && !foreign` alone, so a *partial*
+                // unique index offered a write key over rows it does not
+                // constrain. It also carries the "no *column* keys" guard that
+                // was stated here by hand — without it `all_present(&[])`
+                // answers `Some(vec![])` and an empty write key builds
                 // `… WHERE ` with nothing after it.
-                .filter(|ix| ix.column_names().next().is_some())
+                .filter(|ix| ix.identifies_a_row())
                 .filter(|ix| {
                     ix.column_names().all(|c| {
                         t.columns

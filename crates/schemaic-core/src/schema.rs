@@ -226,6 +226,49 @@ impl IndexInfo {
             .map(|c| c.name.as_str())
     }
 
+    /// **Does this index identify a row?** — the one question three different
+    /// parts of the app ask of an index, and used to answer three ways.
+    ///
+    /// Not "is it unique". A unique index identifies a row only when all five
+    /// hold:
+    ///
+    /// - **`unique`**, and **not `foreign`** — a foreign key constrains where a
+    ///   value may point, not how many rows may hold it.
+    /// - **not partial** ([`IndexInfo::predicate`]) — the uniqueness is promised
+    ///   only over the rows the `WHERE` admits. `CREATE UNIQUE INDEX ux ON t
+    ///   (email) WHERE deleted_at IS NULL` lets any number of soft-deleted rows
+    ///   share an email.
+    /// - **at least one key**, and **every key a plain column** — an expression
+    ///   key is not a column, and no result column carries its value.
+    ///   [`IndexInfo::column_names`] drops expressions, so `(a, lower(b))`
+    ///   reduces to `[a]`, which is not unique: measured on PostgreSQL 16.15,
+    ///   two rows with `a = 1` coexist happily under that index.
+    /// - **not [`lossy`](IndexInfo::lossy)** — an index whose keys could not all
+    ///   be read back, so what is in `columns` is not the whole index and none
+    ///   of the checks above was made against the whole of it.
+    ///
+    /// **It says nothing about NULL.** A unique index over a nullable column
+    /// identifies nothing (SQL lets any number of rows share a NULL), but that
+    /// is a fact about the *table's* columns, which this cannot see. The two key
+    /// resolvers add it; [`crate::ddl::supports_concurrent_refresh`] does not
+    /// need to, because PostgreSQL checks it itself.
+    ///
+    /// This existed as `supports_concurrent_refresh`'s inner predicate — with a
+    /// doc spelling out why uncertainty must refuse — while the two resolvers
+    /// that decide whether a user may *edit a row* each filtered on `unique &&
+    /// !foreign` alone. A partial unique index made a keyless table look
+    /// editable; the `UPDATE` then matched two rows and the 1-row safety net
+    /// rolled the whole batch back, telling the user the edit failed for a
+    /// reason that was not the reason.
+    pub fn identifies_a_row(&self) -> bool {
+        self.unique
+            && !self.foreign
+            && self.predicate.is_none()
+            && !self.lossy
+            && !self.columns.is_empty()
+            && self.columns.iter().all(|c| !c.expression)
+    }
+
     /// An index over whole columns, ascending — the shape most call sites mean.
     pub fn plain<S: Into<String>>(name: impl Into<String>, columns: Vec<S>, unique: bool) -> Self {
         Self {
@@ -482,14 +525,14 @@ pub fn browse_key_columns(t: &TableInfo) -> Vec<String> {
     }
     t.indexes
         .iter()
-        .filter(|ix| ix.unique && !ix.foreign)
-        // **An index with no *column* keys keys nothing.** PostgreSQL models
+        // **The whole question, in one place** — see
+        // [`IndexInfo::identifies_a_row`]. It subsumes the "no *column* keys"
+        // guard this used to make on its own (PostgreSQL models
         // `CREATE UNIQUE INDEX ON u (lower(email))` as a real index over one
-        // expression, and `column_names()` filters expressions out — so the
-        // `all(…)` below is vacuously true for it and `find` used to *stop*
-        // there and answer with an empty key, hiding a perfectly good unique
-        // index that sorted after it.
-        .filter(|ix| ix.column_names().next().is_some())
+        // expression, and `column_names()` filters expressions out, so the
+        // `all(…)` below is vacuously true for it), and adds the partial and
+        // lossy cases that were missing here and in `edit::resolve_key` alike.
+        .filter(|ix| ix.identifies_a_row())
         .find(|ix| {
             ix.column_names().all(|c| {
                 t.columns
@@ -4897,6 +4940,94 @@ mod browse_key_tests {
             implicit_key: Some("rowid".into()),
             ..Default::default()
         }
+    }
+
+    /// **A partial unique index is not a key.** `CREATE UNIQUE INDEX ux ON t
+    /// (email) WHERE deleted_at IS NULL` promises uniqueness over the rows the
+    /// `WHERE` admits and nothing about the rest, so any number of soft-deleted
+    /// rows may share an email. The table has no key of its own and must be
+    /// browsed by its implicit one.
+    #[test]
+    fn a_partial_unique_index_is_not_a_key() {
+        let mut ix = IndexInfo::plain("ux", vec!["email"], true);
+        ix.predicate = Some("deleted_at IS NULL".into());
+        let t = table(
+            vec![col("email", false, false), col("deleted_at", true, false)],
+            vec![ix],
+        );
+        assert!(
+            browse_key_columns(&t).is_empty(),
+            "{:?}",
+            browse_key_columns(&t)
+        );
+    }
+
+    /// **A lossy one is not a key either**, and this is the case a partial index
+    /// takes on SQLite: `db::sqlite` leaves the predicate unread on purpose and
+    /// sets `lossy` instead, so `predicate.is_none()` is true and `lossy` is the
+    /// only thing saying the index is not what `columns` says it is.
+    #[test]
+    fn a_lossy_unique_index_is_not_a_key() {
+        let mut ix = IndexInfo::plain("ux", vec!["email"], true);
+        ix.lossy = true;
+        let t = table(
+            vec![col("email", false, false), col("name", true, false)],
+            vec![ix],
+        );
+        assert!(
+            browse_key_columns(&t).is_empty(),
+            "{:?}",
+            browse_key_columns(&t)
+        );
+    }
+
+    /// **And a *mixed* one is not**, which the all-expression case already
+    /// covered by accident. `CREATE UNIQUE INDEX ux ON t (a, lower(b))`
+    /// constrains the pair; `column_names()` drops the expression and leaves
+    /// `[a]`, which is not unique — measured on PostgreSQL 16.15, two rows with
+    /// `a = 1` coexist under it.
+    #[test]
+    fn a_unique_index_over_a_column_and_an_expression_is_not_a_key() {
+        let ix = IndexInfo {
+            name: "ux".into(),
+            unique: true,
+            columns: vec![
+                IndexColumn::plain("a"),
+                IndexColumn {
+                    name: "lower(b)".into(),
+                    expression: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let t = table(
+            vec![col("a", false, false), col("b", false, false)],
+            vec![ix],
+        );
+        assert!(
+            browse_key_columns(&t).is_empty(),
+            "{:?}",
+            browse_key_columns(&t)
+        );
+    }
+
+    /// The three refusals above must not have cost the arm they sit in: an
+    /// ordinary unique index over a `NOT NULL` column is still a key, and one
+    /// that sorts *after* a refused index is still reached.
+    #[test]
+    fn a_sound_unique_index_after_a_refused_one_is_still_the_key() {
+        let mut partial = IndexInfo::plain("ux_partial", vec!["email"], true);
+        partial.predicate = Some("deleted_at IS NULL".into());
+        let t = table(
+            vec![
+                col("email", false, false),
+                col("code", false, false),
+                col("deleted_at", true, false),
+            ],
+            vec![partial, IndexInfo::plain("ux_code", vec!["code"], true)],
+        );
+        assert_eq!(browse_key_columns(&t), vec!["code".to_string()]);
     }
 
     #[test]

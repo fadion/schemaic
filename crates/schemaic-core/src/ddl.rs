@@ -7248,14 +7248,7 @@ pub fn view_definition_is_qualified(dialect: SqlDialect) -> bool {
 /// was written off here as "a clear message from the engine"; it is a clear
 /// message about an action the user cannot perform any other way.
 pub fn supports_concurrent_refresh(populated: bool, indexes: &[crate::schema::IndexInfo]) -> bool {
-    populated
-        && indexes.iter().any(|i| {
-            i.unique
-                && i.predicate.is_none()
-                && !i.lossy
-                && !i.columns.is_empty()
-                && i.columns.iter().all(|c| !c.expression)
-        })
+    populated && indexes.iter().any(|i| i.identifies_a_row())
 }
 
 /// Is this a **materialized** view — the object [`Change::RefreshView`] acts on,

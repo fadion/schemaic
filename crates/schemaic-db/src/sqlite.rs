@@ -5598,6 +5598,107 @@ mod tests {
         );
     }
 
+    /// **A partial unique index is not a row key**, and the whole path has to
+    /// agree — which is the point of testing it here rather than only against
+    /// `IndexInfo::identifies_a_row`. The predicate is pure and its own test
+    /// pins it; this one runs the introspector, the edit model and a real engine
+    /// in the order the app does, because the bug was never in the predicate. It
+    /// was in the two resolvers that never asked it.
+    ///
+    /// SQLite is also the engine that makes the case sharpest: `db::sqlite`
+    /// leaves a partial index's `WHERE` unread on purpose and reports `lossy`
+    /// instead, so `predicate` is `None` here and `lossy` is the *only* thing
+    /// saying the index does not mean what `columns` says. A resolver reading
+    /// `predicate` alone would still get this wrong.
+    ///
+    /// The rows prove the index really is not a key: two live rows share an
+    /// email, which the engine accepts, so `WHERE email = ?` would have matched
+    /// both and the 1-row net would have rolled the user's edit back with a
+    /// message about a failure that was really a bad key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_unique_index_is_not_offered_as_a_write_key() {
+        let (keeper, _db) = shared_memory("partial_unique_key");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (email TEXT NOT NULL, deleted_at TEXT);
+                 CREATE UNIQUE INDEX ux ON t (email) WHERE deleted_at IS NULL;
+                 INSERT INTO t VALUES ('a@x', NULL), ('a@x', '2026-01-01'), ('b@x', NULL);",
+            )
+            .unwrap();
+        // The premise: the engine accepted two rows with one email, so the index
+        // does not identify a row.
+        let dupes: i64 = keeper
+            .query_row("SELECT count(*) FROM t WHERE email = 'a@x'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dupes, 2, "the partial index was not partial");
+
+        // And the introspector reports it the way the resolvers see it.
+        let info = table_info_of(&keeper, "t");
+        let ux = info
+            .indexes
+            .iter()
+            .find(|ix| ix.name == "ux")
+            .expect("the index was introspected");
+        assert!(ux.unique, "not read as unique, so this proves nothing");
+        assert!(
+            ux.lossy && ux.predicate.is_none(),
+            "SQLite reports a partial index as lossy with no predicate: {ux:?}"
+        );
+
+        // `SELECT email, deleted_at` — no rowid, so the *only* candidate key is
+        // the index. If it is accepted, the table is editable; it must not be.
+        let rs = run_query(
+            &keeper,
+            "SELECT email, deleted_at FROM t",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
+        assert!(
+            m.insert_target().is_none(),
+            "a partial unique index was accepted as a write key"
+        );
+        let editable: Vec<&str> = (0..rs.col_count())
+            .filter(|&ci| m.editable(ci))
+            .map(|ci| rs.columns[ci].name.as_str())
+            .collect();
+        assert!(
+            editable.is_empty(),
+            "the result is offered as editable on a key that matches two rows: {editable:?}"
+        );
+
+        // The same table with a **whole** unique index is editable, so the
+        // refusal above is about the index being partial and not about anything
+        // else in this fixture.
+        keeper
+            .execute_batch(
+                "CREATE TABLE u (email TEXT NOT NULL);
+                 CREATE UNIQUE INDEX ux_u ON u (email);",
+            )
+            .unwrap();
+        let rs = run_query(
+            &keeper,
+            "SELECT email FROM u",
+            &mut crate::RowDest::Capped(100),
+        )
+        .unwrap();
+        let m = schemaic_core::edit::analyze_edit(
+            &rs,
+            schemaic_core::intel::SqlDialect::Sqlite,
+            |_, _, name| Some(table_info_of(&keeper, name)),
+        );
+        assert!(
+            m.insert_target().is_some(),
+            "a whole unique index over a NOT NULL column is still a key"
+        );
+    }
+
     /// **The re-fetch is a second statement on a second connection**, and it was
     /// keyed on the rowid alone.
     ///
