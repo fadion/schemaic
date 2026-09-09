@@ -1993,6 +1993,43 @@ impl Volatility {
     }
 }
 
+/// Whether PostgreSQL may run a function inside a parallel plan.
+///
+/// Modelled as an enum for the reason [`Volatility`] is: the server stores a
+/// single char and there are exactly three answers, so a `String` would let a
+/// fourth through to the emitter and into a `CREATE` the server then refuses.
+///
+/// **`Unsafe` is the default**, and it is the *restrictive* one — a function
+/// that says nothing is one no parallel plan may use. That is why the loss this
+/// models was silent: a `PARALLEL SAFE` function dropped back to `UNSAFE` on
+/// every redefinition, and nothing failed, queries just stopped parallelising.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Parallel {
+    #[default]
+    Unsafe,
+    Restricted,
+    Safe,
+}
+
+impl Parallel {
+    pub fn sql(self) -> &'static str {
+        match self {
+            Parallel::Unsafe => "PARALLEL UNSAFE",
+            Parallel::Restricted => "PARALLEL RESTRICTED",
+            Parallel::Safe => "PARALLEL SAFE",
+        }
+    }
+
+    /// From `pg_proc.proparallel`, which is a single char.
+    pub fn parse_code(c: &str) -> Parallel {
+        match c.trim() {
+            "s" => Parallel::Safe,
+            "r" => Parallel::Restricted,
+            _ => Parallel::Unsafe,
+        }
+    }
+}
+
 /// A stored routine — a function or a procedure.
 ///
 /// Modelled first because a PostgreSQL trigger holds no body of its own — it is
@@ -2064,6 +2101,35 @@ pub struct RoutineInfo {
     /// leaving the default unwritten as the PostgreSQL arm does: omitting it
     /// there does not mean `INVOKER`, it means `DEFINER`.
     pub security_definer: bool,
+    /// **PostgreSQL.** Whether a parallel plan may use this function. See
+    /// [`Parallel`]: the default is the restrictive answer, so a redefinition
+    /// that says nothing takes the function *out* of every parallel plan.
+    pub parallel: Parallel,
+    /// **PostgreSQL.** `LEAKPROOF` — the promise that the function reveals
+    /// nothing about its arguments beyond its return value, which is what lets
+    /// the planner push it below a security barrier or a row-level-security
+    /// policy. Losing it does not break a query; it makes some queries slower
+    /// and is a privilege the owner had to be superuser to grant, so it is not
+    /// something an edit should quietly hand back.
+    pub leakproof: bool,
+    /// **PostgreSQL.** `COST`, as the server renders it (`pg_proc.procost` is a
+    /// `real`).
+    ///
+    /// **A string, not an `f32`**, so [`RoutineInfo`] keeps its `Eq` — the diff
+    /// compares whole routines — and so the number goes back exactly as it came:
+    /// re-printing a parsed float is how `0.5` becomes `0.5000000074505806`.
+    /// `None` means unknown (every MySQL routine, and any draft assembled by
+    /// hand); the emitter writes nothing for it, and nothing for a value that
+    /// equals the language's default either — see [`RoutineInfo::pg_default_cost`].
+    pub cost: Option<String>,
+    /// **PostgreSQL.** `ROWS`, the estimated result size of a **set-returning**
+    /// function, as the server renders it.
+    ///
+    /// `None` on anything that returns one row, where the clause is not merely
+    /// unnecessary but refused: `ERROR: ROWS is not applicable when function
+    /// does not return a set`. The read side sets it only when `proretset`, so
+    /// the emitter never has to guess from the return type's spelling.
+    pub rows: Option<String>,
     /// **PostgreSQL.** Per-function `SET` clauses, already rendered as
     /// `key=value`.
     pub settings: Vec<String>,
@@ -2211,6 +2277,50 @@ impl RoutineInfo {
         }
     }
 
+    /// What PostgreSQL assumes a function costs when the `CREATE` says nothing:
+    /// 1 for a C or internal function, 100 for every other language.
+    ///
+    /// Public because it is the *reason* a `COST` clause is or is not emitted,
+    /// and a test that hard-coded 100 would agree with the emitter about the one
+    /// case they are both wrong on.
+    pub fn pg_default_cost(&self) -> f64 {
+        match self.language.trim().to_ascii_lowercase().as_str() {
+            "c" | "internal" => 1.0,
+            _ => 100.0,
+        }
+    }
+
+    /// `COST n`, or nothing when the routine is at its language's default (or
+    /// the value was never read).
+    fn pg_cost_clause(&self) -> Option<String> {
+        let raw = self
+            .cost
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        // An unparsable value is still restated rather than dropped: this
+        // module's job is not to lose what the server said, and a bad number
+        // fails loudly at the server instead of silently here.
+        match raw.parse::<f64>() {
+            Ok(v) if (v - self.pg_default_cost()).abs() < f64::EPSILON => None,
+            _ => Some(format!("COST {raw}")),
+        }
+    }
+
+    /// `ROWS n`, or nothing for a function that returns one row or is at the
+    /// server's 1000-row default.
+    fn pg_rows_clause(&self) -> Option<String> {
+        let raw = self
+            .rows
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        match raw.parse::<f64>() {
+            Ok(v) if (v - 1000.0).abs() < f64::EPSILON => None,
+            _ => Some(format!("ROWS {raw}")),
+        }
+    }
+
     fn pg_create_sql(&self, replace: bool) -> String {
         let d = crate::intel::SqlDialect::Postgres;
         let tag = dollar_tag(&self.body);
@@ -2248,11 +2358,36 @@ impl RoutineInfo {
             out.push_str(self.volatility.sql());
             out.push('\n');
         }
+        if is_function && self.leakproof {
+            out.push_str("LEAKPROOF\n");
+        }
         if is_function && self.strict {
             out.push_str("STRICT\n");
         }
         if self.security_definer {
             out.push_str("SECURITY DEFINER\n");
+        }
+        // **The three the redefinition used to drop.** Each has a default the
+        // server falls back to, and each default is the one that costs
+        // something: `PARALLEL UNSAFE` takes the function out of every parallel
+        // plan, `COST 100` is 20x off a function declared at 5, and a lost
+        // `ROWS` sends the planner a 1000-row estimate for a function that
+        // returns three. Nothing failed, which is why it went unnoticed.
+        //
+        // Restated only where it differs from that default, the way
+        // `SequenceInfo::clauses` does — a `CREATE` that spells out every
+        // server default is noise in the preview and in Copy DDL.
+        if is_function && self.parallel != Parallel::Unsafe {
+            out.push_str(self.parallel.sql());
+            out.push('\n');
+        }
+        if is_function && let Some(c) = self.pg_cost_clause() {
+            out.push_str(&c);
+            out.push('\n');
+        }
+        if is_function && let Some(r) = self.pg_rows_clause() {
+            out.push_str(&r);
+            out.push('\n');
         }
         for s in &self.settings {
             out.push_str(&format!("SET {s}\n"));
@@ -6903,6 +7038,214 @@ mod tests {
 
         src.apply_body_to(&mut r);
         assert_eq!(r.body, "the source as written");
+    }
+
+    /// **A redefinition restates the planner attributes it used to drop.**
+    ///
+    /// Measured on PostgreSQL 16.15: a function created `PARALLEL SAFE
+    /// LEAKPROOF COST 5` came back `parallel=u cost=100 leakproof=false` after
+    /// one body edit, because [`RoutineInfo`] had no field for any of them and
+    /// the emitter wrote nothing. Nothing failed — the defaults are the
+    /// conservative ones in every case, so the function merely stopped being
+    /// usable in a parallel plan and started lying to the planner by 20x.
+    ///
+    /// The whole clause list is asserted rather than four `contains`, because
+    /// the failure this guards against is a clause landing somewhere the
+    /// grammar refuses (`COST` before `RETURNS`, say) — which a `contains`
+    /// cannot see.
+    #[test]
+    fn a_pg_redefinition_restates_parallel_leakproof_and_a_non_default_cost() {
+        let r = RoutineInfo {
+            name: "f".into(),
+            schema: Some("public".into()),
+            kind: RoutineKind::Function,
+            arguments: "x integer".into(),
+            returns: "integer".into(),
+            language: "sql".into(),
+            body: "SELECT x".into(),
+            volatility: Volatility::Immutable,
+            parallel: Parallel::Safe,
+            leakproof: true,
+            cost: Some("5".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            r.create_sql(crate::intel::SqlDialect::Postgres, true),
+            // Unqualified: `qualified_ident` leaves `public` off, as every
+            // other emitter here does.
+            "CREATE OR REPLACE FUNCTION \"f\"(x integer)\n\
+             RETURNS integer\n\
+             LANGUAGE sql\n\
+             IMMUTABLE\n\
+             LEAKPROOF\n\
+             PARALLEL SAFE\n\
+             COST 5\n\
+             AS $$\nSELECT x\n$$;"
+        );
+    }
+
+    /// The other direction, which is what keeps the preview and Copy DDL
+    /// readable: a function sitting on every server default says none of them.
+    /// Without this the fix could be "always emit all four", and every
+    /// `CREATE` in the app would grow three lines of noise.
+    #[test]
+    fn a_pg_routine_at_its_defaults_states_none_of_the_four() {
+        let r = RoutineInfo {
+            name: "f".into(),
+            kind: RoutineKind::Function,
+            returns: "integer".into(),
+            language: "plpgsql".into(),
+            body: "BEGIN RETURN 1; END".into(),
+            parallel: Parallel::Unsafe,
+            leakproof: false,
+            // What the server reports for a function that declared no `COST`,
+            // and for a set-returning one that declared no `ROWS`.
+            cost: Some("100".into()),
+            rows: Some("1000".into()),
+            ..Default::default()
+        };
+        let sql = r.create_sql(crate::intel::SqlDialect::Postgres, true);
+        for word in ["PARALLEL", "LEAKPROOF", "COST", "ROWS"] {
+            assert!(
+                !sql.contains(word),
+                "{word} was restated needlessly:\n{sql}"
+            );
+        }
+    }
+
+    /// `COST` is 1 for a C function and 100 for everything else, so a single
+    /// hard-coded default would emit `COST 1` on every C function in the
+    /// database — and suppress the one place `COST 100` is meaningful.
+    #[test]
+    fn the_cost_default_follows_the_language() {
+        let of = |lang: &str, cost: &str| RoutineInfo {
+            name: "f".into(),
+            kind: RoutineKind::Function,
+            returns: "integer".into(),
+            language: lang.into(),
+            body: "x".into(),
+            cost: Some(cost.into()),
+            ..Default::default()
+        };
+        assert!(
+            !of("sql", "100")
+                .create_sql(crate::intel::SqlDialect::Postgres, false)
+                .contains("COST")
+        );
+        assert!(
+            of("c", "100")
+                .create_sql(crate::intel::SqlDialect::Postgres, false)
+                .contains("COST 100")
+        );
+        // ...and 1 is that default, so it is the one value a C function does
+        // not restate - the exact inverse of the `sql` case above.
+        assert!(
+            !of("c", "1")
+                .create_sql(crate::intel::SqlDialect::Postgres, false)
+                .contains("COST")
+        );
+        assert_eq!(of("c", "1").pg_default_cost(), 1.0);
+        assert_eq!(of("internal", "1").pg_default_cost(), 1.0);
+        assert_eq!(of("plpgsql", "1").pg_default_cost(), 100.0);
+    }
+
+    /// **A procedure takes none of them**, and PostgreSQL does not ignore the
+    /// ones it rejects: `CREATE PROCEDURE … PARALLEL SAFE` is
+    /// `ERROR: invalid attribute in procedure definition`. This is the same
+    /// trap the `RETURNS` guard was added for, and the four new clauses walked
+    /// straight into it — so they sit behind the same `is_function`.
+    #[test]
+    fn a_pg_procedure_states_none_of_the_function_only_attributes() {
+        let r = RoutineInfo {
+            name: "p".into(),
+            kind: RoutineKind::Procedure,
+            language: "sql".into(),
+            body: "SELECT 1".into(),
+            volatility: Volatility::Immutable,
+            parallel: Parallel::Safe,
+            leakproof: true,
+            strict: true,
+            cost: Some("5".into()),
+            rows: Some("3".into()),
+            // The one attribute a procedure *does* take, so the test proves the
+            // gate is per-clause and not "emit nothing for a procedure".
+            security_definer: true,
+            ..Default::default()
+        };
+        let sql = r.create_sql(crate::intel::SqlDialect::Postgres, false);
+        for word in [
+            "PARALLEL",
+            "LEAKPROOF",
+            "COST",
+            "ROWS",
+            "STRICT",
+            "IMMUTABLE",
+            "RETURNS",
+        ] {
+            assert!(
+                !sql.contains(word),
+                "a procedure cannot take {word}:\n{sql}"
+            );
+        }
+        assert!(sql.contains("SECURITY DEFINER"), "{sql}");
+    }
+
+    /// `ROWS` is refused on a function that returns one row —
+    /// *"ROWS is not applicable when function does not return a set"* — so the
+    /// read side sets the field only for a set-returning one and the emitter
+    /// restates whatever it was given. A non-default estimate is the whole
+    /// point of the clause: losing it hands the planner 1000 for a function
+    /// that returns three.
+    #[test]
+    fn a_set_returning_functions_row_estimate_survives() {
+        let r = RoutineInfo {
+            name: "f".into(),
+            kind: RoutineKind::Function,
+            returns: "SETOF integer".into(),
+            language: "sql".into(),
+            body: "SELECT 1".into(),
+            rows: Some("3".into()),
+            ..Default::default()
+        };
+        assert!(
+            r.create_sql(crate::intel::SqlDialect::Postgres, false)
+                .contains("ROWS 3"),
+            "{}",
+            r.create_sql(crate::intel::SqlDialect::Postgres, false)
+        );
+        // And a routine assembled by hand, which knows none of this, says
+        // nothing rather than guessing.
+        let bare = RoutineInfo {
+            rows: None,
+            ..r.clone()
+        };
+        assert!(
+            !bare
+                .create_sql(crate::intel::SqlDialect::Postgres, false)
+                .contains("ROWS")
+        );
+    }
+
+    /// None of the four is MySQL's, and the MySQL emitter must not learn them:
+    /// `PARALLEL`/`LEAKPROOF`/`COST`/`ROWS` are not in its grammar at all.
+    #[test]
+    fn the_mysql_emitter_says_nothing_about_any_of_the_four() {
+        let r = RoutineInfo {
+            name: "f".into(),
+            kind: RoutineKind::Function,
+            returns: "int".into(),
+            language: "SQL".into(),
+            body: "RETURN 1".into(),
+            parallel: Parallel::Safe,
+            leakproof: true,
+            cost: Some("5".into()),
+            rows: Some("3".into()),
+            ..Default::default()
+        };
+        let sql = r.create_sql(crate::intel::SqlDialect::MySql, false);
+        for word in ["PARALLEL", "LEAKPROOF", "COST", "ROWS"] {
+            assert!(!sql.contains(word), "{word} reached MySQL:\n{sql}");
+        }
     }
 
     /// A routine whose body is a **link symbol** rather than source can't be

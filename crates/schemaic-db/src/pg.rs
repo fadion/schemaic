@@ -56,9 +56,9 @@ use schemaic_core::model::{
     binary_display, one_row_verdict,
 };
 use schemaic_core::schema::{
-    CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, RoutineInfo, RoutineKind,
-    SequenceInfo, SequenceOwner, TableInfo, TriggerAction, TriggerEnabled, TriggerEvent,
-    TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, Volatility,
+    CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, Parallel, RoutineInfo,
+    RoutineKind, SequenceInfo, SequenceOwner, TableInfo, TriggerAction, TriggerEnabled,
+    TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, Volatility,
 };
 use schemaic_core::sql;
 use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
@@ -2718,7 +2718,9 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
                     pg_get_function_result(p.oid), l.lanname, p.prosrc, \
                     p.provolatile, p.proisstrict::int, p.prosecdef::int, \
                     p.oid::text, p.prokind, \
-                    pg_get_function_identity_arguments(p.oid) \
+                    pg_get_function_identity_arguments(p.oid), \
+                    p.proparallel, p.proleakproof::int, p.procost::text, \
+                    CASE WHEN p.proretset THEN p.prorows::text END \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              JOIN pg_language l ON l.oid = p.prolang \
@@ -2746,6 +2748,16 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
             strict: cell(r, 7) == "1",
             security_definer: cell(r, 8) == "1",
             settings: settings.get(&cell(r, 9)).cloned().unwrap_or_default(),
+            // The four a redefinition used to drop on the floor. `procost` and
+            // `prorows` come across as text so the number goes back exactly as
+            // the server printed it, and `prorows` only for a set-returning
+            // function — `ROWS` on anything else is refused outright, so the
+            // `CASE` is what keeps the emitter from having to guess from the
+            // return type's spelling.
+            parallel: Parallel::parse_code(&cell(r, 12)),
+            leakproof: cell(r, 13) == "1",
+            cost: Some(cell(r, 14)).filter(|s| !s.is_empty()),
+            rows: Some(cell(r, 15)).filter(|s| !s.is_empty()),
             // MySQL's alone; PostgreSQL has no clause for any of them and the
             // emitter writes nothing for a `None`.
             ..Default::default()
