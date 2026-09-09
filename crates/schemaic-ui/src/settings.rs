@@ -557,7 +557,15 @@ where
             .into_iter()
             .map(|item| {
                 let text: String = label(item).into();
-                let pick = move || active.set(item);
+                // Guarded, though this `active` is the picker's own value and
+                // not the tab selection: the term is free, and it keeps
+                // `no_bare_active_set_gate` a rule with no exceptions rather
+                // than one with a list.
+                let pick = move || {
+                    if active.get_untracked() != item {
+                        active.set(item)
+                    }
+                };
                 // The value already in effect is **tinted**, not given a filled
                 // background: the tint is this menu system's vocabulary for "you
                 // are holding this one" (`cell_editors::pick_entries` says the

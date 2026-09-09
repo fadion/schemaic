@@ -615,9 +615,25 @@ impl GridState {
             focus_id: RwSignal::new(None),
             edit_cell: RwSignal::new(None),
             edit_buf: RwSignal::new(String::new()),
-            dirty: RwSignal::new(HashMap::new()),
-            new_rows: RwSignal::new(Vec::new()),
-            del_rows: RwSignal::new(HashSet::new()),
+            // **Adopted from the panel, not created here.** Created here they
+            // belonged to the `results_area` `dyn_container`'s child scope,
+            // which an ordinary tab switch disposes — so switching away and
+            // back reverted every staged cell, dropped every pending row and
+            // unmarked every deletion, silently. The panel's scope survives that
+            // swap, which is why the column widths already do.
+            //
+            // The fallback is for a context with no panel yet
+            // (`app_view`'s template, which `results_multi` fills in): fresh
+            // signals there behave exactly as they did before.
+            dirty: gctx
+                .panel
+                .map_or_else(|| RwSignal::new(HashMap::new()), |p| p.dirty),
+            new_rows: gctx
+                .panel
+                .map_or_else(|| RwSignal::new(Vec::new()), |p| p.new_rows),
+            del_rows: gctx
+                .panel
+                .map_or_else(|| RwSignal::new(HashSet::new()), |p| p.del_rows),
             selecting: RwSignal::new(false),
             row_selecting: RwSignal::new(false),
             edit_model: RwSignal::new(Arc::new(EditModel::default())),

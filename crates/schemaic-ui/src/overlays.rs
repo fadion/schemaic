@@ -3914,7 +3914,7 @@ fn cycle_tab(
         Some(active.get_untracked()),
         step,
     ) {
-        active.set(next);
+        crate::activate(active, next);
     }
 }
 

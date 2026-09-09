@@ -17896,6 +17896,49 @@ mod sqlite_view_tests {
         assert!(supports_view_editing(Sqlite));
     }
 
+    /// **`diff_view(x, ViewDraft::from_table(x))` is empty by construction, and
+    /// four live tests spell it that way.**
+    ///
+    /// This is not a property worth having — it is a trap worth naming.
+    /// [`diff_view`] derives its own old side as `ViewDraft::from_table(current)`
+    /// and compares the draft against *that*, so handing it a draft made from
+    /// the same reading asks nothing: the two sides are one expression. Yet it
+    /// reads exactly like the round-trip gate the architecture doc prescribes
+    /// for **tables**, where [`diff`] does *not* derive the old side that way
+    /// and the gate is real — so the spelling is correct in one place and empty
+    /// in two, with nothing distinguishing them at the call site.
+    ///
+    /// `live/views.rs` and `live/triggers.rs` each assert "the edit settled"
+    /// this way (four sites), and each is green whatever the server did. The
+    /// honest question is `diff_view(after, the_draft_that_was_applied)` — the
+    /// draft came from the user's edit rather than from `after`, so a server
+    /// that normalised the body away from it *fails*, which is precisely the
+    /// "permanently dirty in the editor" claim those comments make. Fixing them
+    /// needs a live run; `TODO.md` carries it.
+    ///
+    /// This test exists so the next person to reach for the spelling finds out
+    /// here, without a server.
+    #[test]
+    fn a_view_diffed_against_its_own_reading_can_never_report_a_change() {
+        for dialect in [Sqlite, SqlDialect::MySql, SqlDialect::Postgres] {
+            // Any view, however edited, and whatever the differ would say about
+            // a real draft.
+            let mut cur = view();
+            cur.view_definition = Some("SELECT a, b FROM t WHERE a > 1".into());
+            let from_itself = ViewDraft::from_table(&cur).unwrap();
+            assert!(
+                diff_view(&cur, &from_itself, dialect).changes.is_empty(),
+                "{dialect:?}: vacuous, as documented above — if this ever fails, \
+                 `diff_view` has stopped deriving its old side from `current` and \
+                 the live suites' spelling has become meaningful"
+            );
+            // The contrast: a draft that is not `from_table(cur)` does report.
+            let mut edited = from_itself;
+            edited.select = "SELECT a FROM t".into();
+            assert!(!diff_view(&cur, &edited, dialect).changes.is_empty());
+        }
+    }
+
     #[test]
     fn a_body_change_drops_and_creates_rather_than_replacing() {
         let cur = view();

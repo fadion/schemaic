@@ -5102,7 +5102,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 t.label = smallest_free_label(&used_labels(v, conn_id));
                 v.push(t);
             });
-            active.set(id);
+            schemaic_ui::activate(active, id);
         })
     };
 
@@ -5274,7 +5274,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let closed_cx = closed.map(|t| t.cx);
             tabs.update(|v| v.retain(|t| t.id != id));
             if was_active && let Some(n) = neighbor {
-                active.set(n);
+                schemaic_ui::activate(active, n);
             }
             // Dispose deferred: the center view is keyed on the active tab, so it
             // rebuilds (unmounting this tab's editor/grid) after the `active.set`
@@ -5461,7 +5461,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 message: "Are you sure you want to close all the other tabs?".to_string(),
                 resolve: Rc::new(move |yes| {
                     if yes {
-                        active.set(keep);
+                        schemaic_ui::activate(active, keep);
                         close_tabs_seq(ids.clone(), guard_close.clone(), close_tab_now.clone());
                     }
                 }),
@@ -5503,7 +5503,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 v.push(nt);
             }
         });
-        active.set(new_tab.id);
+        schemaic_ui::activate(active, new_tab.id);
         // Deferred for the same reason as `close_tab`: let the center view rebuild
         // for the new tab id before the old tab's scope is dropped.
         if let Some(scope) = replaced_cx {
@@ -5562,7 +5562,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .max(boundary);
                 v.insert(at, nt);
             });
-            active.set(new_id);
+            schemaic_ui::activate(active, new_id);
         })
     };
 
@@ -5638,7 +5638,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .copied()
             });
             if let Some(tab) = existing {
-                active.set(tab.id);
+                schemaic_ui::activate(active, tab.id);
                 // Deliberately *not* running the tab's query, even though a restored
                 // tab is `Idle` and so shows an empty grid. A table tab keeps its
                 // `source` however the user edits its text, so "open the table" would
@@ -5673,9 +5673,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // the live grid out from under the highlight effect. When the tab is
                 // already active, setting `highlight_col` alone re-fires its mounted
                 // grid's effect, which re-selects on the live grid — no rebuild.
-                if active.get_untracked() != tab.id {
-                    active.set(tab.id);
-                }
+                schemaic_ui::activate(active, tab.id);
                 // Same rule as `open_table`: a restored tab is not run for the user
                 // (its text is no longer necessarily the table's `SELECT`). The
                 // highlight stays pending — the effect consumes it whenever the
@@ -6153,7 +6151,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             switch(on_conn);
                         }
                     }
-                    active.set(id);
+                    schemaic_ui::activate(active, id);
                     return;
                 }
                 let next_id = next_id.clone();
@@ -7615,18 +7613,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // **And warm the shared slot with it**, so the size column and
                     // a capped result's total are spared the same round trip — the
                     // two paths used to be unable to see each other in either
-                    // direction. Only into a slot that hasn't got figures already:
-                    // `Loading` means a fetch of its own is in flight and will land,
-                    // and overwriting a `Loaded` set would substitute one reading
-                    // for another with nothing to say which is newer.
-                    if let (Some(slot), Ok(set)) = (slot, res)
-                        && matches!(
-                            slot.get_untracked(),
-                            schemaic_ui::DbStatsState::Idle
-                                | schemaic_ui::DbStatsState::Unavailable
-                        )
-                    {
-                        slot.set(schemaic_ui::DbStatsState::Loaded(set));
+                    // direction.
+                    //
+                    // Through `warm_stats_slot`, which is where the "only a
+                    // vacant slot" rule and the disposal guard live: this
+                    // closure keeps `slot` across an await, so a connection
+                    // switch in between frees the signal it points at — and the
+                    // `matches!(slot.get_untracked(), …)` this replaced was
+                    // `try_get_untracked().unwrap()` on a `None`, a panic that
+                    // took the window and every tab's uncommitted edits.
+                    if let (Some(slot), Ok(set)) = (slot, res) {
+                        schemaic_ui::warm_stats_slot(slot, set);
                     }
                 },
             );
@@ -8203,7 +8200,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // connection's until `load_schema` below finishes.
             let remembered = last_tab.borrow().get(&id).copied();
             match schemaic_core::tabsel::pick_active(&tab_refs(), id, remembered) {
-                Some(tab) => active.set(tab),
+                Some(tab) => schemaic_ui::activate(active, tab),
                 None => (open_tab_on)(id, None),
             }
             // Clear stale status until this connection's own check lands. The
@@ -8855,7 +8852,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 adopting,
                 Some(active.get_untracked()),
             ) {
-                Some(tab) => active.set(tab),
+                Some(tab) => schemaic_ui::activate(active, tab),
                 None => (open_tab_on)(adopting, None),
             }
             // Scopes are disposed a tick later, once the center view has rebuilt

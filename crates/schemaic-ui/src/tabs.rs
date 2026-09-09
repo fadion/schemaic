@@ -360,7 +360,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     );
 
     let chip = content
-        .on_click_stop(move |_| active.set(tab.id))
+        .on_click_stop(move |_| crate::activate(active, tab.id))
         // Double-click a tab to rename it in place: seed the buffer with the
         // current title and switch to the field. Guarded so double-clicking
         // *inside* the field (word-select) doesn't reset the buffer mid-edit.

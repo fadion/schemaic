@@ -130,7 +130,10 @@ fn every_module_is_named_in_the_architecture_doc() {
             modules.push((short.clone(), name.to_string()));
         }
     }
-    assert!(!modules.is_empty(), "found no sources to check under crates/");
+    assert!(
+        !modules.is_empty(),
+        "found no sources to check under crates/"
+    );
 
     // Which basenames exist in more than one crate — the ones a bare mention
     // cannot answer for.
@@ -184,7 +187,12 @@ fn a_module_is_not_covered_by_a_longer_name_that_ends_with_it() {
         );
     }
     // And its own entry does cover it, in either spelling.
-    assert!(covered("- `core/date.rs` — dates.", "core", "date.rs", false));
+    assert!(covered(
+        "- `core/date.rs` — dates.",
+        "core",
+        "date.rs",
+        false
+    ));
     assert!(covered("- `date.rs` — dates.", "core", "date.rs", false));
 
     // An ambiguous basename needs its crate. `secrets.rs` exists in

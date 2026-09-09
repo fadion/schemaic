@@ -2116,6 +2116,17 @@ impl Tab {
         if !self.holds_panel(id) {
             return;
         }
+        // **The staged edits go with the rows.** They live on the panel now, so
+        // they survive a tab switch — and this is the one writer that means the
+        // rows underneath them are being replaced. A `dirty` map indexed by data
+        // row over a different set of rows would stage onto whichever row landed
+        // in that position; see `PanelView::clear_staged`.
+        let staged = self
+            .result_tabs
+            .with_untracked(|v| v.iter().find(|p| p.id == id).map(|p| p.view));
+        if let Some(view) = staged {
+            view.clear_staged();
+        }
         self.result_tabs.update(|panels| {
             if let Some(p) = panels.iter_mut().find(|p| p.id == id) {
                 p.load_gen = p.load_gen.wrapping_add(1);
@@ -2796,6 +2807,16 @@ impl ResultPanel {
 /// Selection is deliberately **not** here: it is where the user last clicked,
 /// which is not a property of the result, and restoring it puts a highlight
 /// somewhere nobody put it.
+///
+/// **The staged-edit trio *is* here, and was not.** `dirty`, `new_rows` and
+/// `del_rows` were created by `GridState::new` with a bare `RwSignal::new`, so
+/// they belonged to the `results_area` `dyn_container` child scope — which is
+/// disposed on any change of the active tab. An ordinary switch away and back
+/// therefore reverted every staged cell, dropped every pending row and unmarked
+/// every row set for deletion, with nothing warned and nothing written; the
+/// *close* path stops to ask about unsaved `.sql` text and an open transaction
+/// and had no third question for this. They are the panel's, for the same reason
+/// the column widths are: they are about the **result**.
 #[derive(Clone, Copy)]
 pub struct PanelView {
     /// Measured column widths, `None` until the grid has measured them once.
@@ -2812,6 +2833,12 @@ pub struct PanelView {
     /// index, `gctx.panel_frozen` is whether the result is pinned — and the two
     /// spelled the same way is a wrong-variable bug waiting for the next reader.
     pub frozen_col: RwSignal<Option<usize>>,
+    /// Staged cell edits: `(data row, column) → the new value`, uncommitted.
+    pub dirty: RwSignal<schemaic_core::edit::DirtyCells>,
+    /// Rows the user has added and not yet committed.
+    pub new_rows: RwSignal<Vec<std::collections::HashMap<usize, schemaic_core::model::CellEdit>>>,
+    /// Data rows marked for deletion and not yet committed.
+    pub del_rows: RwSignal<std::collections::HashSet<usize>>,
 }
 
 impl PanelView {
@@ -2821,7 +2848,26 @@ impl PanelView {
             widths_at: cx.create_rw_signal(0.0),
             sort: cx.create_rw_signal(None),
             frozen_col: cx.create_rw_signal(None),
+            dirty: cx.create_rw_signal(Default::default()),
+            new_rows: cx.create_rw_signal(Vec::new()),
+            del_rows: cx.create_rw_signal(Default::default()),
         }
+    }
+
+    /// Drop every staged edit — **called where the rows are replaced, not where
+    /// the view is.**
+    ///
+    /// The trio is indexed by *data row*, so a re-run that returns different
+    /// rows would leave a staged value pointing at whichever row landed in that
+    /// position. That is worse than losing the edit, so the clear belongs on the
+    /// one writer that means "these rows are being replaced":
+    /// [`Tab::bump_panel_load`]. A fresh run needs none — `begin_run` builds new
+    /// panels, so their trio is empty by construction — and a commit splice
+    /// deliberately bumps nothing, which is why it keeps its own state.
+    fn clear_staged(&self) {
+        self.dirty.update(|d| d.clear());
+        self.new_rows.update(|r| r.clear());
+        self.del_rows.update(|d| d.clear());
     }
 }
 
@@ -2896,6 +2942,46 @@ pub enum DbStatsState {
     /// that re-queried a failing server on every expand would be worse than no
     /// column.
     Unavailable,
+}
+
+/// Put `set` into a database's statistics slot, if the slot is still there and
+/// has nothing better in it.
+///
+/// **Two things, and each was a bug.**
+///
+/// *It must not panic on a disposed signal.* floem 0.2's
+/// `get_untracked` is literally `try_get_untracked().unwrap()`, while `set` is
+/// guarded (`if let Some(signal) = self.id().signal()`) — so the properties
+/// fetch, which captures a `ConnNode::stats` slot and reads it back *after* an
+/// await, panicked when the connection was switched in between:
+/// `nodes_scope_cb` swaps in a fresh scope and disposes the old one, freeing
+/// every slot signal, and the panic takes the window and every tab's
+/// uncommitted edits with it. `DbStatsSlot`'s own doc states the rule that was
+/// broken — "anything that keeps the slot across renders tracks the list too" —
+/// and this site kept it across something longer than a render. The schema
+/// fetch's own landing closure chose `try_update` for exactly this reason two
+/// hundred lines up.
+///
+/// *And it must not clone to ask.* The condition is a two-variant question, and
+/// `get_untracked` cloned a whole `SchemaStats` — a `Vec<TableStats>` plus its
+/// `HashMap` — to answer it. `with` rather than `get` is the same call the
+/// `expanded` effect twelve lines below spells out.
+///
+/// Only into a slot that has no figures: `Loading` means a fetch of its own is
+/// in flight and will land, and overwriting a `Loaded` set would substitute one
+/// reading for another with nothing to say which is newer.
+pub fn warm_stats_slot(slot: RwSignal<DbStatsState>, set: schemaic_core::stats::SchemaStats) {
+    // The closure's argument is `None` when the signal's scope is gone, which is
+    // not a slot to warm — and is the case `get_untracked` panicked on.
+    let vacant = slot.try_with_untracked(|st| {
+        matches!(
+            st,
+            Some(DbStatsState::Idle) | Some(DbStatsState::Unavailable)
+        )
+    });
+    if vacant {
+        slot.set(DbStatsState::Loaded(set));
+    }
 }
 
 /// One database's statistics slot in the schema tree's cache, found by name —
@@ -3431,6 +3517,148 @@ pub struct AiActions {
     pub constraint_notice: Rc<dyn Fn() -> Option<String>>,
 }
 
+/// Make tab `id` the active one — **the one writer for `TabsUi::active`.**
+///
+/// `RwSignal::set` to the same value still notifies every dependent
+/// (floem 0.2 compares nothing, in `set` or in `create_updater`), and `active`
+/// is `results_area`'s and `editor_area`'s `dyn_container` key — so a redundant
+/// `set` disposes the grid's child scope and rebuilds the editor's `Document`.
+/// Every no-op spelling of "go to this tab" did that: clicking the chip you are
+/// already on, Ctrl+Tab with one tab open (`tabsel::cycle` over `n == 1` returns
+/// the current id), Ctrl+1 on the first chip, Find-Anywhere opening the tab that
+/// is already active, double-clicking a table already open, and *Close other
+/// tabs* on the tab you are on — which loses the caret, the undo stack, the
+/// scroll position and the cell selection of the one tab the action promises to
+/// keep. (Staged edits and pending rows used to go too; they live on
+/// [`PanelView`] now and survive it, which is a different fix.)
+///
+/// **A function rather than a rule in a comment**, because the rule was already
+/// written down and applied at one of thirteen sites: `open_table_col` guards
+/// its own `set` under a comment stating it verbatim, thirty-five lines from an
+/// `open_table` that does not. `no_bare_active_set_gate` is what keeps the
+/// fourteenth from happening.
+pub fn activate(active: RwSignal<usize>, id: usize) {
+    if active.get_untracked() != id {
+        active.set(id);
+    }
+}
+
+#[cfg(test)]
+mod warm_stats_slot_tests {
+    use super::{DbStatsState, warm_stats_slot};
+    use floem::prelude::SignalGet;
+    use floem::reactive::Scope;
+
+    fn stats() -> schemaic_core::stats::SchemaStats {
+        schemaic_core::stats::SchemaStats::default()
+    }
+
+    /// **A slot whose scope is gone is not a slot to warm** — and reading it
+    /// with `get_untracked` panicked, taking the window and every tab's
+    /// uncommitted edits with it.
+    ///
+    /// The trigger is a connection switch landing between the properties
+    /// fetch's dispatch and its return: `nodes_scope_cb` swaps in a fresh scope
+    /// and disposes the old one, freeing every `ConnNode::stats` signal the
+    /// closure captured. Against the body this replaced — a `matches!` over
+    /// `slot.get_untracked()`, which floem defines as
+    /// `try_get_untracked().unwrap()` — this test panics rather than failing.
+    #[test]
+    fn warming_a_disposed_slot_does_nothing() {
+        let cx = Scope::new().create_child();
+        let slot = cx.create_rw_signal(DbStatsState::Idle);
+        cx.dispose();
+        warm_stats_slot(slot, stats());
+    }
+
+    /// And on a live slot it warms exactly the two vacant states — `Loading`
+    /// means a fetch of its own will land, and a `Loaded` set must not be
+    /// substituted for another with nothing to say which is newer.
+    #[test]
+    fn only_a_vacant_slot_is_warmed() {
+        let cx = Scope::new();
+        for (from, warmed) in [
+            (DbStatsState::Idle, true),
+            (DbStatsState::Unavailable, true),
+            (DbStatsState::Loading, false),
+            (DbStatsState::Loaded(stats()), false),
+        ] {
+            let slot = cx.create_rw_signal(from.clone());
+            warm_stats_slot(slot, stats());
+            let landed = matches!(slot.get(), DbStatsState::Loaded(_));
+            assert_eq!(
+                landed && from != DbStatsState::Loaded(stats()),
+                warmed,
+                "{from:?}"
+            );
+        }
+    }
+}
+
+/// **No production code writes the active tab except [`activate`].**
+///
+/// The behavioural half of this is a view-lifetime decision with no pure
+/// subject — a redundant `set` disposes a `dyn_container` child scope, which
+/// only floem can be asked about — so what is assertable is the *spelling*, over
+/// both crates that build views. Thirteen sites got this wrong while the rule
+/// was written down and correctly applied at the fourteenth (`open_table_col`),
+/// which is the shape a gate exists for.
+///
+/// `gs.active.set(…)` is the grid's *cell* selection and a different signal
+/// entirely; the gate keys on the bare receiver so the two cannot be confused.
+#[cfg(test)]
+mod no_bare_active_set_gate {
+    /// The guard term that makes a direct write acceptable. Two lines carry it
+    /// today: [`crate::activate`]'s own body, and the settings picker's, whose
+    /// `active` is a different signal and is guarded anyway because the term is
+    /// free.
+    const GUARD: &str = "active.get_untracked() !=";
+
+    #[test]
+    fn the_active_tab_has_one_writer() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut guarded = 0usize;
+        for (name, code) in crate::source_gate::crate_sources() {
+            let lines: Vec<&str> = code.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                // A bare `active.set(` — not `gs.active.set(`, and not
+                // `.active.set(` on anything else.
+                let Some(at) = line.find("active.set(") else {
+                    continue;
+                };
+                let before = line[..at].chars().next_back();
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                    continue;
+                }
+                // Guarded on this line or the one above it, which is where
+                // rustfmt puts the `if`.
+                let above = i.checked_sub(1).and_then(|j| lines.get(j)).unwrap_or(&"");
+                if line.contains(GUARD) || above.contains(GUARD) {
+                    guarded += 1;
+                    continue;
+                }
+                offenders.push(format!(
+                    "{name}:{} writes the active tab directly — call \
+                     `schemaic_ui::activate`, which is the one guarded writer. A \
+                     same-value `set` disposes `results_area`'s child scope and \
+                     rebuilds the editor's Document, so every no-op \"go to this \
+                     tab\" gesture cost the caret, the undo stack, the scroll \
+                     position and the cell selection.",
+                    i + 1
+                ));
+            }
+        }
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+        // The gate must still be finding the writes it permits, or a rename has
+        // made it scan for a spelling nothing uses.
+        assert!(
+            guarded >= 2,
+            "only {guarded} guarded `active.set` found — this gate has stopped \
+             seeing the sites it is written about"
+        );
+    }
+}
+
 /// Tabs / query signals (Copy bundle).
 #[derive(Clone, Copy)]
 pub struct TabsUi {
@@ -3718,7 +3946,7 @@ impl NavKeys {
             Some(self.active.get_untracked()),
             step,
         ) {
-            self.active.set(next);
+            crate::activate(self.active, next);
         }
     }
 
@@ -3728,7 +3956,7 @@ impl NavKeys {
         if let Some(id) =
             schemaic_core::tabsel::nth(&self.tab_refs(), self.active_conn.get_untracked(), idx)
         {
-            self.active.set(id);
+            crate::activate(self.active, id);
         }
     }
 }
@@ -10991,6 +11219,81 @@ mod result_panel_tab_tests {
         t.close_panels(&[batch[1]]);
         t.bump_panel_load(batch[1]);
         assert_eq!(load_of(batch[1]), None);
+    }
+
+    /// **An ordinary tab switch discarded every staged grid edit, silently.**
+    ///
+    /// `results_area` is a `dyn_container` keyed on the active tab, so any
+    /// change of `active` disposes the child scope the grid was built in — and
+    /// `GridState::new` created `dirty`, `new_rows` and `del_rows` with a bare
+    /// `RwSignal::new`, so they belonged to *that* scope and came back empty.
+    /// One level up, `PanelView` is created in the panel's own scope, which
+    /// survives every such swap, and its doc is the codebase's explicit
+    /// survivor list — widths, `widths_at`, sort, `frozen_col` — going out of
+    /// its way to say what is excluded and why. Staged edits were in neither
+    /// list and no comment anywhere recorded excluding them.
+    ///
+    /// So: stage two cells and a pending row in tab A, click tab B to look
+    /// something up, click back — the yellow cells have reverted, the pending
+    /// row is gone, a row marked for deletion is unmarked, nothing warned and
+    /// nothing was written. The *close* path stops to ask about two other kinds
+    /// of uncommitted work first and had no third question for this one.
+    ///
+    /// The test is a composition, and against the tree as it stood it did not
+    /// compile — `PanelView` had no such field, which is the point. A test of
+    /// `GridState` alone passes today and would keep passing after the bug was
+    /// reintroduced.
+    #[test]
+    fn a_panels_staged_edits_survive_a_grid_rebuild() {
+        use std::collections::{HashMap, HashSet};
+        let t = tab();
+        let id = t.begin_run(&["SELECT * FROM customers".to_string()])[0];
+        let view = t
+            .result_tabs
+            .with_untracked(|v| v.iter().find(|p| p.id == id).map(|p| p.view))
+            .expect("the panel");
+
+        // Two staged cells, a pending row and a row marked for deletion — the
+        // three things the switch destroyed.
+        view.dirty.update(|d| {
+            d.insert((0, 1), schemaic_core::model::CellEdit::Text("Ada".into()));
+            d.insert((3, 2), schemaic_core::model::CellEdit::Null);
+        });
+        view.new_rows.update(|r| {
+            r.push(HashMap::from([(
+                1,
+                schemaic_core::model::CellEdit::Text("new".into()),
+            )]))
+        });
+        view.del_rows.update(|d| {
+            d.insert(7);
+        });
+
+        // The mount, and its disposal: this is what an A→B→A switch does to the
+        // scope `GridState` used to own these in.
+        let mount = floem::reactive::Scope::new().create_child();
+        let _ = mount.create_rw_signal(0);
+        mount.dispose();
+
+        assert_eq!(view.dirty.with_untracked(HashMap::len), 2, "staged cells");
+        assert_eq!(view.new_rows.with_untracked(Vec::len), 1, "the pending row");
+        assert_eq!(
+            view.del_rows.with_untracked(HashSet::len),
+            1,
+            "the deletion"
+        );
+
+        // **And they are cleared where the rows are replaced**, not where the
+        // view is. A filter re-run returns different rows, and a row-indexed
+        // map over them would stage onto the wrong ones — which would be worse
+        // than the bug this fixes.
+        t.bump_panel_load(id);
+        assert!(
+            view.dirty.with_untracked(HashMap::is_empty),
+            "a re-run replaces the rows, so the staged edits over them must go"
+        );
+        assert!(view.new_rows.with_untracked(Vec::is_empty));
+        assert!(view.del_rows.with_untracked(HashSet::is_empty));
     }
 
     #[test]
