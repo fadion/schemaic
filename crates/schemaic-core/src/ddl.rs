@@ -7594,17 +7594,25 @@ fn is_rebuild(c: &Change) -> bool {
 /// gate, *not* about SQLite — what the engine refuses is an inline `UNIQUE` in
 /// the column definition, and there is none to emit, so a native add followed by
 /// a `CREATE UNIQUE INDEX` would be two legal statements the day that arm
-/// exists. And a **generated** column is addable — the
-/// emitter writes no `VIRTUAL`/`STORED` keyword, so SQLite's own default
-/// (`VIRTUAL`) applies, and it is `STORED` that the engine refuses. A generated
-/// column also carries its expression *instead of* a default, so the null-default
-/// rule has nothing to reach.
+/// exists. And a **`VIRTUAL` generated** column is addable, which is not the same as
+/// "a generated column is". The justification here used to be that "the emitter
+/// writes no `VIRTUAL`/`STORED` keyword, so SQLite's own default (`VIRTUAL`)
+/// applies" — and the emitter does write it:
+/// [`ColumnInfo::definition_sql`] emits ` STORED` for a SQLite column whose
+/// `generated_stored` is set, a line added deliberately so a `STORED` column
+/// survives a rebuild, with the flag round-tripped from `table_xinfo`'s
+/// `hidden == 3`. So the predicate and the emitter disagreed about what the
+/// statement would say, and SQLite answers *"cannot add a STORED column"* on any
+/// table that has rows — through `run_ddl` a rolled-back plan with a confusing
+/// message, through Copy / "Open in editor" a two-column add that half-applies.
+/// A generated column carries its expression *instead of* a default, so the
+/// null-default rule has nothing to reach either way.
 fn sqlite_native_add(column: &ColumnInfo, position: Option<&Position>) -> bool {
     if position.is_some() || column.primary_key || column.auto_increment {
         return false;
     }
     if column.generated.is_some() {
-        return true;
+        return !column.generated_stored;
     }
     let default = column.default.as_deref().map(str::trim);
     if let Some(d) = default
@@ -8186,6 +8194,32 @@ fn rebuild_cannot_restate(current: &TableInfo) -> Option<String> {
 /// ([`crate::schema::IndexColumn::descending`]). `DESC` is therefore the key's
 /// only when the item declaring it is a primary key; `ASC` is the default and
 /// loses nothing.
+///
+/// **Three of the four words are legal column names, so each one asks where it
+/// is and not merely whether it is there.** A refusal here is permanent —
+/// `unsupported()` is non-empty for *every* rebuild of the table, so
+/// `ddl_preview` leaves Apply disabled and the designer refuses a table the user
+/// has not touched, naming a clause the declaration does not contain. Measured
+/// on 3.50.4: `conflict` and `desc` are both accepted as bare column names, and
+/// `PRIMARY KEY (desc)` is accepted as a key on one. So:
+///
+/// - `CONFLICT` counts only where the grammar puts it, directly after `ON`.
+/// - `DESC` counts only as a key column's *modifier*, which is never the first
+///   word of the comma-separated item it sits in — `PRIMARY KEY (a DESC)` is a
+///   direction and `PRIMARY KEY (desc)` is a column.
+/// - `COLLATE` counts only **inside** a `PRIMARY KEY ( … )` group, which is the
+///   one place its collation has nowhere to go: a column's own is
+///   [`ColumnInfo::collation`] and an index key's is
+///   [`crate::schema::IndexColumn::collation`], both modelled and both
+///   round-tripped. The key's is not, because `is_primary()` filters the key's
+///   index out of the draft and the `Vec<String>` that replaces it has no field
+///   for one — so `PRIMARY KEY (email COLLATE NOCASE)` came back as
+///   `PRIMARY KEY ("email")` and the key started comparing in `BINARY`.
+///   Measured on 3.50.4: with `'A@x'` present, `'a@x'` is refused
+///   *UNIQUE constraint failed* before the rebuild and accepted after it.
+/// - `DEFERRABLE` needs no position, and not by luck of the scan: SQLite refuses
+///   it as a bare column name (*near "deferrable": syntax error*), so the only
+///   way it reaches code is as the clause.
 fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
     use crate::sql::{is_word_byte, is_word_start, skip_noncode};
     let d = SqlDialect::Sqlite;
@@ -8219,6 +8253,10 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
     // Whether the item being read is a primary key — reset at each top-level
     // comma, so a `DESC` cannot borrow the key from the item before it.
     let mut item_is_key = false;
+    // The word before this one, and whether this is the first word of its
+    // comma-separated group. Both are what tells a clause from a column name.
+    let mut prev_word = String::new();
+    let mut first_in_group = true;
     while i < b.len() && depth > 0 {
         if let Some(j) = skip_noncode(b, i, d) {
             i = j.max(i + 1);
@@ -8227,6 +8265,9 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
         match b[i] {
             b'(' => {
                 depth += 1;
+                // A group's first word is its own, not the enclosing item's.
+                first_in_group = true;
+                prev_word.clear();
                 i += 1;
                 continue;
             }
@@ -8235,8 +8276,12 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
                 i += 1;
                 continue;
             }
-            b',' if depth == 1 => {
-                item_is_key = false;
+            b',' => {
+                if depth == 1 {
+                    item_is_key = false;
+                }
+                first_in_group = true;
+                prev_word.clear();
                 i += 1;
                 continue;
             }
@@ -8256,11 +8301,16 @@ fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
             item_is_key = true;
         } else if word.eq_ignore_ascii_case("DEFERRABLE") {
             add("a foreign key's DEFERRABLE clause");
-        } else if word.eq_ignore_ascii_case("CONFLICT") {
+        } else if word.eq_ignore_ascii_case("CONFLICT") && prev_word.eq_ignore_ascii_case("ON") {
             add("an ON CONFLICT clause");
-        } else if word.eq_ignore_ascii_case("DESC") && item_is_key {
+        } else if word.eq_ignore_ascii_case("DESC") && item_is_key && !first_in_group {
             add("a DESC primary-key column");
+        } else if word.eq_ignore_ascii_case("COLLATE") && item_is_key && depth > 1 {
+            add("a COLLATE on a primary-key column");
         }
+        prev_word.clear();
+        prev_word.push_str(word);
+        first_in_group = false;
         i = end;
     }
     out
@@ -17701,6 +17751,106 @@ mod sqlite_rebuild_tests {
              a INTEGER DEFAULT 'ON CONFLICT', b TEXT, \"desc\" TEXT, PRIMARY KEY (a));",
         );
         assert!(withheld(&t).is_empty(), "{:?}", withheld(&t));
+    }
+
+    /// **And the spelling the negative test above avoided: a bare identifier.**
+    /// `conflict` and `desc` are legal SQLite column names spelled bare
+    /// (measured on 3.50.4, and `PRIMARY KEY (desc)` is a legal key on one), and
+    /// the scan compared every code word to the keyword list with no regard for
+    /// where it sat. So the designer opened on a table the user had not touched,
+    /// refused it, and named a clause the declaration does not contain — for
+    /// ever, since `unsupported()` was non-empty for *every* rebuild of it and
+    /// `ddl_preview` leaves Apply disabled on that.
+    #[test]
+    fn a_column_named_after_a_clause_is_still_a_column() {
+        for sql in [
+            "CREATE TABLE \"issues\" (id INTEGER PRIMARY KEY, conflict TEXT)",
+            "CREATE TABLE \"t\" (a INTEGER, conflict TEXT, PRIMARY KEY (a))",
+            "CREATE TABLE \"t\" (a INTEGER, desc TEXT, PRIMARY KEY (desc))",
+            "CREATE TABLE \"t\" (desc INTEGER, PRIMARY KEY (desc))",
+            "CREATE TABLE \"t\" (a INTEGER, desc TEXT, PRIMARY KEY (a, desc))",
+        ] {
+            let w = withheld(&table_declaring(sql));
+            assert!(w.is_empty(), "{sql}: {w:?}");
+        }
+    }
+
+    /// The positives all still fire, each in the position the grammar puts it —
+    /// otherwise "asks where the word is" is just a way of never refusing.
+    #[test]
+    fn the_clauses_are_still_withheld_where_they_really_are_clauses() {
+        for (sql, want) in [
+            (
+                "CREATE TABLE \"t\" (a TEXT NOT NULL ON CONFLICT REPLACE)",
+                "ON CONFLICT",
+            ),
+            (
+                "CREATE TABLE \"t\" (a INTEGER, desc TEXT, PRIMARY KEY (desc DESC))",
+                "DESC",
+            ),
+            ("CREATE TABLE \"t\" (a INTEGER PRIMARY KEY DESC)", "DESC"),
+            (
+                "CREATE TABLE \"t\" (a INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+                "DEFERRABLE",
+            ),
+        ] {
+            let w = withheld(&table_declaring(sql));
+            assert_eq!(w.len(), 1, "{sql}: {w:?}");
+            assert!(w[0].contains(want), "{sql}: {w:?}");
+        }
+    }
+
+    /// **A primary key's own `COLLATE` has nowhere to go in the model**, so the
+    /// rebuild wrote `PRIMARY KEY ("email")` and the key started comparing in
+    /// `BINARY`. Measured on 3.50.4: with `'A@x'` present, `'a@x'` is refused
+    /// *UNIQUE constraint failed* before the rebuild and accepted after it — the
+    /// constraint gone from a table that still looks right, on a plan that
+    /// reported success, and invisible to the next `diff` because both sides
+    /// read the same incomplete model.
+    #[test]
+    fn a_primary_keys_collation_is_withheld() {
+        let t =
+            table_declaring("CREATE TABLE \"u\" (email TEXT, PRIMARY KEY (email COLLATE NOCASE));");
+        let w = withheld(&t);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("COLLATE"), "{w:?}");
+    }
+
+    /// And the two `COLLATE`s that **are** modelled stay out of it: a column's
+    /// own is `ColumnInfo::collation` and an index key's is
+    /// `IndexColumn::collation`, both round-tripped. Refusing either would make
+    /// an ordinary table uneditable for a clause the rebuild restates correctly.
+    #[test]
+    fn a_modelled_collation_is_not_withheld() {
+        for sql in [
+            "CREATE TABLE \"c\" (email TEXT COLLATE NOCASE)",
+            "CREATE TABLE \"c\" (email TEXT COLLATE NOCASE PRIMARY KEY)",
+            "CREATE TABLE \"c\" (email TEXT PRIMARY KEY COLLATE NOCASE)",
+            "CREATE TABLE \"c\" (email TEXT, UNIQUE (email COLLATE NOCASE))",
+            "CREATE TABLE \"c\" (a TEXT, b TEXT, CHECK (a COLLATE NOCASE <> b))",
+        ] {
+            let w = withheld(&table_declaring(sql));
+            assert!(w.is_empty(), "{sql}: {w:?}");
+        }
+    }
+
+    /// **A `STORED` generated column is not natively addable**, and the doc that
+    /// said it was reasoned from an emitter that writes the keyword: SQLite
+    /// answers *"cannot add a STORED column"* on any table that has rows.
+    /// `VIRTUAL` still takes the fast path, which is what the rule is for.
+    #[test]
+    fn a_stored_generated_column_is_not_a_native_add() {
+        let mut c = col("g", "TEXT");
+        c.generated = Some("b || b".into());
+        assert!(
+            sqlite_native_add(&c, None),
+            "a VIRTUAL generated column is addable"
+        );
+        c.generated_stored = true;
+        assert!(
+            !sqlite_native_add(&c, None),
+            "and a STORED one is what the engine refuses"
+        );
     }
 
     /// An **index** key's direction is modelled ([`IndexColumn::descending`]) and

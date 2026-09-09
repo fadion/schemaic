@@ -7589,6 +7589,120 @@ mod rebuild_fidelity_tests {
         assert!(sql.to_uppercase().contains("STORED"), "{sql}");
     }
 
+    /// **And a `STORED` generated column can be *added* to a table that has
+    /// rows**, which `sqlite_native_add` used to promise and the engine refuses:
+    /// *"cannot add a STORED column"*. Confirmed here against the workspace's
+    /// own SQLite rather than a system one, since that is the version the app
+    /// ships.
+    ///
+    /// **With a row**, deliberately: the same `ALTER TABLE … ADD COLUMN …
+    /// STORED` is accepted on an empty table, so a fixture that creates and
+    /// immediately alters passes whichever path the plan takes — which is why
+    /// the rebuild test above never reached this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_generated_column_can_be_added_to_a_table_with_rows() {
+        let (keeper, db) = shared_memory("fid_stored_add");
+        keeper
+            .execute_batch("CREATE TABLE g (a TEXT, b TEXT); INSERT INTO g VALUES ('x', 'y');")
+            .unwrap();
+        // The engine's own refusal, so the test states the premise rather than
+        // trusting the finding.
+        let native = keeper.execute_batch(
+            "ALTER TABLE g ADD COLUMN probe TEXT GENERATED ALWAYS AS (a || b) STORED",
+        );
+        assert!(
+            native.is_err(),
+            "SQLite accepted a native STORED add on a table with rows; \
+             the fast path this test guards would then be fine"
+        );
+
+        let before = table_of(&db, "g").await;
+        let mut draft = TableDraft::from_table(&before);
+        let mut added = ColumnInfo {
+            name: "s".into(),
+            type_name: "TEXT".into(),
+            nullable: true,
+            generated: Some("a || b".into()),
+            generated_stored: true,
+            ..Default::default()
+        };
+        draft
+            .columns
+            .push(schemaic_core::ddl::ColumnDraft::new(added.clone()));
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        let sql: String = keeper
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'g'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.to_uppercase().contains("STORED"), "{sql}");
+        let v: String = keeper
+            .query_row("SELECT s FROM g", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "xy", "the row came across and the column computes");
+
+        // And the VIRTUAL half still takes the fast path it is there for.
+        added.generated_stored = false;
+        added.name = "v".into();
+        let before = table_of(&db, "g").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft
+            .columns
+            .push(schemaic_core::ddl::ColumnDraft::new(added));
+        let plan = diff(&before, &draft, SqlDialect::Sqlite).emit().join("\n");
+        assert!(plan.contains("ADD COLUMN"), "{plan}");
+        assert!(!plan.contains("_schemaic_rebuild"), "{plan}");
+    }
+
+    /// **A primary key's own `COLLATE` really is enforced**, and the model has
+    /// no field for it — so the rebuild wrote `PRIMARY KEY ("email")` and the
+    /// key started comparing in `BINARY`: the constraint gone from a table that
+    /// still looked right, on a plan that reported success, and invisible to the
+    /// next `diff` because both sides read the same incomplete model.
+    ///
+    /// The premise is measured against the engine first, then the plan is
+    /// required to refuse. A test asserting only the refusal would pass against
+    /// a `COLLATE` the engine ignored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primary_keys_collation_is_refused_rather_than_dropped() {
+        let (keeper, db) = shared_memory("fid_pk_collate");
+        keeper
+            .execute_batch(
+                "CREATE TABLE u (email TEXT, note TEXT, PRIMARY KEY (email COLLATE NOCASE)); \
+                 INSERT INTO u VALUES ('A@x', 'first');",
+            )
+            .unwrap();
+        assert!(
+            keeper
+                .execute_batch("INSERT INTO u VALUES ('a@x', 'second')")
+                .is_err(),
+            "the key is not case-insensitive here, so there is nothing to lose"
+        );
+
+        let before = table_of(&db, "u").await;
+        let mut draft = TableDraft::from_table(&before);
+        // Retype `note` — `retype_last` writes TEXT, which it already is.
+        draft.columns[1].info.type_name = "INTEGER".into();
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(c, schemaic_core::ddl::Change::RebuildTable(_))),
+            "the edit has to need a rebuild, or there is nothing to refuse: {:#?}",
+            cs.changes
+        );
+        let w = cs.unsupported();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("COLLATE"), "{w:?}");
+    }
+
     /// The one that used to kill the plan outright: `pragma_table_xinfo` strips
     /// the parentheses SQLite's grammar requires, so the re-emitted default was
     /// `near "(": syntax error` and the table could never be edited again.
