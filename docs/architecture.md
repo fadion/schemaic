@@ -666,7 +666,8 @@ existing prose was left alone.
     `the_byte_cap_comes_from_the_schemas_type_for_binary_columns_only` closes it on four counts:
     which columns get a cap (binary only), where the type comes from (the loaded `TableInfo`, not
     `rs.columns[ci].type_name`, whose length the wire has stripped), how the schema column is
-    matched (by `origin.column`), and that the dialect really reaches the answer. The answer rides to the panel on
+    matched (by `origin.column`), and that the dialect really reaches the answer.
+    The answer rides to the panel on
     `BlobTarget::cap` rather than being asked for when the file comes back, because by then the grid
     it was read from may have been re-run underneath.
     `refetch_key` reads a `Bytes` edit's **original** value rather than guessing at a text form for
@@ -5206,7 +5207,8 @@ existing prose was left alone.
   have to reach `schema::classify_column_type`, `ddl::normalize_type` and `model::type_is_binary`
   as one type, or one surface's icon, diff or binary-cell guard answers differently from the
   other's for the same column — which is what `the_two_type_spellings_are_read_as_one_type` pins,
-  and what the test it replaced claimed to hold while comparing the function with itself. `mysql_column` normalizes the
+  and what the test it replaced claimed to hold while comparing the function with itself.
+  `mysql_column` normalizes the
   MySQL/MariaDB `COLUMN_DEFAULT` divergence (MariaDB returns SQL text, MySQL a raw value needing
   quoting) — pure + tested, since getting it wrong writes a *different* default rather than failing.
   MySQL additionally reads each table's engine/collation/comment, each FK's
@@ -6591,7 +6593,7 @@ existing prose was left alone.
   needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
   **It is gated as a *target*, not at runtime.** The manifest declares the target
   `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-  tier stays pure by construction. It is **303 tests** as this is written — 99 suite functions
+  tier stays pure by construction. It is **306 tests** as this is written — 100 suite functions
   expanded across the three legs by `main.rs`'s macro, plus the six that need no server (the four
   name-guard cases, `endpoint.rs`'s declared-case count, and the skip-notice source gate) — and it
   is reachable from this Windows environment again,
@@ -13304,6 +13306,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   call, so a test of it is still deterministic and still needs no server; it is the same pragmatic
   exception in-memory SQLite already is in `schemaic-db`. Read it as the one case, not as licence
   for a second: anything else wanting a file still models it at the boundary.
+- **What the source knew is carried, never re-derived from the text it rendered into.** Two
+  separate defects turned out to be one shape — a precise oracle two functions upstream, dropped by
+  a type, then guessed at downstream from a string — and both were fixed by carrying the fact
+  rather than by adding a cleverer check. `import::Record::sheet_errors` carries calamine's
+  `Data::Error` positions beside the fields, because `cell_text` renders such a cell in Excel's own
+  spelling and by the coercer's turn `#N/A` from a broken formula is byte-identical to `#N/A` typed
+  into a `status` column: the ten-spelling table that tried to tell them apart refused an ordinary
+  workbook **whole**. `edit::TsvBlock::split` counts the copied cells holding a tab or a newline as
+  the block is built, because on the clipboard a separator and a cell's own tab are the same byte,
+  so no paste — this grid's or a spreadsheet's — can tell afterwards, and a split cell leaves the
+  row count right so nothing downstream even has a reason to look. Both fixes were cheap for the
+  same reason: the oracle already existed and a type was throwing it away. Where a reading is
+  available only at the point the data is produced, produce it there and carry it — a downstream
+  re-derivation from rendered text is the bug, not the fallback.
 - **Generated DDL is never run silently, and never emitted from a second differ.** Every
   schema edit goes `TableDraft`/`ViewDraft` → `ddl::diff`/`diff_view` → `ChangeSet::emit` →
   the preview modal → `Db::run_ddl`. **`Db::run_server_ddl` is on the same rule, not beside it**:
@@ -15893,7 +15909,8 @@ this bundle's.
   the block is on the clipboard a separator and a cell's own tab are the same byte, so no paste can
   tell them apart, and a split cell keeps the row count right so the paste's counters stay quiet
   while every later column of that row shifts left by one — green, and one Commit from a real
-  `UPDATE`. `grid.rs`'s gate asserts `copy_selection` still calls the helper. The reason is under `core::edit`: the rule went out one source
+  `UPDATE`. `grid.rs`'s gate asserts `copy_selection` still calls the helper.
+  The reason is under `core::edit`: the rule went out one source
   short twice in the view, most recently without `format::apply`, so a `Timestamp` column attached
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
   `data_cell`'s content `dyn_container` runs per cell per frame reading the signals one at a time,
