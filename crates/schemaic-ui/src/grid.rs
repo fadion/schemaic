@@ -5328,15 +5328,69 @@ fn ai_pulse_tick(gs: GridState) {
 
 /// Stage an AI-filled value into the active cell — a real row (`dirty`) or a
 /// pending new row (`new_rows`), matching the double-click edit path.
-fn stage_fill(gs: GridState, disp: usize, ci: usize, pending: Option<usize>, val: Option<String>) {
-    match pending {
-        Some(p) => gs.stage_new(p, ci, val),
-        None => {
-            let di = gs.order.get_untracked().get(disp).copied().unwrap_or(disp);
-            // Force the edit (even if it equals the current value) so an AI fill is
-            // always visibly staged — see `stage_set`.
-            gs.stage_set(di, ci, val);
-        }
+/// Which cell an in-flight AI fill is for, resolved **at launch** and carried
+/// across the round trip.
+///
+/// **Never a display coordinate.** `stage_fill` used to take the `(display
+/// row, pending index)` the user had selected and re-resolve it when the model
+/// answered, seconds later — and both halves move in the meantime.
+///
+/// A sort mid-flight rewrites `gs.order` while `GridState` survives, so
+/// `gs.order.get(disp)` came back a **different data row** and the value was
+/// staged there, as an ordinary green edit. (The purple "generating" wash was
+/// on the right row the whole time: `ai_fill_value` already resolved the data
+/// row at launch for that, and then threw it away.)
+///
+/// A pending row is worse: **✗ Discard** clears `new_rows` and bumps
+/// `new_rows_gen`, and the next **+ Row** hands out index 0 again — so a reply
+/// carrying `pending = Some(0)` overwrote what the user had just typed into
+/// the new row. That is verbatim the bug `new_rows_gen` was introduced for,
+/// and its doc says so; the guard was written into `ai_seed_rows` and not into
+/// this, the sibling that reaches the same `stage_new`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FillTarget {
+    /// A committed row, by its **data** index — stable under a sort.
+    Row { di: usize, ci: usize },
+    /// A pending new row, by index *and* the generation it belongs to.
+    Pending {
+        idx: usize,
+        rows_gen: u64,
+        ci: usize,
+    },
+}
+
+/// Is this reply still for a cell that exists?
+///
+/// A pending row belongs to a **staging batch**: ✗ Discard clears `new_rows`
+/// and bumps `new_rows_gen`, and the next + Row hands out index 0 again — so a
+/// reply carrying the old batch's index would land on the row the user is
+/// typing into now. A committed row has no batch and is addressed by its data
+/// index, which nothing moves.
+///
+/// `try_get_untracked`, because the grid's scope may be gone: a disposed
+/// signal answers `None`, which is not the launch generation, so the reply is
+/// dropped.
+fn fill_is_current(rows_gen: RwSignal<u64>, target: FillTarget) -> bool {
+    match target {
+        FillTarget::Row { .. } => true,
+        FillTarget::Pending {
+            rows_gen: at_launch,
+            ..
+        } => rows_gen.try_get_untracked() == Some(at_launch),
+    }
+}
+
+/// Stage an AI fill's answer on the cell it was launched for, or drop it if
+/// that cell is gone. See [`FillTarget`].
+fn stage_fill(gs: GridState, target: FillTarget, val: Option<String>) {
+    if !fill_is_current(gs.new_rows_gen, target) {
+        return;
+    }
+    match target {
+        FillTarget::Pending { idx, ci, .. } => gs.stage_new(idx, ci, val),
+        // Force the edit (even if it equals the current value) so an AI fill is
+        // always visibly staged — see `stage_set`.
+        FillTarget::Row { di, ci } => gs.stage_set(di, ci, val),
     }
 }
 
@@ -5424,11 +5478,26 @@ fn ai_fill_value(gs: GridState) {
     let Some(cb) = gs.ai_fill.get_untracked() else {
         return;
     };
+    // **The target, resolved once, here.** Everything after this point is
+    // about a cell identity that a sort or a discard cannot move — see
+    // `FillTarget`.
+    let target = match pending {
+        Some(idx) => FillTarget::Pending {
+            idx,
+            rows_gen: gs.new_rows_gen.get_untracked(),
+            ci,
+        },
+        None => FillTarget::Row {
+            di: order.get(disp).copied().unwrap_or(disp),
+            ci,
+        },
+    };
     // Mark the target real-row cell "generating" (purple pulse); a pending-row
     // cell is left unmarked for now — Insert Row / Seed Table will mark their rows.
-    let gen_cell: Option<(usize, usize)> = pending
-        .is_none()
-        .then(|| (order.get(disp).copied().unwrap_or(disp), ci));
+    let gen_cell: Option<(usize, usize)> = match target {
+        FillTarget::Row { di, ci } => Some((di, ci)),
+        FillTarget::Pending { .. } => None,
+    };
     if let Some(cell) = gen_cell {
         gs.ai_gen.update(|g| {
             g.insert(cell);
@@ -5455,8 +5524,8 @@ fn ai_fill_value(gs: GridState) {
             });
         }
         match res {
-            crate::AiFillResult::Value(v) => stage_fill(gs, disp, ci, pending, Some(v)),
-            crate::AiFillResult::Null => stage_fill(gs, disp, ci, pending, None),
+            crate::AiFillResult::Value(v) => stage_fill(gs, target, Some(v)),
+            crate::AiFillResult::Null => stage_fill(gs, target, None),
             crate::AiFillResult::Failed(e) => gs.commit_err.set(Some(e)),
         }
     });
@@ -10157,6 +10226,73 @@ fn truncate(s: &str, max: usize) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod fill_target_tests {
+    use super::*;
+    use floem::reactive::Scope;
+
+    /// **A reply for a discarded pending row must not land on its
+    /// replacement.**
+    ///
+    /// ✗ Discard clears `new_rows` and bumps `new_rows_gen`; the next + Row
+    /// hands out index 0 again. A reply still carrying `pending = Some(0)`
+    /// overwrote whatever the user had typed into the new row — verbatim the
+    /// bug `new_rows_gen` exists for, whose guard was written into
+    /// `ai_seed_rows` and not into the sibling that reaches the same
+    /// `stage_new`.
+    ///
+    /// Asserted on the generation check itself, because `stage_fill` needs a
+    /// whole `GridState`: the target carries the generation it was launched
+    /// in, and a reply is for the batch that is still open or for nothing.
+    #[test]
+    fn a_pending_fill_belongs_to_the_batch_it_was_launched_in() {
+        let scope = Scope::new();
+        let rows_gen = scope.create_rw_signal(0u64);
+
+        let at_launch = FillTarget::Pending {
+            idx: 0,
+            rows_gen: rows_gen.get_untracked(),
+            ci: 2,
+        };
+        // Still the same batch: the reply is for this row.
+        assert!(fill_is_current(rows_gen, at_launch));
+
+        // ✗ Discard, then + Row again — index 0 exists again and is somebody
+        // else's.
+        rows_gen.update(|g| *g = g.wrapping_add(1));
+        assert!(
+            !fill_is_current(rows_gen, at_launch),
+            "the reply would overwrite the row the user just typed into"
+        );
+
+        // A committed row has no batch and is never refused on this ground.
+        assert!(fill_is_current(rows_gen, FillTarget::Row { di: 3, ci: 2 }));
+    }
+
+    /// **The target is a data row, not a display row**, so a sort mid-flight
+    /// cannot move it. `ai_fill_value` already resolved the data row at launch
+    /// — for the purple "generating" wash — and then threw it away, handing
+    /// `stage_fill` the display index to re-resolve seconds later against an
+    /// `order` the sort had rewritten.
+    #[test]
+    fn a_real_row_fill_is_addressed_by_data_row_and_survives_a_sort() {
+        // Display order 3, 2, 1, 0 — what a descending sort produces.
+        let order = [3usize, 2, 1, 0];
+        let disp = 1usize;
+        let di = order[disp];
+        let target = FillTarget::Row { di, ci: 5 };
+
+        // The sort lands: the same display row now points somewhere else.
+        let resorted = [0usize, 1, 2, 3];
+        assert_ne!(
+            resorted[disp], di,
+            "the fixture must actually move the row, or this proves nothing"
+        );
+        // The target does not move with it.
+        assert_eq!(target, FillTarget::Row { di: 2, ci: 5 });
     }
 }
 
