@@ -111,8 +111,9 @@ pub struct SnapshotRow {
 
 /// A point-in-time capture of the monitored rows, in fetch order. Diffed against
 /// the next capture to find what changed. Order carries meaning only when
-/// [`Snapshot::ordered_window_full`] is set — otherwise the diff matches by `key`
-/// and the sequence is just for display.
+/// [`Snapshot::ordered`] is set — otherwise the diff matches by `key` and the
+/// sequence is just for display. [`Snapshot::window_full`] is the second half:
+/// see `diff_snapshots`, which asks the two independently.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub rows: Vec<SnapshotRow>,

@@ -353,6 +353,39 @@ pub struct CompareCounts {
     pub uncertain: usize,
 }
 
+impl<'a> FromIterator<&'a CompareEntry> for CompareCounts {
+    /// The tally of any run of entries.
+    ///
+    /// **One tally, because there were two.** `SchemaComparison::counts` and
+    /// `SchemaComparison::rows` each carried a byte-identical four-arm `match`
+    /// filling this struct, a hundred lines apart, differing only in what they
+    /// iterated. A fifth `ObjectStatus` is a compile error in neither — both
+    /// matches are exhaustive over today's four — so both would keep compiling
+    /// and one would silently stop counting the new one, and the header
+    /// summary and the per-group headings would then disagree. That is the
+    /// thing `uncertain`'s own doc was added to prevent in the other
+    /// direction.
+    ///
+    /// The `uncertain` bump is here too, and it is deliberately not an arm of
+    /// the match: an uncertain object is also one of the four, and the summary
+    /// line says both things about it.
+    fn from_iter<I: IntoIterator<Item = &'a CompareEntry>>(entries: I) -> Self {
+        let mut c = CompareCounts::default();
+        for e in entries {
+            match e.status {
+                ObjectStatus::Same => c.same += 1,
+                ObjectStatus::Differing => c.differing += 1,
+                ObjectStatus::OnlyLeft => c.only_left += 1,
+                ObjectStatus::OnlyRight => c.only_right += 1,
+            }
+            if e.uncertain {
+                c.uncertain += 1;
+            }
+        }
+        c
+    }
+}
+
 impl CompareCounts {
     /// Everything that is not [`ObjectStatus::Same`].
     pub fn differences(&self) -> usize {
@@ -695,21 +728,7 @@ impl SchemaComparison {
 
     /// The per-status tally.
     pub fn counts(&self) -> CompareCounts {
-        let mut c = CompareCounts::default();
-        for e in &self.entries {
-            match e.status {
-                ObjectStatus::Same => c.same += 1,
-                ObjectStatus::Differing => c.differing += 1,
-                ObjectStatus::OnlyLeft => c.only_left += 1,
-                ObjectStatus::OnlyRight => c.only_right += 1,
-            }
-            // Deliberately not an arm of the match: an uncertain object is also
-            // one of the four, and the summary line says both things about it.
-            if e.uncertain {
-                c.uncertain += 1;
-            }
-        }
-        c
+        self.entries.iter().collect()
     }
 
     /// Do **either** schema's foreign keys form a cycle — the comparison-level
@@ -801,15 +820,7 @@ impl SchemaComparison {
                 .iter()
                 .position(|e| e.kind != kind)
                 .map_or(visible.len(), |n| i + n);
-            let mut counts = CompareCounts::default();
-            for e in &visible[i..end] {
-                match e.status {
-                    ObjectStatus::Same => counts.same += 1,
-                    ObjectStatus::Differing => counts.differing += 1,
-                    ObjectStatus::OnlyLeft => counts.only_left += 1,
-                    ObjectStatus::OnlyRight => counts.only_right += 1,
-                }
-            }
+            let counts: CompareCounts = visible[i..end].iter().copied().collect();
             let open = expanded.contains(kind.label());
             out.push(CompareRow::Group {
                 kind,
@@ -1044,8 +1055,24 @@ impl SchemaPlan {
     }
 
     /// How many objects this plan touches.
+    ///
+    /// **The `CREATE SCHEMA` sets do not count.** `plan()` prepends one per
+    /// namespace a chosen set names and the left side lacks, so that
+    /// `CREATE TABLE reporting.sales` has a `reporting` to land in — but a
+    /// namespace is not an object the comparison pairs, has no tick-box, and
+    /// was never in the number the user pressed. Counting it made the footer
+    /// say *"1 object selected"* and the preview behind it *"2 objects in
+    /// shop"*, with the success line reading "Applied 2 statements to 2
+    /// objects", and the gap grew with the number of new namespaces.
+    ///
+    /// `is_planned`'s doc states the rule this belongs to: the footer's count,
+    /// the button's enabled state and the statements that actually get built
+    /// cannot answer differently.
     pub fn len(&self) -> usize {
-        self.sets.len()
+        self.sets
+            .iter()
+            .filter(|s| !s.changes.iter().all(ddl::is_namespace_change))
+            .count()
     }
 
     /// What the preview modal is **about** — its title's second half, and the
@@ -1084,24 +1111,21 @@ impl SchemaPlan {
         self.sets.iter().flat_map(ChangeSet::emit).collect()
     }
 
-    /// The statements as one script, blank-line separated, under the same
-    /// "INCOMPLETE" preamble a single set's [`ChangeSet::script`] carries.
-    ///
-    /// **A copied script must not look complete.** [`SchemaPlan::emit`] leaves
-    /// out whatever the engine can't express faithfully, exactly as one set's
-    /// does, so the omission has to travel with the text — an aggregate that
-    /// concatenated only the statements would drop the one sentence saying the
-    /// script is partial.
-    pub fn script(&self) -> String {
-        format!(
-            "{}{}",
-            ddl::withheld_header(&self.unsupported()),
-            self.emit().join("\n\n")
-        )
-    }
-
     /// The script as it may **leave** a preview — for the clipboard and for the
     /// editor tab, split on `;` by the app's own splitter.
+    ///
+    /// **The only script this type produces.** There used to be a third,
+    /// `script()`, which no production caller ever reached: `preview_of_plan`
+    /// takes `emit()` and `export_script()`, and a workspace grep found only
+    /// this module's own tests. It was nonetheless the surface six of them read
+    /// a plan through, so the ordering the suite pinned was the ordering of a
+    /// string nobody was ever shown — and it was the one builder of the three
+    /// that joined statements without going through [`ddl::client_script`],
+    /// which exists precisely because a MySQL routine's `CREATE` is
+    /// deliberately unterminated and two of those run together when joined for
+    /// a reader. A third builder skipping that fix, kept alive by tests, is the
+    /// next caller's trap. Those six tests now assert what Copy and Open in
+    /// editor produce.
     ///
     /// [`ddl::client_script`] is what makes a MySQL routine or trigger body
     /// survive that split, and a compare plan is the most likely thing to carry
@@ -2223,6 +2247,32 @@ mod tests {
         // is no button to press, so the sentence is not a count at all.
         assert_eq!(SchemaPlan::default().subject(), "0 objects");
         assert_eq!(selection_note(0), "Nothing selected.");
+
+        // **And a `CREATE SCHEMA` the plan prepended is not an object.** Every
+        // case above is MySQL, where `new_namespaces` is empty by
+        // construction, which is why they were green over this: on PostgreSQL,
+        // ticking one table into a namespace the left side lacks made the
+        // footer read "1 object selected" over a preview reading "2 objects",
+        // and the success line "Applied 2 statements to 2 objects".
+        let in_ns = |ns: &str, name: &str| TableInfo {
+            name: name.to_string(),
+            schema: Some(ns.to_string()),
+            columns: vec![col("id", "int")],
+            ..Default::default()
+        };
+        let plan = SchemaComparison::of(
+            &schema_of(vec![in_ns("public", "city")]),
+            &schema_of(vec![in_ns("public", "city"), in_ns("reporting", "sales")]),
+            SqlDialect::Postgres,
+        )
+        .plan(|_| true);
+        assert!(
+            plan.emit().iter().any(|s| s.contains("CREATE SCHEMA")),
+            "the fixture has to prepend one for this to mean anything: {:?}",
+            plan.emit()
+        );
+        assert_eq!(plan.subject(), "1 object");
+        assert_eq!(selection_note(1), "1 object selected");
     }
 
     /// **And the preview names the database, not just the connection.** The
@@ -2773,7 +2823,7 @@ mod tests {
         let e = find(&c, "table:city");
         assert_eq!(e.status, ObjectStatus::Differing);
         assert_eq!(e.changes.dialect, SqlDialect::Sqlite);
-        let sql = c.plan(|_| true).script();
+        let sql = c.plan(|_| true).editor_script();
         assert!(!sql.contains("MODIFY COLUMN"), "{sql}");
         assert!(sql.contains("\"city\""), "sqlite quotes with \": {sql}");
     }
@@ -2933,7 +2983,11 @@ mod tests {
         );
         let plan = c.plan(|_| true);
         assert_eq!(plan.len(), 1);
-        assert!(plan.script().contains("`town`"), "{}", plan.script());
+        assert!(
+            plan.editor_script().contains("`town`"),
+            "{}",
+            plan.editor_script()
+        );
     }
 
     #[test]
@@ -2947,8 +3001,16 @@ mod tests {
         );
         let plan = c.plan(|e| e.name == "a");
         assert_eq!(plan.len(), 1);
-        assert!(plan.script().contains("`a`"), "{}", plan.script());
-        assert!(!plan.script().contains("`b`"), "{}", plan.script());
+        assert!(
+            plan.editor_script().contains("`a`"),
+            "{}",
+            plan.editor_script()
+        );
+        assert!(
+            !plan.editor_script().contains("`b`"),
+            "{}",
+            plan.editor_script()
+        );
     }
 
     #[test]
@@ -2957,7 +3019,7 @@ mod tests {
             schema_of(vec![table("gone", &[("id", "int")])]),
             schema_of(vec![table("fresh", &[("id", "int")])]),
         );
-        let sql = c.plan(|_| true).script().to_uppercase();
+        let sql = c.plan(|_| true).editor_script().to_uppercase();
         assert!(sql.contains("DROP TABLE"), "{sql}");
         assert!(sql.contains("CREATE TABLE"), "{sql}");
     }
@@ -3246,7 +3308,7 @@ mod tests {
         // Child listed *first*, so insertion order can't accidentally be right,
         // and it sorts before "parent" by name too.
         let c = mysql(schema_of(vec![]), schema_of(vec![child, parent]));
-        let sql = c.plan(|_| true).script();
+        let sql = c.plan(|_| true).editor_script();
         let at = |n: &str| sql.find(n).unwrap_or_else(|| panic!("no {n} in {sql}"));
         assert!(at("`parent`") < at("`child`"), "{sql}");
         assert!(!c.cycles());
@@ -3415,9 +3477,9 @@ mod tests {
             "the fixture has to withhold something for this to mean anything"
         );
         assert!(
-            plan.script().starts_with("-- INCOMPLETE"),
+            plan.editor_script().starts_with("-- INCOMPLETE"),
             "the script has to admit it is partial: {}",
-            plan.script()
+            plan.editor_script()
         );
     }
 
@@ -3430,9 +3492,9 @@ mod tests {
         let plan = c.plan(|_| true);
         assert!(plan.unsupported().is_empty());
         assert!(
-            plan.script().starts_with("CREATE TABLE"),
+            plan.editor_script().starts_with("CREATE TABLE"),
             "{}",
-            plan.script()
+            plan.editor_script()
         );
     }
 
@@ -4147,7 +4209,7 @@ mod tests {
         assert!(plan.is_empty());
         assert_eq!(plan.len(), 0);
         assert!(plan.emit().is_empty());
-        assert!(plan.script().is_empty());
+        assert!(plan.editor_script().is_empty());
         assert!(plan.destructive().is_empty());
         assert!(plan.unsupported().is_empty());
         assert!(plan.summaries().is_empty());

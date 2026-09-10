@@ -2593,6 +2593,20 @@ pub fn is_account_change(change: &Change) -> bool {
     )
 }
 
+/// Is `change` about a **namespace** rather than about an object in one?
+///
+/// A namespace is not an object the schema comparison pairs — it has no row and
+/// no tick-box — so a `CREATE SCHEMA` that `SchemaPlan` prepends to give a
+/// ticked table somewhere to land must not be counted among the objects the
+/// user chose. See [`crate::compare::SchemaPlan::len`] for what counting it
+/// looked like.
+pub fn is_namespace_change(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::CreateSchema { .. } | Change::DropSchema { .. }
+    )
+}
+
 /// Is `change` **server-level** — about a database as a whole rather than about
 /// anything inside one?
 ///
@@ -3969,7 +3983,7 @@ impl ChangeSet {
 /// items — empty when nothing was withheld.
 ///
 /// A free function because a multi-object plan
-/// ([`crate::compare::SchemaPlan::script`]) has to say the same thing over the
+/// ([`crate::compare::SchemaPlan::editor_script`]) has to say the same thing over the
 /// union of its sets' omissions, and a second copy of this sentence is a second
 /// thing to keep true.
 pub fn withheld_header(withheld: &[String]) -> String {
