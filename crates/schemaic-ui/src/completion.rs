@@ -155,6 +155,89 @@ thread_local! {
     /// `Arc` identity, which a re-introspection changes, so nothing here has to be
     /// invalidated by hand.
     static CATALOG: RefCell<intel::CatalogCache> = RefCell::new(intel::CatalogCache::default());
+
+    /// One memoised [`SchemaIndex`] per UI thread, for the reason the catalog
+    /// beside it gives — and it was the half that never got it.
+    ///
+    /// `SchemaIndex::build` walks every loaded database, every table and every
+    /// column, allocating a fresh `ColMeta` per column plus three `HashMap`s.
+    /// `recompute_completions` called it directly, and that function is
+    /// deliberately undebounced (`editor_pane` schedules it at
+    /// `Duration::ZERO`, one tick, only so the caret has settled) — so it ran
+    /// on effectively every keystroke of the ordinary case, since typing an
+    /// identifier leaves a non-empty prefix. This exact cost was found and
+    /// fixed once, for `Catalog`, with a cache keyed on `Arc` identity; the
+    /// index kept paying it.
+    static SCHEMA_INDEX: RefCell<Option<CachedIndex>> = const { RefCell::new(None) };
+}
+
+/// One database node as the index reads it: its name and the schema `Arc` it
+/// currently holds, if any.
+///
+/// Taken out of the signals once, so the cache key and the build see the same
+/// snapshot — reading `node.schema` twice could otherwise key an index on a
+/// schema it was not built from.
+struct LoadedNode {
+    database: String,
+    schema: Option<std::sync::Arc<schemaic_core::schema::DbSchema>>,
+}
+
+/// One built index and the inputs it was built from.
+struct CachedIndex {
+    nodes: Vec<LoadedNode>,
+    hidden: HashSet<String>,
+    active_db: Option<String>,
+    index: Rc<SchemaIndex>,
+}
+
+/// The [`SchemaIndex`] for these nodes, rebuilding only when the node list,
+/// their schemas, the hidden set or the active database has moved.
+///
+/// Identity, not equality, for the schemas: `Arc::ptr_eq` is what a
+/// re-introspection changes, so nothing here has to be invalidated by hand —
+/// the same key [`intel::CatalogCache`] uses, for the same reason.
+fn schema_index(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden: &HashSet<String>,
+    active_db: Option<&str>,
+) -> Rc<SchemaIndex> {
+    let nodes: Vec<LoadedNode> = db_nodes
+        .get_untracked()
+        .into_iter()
+        .map(|n| LoadedNode {
+            schema: match n.schema.get_untracked() {
+                SchemaState::Loaded(s) => Some(s),
+                _ => None,
+            },
+            database: n.database,
+        })
+        .collect();
+    SCHEMA_INDEX.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if let Some(hit) = cell.as_ref()
+            && hit.active_db.as_deref() == active_db
+            && &hit.hidden == hidden
+            && hit.nodes.len() == nodes.len()
+            && hit.nodes.iter().zip(&nodes).all(|(a, b)| {
+                a.database == b.database
+                    && match (&a.schema, &b.schema) {
+                        (None, None) => true,
+                        (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+                        _ => false,
+                    }
+            })
+        {
+            return Rc::clone(&hit.index);
+        }
+        let index = Rc::new(SchemaIndex::build(&nodes, hidden, active_db));
+        *cell = Some(CachedIndex {
+            nodes,
+            hidden: hidden.clone(),
+            active_db: active_db.map(str::to_string),
+            index: Rc::clone(&index),
+        });
+        index
+    })
 }
 
 /// The `schemaic_core::intel::Catalog` for **validation** — every loaded
@@ -259,7 +342,7 @@ impl SchemaIndex {
     /// name, not its tables, not its columns — unless it is the active one; see
     /// [`schemaic_core::schema::db_contributes`].
     fn build(
-        db_nodes: RwSignal<Vec<ConnNode>>,
+        nodes: &[LoadedNode],
         hidden: &HashSet<String>,
         active_db: Option<&str>,
     ) -> SchemaIndex {
@@ -268,7 +351,7 @@ impl SchemaIndex {
         let mut columns: HashMap<String, Vec<ColMeta>> = HashMap::new();
         let mut columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>> = HashMap::new();
         let mut tables_by_db: HashMap<String, Vec<String>> = HashMap::new();
-        for node in db_nodes.get_untracked() {
+        for node in nodes {
             if !db_contributes(hidden, &node.database, active_db) {
                 continue;
             }
@@ -278,7 +361,7 @@ impl SchemaIndex {
             {
                 databases.push(node.database.clone());
             }
-            if let SchemaState::Loaded(schema) = node.schema.get_untracked() {
+            if let Some(schema) = &node.schema {
                 let db_lower = node.database.to_ascii_lowercase();
                 let by_db = tables_by_db.entry(db_lower.clone()).or_default();
                 // Unqualified pool: only the selected database (or all, if none).
@@ -896,7 +979,7 @@ pub(crate) fn recompute_completions(
         return;
     }
 
-    let schema = hidden_dbs.with_untracked(|h| SchemaIndex::build(db_nodes, h, active_db));
+    let schema = hidden_dbs.with_untracked(|h| schema_index(db_nodes, h, active_db));
     let scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
     let pl = prefix.to_ascii_lowercase();
 
@@ -2397,5 +2480,67 @@ mod catalog_tests {
             offered(&cat)
         );
         cx.dispose();
+    }
+}
+
+#[cfg(test)]
+mod schema_index_cache_tests {
+    use super::*;
+    use floem::reactive::Scope;
+    use schemaic_core::schema::DbSchema;
+    use std::sync::Arc;
+
+    fn node(scope: Scope, db: &str, schema: Option<Arc<DbSchema>>) -> ConnNode {
+        let n = ConnNode::new(scope, 1, "conn", db);
+        if let Some(s) = schema {
+            n.schema.set(SchemaState::Loaded(s));
+        }
+        n
+    }
+
+    /// **The index is rebuilt only when something it is built from moves.**
+    ///
+    /// `SchemaIndex::build` walks every loaded database, every table and every
+    /// column, allocating a `ColMeta` per column plus three `HashMap`s — and
+    /// `recompute_completions` called it directly, on a path that is
+    /// deliberately undebounced, so it ran on effectively every keystroke. The
+    /// catalog fourteen lines above it was memoised for this exact cost, on
+    /// this exact key.
+    ///
+    /// Asserted by identity: the same `Rc` back means nothing was rebuilt.
+    #[test]
+    fn the_index_is_reused_until_a_schema_or_the_filters_move() {
+        let scope = Scope::new();
+        let s1 = Arc::new(DbSchema::default());
+        let nodes = scope.create_rw_signal(vec![node(scope, "shop", Some(Arc::clone(&s1)))]);
+        let none: HashSet<String> = HashSet::new();
+
+        let a = schema_index(nodes, &none, Some("shop"));
+        let b = schema_index(nodes, &none, Some("shop"));
+        assert!(Rc::ptr_eq(&a, &b), "an unchanged input rebuilt the index");
+
+        // A different active database is a different index.
+        let c = schema_index(nodes, &none, None);
+        assert!(!Rc::ptr_eq(&a, &c));
+
+        // …and so is a different hidden set.
+        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
+        let d = schema_index(nodes, &hidden, None);
+        assert!(!Rc::ptr_eq(&c, &d));
+
+        // **A re-introspection replaces the `Arc`**, which is what the key is
+        // for: the contents may be identical and the index must still be
+        // rebuilt, because nothing else tells it the schema was re-read.
+        let s2 = Arc::new(DbSchema::default());
+        nodes.update(|v| v[0].schema.set(SchemaState::Loaded(Arc::clone(&s2))));
+        let e = schema_index(nodes, &hidden, None);
+        assert!(!Rc::ptr_eq(&d, &e), "a re-introspection was not noticed");
+
+        // A node appearing or disappearing is a change too.
+        nodes.update(|v| v.push(node(scope, "other", None)));
+        let f = schema_index(nodes, &hidden, None);
+        assert!(!Rc::ptr_eq(&e, &f));
+
+        scope.dispose();
     }
 }

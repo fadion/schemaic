@@ -4486,12 +4486,20 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                         // an empty slice says so at the call site.
                         let cells = grid_cells(&rs, &order, &[], dirty, pending);
                         let texts = (r0..=r1).map(|d| cells.summary_text(d, ci));
-                        schemaic_core::aggregate::aggregate_texts(column, texts)
+                        // **Capped**, because this effect is undebounced and a
+                        // drag re-scans the range-so-far on every row it
+                        // enters — see `AGGREGATE_CELL_BUDGET`.
+                        schemaic_core::aggregate::aggregate_capped(
+                            column,
+                            texts,
+                            schemaic_core::aggregate::AGGREGATE_CELL_BUDGET,
+                        )
                     })
                 })
             }
             _ => schemaic_core::aggregate::Aggregates {
                 rows: r1 - r0 + 1,
+                truncated: false,
                 // No column, so no cell to be NULL — the counts are all a row
                 // selection can honestly report.
                 non_null: r1 - r0 + 1,

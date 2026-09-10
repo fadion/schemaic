@@ -164,6 +164,16 @@ pub struct Aggregates {
     /// `None` for a non-numeric column, and for a numeric one whose selected
     /// cells are all NULL, all unparseable, or overflow the accumulator.
     pub numeric: Option<NumericAggregates>,
+    /// The scan stopped at its budget, so `rows` and `non_null` are lower
+    /// bounds and [`Aggregates::numeric`] is `None`.
+    ///
+    /// **A partial sum is not a sum.** This module already refuses one for
+    /// overflow — "there is then no honest number to report, only a total over
+    /// *some* of what was selected" — and a budget is the same situation
+    /// arrived at differently. The counts still say something true with a `+`,
+    /// which is the idiom the find bar's `find_more` already uses in the same
+    /// panel.
+    pub truncated: bool,
 }
 
 /// The arithmetic half, present only when the column is numeric and at least one
@@ -205,12 +215,48 @@ pub fn aggregate_texts<S: AsRef<str>>(
     column: &Column,
     cells: impl Iterator<Item = Option<S>>,
 ) -> Aggregates {
+    aggregate_capped(column, cells, usize::MAX)
+}
+
+/// How many cells one selection summary will read before it stops.
+///
+/// **The selection aggregate is undebounced and was uncapped**, unlike the
+/// find-count effect fifty lines below it in the same function, which is
+/// 150 ms debounced *and* budgeted at two million cells "so a big grid doesn't
+/// stutter typing". Both are per-cell scans over the same result feeding a
+/// small readout in the same panel.
+///
+/// It cannot take the same debounce: the effect is driven by the selection,
+/// not by typing, and a two-cell selection has to answer at once. So the cap
+/// is the guard, and it is much smaller than the find bar's for that reason —
+/// this one runs inside the frame. A drag down a column re-scans the
+/// range-so-far on every row it enters, so what matters is the cost of one
+/// run, and this bounds it.
+pub const AGGREGATE_CELL_BUDGET: usize = 100_000;
+
+/// [`aggregate_texts`] over at most `budget` cells, saying so when it stopped.
+///
+/// Reading one cell past the budget is deliberate: it is how "there were more"
+/// is told from "that was all", and it costs one extra probe rather than a
+/// separate count.
+pub fn aggregate_capped<S: AsRef<str>>(
+    column: &Column,
+    cells: impl Iterator<Item = Option<S>>,
+    budget: usize,
+) -> Aggregates {
     let numeric_column = column.is_numeric();
     let mut agg = Aggregates::default();
     // `None` once anything has overflowed: there is then no honest number to
     // report, only a total over some of what was selected.
     let mut fold = Some(Fold::default());
     for cell in cells {
+        if agg.rows >= budget {
+            // One past the budget: something is there, so the counts are a
+            // floor and the arithmetic has nothing honest to say.
+            agg.truncated = true;
+            agg.numeric = None;
+            return agg;
+        }
         agg.rows += 1;
         let Some(text) = cell else {
             continue;
@@ -372,8 +418,12 @@ impl Aggregates {
     /// The NULL count appears only when there is one, so an ordinary selection
     /// isn't padded with `0 null`.
     pub fn summary(&self) -> String {
+        // `N+` when the scan stopped at its budget — the same `+` the find
+        // bar's count uses for the same reason, rather than a number that
+        // reads exact and is not.
+        let more = if self.truncated { "+" } else { "" };
         let mut parts = vec![format!(
-            "{} {}",
+            "{}{more} {}",
             self.rows,
             crate::text::plural(self.rows, "row", "rows")
         )];
@@ -419,6 +469,53 @@ mod tests {
         aggregate(&rs.columns[0], cells.into_iter())
     }
 
+    /// **The selection summary stops at its budget and says so.**
+    ///
+    /// The effect that calls it is undebounced — unlike the find-count effect
+    /// fifty lines below it, which is 150 ms debounced *and* capped at two
+    /// million cells "so a big grid doesn't stutter typing" — and it was
+    /// uncapped. A drag down a column re-scans the range-so-far on every row
+    /// it enters, so what matters is the cost of one run.
+    ///
+    /// A partial **sum** is withheld rather than shown, which is this module's
+    /// own rule for overflow: "there is then no honest number to report, only
+    /// a total over *some* of what was selected". The counts still say
+    /// something true with a `+`, the idiom the find bar's `find_more`
+    /// already uses in the same panel.
+    #[test]
+    fn a_range_wider_than_the_budget_reports_a_floor_and_no_sum() {
+        let c = col("int");
+        let cells = (0..50).map(|i| Some(i.to_string()));
+        let agg = aggregate_capped(&c, cells, 10);
+        assert!(agg.truncated);
+        assert_eq!(agg.rows, 10, "the counts are what it read");
+        assert_eq!(agg.non_null, 10);
+        assert_eq!(agg.numeric, None, "a partial sum is not a sum");
+        assert!(agg.summary().starts_with("10+ rows"), "{}", agg.summary());
+    }
+
+    /// Exactly the budget is **not** truncated: the scan saw everything there
+    /// was, and reading one cell past it is how the two are told apart.
+    #[test]
+    fn a_range_that_exactly_fits_the_budget_is_complete() {
+        let c = col("int");
+        let agg = aggregate_capped(&c, (0..10).map(|i| Some(i.to_string())), 10);
+        assert!(!agg.truncated);
+        assert_eq!(agg.rows, 10);
+        assert!(agg.numeric.is_some(), "the sum is over all of it");
+        assert!(!agg.summary().contains('+'), "{}", agg.summary());
+    }
+
+    /// And the uncapped entry point is unchanged — every existing caller and
+    /// every test above goes through it.
+    #[test]
+    fn the_uncapped_call_never_truncates() {
+        let c = col("int");
+        let agg = aggregate_texts(&c, (0..5_000).map(|i| Some(i.to_string())));
+        assert!(!agg.truncated);
+        assert_eq!(agg.rows, 5_000);
+        assert!(agg.numeric.is_some());
+    }
     #[test]
     fn parses_a_decimal_literal_as_the_wire_sends_it() {
         assert_eq!(

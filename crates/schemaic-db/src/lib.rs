@@ -4189,6 +4189,9 @@ pub(crate) async fn collect_rows(
         .iter()
         .map(|c| schemaic_core::model::type_is_bit(&c.type_name))
         .collect();
+    // And how each column's text parses, for the same reason and with the
+    // same lifetime — see `convert_row`.
+    let kinds: Vec<NumKind> = columns.iter().map(|c| num_kind(&c.type_name)).collect();
     // Assemble the result columnar, one row at a time, so we never hold a
     // row-major `Vec<Vec<Value>>` copy alongside the final storage.
     let chunk_capacity = dest.chunk_capacity();
@@ -4198,7 +4201,7 @@ pub(crate) async fn collect_rows(
         while let Some(row) = stream.next().await {
             let row = row.map_err(qerr)?;
             if builder.row_count() < row_cap {
-                let cells = convert_row(&row, builder.columns(), &binary, &bit, &scale);
+                let cells = convert_row(&row, builder.columns(), &binary, &bit, &scale, &kinds);
                 builder.push_row(&cells);
                 // A stream hands the block over here and keeps reading into an
                 // empty builder; a capped read never fills a chunk, so this is
@@ -4420,6 +4423,7 @@ fn convert_row(
     binary: &[bool],
     bit: &[bool],
     scale: &[u32],
+    kinds: &[NumKind],
 ) -> Vec<Value> {
     (0..columns.len())
         .map(|i| match row.as_ref(i) {
@@ -4443,9 +4447,21 @@ fn convert_row(
             Some(MyValue::Bytes(b)) if bit.get(i).copied().unwrap_or(false) => {
                 schemaic_core::model::bit_cell(b)
             }
-            Some(MyValue::Bytes(b)) => parse_typed(
+            // **`parse_as` with a kind computed once, not `parse_typed`.**
+            // `parse_typed` is `parse_as(num_kind(type_name), s)`, and
+            // `num_kind` opens by uppercasing the type name — a heap
+            // allocation — then walks up to eight `starts_with` scans and a
+            // `contains`, for an answer that is a property of the *column*
+            // and cannot vary between rows. Both docs say so: `num_kind`'s
+            // reads "Called once per column", and `parse_typed`'s says "What
+            // a row loop should call is `parse_as` with a kind it computed
+            // once". This is the row loop. `binary` and `bit` above are
+            // hoisted for exactly this reason, with a comment pricing it at
+            // "tens of millions of calls in the row loop" at the 200k cap on
+            // a wide result.
+            Some(MyValue::Bytes(b)) => parse_as(
+                kinds.get(i).copied().unwrap_or(NumKind::Text),
                 String::from_utf8_lossy(b).into_owned(),
-                &columns[i].type_name,
             ),
             Some(MyValue::Int(n)) => Value::Int(*n),
             Some(MyValue::UInt(n)) => Value::UInt(*n),
@@ -5656,9 +5672,10 @@ pub(crate) async fn refetch_on(
                 .iter()
                 .map(|c| schemaic_core::model::type_is_bit(&c.type_name))
                 .collect();
+            let kinds: Vec<NumKind> = columns.iter().map(|c| num_kind(&c.type_name)).collect();
             out.push((
                 row.data_row,
-                convert_row(r, &columns, &binary, &bit, &scale),
+                convert_row(r, &columns, &binary, &bit, &scale, &kinds),
             ));
         }
     }
@@ -6502,6 +6519,70 @@ mod tests {
             binary_as_text(&MyValue::Time(false, 0, 10, 30, 0, 500_000), "TIME", 1).as_deref(),
             Some("10:30:00.5")
         );
+    }
+
+    /// **A hoisted kind has to answer what the per-cell call answered.**
+    ///
+    /// `convert_row` called `parse_typed` per cell, which is
+    /// `parse_as(num_kind(type_name), s)` — and `num_kind` opens by
+    /// uppercasing the type name, then walks up to eight `starts_with` scans
+    /// and a `contains`, for a property of the *column*. Both docs already
+    /// said so ("Called once per column"; "What a row loop should call is
+    /// `parse_as` with a kind it computed once"), and the two sibling
+    /// classifications beside it in the row loop were hoisted on exactly that
+    /// reasoning.
+    ///
+    /// The answer must not move, so this is the equivalence: over every type
+    /// spelling the mapping distinguishes, `parse_as(num_kind(t), s)` is
+    /// `parse_typed(s, t)`.
+    #[test]
+    fn a_kind_computed_once_parses_a_cell_the_way_the_per_cell_call_did() {
+        let types = [
+            "TINYINT",
+            "SMALLINT",
+            "MEDIUMINT",
+            "INT",
+            "BIGINT",
+            "YEAR",
+            "INT UNSIGNED",
+            "BIGINT UNSIGNED",
+            "tinyint unsigned",
+            "FLOAT",
+            "DOUBLE",
+            "DECIMAL(10,2)",
+            "VARCHAR(255)",
+            "TEXT",
+            "DATETIME",
+            "",
+        ];
+        let cells = ["42", "-1", "0", "3.5", "18446744073709551615", "abc", ""];
+        for t in types {
+            let kind = num_kind(t);
+            for c in cells {
+                assert_eq!(
+                    parse_as(kind, c.to_string()),
+                    parse_typed(c.to_string(), t),
+                    "{t:?} / {c:?}"
+                );
+            }
+        }
+    }
+
+    /// A column index past the end falls back to `Text`, which is what a
+    /// value with no column to describe it has to be — the row loop indexes
+    /// `kinds` the same way it indexes `binary` and `bit`, both of which take
+    /// the same defensive default.
+    #[test]
+    fn a_missing_kind_is_text() {
+        let kinds: Vec<NumKind> = vec![NumKind::Int];
+        assert_eq!(
+            kinds.get(9).copied().unwrap_or(NumKind::Text),
+            NumKind::Text
+        );
+        assert!(matches!(
+            parse_as(NumKind::Text, "42".to_string()),
+            Value::Str(_)
+        ));
     }
 
     #[test]
