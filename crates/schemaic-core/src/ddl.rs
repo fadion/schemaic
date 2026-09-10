@@ -2660,13 +2660,24 @@ fn unreplayable_rename(c: &Change) -> Option<String> {
 /// warning was about someone else's engine. What SQLite really drops with a view
 /// is its `INSTEAD OF` triggers — the only way a view there is written to — and
 /// that was the one thing the sentence left out.
+///
+/// **And the repair added the clause to one arm only.** PostgreSQL has
+/// `INSTEAD OF` triggers too, and they are the half that goes *silently*: a
+/// dependent view makes `DROP VIEW` refuse without `CASCADE`, which Schemaic
+/// never sends, so the user finds out about that one — while the triggers, the
+/// only reason the view was writable, are dropped with no error at all.
+/// Measured on PostgreSQL 16.15. The non-SQLite arm names them too, and the two
+/// arms now differ only in what the engine actually has.
 fn view_drop_cost(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::Sqlite => {
             "Views that select from it stop resolving until it is back, and its \
              INSTEAD OF triggers are dropped with it."
         }
-        _ => "Dependent views, rules and grants on it are dropped with it and aren't restored.",
+        _ => {
+            "Dependent views, rules, grants and its INSTEAD OF triggers are dropped \
+             with it and aren't restored."
+        }
     }
 }
 
@@ -16248,6 +16259,38 @@ mod tests {
                 Change::DropView { materialized: true },
             );
             assert_eq!(cs.script(), r#"DROP MATERIALIZED VIEW "city_stats";"#);
+        }
+
+        /// **Every engine that has `INSTEAD OF` triggers says they go.**
+        ///
+        /// The list was once written for PostgreSQL and read as universal; the
+        /// repair added the trigger clause to the SQLite arm and left the other
+        /// one as it was — though PostgreSQL has them too, and they are the half
+        /// that goes *silently*. A dependent view makes `DROP VIEW` refuse
+        /// without `CASCADE`, which Schemaic never sends, so the user finds out
+        /// about that one; the triggers, the only reason the view was writable,
+        /// are dropped with no error at all. Measured on PostgreSQL 16.15.
+        #[test]
+        fn every_engine_is_told_its_views_triggers_go_with_it() {
+            for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+                let cs = single(
+                    "v",
+                    None,
+                    dialect,
+                    Change::DropView {
+                        materialized: false,
+                    },
+                );
+                let said = cs.destructive().join(" ");
+                assert!(said.contains("INSTEAD OF triggers"), "{dialect:?}: {said}");
+                // And each still names only what that engine has: rules and
+                // grants are not SQLite's.
+                assert_eq!(
+                    said.contains("rules"),
+                    dialect != SqlDialect::Sqlite,
+                    "{dialect:?}: {said}"
+                );
+            }
         }
 
         /// The statement itself, both forms, and the fact that it destroys

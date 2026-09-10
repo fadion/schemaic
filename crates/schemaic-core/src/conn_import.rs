@@ -736,10 +736,15 @@ fn apply_params(c: &mut Connection, params: &[(String, String)]) {
                 }
             }
             // MySQL's boolean spellings. Only ever *raises* the mode, so an
-            // explicit `sslmode` alongside them is not undone by ordering.
+            // explicit `sslmode` alongside them is not undone by ordering —
+            // through `stronger_of`, which is the file's own rule for two
+            // sources that disagree. It used to be `!negotiates_tls()`, i.e.
+            // "raise it if it is `Disable`", which stopped raising anything the
+            // moment `blank`'s floor became `Prefer`: `useSSL=true` is a
+            // positive assertion and has to reach `Require` from there.
             "ssl" | "usessl" | "requiressl" => {
-                if truthy(v) && !c.tls.mode.negotiates_tls() {
-                    c.tls.mode = SslMode::Require;
+                if truthy(v) {
+                    c.tls.mode = c.tls.mode.stronger_of(SslMode::Require);
                 }
             }
             "sslrootcert" | "sslca" | "trustcertificatekeystoreurl" => {
@@ -792,15 +797,6 @@ fn sslmode_from_str(v: &str) -> Option<SslMode> {
         // `dbeaver_handlers`' `unwrap_or(Require)` guard, since that guard only
         // protects values the table does *not* recognise.
         "allow" => Some(SslMode::Prefer),
-        // **`allow` is not a synonym for `disable`.** libpq's `allow` tries a
-        // non-SSL connection *first* and an SSL one second, so a service file
-        // `psql` reaches over TLS could not connect at all once imported.
-        // `Prefer` is the faithful end of the ladder: it is the one mode
-        // `Tls::plan` gives `fallback_to_plaintext`, which is the same
-        // "either transport is acceptable" promise with the order reversed.
-        // Reading it as `Disable` was also the one value that defeated
-        // `dbeaver_handlers`' `unwrap_or(Require)` guard, since that guard only
-        // protects values the table does *not* recognise.
         "prefer" | "preferred" => Some(SslMode::Prefer),
         "require" | "required" => Some(SslMode::Require),
         "verifyca" => Some(SslMode::VerifyCa),
@@ -1714,25 +1710,71 @@ fn same_path(a: &str, b: &str) -> bool {
     norm(a).eq_ignore_ascii_case(&norm(b))
 }
 
-/// Drop rows that repeat an earlier row's endpoint, keeping the **first**.
+/// Collapse rows that repeat an earlier row's endpoint into the **first**,
+/// taking from each dropped row whatever the survivor lacks.
 ///
 /// Sources are parsed in a fixed order and the first one to describe a server is
 /// the one that described it best — a `.pgpass` line is the same endpoint as the
-/// DBeaver connection above it, with a worse name. Runs after
-/// [`fill_missing_passwords`] so the survivor has already collected the password
-/// the row below it was carrying.
+/// DBeaver connection above it, with a worse name.
+///
+/// **It merges rather than discards, and it used to only discard.** The doc here
+/// claimed the survivor "has already collected the password the row below it was
+/// carrying", on the strength of [`fill_missing_passwords`] running first — but
+/// that function's only matcher opens with `is_postgres`, and there is no
+/// `.my.cnf` analogue anywhere. So on MySQL the source order did the *opposite*
+/// of the rationale `conn_sources::discover` states for it ("the plain-text
+/// files come last because their value is the passwords they can lend to the
+/// rows above them"): a DBeaver row, whose passwords this module deliberately
+/// does not read, swallowed the `~/.my.cnf` row that had one, and `scan` then
+/// tagged the survivor [`ImportNote::NoPassword`] with the password sitting in
+/// plaintext in a file the same scan had just read.
+///
+/// Merging closes the class rather than one file: whatever the engine and
+/// whatever the two sources, a field the survivor lacks and the duplicate has
+/// comes across. **Only what it lacks** — a later, worse row must never
+/// overwrite a better one's value.
 pub fn dedupe(found: Vec<Imported>) -> Vec<Imported> {
     let mut out: Vec<Imported> = Vec::with_capacity(found.len());
     for imp in found {
-        if out
-            .iter()
-            .any(|k| same_endpoint(&k.connection, &imp.connection))
+        match out
+            .iter_mut()
+            .find(|k| same_endpoint(&k.connection, &imp.connection))
         {
-            continue;
+            Some(kept) => absorb(kept, imp),
+            None => out.push(imp),
         }
-        out.push(imp);
     }
     out
+}
+
+/// Fill `kept`'s empty fields from `dropped` — the merge half of [`dedupe`].
+///
+/// Only the fields a *source* can be missing and another source can supply. The
+/// endpoint itself (`db_type`, `host`, `port`, `user`, `database`, `file`) is
+/// what `same_endpoint` just matched on, so there is nothing there to take; the
+/// name is the survivor's by the rule above.
+fn absorb(kept: &mut Imported, dropped: Imported) {
+    let a = &mut kept.connection;
+    let b = dropped.connection;
+    if a.password.is_empty() {
+        a.password = b.password;
+    }
+    if a.ssh.host.is_empty() {
+        a.ssh = b.ssh;
+    }
+    // A TLS mode the survivor never stated: `Tls::default()` is what a source
+    // that said nothing leaves behind, so a source that *did* say is the better
+    // answer. See `sslmode_from_str` for why the default is not "no opinion".
+    if a.tls == Tls::default() {
+        a.tls = b.tls;
+    }
+    // The dropped row's notes are about a row that is gone; only
+    // `UnexpandedPath` is a property of the endpoint both describe, and the
+    // survivor has its own. So none come across — but a survivor that has just
+    // gained a password is no longer missing one, and `scan` re-derives that
+    // note after this anyway.
+    kept.notes
+        .retain(|n| *n != ImportNote::NoPassword || a.password.is_empty());
 }
 
 /// Fold newly-parsed rows into a review list already on screen, and answer which
@@ -1827,11 +1869,36 @@ pub fn mark_existing(found: &mut [Imported], existing: &[Connection]) {
 // Shared construction
 // ---------------------------------------------------------------------------
 
-/// A connection with nothing filled in but its engine and that engine's port.
+/// A connection with nothing filled in but its engine, that engine's port, and
+/// the TLS floor an import starts from.
 ///
 /// Written out field by field rather than through a `Default`: adding a field to
 /// `Connection` should make *this* fail to compile, so an import decides what
-/// the new field is rather than inheriting whatever `Default` would say.
+/// the new field is rather than inheriting whatever `Default` would say — which
+/// is exactly the decision the TLS mode needed and did not get.
+///
+/// **The floor is [`SslMode::Prefer`], not `Tls::default()`.** Every source's
+/// own default negotiates TLS: libpq's `sslmode` defaults to `prefer`, and
+/// `mysql` 8 and Connector/J default to `PREFERRED`. Each parser sets a mode
+/// only when the key is *present*, so the ordinary shape — a
+/// `~/.pg_service.conf` with no `sslmode` line, a URL with no query — inherited
+/// `Tls::default()`'s `Disable`, and `Connection::tls_plan` then answered
+/// `None`: the handshake, `password`-method authentication where `pg_hba`
+/// selects it, and every row of every result crossed in cleartext the same
+/// network `psql` was encrypting. Nothing said so — the review list has no TLS
+/// column and there is no `ImportNote` for a changed transport.
+///
+/// It is the sharper half of `sslmode_from_str`'s own rule, too: "a mode we do
+/// not know is not evidence that TLS is off" was true of the *code path* and
+/// false of the *outcome*, because the baseline it left alone was the weakest
+/// rung. `postgres://h/d?sslmode=requre` imported as plaintext.
+///
+/// `Prefer` costs nothing that `Disable` saved: it "never refuses a server
+/// plaintext would have reached", which is the only cost `SslMode::Disable`'s
+/// doc names for being the default of a **hand-typed** connection. An import is
+/// not one — it has a prior configuration to preserve. A source that states
+/// `disable` still wins, by assignment, because saying so is evidence and this
+/// is only the floor beneath a source that does not.
 fn blank(db_type: &str) -> Connection {
     Connection {
         id: 0,
@@ -1844,7 +1911,10 @@ fn blank(db_type: &str) -> Connection {
         file: String::new(),
         database: String::new(),
         ssh: SshTunnel::default(),
-        tls: Tls::default(),
+        tls: Tls {
+            mode: SslMode::Prefer,
+            ..Tls::default()
+        },
         color: None,
         prominent_color: false,
         read_only: false,
@@ -2087,10 +2157,56 @@ mod tests {
             url("mysql://h/d?sslMode=DISABLED").tls.mode,
             SslMode::Disable
         );
-        // Unrecognised leaves the default alone rather than guessing.
+        // Unrecognised leaves the floor alone rather than guessing — and the
+        // floor is `Prefer`, so "a mode we do not know is not evidence that TLS
+        // is off" is now true of the outcome and not only of the sentence.
         assert_eq!(
             url("postgres://h/d?sslmode=elsewhere").tls.mode,
-            SslMode::Disable
+            SslMode::Prefer
+        );
+    }
+
+    /// **A source that says nothing about TLS does not mean "off".**
+    ///
+    /// libpq's own default is `prefer`, so a `~/.pg_service.conf` with no
+    /// `sslmode` line — the ordinary shape — is a server `psql` reaches over
+    /// TLS. `mysql` 8 and Connector/J default to `PREFERRED` the same way. The
+    /// import floor was `Tls::default()` → `Disable`, so every one of those
+    /// arrived as plaintext: the handshake, `password`-method authentication
+    /// where `pg_hba` selects it, and every row of every result crossed the
+    /// network in the clear, with no TLS column in the review list and no note
+    /// to say the setting had moved.
+    ///
+    /// `Prefer` is the floor because it is the one that costs nothing: it
+    /// "never refuses a server plaintext would have reached", which is the only
+    /// cost `SslMode::Disable`'s own doc names for being the default of a
+    /// hand-typed connection. An import is not a hand-typed connection — it has
+    /// a prior configuration to preserve.
+    ///
+    /// An explicit `disable` still wins, because a source that *says* so is
+    /// evidence and this is only the floor beneath one that does not.
+    #[test]
+    fn a_source_that_states_no_tls_mode_still_negotiates_tls() {
+        assert!(url("postgres://h/d").tls.mode.negotiates_tls());
+        assert!(url("mysql://h/d").tls.mode.negotiates_tls());
+        assert!(
+            url("postgres://h/d?sslmode=elsewhere")
+                .tls
+                .mode
+                .negotiates_tls()
+        );
+        // And saying so is still heard, in both vocabularies.
+        assert!(
+            !url("postgres://h/d?sslmode=disable")
+                .tls
+                .mode
+                .negotiates_tls()
+        );
+        assert!(
+            !url("mysql://h/d?sslMode=DISABLED")
+                .tls
+                .mode
+                .negotiates_tls()
         );
     }
 
@@ -3137,6 +3253,50 @@ mod tests {
         let out = dedupe(vec![first, second]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].connection.name, "Shop (prod)");
+    }
+
+    /// **The survivor takes the password the row below it was carrying.**
+    ///
+    /// `conn_sources::discover` puts the plain-text CLI files last, and says why:
+    /// their value is "the passwords they can lend to the rows above them". The
+    /// lending was `fill_missing_passwords`, whose only matcher opens with
+    /// `is_postgres` — so on MySQL the ordering did the opposite of its
+    /// rationale. A DBeaver row (passwords kept elsewhere, deliberately unread)
+    /// and a `~/.my.cnf` group naming the same endpoint collapsed to the
+    /// DBeaver one, the `.my.cnf` password was discarded, and `scan` then told
+    /// the user there was **no password in the source** — with one sitting in
+    /// plaintext in a file the same scan had just read.
+    ///
+    /// Merging rather than a second matcher closes the class: any field the
+    /// survivor lacks and the duplicate has comes across, whatever the engine
+    /// and whatever the two sources are.
+    #[test]
+    fn dedupe_takes_what_the_row_it_drops_was_carrying() {
+        let mut first = imported(at("h", 3306, "d", "u"), ImportSource::DBeaver);
+        first.connection.name = "Shop (prod)".into();
+        let mut second = imported(at("h", 3306, "d", "u"), ImportSource::MyCnf);
+        second.connection.name = "d@h".into();
+        second.connection.password = "hunter2".into();
+
+        let out = dedupe(vec![first, second]);
+        assert_eq!(out.len(), 1);
+        // The better name still wins — that is what "keep the first" was for.
+        assert_eq!(out[0].connection.name, "Shop (prod)");
+        assert_eq!(out[0].connection.password, "hunter2");
+        // And it is no longer a row with nothing behind it.
+        assert!(!out[0].has(ImportNote::NoPassword));
+    }
+
+    /// The survivor's own values are never overwritten: only what it *lacks*
+    /// comes across, or a worse row could take a better one's password.
+    #[test]
+    fn dedupe_never_overwrites_what_the_survivor_already_had() {
+        let mut first = imported(at("h", 3306, "d", "u"), ImportSource::DBeaver);
+        first.connection.password = "right".into();
+        let mut second = imported(at("h", 3306, "d", "u"), ImportSource::MyCnf);
+        second.connection.password = "stale".into();
+        let out = dedupe(vec![first, second]);
+        assert_eq!(out[0].connection.password, "right");
     }
 
     #[test]
