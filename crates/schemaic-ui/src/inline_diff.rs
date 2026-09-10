@@ -448,6 +448,49 @@ mod tests {
         }
     }
 
+    /// **The predicate three surfaces read, and it had no test.**
+    ///
+    /// "Is this line faded" decides the code column's alpha
+    /// (`SqlStyling::apply_attr_styles`), and the same question spelled out
+    /// again decided the deletion bands (`apply_layout_styles`) — so a change
+    /// to either left the column faded where the bands were not, or banded
+    /// where the fade was not, with nothing red. That second spelling now calls
+    /// this, and this is what pins it.
+    #[test]
+    fn fades_answers_both_states_and_their_boundaries() {
+        // Working: exactly the lines being worked on.
+        let w = InlineView::Working(2..5);
+        assert!(!w.fades(1));
+        assert!(w.fades(2) && w.fades(4));
+        assert!(!w.fades(5), "the range end is exclusive");
+
+        // Plan: exactly the lines a hunk removes — the anchor of a pure
+        // insertion is *not* one, which is the case `editor_pane`'s band gate
+        // exists for.
+        let p = plan(vec![hunk(3..5, &["new"], 3, false)]);
+        assert!(!p.fades(2));
+        assert!(p.fades(3) && p.fades(4));
+        assert!(!p.fades(5), "the del range end is exclusive");
+
+        // A pure insertion removes nothing, so it fades nothing — including its
+        // own anchor line.
+        let ins = plan(vec![hunk(4..4, &["new"], 4, true)]);
+        assert!(!ins.fades(4));
+        assert!(!ins.fades(3));
+
+        // Several hunks: any of them counts.
+        let two = plan(vec![
+            hunk(1..2, &["a"], 1, false),
+            hunk(7..9, &["b"], 7, false),
+        ]);
+        assert!(two.fades(1) && two.fades(7) && two.fades(8));
+        assert!(!two.fades(2) && !two.fades(6) && !two.fades(9));
+
+        // The two depths are deliberately different, and waiting is the
+        // stronger dim — the doc says why.
+        assert!(w.fade() < p.fade());
+    }
+
     /// The usual case: a block trailing the line's own content. One own row, two
     /// added rows, the block starting on row 1.
     #[test]

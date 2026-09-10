@@ -1604,7 +1604,12 @@ fn inline_band_runs(ed: &Editor, preview: inline_diff::InlinePreview) -> Vec<(f6
             // context line the block merely hangs off — and banding its own rows
             // put a red strip and a `−` in the gutter beside a line nothing had
             // happened to, while the code column beside it stayed clean. The same
-            // gate as `sql_highlight`'s `replaced`, for the same reason.
+            // gate as `sql_highlight`'s `replaced`, for the same reason — but
+            // **not the same question**, which is why it is not
+            // `view.fades(line)`: this loop is inside one hunk, and what has to
+            // be asked here is whether *this* hunk removes the line, not
+            // whether any of them does. `fades` is the wider question and is
+            // what `sql_highlight` calls.
             if hunk.del.contains(&line) {
                 for r in own {
                     rows.push((top + r as f64 * line_h, line_h, false));

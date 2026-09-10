@@ -222,10 +222,18 @@ impl Styling for SqlStyling {
         // Only a settled suggestion paints bands. While the model is working there
         // is nothing to band — the lines just fade (`apply_attr_styles`), which is
         // the design's "dimmed, waiting" state and not a diff yet.
-        let Some(plan) = view.plan() else {
+        if view.plan().is_none() {
             return;
-        };
-        let replaced = plan.hunks.iter().any(|h| h.del.contains(&line));
+        }
+        // `InlineView::fades`, not a third spelling of it. "Is this line
+        // replaced" was written out here, in `InlineView::fades` and in
+        // `editor_pane`'s band gate, with nothing asserting the three agreed —
+        // and this one and `fades` are the *same* question (the guard above has
+        // already established the `Plan` arm), so a change to either left the
+        // code column faded where the bands were not, or banded where the fade
+        // was not, with nothing red. `editor_pane`'s is a narrower question and
+        // stays its own; see the comment there.
+        let replaced = view.fades(line);
         let block = crate::inline_diff::block_at(&view, line);
         if !replaced && block.is_none() {
             return;
