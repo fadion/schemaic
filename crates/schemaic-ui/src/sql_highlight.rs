@@ -26,7 +26,7 @@ use floem::views::editor::id::EditorId;
 use floem::views::editor::layout::{LineExtraStyle, TextLayoutLine};
 use floem::views::editor::text::{Document, Styling};
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::sql::{is_word_byte, is_word_start};
+use schemaic_core::sql::{NonCode, is_word_byte, is_word_start};
 
 #[derive(Clone, Copy)]
 enum Tok {
@@ -363,13 +363,24 @@ fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize
     while i < n {
         let c = b[i];
 
-        // A string, identifier, dollar-quote, or comment: color by which one it is.
+        // A string, identifier, dollar-quote, or comment: color by which one it
+        // is — asked of `core::sql::noncode_kind`, which answers with the same
+        // per-dialect predicates the lexer used to *find* the span.
+        //
+        // This was a byte `match` with no dialect in it: `` ` `` took the
+        // identifier arm, `'`/`"` the string arm, and **everything else** the
+        // comment arm. `skip_noncode` also answers `Some` for `$` on PostgreSQL
+        // and `[` on SQLite, so both landed there — every dollar-quoted
+        // function body and `DO` block in a PostgreSQL editor was greyed out as
+        // if commented, and `"Name"` painted as a string on the two engines
+        // where it is a name. The `dialect` field above promised the opposite.
         if let Some(end) = schemaic_core::sql::skip_noncode(b, i, dialect) {
             let end = end.min(n);
-            match c {
-                b'`' => {} // quoted identifier: default color
-                b'\'' | b'"' => out.push((i, end, Tok::Str)),
-                _ => out.push((i, end, Tok::Comment)), // `--`, `#`, `/* */`
+            match schemaic_core::sql::noncode_kind(b, i, dialect) {
+                // A quoted identifier is a name: default colour, like a bare one.
+                Some(NonCode::Identifier) | None => {}
+                Some(NonCode::Literal) => out.push((i, end, Tok::Str)),
+                Some(NonCode::Comment) => out.push((i, end, Tok::Comment)),
             }
             i = end;
             continue;
@@ -521,6 +532,93 @@ fn is_keyword(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text of every span of one kind, on one dialect.
+    ///
+    /// **Every other test in this block is `SqlDialect::MySql`**, which is why
+    /// the classification of a non-code span could be dialect-blind with the
+    /// suite green: MySQL is the one engine where `"…"` really is a string,
+    /// `$$` opens nothing and `[` is ordinary punctuation, so its answers were
+    /// right by construction. The `dialect` parameter could have been replaced
+    /// by a constant.
+    fn spans_of(line: &str, dialect: SqlDialect, want: &str) -> Vec<String> {
+        lex_line(line, dialect, false)
+            .into_iter()
+            .filter(|(_, _, t)| {
+                matches!(
+                    (t, want),
+                    (Tok::Comment, "comment")
+                        | (Tok::Str, "string")
+                        | (Tok::Keyword, "keyword")
+                        | (Tok::Number, "number")
+                )
+            })
+            .map(|(s, e, _)| line[s..e].to_string())
+            .collect()
+    }
+
+    /// **A non-code span is coloured by what it is on *this* engine.**
+    ///
+    /// `lex_line` asked the dialect-aware lexer where the span was and then
+    /// classified it by its opening byte with no dialect: `` ` `` was an
+    /// identifier, `'`/`"` a string, and **everything else** a comment.
+    /// `skip_noncode` also answers `Some` for `$` on PostgreSQL and `[` on
+    /// SQLite, so both landed on the comment arm — every dollar-quoted function
+    /// body and `DO` block in a PostgreSQL editor was greyed out as if
+    /// commented. The field doc promised exactly the opposite.
+    #[test]
+    fn a_quoted_span_is_classified_per_dialect() {
+        use SqlDialect::{MySql, Postgres, Sqlite};
+
+        // A dollar-quoted body is a *literal* on PostgreSQL, and nothing at all
+        // on the two engines that have no such syntax.
+        let pg_body = "SELECT $body$ SELECT 1; $body$";
+        assert_eq!(
+            spans_of(pg_body, Postgres, "string"),
+            ["$body$ SELECT 1; $body$"]
+        );
+        assert!(spans_of(pg_body, Postgres, "comment").is_empty());
+        for d in [MySql, Sqlite] {
+            assert!(spans_of(pg_body, d, "comment").is_empty(), "{d:?}");
+            assert!(spans_of(pg_body, d, "string").is_empty(), "{d:?}");
+        }
+
+        // A bracket-quoted identifier is a name on SQLite: neither colour.
+        let brackets = "SELECT [my col] FROM t";
+        assert!(spans_of(brackets, Sqlite, "comment").is_empty());
+        assert!(spans_of(brackets, Sqlite, "string").is_empty());
+
+        // `"…"` is a string on MySQL and an identifier on the other two.
+        let dq = r#"SELECT "Name" FROM t"#;
+        assert_eq!(spans_of(dq, MySql, "string"), [r#""Name""#]);
+        for d in [Postgres, Sqlite] {
+            assert!(spans_of(dq, d, "string").is_empty(), "{d:?}");
+            assert!(spans_of(dq, d, "comment").is_empty(), "{d:?}");
+        }
+
+        // A backtick identifier stays a name where it is one.
+        let bt = "SELECT `Name` FROM t";
+        for d in [MySql, Sqlite] {
+            assert!(spans_of(bt, d, "string").is_empty(), "{d:?}");
+            assert!(spans_of(bt, d, "comment").is_empty(), "{d:?}");
+        }
+
+        // The three comment openers still colour as comments where each is one,
+        // which is what the `_` arm was reaching for.
+        assert_eq!(spans_of("SELECT 1 -- note", MySql, "comment"), ["-- note"]);
+        assert_eq!(
+            spans_of("SELECT 1 /* n */", Postgres, "comment"),
+            ["/* n */"]
+        );
+        assert_eq!(spans_of("SELECT 1 # note", MySql, "comment"), ["# note"]);
+        // …and `#` is an operator on PostgreSQL, not a comment. (The one half of
+        // the field doc's promise that was already true.)
+        assert!(spans_of("SELECT 1 # 2", Postgres, "comment").is_empty());
+        // An ordinary string literal is a string everywhere.
+        for d in [MySql, Postgres, Sqlite] {
+            assert_eq!(spans_of("SELECT 'x' FROM t", d, "string"), ["'x'"], "{d:?}");
+        }
+    }
 
     fn comment_spans(line: &str, start_in_block: bool) -> Vec<(usize, usize)> {
         lex_line(line, SqlDialect::MySql, start_in_block)

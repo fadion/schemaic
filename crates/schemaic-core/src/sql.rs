@@ -154,6 +154,55 @@ pub(crate) fn comment_open(b: &[u8], i: usize, dialect: SqlDialect) -> bool {
     i < b.len() && skip_comment(b, i, dialect).is_some()
 }
 
+/// What the non-code span opening at `b[i]` **is** — the classification half of
+/// [`skip_noncode`], for a caller that has to colour or label the span rather
+/// than skip it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NonCode {
+    /// `--`, `#` or `/* … */`.
+    Comment,
+    /// A string literal — including a dollar-quoted body, which is one.
+    Literal,
+    /// A **quoted identifier**: a name, not a value.
+    Identifier,
+}
+
+/// See [`NonCode`]. `None` exactly where [`skip_noncode`] returns `None`.
+///
+/// **Here rather than at the caller, because the caller got it wrong.** The
+/// syntax highlighter asked [`skip_noncode`] where a span was — dialect-aware —
+/// and then classified it by its opening byte with no dialect at all, in a
+/// `match` whose arms were `` ` ``, `'`/`"`, and everything else as a comment.
+/// `skip_noncode` also answers `Some` for `$` on PostgreSQL and `[` on SQLite,
+/// so both landed on the comment arm: **every dollar-quoted function body and
+/// `DO` block in a PostgreSQL editor was greyed out as if commented**, and every
+/// bracket-quoted identifier on SQLite was. `"Name"` painted as a string on the
+/// two engines where it is an identifier. The highlighter's own field doc
+/// promised the opposite ("so `#`-operators / `$tag$` bodies aren't coloured as
+/// comments on a PostgreSQL connection") — the `#` half worked and the `$tag$`
+/// half was exactly inverted.
+///
+/// The predicates it needs (`double_quote_is_ident`, `backtick_ident`,
+/// `bracket_ident`, `dollar_quoted`) are this module's, and a second module
+/// needing the same answer is the same privacy wall `comment_open` was exposed
+/// for.
+pub fn noncode_kind(b: &[u8], i: usize, dialect: SqlDialect) -> Option<NonCode> {
+    if comment_open(b, i, dialect) {
+        return Some(NonCode::Comment);
+    }
+    match *b.get(i)? {
+        b'\'' => Some(NonCode::Literal),
+        b'"' if dialect.double_quote_is_ident() => Some(NonCode::Identifier),
+        b'"' => Some(NonCode::Literal),
+        b'`' if dialect.backtick_ident() => Some(NonCode::Identifier),
+        b'[' if dialect.bracket_ident() => Some(NonCode::Identifier),
+        // A `$` that opens no valid tag is ordinary punctuation, which is what
+        // `skip_noncode` says by returning `None` for it.
+        b'$' if dialect.dollar_quoted() => scan_dollar(b, i).map(|_| NonCode::Literal),
+        _ => None,
+    }
+}
+
 /// Scan a quoted span opening at `b[i]` (quote byte `q`) to just past its close,
 /// honoring `\` escapes when `backslash` and always the doubled-quote (`qq`)
 /// escape. Unterminated → end of input.
