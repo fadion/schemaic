@@ -1209,11 +1209,19 @@ pub(crate) fn recompute_completions(
     // offer an item that rewrites it into the explicit column list (shown when the
     // popup opens here — e.g. via Ctrl+Space, since the list doesn't auto-open on `*`).
     if let Some(exp) = star_expansion(&text, lo, hi, offset, db_nodes, active_db, dialect) {
-        let ncols = exp.replacement.matches(',').count() + 1;
+        // `exp.columns`, not the commas in the SQL: a quoted identifier holding
+        // one (`` `a,b` ``, legal on MySQL) over-reported. And `plural`, which
+        // this crate has 33 other call sites for — a one-column table is
+        // ordinary (an id-only join table, a `settings(key)` lookup) and the row
+        // read "1 columns".
+        let ncols = exp.columns;
         cands.push(Cand {
             text: "expand *".to_string(),
             kind: SuggestKind::Column,
-            detail: format!("{ncols} columns"),
+            detail: format!(
+                "{ncols} {}",
+                schemaic_core::text::plural(ncols, "column", "columns")
+            ),
             table: String::new(),
             alias: String::new(),
             icon: icons::TABLE,

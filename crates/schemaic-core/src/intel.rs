@@ -4843,6 +4843,13 @@ pub struct StarExpansion {
     pub range: (usize, usize),
     /// The comma-separated column list, e.g. `id, name` or `e.id, e.name, d.id`.
     pub replacement: String,
+    /// How many columns [`StarExpansion::replacement`] names.
+    ///
+    /// Carried rather than re-derived: the completion row counted the commas in
+    /// the emitted SQL, which is the wrong quantity — a quoted identifier
+    /// holding one (`` `a,b` ``, legal on MySQL) over-reports — and this is the
+    /// side that built the list.
+    pub columns: usize,
 }
 
 /// If the caret sits right after a projection `*` (or `t.*`), return the explicit
@@ -4957,6 +4964,7 @@ pub fn expand_star(
     }
     Some(StarExpansion {
         range: (range_start, star_end),
+        columns: parts.len(),
         replacement: parts.join(", "),
     })
 }
@@ -7437,6 +7445,52 @@ mod tests {
             .filter(|d| d.message.starts_with("Column "))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// **The expansion counts its own columns**, rather than the commas in the
+    /// SQL it emitted.
+    ///
+    /// The completion row said `"{n} columns"` with `n` from
+    /// `replacement.matches(',').count() + 1`, which is a hard-coded plural
+    /// ("1 columns" for a one-column table, which is ordinary) over the wrong
+    /// quantity: a quoted identifier holding a comma is legal on MySQL and
+    /// over-reported.
+    #[test]
+    fn a_star_expansion_carries_its_own_column_count() {
+        let one = DbSchema {
+            tables: vec![tbl("settings", &["setting"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &one)], Some("company"));
+        let sql = "SELECT * FROM settings";
+        let star = sql.find('*').unwrap();
+        let ex = expand_star(sql, 0, sql.len(), star + 1, &cat, SqlDialect::MySql).unwrap();
+        assert_eq!(ex.columns, 1);
+        assert_eq!(ex.replacement, "setting");
+
+        // A comma *inside* an identifier is one column, and the comma count
+        // would have said two.
+        let comma = DbSchema {
+            tables: vec![tbl("weird", &["a,b"])],
+            ..Default::default()
+        };
+        let cat = Catalog::build(&[("company", &comma)], Some("company"));
+        let sql = "SELECT * FROM weird";
+        let star = sql.find('*').unwrap();
+        let ex = expand_star(sql, 0, sql.len(), star + 1, &cat, SqlDialect::MySql).unwrap();
+        assert_eq!(ex.columns, 1, "{:?}", ex.replacement);
+        assert!(ex.replacement.contains(','), "{:?}", ex.replacement);
+
+        // And the ordinary multi-column case still counts what it lists.
+        let cat = {
+            let (schema, db) = sample_catalog();
+            Catalog::build(&[(db, &schema)], Some(db))
+        };
+        let sql = "SELECT * FROM employees";
+        let star = sql.find('*').unwrap();
+        let ex = expand_star(sql, 0, sql.len(), star + 1, &cat, SqlDialect::MySql).unwrap();
+        assert_eq!(ex.columns, 4);
+        assert_eq!(ex.replacement.matches(", ").count() + 1, ex.columns);
     }
 
     /// **A misspelling in a derived table's or CTE's own projection.**
