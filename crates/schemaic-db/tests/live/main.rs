@@ -187,6 +187,7 @@ live_suite!(
         a_created_account_can_log_in_with_the_password_it_was_given,
         a_created_role_is_one_the_server_accepts,
         a_granted_privilege_comes_back_and_a_revoke_takes_it_off,
+        a_grant_at_every_level_reads_back_naming_that_object,
         a_granted_role_comes_back_and_a_revoke_takes_it_off,
         a_dropped_account_is_gone_from_the_list,
     ],

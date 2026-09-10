@@ -17,6 +17,7 @@
 //! live server says so.
 
 use schemaic_core::ddl;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::users::{
     self, AccountDraft, GrantDraft, GrantLevelKind, Principal, PrincipalKind,
 };
@@ -398,6 +399,30 @@ impl Drop for ScratchAccount {
     }
 }
 
+/// The text a grant on `raw` at `level` appears under when the server reads it
+/// back — which is **not** `raw` on MySQL.
+///
+/// The database position is a `LIKE` pattern there, so the name the app writes
+/// carries `\_` for every underscore (`export::ident_pattern_sql`, and the
+/// measured reason it exists: without it a grant on `app_db` reaches `appXdb`).
+/// `SHOW GRANTS` echoes the stored pattern verbatim, so a scratch database —
+/// whose name is nothing but underscores — comes back as
+/// ``` `schemaic\_it\_…` ```. Comparing against the raw name there would pass
+/// only for a name with no wildcard characters in it, which is the one case
+/// the escaping does not matter for.
+///
+/// PostgreSQL's reader rebuilds the statement from the catalogue and does not
+/// quote an ordinary lower-case name, so the bare name is what to look for.
+fn as_read_back(dialect: SqlDialect, level: GrantLevelKind, raw: &str) -> String {
+    match (dialect, level) {
+        (SqlDialect::MySql, GrantLevelKind::Database) => {
+            schemaic_core::export::ident_pattern_sql(raw, dialect)
+        }
+        (SqlDialect::MySql, _) => schemaic_core::export::ident_sql(raw, dialect),
+        _ => raw.to_string(),
+    }
+}
+
 /// A draft granting **one privilege, chosen from what this engine offers at the
 /// database level** — which is the one level every engine here has, and the only
 /// one a scratch database can be the subject of.
@@ -565,9 +590,20 @@ pub async fn a_granted_privilege_comes_back_and_a_revoke_takes_it_off(target: &'
     account.run(change).await;
 
     let after_grant = account.grants().await;
+    // **The scope, not just the word.** `s.contains(&privilege)` alone is
+    // satisfied identically by `GRANT SELECT ON *.*` — collapse `object_sql`'s
+    // Database arm and a server-wide grant passes this test unchanged, on the
+    // one feature whose entire safety property is scope.
+    let object = as_read_back(
+        scratch.dialect(),
+        GrantLevelKind::Database,
+        &scratch.database,
+    );
     assert!(
-        after_grant.iter().any(|s| s.contains(&privilege)),
-        "{}: granted {privilege} is not in {after_grant:?}",
+        after_grant
+            .iter()
+            .any(|s| s.contains(&privilege) && s.contains(&object)),
+        "{}: granted {privilege} on {object} is not in {after_grant:?}",
         target.endpoint()
     );
 
@@ -582,6 +618,122 @@ pub async fn a_granted_privilege_comes_back_and_a_revoke_takes_it_off(target: &'
         "{}: revoked {privilege} is still in {after_revoke:?}",
         target.endpoint()
     );
+
+    account.teardown().await;
+    scratch.teardown().await;
+}
+
+/// Every grant level this engine offers, granted and read back — because the
+/// round trip above only ever reaches **one** of `object_sql`'s five arms.
+///
+/// `one_privilege` hardcodes `GrantLevelKind::Database`, so four arms had never
+/// met a server: MySQL's `Global` — the level the grant form *opens* on, two
+/// clicks from `GRANT … ON *.*` — and PostgreSQL's `Schema`, `Table` and
+/// `Sequence`. The strings themselves are unit-pinned; what only a server can
+/// answer is whether the object the app *wrote* is the object it then *reads
+/// back*, which is the composition this tier exists for.
+///
+/// The assertion is deliberately two-sided at each level: the read-back must
+/// name the object, and — for every level below `Global` — must **not** be a
+/// whole-server grant. One side alone is what let the substring check stand.
+pub async fn a_grant_at_every_level_reads_back_naming_that_object(target: &'static Target) {
+    let scratch = Scratch::create(target, "grantlvl").await;
+    let account = ScratchAccount::create(target, &scratch, "gl", PrincipalKind::User).await;
+    let dialect = scratch.dialect();
+    // The objects the lower levels need. Both engines take these spellings.
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} (id INTEGER)",
+            scratch.qualified("gt")
+        ))
+        .await;
+    if dialect == SqlDialect::Postgres {
+        scratch
+            .exec(&format!("CREATE SEQUENCE {}", scratch.qualified("gs")))
+            .await;
+    }
+    let ns = scratch.namespace.unwrap_or(&scratch.database).to_string();
+
+    for &level in users::levels_for(dialect) {
+        // Whatever this level names, in the fields the form fills in — and the
+        // text the server will echo it back under.
+        let (qualifier, name, object) = match level {
+            GrantLevelKind::Global => (String::new(), String::new(), "*.*".to_string()),
+            GrantLevelKind::Database => (
+                scratch.database.clone(),
+                String::new(),
+                as_read_back(dialect, level, &scratch.database),
+            ),
+            GrantLevelKind::Schema => {
+                (ns.clone(), String::new(), as_read_back(dialect, level, &ns))
+            }
+            GrantLevelKind::Table => (
+                ns.clone(),
+                "gt".to_string(),
+                as_read_back(dialect, level, "gt"),
+            ),
+            GrantLevelKind::Sequence => (
+                ns.clone(),
+                "gs".to_string(),
+                as_read_back(dialect, level, "gs"),
+            ),
+        };
+        let order = users::privileges_for(dialect, level);
+        let privilege = order
+            .first()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: {} is offered as a level with no privileges",
+                    target.endpoint(),
+                    level.label()
+                )
+            })
+            .to_string();
+        let mut draft = GrantDraft {
+            level: Some(level),
+            qualifier,
+            name,
+            ..Default::default()
+        };
+        draft.toggle(&privilege, order);
+
+        let change = ddl::grant_change(&draft, &account.principal).expect("a complete draft");
+        account.run(change).await;
+
+        let after = account.grants().await;
+        let named: Vec<&String> = after.iter().filter(|s| s.contains(&privilege)).collect();
+        assert!(
+            named.iter().any(|s| s.contains(&object)),
+            "{}: {privilege} granted at {} on {object} reads back as {named:?}",
+            target.endpoint(),
+            level.label()
+        );
+        if level != GrantLevelKind::Global {
+            assert!(
+                !named.iter().any(|s| s.contains("*.*")),
+                "{}: {privilege} granted at {} on {object} reads back as a \
+                 whole-server grant: {named:?}",
+                target.endpoint(),
+                level.label()
+            );
+        }
+
+        // And off again, so the next level's read-back is not confused by the
+        // last one's leftovers — which is also the revoke naming the same object.
+        let mut revoking = draft.clone();
+        revoking.revoke = true;
+        let change = ddl::grant_change(&revoking, &account.principal).expect("a complete draft");
+        account.run(change).await;
+        let after = account.grants().await;
+        assert!(
+            !after
+                .iter()
+                .any(|s| s.contains(&privilege) && s.contains(&object)),
+            "{}: {privilege} at {} on {object} survived its revoke: {after:?}",
+            target.endpoint(),
+            level.label()
+        );
+    }
 
     account.teardown().await;
     scratch.teardown().await;
