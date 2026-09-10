@@ -660,6 +660,48 @@ fn confirm_columns(key_cols: &[usize], cis: &[usize], rs: &ResultSet) -> Option<
     (!cols.is_empty()).then_some(cols)
 }
 
+/// The column **names** that identify a row of `info`, walking the same ladder
+/// [`resolve_key`] does but over the table alone: its primary key, else the
+/// first unique non-foreign index whose columns are all present and all
+/// NOT NULL.
+///
+/// **For a caller that needs the key before it has a result set** — the Live
+/// Monitor, which must put an `ORDER BY` on the very first poll and cannot ask
+/// `analyze_edit` until a poll has come back. It reached for the primary key
+/// alone instead, so the whole band "no PK, but a usable key exists" polled
+/// **unordered** while still diffing happily, and the exportable log filled
+/// with inserts and deletes that never happened.
+///
+/// It cannot be `resolve_key` itself and does not try to be: that one
+/// interleaves a *presence* check against the result's columns, and falls from
+/// a primary key that is not fully projected down to an index that is. There
+/// is no result here to check against, so this answers about the table and the
+/// caller selects `*`. SQLite's implicit `rowid` is likewise out of reach —
+/// it is asserted by the backend on a returned column, not by the schema.
+pub fn order_key_columns(info: &TableInfo) -> Option<Vec<String>> {
+    let pk: Vec<String> = info
+        .columns
+        .iter()
+        .filter(|c| c.primary_key)
+        .map(|c| c.name.clone())
+        .collect();
+    if !pk.is_empty() {
+        return Some(pk);
+    }
+    info.indexes
+        .iter()
+        .filter(|ix| ix.identifies_a_row())
+        .find(|ix| {
+            ix.column_names().all(|c| {
+                info.columns
+                    .iter()
+                    .find(|tc| tc.name == c)
+                    .is_some_and(|tc| !tc.nullable)
+            })
+        })
+        .map(|ix| ix.column_names().map(str::to_string).collect())
+}
+
 /// Find the result-column indices forming a usable row key for one base table,
 /// or `None` if the table's rows can't be identified safely (read-only).
 /// `info` is this table's loaded schema, or `None` when it has none — resolved
@@ -3428,6 +3470,98 @@ mod tests {
     /// a value. That was fixed once, for the staged-over-a-real-row arm, and
     /// the pending-new-row arm four lines below it kept the bug. This asserts
     /// both arms through the one resolution they now share.
+    /// **The Live Monitor's `ORDER BY` key, and the whole band it used to
+    /// miss.**
+    ///
+    /// It collected `primary_key` columns and gave up when there were none,
+    /// while the key the snapshot is *diffed* by falls back to a unique
+    /// NOT NULL index — so a keyed table with no PK polled unordered and the
+    /// exportable log filled with inserts and deletes that never happened.
+    #[test]
+    fn the_order_key_falls_back_to_a_unique_not_null_index() {
+        let mut t = schema_with_pk("nopk", &[], &[("code", "VARCHAR(20)"), ("note", "TEXT")]);
+        // `schema_with_pk` marks everything nullable when there is no PK.
+        t.columns[0].nullable = false;
+        assert_eq!(
+            super::order_key_columns(&t),
+            None,
+            "no key at all until an index says so"
+        );
+        t.indexes.push(crate::schema::IndexInfo {
+            name: "uq_code".to_string(),
+            unique: true,
+            columns: vec![crate::schema::IndexColumn::plain("code")],
+            ..Default::default()
+        });
+        assert_eq!(
+            super::order_key_columns(&t),
+            Some(vec!["code".to_string()]),
+            "a unique NOT NULL index identifies a row"
+        );
+    }
+
+    /// A primary key still wins, and a composite one keeps its order.
+    #[test]
+    fn a_primary_key_is_the_order_key_and_keeps_its_column_order() {
+        let t = schema_with_pk(
+            "t",
+            &["b", "a"],
+            &[("a", "INT"), ("b", "INT"), ("c", "TEXT")],
+        );
+        // Column order, not key order — the same list `resolve_key` builds.
+        assert_eq!(
+            super::order_key_columns(&t),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    /// **The three shapes a unique index can have and still not identify a
+    /// row**, each of which would order the poll by something that does not.
+    #[test]
+    fn an_index_that_does_not_identify_a_row_is_not_an_order_key() {
+        let base = |ix: crate::schema::IndexInfo| {
+            let mut t = schema_with_pk(
+                "t",
+                &[],
+                &[("code", "VARCHAR(20)"), ("other", "VARCHAR(20)")],
+            );
+            t.columns[0].nullable = false;
+            t.columns[1].nullable = true;
+            t.indexes.push(ix);
+            super::order_key_columns(&t)
+        };
+        // Not unique.
+        assert_eq!(
+            base(crate::schema::IndexInfo {
+                name: "ix".into(),
+                unique: false,
+                columns: vec![crate::schema::IndexColumn::plain("code")],
+                ..Default::default()
+            }),
+            None
+        );
+        // Unique, but over a nullable column: two NULLs are not one row.
+        assert_eq!(
+            base(crate::schema::IndexInfo {
+                name: "ix".into(),
+                unique: true,
+                columns: vec![crate::schema::IndexColumn::plain("other")],
+                ..Default::default()
+            }),
+            None
+        );
+        // Unique over an expression, which no `ORDER BY <column>` can name.
+        assert_eq!(
+            base(crate::schema::IndexInfo {
+                name: "ix".into(),
+                unique: true,
+                columns: vec![crate::schema::IndexColumn::expr("lower(code)")],
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
     #[test]
     fn a_staged_blob_counts_as_a_value_in_both_arms() {
         let rs = ResultSet::from_rows(

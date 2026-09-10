@@ -11152,11 +11152,21 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
     });
 }
 
-/// The monitored table's primary-key column names, for the poll's `ORDER BY`.
+/// The monitored table's **row-identity** column names, for the poll's
+/// `ORDER BY`.
 ///
-/// `None` when the schema isn't loaded or the table has no primary key — the
-/// monitor then polls unordered, exactly as before, and (because the snapshot
-/// isn't flagged as an ordered window) claims nothing about its tail.
+/// **The key the snapshot is diffed by, not the primary key.** This collected
+/// `primary_key` columns and answered `None` when there were none — while the
+/// key `Snapshot::from_result` is actually keyed by comes from `analyze_edit`
+/// → `resolve_key`, which falls back to a unique NOT NULL index. So the whole
+/// band "no PK, but a usable key exists" polled unordered and diffed anyway,
+/// and the exportable log filled with inserts and deletes that never happened.
+/// `core::edit::order_key_columns` is that same ladder, over the table alone.
+///
+/// `None` when the schema isn't loaded or the table has no key at all — the
+/// monitor then polls unordered, and because the snapshot records that
+/// separately from whether the window was full, the diff attributes nothing at
+/// its edges rather than reporting the whole window.
 fn monitor_order_key(
     db_nodes: RwSignal<Vec<ConnNode>>,
     source: &TableSource,
@@ -11172,13 +11182,7 @@ fn monitor_order_key(
                 _ => None,
             })
     })?;
-    let key: Vec<String> = table
-        .columns
-        .iter()
-        .filter(|c| c.primary_key)
-        .map(|c| c.name.clone())
-        .collect();
-    (!key.is_empty()).then_some(key)
+    schemaic_core::edit::order_key_columns(&table)
 }
 
 /// UI-thread half of a poll: on the first result, record the columns + resolve the
@@ -11220,13 +11224,17 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
             }
             ctx.error.set(None);
             let key_cols = ctx.key_cols.borrow().clone();
-            // Flagged as an ordered window only when the poll really was ordered
-            // (a resolvable primary key) *and* came back full — that pair is what
-            // licenses the diff to treat the tail as the window sliding.
+            // **The two facts the snapshot needs, recorded separately.**
+            // Whether the poll carried an `ORDER BY` over the row key is what
+            // licenses treating the tail as the window sliding; whether the
+            // fetch came back at its limit is what says there *is* a tail. A
+            // window that is full but unordered is neither, and reporting it
+            // whole is what put inserts and deletes that never happened into
+            // an exportable log — see `Snapshot::window_full`.
             let full = rs.row_count() >= MONITOR_LIMIT;
-            let ordered_full = full && monitor_order_key(ctx.db_nodes, &ctx.target.1).is_some();
+            let ordered = monitor_order_key(ctx.db_nodes, &ctx.target.1).is_some();
             ctx.partial.set(full);
-            let snap = Snapshot::from_result(&rs, &key_cols).ordered_window(ordered_full);
+            let snap = Snapshot::from_result(&rs, &key_cols).window(ordered, full);
             if let Some(prev) = ctx.prev.borrow().as_ref() {
                 let changes = diff_snapshots(prev, &snap);
                 if !changes.is_empty() {

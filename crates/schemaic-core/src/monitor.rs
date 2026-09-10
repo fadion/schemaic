@@ -116,17 +116,28 @@ pub struct SnapshotRow {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub rows: Vec<SnapshotRow>,
-    /// These rows are the **first N of a deterministic total order**, and the
-    /// table has more beyond them — i.e. an `ORDER BY key LIMIT n` that came back
-    /// full.
+    /// The poll asked the server for a **deterministic total order**
+    /// (`ORDER BY key`), so position means something and two windows can be
+    /// compared as prefixes of one sequence.
+    pub ordered: bool,
+    /// The fetch came back at its row limit, so the table has more rows than
+    /// these.
     ///
-    /// A bounded window has to be a *stable* one, and knowing it was full is what
-    /// lets [`diff_snapshots`] tell a real change from the window sliding: delete
-    /// a row inside the window and the next row is promoted into it, which reads
-    /// as an insert of a row that existed all along. Only set this when the poll
-    /// really was ordered — with an arbitrary order the tail suppression below
-    /// would swallow real changes.
-    pub ordered_window_full: bool,
+    /// **Two facts, not one.** They were a single `ordered_window_full`, and
+    /// conflating them is what made the monitor's log false. A bounded window
+    /// has to be a *stable* one: delete a row inside it and the next row is
+    /// promoted in, which reads as an insert of a row that existed all along,
+    /// so [`diff_snapshots`] suppresses the tail — but only for a window it
+    /// knows is an ordered prefix. A window that is **full but unordered** is
+    /// neither of the two states the old flag could express, and it landed on
+    /// the "report everything" branch: measured on MariaDB 10.11, deleting one
+    /// row of a 1,200-row table with no primary key logged a phantom INSERT
+    /// beside the real DELETE, and on PostgreSQL 16.15 an `UPDATE` moved the
+    /// heap tuple out of the window entirely and was logged as a **DELETE of
+    /// the updated row**, with the update never reported at all. The log is
+    /// exportable and `discard_needs_asking` exists because it is treated as a
+    /// record someone keeps.
+    pub window_full: bool,
 }
 
 impl Snapshot {
@@ -156,16 +167,18 @@ impl Snapshot {
         }
         Snapshot {
             rows,
-            ordered_window_full: false,
+            ordered: false,
+            window_full: false,
         }
     }
 
-    /// Mark this capture as the full, ordered first page of a larger table — see
-    /// [`Snapshot::ordered_window_full`]. The caller sets it only when it ordered
-    /// the query *and* got back exactly the limit.
+    /// Record how this capture was taken: whether the query carried an
+    /// `ORDER BY` over the row-identity key, and whether it came back at its
+    /// limit. See [`Snapshot::window_full`] for why both are needed.
     #[must_use]
-    pub fn ordered_window(mut self, full: bool) -> Self {
-        self.ordered_window_full = full;
+    pub fn window(mut self, ordered: bool, full: bool) -> Self {
+        self.ordered = ordered;
+        self.window_full = full;
         self
     }
 }
@@ -230,14 +243,39 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<RowChange> {
     // they share is directly comparable and everything after it is not. That
     // boundary is positional, which matters: the keys are text, and comparing
     // them here would order `"1000"` before `"500"` where the server did not.
-    let bounded = old.ordered_window_full && new.ordered_window_full;
-    let (old_cut, new_cut) = if bounded {
-        (
-            last_common(&old.rows, &new.rows),
-            last_common(&new.rows, &old.rows),
-        )
+    // **Each cut asks about the *other* window**, because that is the one whose
+    // silence has to be interpreted. A key missing from the new snapshot is a
+    // real delete only if the new snapshot would have shown it; a key new to
+    // this snapshot is a real insert only if the old one would have shown it.
+    //
+    // Three states per window, and the old code could only express two. A
+    // window below the limit **is** the table, so absence from it is real. A
+    // window at the limit *and ordered* is a stable prefix, so absence before
+    // the last row the two share is real and everything after it is the window
+    // sliding. A window at the limit and **unordered** is neither: which rows
+    // came back is arbitrary, and absence from it means nothing at all.
+    //
+    // That third state used to land on "report everything", which is what put
+    // changes that never happened into an exportable log — measured, a phantom
+    // INSERT beside a real DELETE on MariaDB 10.11, and on PostgreSQL 16.15 an
+    // `UPDATE` that moved the heap tuple out of the window logged as a
+    // **DELETE of the row it updated**, with the update never reported. Rows
+    // both windows hold are still diffed either way, so a real change to a
+    // visible row is still seen.
+    let ordered = old.ordered && new.ordered;
+    let old_cut = if !new.window_full {
+        old.rows.len()
+    } else if ordered {
+        last_common(&old.rows, &new.rows)
     } else {
-        (old.rows.len(), new.rows.len())
+        0
+    };
+    let new_cut = if !old.window_full {
+        new.rows.len()
+    } else if ordered {
+        last_common(&new.rows, &old.rows)
+    } else {
+        0
     };
 
     // Inserts + updates, in the new snapshot's order.
@@ -582,7 +620,8 @@ mod tests {
     fn snap(rows: Vec<SnapshotRow>) -> Snapshot {
         Snapshot {
             rows,
-            ordered_window_full: false,
+            ordered: false,
+            window_full: false,
         }
     }
 
@@ -591,7 +630,8 @@ mod tests {
     fn window(rows: Vec<SnapshotRow>) -> Snapshot {
         Snapshot {
             rows,
-            ordered_window_full: true,
+            ordered: true,
+            window_full: true,
         }
     }
 
@@ -717,6 +757,105 @@ mod tests {
             out.iter()
                 .any(|c| c.kind == ChangeKind::Delete && c.key == vec!["2"])
         );
+    }
+
+    /// A window that came back **at the limit with no `ORDER BY`** — the shape
+    /// every table with no primary key polled in.
+    fn unordered_full(rows: Vec<SnapshotRow>) -> Snapshot {
+        Snapshot {
+            rows,
+            ordered: false,
+            window_full: true,
+        }
+    }
+
+    /// **A full window with no order attributes nothing at its edges.**
+    ///
+    /// The exportable log filled with changes that never happened: measured on
+    /// MariaDB 10.11, deleting one row of a 1,200-row keyed-but-PK-less table
+    /// promoted `0000001001` into the second window and logged it as an
+    /// INSERT; on PostgreSQL 16.15 an `UPDATE` moved the heap tuple out of the
+    /// window and was logged as a **DELETE of the row it updated**, with the
+    /// update never reported at all.
+    ///
+    /// Which rows an unordered `LIMIT` returns is the server's choice, so a
+    /// key in one window and not the other says nothing about the table.
+    #[test]
+    fn two_full_unordered_windows_report_nothing_at_their_edges() {
+        let old = unordered_full(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("3", &[Some("c")]),
+        ]);
+        let new = unordered_full(vec![
+            row("1", &[Some("a")]),
+            row("3", &[Some("c")]),
+            row("9", &[Some("i")]),
+        ]);
+        assert_eq!(
+            diff_snapshots(&old, &new),
+            Vec::new(),
+            "`2` may still be there and `9` may always have been"
+        );
+    }
+
+    /// **But a row both windows hold is still diffed.** Suppressing the edges
+    /// must not turn the monitor off — an `UPDATE` to a row that stayed in
+    /// view is exactly what it is for, and it is attributable whatever the
+    /// order.
+    #[test]
+    fn an_update_inside_two_full_unordered_windows_is_still_reported() {
+        let old = unordered_full(vec![row("1", &[Some("a")]), row("2", &[Some("b")])]);
+        let new = unordered_full(vec![row("1", &[Some("a")]), row("2", &[Some("CHANGED")])]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].kind, ChangeKind::Update);
+        assert_eq!(out[0].key, vec!["2"]);
+    }
+
+    /// **Each cut asks about the *other* window.** A new snapshot below the
+    /// limit *is* the table, so a key missing from it really is gone — even
+    /// though the old window was full and neither was ordered.
+    #[test]
+    fn a_short_new_window_still_proves_a_delete() {
+        let old = unordered_full(vec![row("1", &[Some("a")]), row("2", &[Some("b")])]);
+        let new = snap(vec![row("1", &[Some("a")])]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].kind, ChangeKind::Delete);
+        assert_eq!(out[0].key, vec!["2"]);
+    }
+
+    /// …and the mirror: an old snapshot below the limit proves an insert, even
+    /// though the new window is a full unordered one.
+    #[test]
+    fn a_short_old_window_still_proves_an_insert() {
+        let old = snap(vec![row("1", &[Some("a")])]);
+        let new = unordered_full(vec![row("1", &[Some("a")]), row("2", &[Some("b")])]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].kind, ChangeKind::Insert);
+        assert_eq!(out[0].key, vec!["2"]);
+    }
+
+    /// **Order alone is not enough, and fullness alone is not enough** — the
+    /// two facts the single flag used to conflate. A full *ordered* pair still
+    /// suppresses only its tail, which is the behaviour that already existed
+    /// and must not have moved.
+    #[test]
+    fn a_full_ordered_pair_still_suppresses_only_its_tail() {
+        let old = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("3", &[Some("c")]),
+        ]);
+        let new = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("4", &[Some("d")]),
+        ]);
+        // `3`/`4` are past the last row the two share: the window slid.
+        assert_eq!(diff_snapshots(&old, &new), Vec::new());
     }
 
     #[test]
