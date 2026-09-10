@@ -1080,8 +1080,16 @@ fn pg_action(
     // callers of the text-only footer button, in the one place it wasn't a
     // footer.
     // 61 and 62: right after the picker at 60 they sit beside, and below the
-    // arguments block at `VALUE_TAB`.
-    let new_btn = control_button("New function", ring.clone(), 61, move || {
+    // arguments block at `VALUE_TAB`. **Edit takes 61 and New function 62**,
+    // because the row is `h_stack((picker, edit_btn, new_btn))` and
+    // `ACTION_TAB`'s convention for a row of buttons is one stop each, left to
+    // right. The numbers used to be the other way round: Tab from the picker
+    // jumped to the far button and then came back leftwards, and since Edit is
+    // the conditionally disabled one, on a trigger whose function isn't in the
+    // list the ring skipped the far button and landed on the near one — which
+    // reads as arbitrary rather than reversed. Nothing machine-checks
+    // adjacency: the tabindex gates check collisions and ceilings.
+    let new_btn = control_button("New function", ring.clone(), 62, move || {
         crate::routine_editor::open_for_new_trigger_function(&new_ui, &database, schema.as_deref());
     });
 
@@ -1103,7 +1111,7 @@ fn pg_action(
             let found = list.iter().find(|f| fn_display(f) == named).cloned();
             let ui = edit_ui.clone();
             let db = edit_db.clone();
-            control_button_enabled("Edit", found.is_some(), ring, 62, move || {
+            control_button_enabled("Edit", found.is_some(), ring, 61, move || {
                 if let Some(f) = &found {
                     crate::routine_editor::open_for_routine(&ui, &db, f);
                 }

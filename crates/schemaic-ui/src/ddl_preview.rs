@@ -103,6 +103,36 @@ pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
     d.grant_draft.set(Default::default());
 }
 
+/// Is one of the editors [`close_peers`] enumerates standing behind the
+/// preview?
+///
+/// **What the exit button's word depends on.** The label was a hand-spelled
+/// two-name test — `designer.is_some() || view.is_some()` — while the canonical
+/// list of what stacks under the preview sat in `close_peers` just above, nine
+/// entries long. So seven of the nine editors got **Cancel** on a button that
+/// does not cancel: `exit` resolves to [`close_preview`], which writes only
+/// `preview` and `sql`, so whichever editor signal is still `Some` re-renders
+/// with the draft intact. `object_editor` and `database_editor` both carry the
+/// comment "Cancel there returns here with the draft intact", which is the code
+/// asserting the button is a Back while the button said Cancel.
+///
+/// The same drift class this file already names once — "One list, in
+/// `ddl_preview`; five hand-written copies had already drifted" — so the answer
+/// is one predicate rather than a third spelling. `read_only_door_gate`'s
+/// neighbour `preview_exit_label_gate` asserts the two functions name the same
+/// signals, since two lists that agree today is precisely what went wrong here.
+pub(crate) fn has_editor_behind(d: crate::DdlUi) -> bool {
+    d.designer.get_untracked().is_some()
+        || d.view.get_untracked().is_some()
+        || d.trigger.get_untracked().is_some()
+        || d.routine.get_untracked().is_some()
+        || d.object.get_untracked().is_some()
+        || d.event.get_untracked().is_some()
+        || d.database.get_untracked().is_some()
+        || d.account.get_untracked().is_some()
+        || d.grant.get_untracked().is_some()
+}
+
 /// Close the preview and drop the script with it.
 ///
 /// The one door, because there are two `set(None)` sites and a third would
@@ -1053,13 +1083,16 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     h_stack((
                         // "Back" only when there's somewhere to go back *to*. A
                         // context-menu shortcut opens this modal with nothing
-                        // behind it, where Back would point at nowhere.
+                        // behind it, where Back would point at nowhere. Asked
+                        // through `has_editor_behind`, so the word and
+                        // `close_peers`' list are one definition — spelled here
+                        // it named two of the nine and called the other seven
+                        // Cancel, on a button that returns with the draft
+                        // intact.
                         action_button(
                             if stoppable {
                                 "Stop"
-                            } else if d.designer.get_untracked().is_some()
-                                || d.view.get_untracked().is_some()
-                            {
+                            } else if has_editor_behind(d) {
                                 "Back"
                             } else {
                                 "Cancel"
@@ -1478,19 +1511,22 @@ mod tests {
         scope.dispose();
     }
 
-    /// **The same invariant read from the other end.** `close_editors` must
-    /// clear every editor; `ddl_editors_up` must *see* every editor — it is what
-    /// gives the whole DDL overlay group its box, and a modal missing from it
-    /// opens into zero by zero and paints nothing.
+    /// **The same invariant read from the other end**, now for two consumers.
+    /// `close_editors` must clear every editor; `ddl_editors_up` must *see*
+    /// every editor — it is what gives the whole DDL overlay group its box, and
+    /// a modal missing from it opens into zero by zero and paints nothing — and
+    /// [`has_editor_behind`] must see every editor too, because it is what
+    /// decides whether the preview's exit button says **Back** or **Cancel**.
     ///
-    /// The event editor shipped absent from it, which is why this test exists
-    /// beside the one above rather than being folded into it: two lists, one
-    /// rule, and a new editor has to be added to both.
+    /// The event editor shipped absent from `ddl_editors_up`, and the exit label
+    /// shipped naming two of the nine, which is why this test exists beside the
+    /// one above rather than being folded into it: three lists, one rule, and a
+    /// new editor has to be added to all of them.
     ///
     /// Each target is raised **alone**, so a list that happens to contain some
     /// other signal can't carry a missing one.
     #[test]
-    fn every_editor_raises_the_group_that_gives_it_a_box() {
+    fn every_editor_reaches_the_three_lists_that_must_know_about_it() {
         let scope = Scope::new();
         let d = ddl_ui(scope);
         let up = crate::modals::ddl_editors_up(d);
@@ -1596,12 +1632,21 @@ mod tests {
         for (name, set) in raise {
             set(d);
             assert!(up(), "{name} is open and the group says nothing is");
+            assert!(
+                has_editor_behind(d),
+                "{name} is open and the preview's exit button would say Cancel — \
+                 but Cancel there returns to {name} with its draft intact"
+            );
             close_editors(d);
             // `close_editors` deliberately leaves the trigger form standing when
             // the plan came from the routine editor above it, which is not the
             // case here — nothing raised a routine.
             d.trigger.set(None);
             assert!(!up(), "{name} closed and the group still says something is");
+            assert!(
+                !has_editor_behind(d),
+                "{name} closed and the exit button would still offer to go Back to it"
+            );
         }
 
         scope.dispose();

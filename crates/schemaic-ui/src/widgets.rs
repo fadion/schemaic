@@ -3766,6 +3766,10 @@ pub(crate) fn menu_channel() -> Option<PopupChannel> {
 /// Returns the anchor the caller's menu is now standing at, or `None` if this
 /// call **closed** one — see [`close_picker`], which is what the returned value
 /// is for.
+///
+/// **An empty list opens as one disabled row, not as an empty panel** — see
+/// [`noted_if_empty`]. Here rather than in each wrapper, because it is the door
+/// every picker in the app goes through.
 pub(crate) fn open_picker(
     ch: PopupChannel,
     anchor: Option<floem::ViewId>,
@@ -3795,8 +3799,40 @@ pub(crate) fn open_picker(
     // At least as wide as the control it drops from, so the menu doesn't read as
     // a different control than the one that opened it.
     ch.width.set(width.max(theme::scaled(150.0)));
-    ch.menus.popup.set(Some(entries));
+    ch.menus.popup.set(Some(noted_if_empty(entries)));
     here
+}
+
+/// **Nothing to choose from is an answer, not silence.**
+///
+/// `popup_menu_overlay` builds a panel for any `Some`, and for an empty list its
+/// height sums to the padding and border alone while its measured width is zero
+/// — so it clamps to the `popup_width` floor and draws an empty bordered box
+/// under the control, which then eats the click meant to dismiss it. Declining
+/// to open at all is worse in the way that matters: the box looks pressable,
+/// answers with nothing, and is indistinguishable from one that is broken, which
+/// is how it was reported the first time.
+///
+/// [`crate::table_designer::suggest_chevron`] already had this arm and carried
+/// its own note; its sibling `focusable_owned_dropdown` — the wrapper behind
+/// every dropdown in the designer, the object editor, the trigger editor, the
+/// view editor, the event editor and the routine editor — did not. It is
+/// reachable in each of them wherever the list comes from a fetch or a schema
+/// that has not loaded: *Create ▸ Table* on an unexpanded database, then
+/// Foreign keys ▸ + ▸ **References table**, is an empty box with nothing in it,
+/// at exactly the moment the user needs to be told there is nothing to
+/// reference.
+///
+/// So the arm lives at the door instead of in a wrapper's parameter list — one
+/// answer for every picker, present and future, rather than a behaviour each
+/// caller has to remember. A caller that has something more specific to say
+/// hands over a list that is already non-empty, which is what `suggest_chevron`
+/// does and why its own wording still wins.
+fn noted_if_empty(entries: Vec<MenuEntry>) -> Vec<MenuEntry> {
+    if entries.is_empty() {
+        return vec![MenuEntry::action("Nothing to choose from", || {}).disabled(true)];
+    }
+    entries
 }
 
 /// Take down a picker's menu **if the one standing is that picker's** — the
@@ -7969,6 +8005,53 @@ mod key_pressable_gate {
                 );
                 from = at + "key_pressable(".len();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    /// The empty panel every picker in the app could draw, closed at the door.
+    ///
+    /// Asserted over `noted_if_empty` rather than through a channel, because a
+    /// `PopupChannel` is thread-local workspace state a unit test has no
+    /// workspace for. `open_picker` is the one caller, and it applies this to
+    /// the entries it is about to publish — the assertion below that the row is
+    /// **disabled** is the half that matters, since an enabled row would open a
+    /// menu whose only entry does nothing when picked.
+    #[test]
+    fn a_picker_with_nothing_to_offer_says_so() {
+        let noted = noted_if_empty(Vec::new());
+        assert_eq!(noted.len(), 1);
+        match &noted[0] {
+            MenuEntry::Action {
+                label, disabled, ..
+            } => {
+                assert!(disabled, "an enabled row that does nothing is worse");
+                assert!(!label.trim().is_empty(), "the row has to say something");
+            }
+            _ => panic!("expected one action row"),
+        }
+    }
+
+    /// And a caller with something to say keeps it — `suggest_chevron` passes a
+    /// list that already carries its own note, and a non-empty list must come
+    /// back untouched.
+    #[test]
+    fn a_picker_with_entries_is_left_alone() {
+        let mine = vec![
+            MenuEntry::action("No tables in this database", || {}).disabled(true),
+            MenuEntry::action("orders", || {}),
+        ];
+        let out = noted_if_empty(mine);
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            MenuEntry::Action { label, .. } => {
+                assert_eq!(label, "No tables in this database")
+            }
+            _ => panic!("the caller's own first row did not survive"),
         }
     }
 }
