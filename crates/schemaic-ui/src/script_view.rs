@@ -30,7 +30,7 @@ use floem::reactive::create_effect;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::script::{
     DestructionNotice, Durability, Probe, ProbeSummary, RunOutcome, destruction_notice,
-    summary_kind,
+    summary_kind, unqualified_notice,
 };
 use schemaic_core::sql::GuardPolicy;
 
@@ -409,6 +409,30 @@ fn probe_body(p: &Probe) -> impl IntoView {
                 // Read whole, destroys nothing: a permanent "destroys nothing"
                 // line would be one more thing to read past on every file.
                 None => {}
+            }
+            // **The second red fact, and the one the line above cannot carry.**
+            // `is_destructive` is a net over statement *kinds* and `UPDATE` is
+            // in none of them, so a migration of four hundred unqualified
+            // `UPDATE`s — every value in those columns overwritten, with no
+            // second "are you sure" anywhere on this path — printed nothing at
+            // all. Its own count, not a widening of the one above, because they
+            // say different things and a statement can be in both.
+            if let Some(n) = unqualified_notice(p) {
+                rows.push(
+                    text(format!(
+                        "{} {} in this file {} on every row of a table — a DELETE, UPDATE or \
+                         TRUNCATE with no WHERE. That cannot be undone from here.",
+                        p.count_label(n),
+                        schemaic_core::text::plural(n, "statement", "statements"),
+                        schemaic_core::text::plural(n, "acts", "act"),
+                    ))
+                    .style(|s| {
+                        s.font_size(theme::font_label())
+                            .color(theme::error())
+                            .padding_top(theme::scaled(8.0))
+                    })
+                    .into_any(),
+                );
             }
             // **Same size as the warning above it, not a hint.** Whether the
             // file wraps itself is what decides the meaning of a Stop half way

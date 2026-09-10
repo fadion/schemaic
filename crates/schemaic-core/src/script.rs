@@ -437,6 +437,19 @@ pub enum DestructionNotice {
     Unread,
 }
 
+/// How many statements the red panel should say act on **every row**, or
+/// `None` when there are none to say it about.
+///
+/// **No `Unread` state of its own, deliberately.** A probe that stopped early
+/// already prints [`DestructionNotice::Unread`] — "the rest was not looked at"
+/// — and a second sentence saying the same thing about a different predicate is
+/// one more line to read past on the panel whose whole job is that the red text
+/// gets read. This says only what was actually seen; when the probe is a floor,
+/// [`Probe::count_label`] renders it as `400+` like every other count.
+pub fn unqualified_notice(p: &Probe) -> Option<usize> {
+    (p.unqualified > 0).then_some(p.unqualified)
+}
+
 /// Which of the three states a probe is in. See [`DestructionNotice`].
 pub fn destruction_notice(p: &Probe) -> Option<DestructionNotice> {
     match (p.destructive, p.more) {
@@ -595,6 +608,26 @@ pub struct Probe {
     /// Statements that destroy something. Named in plain language before the
     /// run, the way generated DDL is.
     pub destructive: usize,
+    /// Statements that act on **every row** — [`crate::sql::unsafe_reason`]'s
+    /// question, asked per statement.
+    ///
+    /// **A separate count because it is a separate fact, and because the
+    /// deferral that stood in its place could not be honoured here.**
+    /// [`is_destructive`] is a net over statement *kinds*, and `UPDATE` is in
+    /// none of them: a migration of four hundred unqualified `UPDATE`s
+    /// permanently overwrote every value in the columns it named and the panel
+    /// — whose red line *is* the confirmation, there being no second "are you
+    /// sure" step — printed nothing. Its doc deferred the "missing `WHERE`"
+    /// question to `sql::first_unsafe`, which is reached only from
+    /// `sql::run_verdict` and takes the statements; `sql::script_verdict` takes
+    /// none and structurally cannot call it, so the named owner of the question
+    /// was unreachable for every `.sql` file.
+    ///
+    /// Asking `unsafe_reason` here is the same predicate rather than a second
+    /// wording of it — which is what the deferral was protecting. A statement
+    /// can be in both counts (an unqualified `DELETE`, a `TRUNCATE`); they say
+    /// different things about it and the panel prints one line each.
+    pub unqualified: usize,
     /// Bytes the probe actually read.
     pub bytes_read: u64,
 }
@@ -649,6 +682,7 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
     let mut depth = 0usize;
     let mut closed_at: Option<usize> = None;
     let mut destructive = 0usize;
+    let mut unqualified = 0usize;
     for (i, s) in stmts.iter().enumerate() {
         // **Counted, not dropped.** A statement `statement_kind` cannot name is
         // still a statement the run will send, and dropping it from the
@@ -672,6 +706,11 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
         if is_destructive(&s.sql, &kind, dialect) {
             destructive += 1;
         }
+        // The same predicate the run guard asks, asked where the statements
+        // are — see `Probe::unqualified`.
+        if sql::unsafe_reason(&s.sql, dialect).is_some() {
+            unqualified += 1;
+        }
         *counts.entry(kind).or_default() += 1;
     }
     let mut kinds: Vec<(String, usize)> = counts.into_iter().collect();
@@ -686,6 +725,7 @@ pub fn probe<R: std::io::Read>(r: R, dialect: SqlDialect) -> std::io::Result<Pro
         // one being asked — see the field.
         atomic_through: (opens == 1).then(|| closed_at.unwrap_or(stmts.len())),
         destructive,
+        unqualified,
         bytes_read,
     })
 }
@@ -1132,6 +1172,50 @@ mod tests {
     fn a_delete_counts_as_something_the_script_destroys() {
         let p = probed("DELETE FROM a WHERE id = 1; DELETE FROM b; SELECT 1;");
         assert_eq!(p.destructive, 2, "{:?}", p.kinds);
+    }
+
+    /// **The hole the destruction count could not see.** A migration of
+    /// unqualified `UPDATE`s destroys every value in the columns it names and
+    /// `is_destructive` matches none of it: `statement_kind` returns `UPDATE`,
+    /// which is not `DROP`/`TRUNCATE`/`DELETE`/`REPLACE`, so the panel — whose
+    /// red line *is* the confirmation, there being no second "are you sure" —
+    /// said nothing at all.
+    ///
+    /// The doc deferred the question to `sql::first_unsafe`, and on this path
+    /// that deferral was hollow: `first_unsafe` is reached only from
+    /// `sql::run_verdict`, which takes the statements; `script_verdict` takes
+    /// none and cannot call it. So the probe asks `sql::unsafe_reason` itself,
+    /// per statement, which is the same predicate rather than a second wording
+    /// of it.
+    #[test]
+    fn the_probe_counts_the_writes_that_name_no_row() {
+        let p = probed("UPDATE users SET email = NULL; UPDATE orders SET status = 'x';");
+        assert_eq!(p.destructive, 0, "an UPDATE destroys no object");
+        assert_eq!(p.unqualified, 2, "{:?}", p.kinds);
+        assert_eq!(unqualified_notice(&p), Some(2));
+
+        // A `WHERE` is the whole difference, and it is the *top-level* one —
+        // `has_top_level_where`'s question, not a substring search.
+        let safe = probed("UPDATE users SET email = NULL WHERE id = 1;");
+        assert_eq!(safe.unqualified, 0);
+        assert_eq!(unqualified_notice(&safe), None);
+
+        // The two counts are separate facts and a statement can be in both: an
+        // unqualified DELETE destroys data *and* names no row.
+        let both = probed("DELETE FROM a; DELETE FROM b WHERE id = 1;");
+        assert_eq!(both.destructive, 2);
+        assert_eq!(both.unqualified, 1);
+
+        // TRUNCATE is unsafe by construction — `unsafe_reason` says so with no
+        // WHERE to look for — so it lands in both counts too.
+        let t = probed("TRUNCATE TABLE a;");
+        assert_eq!(t.destructive, 1);
+        assert_eq!(t.unqualified, 1);
+
+        // And a data-modifying CTE, which neither the head keyword nor a
+        // top-level WHERE scan can reach — `unsafe_reason`'s own `WITH` arm.
+        let cte = probed("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d;");
+        assert_eq!(cte.unqualified, 1, "{:?}", cte.kinds);
     }
 
     /// **A migration script's real shape.** `ALTER TABLE … DROP COLUMN`
