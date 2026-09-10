@@ -1492,7 +1492,6 @@ pub(crate) fn completion_popup(
                         insert: _,
                         replace: _,
                     } = item;
-                    let color = suggest_color(kind);
                     // Schema-style leading glyph, coloured by kind/key (see
                     // `suggest_icon_color`): a column's type family tinted gold (PK) /
                     // purple (FK), a table/db icon, or the muted `square-function`
@@ -1530,9 +1529,17 @@ pub(crate) fn completion_popup(
                     // thing being picked — and the two dim columns ellipsize.
                     h_stack((
                         lead,
+                        // `suggest_color(kind)` **inside** the closure, like its
+                        // sibling `suggest_icon_color(kind, key)` above and the
+                        // two `theme::` calls below — themable colours reach a
+                        // reactive style as a call, never as a captured
+                        // `Color`. This closure re-runs on every selection move
+                        // (it reads `comp.sel`), so a colour frozen at build
+                        // time kept the old tint after a theme switch until the
+                        // next keystroke rebuilt the list.
                         text(name).style(move |s| {
                             s.font_size(completion_name_size())
-                                .color(color)
+                                .color(suggest_color(kind))
                                 .flex_shrink(0.0_f32)
                         }),
                         empty().style(|s| s.flex_grow(1.0_f32).min_width(completion_gap_w())),
