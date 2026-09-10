@@ -1575,14 +1575,53 @@ pub(crate) fn start_ai_session(
                 // A turn the *user* stopped is not a turn that went wrong, and
                 // must not be reported with the CLI's exit status as its reason.
                 let mut stopped = false;
+                // **And a session that was *dropped* is a turn nobody is
+                // listening to.** See the `None` arm below.
+                let mut abandoned = false;
                 loop {
                     tokio::select! {
                         // An interrupt mid-turn kills the child; the turn is
                         // closed below by the `ended == false` arm.
                         maybe = rx.recv() => match maybe {
-                            Some(SessionMsg::Interrupt) | None => {
+                            // Stop: someone is waiting, and the turn is closed
+                            // below with "stopped" rather than the exit status.
+                            Some(SessionMsg::Interrupt) => {
                                 let _ = child.kill().await;
                                 stopped = true;
+                                break;
+                            }
+                            // **The session was dropped — there is nobody to
+                            // tell, and telling anyone is the bug.**
+                            //
+                            // `switch_conn` sets `*ai_session.borrow_mut() =
+                            // None` and, eight lines later, replaces the panel
+                            // with the connection switched *to* and clears
+                            // `ai_busy`. This arm used to fold in with
+                            // `Interrupt` and close the turn, which sends an
+                            // `AiStreamMsg { segs, done: true, is_error: true }`
+                            // carrying **A's half-written answer** — and that
+                            // message has no session or connection id, so the
+                            // consumer applies it blind to `v.last_mut()`:
+                            // connection B's last assistant answer replaced by
+                            // A's text, recoloured as an error, and written
+                            // into B's entry in `chats.json` by B's next
+                            // `persist_chat`.
+                            //
+                            // Not a race — `switch_conn` runs to completion on
+                            // the UI thread, so the restored transcript is
+                            // always already in place.
+                            //
+                            // The persistent branch has always got this right
+                            // (`None => break`, falling out to `child.kill()`
+                            // with nothing sent), and the comment beside the
+                            // consumer names this exact hazard and then guards
+                            // only the *save*, which fails open because
+                            // `ai_session` is `None` by then: nothing is
+                            // written at that moment and the corruption stays
+                            // in the signal.
+                            None => {
+                                let _ = child.kill().await;
+                                abandoned = true;
                                 break;
                             }
                             // A question asked while one is still running is
@@ -1637,12 +1676,14 @@ pub(crate) fn start_ai_session(
                         None
                     }
                 };
-                if !ended {
+                if !ended && !abandoned {
                     // The panel is still waiting either way, so the turn has to
                     // be closed here or it spins forever — but *why* it ended
                     // decides what to say. A turn the user stopped is reported as
                     // stopped; reaching for the exit status there would blame the
-                    // CLI for doing exactly what it was told.
+                    // CLI for doing exactly what it was told. An **abandoned**
+                    // turn is neither: no panel is waiting on it, and the one
+                    // that is showing belongs to somebody else.
                     if stopped {
                         pump.stop();
                     } else {
@@ -3211,6 +3252,61 @@ mod tests {
     /// because the model falls back to writing the fenced block from the schema
     /// it already has and the user sees a preview either way.
     ///
+    /// **A dropped session says nothing, and the two branches agree about
+    /// that.**
+    ///
+    /// The per-turn branch folded `None` (the session was dropped — nobody is
+    /// listening) in with `Some(SessionMsg::Interrupt)` (the user pressed Stop
+    /// — someone is), and closed the turn for both. Closing sends an
+    /// `AiStreamMsg { segs, done: true, is_error: true }` carrying the
+    /// half-written answer, and that message has no session or connection id,
+    /// so the consumer applies it blind to `v.last_mut()`. Switch connection
+    /// mid-turn and **A's text replaced B's last assistant answer**, recoloured
+    /// as an error, and rode B's next `persist_chat` into `chats.json`. Not a
+    /// race: `switch_conn` runs to completion on the UI thread, so B's restored
+    /// transcript is always already in place.
+    ///
+    /// The **persistent** branch has always got this right — `None => break`,
+    /// falling out to `child.kill()` with nothing sent — so the two branches
+    /// disagreed about what a dropped session owes the panel and only one could
+    /// be right.
+    ///
+    /// A source check because both arms live inside a spawned task in a
+    /// long-running `select!`; there is no seam a unit test can reach. The
+    /// consumer-side comment that names this hazard guards only the *save*, and
+    /// that guard fails open here (`ai_session` is already `None`, so nothing
+    /// is written *then* and the corruption stays in the signal).
+    #[test]
+    fn a_dropped_session_closes_no_turn_in_either_branch() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("ai.rs"),
+        )
+        .expect("this file's own source");
+        let body = production_code(&src);
+        assert!(
+            !body.contains("Some(SessionMsg::Interrupt) | None =>"),
+            "the per-turn branch folds a dropped session in with Stop again — \
+             a turn nobody is listening to will overwrite whichever \
+             conversation happens to be on screen"
+        );
+        // The per-turn branch names the state and the close skips it.
+        for term in ["let mut abandoned = false;", "if !ended && !abandoned {"] {
+            assert!(
+                body.contains(term),
+                "the per-turn branch no longer distinguishes an abandoned turn \
+                 ({term} is gone)"
+            );
+        }
+        // And the persistent branch still simply leaves.
+        assert!(
+            body.contains("None => break,"),
+            "the persistent branch's dropped-session arm has changed shape — \
+             the two must stay in agreement"
+        );
+    }
+
     /// **Every agent spawn sets a working directory, unconditionally.**
     ///
     /// The three sites read `if let Some(d) = &cwd { cmd.current_dir(d); }`, so
