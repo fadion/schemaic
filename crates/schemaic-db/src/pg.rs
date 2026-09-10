@@ -3275,6 +3275,50 @@ struct ColMeta {
     flags: ColumnFlags,
 }
 
+/// [`fetch_col_meta`]'s query, over the table OIDs in `in_list`.
+///
+/// **Extracted so the decisions in it can be checked without a server**, the
+/// way `table_stats_sql`, `index_stats_sql`, `index_list_sql` and the activity
+/// query already are. Three judgments live in this string and each has a wrong
+/// answer that produces a plausible grid rather than an error: which columns
+/// are the primary key, which column is server-assigned, and the ordinals the
+/// fold below reads by position.
+///
+/// **`indnkeyatts`, not `indnatts`.** `PRIMARY KEY … INCLUDE` has been legal
+/// since PostgreSQL 11, and `pg_index.indkey` is `indnatts` long — the INCLUDE
+/// positions are in it. An unbounded `unnest(i.indkey)` therefore reported an
+/// INCLUDE column as part of the primary key, and on a result whose table the
+/// schema tree has not introspected yet — an everyday case for a table created
+/// since the last refresh — `edit::resolve_key`'s no-schema branch trusts these
+/// wire flags. With `PRIMARY KEY (id) INCLUDE (payload)` that made the key
+/// `[id, payload]`, and `payload` being binary made the whole grid silently
+/// read-only; with a non-binary INCLUDE column it put a non-identity value in
+/// every `UPDATE`'s `WHERE`, so any concurrent touch of it made the statement
+/// affect no rows and the batch roll back reporting the row as gone. The other
+/// PK reader in this file, `index_list_sql`, gets the same question right by
+/// accident — it inner-joins `unnest(ix.indoption)`, which is `indnkeyatts`
+/// long — so the two disagreed depending on whether the tree had run.
+fn col_meta_sql(in_list: &str) -> String {
+    format!(
+        "SELECT a.attrelid, a.attnum, a.attname, c.relname, n.nspname, \
+                a.attnotnull, \
+                (a.attidentity <> '' OR (a.atthasdef AND \
+                    COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '') LIKE 'nextval(%')) AS auto_inc, \
+                a.atthasdef, a.attidentity, \
+                (pk.attnum IS NOT NULL) AS is_pk \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+         LEFT JOIN (SELECT i.indrelid AS relid, k.attnum \
+                    FROM pg_index i, \
+                         unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) \
+                    WHERE i.indisprimary AND k.ord <= i.indnkeyatts) pk \
+           ON pk.relid = a.attrelid AND pk.attnum = a.attnum \
+         WHERE a.attrelid IN ({in_list}) AND a.attnum > 0 AND NOT a.attisdropped"
+    )
+}
+
 /// Resolve `(table_oid, attnum)` → real names + key flags via `pg_catalog`, in
 /// one query over the set of referenced table OIDs. Booleans come back as 't'/'f'
 /// over the text protocol. `auto_increment` covers both identity columns and
@@ -3293,23 +3337,7 @@ async fn fetch_col_meta(
         .map(|o| o.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(
-        "SELECT a.attrelid, a.attnum, a.attname, c.relname, n.nspname, \
-                a.attnotnull, \
-                (a.attidentity <> '' OR (a.atthasdef AND \
-                    COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '') LIKE 'nextval(%')) AS auto_inc, \
-                a.atthasdef, a.attidentity, \
-                (pk.attnum IS NOT NULL) AS is_pk \
-         FROM pg_attribute a \
-         JOIN pg_class c ON c.oid = a.attrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
-         LEFT JOIN (SELECT i.indrelid AS relid, k AS attnum \
-                    FROM pg_index i, unnest(i.indkey) AS k WHERE i.indisprimary) pk \
-           ON pk.relid = a.attrelid AND pk.attnum = a.attnum \
-         WHERE a.attrelid IN ({in_list}) AND a.attnum > 0 AND NOT a.attisdropped"
-    );
-    let rows = query_all(client, &sql).await?;
+    let rows = query_all(client, &col_meta_sql(&in_list)).await?;
     let mut out = HashMap::new();
     for r in rows {
         let oid: u32 = cell(&r, 0).parse().unwrap_or(0);
@@ -5172,6 +5200,47 @@ mod index_key_tests {
             sql.contains("pg_get_indexdef(ix.indexrelid) AS idxdef"),
             "the server's own CREATE INDEX has to come back with the row"
         );
+    }
+
+    /// **The query that decides whether a result is editable, pinned as a
+    /// string** — the convention four of its siblings in this file already
+    /// follow, and the one it had never had.
+    ///
+    /// The decision lives in the SQL: `pg_index.indkey` is `indnatts` long and
+    /// carries a `PRIMARY KEY … INCLUDE` list, so an unbounded
+    /// `unnest(i.indkey)` reported `payload` as a primary-key column for
+    /// `PRIMARY KEY (id) INCLUDE (payload)`. `edit::resolve_key`'s no-schema
+    /// branch trusts these wire flags — the everyday case being a table
+    /// created since the last tree refresh — and a binary column in the key
+    /// makes the grid silently read-only, while a non-binary one puts a
+    /// non-identity value in every `UPDATE`'s `WHERE`.
+    ///
+    /// Nothing in a fold could catch this: the query answers `is_pk = t` and
+    /// the fold faithfully records it.
+    #[test]
+    fn the_column_meta_query_takes_only_the_key_positions_of_the_primary_index() {
+        let sql = col_meta_sql("1234");
+        assert!(
+            sql.contains("indnkeyatts"),
+            "an INCLUDE column is not a primary-key column: {sql}"
+        );
+        assert!(sql.contains("i.indisprimary"), "{sql}");
+        // The OID list reaches the statement — a filter that silently matched
+        // every table would be slow and correct-looking.
+        assert!(sql.contains("a.attrelid IN (1234)"), "{sql}");
+        // The three server-assigned/default columns the fold reads by ordinal
+        // are all still projected, in the order its comment states.
+        for (i, term) in [
+            "a.attnotnull",
+            "AS auto_inc",
+            "a.atthasdef, a.attidentity",
+            "AS is_pk",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(sql.contains(term), "column {i} is gone: {sql}");
+        }
     }
 
     /// **`NULLS NOT DISTINCT` cannot be asked of the catalogue**, and that is

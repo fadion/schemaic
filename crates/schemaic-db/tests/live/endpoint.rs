@@ -86,6 +86,14 @@ pub struct Target {
     /// Data on the target rather than an `if engine == Postgres` in a test body,
     /// for the reason at the top of [`crate::suite`].
     pub grants_are_database_scoped: bool,
+    /// How this server adds non-key payload columns to a primary key, or
+    /// `None` where it cannot.
+    ///
+    /// `PRIMARY KEY (id) INCLUDE (payload)` is PostgreSQL 11 and later; MySQL
+    /// and MariaDB have no equivalent, so there is nothing there to mistake
+    /// for a key column. The clause, not a bool, so the leg that has it also
+    /// says how it spells it.
+    pub primary_key_include: Option<&'static str>,
     /// Does a refused write on this server carry a **separate detail field**
     /// naming the offending value?
     ///
@@ -179,6 +187,7 @@ pub static MARIADB: Target = Target {
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} IGNORED"),
     transactional_ddl: false,
     grants_are_database_scoped: false,
+    primary_key_include: None,
     error_names_the_value: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
@@ -203,6 +212,7 @@ pub static MYSQL: Target = Target {
     disable_index_sql: Some("ALTER TABLE {table} ALTER INDEX {index} INVISIBLE"),
     transactional_ddl: false,
     grants_are_database_scoped: false,
+    primary_key_include: None,
     error_names_the_value: false,
     trigger_body: Some("SET NEW.name = UPPER(NEW.name)"),
     trigger_function_ddl: None,
@@ -227,6 +237,7 @@ pub static POSTGRES: Target = Target {
     disable_index_sql: None,
     transactional_ddl: true,
     grants_are_database_scoped: true,
+    primary_key_include: Some(" INCLUDE (payload)"),
     error_names_the_value: true,
     trigger_body: None,
     trigger_function_ddl: Some(

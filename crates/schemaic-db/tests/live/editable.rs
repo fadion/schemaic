@@ -745,3 +745,54 @@ fn assert_read_only(rs: &ResultSet, model: &EditModel, target: &Target, why: &st
         target.name
     );
 }
+
+/// **A `PRIMARY KEY … INCLUDE` column is not part of the key — and the branch
+/// where that mattered is the one with no schema loaded.**
+///
+/// `pg_index.indkey` is `indnatts` long and carries the INCLUDE positions, so
+/// `fetch_col_meta`'s unbounded `unnest(i.indkey)` flagged `payload` as a
+/// primary-key column on the wire. The schema-loaded path reads the key from
+/// `index_list_sql`, which drops those positions by accident (its ordinality
+/// join is against `indoption`, which is `indnkeyatts` long) — so the failure
+/// only appears when `resolve_key` falls back to trusting the wire flags,
+/// which is what the grid does for a table the tree has not introspected yet:
+/// an everyday case for a table created since the last refresh.
+///
+/// That is why the model here is built with a lookup that answers `None`
+/// rather than through `Scratch::edit_model`, which loads a schema and would
+/// have hidden the whole thing.
+///
+/// With a **binary** INCLUDE column the consequence is the sharpest one:
+/// `resolve_key`'s binary guard sees `payload` in the key and returns no key at
+/// all, so the grid is silently read-only for a table with a perfectly good
+/// integer primary key — and becomes editable after a tree refresh.
+///
+/// PostgreSQL only: MySQL and MariaDB have no `INCLUDE` on an index.
+pub async fn an_include_column_is_not_part_of_the_write_key(target: &'static Target) {
+    let Some(include) = target.primary_key_include else {
+        return;
+    };
+    let scratch = Scratch::create(target, "pk_include").await;
+    let t = scratch.qualified("doc");
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {t} (id INTEGER NOT NULL, payload {}, note VARCHAR(32), \
+             CONSTRAINT doc_pk PRIMARY KEY (id){include})",
+            target.binary_type
+        ))
+        .await;
+
+    let rs = scratch.exec(&format!("SELECT * FROM {t}")).await;
+    // The no-schema branch, exactly as the grid reaches it.
+    let model = schemaic_core::edit::analyze_edit(&rs, scratch.dialect(), |_, _, _| None);
+
+    let table = sole_table(&model, target);
+    assert_eq!(
+        key_names(&rs, table),
+        ["id"],
+        "{}: an INCLUDE column was counted into the key",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
