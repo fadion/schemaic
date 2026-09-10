@@ -1180,13 +1180,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                 move |(draft, errs)| {
                     let first = errs.first().cloned().or_else(|| draft.validate().pop());
                     if let Some(first) = first {
-                        return text(first)
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::font_label())
-                                    .max_width(420.0)
-                            })
-                            .into_any();
+                        return crate::widgets::footer_error(first);
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(match n {

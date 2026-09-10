@@ -637,7 +637,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
             .style(|s| {
                 s.color(theme::text_dim())
                     .font_size(theme::font_label())
-                    .max_width(420.0)
+                    .max_width(theme::scaled(420.0))
             }),
         ))
         .style(|s| s.flex_col().gap(form_gap()).width_full())
@@ -1391,13 +1391,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                         status_target.host(),
                     );
                     if let Some(first) = errs.first() {
-                        return text(first.clone())
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::font_label())
-                                    .max_width(460.0)
-                            })
-                            .into_any();
+                        return crate::widgets::footer_error(first.clone());
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(match n {

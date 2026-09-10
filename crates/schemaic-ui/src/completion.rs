@@ -1650,7 +1650,7 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
             s.absolute()
                 .inset_left(COMPLETION_GUTTER + px + sig_help_dx())
                 .inset_top(top)
-                .max_width(560.0)
+                .max_width(theme::scaled(560.0))
         } else {
             s
         }

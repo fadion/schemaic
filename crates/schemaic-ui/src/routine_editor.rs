@@ -893,15 +893,7 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
                     let Some(status_target) = status_target else {
                         return empty().into_any();
                     };
-                    let say = |m: String| {
-                        text(m)
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::font_label())
-                                    .max_width(460.0)
-                            })
-                            .into_any()
-                    };
+                    let say = crate::widgets::footer_error;
                     // Said before the change count, because until the source
                     // lands the count is over `information_schema`'s resolved
                     // body rather than the routine as written.

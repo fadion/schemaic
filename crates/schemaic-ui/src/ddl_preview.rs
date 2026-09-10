@@ -928,7 +928,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                         .style(|s| {
                             s.color(theme::error())
                                 .font_size(theme::font_body())
-                                .max_width(580.0)
+                                .max_width(theme::scaled(580.0))
                                 .margin_top(theme::scaled(12.0))
                         })
                         .into_any(),

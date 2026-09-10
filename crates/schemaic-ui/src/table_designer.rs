@@ -1140,10 +1140,14 @@ pub(crate) fn list_pane(
 fn detail_pane(tab: RwSignal<DesignerTab>, body: impl IntoView + 'static) -> impl IntoView {
     autohide(scroll(container(body).style(move |s| {
         s.width_full()
+            // Scaled, like the `padding_right` four lines down: this gap is the
+            // one measurement in the modal that says "these are two panes", and
+            // frozen at 18px it was the only thing that didn't grow when the
+            // list, the rows and every field did.
             .padding_left(if tab.get() == DesignerTab::Table {
                 0.0
             } else {
-                18.0
+                theme::scaled(18.0)
             })
             // Clear of the scrollbar, which floats over the content at the pane's
             // edge rather than insetting it. Now that the form really is as wide
@@ -1569,8 +1573,16 @@ fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
                 ui.ddl.draft.update(|d| {
                     let names: Vec<String> =
                         d.indexes.iter().map(|i| i.info.name.clone()).collect();
-                    // Seed on the selected column, which is nearly always the one
-                    // the index is wanted for.
+                    // The **first** column, not the selected one: while the
+                    // Indexes section is showing, `ui.ddl.selected` indexes
+                    // `d.indexes` — the two lists share one selection signal and
+                    // `tab_strip` resets it to 0 on every section change — so
+                    // there is no selected *column* here to seed from. The
+                    // comment that used to say otherwise would have had a reader
+                    // write `d.columns.get(selected)` and seed the index from an
+                    // index row's ordinal. Seeding on the selection is a feature
+                    // wanting a second signal, not a fix. `fks_list` below does
+                    // the identical `first()`.
                     let first = d.columns.first().map(|c| c.info.name.clone());
                     d.indexes.push(IndexDraft::new(IndexInfo {
                         name: unique_name(&names, &format!("{}_idx", d.name)),
@@ -2319,13 +2331,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                 move |draft| {
                     let errs = draft.validate(status_target.dialect);
                     if let Some(first) = errs.first() {
-                        return text(first.clone())
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::font_label())
-                                    .max_width(460.0)
-                            })
-                            .into_any();
+                        return crate::widgets::footer_error(first.clone());
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(match n {

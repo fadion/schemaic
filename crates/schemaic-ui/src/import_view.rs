@@ -911,7 +911,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             .style(|s| {
                 s.color(theme::plan_warn())
                     .font_size(theme::font_body())
-                    .max_width(560.0)
+                    .max_width(theme::scaled(560.0))
                     .margin_top(theme::scaled(20.0))
             })
             .into_any()
@@ -938,7 +938,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
                 .style(|s| {
                     s.color(theme::plan_warn())
                         .font_size(theme::font_body())
-                        .max_width(560.0)
+                        .max_width(theme::scaled(560.0))
                         .margin_top(theme::scaled(20.0))
                 })
                 .into_any()
@@ -970,7 +970,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             .style(|s| {
                 s.color(theme::plan_warn())
                     .font_size(theme::font_body())
-                    .max_width(560.0)
+                    .max_width(theme::scaled(560.0))
                     .margin_top(theme::scaled(20.0))
             })
             .into_any()
@@ -1228,7 +1228,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                         .style(|s| {
                             s.color(theme::error())
                                 .font_size(theme::font_body())
-                                .max_width(520.0)
+                                .max_width(theme::scaled(520.0))
                                 .margin_top(theme::scaled(10.0))
                         })
                         .into_any(),

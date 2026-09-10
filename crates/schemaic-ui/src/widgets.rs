@@ -2019,6 +2019,33 @@ pub(crate) fn modal_footer_split(
     })
 }
 
+/// The validation message in a schema editor's footer — the left half of
+/// [`modal_footer_split`] when the draft doesn't validate.
+///
+/// **One helper because there were six copies**, byte-identical in five of them
+/// (`table_designer`, `trigger_editor`, `view_editor`, `event_editor`,
+/// `routine_editor`; `object_editor` differed only in the number), and each one
+/// froze its box at `max_width(460.0)` while the `font_size` beside it scaled.
+/// At **Huge** the longest messages these render — the ones that matter, like
+/// "Foreign key fk_orders must pair each column with one it references." — are
+/// ~1.6× wider and were given the same 460px, so a one-line error wrapped to
+/// two or three inside a footer whose height is fixed.
+///
+/// The width is a wrap hint rather than a demand: [`modal_footer_split`] lets
+/// the status shrink to nothing and never shrinks the actions, so a modal too
+/// narrow for this bound simply wraps earlier. That is why one number serves the
+/// 700-wide object editor and the 900-wide rest, and why `object_editor`'s 420
+/// was over-specification rather than a second decision.
+pub(crate) fn footer_error(msg: String) -> AnyView {
+    text(msg)
+        .style(|s| {
+            s.color(theme::error())
+                .font_size(theme::font_label())
+                .max_width(theme::scaled(460.0))
+        })
+        .into_any()
+}
+
 pub(crate) fn menu_item_style(s: floem::style::Style) -> floem::style::Style {
     // The gap and the horizontal padding are the constants `menu_panel_width`
     // predicts with, read rather than restated — the same rule `MENU_ROW_PAD`

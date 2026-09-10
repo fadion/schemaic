@@ -557,13 +557,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                     };
                     let errs = draft.validate(status_target.dialect);
                     if let Some(first) = errs.first() {
-                        return text(first.clone())
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::font_label())
-                                    .max_width(460.0)
-                            })
-                            .into_any();
+                        return crate::widgets::footer_error(first.clone());
                     }
                     let n = change_set(&status_target, &draft).len();
                     text(match n {

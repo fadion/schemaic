@@ -4008,6 +4008,70 @@ mod read_only_door_gate {
     }
 }
 
+/// **A text box's width moves with the interface scale, or the text outgrows
+/// it.**
+///
+/// `max_width` is the one geometry property in this crate that always bounds
+/// *type*: a validation message, a warning paragraph, a diagnostic tooltip, the
+/// completion popup. The `font_size` beside it is scaled in every one of those,
+/// so a bare literal is a box that stays 460px while the sentence inside it
+/// grows ~1.6× at **Huge** — and floem's default `TextOverflow::Wrap` then turns
+/// a one-line error into two or three inside a footer whose height is fixed.
+/// The messages it happens to are the longest ones each draft produces, which
+/// are the ones the user needs to read.
+///
+/// Fourteen sites in ten files, and the review found four of them
+/// (B11.2-L3-03, B11.3-L3-03) — the other ten were the same line copied into
+/// `object_editor`, `event_editor`, `routine_editor`, `completion`,
+/// `ddl_preview`, `editor_pane` and `import_view`, which is how a finding filed
+/// against two files turns out to be a class. Six of the fourteen were the
+/// schema editors' footer status, byte-identical in five, and are now
+/// `widgets::footer_error`. `table_designer`'s own `width_scale_tests` block
+/// exists for exactly this defect and could not see any of them: it enumerates
+/// the file's `fn() -> f64` width functions, and a literal written inside a
+/// `.style(move |s| …)` closure is not one.
+///
+/// **Narrow on purpose.** `min_width` and `min_height` carry 220-odd literals in
+/// this crate and nearly all are `0.0` (the flex contract [`widgets::
+/// modal_footer_split`] documents) or a floor in the tens of pixels that keeps a
+/// column from vanishing; `width`/`height` at `1.0`/`2.0` are hairlines and
+/// scrollbar geometry, which are a border's question rather than a font's.
+/// Those want their own argument, and a gate that swept them in would have
+/// needed a thirty-line allowlist on day one — which is how a ratchet becomes
+/// laundering. This one starts with an **empty** allowlist and should keep it.
+#[cfg(test)]
+mod scaled_text_width_gate {
+    #[test]
+    fn a_text_box_scales_with_the_interface() {
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, code) in crate::source_gate::crate_sources() {
+            // No line numbers: `production_code` has already dropped the
+            // comment lines, so a count here would name a line the file does
+            // not have. The offending text is what a `grep` needs anyway —
+            // `engine_comparison_gate` reports the same way.
+            for line in code.lines() {
+                for prop in [".max_width(", ".max_height("] {
+                    let Some(at) = line.find(prop) else { continue };
+                    let arg = &line[at + prop.len()..];
+                    // A literal, not `theme::scaled(460.0)` or `field_w()`.
+                    if arg.starts_with(|c: char| c.is_ascii_digit())
+                        && arg.trim_end_matches(&[')', ','][..]).contains('.')
+                    {
+                        offenders.push(format!("{file}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a text box frozen at 100% while the font beside it scales:\n    {}\n\n\
+             Wrap it in `theme::scaled(…)`, or — if this is a schema editor's \
+             footer message — call `widgets::footer_error`.",
+            offenders.join("\n    ")
+        );
+    }
+}
+
 /// Tabs / query signals (Copy bundle).
 #[derive(Clone, Copy)]
 pub struct TabsUi {

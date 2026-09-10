@@ -4647,8 +4647,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         })
                         .pointer_events(|| true)
                         .tooltip(move || {
-                            text(msg.clone())
-                                .style(|s| s.font_size(theme::scaled_font(12.0)).max_width(360.0))
+                            text(msg.clone()).style(|s| {
+                                s.font_size(theme::scaled_font(12.0))
+                                    .max_width(theme::scaled(360.0))
+                            })
                         })
                 }))
                 .style(|s| s.absolute().inset(0.0))
