@@ -2369,7 +2369,16 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         .await
         .map_err(qerr)?
         .unwrap_or_default();
-    let mariadb: bool = version.to_ascii_lowercase().contains("mariadb");
+    // **The model's decision, not a second spelling of it.** This was
+    // `version.to_ascii_lowercase().contains("mariadb")` written out here,
+    // byte-identical to `ServerFlavour::parse_version` and driving five
+    // branches — while the flavour the schema carries was then re-derived from
+    // the `bool` at the bottom of this function. Two spellings of one question
+    // on the path where the two servers' divergence is a data-loss class, and
+    // unlike the enum a local `bool` has no `Unknown` arm, so "the server did
+    // not say" folded to MySQL rather than to the documented safe default.
+    let flavour = schemaic_core::schema::ServerFlavour::parse_version(&version);
+    let mariadb = flavour.is_mariadb();
 
     // Columns for the whole schema in one pass, grouped back onto their tables.
     let col_rows: Vec<ColRow> = conn
@@ -2740,12 +2749,9 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     apply_triggers(&mut schema, mysql_triggers(&trigger_rows));
     // The flavour was computed at the top of this function and then thrown
     // away, so the emitter — which is where MySQL and MariaDB actually diverge
-    // — had no way to ask. It rides on the schema now.
-    schema.flavour = if mariadb {
-        schemaic_core::schema::ServerFlavour::MariaDb
-    } else {
-        schemaic_core::schema::ServerFlavour::MySql
-    };
+    // — had no way to ask. It rides on the schema now, and it is the *same*
+    // value the branches above asked rather than one rebuilt from a `bool`.
+    schema.flavour = flavour;
     // And where it was read from, for the same kind of reason: a foreign key's
     // `REFERENCED_TABLE_SCHEMA` and a view's rewritten `VIEW_DEFINITION` both
     // name this database, and the one reader that compares two databases has to
@@ -7042,6 +7048,43 @@ mod tests {
         for (raw, want) in cases {
             assert_eq!(mysql_check_clause(raw, false), want, "for {raw}");
         }
+    }
+
+    /// **The gate.** One place decides which MySQL-family server this is, and
+    /// it is `ServerFlavour::parse_version`.
+    ///
+    /// `collect_schema` spelled the same test out —
+    /// `version.to_ascii_lowercase().contains("mariadb")` — into a local
+    /// `bool` driving five branches, then rebuilt the model's `ServerFlavour`
+    /// from that `bool` at the bottom of the same function. Two spellings of
+    /// one question on the path where the two servers' divergence is a
+    /// data-loss class, and a local `bool` is the constant CLAUDE.md's engine
+    /// rule names: greppable inside one function, invisible outside it, and
+    /// with no `Unknown` arm, so "the server did not say" folded to MySQL
+    /// rather than to the documented safe default.
+    ///
+    /// Line comments are dropped before the scan, so the paragraph in
+    /// `collect_schema` that quotes the old spelling is not a hit.
+    #[test]
+    fn only_one_function_decides_which_mysql_family_server_this_is() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("this module's own source");
+        // Assembled, so this line is not its own first offender.
+        let needle = format!("contains({}mariadb{})", '"', '"');
+        let mut offenders = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line.contains(&needle) {
+                offenders.push(format!("lib.rs:{}: {}", i + 1, line.trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "ask `ServerFlavour::parse_version`:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// MariaDB reports the clause already runnable — its `CHECK_CLAUSE` and its

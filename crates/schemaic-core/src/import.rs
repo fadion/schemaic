@@ -1795,9 +1795,11 @@ pub fn insert_columns(mapping: &Mapping, table: &TableInfo) -> Vec<usize> {
 /// [`insert_columns`] order, collecting anything wrong with it.
 ///
 /// `line` is the record's 1-based line in the file, so an issue can say where.
-/// `format` is here for one reason: a worksheet's formula errors
-/// ([`IssueKind::CellError`]) are wrong for every column type, and only a
-/// worksheet has them.
+/// `sheet_errors` holds the indices of fields the *format itself* reported as
+/// broken — a worksheet's formula errors ([`IssueKind::CellError`]), which are
+/// wrong for every column type and which no amount of reading the text can
+/// establish; see [`Record`]. Empty for CSV and JSON, which have nothing of the
+/// kind, so no format argument is needed to gate it.
 pub fn coerce_record(
     fields: &[Field],
     sheet_errors: &[usize],
