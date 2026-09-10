@@ -1921,6 +1921,35 @@ pub struct Validation {
     pub more_issues: bool,
 }
 
+/// The line under a problem list that says what it is not showing, or `None`
+/// when it is showing everything.
+///
+/// **There are two caps and they are not the same one.** `more_issues` is set
+/// when [`validate`] stops *collecting* at its `max_issues`; a view has its own,
+/// much smaller, cap on how many it *renders*. The disclosure used to be wired
+/// only to the first, so a file with 57 problems rendered 20 lines under a
+/// heading reading "57 problems in the file" and said nothing — the user fixed
+/// twenty, re-imported, was told "37 problems", and repeated, at one whole file
+/// pass each.
+///
+/// `shown` is what the caller is about to render, `total` is
+/// `Validation::issues.len()`, and `capped` is `Validation::more_issues`. Both
+/// caps can be in force at once, and the sentence has to name both: at exactly
+/// `max_issues` the old wording said "…and more." over 20 of 200 lines, which
+/// is the same gap one notch worse.
+pub fn issue_tail(shown: usize, total: usize, capped: bool) -> Option<String> {
+    match (total > shown, capped) {
+        (false, false) => None,
+        (true, false) => Some(format!("Showing {shown} of {total}.")),
+        (false, true) => Some(format!(
+            "Showing all {total} — the check stopped counting there, so the file holds more."
+        )),
+        (true, true) => Some(format!(
+            "Showing {shown} of the first {total} — the check stopped counting there, so the file holds more."
+        )),
+    }
+}
+
 /// Check every record without inserting anything.
 ///
 /// This is what makes the all-or-nothing import bearable: the transaction would
@@ -4806,6 +4835,29 @@ mod tests {
         assert_eq!(v.issues[0].line, 3);
         assert_eq!(v.issues[1].line, 5);
         assert!(!v.more_issues);
+    }
+
+    /// The two caps are independent, and the tail has to see both. The middle
+    /// case is the one that shipped wrong: 57 issues, all of them collected, 20
+    /// of them rendered, and nothing said.
+    #[test]
+    fn the_problem_list_tail_names_whichever_cap_is_in_force() {
+        assert_eq!(issue_tail(20, 20, false), None);
+        assert_eq!(issue_tail(50, 0, false), None);
+        assert_eq!(
+            issue_tail(20, 57, false).as_deref(),
+            Some("Showing 20 of 57.")
+        );
+        // Core's cap alone: everything collected is on screen, but the file has
+        // more than the check counted.
+        let both = issue_tail(200, 200, true).expect("the file holds more");
+        assert!(both.starts_with("Showing all 200"), "{both}");
+        assert!(both.ends_with("the file holds more."), "{both}");
+        // And both at once, which is the case the old wording got worst: it
+        // said "…and more." over 20 of 200.
+        let both = issue_tail(20, 200, true).expect("both caps");
+        assert!(both.starts_with("Showing 20 of the first 200"), "{both}");
+        assert!(both.ends_with("the file holds more."), "{both}");
     }
 
     /// A file that's wrong in a thousand places shouldn't produce a thousand-row

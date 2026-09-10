@@ -38,6 +38,13 @@ use crate::{
 /// Rows shown in the mapping step's preview. Enough to spot a wrong delimiter or
 /// an off-by-one mapping; not so many that the panel becomes a grid.
 const PREVIEW_ROWS: usize = 50;
+/// Problem lines rendered before the list is cut. The section sits inside the
+/// body's own scroll, so this was never a layout requirement — 20 was a bare
+/// literal, and its whole cost was that the disclosure below it was wired to
+/// core's cap instead of this one (`import::issue_tail`). 50 is the same number
+/// as the preview's, for the same reason: enough to see the shape of what is
+/// wrong without turning the panel into a report.
+const ISSUE_LINES: usize = 50;
 /// One width for every step, so the panel doesn't resize as you move through it.
 fn panel_w() -> f64 {
     modal_w(620.0)
@@ -829,7 +836,8 @@ fn issue_list(ui: Ui) -> impl IntoView {
                     .font_bold()
                     .margin_bottom(theme::scaled(6.0))
             });
-            let lines = v_stack_from_iter(issues.iter().take(20).map(|is: &Issue| {
+            let shown = issues.len().min(ISSUE_LINES);
+            let lines = v_stack_from_iter(issues.iter().take(ISSUE_LINES).map(|is: &Issue| {
                 let where_ = if is.column.is_empty() {
                     format!("line {}", is.line)
                 } else {
@@ -841,13 +849,11 @@ fn issue_list(ui: Ui) -> impl IntoView {
                         .margin_bottom(theme::scaled(2.0))
                 })
             }));
-            let tail = text(if more {
-                "…and more.".to_string()
-            } else {
-                String::new()
-            })
-            .style(move |s| {
-                if more {
+            // Both caps, in one sentence, from core — see `issue_tail`.
+            let tail_text = schemaic_core::import::issue_tail(shown, issues.len(), more);
+            let showing = tail_text.is_some();
+            let tail = text(tail_text.unwrap_or_default()).style(move |s| {
+                if showing {
                     s.font_size(theme::scaled_font(11.0))
                         .color(theme::text_dim())
                 } else {
@@ -1386,4 +1392,35 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// **The gate.** The problem list's "there is more" line must come from
+    /// `import::issue_tail`, not from this file's own reading of
+    /// `more_issues`.
+    ///
+    /// There are two caps and they are not the same one: core stops
+    /// *collecting* at `max_issues` (200), this view stops *rendering* at
+    /// `ISSUE_LINES`. The tail used to be `if more { "…and more." }`, wired to
+    /// the larger cap only — so the whole 21..=199 range reported as complete,
+    /// and a file with 57 problems showed 20 lines under a heading that said
+    /// 57. A unit test on `issue_tail` alone guards nothing here: the helper
+    /// was correct in isolation the moment it was written, and the defect was
+    /// entirely in which of the two numbers the view asked about.
+    #[test]
+    fn the_problem_list_discloses_its_own_cap_and_not_only_cores() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/import_view.rs"))
+                .expect("this file");
+        let body = crate::source_gate::production_code(&src);
+        assert!(
+            body.contains("issue_tail("),
+            "the tail must be derived by `import::issue_tail`, which sees both caps"
+        );
+        assert!(
+            !body.contains("…and more."),
+            "the old wording names neither cap and fires only on core's"
+        );
+    }
 }
