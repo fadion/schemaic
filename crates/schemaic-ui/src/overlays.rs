@@ -1136,6 +1136,38 @@ pub(crate) enum GearKind {
     ShowTableSizes,
 }
 
+impl GearKind {
+    /// Is this entry inert, given the connection's state **right now**?
+    ///
+    /// **Separate from [`gear_entries`] because the two questions have
+    /// different lifetimes.** Which rows exist is settled when the menu opens —
+    /// the engine's capabilities and whether a connection is saved cannot
+    /// change under a standing menu. Whether a row *acts* cannot be: the health
+    /// poll writes `ConnStatus::Disconnected` with no user interaction at all,
+    /// and the gear menu is deliberately not rebuilt while it stands. Frozen
+    /// into a per-row `bool` at build time, `Create database` and `Users and
+    /// privileges` stayed lit on a server that had since stopped — `Create
+    /// database` opened the form, previewed a real `CREATE DATABASE` and failed
+    /// at Apply with the connect error the header was already showing, which is
+    /// verbatim the outcome their own comments say the dim exists to prevent.
+    ///
+    /// `read_only` is not the live half — it only changes on a status-bar
+    /// click, and that press dismisses the menu — but it is asked here too so
+    /// there is one answer per row rather than two half-fresh ones.
+    pub(crate) fn disabled_when(self, read_only: bool, down: bool) -> bool {
+        match self {
+            // Never dimmed: a down connection is the one most worth re-reading,
+            // and collapsing the tree or toggling a column needs no server.
+            GearKind::Refresh | GearKind::CollapseAll | GearKind::ShowTableSizes => false,
+            // Dimmed on down but not on read-only: browsing accounts writes
+            // nothing, so the read-only refusal that guards `Create database`
+            // would answer a question this action does not ask.
+            GearKind::Users => down,
+            GearKind::CreateDatabase => read_only || down,
+        }
+    }
+}
+
 /// One SCHEMA-gear entry as data: its label, what it does, and whether it is
 /// inert.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1190,7 +1222,7 @@ pub(crate) fn gear_entries(
         out.push(GearEntry {
             label: "Users and privileges",
             kind: GearKind::Users,
-            disabled: down,
+            disabled: GearKind::Users.disabled_when(read_only, down),
         });
     }
     // Dimmed on read-only *and* on down, for the reason
@@ -1200,7 +1232,7 @@ pub(crate) fn gear_entries(
         out.push(GearEntry {
             label: "Create database",
             kind: GearKind::CreateDatabase,
-            disabled: read_only || down,
+            disabled: GearKind::CreateDatabase.disabled_when(read_only, down),
         });
     }
     // Absent where the engine has no sizes to show — a row that visibly toggles
@@ -1256,8 +1288,24 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                     let collapse_all = collapse_all.clone();
                     let toggle_sizes = toggle_sizes.clone();
                     let kind = e.kind;
-                    let disabled = e.disabled;
+                    // **Asked live, not captured.** `e.disabled` was resolved
+                    // when the menu was built, and this menu stays open — see
+                    // `GearKind::disabled_when`. The style closure below
+                    // already tracks (that is how the size toggle's label
+                    // updates in place), so reading `conn_status` inside it is
+                    // what makes the dim arrive without the menu being
+                    // reopened.
+                    let conn_status = ui.conn.conn_status;
+                    let connections = ui.conn.connections;
+                    let active_conn = ui.conn.active_conn;
+                    let live_disabled = move || {
+                        kind.disabled_when(
+                            conn_read_only(&connections, active_conn),
+                            conn_status.get().is_down(),
+                        )
+                    };
                     container(text(e.label).style(move |s| {
+                        let disabled = live_disabled();
                         // **The size toggle's label carries its state, the
                         // way the eye menu's rows do** — `db_toggle_on` when
                         // the column is showing. No check glyph: it would
@@ -1287,7 +1335,14 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                         if kind != GearKind::ShowTableSizes {
                             open.set(false);
                         }
-                        if disabled {
+                        // Re-asked, for the same reason the style closure is:
+                        // the connection may have dropped since the menu was
+                        // built, and a dimmed row that still acts is worse
+                        // than one that never dimmed.
+                        if kind.disabled_when(
+                            conn_read_only(&connections, active_conn),
+                            conn_status.get_untracked().is_down(),
+                        ) {
                             return;
                         }
                         match kind {
@@ -2693,6 +2748,26 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
         }
     });
 
+    // **Where the menu was raised, resolved once per menu.**
+    //
+    // The placement closure below tracks `window_size()`, so a window resize
+    // (a border drag, Win+Up) re-runs it — and it used to re-evaluate
+    // `menu.at.unwrap_or_else(|| last_mouse.get_untracked())` each time, so a
+    // menu raised on a row at the top of the tree teleported to wherever the
+    // pointer had since wandered. Reading `last_mouse` untracked stopped a bare
+    // mouse *move* from re-placing it and did nothing about a re-run driven by
+    // another signal. The keyboard route was immune only because it fills `at`.
+    //
+    // This memo tracks `ctx` and nothing else, so the anchor is fixed when the
+    // menu opens and the resize still re-runs the *flip*, which is the half
+    // that should follow the window.
+    let anchor = floem::reactive::create_memo(move |_| {
+        ctx.with(|m| {
+            m.as_ref()
+                .map(|m| m.at.unwrap_or_else(|| last_mouse.get_untracked()))
+        })
+    });
+
     let render = build.clone();
     dyn_container(
         move || ctx.get(),
@@ -2714,10 +2789,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
             return s;
         };
         // `at` when the opener named a place (Shift+F10, which opens at the nav
-        // cursor's row), else the pointer. Both go through the same edge-flip:
-        // a row low in the tree runs its last entries off the bottom otherwise,
-        // however the menu was raised.
-        let from = menu.at.unwrap_or_else(|| last_mouse.get_untracked());
+        // cursor's row), else where the pointer was when it was raised — see
+        // `anchor`. Both go through the same edge-flip: a row low in the tree
+        // runs its last entries off the bottom otherwise, however the menu was
+        // raised.
+        let Some(from) = anchor.get() else {
+            return s;
+        };
         let entries = (build)(menu);
         // The **drawn** height: a list longer than the window scrolls inside its
         // own panel now, so the placement must not be told it is taller than it is.
@@ -6745,6 +6823,34 @@ fn ",
             "a Find-Anywhere pass spells the search predicate itself; every \
              schema-search surface matches through `schema::object_name_matches` \
              (or a wrapper of it), or the palette drifts from the tree"
+        );
+    }
+
+    /// **The gear's rows ask their gate live.**
+    ///
+    /// `GearKind::disabled_when` is pure and `gear_entries` is tested over it,
+    /// but neither can see the bug this was: the row builder captured
+    /// `e.disabled` into a per-row `bool` at build time, and the menu is
+    /// deliberately not rebuilt while it stands, so a connection that dropped
+    /// under it left `Create database` and `Users and privileges` lit and
+    /// acting. The decision lives inside a `dyn_container` builder, which no
+    /// test here can reach — so this asks the source instead, in
+    /// `source_gate`'s idiom.
+    #[test]
+    fn the_gear_menu_does_not_freeze_its_gate() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let body = crate::source_gate::production_code(&src);
+        // Split so this assertion is not itself a match.
+        let frozen = format!("let disabled = e.{}", "disabled;");
+        assert!(
+            !body.contains(&frozen),
+            "the gear's row builder captures its gate; a connection that drops \
+             under a standing menu must dim the rows in place"
+        );
+        assert!(
+            body.matches("disabled_when(").count() >= 4,
+            "both the style closure and the click handler have to re-ask, and \
+             `gear_entries` builds its two gated rows from the same predicate"
         );
     }
 
