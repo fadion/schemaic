@@ -1782,9 +1782,14 @@ pub fn qualified_table(
     dialect: SqlDialect,
 ) -> String {
     let q = |s: &str| ident_sql(s, dialect);
+    // Spelled out rather than `_`, which is what every sibling per-engine match
+    // in this file and in `dump.rs` does. A wildcard here would sort a fourth
+    // engine onto the qualifying side silently — and unlike a `dialect ==
+    // Postgres` it leaves no comparison for a census to grep for, while the
+    // compiler, which flags an exhaustive match, says nothing.
     match dialect {
         SqlDialect::Sqlite => q(table),
-        _ => match schema {
+        SqlDialect::MySql | SqlDialect::Postgres => match schema {
             Some(ns) => format!("{}.{}", q(ns), q(table)),
             // **An empty `database` means "don't qualify"**, and no engine has a
             // database whose name is the empty string, so nothing legal collides

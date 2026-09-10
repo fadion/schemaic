@@ -3708,6 +3708,189 @@ mod no_bare_active_set_gate {
     }
 }
 
+/// **Ask a capability, never an engine — and now there is something that
+/// notices when a view doesn't.**
+///
+/// CLAUDE.md's engine rule is load-bearing: `dialect == Postgres` or
+/// `!= MySql` compiles cleanly while silently sorting a third engine onto
+/// whichever side it happens to fall, and the narrow predicates that exist to
+/// be asked instead (`ddl::supports_change`, `supports_or_replace_view`,
+/// `supports_column_reorder`, `supports_view_rename`,
+/// `alter_column_disturbs_checks`, `stats::supports_table_stats`, …) live
+/// inside a 9,000-line emitter that is legitimately per-dialect throughout, so
+/// a view author looking for one does not find it. The rule was unenforced,
+/// and the view crates' comparison count went from zero to two dozen
+/// unremarked — with `ddl_preview.rs`'s `unwrap_or(SqlDialect::MySql)` (a
+/// *constant* where a capability belonged) the case where the care ran out.
+///
+/// **This is a ratchet, not a ban.** Several admitted sites are genuinely
+/// per-engine *syntax shape* — a trigger-body template, `INSTEAD OF` timing, a
+/// view's `ALGORITHM=`, whether a role name has a host part — and no capability
+/// predicate covers those. What the gate stops is a new one appearing without
+/// anyone deciding it should. The counts are exact in both directions: paying
+/// one off is a deliberate edit here too, which is the only way the number ever
+/// goes down.
+#[cfg(test)]
+mod engine_comparison_gate {
+    /// Per-file budget of un-checked `SqlDialect::` uses in production code,
+    /// and why that file has any.
+    ///
+    /// The reasons are the record: each was read before it was admitted, and
+    /// the ones that are *not* clean are labelled so, because a gate that
+    /// launders debt into approval is worse than none.
+    const ADMITTED: &[(&str, usize, &str)] = &[
+        (
+            "account_editor.rs",
+            2,
+            "Account-name grammar. MySQL identifies an account as `user@host` \
+             and the other two do not, so the host field and the \
+             Database/Schema label are shape, not capability.",
+        ),
+        (
+            "lib.rs",
+            1,
+            "`edit_ctx`'s dialect when there is no connection at all. There is \
+             no capability to ask of nothing, and what it feeds — completion \
+             and diagnostics parsing — is never executed. Kept on the list \
+             anyway because this is the exact spelling A1.1-L2-01 shipped a \
+             bug in (`unwrap_or(SqlDialect::MySql)` where a capability \
+             belonged), and the next one like it should have to be argued.",
+        ),
+        (
+            "overlays.rs",
+            2,
+            "**Not clean.** `dialect != MySql` decides whether a *view* is \
+             offered a trigger, and `trigger_editor.rs` asks the same question \
+             again in its own spelling to default the draft. That is defence \
+             in depth today and divergence the moment one is edited — it wants \
+             a `ddl::supports_view_triggers`, which does not exist yet. The \
+             Postgres-only menu entry beside it is ordinary shape.",
+        ),
+        (
+            "routine_editor.rs",
+            2,
+            "Routine grammar: MySQL's characteristics block and PostgreSQL's \
+             `LANGUAGE`/`RETURNS` are different statements, not one statement \
+             an engine may or may not support.",
+        ),
+        (
+            "schemaic-app/ai.rs",
+            1,
+            "The dialect handed to the AI prompt when no connection is \
+             selected — the same no-connection case as `lib.rs`, and the \
+             prompt says `(none)` beside it.",
+        ),
+        (
+            "table_designer.rs",
+            9,
+            "**Partly not clean.** `has_comments != Sqlite` (twice) and \
+             `has_on_update == MySql` are capability questions with no \
+             predicate — `ddl::supports_column_comments` and \
+             `supports_on_update_current_timestamp` are the two this file is \
+             waiting for. The Postgres ones (identity, `NOT ENFORCED`, the \
+             storage row) are per-engine column *grammar*.",
+        ),
+        (
+            "trigger_editor.rs",
+            8,
+            "Trigger grammar throughout: the body template, `INSTEAD OF` \
+             timing, `FOR EACH ROW`, and PostgreSQL's separate function. \
+             `supports_trigger_editing` already answers the capability half \
+             and this file calls it; what is left is which statement to write.",
+        ),
+        (
+            "view_editor.rs",
+            4,
+            "View grammar: MySQL's `ALGORITHM=`/`SQL SECURITY`, PostgreSQL's \
+             `WITH CHECK OPTION` spelling, SQLite's absence of both. \
+             `supports_or_replace_view` and `supports_view_rename` carry the \
+             capability half and are called here.",
+        ),
+    ];
+
+    /// Is this line a `match` arm — `SqlDialect::X =>`, or several `|`-joined?
+    ///
+    /// **An exhaustive `match` is the sanctioned shape and is not what this
+    /// gate is about.** The compiler already refuses to let a fourth variant
+    /// through one, so the whole hazard the rule names — a branch that
+    /// silently swallows an engine nobody considered — cannot happen there.
+    /// What it cannot check is `== SqlDialect::Postgres`, `matches!(d,
+    /// SqlDialect::MySql)`, a wildcard arm's companion, or a bare
+    /// `unwrap_or(SqlDialect::MySql)` standing in for a capability, which is
+    /// the one that shipped.
+    fn is_match_arm(line: &str) -> bool {
+        let head = line.split("=>").next().unwrap_or("").trim();
+        !head.is_empty()
+            && head.contains("SqlDialect::")
+            // Path-tolerant: `schemaic_core::intel::SqlDialect::MySql` is the
+            // same arm spelled through the module.
+            && head.split('|').all(|t| {
+                t.trim()
+                    .rsplit_once("SqlDialect::")
+                    .is_some_and(|(path, variant)| {
+                        !variant.is_empty()
+                            && variant.chars().all(|c| c.is_alphanumeric() || c == '_')
+                            && path.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                    })
+            })
+    }
+
+    /// Deriving the dialect from a connection is not comparing engines.
+    ///
+    /// `SqlDialect::from_db_type(&c.db_type)` is how nearly every view answers
+    /// "which engine is this connection", and it is the *input* to a capability
+    /// question rather than a substitute for one. Counting it buried the
+    /// thirty sites this gate is about under twenty that are simply correct.
+    const DERIVATION: &str = "SqlDialect::from_db_type(";
+
+    #[test]
+    fn a_view_asks_a_capability_and_not_an_engine() {
+        let mut found: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, code) in crate::source_gate::crate_sources() {
+            let sites: Vec<String> = code
+                .lines()
+                .map(|l| l.replace(DERIVATION, "«derived»("))
+                .filter(|l| l.contains("SqlDialect::") && !is_match_arm(l))
+                .map(|l| l.trim().to_string())
+                .collect();
+            if !sites.is_empty() {
+                found.push((name, sites));
+            }
+        }
+        found.sort();
+        let mut report = String::new();
+        for (name, sites) in &found {
+            let budget = ADMITTED
+                .iter()
+                .find(|(f, _, _)| f == name)
+                .map(|(_, n, _)| *n);
+            // Counted per *occurrence*, not per line: two on one line is two.
+            let n: usize = sites
+                .iter()
+                .map(|l| l.matches("SqlDialect::").count())
+                .sum();
+            if budget != Some(n) {
+                report.push_str(&format!("{name}: {n}, admitted {budget:?}\n"));
+                for l in sites {
+                    report.push_str(&format!("    {l}\n"));
+                }
+            }
+        }
+        for (name, n, _) in ADMITTED {
+            if !found.iter().any(|(f, _)| f == name) {
+                report.push_str(&format!("{name}: admitted {n}, found none\n"));
+            }
+        }
+        assert!(
+            report.is_empty(),
+            "\n{report}\nAsk a capability, never an engine (CLAUDE.md). If one of \
+             these is a capability question, add or reuse a predicate in \
+             `core::ddl` and call that. If it is genuinely per-engine syntax \
+             shape, raise this file's number in ADMITTED and say why there."
+        );
+    }
+}
+
 /// Tabs / query signals (Copy bundle).
 #[derive(Clone, Copy)]
 pub struct TabsUi {
