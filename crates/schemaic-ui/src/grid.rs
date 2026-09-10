@@ -1849,7 +1849,16 @@ fn copy_selection(gs: GridState) {
     // absolute index, so a selection that crosses it reads one way on screen and
     // another in the range. The clipboard's consumer is outside this grid and has
     // only the order to go on.
-    let _ = floem::Clipboard::set_contents(cells.tsv(rect, gs.frozen.get_untracked()));
+    let block = cells.tsv_block(rect, gs.frozen.get_untracked());
+    // **What the format could not carry, said at the only step that knows.** A
+    // cell holding a tab is copied as two cells and pasted as two, shifting
+    // every later column of the row — and once the block is on the clipboard
+    // nothing can tell the separator from the content, so no paste can report
+    // it. The bottom bar's note surface, not the red one: the copy succeeded.
+    if let Some(note) = schemaic_core::edit::copy_split_note(block.split) {
+        gs.commit_note.set(Some(note));
+    }
+    let _ = floem::Clipboard::set_contents(block.text);
 }
 
 /// Paste the clipboard over the selection, staged as ordinary green edits.
@@ -9731,6 +9740,43 @@ fn truncate(s: &str, max: usize) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod clipboard_gate {
+    /// **The gate.** A copy whose cells hold a tab or a newline has to say so,
+    /// because the clipboard format cannot carry them and nothing downstream
+    /// can tell afterwards.
+    ///
+    /// `tsv` writes cell text between literal `\t` and `\n` with no escaping,
+    /// and `parse_tsv_block` splits on exactly those bytes — so a cell holding
+    /// `a<TAB>b` copies as two cells and pastes as two cells, shifting every
+    /// later column of the row. Pasted back into this grid that lands as
+    /// `status = 'b'`, staged green and one Commit from a real `UPDATE`; and if
+    /// the row runs out of columns the extra is counted in `plan.dropped` and
+    /// reported as "skipping 1 outside the grid", which reads as a clipping
+    /// problem rather than a corruption.
+    ///
+    /// The format is not being changed — a marker would break every
+    /// spreadsheet that receives one of these blocks — so the copy is the only
+    /// place that both knows and can speak. A unit test on `copy_split_note`
+    /// guards nothing without this: the sentence was right the moment it was
+    /// written, and the whole defect was that nobody asked for it.
+    #[test]
+    fn a_copy_that_the_clipboard_format_cannot_carry_says_so() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("grid.rs");
+        let src = std::fs::read_to_string(path).expect("this module's own source");
+        let at = src
+            .find("fn copy_selection(")
+            .expect("copy_selection is gone — this gate is stale");
+        let body_end = src[at..].find("\n}\n").expect("the end of the function") + at;
+        assert!(
+            src[at..body_end].contains("copy_split_note"),
+            "copy_selection must report the cells the TSV format split"
+        );
     }
 }
 

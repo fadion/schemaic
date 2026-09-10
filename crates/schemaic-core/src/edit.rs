@@ -997,18 +997,39 @@ impl GridCells<'_> {
     }
 
     /// The block `(r0, c0, r1, c1)` as TSV, for the clipboard. Raw values — see
-    /// [`GridCells::text`]. [`parse_tsv_block`] is its exact inverse.
+    /// [`GridCells::text`]. [`parse_tsv_block`] inverts it exactly **for cells
+    /// that hold neither a tab nor a newline**; [`GridCells::tsv_block`] is the
+    /// entry point that says how many did.
     ///
     /// Columns in the order they are **drawn** ([`visual_cols`]), not in index
     /// order: whoever receives the block reads it left to right, and under a
     /// freeze the two disagree.
-    pub fn tsv(
+    pub fn tsv(&self, rect: (usize, usize, usize, usize), frozen: Option<usize>) -> String {
+        self.tsv_block(rect, frozen).text
+    }
+
+    /// [`GridCells::tsv`], plus **what the format could not carry**.
+    ///
+    /// The separators are written raw and nothing is escaped or quoted, which
+    /// is deliberate — the receiving side is usually a spreadsheet, and a
+    /// marker of any kind would break every one of them. The cost is that a
+    /// cell whose own text holds a tab is copied as two cells and pasted as
+    /// two, shifting every later column of the row; a newline does the same a
+    /// row at a time. Pasted back into this grid that stages a *neighbouring*
+    /// column's value onto the wrong column, green and one Commit from a real
+    /// `UPDATE`, and the paste's own counters stay quiet because the row is
+    /// still one row.
+    ///
+    /// So the copy counts them, since the copy is the only step that both
+    /// knows and can still say. See [`copy_split_note`] for the sentence.
+    pub fn tsv_block(
         &self,
         (r0, c0, r1, c1): (usize, usize, usize, usize),
         frozen: Option<usize>,
-    ) -> String {
+    ) -> TsvBlock {
         let cols = selected_cols((c0, c1), self.rs.col_count(), frozen);
         let mut out = String::new();
+        let mut split = 0usize;
         for i in r0..=r1 {
             if i > r0 {
                 out.push('\n');
@@ -1017,10 +1038,17 @@ impl GridCells<'_> {
                 if n > 0 {
                     out.push('\t');
                 }
-                out.push_str(&self.text(i, ci, false));
+                let cell = self.text(i, ci, false);
+                // Counted from the same string that is written, in the same
+                // step — a second walk is a second chance to disagree with the
+                // block it is describing.
+                if cell.contains('\t') || cell.contains('\n') {
+                    split += 1;
+                }
+                out.push_str(&cell);
             }
         }
-        out
+        TsvBlock { text: out, split }
     }
 
     /// The block `(r0, c0, r1, c1)` as an AI attachment: its column names, its
@@ -1122,18 +1150,63 @@ fn selected_cols((c0, c1): (usize, usize), ncols: usize, frozen: Option<usize>) 
         .collect()
 }
 
+/// A copied block and what the clipboard's format could not carry.
+///
+/// See [`GridCells::tsv_block`], which is the only thing that builds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsvBlock {
+    /// The TSV itself, for the clipboard.
+    pub text: String,
+    /// How many of the copied cells held a tab or a newline of their own, and
+    /// were therefore written as more than one cell.
+    pub split: usize,
+}
+
+/// What a copy has to admit when the TSV format could not carry a cell whole,
+/// or `None` when every cell survived.
+///
+/// **The copy is the only step that can say it.** A tab inside a cell is
+/// indistinguishable from the separator the moment it is on the clipboard, so
+/// no paste — this grid's or a spreadsheet's — can tell afterwards; and the
+/// paste's own counters stay quiet, because a split row is still one row. The
+/// wording names the consequence rather than the encoding, since what the user
+/// has to decide is whether to paste it anywhere.
+pub fn copy_split_note(split: usize) -> Option<String> {
+    match split {
+        0 => None,
+        1 => Some(
+            "1 copied cell contains a tab or a line break — a paste will read it as more \
+             than one cell."
+                .to_string(),
+        ),
+        n => Some(format!(
+            "{n} copied cells contain a tab or a line break — a paste will read each of \
+             them as more than one cell."
+        )),
+    }
+}
+
 /// A clipboard block, parsed for pasting into the grid: rows of cell text.
 ///
-/// **The exact inverse of [`GridCells::tsv`]** — lines split on `\n` (a trailing
+/// **The inverse of [`GridCells::tsv`]** for any cell holding neither a tab nor
+/// a newline, which is what [`copy_split_note`] exists to report — lines split
+/// on `\n` (a trailing
 /// `\r` dropped, so a Windows clipboard behaves), cells split on `\t`, and *no
 /// quote interpretation at all*. The symmetry is the whole rule and it is worth
 /// stating, because a CSV-style parser here would be the obvious mistake: this
 /// codebase's copy side emits no quoting, so there is none to undo, and
 /// unquoting would silently turn a cell whose value genuinely is `"hello"` —
 /// ordinary in a database, and exactly what a user is most likely to be moving
-/// between rows — into `hello`. The cost is that a spreadsheet cell containing
-/// a newline arrives as two rows; that is the rarer wrong answer, and it is
-/// visible in the grid rather than silent.
+/// between rows — into `hello`.
+///
+/// The cost is real in both directions and only one half of it is visible. A
+/// cell containing a **newline** arrives as two rows, which shows up in the
+/// grid. A cell containing a **tab** arrives as two cells on *one* row: every
+/// later column shifts left by one, the values that land look like ordinary
+/// neighbouring text, and the paste's counters have nothing to report because
+/// the row count is right. That is why the *copy* counts them
+/// ([`copy_split_note`]) — by the time a block is on the clipboard the
+/// distinction is gone.
 ///
 /// A trailing newline (which every spreadsheet appends) is not a row. Text that
 /// is entirely empty yields no rows at all.
@@ -3330,6 +3403,63 @@ mod tests {
             g.tsv((0, 0, 1, 1), None),
             "1709380800\tsecond\n1709294400\tfirst"
         );
+    }
+
+    /// **A cell holding a tab does not survive the clipboard, and the copy is
+    /// the only step that can say so.**
+    ///
+    /// The round trip is asserted rather than the count alone: `tsv` writes
+    /// `7\ta\tb\topen` for a three-cell row whose middle value is `a<TAB>b`,
+    /// `parse_tsv_block` reads four cells back, and pasted into a grid that
+    /// stages `status = 'b'` — a neighbouring column's text, green and one
+    /// Commit from an `UPDATE`, with the paste's counters quiet because the
+    /// row is still one row. Nothing downstream can tell; hence the note.
+    #[test]
+    fn a_cell_holding_a_tab_does_not_round_trip_and_the_copy_reports_it() {
+        let rs = ResultSet::from_rows(
+            vec![
+                Column {
+                    name: "id".into(),
+                    type_name: "INT".into(),
+                    origin: None,
+                },
+                Column {
+                    name: "note".into(),
+                    type_name: "VARCHAR".into(),
+                    origin: None,
+                },
+                Column {
+                    name: "status".into(),
+                    type_name: "VARCHAR".into(),
+                    origin: None,
+                },
+            ],
+            vec![vec![
+                Value::Int(7),
+                Value::Str("a\tb".into()),
+                Value::Str("open".into()),
+            ]],
+        );
+        let (order, formats) = (vec![0], vec![crate::format::ColumnFormat::None; 3]);
+        let (dirty, new_rows) = (HashMap::new(), Vec::new());
+        let g = cells(&rs, &order, &formats, &dirty, &new_rows);
+
+        let block = g.tsv_block((0, 0, 0, 2), None);
+        assert_eq!(block.text, "7\ta\tb\topen");
+        assert_eq!(block.split, 1);
+
+        // The loss itself, pinned so nobody "fixes" the doc instead of the
+        // silence: three cells out, four cells back.
+        let back = parse_tsv_block(&block.text);
+        assert_eq!(back, vec![vec!["7", "a", "b", "open"]]);
+
+        let note = copy_split_note(block.split).expect("a split cell is reported");
+        assert!(note.starts_with("1 copied cell contains"), "{note}");
+        // A newline is the same defect one row at a time, and counts too.
+        assert_eq!(g.tsv_block((0, 0, 0, 0), None).split, 0);
+        assert_eq!(copy_split_note(0), None);
+        let many = copy_split_note(3).expect("plural");
+        assert!(many.starts_with("3 copied cells contain"), "{many}");
     }
 
     /// **Under a freeze, the clipboard reads left to right.** `note` frozen out
