@@ -157,12 +157,48 @@ thread_local! {
     static CATALOG: RefCell<intel::CatalogCache> = RefCell::new(intel::CatalogCache::default());
 }
 
-/// The `schemaic_core::intel::Catalog` for the loaded connection schemas and the
-/// tab's active database. Shared by the FK-aware `JOIN … ON` completion and the
-/// editor's diagnostics (`editor_pane::compute_diagnostics`), so both read the same
-/// catalog view.
+/// The `schemaic_core::intel::Catalog` for **validation** — every loaded
+/// database, hidden or not.
+///
+/// `schema::db_contributes`' own doc draws the line this pair of functions
+/// exists to keep: *"Hiding governs what is offered; never what is true."* The
+/// editor's diagnostics are the "true" side — a column that exists must not be
+/// squiggled because its database is hidden behind the SCHEMA eye — so this one
+/// asks nothing about hiding. Everything that makes an **offer** takes
+/// [`build_offer_catalog`] instead.
+///
+/// That split is the fix for one popup answering "does this database exist" two
+/// ways: `SchemaIndex::build` filters with `db_contributes` and this did not, so
+/// with `archive` hidden and no database selected the plain table list skipped
+/// it entirely while the FK JOIN-target rows immediately above offered
+/// `archive`'s tables in the top tier — and accepting one spliced
+/// `customers ON o.customer_id = customers.id` for a database the tree was
+/// hiding.
 pub(crate) fn build_catalog(
     db_nodes: RwSignal<Vec<ConnNode>>,
+    active_db: Option<&str>,
+) -> Arc<intel::Catalog> {
+    catalog_of(db_nodes, None, active_db)
+}
+
+/// The catalog for **offers** — FK auto-join, FK JOIN targets, `SELECT *`
+/// expansion. A database the SCHEMA eye has hidden contributes nothing to it,
+/// which is the rule `SchemaIndex::build` has always followed and these three
+/// surfaces did not.
+///
+/// Shares [`CATALOG`]'s cache: the filtered `loaded` list is a different key, so
+/// the two views coexist without a second cache or a second walk.
+pub(crate) fn build_offer_catalog(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden: &HashSet<String>,
+    active_db: Option<&str>,
+) -> Arc<intel::Catalog> {
+    catalog_of(db_nodes, Some(hidden), active_db)
+}
+
+fn catalog_of(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden: Option<&HashSet<String>>,
     active_db: Option<&str>,
 ) -> Arc<intel::Catalog> {
     // Each `schema` is the `Arc` out of `SchemaState`, so this walk is refcount
@@ -171,6 +207,7 @@ pub(crate) fn build_catalog(
     let loaded: Vec<(String, Arc<DbSchema>)> = db_nodes
         .get_untracked()
         .into_iter()
+        .filter(|node| hidden.is_none_or(|h| db_contributes(h, &node.database, active_db)))
         .filter_map(|node| match node.schema.get_untracked() {
             SchemaState::Loaded(schema) => Some((node.database, schema)),
             _ => None,
@@ -811,7 +848,8 @@ pub(crate) fn recompute_completions(
     // on an empty ON expression (`prefix` empty, in a column/ON context), so it
     // never fights manual typing.
     if prefix.is_empty() && matches!(ctx, ClauseCtx::Column) {
-        let catalog = build_catalog(db_nodes, active_db);
+        // The *offer* catalog: a hidden database must not be joined to.
+        let catalog = hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
         if let Some(pred) = intel::join_condition(&text, lo, hi, offset, &catalog, dialect) {
             set_anchor(ed, comp, offset);
             set_items(
@@ -1055,7 +1093,8 @@ pub(crate) fn recompute_completions(
         ClauseCtx::Table => {
             // FK-aware JOIN targets first (top tier): a table connected by a foreign
             // key to something in scope, inserting `table ON <predicate>` in one go.
-            let catalog = build_catalog(db_nodes, active_db);
+            let catalog =
+                hidden_dbs.with_untracked(|h| build_offer_catalog(db_nodes, h, active_db));
             let mut fk_added = false;
             for jt in intel::join_targets(&text, lo, hi, offset, &catalog, dialect) {
                 let tl = jt.table.to_ascii_lowercase();
@@ -1208,7 +1247,9 @@ pub(crate) fn recompute_completions(
     // SELECT * expansion: when the caret sits right after a projection `*`/`t.*`,
     // offer an item that rewrites it into the explicit column list (shown when the
     // popup opens here — e.g. via Ctrl+Space, since the list doesn't auto-open on `*`).
-    if let Some(exp) = star_expansion(&text, lo, hi, offset, db_nodes, active_db, dialect) {
+    if let Some(exp) = hidden_dbs
+        .with_untracked(|h| star_expansion(&text, lo, hi, offset, db_nodes, h, active_db, dialect))
+    {
         // `exp.columns`, not the commas in the SQL: a quoted identifier holding
         // one (`` `a,b` ``, legal on MySQL) over-reported. And `plural`, which
         // this crate has 33 other call sites for — a one-column table is
@@ -1314,12 +1355,14 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
 /// `SELECT *` expansion for the candidate at the caret, or `None`. Cheap-guards on
 /// the caret sitting right after a `*` before building the catalog + delegating to
 /// `intel::expand_star`, so the common keystroke path stays allocation-free.
+#[allow(clippy::too_many_arguments)] // the caret's whole context; a struct adds no clarity
 fn star_expansion(
     text: &str,
     lo: usize,
     hi: usize,
     offset: usize,
     db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden: &HashSet<String>,
     active_db: Option<&str>,
     dialect: SqlDialect,
 ) -> Option<intel::StarExpansion> {
@@ -1331,7 +1374,8 @@ fn star_expansion(
     if p <= lo || b.get(p - 1) != Some(&b'*') {
         return None;
     }
-    let catalog = build_catalog(db_nodes, active_db);
+    // An offer, so a hidden database's columns are not part of it.
+    let catalog = build_offer_catalog(db_nodes, hidden, active_db);
     intel::expand_star(text, lo, hi, offset, &catalog, dialect)
 }
 
@@ -2145,5 +2189,130 @@ mod tests {
         assert!(!rows.iter().any(|r| r.1 == "orders"));
         // And the interior match sorts last of the three that do.
         assert_eq!(rows.last().map(|r| r.1), Some("account_customs"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use floem::prelude::SignalUpdate;
+    use floem::reactive::{RwSignal, Scope};
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::schema::{ColumnInfo, DbSchema, ForeignKeyInfo, SchemaState, TableInfo};
+
+    use super::{build_catalog, build_offer_catalog};
+
+    fn tbl(name: &str, cols: &[&str], fk: Option<(&str, &str, &str)>) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            columns: cols
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.to_string(),
+                    type_name: "int".into(),
+                    nullable: true,
+                    ..Default::default()
+                })
+                .collect(),
+            foreign_keys: fk
+                .map(|(col, ref_table, ref_col)| {
+                    vec![ForeignKeyInfo {
+                        name: "fk".into(),
+                        columns: vec![col.to_string()],
+                        ref_table: ref_table.to_string(),
+                        ref_columns: vec![ref_col.to_string()],
+                        ..Default::default()
+                    }]
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    /// **One popup answered "does this database exist" two ways.**
+    ///
+    /// `SchemaIndex::build` filters with `schema::db_contributes` — a hidden
+    /// database "contributes nothing at all, not its name, not its tables, not
+    /// its columns" — and `build_catalog` never asked. So with `archive` hidden
+    /// and no database selected, the plain table list skipped it entirely while
+    /// the FK JOIN-target rows immediately above offered `archive`'s tables in
+    /// the **top** tier, and accepting one spliced a join to a database the tree
+    /// was hiding.
+    ///
+    /// The two catalogs are the fix, and the rule that separates them is
+    /// `db_contributes`' own: hiding governs what is *offered*, never what is
+    /// true — so the diagnostics keep the unfiltered view, or a column that
+    /// exists would be squiggled for living in a hidden database.
+    #[test]
+    fn a_hidden_database_is_offered_no_join_but_still_validates() {
+        let cx = Scope::new();
+        let shop = DbSchema {
+            tables: vec![tbl("orders", &["id", "customer_id"], None)],
+            ..Default::default()
+        };
+        let archive = DbSchema {
+            tables: vec![tbl(
+                "customers",
+                &["id", "order_id"],
+                Some(("order_id", "orders", "id")),
+            )],
+            ..Default::default()
+        };
+        let nodes = vec![
+            crate::ConnNode::new(cx, 0, "conn", "shop"),
+            crate::ConnNode::new(cx, 1, "conn", "archive"),
+        ];
+        nodes[0].schema.set(SchemaState::Loaded(Arc::new(shop)));
+        nodes[1].schema.set(SchemaState::Loaded(Arc::new(archive)));
+        let db_nodes = RwSignal::new(nodes);
+
+        let sql = "SELECT * FROM orders o JOIN ";
+        let offered = |cat: &schemaic_core::intel::Catalog| -> Vec<String> {
+            schemaic_core::intel::join_targets(sql, 0, sql.len(), sql.len(), cat, SqlDialect::MySql)
+                .into_iter()
+                .map(|t| t.table)
+                .collect()
+        };
+
+        // Nothing hidden: the cross-database FK target is offered.
+        let none = HashSet::new();
+        let cat = build_offer_catalog(db_nodes, &none, None);
+        assert!(
+            offered(&cat).iter().any(|t| t == "customers"),
+            "{:?}",
+            offered(&cat)
+        );
+
+        // `archive` hidden, no database selected: it contributes nothing to an
+        // offer.
+        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
+        let cat = build_offer_catalog(db_nodes, &hidden, None);
+        assert!(
+            !offered(&cat).iter().any(|t| t == "customers"),
+            "a hidden database was offered as a JOIN target: {:?}",
+            offered(&cat)
+        );
+
+        // The validation catalog is unfiltered, so a real column in a hidden
+        // database is still known — "hiding governs what is offered, never what
+        // is true".
+        let cat = build_catalog(db_nodes, None);
+        assert!(
+            offered(&cat).iter().any(|t| t == "customers"),
+            "the validation catalog must not be filtered: {:?}",
+            offered(&cat)
+        );
+
+        // And the active-database exception holds: hiding the database you are
+        // working in does not take it out of your own completion.
+        let cat = build_offer_catalog(db_nodes, &hidden, Some("archive"));
+        assert!(
+            offered(&cat).iter().any(|t| t == "customers"),
+            "the active database's own tables must survive hiding: {:?}",
+            offered(&cat)
+        );
+        cx.dispose();
     }
 }
