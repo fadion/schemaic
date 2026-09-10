@@ -63,10 +63,7 @@ macro_rules! live_suite {
                 async fn $test() {
                     let target = &crate::endpoint::$target;
                     if !target.enabled() {
-                        eprintln!(
-                            "live: {} is not in SCHEMAIC_IT_ENGINES — this test asserted nothing",
-                            target.name
-                        );
+                        crate::endpoint::note_skipped(target);
                         return;
                     }
                     crate::$module::$test(target).await;
@@ -228,5 +225,43 @@ mod name_guard {
         // Belt and braces: every name is quoted before it reaches a statement,
         // so this is the second lock rather than the first.
         assert_scratch_name("schemaic_it_1`; DROP DATABASE sakila; --");
+    }
+}
+
+/// The skip notice is the whole mitigation for the one silent-green exception
+/// this tier allows, so its *spelling* is load-bearing.
+///
+/// libtest captures a test's `print!`/`eprint!` and prints it only for failing
+/// tests — and a skipped leg is a passing one, so the notice was swallowed for
+/// years of runs. `endpoint::note_skipped` writes to the locked handle instead,
+/// which is past the macro's capture-aware path.
+///
+/// A source assertion because it has to be: libtest's capture is a property of
+/// the harness, not something a `#[test]` can observe about its own run. Same
+/// argument every source gate in this workspace makes.
+mod skip_notice {
+    #[test]
+    fn no_skip_notice_goes_through_the_captured_macro() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("live");
+        for file in ["main.rs", "endpoint.rs"] {
+            let src = std::fs::read_to_string(dir.join(file))
+                .unwrap_or_else(|e| panic!("reading {file}: {e}"));
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Split so this assertion is not itself a match.
+            let macro_call = format!("eprint{}!(", "ln");
+            assert!(
+                !code.contains(&macro_call),
+                "{file} reports through the macro libtest hides for passing \
+                 tests; the skip notice must go to the locked stderr handle \
+                 (`endpoint::note_skipped`), or the one exception this tier \
+                 allows becomes a silent green"
+            );
+        }
     }
 }

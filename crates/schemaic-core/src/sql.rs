@@ -71,7 +71,7 @@ impl SqlDialect {
     /// as an identifier, escaped only by doubling. (SQLite additionally *falls back*
     /// to reading one as a string when it resolves to no identifier, but that is a
     /// name-resolution rule, not a lexical one — the span is the same either way.)
-    fn double_quote_is_ident(self) -> bool {
+    pub(crate) fn double_quote_is_ident(self) -> bool {
         !matches!(self, SqlDialect::MySql)
     }
 
@@ -89,7 +89,7 @@ impl SqlDialect {
     /// Are `[…]` identifiers accepted? SQLite only (taken for SQL-Server/Access
     /// compatibility). There is **no escape inside one** — the span ends at the
     /// first `]`, because SQLite defines no way to write one.
-    fn bracket_ident(self) -> bool {
+    pub(crate) fn bracket_ident(self) -> bool {
         matches!(self, SqlDialect::Sqlite)
     }
 

@@ -417,3 +417,49 @@ fn every_leg_declares_the_number_of_cases_it_has() {
         );
     }
 }
+
+/// Say, **where a developer will see it**, that a leg was excluded.
+///
+/// The tier's design is explicit that a silent green is the thing it exists to
+/// prevent, and it names one deliberate exception: a leg left out of
+/// `SCHEMAIC_IT_ENGINES` returns without asserting. The whole mitigation for
+/// that exception is this notice, and [`engines_var`]'s own doc states the
+/// bargain it rests on — an exclusion is tolerable when a developer typed it on
+/// their own machine and *can see it on stderr*.
+///
+/// **They could not.** It was `eprintln!` inside a `#[tokio::test]` body, and
+/// libtest captures a test's `print!`/`eprint!` and prints it **only for
+/// failing tests** — which a skipped leg is not. So narrowing the tier to
+/// `mariadb` reported green across all three legs' names with nothing on screen
+/// separating the ones that ran from the ~two-thirds that returned
+/// immediately. That matters beyond tidiness: this tier is the only call-site
+/// coverage the write-back 1-row net has on MySQL and PostgreSQL, so a
+/// developer who narrowed the tier, fixed a MariaDB failure and re-ran to green
+/// has been told nothing about the other two.
+///
+/// `writeln!` on the locked handle writes past libtest's capture-aware macro
+/// path, and the once-per-leg guard keeps ninety-odd identical lines down to
+/// one. `no_skip_notice_goes_through_the_captured_macro` is what holds the
+/// spelling, because a `#[test]` cannot observe libtest's capture about its own
+/// run — the same argument the crate's source gates all make.
+pub fn note_skipped(target: &'static Target) {
+    use std::io::Write as _;
+    use std::sync::OnceLock;
+    static SAID: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        OnceLock::new();
+    let said = SAID.get_or_init(Default::default);
+    let first = said
+        .lock()
+        .map(|mut s| s.insert(target.name))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "live: {} is not in SCHEMAIC_IT_ENGINES — its tests asserted nothing",
+        target.name
+    );
+    let _ = err.flush();
+}

@@ -7950,7 +7950,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 old.cancel();
             }
             let want = target.clone();
-            let report = create_ext_action(cx, move |res: Result<u64, String>| {
+            // **`Option<String>` for the error, so the cancel is a variant and
+            // not a sentence.** This matched `e == DbError::Cancelled.to_string()`
+            // — the only place in the workspace that recognised a typed error by
+            // its rendered `Display` — so rewording `#[error("query cancelled")]`,
+            // a copy edit with nothing to fail, would have turned a cancelled
+            // count into a visible error in the panel. The cause was an ordering
+            // slip rather than a missing abstraction: `map_err(|e| e.to_string())`
+            // ran in the spawned task, *before* the closure that has to tell the
+            // variants apart, so the closure had nothing left but text. Two other
+            // sites in this file get the order right; this one now does too.
+            let report = create_ext_action(cx, move |res: Result<u64, Option<String>>| {
                 if properties.with_untracked(|t| t.as_ref() != Some(&want)) {
                     return;
                 }
@@ -7973,11 +7983,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             *st = schemaic_ui::PropertiesState::Loaded(stats);
                         });
                     }
-                    // A cancelled count is not a failure to report: the user asked
-                    // for it to stop, and the estimate they already have is what
-                    // the panel goes back to showing.
-                    Err(e) if e == schemaic_db::DbError::Cancelled.to_string() => {}
-                    Err(e) => properties_count_err.set(Some(e)),
+                    // A cancelled count is not a failure to report: the user
+                    // asked for it to stop, and the estimate they already have
+                    // is what the panel goes back to showing.
+                    Err(None) => {}
+                    Err(Some(e)) => properties_count_err.set(Some(e)),
                 }
             });
             handle.spawn(async move {
@@ -7989,7 +7999,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         token,
                     )
                     .await
-                    .map_err(|e| e.to_string());
+                    // Discriminated while still typed, erased after — the whole
+                    // point of the `Option` above.
+                    .map_err(|e| match e {
+                        schemaic_db::DbError::Cancelled => None,
+                        other => Some(other.to_string()),
+                    });
                 report(res);
             });
         })

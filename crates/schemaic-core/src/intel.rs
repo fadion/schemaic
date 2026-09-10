@@ -5623,6 +5623,55 @@ mod tests {
 
     const DIALECTS: [SqlDialect; 3] = [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
 
+    /// **[`ident_quote`] and `SqlDialect`'s three predicates are two tables for
+    /// one fact, and nothing said they agreed.**
+    ///
+    /// `sql::ident_at`/`quoted_ident` deliberately does not go through
+    /// `skip_noncode` — its doc says why: which bytes quote a *name* is this
+    /// function's answer, because SQLite's `[x]` does not close with the byte it
+    /// opened with. Fair, and it makes this a second per-dialect quote table
+    /// standing beside `SqlDialect::backtick_ident` /
+    /// `double_quote_is_ident` / `bracket_ident`: two tables, one fact, three
+    /// dialects, six independent editing sites.
+    ///
+    /// A fourth dialect — or a change to one engine's accepted quoting — means
+    /// editing both, and editing only one fails **silently in the direction
+    /// that matters**: an `ident_quote` returning `None` for a spelling
+    /// `skip_noncode` treats as an identifier makes the tokenizer read a quoted
+    /// name as opaque non-code, which is a shipped bug this function's own doc
+    /// already records — "a completion popup that goes blank on a name the user
+    /// quoted".
+    ///
+    /// The two are not merged, and should not be: the `doubled` flag and the
+    /// asymmetric `]` close are `ident_quote`'s own, and belong to it. This
+    /// turns them into one *checked* fact instead.
+    #[test]
+    fn the_two_quote_tables_agree_for_every_dialect_and_byte() {
+        for d in DIALECTS {
+            for (open, accepted) in [
+                (b'`', d.backtick_ident()),
+                (b'"', d.double_quote_is_ident()),
+                (b'[', d.bracket_ident()),
+            ] {
+                assert_eq!(
+                    ident_quote(d, open).is_some(),
+                    accepted,
+                    "{d:?}: `{}` is an identifier quote to one table and not the other",
+                    open as char
+                );
+            }
+            // And nothing else opens one, on any dialect — the negative half,
+            // so a table that said "yes" to everything would fail too.
+            for open in *b"'(_a] " {
+                assert!(
+                    ident_quote(d, open).is_none(),
+                    "{d:?}: `{}` opens a quoted identifier",
+                    open as char
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_reply_with_a_non_ascii_chatter_line_still_finds_its_sql() {
         // `droppable` inlined a fifth word-run predicate without the `>= 0x80`
