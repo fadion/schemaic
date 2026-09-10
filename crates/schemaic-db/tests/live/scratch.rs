@@ -190,6 +190,25 @@ impl Scratch {
     ///
     /// `what` names the kind of plan, for the failure message only.
     pub async fn apply_plan(&self, set: &schemaic_core::ddl::ChangeSet, what: &str) {
+        self.apply_plan_in(&self.namespace_ref(), set, what).await;
+    }
+
+    /// [`Scratch::apply_plan`] against a namespace that is not this scratch's
+    /// own — which on PostgreSQL is the same database and a different schema,
+    /// and on MySQL a different database entirely.
+    ///
+    /// The connection is scoped to `ns.database` for the same reason
+    /// [`Scratch::exec_in`] does it: on a leg where a namespace *is* a
+    /// database, a statement run on the primary connection would need the
+    /// server to allow cross-database DDL. What routes the statement within
+    /// that database is the qualifier the emitter wrote, which is the thing
+    /// under test.
+    pub async fn apply_plan_in(
+        &self,
+        ns: &Namespace,
+        set: &schemaic_core::ddl::ChangeSet,
+        what: &str,
+    ) {
         assert!(
             !set.changes.is_empty(),
             "{}: the {what} draft proposed no change at all — the test changed nothing",
@@ -203,7 +222,9 @@ impl Scratch {
             set.changes
         );
         self.db
-            .run_ddl(&self.database, &stmts, CancellationToken::new())
+            .clone()
+            .with_database(Some(&ns.database))
+            .run_ddl(&ns.database, &stmts, CancellationToken::new())
             .await
             .unwrap_or_else(|e| {
                 panic!(

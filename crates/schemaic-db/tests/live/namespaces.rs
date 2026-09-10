@@ -45,6 +45,55 @@ pub async fn same_named_tables_in_two_namespaces_stay_distinct(target: &'static 
         target.name
     );
 
+    // **The two assertions above are nearly free on a leg whose namespaces are
+    // databases.** `table_in` issues a separate `fetch_schema` per namespace,
+    // and `collect_schema`'s table query is bound to that same argument
+    // (`TABLE_SCHEMA = ?`), so on MySQL and MariaDB the two column lists differ
+    // by construction: the only regression they can catch there is one that
+    // ignores the `database` parameter outright, not the identity collapse this
+    // test is named for. Only the PostgreSQL leg, where both tables come back
+    // from **one** call and the discriminator is `t.schema`, tests the claim.
+    //
+    // So this asks a question about *one* call: within a single introspection,
+    // the namespace has to be what picks between two same-named tables.
+    //
+    // **On PostgreSQL that is the real thing** — both `orders` tables come back
+    // from this one `fetch_schema`, and `t.schema` is the only thing telling
+    // them apart, so a collapse shows up here. On a leg where a namespace *is*
+    // a database there is nothing stronger available, and saying so is better
+    // than implying otherwise: one call covers one database by definition, so
+    // the alt table is not in this answer at all and the assertion is close to
+    // free there. The cross-namespace join
+    // (`a_join_across_namespaces_stays_two_tables`) is where those legs are
+    // actually held to the claim, because one result set carries both.
+    let primary = scratch
+        .db
+        .clone()
+        .with_database(Some(&scratch.database))
+        .fetch_schema(&scratch.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("introspecting {}: {e}", scratch.database));
+    let ns = scratch.namespace_ref();
+    let mine: Vec<&schemaic_core::schema::TableInfo> = primary
+        .tables
+        .iter()
+        .filter(|t| t.name == "orders" && t.schema.as_deref() == ns.schema.as_deref())
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "{}: one introspection returned {} tables called orders in this \
+         namespace",
+        target.name,
+        mine.len()
+    );
+    assert!(
+        mine[0].columns.iter().all(|c| c.name != "customer"),
+        "{}: the primary namespace's orders came back with the *alt* table's \
+         shape — the two collapsed inside one introspection",
+        target.name
+    );
+
     scratch.teardown().await;
 }
 
@@ -471,4 +520,103 @@ pub async fn a_join_across_namespaces_stays_two_tables(target: &'static Target) 
     );
 
     scratch.teardown().await;
+}
+
+/// **The branch that qualifies generated DDL has never reached a server.**
+///
+/// `schema::sql_qualifier` returns `None` for `public`, so the qualifying arm
+/// is taken only for a non-default schema — and every table in the DDL, view
+/// and trigger tiers is addressed through `Scratch::qualified`, which resolves
+/// to `public` on the PostgreSQL leg and to the connection's own database on
+/// both MySQL legs. `alt_namespace` had three callers, all in this file, and
+/// all three were reads or a `commit_writes` UPDATE: no `run_ddl` had ever run
+/// against a table outside the default namespace on any engine.
+///
+/// What that hides is not a loud failure. Drop the qualifier from the emitted
+/// `ALTER TABLE` and PostgreSQL resolves the bare name through `search_path`
+/// (`"$user", public`), so a designer edit to `alt.orders` alters
+/// `public.orders` instead — same table name, a plausible shape, and the
+/// statement succeeds.
+///
+/// **The untouched table is the assertion that matters**, which is why both
+/// namespaces get a table of the same shape: an `ALTER` aimed at the wrong one
+/// has to *succeed* for the failure to be silent.
+pub async fn generated_ddl_lands_in_the_namespace_it_was_drafted_from(target: &'static Target) {
+    use schemaic_core::ddl::{self, ColumnDraft, TableDraft};
+    use schemaic_core::schema::ColumnInfo;
+
+    let mut scratch = Scratch::create(target, "ns_ddl").await;
+    let alt = scratch.alt_namespace().await;
+    let shape = "(id INTEGER NOT NULL PRIMARY KEY, label VARCHAR(16))";
+    scratch
+        .exec(&format!(
+            "CREATE TABLE {} {shape}",
+            scratch.qualified("orders")
+        ))
+        .await;
+    scratch
+        .exec_in(
+            &alt,
+            &format!(
+                "CREATE TABLE {} {shape}",
+                scratch.qualified_in(&alt, "orders")
+            ),
+        )
+        .await;
+
+    let current = table_info_in(&scratch, &alt, "orders").await;
+    assert_eq!(
+        current.schema.as_deref(),
+        alt.schema.as_deref(),
+        "{}: the introspected table does not carry the alt namespace, so this \
+         test could not tell the two apart",
+        target.name
+    );
+    let mut draft = TableDraft::from_table(&current);
+    draft.columns.push(ColumnDraft::new(ColumnInfo {
+        name: "added".to_string(),
+        type_name: "INTEGER".to_string(),
+        nullable: true,
+        ..Default::default()
+    }));
+    let set = ddl::diff(&current, &draft, target.engine.dialect());
+    scratch
+        .apply_plan_in(&alt, &set, "alt-namespace table")
+        .await;
+
+    let after = table_info_in(&scratch, &alt, "orders").await;
+    assert!(
+        after.columns.iter().any(|c| c.name == "added"),
+        "{}: the column did not land in the namespace it was drafted from",
+        target.name
+    );
+    let other = table_info_in(&scratch, &scratch.namespace_ref(), "orders").await;
+    assert!(
+        other.columns.iter().all(|c| c.name != "added"),
+        "{}: the ALTER landed on the *other* namespace's same-named table",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
+
+/// The `TableInfo` for `table` as `ns` reports it — the whole row the designer
+/// would draft from, not just its column names (cf. [`table_in`]).
+async fn table_info_in(
+    scratch: &Scratch,
+    ns: &Namespace,
+    table: &str,
+) -> schemaic_core::schema::TableInfo {
+    let schema = scratch
+        .db
+        .clone()
+        .with_database(Some(&ns.database))
+        .fetch_schema(&ns.database, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("introspecting {}: {e}", ns.database));
+    schema
+        .tables
+        .into_iter()
+        .find(|t| t.name == table && t.schema.as_deref() == ns.schema.as_deref())
+        .unwrap_or_else(|| panic!("no {table:?} in {}", ns.database))
 }

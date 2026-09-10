@@ -700,8 +700,11 @@ existing prose was left alone.
     `GridCells` is a borrow struct over what the grid's signals hold — `rs`, the display→data
     `order`, the per-column `formats`, `dirty` and `new_rows` — and `text(i, ci, formatted)`
     resolves one *display* cell in the painter's order: a pending new row's typed value, then a
-    staged edit, then the stored cell through `format::apply`. `tsv(rect, frozen)` is the clipboard's
-    block and `attached(rect, cap, frozen)` is an AI attachment's column names, rows and pre-cap
+    staged edit, then the stored cell through `format::apply`. `tsv_block(rect, frozen)` is the
+    clipboard's block **plus what the format could not carry** — `TsvBlock { text, split }`, `split`
+    counting the copied cells that hold a tab or a newline of their own, phrased by
+    `copy_split_note` and reported by the grid (`tsv` is the wrapper that throws the count away);
+    and `attached(rect, cap, frozen)` is an AI attachment's column names, rows and pre-cap
     total — both emitting the selected columns in the order they are **drawn** (`visual_cols`) rather
     than in index order, because whoever receives the block reads it left to right and a copy across
     a freeze reached a spreadsheet transposed. One rule,
@@ -1277,10 +1280,20 @@ existing prose was left alone.
     `IssueKind::CellError`, raised ahead of the type dispatch and not by it**: a cell the sheet
     could not evaluate is wrong for *every* column type, and `ColKind::Other` — text, date, JSON,
     blob, enum — has no dispatch to catch it with, so a `#N/A` went into a `VARCHAR` column as the
-    literal text. `is_worksheet_error` matches the closed set the format defines, case-sensitively
-    and whole-field, so a `VARCHAR` holding "check the #REF! column" is text, which it is. It is
-    **gated on `ImportFormat::Xlsx`**, which is why `coerce_record` gained a `format` parameter — a
-    `#N/A` typed into a CSV is a string somebody wrote. The worksheet header goes through
+    literal text. **Which cells those are is carried from the reader, not re-derived from the
+    text.** `Record` — the private type the traversal hands over (`for_each_record`,
+    `xlsx_records`, `xlsx_rows`, `RowSourceIter::Buffered`) — pairs the `fields` with
+    `sheet_errors`, the indices of the cells calamine reported as `Data::Error`, and
+    `coerce_record` takes that slice where it used to take the `ImportFormat`. It was a table of
+    the ten spellings gated on `ImportFormat::Xlsx`, and that cannot work: `cell_text` renders a
+    formula error in Excel's own words, so a broken cell and a *string* cell whose whole content is
+    `#N/A` are byte-identical by the time the coercer sees them — and `#N/A` is pandas' first
+    default `na_values` entry and what people type by hand for "not applicable", so an ordinary
+    workbook with one in a `status` column was refused **whole** (the first issue makes `row_iter`
+    return `Err` and rolls the transaction back). No format gate is needed any more, because only a
+    worksheet ever fills the list, and nothing trims the indices alongside a trimmed field list
+    (`trim_to_mapping`) because an index past the end matches no field that is still there. The
+    worksheet header goes through
     `text::strip_bom` for the same reason the CSV path does: a BOM that survived a round trip
     through a BOM'd CSV lands *inside* the first header name and silently breaks name-matching on
     the very first column. **`ImportFormat::has_own_nulls` is the capability the null rules ask** — true for JSON
@@ -4097,10 +4110,24 @@ existing prose was left alone.
     wall clock the server read as its own: server at `+00:00`, client at `+02`, an instant stored two
     hours in the future and rendered back in the session zone so the cell re-read as correct. It
     drops the old value's fraction for the same class of reason — those were its microseconds, not
-    this instant's. `set_date` drops the offset on **both** flavours of column, because an offset
-    qualifies a particular instant: `+01` on a Berlin `timestamptz` is true in January and false in
-    July, so carrying it onto a picked July day restates the time of day an hour out and changes the
-    one thing the user did not touch. **MySQL's `TIMESTAMP` is the one entry this deliberately gets
+    this instant's. **`set_date` asks the same destination, and it is the pair that made that
+    necessary.** It used to clear the offset unconditionally, on the premise that the tail was the
+    old value's — the server's rendering, best handed back bare so the session zone resolves it.
+    True of a value read from the server and false of one `set_now` wrote two clicks earlier, which
+    is the *client's* assertion about which instant "now" is: client at UTC+2, server at UTC, **Now**
+    put `09:00:00+02:00` in the field, picking another day turned it into a bare `09:00:00`, and the
+    commit stored an instant two hours from the one the field had been showing — rendered back in the
+    server's zone, so nothing on screen said it had moved. Every test asked one of the two functions
+    at a time and nothing composed them, which is what
+    `now_then_pick_a_day_keeps_the_instant_now_stated` is for. So a `Zoned::Offset` column is
+    re-stated with the client's offset and one that cannot resolve an offset still gets none. **The
+    cost is stated rather than hidden**: an offset qualifies a particular instant and the client's is
+    *today's*, so picking a July day from Berlin in January states `+01`, an hour from the July wall
+    clock the field shows. Recomputing it needs the zone's DST rules, which `core` has no business
+    carrying, and the string alone cannot tell a server-rendered offset from a client-asserted one —
+    so this is a choice between two wrong answers, and it takes the one that is wrong only across a
+    DST boundary over the one that was wrong whenever client and server sit in different zones.
+    **MySQL's `TIMESTAMP` is the one entry this deliberately gets
     wrong**, and it is `Zoned::Naive` on purpose: the type *does* resolve an offset — stored in UTC,
     rendered in the session zone — but there is no offset it can be sent that every server on this
     dialect reads. `[+-]hh:mm` inside a datetime literal is MySQL 8.0.19+, and **MariaDB accepts no
@@ -13249,9 +13276,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   each keeping its own `to_lowercase().contains`. The empty needle is why that matters beyond
   tidiness: the predicate owns the rule that an empty term matches nothing (every caller answers "no
   filter" separately), and while the callers spelled the comparison themselves that case was handled
-  in some of them and not others. `overlays::schema_hits` is the palette's half split out as plain data for exactly this
-  reason, and `overlays::find_tests` asserts the two surfaces return the same objects for a set of
-  terms. **One deliberate divergence, and it is the only one allowed without a test change:** an
+  in some of them and not others. **Find-Anywhere's three passes were the last two copies**, and
+  they were one function asking one question three times and answering it two ways: pass 2 went
+  through the predicate while passes 1 and 3 hand-spelled `name.to_lowercase().contains(q)`, so a
+  clause added to it — the predicate's own hypotheticals are quote-stripping and
+  underscore/camel splitting — would have moved the tree and the object pass and left the name and
+  column passes behind, leaving the palette disagreeing with the tree *and with itself*. Nothing
+  fails for that today, which is why the pin is a **source gate**
+  (`find_anywhere_matches_through_the_one_predicate`) rather than a behavioural test, and why it is
+  scoped to `schema_hits` and not to `find_matches`: the passes live in the former, and a gate
+  pointed at the latter scans forty lines of delegation and reports success — which is how it was
+  first written, and what mutating the fix caught. Pass 1 asks `object_name_matches` **and not
+  `TableInfo::matches_search`**, though that is the wrapper that looks right: the wrapper is name
+  *or any column*, which is the *tree's* question, and folding it in here would list a table for a
+  needle its name does not contain, duplicate what pass 3 already reports per column, and crowd out
+  the object pass. `overlays::schema_hits` is the palette's half split out as plain data for exactly
+  this reason, and `overlays::find_tests` asserts the two surfaces return the same objects for a set
+  of terms. **One deliberate divergence, and it is the only one allowed without a test change:** an
   *internal* object (an identity column's counter) is listed by the tree and withheld by the
   palette — a tree row is context, sitting under the table that owns it, while a palette row is a
   destination, and this one's activation is an editor that refuses to open. That withholding is
@@ -15451,11 +15492,16 @@ this bundle's.
   below it — the same clipboard cell, two stored values, decided by a line the user cannot see — and
   it discarded a value typed into a pending row whenever the cell pasted over it happened to be
   blank. The parse is
-  `core::edit::parse_tsv_block`, **the exact inverse of `GridCells::tsv`**: split on newlines and
+  `core::edit::parse_tsv_block`, **the inverse of `GridCells::tsv` for every cell holding neither a
+  tab nor a newline**, which is as exact as an unescaped format gets: split on newlines and
   tabs, no quote interpretation. A CSV-style reader here would be the obvious mistake — the copy
   side emits no quoting, so there is none to undo, and unquoting would silently turn a cell whose
-  value genuinely is `"hello"` into `hello`. The cost is that a spreadsheet cell containing a
-  newline arrives as two rows, which is the rarer wrong answer and a visible one. `plan_paste`
+  value genuinely is `"hello"` into `hello`. The cost is real in both directions and only one half
+  of it is visible: a cell containing a newline arrives as two rows, which shows in the grid, while
+  a cell containing a **tab** arrives as two cells on *one* row, every later column shifted left by
+  one, the values that land looking like ordinary neighbouring text and the paste's counters with
+  nothing to report because the row count is right. That is what the *copy* side counts — see
+  `copy_split_note` below. `plan_paste`
   lays the block over the grid: **one copied cell fills the whole selection** (that is how a column
   gets set to a constant), anything larger keeps **its own** shape from the selection's top-left,
   and everything is clipped to the display rows — pending new rows included, so a paste can fill
@@ -15510,7 +15556,15 @@ this bundle's.
   `attached(rect, cap, frozen)`, both of which emit the selected columns in **draw** order
   (`visual_cols`) because the receiver reads them left to right; they contain no resolution of their
   own, and `displayed_cell_text` /
-  `pending_cell_text` are gone. The reason is under `core::edit`: the rule went out one source
+  `pending_cell_text` are gone. **A copy also says what the format could not carry**, because it is
+  the only step that still can: `tsv_block` returns `edit::TsvBlock { text, split }` — `tsv` is now
+  a wrapper that throws the count away — counting, from the same string it writes, the cells holding
+  a tab or a newline of their own, and `copy_selection` puts `edit::copy_split_note(split)` on
+  `commit_note`, the ordinary note surface rather than the red one, since the copy succeeded. Once
+  the block is on the clipboard a separator and a cell's own tab are the same byte, so no paste can
+  tell them apart, and a split cell keeps the row count right so the paste's counters stay quiet
+  while every later column of that row shifts left by one — green, and one Commit from a real
+  `UPDATE`. `grid.rs`'s gate asserts `copy_selection` still calls the helper. The reason is under `core::edit`: the rule went out one source
   short twice in the view, most recently without `format::apply`, so a `Timestamp` column attached
   the epoch integer the cell does not show. The **painter** is the exception and stays one:
   `data_cell`'s content `dyn_container` runs per cell per frame reading the signals one at a time,
