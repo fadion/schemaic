@@ -613,19 +613,26 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                     // the active connection is ever checked, so every other row
                     // was neutral and the dot really only marked "this is the
                     // current one" — which the row's own highlight already says.
-                    let dot_color = c
-                        .color
-                        .as_deref()
-                        .and_then(theme::parse_hex)
-                        .unwrap_or_else(theme::text_dim);
-                    let dot =
-                        container(icons::icon(icons::DOT, 6.0).style(move |s| s.color(dot_color)))
-                            .style(|s| {
-                                s.width(theme::scaled(14.0))
-                                    .flex_shrink(0.0_f32)
-                                    .items_center()
-                                    .justify_center()
-                            });
+                    //
+                    // The connection's own colour is genuinely static; only
+                    // the *fallback* is themable, and `unwrap_or_else` calls
+                    // it here rather than in the style closure — so a
+                    // colourless connection kept the outgoing theme's dim for
+                    // as long as the panel stood. A colour function handed to
+                    // a combinator reads like the correct `fn() -> Color`
+                    // idiom and is not one: the combinator invokes what a
+                    // menu builder merely stores.
+                    let hex = c.color.as_deref().and_then(theme::parse_hex);
+                    let dot = container(
+                        icons::icon(icons::DOT, 6.0)
+                            .style(move |s| s.color(hex.unwrap_or_else(theme::text_dim))),
+                    )
+                    .style(|s| {
+                        s.width(theme::scaled(14.0))
+                            .flex_shrink(0.0_f32)
+                            .items_center()
+                            .justify_center()
+                    });
                     // **The three numbers here are one measurement** — 15 name
                     // characters, 22 endpoint characters, and the 400px panel
                     // below — so none of them moves alone.
@@ -1506,11 +1513,19 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     }
                     // Favorite / unfavorite: a favorited database gets a gold star
                     // and sorts to the top of the tree (oldest favorite highest).
-                    let fav_now = schemaic_core::favorite::is_favorite(
-                        &db_favorites.get_untracked(),
-                        active_conn.get_untracked(),
-                        &menu.name,
-                    );
+                    // `with_untracked`, not `get_untracked`: the predicate only
+                    // borrows the rules, and `get` clones the whole
+                    // `Vec<FavoriteRule>` — a `String` per rule — to answer it.
+                    // Every other reader of the three small stores spells it
+                    // this way, including the two `db_color` writers a dozen
+                    // lines below in this same closure.
+                    let fav_now = db_favorites.with_untracked(|rules| {
+                        schemaic_core::favorite::is_favorite(
+                            rules,
+                            active_conn.get_untracked(),
+                            &menu.name,
+                        )
+                    });
                     {
                         let dbf = db_favorites;
                         let save = save_db_favorites.clone();

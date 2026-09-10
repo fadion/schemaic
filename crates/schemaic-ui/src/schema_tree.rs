@@ -354,6 +354,49 @@ pub(crate) fn objects_shown<'a>(
         .collect()
 }
 
+/// Which of a namespace's tables the filter leaves — [`objects_shown`]'s
+/// counterpart one level up, and the predicate the namespace row's own count
+/// capsule has to use.
+///
+/// **A count over a filtered list has to count what is shown.** The header read
+/// `schema.tables.iter().filter(by namespace).count()`, so filtering a
+/// multi-schema PostgreSQL database for one table name left a namespace row
+/// reading *"412 tables"* over the two that matched. The children were right
+/// and the capsule above them was not, because the two spelled the question
+/// separately; now there is one spelling and the header counts its own
+/// children.
+///
+/// `ns_hit` is derived here rather than taken, because a namespace whose *name*
+/// matches reveals all of its tables — the rule the children already applied,
+/// and the reason a caller cannot supply this half correctly by accident.
+pub(crate) fn tables_shown<'a>(
+    schema: &'a DbSchema,
+    ns: &str,
+    db_hit: bool,
+    filt: &str,
+) -> Vec<&'a TableInfo> {
+    let filtering = !filt.is_empty();
+    let ns_hit = filtering && ns.to_lowercase().contains(filt);
+    schema
+        .tables
+        .iter()
+        .filter(|t| t.schema.as_deref() == Some(ns))
+        .filter(|t| !filtering || db_hit || ns_hit || t.matches_search(filt))
+        .collect()
+}
+
+/// One object folder's set, with how many of them the current filter leaves.
+///
+/// The two travel together because the capsule in the header has to be about
+/// the rows beneath it: `items.len()` there left a folder reading
+/// *"Sequences 200"* over the one row that matched. `object_group_nodes` walks
+/// them once to decide the folder renders at all, so the count is already in
+/// hand and nothing walks them twice.
+struct FolderItems {
+    items: Vec<ObjectItem>,
+    count: usize,
+}
+
 /// The namespaces to render as their own tree level, or empty when the tables
 /// should be listed flat directly under the database.
 ///
@@ -1561,7 +1604,16 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         },
     );
     let header = h_stack((
-        chevron(expanded, key.clone(), on_toggle.clone()),
+        chevron(
+            {
+                // The same term `children` opens on: a filter force-expands
+                // every database.
+                let key_chev = key.clone();
+                move || expanded.with(|e| e.contains(&key_chev)) || !filter.get().trim().is_empty()
+            },
+            key.clone(),
+            on_toggle.clone(),
+        ),
         // Gold star before the DB icon (only when this database is favorited).
         favorite_star(
             db_favorites,
@@ -1696,7 +1748,14 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         }
                         // `schema` is already the `Arc` out of `SchemaState`.
                         return v_stack_from_iter(visible.into_iter().map(move |ns| {
-                            schema_node(db.clone(), ns, schema.clone(), db_hit, child_ctx(1))
+                            schema_node(
+                                db.clone(),
+                                ns,
+                                schema.clone(),
+                                db_hit,
+                                filt.clone(),
+                                child_ctx(1),
+                            )
                         }))
                         .style(|s| s.flex_col())
                         .into_any();
@@ -1761,6 +1820,9 @@ fn schema_node(
     ns: String,
     schema: std::sync::Arc<schemaic_core::schema::DbSchema>,
     db_hit: bool,
+    // The filter as the caller's own children container read it — the count
+    // capsule below has to be about the same list the rows under it are.
+    filt: String,
     ctx: SchemaTreeCtx,
 ) -> impl IntoView {
     let node_ui = ctx.ui.clone();
@@ -1774,11 +1836,7 @@ fn schema_node(
         ..
     } = ctx.clone();
     let key = schema_key(&database, &ns);
-    let table_count = schema
-        .tables
-        .iter()
-        .filter(|t| t.schema.as_deref() == Some(ns.as_str()))
-        .count();
+    let table_count = tables_shown(&schema, &ns, db_hit, &filt).len();
 
     let toggle_row = on_toggle.clone();
     let key_row = key.clone();
@@ -1812,7 +1870,15 @@ fn schema_node(
         (!f.is_empty()).then(|| f.to_string())
     };
     let header = h_stack((
-        chevron(expanded, key.clone(), on_toggle),
+        chevron(
+            {
+                // The same term `children` opens on.
+                let key_chev = key.clone();
+                move || expanded.with(|e| e.contains(&key_chev)) || !filter.get().trim().is_empty()
+            },
+            key.clone(),
+            on_toggle,
+        ),
         // Muted: a schema row is structural, not something you open — it should
         // read quieter than the database above and the tables below it.
         icons::icon(icons::FOLDER, SCHEMA_ICON_BASE).style(move |s| {
@@ -1865,11 +1931,8 @@ fn schema_node(
             // The schema's own name matching reveals all its tables, mirroring the
             // database-level `db_hit` rule.
             let ns_hit = filtering && ns_children.to_lowercase().contains(&filt);
-            let tables: Vec<TableInfo> = schema
-                .tables
-                .iter()
-                .filter(|t| t.schema.as_deref() == Some(ns_children.as_str()))
-                .filter(|t| !filtering || db_hit || ns_hit || t.matches_search(&filt))
+            let tables: Vec<TableInfo> = tables_shown(&schema, &ns_children, db_hit, &filt)
+                .into_iter()
                 .cloned()
                 .collect();
             let db = database.clone();
@@ -1934,9 +1997,16 @@ fn object_group_nodes(
     // A folder with nothing to show renders nothing at all — header included.
     // `nav_rows` skips it, so leaving the header on screen made a row with a
     // count that the keyboard could not reach and that expanded to nothing.
+    // `shown`, not `items.len()`, is what the folder's capsule says: the same
+    // walk already decides whether the folder renders at all, and a header
+    // reading "Sequences 200" over the one row that matched was the count and
+    // the children answering separately.
     let groups: Vec<_> = object_groups(&schema, scope())
         .into_iter()
-        .filter(|(_, items)| !objects_shown(items, parent_hit, ns_hit, &filt).is_empty())
+        .filter_map(|(kind, items)| {
+            let count = objects_shown(&items, parent_hit, ns_hit, &filt).len();
+            (count > 0).then_some((kind, FolderItems { items, count }))
+        })
         .collect();
     v_stack_from_iter(groups.into_iter().map(move |(kind, items)| {
         object_group_node(
@@ -1958,10 +2028,11 @@ fn object_group_node(
     database: String,
     scope_ns: Option<String>,
     kind: ObjectKind,
-    items: Vec<ObjectItem>,
+    items: FolderItems,
     parent_hit: bool,
     ctx: SchemaTreeCtx,
 ) -> impl IntoView {
+    let FolderItems { items, count } = items;
     let SchemaTreeCtx {
         expanded,
         filter,
@@ -1977,7 +2048,6 @@ fn object_group_node(
         None => TableScope::Flat,
     };
     let key = object_group_key(&database, scope, kind);
-    let count = items.len();
 
     // A folder's menu is about the *set* it holds, which is why it exists at all
     // now: `Create sequence` used to live only in the database node's `Create`
@@ -2016,7 +2086,26 @@ fn object_group_node(
     let toggle_row = on_toggle.clone();
     let key_row = key.clone();
     let header = h_stack((
-        chevron(expanded, key.clone(), on_toggle),
+        chevron(
+            {
+                // The same term `children` opens on, `ns_hit` included — a
+                // folder that a filter forced open must not read as closed.
+                let key_chev = key.clone();
+                let ns_chev = scope_ns.clone();
+                move || {
+                    let filt = filter.get().trim().to_lowercase();
+                    let filtering = !filt.is_empty();
+                    let ns_hit = filtering
+                        && ns_chev
+                            .as_deref()
+                            .is_some_and(|s| s.to_lowercase().contains(&filt));
+                    expanded.with(|e| e.contains(&key_chev))
+                        || (filtering && !parent_hit && !ns_hit)
+                }
+            },
+            key.clone(),
+            on_toggle,
+        ),
         // Muted like a namespace row: a folder is structural, not something you
         // open.
         icons::icon(icons::FOLDER, SCHEMA_ICON_BASE).style(move |s| {
@@ -2398,7 +2487,16 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let open_menu = marking_opener(nav, &key, open_menu);
     let col_source = source.clone();
     let header = h_stack((
-        chevron(expanded, key.clone(), on_toggle),
+        chevron(
+            {
+                // The same term `children` opens on: a column match reveals
+                // its table's columns whatever the expansion set says.
+                let key_chev = key.clone();
+                move || expanded.with(|e| e.contains(&key_chev)) || force_cols
+            },
+            key.clone(),
+            on_toggle,
+        ),
         icons::icon(glyph, SCHEMA_ICON_BASE).style(move |s| {
             s.color(glyph_color())
                 .margin_left(chevron_gap())
@@ -2697,14 +2795,20 @@ fn key_row(
     indent_levels: u32,
 ) -> impl IntoView {
     let (database, table) = (source.database.clone(), source.display());
-    let (color, tag) = if ix.is_primary() {
-        (theme::key_primary(), "UNIQUE")
+    // `fn() -> Color`, not a resolved `Color`: this row is built inside
+    // `table_node`'s children `dyn_container`, which keys on the expansion set
+    // and the filter and never on `theme::ui_generation()`, so a captured
+    // colour survives a theme switch until something else forces the subtree
+    // to rebuild. `table_node` states the rule verbatim 300 lines above and
+    // follows it; this tuple destructuring was the one site that did not.
+    let (color, tag): (fn() -> Color, &'static str) = if ix.is_primary() {
+        (theme::key_primary, "UNIQUE")
     } else if ix.foreign {
-        (theme::key_foreign(), "FOREIGN")
+        (theme::key_foreign, "FOREIGN")
     } else if ix.unique {
-        (theme::key_index(), "UNIQUE")
+        (theme::key_index, "UNIQUE")
     } else {
-        (theme::key_index(), "INDEX")
+        (theme::key_index, "INDEX")
     };
     let kind = if ix.foreign { "foreign key" } else { "index" };
     let cols = ix.column_names().collect::<Vec<_>>().join(", ");
@@ -2717,7 +2821,7 @@ fn key_row(
     h_stack((
         icons::icon(icons::KEY_ROUND, SCHEMA_ICON_BASE).style(move |s| {
             // 50%-alpha key colour, matching the column icons' quieter marker.
-            s.color(color.multiply_alpha(0.5))
+            s.color(color().multiply_alpha(0.5))
                 .margin_right(icon_gap())
                 .flex_shrink(0.0_f32)
         }),
@@ -2730,7 +2834,7 @@ fn key_row(
     ))
     // Label + key glyph both at 50% alpha (a quiet, non-actionable leaf); the
     // trailing type tag stays full-strength (its own muted colour, above).
-    .style(move |s| s.color(color.multiply_alpha(0.5)).items_center())
+    .style(move |s| s.color(color().multiply_alpha(0.5)).items_center())
     .on_secondary_click_stop(move |_| {
         // This row has no `CtxOpener` to wrap (`marking_opener`) because it has no
         // keyboard route to share one with, so it marks itself.
@@ -2768,23 +2872,33 @@ fn key_row(
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right
 // when collapsed. The SVG inherits the container's text color (muted, brighter
 // on hover). Clicking toggles the node (propagation stopped).
+/// The disclosure triangle.
+///
+/// **It takes the open state rather than deriving it.** Its key used to be
+/// `expanded.contains(key)` and nothing else, while every consumer of that same
+/// key ORs in a second term — `|| filtering` for a database or namespace,
+/// `|| force_cols` for a table, `|| (filtering && !parent_hit && !ns_hit)` for
+/// an object folder. So for the whole duration of a filter every force-expanded
+/// node showed a **right**-pointing chevron over children that were on screen,
+/// and clicking it flipped the glyph and changed nothing, because with a filter
+/// running neither state of `expanded` alters what is rendered. `nav_rows`
+/// agreed with the children, so the keyboard was right and only the glyph lied.
+///
+/// Each caller passes the same expression its own children container uses,
+/// which is what makes one answer per node possible at all.
 fn chevron(
-    expanded: RwSignal<HashSet<String>>,
+    open: impl Fn() -> bool + 'static,
     key: String,
     on_toggle: Rc<dyn Fn(String)>,
 ) -> impl IntoView {
-    let key_read = key.clone();
-    let glyph = dyn_container(
-        move || expanded.with(|e| e.contains(&key_read)),
-        move |open| {
-            let svg = if open {
-                icons::CHEVRON_DOWN
-            } else {
-                icons::CHEVRON_RIGHT
-            };
-            icons::icon(svg, SCHEMA_ICON_BASE).into_any()
-        },
-    );
+    let glyph = dyn_container(open, move |open| {
+        let svg = if open {
+            icons::CHEVRON_DOWN
+        } else {
+            icons::CHEVRON_RIGHT
+        };
+        icons::icon(svg, SCHEMA_ICON_BASE).into_any()
+    });
     container(glyph)
         .on_click_stop(move |_| (on_toggle)(key.clone()))
         .style(|s| {
@@ -3551,6 +3665,42 @@ mod tests {
         // A match on the level above shows the whole folder.
         assert_eq!(objects_shown(&enums, true, false, "zzz").len(), enums.len());
         assert_eq!(objects_shown(&enums, false, true, "zzz").len(), enums.len());
+    }
+
+    /// **A namespace row's capsule counts the tables under it, not the ones
+    /// the filter hid.** Filtering a multi-schema PostgreSQL database for one
+    /// table name left the row reading "412 tables" over the two that
+    /// matched — the children filtered and the count above them did not,
+    /// because the two spelled the question separately.
+    #[test]
+    fn a_namespaces_count_is_of_the_tables_it_shows() {
+        let s = DbSchema {
+            tables: vec![
+                tbl(Some("sales"), "orders"),
+                tbl(Some("sales"), "order_lines"),
+                tbl(Some("sales"), "customers"),
+                tbl(Some("public"), "orders"),
+            ],
+            ..Default::default()
+        };
+        // Unfiltered: every table of that namespace, and no other's.
+        assert_eq!(tables_shown(&s, "sales", false, "").len(), 3);
+        assert_eq!(tables_shown(&s, "public", false, "").len(), 1);
+        // Filtered: only the matches.
+        assert_eq!(
+            tables_shown(&s, "sales", false, "order")
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["orders", "order_lines"]
+        );
+        assert!(tables_shown(&s, "sales", false, "zzz").is_empty());
+        // A hit on the level above reveals the whole namespace — the rule the
+        // children apply, so the count has to apply it too or it under-counts
+        // where it used to over-count.
+        assert_eq!(tables_shown(&s, "sales", true, "zzz").len(), 3);
+        // …and so does a hit on the namespace's own name.
+        assert_eq!(tables_shown(&s, "sales", false, "sale").len(), 3);
     }
 
     /// Enter rebuilds an object leaf's key from the schema, exactly as
