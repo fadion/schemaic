@@ -189,20 +189,78 @@ pub(crate) fn pathext() -> Vec<String> {
     }
 }
 
+/// Which file name in one `PATH` directory is the executable for `name` — the
+/// per-directory half of [`which_on_path`], made pure so it can be tested.
+///
+/// `present` is what that directory actually holds (only the candidates matter);
+/// `exts` is [`pathext`], empty off Windows. The answer is the file name to
+/// spawn, or `None` if this directory has none.
+///
+/// **On Windows the bare name is not an executable and must not win.** `npm i
+/// -g` writes *three* shims per binary: `<name>` — a `#!/bin/sh` script for Git
+/// Bash — plus `<name>.cmd` and `<name>.ps1`. Taking the bare file first
+/// resolved an npm-installed harness to the `sh` script, which
+/// `Command::spawn` answers with **os error 193, "%1 is not a valid Win32
+/// application"**. `harness_reachable` still said connected — it only asks
+/// whether the file exists — while `probe`'s `--help` errored into
+/// `Constraint::Unknown` and `inline_gate` then refused *every* generation
+/// with "could not confirm … so the assistant is disabled". The whole AI
+/// feature dead, and the two surfaces giving contradictory reasons.
+///
+/// `cmd.exe` and `where.exe` consider only `PATHEXT` extensions, so this does
+/// too: the bare name is taken only when its own extension is already one of
+/// them (`foo.exe` asked for by full name), and `PATHEXT`'s order is the
+/// preference order — which is what puts `.CMD` ahead of a `.ps1` nobody can
+/// spawn directly.
+///
+/// Off Windows `exts` is empty and the bare name is the only candidate, which
+/// is correct there: the executable bit is the test, not the name.
+pub(crate) fn pick_executable<'a>(
+    name: &str,
+    present: &[&'a str],
+    exts: &[String],
+) -> Option<&'a str> {
+    let has = |n: &str| present.iter().copied().find(|p| p.eq_ignore_ascii_case(n));
+    if exts.is_empty() {
+        return has(name);
+    }
+    let already_extended = exts
+        .iter()
+        .any(|e| name.len() > e.len() && name[name.len() - e.len()..].eq_ignore_ascii_case(e));
+    if already_extended && let Some(hit) = has(name) {
+        return Some(hit);
+    }
+    exts.iter().find_map(|e| has(&format!("{name}{e}")))
+}
+
 /// Minimal `which`: locate `name` on `PATH`, honoring `PATHEXT` on Windows.
+///
+/// **A relative `PATH` entry is skipped.** `std::env::split_paths` yields an
+/// *empty* `PathBuf` for the trailing `;` most Windows `PATH`s carry, so
+/// `dir.join(name)` became a **cwd-relative** path: `is_file()` answered
+/// against the process working directory and the relative string was what came
+/// back — becoming both `probe`'s cache key and the `Command::new` program.
+/// `Command::new` does not search the cwd, so `harness_reachable` reported a
+/// name that cannot be spawned, and the child's `cwd: session_cwd()` moves the
+/// directory out from under it anyway.
 pub(crate) fn which_on_path(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     let exts = pathext();
     for dir in std::env::split_paths(&path) {
-        let direct = dir.join(name);
-        if direct.is_file() {
-            return Some(direct.to_string_lossy().into_owned());
+        if dir.as_os_str().is_empty() || dir.is_relative() {
+            continue;
         }
-        for ext in &exts {
-            let cand = dir.join(format!("{name}{ext}"));
-            if cand.is_file() {
-                return Some(cand.to_string_lossy().into_owned());
-            }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        if let Some(hit) = pick_executable(name, &refs, &exts) {
+            return Some(dir.join(hit).to_string_lossy().into_owned());
         }
     }
     None
@@ -533,5 +591,97 @@ mod tests {
             Harness::Claude,
             "/nonexistent/zz-not-here"
         ));
+    }
+}
+
+#[cfg(test)]
+mod pick_executable_tests {
+    use super::pick_executable;
+
+    /// The real `PATHEXT` of a Windows 11 install, in its real order.
+    fn win() -> Vec<String> {
+        ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
+            .split(';')
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// **npm's three shims, and only one of them can be spawned.**
+    ///
+    /// `npm i -g` writes `<name>` (a `#!/bin/sh` script for Git Bash),
+    /// `<name>.cmd` and `<name>.ps1`. Taking the bare file resolved an
+    /// npm-installed harness to the `sh` script, which `spawn` answers with os
+    /// error 193 — and `harness_reachable` reported it connected while every
+    /// generation was refused for a reason the user could not act on.
+    #[test]
+    fn an_npm_shim_directory_resolves_to_the_cmd_not_the_sh_script() {
+        let present = ["opencode", "opencode.cmd", "opencode.ps1"];
+        assert_eq!(
+            pick_executable("opencode", &present, &win()),
+            Some("opencode.cmd")
+        );
+    }
+
+    /// `PATHEXT`'s order is the preference order, which is what `cmd.exe` and
+    /// `where.exe` use — so a real `.exe` beside a `.cmd` wins.
+    #[test]
+    fn pathext_order_decides_between_two_real_candidates() {
+        let present = ["claude.cmd", "claude.exe"];
+        assert_eq!(
+            pick_executable("claude", &present, &win()),
+            Some("claude.exe")
+        );
+    }
+
+    /// A name that already carries an executable extension is taken as it
+    /// stands — this is the `resolve_override` shape, a user typing the full
+    /// file name.
+    #[test]
+    fn a_name_that_is_already_executable_is_taken_verbatim() {
+        let present = ["claude.exe"];
+        assert_eq!(
+            pick_executable("claude.exe", &present, &win()),
+            Some("claude.exe")
+        );
+        // Case-insensitively, as the filesystem is.
+        let present = ["Claude.EXE"];
+        assert_eq!(
+            pick_executable("claude.exe", &present, &win()),
+            Some("Claude.EXE")
+        );
+    }
+
+    /// **A name whose extension is not in `PATHEXT` is not executable.** A
+    /// `.ps1` cannot be spawned directly and a bare `sh` script cannot be
+    /// spawned at all, so neither may be the answer just because it is there.
+    #[test]
+    fn a_non_pathext_extension_is_not_an_executable() {
+        assert_eq!(pick_executable("run.ps1", &["run.ps1"], &win()), None);
+        assert_eq!(pick_executable("zzq", &["zzq"], &win()), None);
+        assert_eq!(pick_executable("zzq", &["zzq", "zzq.ps1"], &win()), None);
+    }
+
+    /// Nothing at all in the directory, and a directory holding only other
+    /// programs.
+    #[test]
+    fn an_empty_or_unrelated_directory_answers_nothing() {
+        assert_eq!(pick_executable("claude", &[], &win()), None);
+        assert_eq!(
+            pick_executable("claude", &["node.exe", "npm.cmd"], &win()),
+            None
+        );
+    }
+
+    /// **Off Windows the bare name is the whole rule.** `pathext` is empty
+    /// there, and the executable bit is the test rather than the name — so the
+    /// Windows-only refusal above must not reach a Linux or macOS install.
+    #[test]
+    fn without_pathext_the_bare_name_is_the_answer() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            pick_executable("claude", &["claude"], &none),
+            Some("claude")
+        );
+        assert_eq!(pick_executable("claude", &["claude.cmd"], &none), None);
     }
 }
