@@ -24,7 +24,7 @@ use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
     ColumnInfo, ColumnTypeClass, DbSchema, IndexInfo, ObjectItem, SchemaState, TableInfo,
-    TableSource, classify_column_type, db_visible,
+    TableSource, classify_column_type, db_visible, name_survives, object_name_matches,
 };
 use schemaic_core::text::plural;
 
@@ -321,7 +321,7 @@ fn namespace_has_object_match(schema: &DbSchema, ns: &str, filt: &str) -> bool {
 /// A database whose schema is still loading survives: nothing is known about its
 /// contents yet, and hiding it would be a guess.
 fn db_survives(schema: Option<&DbSchema>, db_name: &str, filt: &str) -> bool {
-    if filt.is_empty() || db_name.to_lowercase().contains(filt) {
+    if name_survives(db_name, filt) {
         return true;
     }
     match schema {
@@ -333,7 +333,7 @@ fn db_survives(schema: Option<&DbSchema>, db_name: &str, filt: &str) -> bool {
 /// Does this namespace's row survive the filter? Same rule one level down, and
 /// shared for the same reason.
 fn namespace_survives(schema: &DbSchema, ns: &str, db_hit: bool, filt: &str) -> bool {
-    if filt.is_empty() || db_hit || ns.to_lowercase().contains(filt) {
+    if db_hit || name_survives(ns, filt) {
         return true;
     }
     schema
@@ -380,7 +380,7 @@ pub(crate) fn tables_shown<'a>(
     filt: &str,
 ) -> Vec<&'a TableInfo> {
     let filtering = !filt.is_empty();
-    let ns_hit = filtering && ns.to_lowercase().contains(filt);
+    let ns_hit = object_name_matches(ns, filt);
     schema
         .tables
         .iter()
@@ -565,7 +565,7 @@ fn nav_rows(
         // Mirror the tree's search filtering (so arrow-key nav walks exactly what's
         // shown): a DB matches by its own name or by containing a matching table; a
         // DB whose schema is still loading is kept (we can't know its tables yet).
-        let db_hit = filtering && n.name.to_lowercase().contains(&filt);
+        let db_hit = object_name_matches(&n.name, &filt);
         let schema = n.schema.as_ref();
         if !db_survives(schema.map(|s| s.as_ref()), &n.name, &filt) {
             continue;
@@ -589,10 +589,7 @@ fn nav_rows(
         let groups = schema_groups(schema);
         let push_tables = |rows: &mut Vec<NavRow>, parent: &String, scope: TableScope| {
             // A schema whose own name matches shows all its tables, like `db_hit`.
-            let ns_hit = filtering
-                && scope
-                    .name()
-                    .is_some_and(|s| s.to_lowercase().contains(&filt));
+            let ns_hit = scope.name().is_some_and(|s| object_name_matches(s, &filt));
             for t in schema
                 .tables
                 .iter()
@@ -631,10 +628,7 @@ fn nav_rows(
         // key rows these *are* navigable: a leaf opens its editor, so selecting
         // one goes somewhere.
         let push_objects = |rows: &mut Vec<NavRow>, parent: &String, scope: TableScope| {
-            let ns_hit = filtering
-                && scope
-                    .name()
-                    .is_some_and(|s| s.to_lowercase().contains(&filt));
+            let ns_hit = scope.name().is_some_and(|s| object_name_matches(s, &filt));
             for (kind, items) in object_groups(schema, scope) {
                 let shown = objects_shown(&items, db_hit, ns_hit, &filt);
                 if shown.is_empty() {
@@ -1989,7 +1983,7 @@ fn schema_node(
             }
             // The schema's own name matching reveals all its tables, mirroring the
             // database-level `db_hit` rule.
-            let ns_hit = filtering && ns_children.to_lowercase().contains(&filt);
+            let ns_hit = object_name_matches(&ns_children, &filt);
             let tables: Vec<TableInfo> = tables_shown(&schema, &ns_children, db_hit, &filt)
                 .into_iter()
                 .cloned()
@@ -2049,10 +2043,9 @@ fn object_group_nodes(
         Some(ns) => TableScope::Namespace(ns.as_str()),
         None => TableScope::Flat,
     };
-    let ns_hit = !filt.is_empty()
-        && scope_ns
-            .as_deref()
-            .is_some_and(|s| s.to_lowercase().contains(&filt));
+    let ns_hit = scope_ns
+        .as_deref()
+        .is_some_and(|s| object_name_matches(s, &filt));
     // A folder with nothing to show renders nothing at all — header included.
     // `nav_rows` skips it, so leaving the header on screen made a row with a
     // count that the keyboard could not reach and that expanded to nothing.
@@ -2154,10 +2147,9 @@ fn object_group_node(
                 move || {
                     let filt = filter.get().trim().to_lowercase();
                     let filtering = !filt.is_empty();
-                    let ns_hit = filtering
-                        && ns_chev
-                            .as_deref()
-                            .is_some_and(|s| s.to_lowercase().contains(&filt));
+                    let ns_hit = ns_chev
+                        .as_deref()
+                        .is_some_and(|s| object_name_matches(s, &filt));
                     expanded.with(|e| e.contains(&key_chev))
                         || (filtering && !parent_hit && !ns_hit)
                 }
@@ -2207,10 +2199,9 @@ fn object_group_node(
         move |(open, filt)| {
             let filt = filt.trim().to_lowercase();
             let filtering = !filt.is_empty();
-            let ns_hit = filtering
-                && ns_hit_base
-                    .as_deref()
-                    .is_some_and(|s| s.to_lowercase().contains(&filt));
+            let ns_hit = ns_hit_base
+                .as_deref()
+                .is_some_and(|s| object_name_matches(s, &filt));
             // A filter that matched inside this folder opens it, the same way a
             // column match force-reveals its table. `nav_rows` mirrors this.
             if !open && !(filtering && !parent_hit && !ns_hit) {
@@ -2491,13 +2482,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         (!f.is_empty()).then(|| f.to_string())
     };
     let force_cols = match &name_term {
-        Some(t) => {
-            let tl = t.to_lowercase();
-            table
-                .columns
-                .iter()
-                .any(|c| c.name.to_lowercase().contains(&tl))
-        }
+        Some(t) => table.any_column_matches(&t.to_lowercase()),
         None => false,
     };
     let key = table_key(&database, &table);
@@ -3726,6 +3711,40 @@ mod tests {
         // A match on the level above shows the whole folder.
         assert_eq!(objects_shown(&enums, true, false, "zzz").len(), enums.len());
         assert_eq!(objects_shown(&enums, false, true, "zzz").len(), enums.len());
+    }
+
+    /// **Every schema-search surface in this file asks the one predicate.**
+    ///
+    /// Nine sites hand-spelled `to_lowercase().contains(…)` here — one
+    /// reimplementing `TableInfo::any_column_matches` 1,700 lines below a
+    /// correct call to it, and eight asking whether a database or namespace
+    /// name survives the filter, in the rendered tree and again in the
+    /// keyboard walk that has to stay bug-for-bug identical to it. Nothing
+    /// failed for it today, which is why a behavioural test is green either
+    /// way: the divergence is what a *future* clause on the predicate would
+    /// cause, and it would land in the tree and not in the palette, or the
+    /// other way round.
+    ///
+    /// The allocation-free body `object_name_matches` grew is the second
+    /// reason: a hand-spelling does not inherit it.
+    #[test]
+    fn the_tree_matches_through_the_one_predicate() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("schema_tree.rs"),
+        )
+        .expect("this file's own source");
+        let body = crate::source_gate::production_code(&src);
+        // Split so this assertion is not itself a match.
+        let spelled = format!("to_lowercase().{}(", "contains");
+        assert!(
+            !body.contains(&spelled),
+            "a schema-tree filter spells the search predicate itself; every \
+             schema-search surface matches through `schema::object_name_matches` \
+             (or `name_survives`, which owns the empty-filter case), or the tree \
+             drifts from the palette"
+        );
     }
 
     /// **The tree's focus handlers do not write a value that is already

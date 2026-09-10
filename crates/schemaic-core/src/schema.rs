@@ -3426,6 +3426,26 @@ pub fn object_name_matches(name: &str, needle_lower: &str) -> bool {
     name.to_lowercase().contains(needle_lower)
 }
 
+/// [`object_name_matches`] with the **opposite** empty-needle answer: an empty
+/// filter leaves every name standing.
+///
+/// The two rules are both real and they are not interchangeable. A *search*
+/// asks "does this name match what I typed", and nothing matches nothing —
+/// which is why `object_name_matches` refuses an empty needle and every caller
+/// answers "no filter" separately. A *filter* on the schema tree asks "does
+/// this row survive", and with the box empty every row does.
+///
+/// It exists so the tree can stop hand-spelling
+/// `filt.is_empty() || name.to_lowercase().contains(filt)`, which it did at
+/// eight sites — the database and namespace rows, in the rendered tree and
+/// again in the keyboard walk that has to stay bug-for-bug identical to it.
+/// Folding those into `object_name_matches` directly would have inverted the
+/// tree on an empty filter, which is why this is a second spelling that owns
+/// the empty case rather than a rewrite of the first.
+pub fn name_survives(name: &str, filt: &str) -> bool {
+    filt.is_empty() || object_name_matches(name, filt)
+}
+
 /// One standalone object, whichever kind it is.
 ///
 /// The tree renders a mixed list of these and the editor holds exactly one, so
@@ -6130,6 +6150,38 @@ mod tests {
         assert!(!t.any_column_matches("zzz"));
         // Empty needle matches nothing (callers handle "no filter" separately).
         assert!(!t.matches_search(""));
+    }
+
+    /// **The two empty-filter answers are opposite, and both are right.**
+    ///
+    /// The schema tree hand-spelled `filt.is_empty() || name.to_lowercase()
+    /// .contains(filt)` at eight sites — the database and namespace rows, in
+    /// the rendered tree and again in the keyboard walk that must stay
+    /// bug-for-bug identical to it. Folding those into `object_name_matches`,
+    /// which refuses an empty needle, would have inverted the tree: an empty
+    /// search box would hide every row instead of showing them all. That is
+    /// what `name_survives` exists to make impossible to get wrong by
+    /// accident, and this is what says the two have not been conflated.
+    #[test]
+    fn an_empty_filter_keeps_every_row_and_matches_no_search() {
+        assert!(name_survives("orders", ""));
+        assert!(name_survives("", ""));
+        assert!(!object_name_matches("orders", ""));
+
+        // With a term, they agree exactly — including the case-insensitive
+        // substring rule and the misses.
+        for (name, filt) in [
+            ("Orders", "ord"),
+            ("Orders", "zzz"),
+            ("sales", "ale"),
+            ("İzmir", "izmir"),
+        ] {
+            assert_eq!(
+                name_survives(name, filt),
+                object_name_matches(name, filt),
+                "{name:?} vs {filt:?}"
+            );
+        }
     }
 
     /// **The allocation-free path and the lowercasing one answer the same.**
