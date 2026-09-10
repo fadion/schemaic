@@ -3904,12 +3904,15 @@ mod engine_comparison_gate {
 }
 
 /// **A schema editor's door refuses a read-only connection in the same step
-/// that opens it** — the `widgets::accept_launch` rule, applied to the ten
-/// launches that open a DDL form rather than to a button.
+/// that opens it** — the `widgets::accept_launch` rule, applied to the launches
+/// that open a DDL form rather than to a button.
 ///
-/// Eleven doors across eight files stamp `EditCtx::read_only` into the target
-/// they open, and `ddl_preview`'s Apply is refused on that stamp — so no write
-/// ever escaped. What did was the *door*: on a connection marked read-only the
+/// **Fifteen doors across eight files** stamp `EditCtx::read_only` into the
+/// target they open. Three already refused (`account_editor`'s two and
+/// `database_editor`'s one, which is where the rule is stated in the
+/// imperative); the other twelve did not. Apply is refused on that stamp
+/// downstream, so no write ever escaped. What did was the *door*: on a
+/// connection marked read-only the
 /// schema tree's double-click, its keyboard activation, Find-Anywhere, **Edit
 /// table**, **Edit column**, **Edit index**, **Triggers**, **Edit view** and the
 /// Properties panel's handoff all opened a fully live form, counted the changes
@@ -3986,7 +3989,7 @@ mod read_only_door_gate {
         // finding nothing at all — the failure mode `crate_sources` guards
         // against for the whole family.
         assert!(
-            doors >= 11,
+            doors >= 15,
             "only {doors} editor doors found — is `{STAMP}` still the spelling?"
         );
         for (file, why) in EXEMPT {

@@ -118,9 +118,14 @@ pub(crate) fn close_peers(d: crate::DdlUi, keep_trigger: bool) {
 ///
 /// The same drift class this file already names once — "One list, in
 /// `ddl_preview`; five hand-written copies had already drifted" — so the answer
-/// is one predicate rather than a third spelling. `read_only_door_gate`'s
-/// neighbour `preview_exit_label_gate` asserts the two functions name the same
-/// signals, since two lists that agree today is precisely what went wrong here.
+/// is one predicate rather than a third spelling.
+///
+/// **What holds it and `close_peers` together is a test, not the compiler.**
+/// `tests::every_editor_reaches_the_three_lists_that_must_know_about_it` raises
+/// each of the nine targets *alone* and asserts `close_editors`,
+/// `modals::ddl_editors_up` and this all see it — three hand-written
+/// nine-entry lists, agreeing because something checks, which is the most that
+/// is available without making the nine one enumerable thing.
 pub(crate) fn has_editor_behind(d: crate::DdlUi) -> bool {
     d.designer.get_untracked().is_some()
         || d.view.get_untracked().is_some()
