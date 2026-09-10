@@ -84,10 +84,23 @@ fn is_comment_start(b: &[u8], i: usize, dialect: SqlDialect) -> bool {
 /// Classify what span the byte at `offset` sits inside, walking the shared
 /// `skip_noncode` lexer from the start. A position exactly at a delimiter's start
 /// or one just past its end counts as [`Region::Code`].
+///
+/// **It stops at the caret.** The answer is settled once the walk reaches
+/// `offset`: a span opening at or after it cannot contain it, since the only
+/// way to return is `offset > i && offset < j`. Everything past that was a scan
+/// of the rest of the document for nothing — and this is on the editor's
+/// *undebounced* per-caret-move path (`match_paren` and
+/// `identifier_occurrences` are two `create_effect`s with no debounce and no
+/// size cap, and `sqlfile::open_verdict` will open a 64 MiB script). At 16 MiB
+/// the full walk measured 37.9 ms, so one arrow key was ~123 ms of UI-thread
+/// work across the two effects.
 pub fn region_at(text: &str, offset: usize, dialect: SqlDialect) -> Region {
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
+        if i >= offset {
+            break;
+        }
         if let Some(j) = skip_noncode(b, i, dialect) {
             // Interior of the non-code span `[i, j)` is `i < offset < j`; the
             // boundaries themselves are code positions.
@@ -228,37 +241,20 @@ pub fn backspace_pair(text: &str, caret: usize, dialect: SqlDialect) -> Option<(
     empty_pair.then_some((caret - 1, caret + 1))
 }
 
-/// All balanced parenthesis pairs `(open_pos, close_pos)` in `text`, ignoring
-/// parens inside strings/comments (via the shared lexer). Unbalanced parens are
-/// simply absent from the result.
-fn paren_pairs(text: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
-    let b = text.as_bytes();
-    let mut stack: Vec<usize> = Vec::new();
-    let mut pairs = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if let Some(j) = skip_noncode(b, i, dialect) {
-            i = j.max(i + 1);
-            continue;
-        }
-        match b[i] {
-            b'(' => stack.push(i),
-            b')' => {
-                if let Some(open) = stack.pop() {
-                    pairs.push((open, i));
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    pairs
-}
-
 /// If the caret is adjacent to a parenthesis that isn't inside a string/comment,
 /// return `(here, partner)` — the byte offset of that paren and of its match.
 /// Prefers the paren to the *right* of the caret, else the one to the *left*.
 /// `None` when there's no adjacent (code) paren or it has no match.
+///
+/// **Returns at the pair, not after every pair.** This used to build a `Vec` of
+/// every balanced pair in the document and then `find_map` the one touching the
+/// caret; on the editor's undebounced per-caret-move effect that was 44.6 ms at
+/// 16 MiB for a single arrow key. The walk is the same walk — one stack, the
+/// shared lexer skipping strings and comments — and it stops the moment
+/// `here`'s partner is known, which for a closing paren is at the caret itself.
+///
+/// The pair it picks is unchanged: closes are still visited in increasing
+/// order, and a position is the open or the close of exactly one pair.
 pub fn match_paren(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usize, usize)> {
     let b = text.as_bytes();
     let is_paren = |p: usize| matches!(b.get(p), Some(b'(') | Some(b')'));
@@ -269,17 +265,30 @@ pub fn match_paren(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usi
     } else {
         return None;
     };
-    // A paren inside a string/comment is excluded from `paren_pairs`, so an
-    // adjacent-but-non-code paren simply yields no match here.
-    paren_pairs(text, dialect).into_iter().find_map(|(o, c)| {
-        if o == here {
-            Some((here, c))
-        } else if c == here {
-            Some((here, o))
-        } else {
-            None
+    // A paren inside a string/comment is skipped by the lexer, so an
+    // adjacent-but-non-code paren simply finds no partner here.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j.max(i + 1);
+            continue;
         }
-    })
+        match b[i] {
+            b'(' => stack.push(i),
+            b')' => match stack.pop() {
+                Some(open) if open == here => return Some((here, i)),
+                Some(open) if i == here => return Some((here, open)),
+                // An unmatched `)` **at** the caret has no partner and never
+                // will — the pairs after it belong to somebody else.
+                None if i == here => return None,
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// All byte ranges of the identifier under the caret, for "highlight all
@@ -311,7 +320,7 @@ pub fn identifier_occurrences(
     while we < b.len() && is_word_byte(b[we]) {
         we += 1;
     }
-    if ws == we || region_at(text, ws, dialect) != Region::Code {
+    if ws == we {
         return Vec::new();
     }
     let target = &text[ws..we];
@@ -320,7 +329,22 @@ pub fn identifier_occurrences(
         return Vec::new();
     }
     // Whole-word, case-insensitive matches in code regions only.
+    //
+    // **The caret's own region is answered by this pass**, not by a
+    // `region_at` before it. The scan skips strings and comments wholesale, so
+    // the word straddling the caret is in code **iff** this pass finds a word
+    // starting exactly at `ws` — and it can only be `target`, which is that
+    // word. One walk of the document instead of two: the `region_at` call this
+    // replaces was the other 37.9 ms of the 78.5 ms an arrow key cost at
+    // 16 MiB, on an effect with no debounce.
+    //
+    // The equivalence is exact rather than close. A span's opening byte is
+    // never a word byte (`'`, `"`, `` ` ``, `-`, `/`, `#`), so `ws` can never
+    // be a span start — the one position where `region_at` says `Code` inside
+    // a span it found. And `ws == j`, just past a span, is where the scan
+    // resumes.
     let mut hits = Vec::new();
+    let mut on_caret_word = false;
     let mut i = 0;
     while i < b.len() {
         if let Some(j) = skip_noncode(b, i, dialect) {
@@ -332,12 +356,18 @@ pub fn identifier_occurrences(
             while i < b.len() && is_word_byte(b[i]) {
                 i += 1;
             }
+            if start == ws {
+                on_caret_word = true;
+            }
             if text[start..i].eq_ignore_ascii_case(target) {
                 hits.push((start, i));
             }
         } else {
             i += 1;
         }
+    }
+    if !on_caret_word {
+        return Vec::new();
     }
     // A lone occurrence (only the one under the caret) isn't worth a box.
     if hits.len() >= 2 { hits } else { Vec::new() }
@@ -621,6 +651,32 @@ mod tests {
         assert_eq!(match_paren("", 0, MySql), None);
     }
 
+    /// **The early return picks the same pair the full sweep did.**
+    ///
+    /// `match_paren` used to materialise every balanced pair in the document
+    /// and then look for the caret's; it now returns at the pair. Three shapes
+    /// separate "the first pair that closes" from "the caret's pair", which a
+    /// return placed one line too early would confuse:
+    /// a pair that closes *before* the caret's, a pair that closes *inside*
+    /// it, and an unmatched paren at the caret with well-formed pairs after it.
+    #[test]
+    fn match_paren_returns_the_carets_pair_not_the_first_one_closed() {
+        // An earlier, unrelated pair closes first.
+        assert_eq!(match_paren("(a)(b)", 3, MySql), Some((3, 5)));
+        assert_eq!(match_paren("(a)(b)", 6, MySql), Some((5, 3)));
+        // A nested pair closes inside the caret's.
+        assert_eq!(match_paren("(()x)", 0, MySql), Some((0, 4)));
+        assert_eq!(match_paren("(()x)", 1, MySql), Some((1, 2)));
+        // An unmatched `)` at the caret takes no partner from the pair after
+        // it. (The walk returns here rather than finishing the document; the
+        // answer was the same before, so this pins the behaviour the early
+        // return had to preserve, not a bug it fixed.)
+        assert_eq!(match_paren(")(a)", 0, MySql), None);
+        assert_eq!(match_paren(")(a)", 1, MySql), Some((1, 3)));
+        // ...nor from one before it.
+        assert_eq!(match_paren("(a))", 3, MySql), None);
+    }
+
     // --- identifier_occurrences -------------------------------------------
 
     #[test]
@@ -664,5 +720,38 @@ mod tests {
         assert!(identifier_occurrences("alpha beta", 0, MySql).is_empty());
         // caret on whitespace, not adjacent to any word
         assert!(identifier_occurrences("a   a", 2, MySql).is_empty());
+    }
+
+    /// **A caret word that is not in code still answers nothing** — now that
+    /// the scan decides that itself instead of a `region_at` call before it.
+    ///
+    /// The two halves are separate mistakes. Dropping the check entirely makes
+    /// the *first* case highlight from inside a comment; deciding it from
+    /// "did the target appear anywhere in code" instead of "did a word start
+    /// at `ws`" makes the *second* one do it, because the same name is a real
+    /// identifier twice elsewhere in the statement.
+    #[test]
+    fn occurrences_refuse_a_caret_word_in_a_comment_or_a_string() {
+        // Caret on `ab` inside the line comment; `ab` is a real identifier
+        // twice below it.
+        let sql = "-- ab\nab = ab";
+        assert!(identifier_occurrences(sql, 3, MySql).is_empty());
+        // The same, with the caret on a real one, to show the corpus is not
+        // simply inert.
+        assert_eq!(
+            identifier_occurrences(sql, 6, MySql),
+            vec![(6, 8), (11, 13)]
+        );
+
+        // Block comment, and a string — same rule.
+        let sql = "/* ab */ ab = ab";
+        assert!(identifier_occurrences(sql, 3, MySql).is_empty());
+        let sql = "'ab' ab = ab";
+        assert!(identifier_occurrences(sql, 2, MySql).is_empty());
+
+        // A dollar-quoted body on PostgreSQL is a string too, and the caret
+        // word inside it is not an identifier occurrence.
+        let sql = "$$ ab $$ ab = ab";
+        assert!(identifier_occurrences(sql, 3, Postgres).is_empty());
     }
 }
