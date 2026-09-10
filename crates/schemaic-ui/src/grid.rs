@@ -8266,11 +8266,9 @@ fn blob_launch(
     // still has to say which column it is about.
     let cap = model.byte_cap(ci);
     let target = match &bref {
-        Some(r) => BlobTarget {
-            title: r.title(),
-            stem: r.save_stem(),
-            cap,
-        },
+        // `save_stem` already sanitizes; going through the constructor anyway
+        // is what makes this arm and the one below one rule rather than two.
+        Some(r) => BlobTarget::new(r.title(), &[&r.save_stem()], cap),
         None => {
             let col = rs
                 .columns
@@ -8283,17 +8281,14 @@ fn blob_launch(
                 .and_then(|c| c.origin.as_ref())
                 .map(|o| o.table.as_str())
                 .unwrap_or_default();
-            BlobTarget {
-                title: match table.is_empty() {
+            BlobTarget::new(
+                match table.is_empty() {
                     true => col.to_string(),
                     false => format!("{table}.{col}"),
                 },
-                stem: match table.is_empty() {
-                    true => col.to_string(),
-                    false => format!("{table}_{col}"),
-                },
+                &[table, col],
                 cap,
-            }
+            )
         }
     };
     Some(BlobLaunch {

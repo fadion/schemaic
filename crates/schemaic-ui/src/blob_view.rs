@@ -63,7 +63,15 @@ pub struct BlobTarget {
     /// The file name a save offers, without an extension: `staff_picture_1`.
     /// The extension comes from what the bytes turn out to be, which is not
     /// known yet when this is built.
-    pub stem: String,
+    ///
+    /// **Private, and built only by [`BlobTarget::new`]**, which runs
+    /// [`schemaic_core::blob::save_stem_from`] over the parts. It is a file
+    /// name assembled from server-supplied identifiers, and one of its two
+    /// producers used to skip the sanitizer — a `bytea` column named
+    /// `..\..\..\Startup\payload` reached the save dialog's name box as a
+    /// relative path out of the folder it was showing. A field anyone can
+    /// write is a third producer waiting to forget.
+    stem: String,
     /// The most bytes this column can hold, if its declared type says — see
     /// [`schemaic_core::blob::column_byte_cap`]. `None` is "no answer", never
     /// "no limit".
@@ -73,6 +81,24 @@ pub struct BlobTarget {
     /// struct is, and because by the time a file comes back the grid the cap was
     /// read from may have been re-run underneath.
     pub cap: Option<u64>,
+}
+
+impl BlobTarget {
+    /// The only way to make one, so the save name is sanitized once rather than
+    /// at each producer. `stem_parts` are the raw pieces — a table, a column, a
+    /// key's values — in the order they should appear.
+    pub fn new(title: String, stem_parts: &[&str], cap: Option<u64>) -> Self {
+        BlobTarget {
+            title,
+            stem: schemaic_core::blob::save_stem_from(stem_parts),
+            cap,
+        }
+    }
+
+    /// The file name a save offers, without an extension.
+    pub fn stem(&self) -> &str {
+        &self.stem
+    }
 }
 
 /// Which of the two views of the same bytes is showing.

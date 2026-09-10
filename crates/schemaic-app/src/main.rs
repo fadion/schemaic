@@ -4310,13 +4310,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // real error, which says more than a guess about size would.
                     Err(_) => {}
                 }
-                report(match std::fs::read(&req.path) {
-                    Ok(bytes) if schemaic_core::blob::load_too_large(bytes.len() as u64) => {
-                        Err(too_big(bytes.len() as u64))
-                    }
-                    Ok(bytes) => Ok(bytes),
-                    Err(e) => Err(format!("Load failed: {e}")),
-                });
+                // **The read bounds itself**, which is what the paragraph above
+                // claimed and `std::fs::read` did not do: it sizes its buffer
+                // from the same `metadata` hint and then reads to EOF, and on
+                // Linux `st_size` is 0 for a character or block device — so
+                // `/dev/zero` passed the check above and grew a `Vec` until the
+                // process died. `read_capped` asks for one byte more than the
+                // cap, so "exactly the cap" and "at least the cap" stay apart.
+                report(
+                    match std::fs::File::open(&req.path)
+                        .and_then(|f| schemaic_core::blob::read_capped(f, cap))
+                    {
+                        // Over the cap, and the size is not knowable without
+                        // reading the rest of it — which is the thing refused.
+                        // The `metadata` hint is the honest number when it has
+                        // one, and `cap + 1` says "more than this" when it does
+                        // not.
+                        Ok(None) => Err(too_big(
+                            std::fs::metadata(&req.path)
+                                .map(|m| m.len())
+                                .unwrap_or(cap + 1)
+                                .max(cap + 1),
+                        )),
+                        Ok(Some(bytes)) => Ok(bytes),
+                        Err(e) => Err(format!("Load failed: {e}")),
+                    },
+                );
             });
         })
     };

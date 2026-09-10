@@ -66,6 +66,37 @@ pub fn load_too_large(len: u64) -> bool {
     len > LOAD_CAP as u64
 }
 
+/// Read at most `cap` bytes, and say whether there were more.
+///
+/// **[`LOAD_CAP`]'s only enforcement used to be the allocation it exists to
+/// prevent.** The load path checks `metadata().len()` first — one stat call,
+/// the cheap path, and the right one — and then called `std::fs::read`, whose
+/// buffer is sized from that same hint and which then reads to EOF. On Linux
+/// `st_size` is **0** for a character or block device, so `/dev/zero`, a FIFO
+/// or a `/proc` file passes the pre-check and the `Vec` grows until the
+/// allocator or the OOM killer stops it — taking the window, every tab's
+/// uncommitted grid edits and any open manual transaction with it. The site's
+/// own comment stated the rule (*"the read still bounds itself below"*) that
+/// the code did not keep: only the *result* was measured, which is that
+/// sentence's own definition of the failure.
+///
+/// `Ok(None)` means "more than `cap`" — the reader is asked for `cap + 1`
+/// bytes and getting them all is what tells the two apart, which keeps the
+/// boundary [`load_too_large`] draws (a file of exactly the cap fits).
+///
+/// A reader, not a path, so this is testable against `io::repeat(0)` — an
+/// infinite one, which is exactly what the bug is about and what no real file
+/// in a test could be.
+pub fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    // A modest starting buffer rather than one sized from the cap: the common
+    // case is a small file, and reserving 64 MiB for every avatar is its own
+    // kind of the same mistake.
+    let mut out = Vec::new();
+    let mut limited = reader.take(cap.saturating_add(1));
+    std::io::Read::read_to_end(&mut limited, &mut out)?;
+    Ok((out.len() as u64 <= cap).then_some(out))
+}
+
 /// Most pixels a preview will decode: 32 megapixels.
 ///
 /// **[`FETCH_CAP`] does not bound this, which is the whole reason it exists.**
@@ -193,25 +224,49 @@ impl BlobRef {
     pub fn save_stem(&self) -> String {
         let mut parts = vec![self.table.clone(), self.column.clone()];
         parts.extend(self.key.iter().map(|(_, v)| v.display()));
-        let raw = parts.join("_");
-        let mut out: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        // A name of nothing but separators is no name; and a very long key must
-        // not push the whole thing past what a filesystem will take.
-        out.truncate(120);
-        if out.trim_matches('_').is_empty() {
-            "blob".to_string()
-        } else {
-            out
-        }
+        save_stem_from(&parts)
+    }
+}
+
+/// The sanitizer itself, over whatever parts the caller has to name a save
+/// with — **on the operation, not on one of its callers**.
+///
+/// [`BlobRef::save_stem`] is one producer of a save name and it was the only
+/// one that sanitized. The other is the panel opened on a cell with no
+/// committed row behind it — a pending row, or a `NULL` cell — which has no key
+/// to name and borrows the table and column instead, straight out of the result
+/// set. Those are server-supplied identifiers: PostgreSQL and SQLite restrict
+/// neither, and MySQL restricts `/ \ .` in a *table* name but not in a column
+/// name, so a `bytea` column called `..\..\..\Startup\payload` put a relative
+/// path out of the folder into the save dialog's name box.
+///
+/// Anything that is not a plain filename character becomes `_`, so a part
+/// holding a path separator or a `:` cannot escape the name into a directory or
+/// an NTFS alternate data stream.
+pub fn save_stem_from<S: AsRef<str>>(parts: &[S]) -> String {
+    let raw = parts
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // A name of nothing but separators is no name; and a very long key must
+    // not push the whole thing past what a filesystem will take.
+    out.truncate(120);
+    if out.trim_matches('_').is_empty() {
+        "blob".to_string()
+    } else {
+        out
     }
 }
 
@@ -937,6 +992,36 @@ mod tests {
         assert!(!s.contains('$'), "{s}");
     }
 
+    /// The other producer of a save name: a cell with no committed row behind
+    /// it (a pending row, or a `NULL` one) has no key to name and borrows the
+    /// table and column straight out of the result set. Those are
+    /// server-supplied identifiers — PostgreSQL and SQLite restrict neither,
+    /// and MySQL restricts `/ \ .` in a table name but not in a column name —
+    /// and that arm skipped the sanitizer entirely, so the save dialog opened
+    /// on `t_..\..\..\Startup\payload.png`.
+    #[test]
+    fn a_stem_built_without_a_key_is_sanitized_like_one_with() {
+        let s = save_stem_from(&["t", r"..\..\..\Startup\payload"]);
+        assert!(!s.contains('\\'), "{s}");
+        assert!(!s.contains('.'), "{s}");
+        assert_eq!(s, "t__________Startup_payload");
+        // And the two producers agree on the same parts.
+        assert_eq!(
+            save_stem_from(&["t", "c"]),
+            a_ref("t", "c", &[]).save_stem()
+        );
+    }
+
+    /// An empty part is dropped rather than leaving a leading or doubled `_`:
+    /// a result column with no provenance gives the caller an empty table name,
+    /// and `_c` is a worse name than `c`.
+    #[test]
+    fn an_empty_part_does_not_become_a_separator() {
+        assert_eq!(save_stem_from(&["", "c"]), "c");
+        assert_eq!(save_stem_from(&["t", ""]), "t");
+        assert_eq!(save_stem_from::<&str>(&[]), "blob");
+    }
+
     #[test]
     fn a_stem_with_nothing_usable_in_it_still_names_a_file() {
         let s = a_ref("...", "///", &[("k", Value::Str("!!!".into()))]).save_stem();
@@ -1070,6 +1155,49 @@ mod tests {
     /// pinning: a file of exactly [`LOAD_CAP`] is the largest the read half can
     /// return whole, so refusing it would refuse a value the app can otherwise
     /// handle end to end.
+    /// The reader terminates on a source that never ends, which is the whole
+    /// point: `/dev/zero` reports `st_size == 0`, so the pre-read size check
+    /// passes it and `std::fs::read` then grows a `Vec` until the process dies.
+    #[test]
+    fn read_capped_stops_on_a_reader_that_never_ends() {
+        let got = read_capped(std::io::repeat(0), 1024).expect("no io error");
+        assert!(got.is_none(), "an endless reader was reported as fitting");
+    }
+
+    /// And the boundary [`load_too_large`] draws is the one it keeps: exactly
+    /// the cap fits, one more does not.
+    #[test]
+    fn read_capped_keeps_the_caps_own_boundary() {
+        let exact = vec![7u8; 64];
+        assert_eq!(
+            read_capped(exact.as_slice(), 64).expect("no io error"),
+            Some(exact.clone())
+        );
+        let over = vec![7u8; 65];
+        assert_eq!(read_capped(over.as_slice(), 64).expect("no io error"), None);
+        // Short, and empty, both come back whole.
+        assert_eq!(
+            read_capped([1u8, 2, 3].as_slice(), 64).expect("no io error"),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            read_capped([].as_slice(), 64).expect("no io error"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn read_capped_reports_the_readers_own_error() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk went away"))
+            }
+        }
+        let e = read_capped(Broken, 64).expect_err("the error must not be swallowed");
+        assert!(e.to_string().contains("disk went away"), "{e}");
+    }
+
     #[test]
     fn a_file_of_exactly_the_load_cap_still_fits() {
         assert!(!load_too_large(LOAD_CAP as u64));
