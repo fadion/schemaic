@@ -3281,7 +3281,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // `ddl::supports_view_editing` — so on SQLite the entry would
                 // open a modal ending at a statement the engine has no form of.
                 && schemaic_core::ddl::supports_view_editing(dialect.get_untracked())
-                && schemaic_core::ddl::can_be_view_body(&stmt)
+                && schemaic_core::ddl::can_be_view_body(&stmt, dialect.get_untracked())
             {
                 // Its own group, as in the schema tree: it's the one entry here
                 // that ends at a statement against the database.

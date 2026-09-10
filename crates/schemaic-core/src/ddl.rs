@@ -621,6 +621,32 @@ impl TableDraft {
                 out.push(format!("Check {name} has no predicate."));
             }
         }
+        // **The two clauses the model carries and nothing checked.** `TableDraft`
+        // copies `without_rowid` and `strict` in, and its own doc says why: "the
+        // rebuild writes the table from *this*, so a clause missing here is a
+        // clause the edit silently drops". So they are this validator's to
+        // judge, and both were reaching the engine as a raw error message
+        // instead — `PRIMARY KEY missing on table t`, and `unknown datatype for
+        // t.a: "VARCHAR(20)"`, both measured on SQLite 3.50.4. The precedent is
+        // `TriggerDraft::validate`'s: refused here rather than at Apply because
+        // the modal can say which control is wrong, and because the twelve-step
+        // rebuild has already dropped the original table by the time a `CREATE`
+        // fails.
+        if requires_rowid_key(dialect) && self.without_rowid && self.primary_key.is_empty() {
+            out.push("A WITHOUT ROWID table needs a primary key.".to_string());
+        }
+        if self.strict {
+            for c in &self.columns {
+                let ty = c.info.type_name.trim();
+                if !ty.is_empty() && !strict_type_allowed(dialect, ty) {
+                    out.push(format!(
+                        "STRICT tables take only INT, INTEGER, REAL, TEXT, BLOB or ANY — \
+                         {} is {ty}.",
+                        c.info.name.trim()
+                    ));
+                }
+            }
+        }
         out
     }
 }
@@ -795,7 +821,7 @@ impl ViewDraft {
     /// Empty means "emittable", **not** "the server will accept it" — whether the
     /// body's tables and columns exist is the server's judgement, as everywhere
     /// else here.
-    pub fn validate(&self) -> Vec<String> {
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
         let mut out = Vec::new();
         if self.name.trim().is_empty() {
             out.push("The view needs a name.".to_string());
@@ -803,7 +829,7 @@ impl ViewDraft {
         let body = self.select.trim();
         if body.is_empty() {
             out.push("A view needs a SELECT to define it.".to_string());
-        } else if !can_be_view_body(body) {
+        } else if !can_be_view_body(body, dialect) {
             // Head-keyword only: anything past that is the parser's job, and a
             // body it can't parse mid-edit still has to be emittable.
             out.push(
@@ -829,14 +855,25 @@ impl ViewDraft {
 /// is on a complete statement, which is what both callers need — the draft's
 /// [`validate`](ViewDraft::validate), and the editor's right-click menu deciding
 /// whether "Create view" applies to the statement under the cursor.
-pub fn can_be_view_body(body: &str) -> bool {
-    let head = body
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .find(|w| !w.is_empty())
-        .unwrap_or_default();
-    ["SELECT", "WITH", "VALUES", "TABLE"]
-        .iter()
-        .any(|k| head.eq_ignore_ascii_case(k))
+pub fn can_be_view_body(body: &str, dialect: SqlDialect) -> bool {
+    // **Through `leading_words`, not a `char::split`.** The split took `--` as
+    // the head word, so a body opening with a comment — the ordinary way to
+    // write one — answered "not a query": *Create view* vanished from the
+    // editor's right-click menu with no explanation, and the view editor refused
+    // a pasted body both engines accept. That is the one scanner in this module
+    // that did not build on `sql::skip_noncode`, which
+    // `unrestatable_sqlite_clauses` and `is_begin_end_block` both do.
+    //
+    // It also keeps the `(SELECT 1)` case the split handled by accident: a `(`
+    // is not a word, so the first *word* token is still `SELECT`.
+    schemaic_head_matches(&crate::sql::leading_words(body, 1, dialect))
+}
+
+/// Is this the head keyword of a query? Split out so the list is written once.
+fn schemaic_head_matches(words: &[String]) -> bool {
+    words
+        .first()
+        .is_some_and(|head| ["SELECT", "WITH", "VALUES", "TABLE"].contains(&head.as_str()))
 }
 
 /// A view body as it goes into a `CREATE VIEW`: trimmed, with the terminating
@@ -8096,6 +8133,39 @@ pub fn requires_named_checks(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
 }
 
+/// Does a table declared **WITHOUT ROWID** have to name a primary key on this
+/// engine?
+///
+/// SQLite's own rule, and the reason it is a capability rather than a
+/// `dialect == Sqlite`: the clause exists on no other engine today, so the
+/// answer is `false` there because there is nothing to require — and a fourth
+/// engine that grew the clause would answer for itself.
+///
+/// Measured on SQLite 3.50.4: `CREATE TABLE t (a TEXT, b INT) WITHOUT ROWID`
+/// answers `PRIMARY KEY missing on table t`, which the twelve-step rebuild
+/// surfaces raw after having already dropped the original.
+pub fn requires_rowid_key(dialect: SqlDialect) -> bool {
+    matches!(dialect, SqlDialect::Sqlite)
+}
+
+/// Is `ty` a type a **STRICT** table accepts on this engine?
+///
+/// SQLite's STRICT tables admit exactly `INT`, `INTEGER`, `REAL`, `TEXT`,
+/// `BLOB` and `ANY` — no parameters, no synonyms — so the most natural thing a
+/// user types into the designer, `VARCHAR(20)`, is refused by the server:
+/// `unknown datatype for t.a: "VARCHAR(20)"`, measured on 3.50.4. Every other
+/// engine takes whatever its own parser takes, which is not this function's
+/// question, so they answer `true`.
+pub fn strict_type_allowed(dialect: SqlDialect, ty: &str) -> bool {
+    if !matches!(dialect, SqlDialect::Sqlite) {
+        return true;
+    }
+    matches!(
+        ty.trim().to_ascii_uppercase().as_str(),
+        "INT" | "INTEGER" | "REAL" | "TEXT" | "BLOB" | "ANY"
+    )
+}
+
 /// Does this `AlterColumn` change the column's **name and nothing else**?
 ///
 /// The question SQLite's `RENAME COLUMN` answers exactly: it moves the name and
@@ -10654,6 +10724,89 @@ mod tests {
             cs.destructive().is_empty(),
             "a metadata-only widening was reported as a rewrite: {:?}",
             cs.destructive()
+        );
+    }
+
+    /// **Two SQLite clauses the model itself carries, and the validator never
+    /// read.** `TableDraft` copies `without_rowid` and `strict` in — its own doc
+    /// says "the rebuild writes the table from *this*, so a clause missing here
+    /// is a clause the edit silently drops" — so they are the designer's to
+    /// judge, and both were reaching the engine as raw text instead. Measured on
+    /// SQLite 3.50.4: `PRIMARY KEY missing on table t`, and `unknown datatype
+    /// for t.a: "VARCHAR(20)"`. The twelve-step rebuild has already dropped the
+    /// original table by the time either `CREATE` fails, which is the second
+    /// half of `TriggerDraft::validate`'s stated reason for refusing here.
+    #[test]
+    fn sqlites_own_table_rules_are_refused_in_the_form() {
+        // A fixture of its own: `users()` carries a foreign key, and the two
+        // rules under test are about the table's own clauses.
+        let sqlite_table = |without_rowid: bool, strict: bool| TableInfo {
+            name: "t".into(),
+            schema: None,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    type_name: "TEXT".into(),
+                    nullable: false,
+                    primary_key: true,
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "email".into(),
+                    type_name: "TEXT".into(),
+                    ..Default::default()
+                },
+            ],
+            without_rowid,
+            strict,
+            ..Default::default()
+        };
+        let t = sqlite_table(true, false);
+
+        // Untick the primary key on a WITHOUT ROWID table — two clicks in the
+        // designer, and the engine's answer is unusable.
+        let mut draft = TableDraft::from_table(&t);
+        assert!(draft.without_rowid, "the fixture carries the clause");
+        draft.set_in_primary_key(0, false);
+        let errs = draft.validate(Sqlite);
+        assert!(errs.iter().any(|e| e.contains("WITHOUT ROWID")), "{errs:?}");
+        // Put it back and the objection goes.
+        draft.set_in_primary_key(0, true);
+        assert!(
+            draft.validate(Sqlite).is_empty(),
+            "{:?}",
+            draft.validate(Sqlite)
+        );
+
+        // STRICT: the most natural type a user types is the one it refuses.
+        let t = sqlite_table(false, true);
+        let mut draft = TableDraft::from_table(&t);
+        draft.columns[1].info.type_name = "VARCHAR(20)".into();
+        let errs = draft.validate(Sqlite);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("STRICT") && e.contains("email")),
+            "{errs:?}"
+        );
+        for ok in ["INT", "integer", "REAL", "text", "BLOB", "any"] {
+            draft.columns[1].info.type_name = ok.into();
+            assert!(
+                !draft.validate(Sqlite).iter().any(|e| e.contains("STRICT")),
+                "{ok} was refused: {:?}",
+                draft.validate(Sqlite)
+            );
+        }
+
+        // And neither rule is anyone else's: the same drafts pass on MySQL,
+        // which has no such clause to enforce.
+        let t = sqlite_table(true, true);
+        let mut draft = TableDraft::from_table(&t);
+        draft.set_in_primary_key(0, false);
+        draft.columns[1].info.type_name = "VARCHAR(20)".into();
+        assert!(
+            draft.validate(MySql).is_empty(),
+            "{:?}",
+            draft.validate(MySql)
         );
     }
 
@@ -15462,7 +15615,11 @@ mod tests {
                     t.name,
                     cs.changes
                 );
-                assert!(draft.validate().is_empty(), "{:?}", draft.validate());
+                assert!(
+                    draft.validate(MySql).is_empty(),
+                    "{:?}",
+                    draft.validate(MySql)
+                );
             }
         }
 
@@ -16113,7 +16270,7 @@ mod tests {
         /// What the designer refuses to hand to the preview.
         #[test]
         fn validate_catches_what_cannot_be_emitted() {
-            let msgs = |d: &ViewDraft| d.validate().join(" | ");
+            let msgs = |d: &ViewDraft| d.validate(MySql).join(" | ");
 
             let mut d = ViewDraft::blank("", None);
             d.select = "SELECT 1".into();
@@ -16135,7 +16292,11 @@ mod tests {
             ] {
                 let mut d = ViewDraft::blank("v", None);
                 d.select = body.into();
-                assert!(d.validate().is_empty(), "{body}: {:?}", d.validate());
+                assert!(
+                    d.validate(MySql).is_empty(),
+                    "{body}: {:?}",
+                    d.validate(MySql)
+                );
             }
         }
 
@@ -16152,8 +16313,15 @@ mod tests {
                 "VALUES (1)",
                 "TABLE city",
                 "SELECT a FROM ", // mid-edit, still a query
+                // **A leading comment is the ordinary way to write one**, and
+                // `statement_range` trims whitespace only — so the editor
+                // handed this straight in and the split read `--` as the head
+                // word. Both engines accept a comment before the SELECT.
+                "-- active users\nSELECT id FROM users",
+                "/* note */ SELECT 1",
+                "/* a */ -- b\n  (SELECT 1)",
             ] {
-                assert!(can_be_view_body(yes), "{yes}");
+                assert!(can_be_view_body(yes, MySql), "{yes}");
             }
             for no in [
                 "",
@@ -16162,9 +16330,16 @@ mod tests {
                 "INSERT INTO t VALUES (1)",
                 "CREATE VIEW v AS SELECT 1",
                 "SELECTED",
+                // All comment and no query is still not a view body.
+                "-- just a comment",
+                "/* nothing here */",
             ] {
-                assert!(!can_be_view_body(no), "{no}");
+                assert!(!can_be_view_body(no, MySql), "{no}");
             }
+            // MySQL's `#` line comment is a dialect difference, and the scan is
+            // dialect-aware: PostgreSQL reads `#` as an operator, not a comment.
+            assert!(can_be_view_body("# note\nSELECT 1", SqlDialect::MySql));
+            assert!(!can_be_view_body("# note\nSELECT 1", SqlDialect::Postgres));
         }
 
         /// A materialized view has no `CREATE OR REPLACE` and isn't editable
@@ -16179,9 +16354,12 @@ mod tests {
             let draft = ViewDraft::from_table(&v).unwrap();
             assert!(draft.options.materialized);
             assert!(
-                draft.validate().iter().any(|m| m.contains("materialized")),
+                draft
+                    .validate(Postgres)
+                    .iter()
+                    .any(|m| m.contains("materialized")),
                 "{:?}",
-                draft.validate()
+                draft.validate(Postgres)
             );
         }
 
@@ -19124,7 +19302,7 @@ mod sqlite_view_tests {
             ..Default::default()
         });
         let d = ViewDraft::from_table(&cur).unwrap();
-        assert!(!d.validate().is_empty());
+        assert!(!d.validate(Sqlite).is_empty());
         let sql = create_view(&d, Sqlite).script().to_ascii_uppercase();
         assert!(!sql.contains("MATERIALIZED"), "{sql}");
     }

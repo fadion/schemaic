@@ -542,7 +542,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                     let Some(status_target) = target else {
                         return empty().into_any();
                     };
-                    let errs = draft.validate();
+                    let errs = draft.validate(status_target.dialect);
                     if let Some(first) = errs.first() {
                         return text(first.clone())
                             .style(|s| {
@@ -583,7 +583,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                     };
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = draft.validate().is_empty() && !cs.is_empty();
+                    let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
                             "Cancel",
