@@ -457,6 +457,37 @@ fn mcp_dir() -> Option<PathBuf> {
 /// wedge the session against every later question.
 const CHILD_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Read `child`'s stderr into `buf` on its own task, for as long as the pipe
+/// is open.
+///
+/// **Concurrently, not on exit.** A child whose diagnostics fill the pipe
+/// buffer — 64 KiB on Linux — blocks in `write` until somebody reads, so
+/// reading only when it dies is a deadlock, and `kill_on_drop` cannot help
+/// because the owner is blocked in `wait()`. The stdout half of this hazard is
+/// written up at the per-turn `drop(reader)` a few hundred lines below.
+///
+/// **A function because the persistent session creates a child twice.** The
+/// first spawn drained; the respawn after a Stop reassigned `child`, `stdin`,
+/// `reader`, `parser` and `raw_output` and left `child.stderr` alone, so
+/// nothing read that pipe for the rest of the session — and `stderr_buf` still
+/// held the *killed* child's output, which `cli_failure_message` prefers over
+/// everything.
+fn drain_stderr(child: &mut tokio::process::Child, buf: &std::sync::Arc<std::sync::Mutex<String>>) {
+    let Some(se) = child.stderr.take() else {
+        return;
+    };
+    let buf = buf.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(se).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if let Ok(mut b) = buf.lock() {
+                b.push_str(&l);
+                b.push('\n');
+            }
+        }
+    });
+}
+
 /// Write the `claude` MCP config to a per-session temp file and return its path.
 /// The DB endpoint (with credentials) rides in the config's `env`, so it never
 /// appears on a command line where another same-user process could read it
@@ -1557,18 +1588,7 @@ pub(crate) fn start_ai_session(
                 };
                 let mut reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
                 let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-                if let Some(se) = child.stderr.take() {
-                    let buf = stderr_buf.clone();
-                    tokio::spawn(async move {
-                        let mut lines = BufReader::new(se).lines();
-                        while let Ok(Some(l)) = lines.next_line().await {
-                            if let Ok(mut b) = buf.lock() {
-                                b.push_str(&l);
-                                b.push('\n');
-                            }
-                        }
-                    });
-                }
+                drain_stderr(&mut child, &stderr_buf);
                 let mut parser = schemaic_ai::stream::StreamParser::new(harness);
                 let mut raw: Vec<String> = Vec::new();
                 let mut ended = false;
@@ -1851,18 +1871,7 @@ pub(crate) fn start_ai_session(
         // Drain stderr concurrently into a shared buffer so it's available if the
         // session dies (reading it only on exit could deadlock a full pipe).
         let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        if let Some(se) = child.stderr.take() {
-            let buf = stderr_buf.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(se).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
-                    if let Ok(mut b) = buf.lock() {
-                        b.push_str(&l);
-                        b.push('\n');
-                    }
-                }
-            });
-        }
+        drain_stderr(&mut child, &stderr_buf);
         // Plain-text stdout lines that aren't stream-json (e.g. a fatal error the
         // CLI prints before exiting) — kept as a fallback diagnostic.
         let mut raw_output: Vec<String> = Vec::new();
@@ -1907,6 +1916,30 @@ pub(crate) fn start_ai_session(
                                 reader = BufReader::new(
                                     child.stdout.take().expect("stdout piped"),
                                 ).lines();
+                                // **The replacement's stderr, drained too, and
+                                // the killed child's discarded.** This block
+                                // reassigns everything else the loop reads and
+                                // used to leave `child.stderr` alone, so
+                                // nothing read that pipe for the rest of the
+                                // session. Three ways that showed: a later
+                                // death of an expired login reported as "the
+                                // CLI exited with status 1" — verbatim the
+                                // failure `.stderr(Stdio::piped())` was added
+                                // to prevent; a *clean* exit reported as
+                                // "ended unexpectedly" because the buffer
+                                // still held whatever the **killed** child
+                                // printed (an npm shim's `ExperimentalWarning`
+                                // is enough, and `cli_failure_message` prefers
+                                // stderr over everything); and a replacement
+                                // that writes past the 64 KiB pipe buffer
+                                // blocking in `write` for ever, which the
+                                // unbounded `child.wait()` below cannot
+                                // recover from. The buffer is cleared because
+                                // it belongs to the process that wrote it.
+                                if let Ok(mut b) = stderr_buf.lock() {
+                                    b.clear();
+                                }
+                                drain_stderr(&mut child, &stderr_buf);
                                 parser = schemaic_ai::stream::StreamParser::new(harness);
                                 raw_output.clear();
                                 // **The one chance to deliver the outline is
@@ -2011,7 +2044,22 @@ pub(crate) fn start_ai_session(
                     // an empty response: prefer stderr, then the plain-text stdout it
                     // printed, then the exit status.
                     _ => {
-                        let code = child.wait().await.ok().and_then(|s| s.code());
+                        // **Bounded, like the per-turn path's.** Its own
+                        // comment prices an unbounded one: a child that keeps
+                        // writing past its terminal event fills a pipe and
+                        // blocks here for ever, and `kill_on_drop` cannot help
+                        // because `child` is not dropped until `wait()`
+                        // returns — so the session would accept no further
+                        // question and the `kill()` below would never be
+                        // reached.
+                        let code = match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await
+                        {
+                            Ok(st) => st.ok().and_then(|s| s.code()),
+                            Err(_) => {
+                                let _ = child.kill().await;
+                                None
+                            }
+                        };
                         let stderr_text = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
                         let raw = raw_output.join("\n");
                         let ended_badly = code != Some(0)
@@ -3252,6 +3300,63 @@ mod tests {
     /// because the model falls back to writing the fenced block from the schema
     /// it already has and the user sees a preview either way.
     ///
+    /// **Every child on the persistent path has its stderr drained, and every
+    /// `wait()` is bounded.**
+    ///
+    /// The respawn after a Stop reassigned `child`, `stdin`, `reader`,
+    /// `parser` and `raw_output` and left `child.stderr` alone, so nothing
+    /// read that pipe for the rest of the session. Three ways that showed: a
+    /// later death of an expired login reported as "the CLI exited with
+    /// status 1" — verbatim the failure `.stderr(Stdio::piped())` was added to
+    /// prevent; a *clean* exit reported as "ended unexpectedly", because the
+    /// buffer still held whatever the **killed** child printed and
+    /// `cli_failure_message` prefers stderr over everything (an npm shim's
+    /// `ExperimentalWarning` is enough); and a replacement writing past the
+    /// 64 KiB pipe buffer blocking in `write` for ever, which the persistent
+    /// path's unbounded `child.wait()` could not recover from.
+    ///
+    /// A source check because both children are created inside a spawned task
+    /// in a long-running `select!`, and the pipe hazard needs a real child.
+    /// Counted rather than matched pairwise: a third spawn shows up as an
+    /// imbalance, which is exactly how the second one got missed.
+    #[test]
+    fn every_piped_child_gets_its_stderr_drained_and_is_waited_for_with_a_bound() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("ai.rs"),
+        )
+        .expect("this file's own source");
+        let body = production_code(&src);
+
+        // Every place a child is taken over — the first spawn and the respawn
+        // — drains it. `stdout.take()` is the marker for "this code now owns a
+        // child's pipes".
+        let takeovers = body.matches("child.stdout.take()").count();
+        let drains = body.matches("drain_stderr(&mut child").count();
+        assert!(takeovers >= 2, "the scan found {takeovers} — is it stale?");
+        assert_eq!(
+            takeovers, drains,
+            "a child's pipes are taken over without draining its stderr: its \
+             diagnostics go nowhere, the previous child's are reported in \
+             their place, and a full pipe wedges the session"
+        );
+
+        // And no `wait()` on this path is unbounded.
+        assert!(
+            !body.contains("child.wait().await"),
+            "an unbounded `child.wait()` — a child that keeps writing past its \
+             terminal event blocks here for ever, and `kill_on_drop` cannot \
+             help because `child` is not dropped until `wait()` returns"
+        );
+        assert!(
+            body.matches("timeout(CHILD_EXIT_GRACE, child.wait())")
+                .count()
+                >= 2,
+            "both paths must bound the reap"
+        );
+    }
+
     /// **A dropped session says nothing, and the two branches agree about
     /// that.**
     ///
