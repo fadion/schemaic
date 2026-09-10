@@ -433,7 +433,17 @@ pub(crate) async fn fetch_query(
         Some(d) => connect_to(db, d).await?,
         None => connect_maintenance(db).await?,
     };
-    run_statement(db, &client, database.unwrap_or(""), sql, dest, &cancel).await
+    // A connection of its own, opened three lines up: no transaction to fence.
+    run_statement(
+        db,
+        &client,
+        database.unwrap_or(""),
+        sql,
+        dest,
+        &cancel,
+        false,
+    )
+    .await
 }
 
 /// Run several statements in order on ONE connection, so session state carries
@@ -483,6 +493,10 @@ pub(crate) async fn run_batch(
             sql,
             &mut crate::RowDest::Capped(row_cap),
             &cancel,
+            // `run_batch` wraps nothing; a `BEGIN` in the script itself is the
+            // file's own, and a describe that aborted it would be the same
+            // failure the statement is about to report anyway.
+            false,
         )
         .await;
         if outcome.is_err() {
@@ -601,6 +615,10 @@ pub(crate) async fn explain(
         &format!("EXPLAIN ANALYZE {stmt}"),
         &mut crate::RowDest::Capped(10_000),
         &cancel,
+        // The `BEGIN` four lines up is ours: a failing `EXPLAIN ANALYZE` used
+        // to report the abort message rather than the planner's, while plain
+        // `EXPLAIN` of the same statement reported the real one.
+        true,
     )
     .await;
     // Unconditional, and its own failure can't mask the plan: dropping the
@@ -817,6 +835,35 @@ pub(crate) async fn run_script(
     (end, ran)
 }
 
+/// The savepoint the non-executing describe runs behind — see `in_tx` on
+/// [`run_statement`]. Its own name, not `classify_fenced`'s `schemaic_w`: the
+/// two nest (a fenced blob read is a statement like any other) and a shared
+/// name would have the inner `RELEASE` free the outer one's fence.
+const DESCRIBE_FENCE: &str = "schemaic_describe";
+
+/// `in_tx` — **is this connection already inside a transaction?**
+///
+/// It decides whether the non-executing describe below is bracketed by a
+/// savepoint, and getting it wrong is a message, not a failure: `SAVEPOINT`
+/// outside a transaction is `25P01` on PostgreSQL, which is discarded here.
+///
+/// **A failed `Parse` aborts an open transaction exactly as a failed statement
+/// does.** The describe's own error is thrown away (`Err(_) => None`) because
+/// on a fresh connection the execute below reports the same thing — but inside
+/// a transaction the execute then reports `25P02`, *"current transaction is
+/// aborted, commands ignored until end of transaction block"*, and the user is
+/// told nothing about the relation they mistyped. Two callers are inside one: a
+/// Manual-mode tab's pinned `Session` (whose `ensure_tx` issues `BEGIN` on the
+/// first statement) and `explain(analyze = true)`, which issues its own. So
+/// `SELECT * FROM citys` reported the abort message in Manual mode and
+/// `relation "citys" does not exist` in Auto — and MySQL, which has no describe
+/// step, reported the real error in both. Reproduced on PG 16.15 through
+/// `psql`'s `\bind`; the savepoint recovery is measured there too.
+///
+/// It hits the errors the *planner* raises — unknown relation, unknown column,
+/// unknown function, ambiguous column, type resolution — which is the typo
+/// class, i.e. the common interactive error. A runtime failure passes `Parse`
+/// and always surfaced correctly.
 pub(crate) async fn run_statement(
     db: &Db,
     client: &Client,
@@ -824,6 +871,7 @@ pub(crate) async fn run_statement(
     sql: &str,
     dest: &mut crate::RowDest,
     cancel: &CancellationToken,
+    in_tx: bool,
 ) -> Result<ResultSet, DbError> {
     let row_cap = dest.cap();
     let start = Instant::now();
@@ -842,6 +890,14 @@ pub(crate) async fn run_statement(
     // encoding went into the cell. For a single statement this is the same string
     // and the same one round trip.
     let describe = schemaic_core::sql::first_statement(sql, PG);
+    // **Confirmed, not assumed** — `Session::classify_isolated`'s rule: the
+    // fence counts only if the server accepted it, which is also how "we are
+    // in a transaction" is established rather than trusted.
+    let fenced = in_tx
+        && client
+            .batch_execute(&format!("SAVEPOINT {DESCRIBE_FENCE}"))
+            .await
+            .is_ok();
     let prepared_cols: Option<Vec<Column>> = match client.prepare(describe).await {
         Ok(stmt) => {
             let cols = stmt.columns();
@@ -891,8 +947,28 @@ pub(crate) async fn run_statement(
             }
             Some(columns)
         }
-        Err(_) => None,
+        // The error is still discarded — the execute below reports the same
+        // thing, in the server's own words, for a statement that also *ran*.
+        // What the rollback buys is that it can: without it the transaction is
+        // aborted and every later statement in the tab answers `25P02` too.
+        Err(_) => {
+            if fenced {
+                let _ = client
+                    .batch_execute(&format!("ROLLBACK TO SAVEPOINT {DESCRIBE_FENCE}"))
+                    .await;
+            }
+            None
+        }
     };
+    // Released on both paths, because the name is fixed and a transaction can
+    // hold a great many statements: `ROLLBACK TO SAVEPOINT` does not release,
+    // so without this each one would leave a savepoint behind — the reason
+    // `classify_fenced` releases in every arm.
+    if fenced {
+        let _ = client
+            .batch_execute(&format!("RELEASE SAVEPOINT {DESCRIBE_FENCE}"))
+            .await;
+    }
 
     // Execute over the text protocol, honoring cancellation via the cancel token.
     //

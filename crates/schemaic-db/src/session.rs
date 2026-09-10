@@ -445,7 +445,24 @@ impl Session {
                 let database = self.database.as_deref().unwrap_or("");
                 let mut dest = crate::RowDest::Capped(row_cap);
                 tokio::select! {
-                    r = pg::run_statement(&self.db, client, database, sql, &mut dest, &cancel) => r,
+                    // **`in_tx`, so the non-executing describe is fenced.** A
+                    // Manual-mode tab is inside a transaction from its first
+                    // statement (`ensure_tx`), and a failed `Parse` aborts one
+                    // exactly as a failed statement does — so a typo reported
+                    // "current transaction is aborted" instead of naming the
+                    // relation, and everything after it in the tab reported the
+                    // same. The flag is this session's own belief; PostgreSQL
+                    // refuses the savepoint if it is wrong, and that refusal is
+                    // what `run_statement` reads rather than the flag.
+                    r = pg::run_statement(
+                        &self.db,
+                        client,
+                        database,
+                        sql,
+                        &mut dest,
+                        &cancel,
+                        self.in_tx.load(Ordering::SeqCst),
+                    ) => r,
                     // Over this session's own transport: a cancel that opened a
                     // plaintext connection would be refused by the very servers
                     // the TLS setting exists for, and the failure is discarded.

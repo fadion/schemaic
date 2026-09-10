@@ -794,3 +794,73 @@ async fn column(scratch: &Scratch, sql: &str) -> Vec<String> {
         })
         .collect()
 }
+
+/// A typo in a Manual-mode tab reports **what the server said**, and the tab is
+/// still usable afterwards.
+///
+/// PostgreSQL's `run_statement` opens with a non-executing describe
+/// (`client.prepare`) and discards its error, which is right on a fresh
+/// connection — the execute reports the same thing. Inside a transaction it is
+/// not: a failed `Parse` aborts the transaction exactly as a failed statement
+/// does, so the execute answered `25P02` — *"current transaction is aborted,
+/// commands ignored until end of transaction block"* — and the user was told
+/// nothing about the relation they mistyped. The same statement in Auto mode
+/// reported `relation "…" does not exist`, and MySQL, which has no describe
+/// step, reported the real error in both modes.
+///
+/// The transaction is aborted *afterwards* either way — the statement ran and
+/// failed, and that is PostgreSQL's rule for any failing statement. What was
+/// wrong is that it was aborted before anything ran, by a describe the user
+/// never asked for, so the message named nothing they could act on.
+pub async fn a_typo_in_a_manual_transaction_names_what_the_server_refused(target: &'static Target) {
+    let scratch = Scratch::create(target, "manual_typo").await;
+    seed_import_table(&scratch).await;
+
+    let session = OpenSession(Some(
+        Session::open(&scratch.db, Some(&scratch.database))
+            .await
+            .unwrap_or_else(|e| panic!("{}: could not pin a session: {e}", target.name)),
+    ));
+    session
+        .ensure_tx()
+        .await
+        .unwrap_or_else(|e| panic!("{}: could not begin: {e}", target.name));
+
+    let missing = scratch.qualified("no_such_table_here");
+    let err = session
+        .fetch_query(
+            &format!("SELECT * FROM {missing}"),
+            10,
+            CancellationToken::new(),
+        )
+        .await
+        .result
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: selecting from a table that does not exist succeeded",
+                target.name
+            )
+        })
+        .to_string();
+    assert!(
+        err.contains("no_such_table_here"),
+        "{}: the error does not name the table: {err}",
+        target.name
+    );
+    assert!(
+        !err.contains("transaction is aborted"),
+        "{}: the describe aborted the transaction: {err}",
+        target.name
+    );
+
+    // **What this test does not claim.** The statement then *ran* and failed,
+    // and PostgreSQL aborts a transaction on a failed statement — so the tab
+    // does read "Tx aborted" from here, exactly as it would for a runtime error
+    // that passed `Parse`. That is the engine's rule and the app surfaces it;
+    // what was wrong was being told the transaction was aborted *instead of*
+    // being told what was wrong, before anything had run.
+
+    session.close().await;
+    scratch.teardown().await;
+}

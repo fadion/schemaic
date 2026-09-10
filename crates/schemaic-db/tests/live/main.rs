@@ -136,6 +136,7 @@ live_suite!(
         a_refused_row_rolls_the_whole_import_back,
         a_manual_transaction_is_invisible_until_it_commits,
         a_rolled_back_manual_transaction_leaves_nothing,
+        a_typo_in_a_manual_transaction_names_what_the_server_refused,
         a_cancelled_query_stops_at_the_server,
         a_cancelled_script_stops_at_the_server_and_reports_what_ran,
         a_cancelled_import_rolls_back_and_says_so,
