@@ -577,28 +577,7 @@ pub async fn a_renamed_column_keeps_its_indexs_kind(target: &'static Target) {
 
 async fn apply(scratch: &Scratch, current: &TableInfo, draft: &TableDraft, target: &Target) {
     let set = ddl::diff(current, draft, target.engine.dialect());
-    assert!(
-        !set.changes.is_empty(),
-        "{}: the draft proposed no change at all — the test changed nothing",
-        target.name
-    );
-    let stmts = set.emit();
-    assert!(
-        !stmts.is_empty(),
-        "{}: {:?} emitted no statements",
-        target.name,
-        set.changes
-    );
-    scratch
-        .db
-        .run_ddl(&scratch.database, &stmts, CancellationToken::new())
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: the plan failed at statement {} of {stmts:?}: {}",
-                target.name, e.at, e.message
-            )
-        });
+    scratch.apply_plan(&set, "table").await;
 }
 
 /// After applying, the table read back must round-trip through **its own**

@@ -341,28 +341,7 @@ fn new_trigger(scratch: &Scratch, target: &Target, name: &str) -> TriggerDraft {
 /// Diff the trigger set, emit it, run it — the trigger modal's own path.
 async fn apply(scratch: &Scratch, current: &TableInfo, draft: &TriggerSetDraft, target: &Target) {
     let set = ddl::diff_triggers(&current.triggers, draft, target.engine.dialect());
-    assert!(
-        !set.changes.is_empty(),
-        "{}: the trigger draft proposed no change — the test changed nothing",
-        target.name
-    );
-    let stmts = set.emit();
-    assert!(
-        !stmts.is_empty(),
-        "{}: {:?} emitted no statements",
-        target.name,
-        set.changes
-    );
-    scratch
-        .db
-        .run_ddl(&scratch.database, &stmts, CancellationToken::new())
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: the trigger plan failed at statement {} of {stmts:?}: {}",
-                target.name, e.at, e.message
-            )
-        });
+    scratch.apply_plan(&set, "trigger").await;
 }
 
 /// Run an already-emitted plan, failing loudly with the statement that refused.

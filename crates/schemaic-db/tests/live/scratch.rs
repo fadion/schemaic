@@ -67,6 +67,9 @@ pub struct Scratch {
     pub database: String,
     /// The namespace a table here reports, from [`Target::namespace`].
     pub namespace: Option<&'static str>,
+    /// The leg this scratch belongs to — kept so the shared assertions below
+    /// can name it, the way every hand-written one already does.
+    pub target: &'static Target,
     dialect: SqlDialect,
     /// Further scratch **databases** this test made — the MySQL family's answer
     /// to [`Scratch::alt_namespace`], where a database *is* the namespace. Empty
@@ -161,10 +164,53 @@ impl Scratch {
             db,
             database: name,
             namespace: target.namespace,
+            target,
             dialect,
             extra_databases: Vec::new(),
             torn: false,
         }
+    }
+
+    /// Apply a change set the test just produced: it must **propose** something,
+    /// it must **emit** something, and the server must take it.
+    ///
+    /// **One helper because four suites hand-rolled it.** `live/ddl.rs`,
+    /// `live/views.rs` and `live/triggers.rs` each grew a private `apply` that
+    /// is this function with one differ swapped, and `Scratch` had no assertion
+    /// helper of any kind — every method on it was setup, which is what made
+    /// hand-rolling one the path of least resistance. All three differs
+    /// (`ddl::diff`, `diff_view`, `diff_triggers`) return a [`ChangeSet`], so
+    /// there is one shape here and not three.
+    ///
+    /// The first assertion is the one worth stating: a draft that proposes
+    /// nothing means the *test* changed nothing, and every assertion after it
+    /// would then be about a table nobody touched. That is the vacuous shape
+    /// this tier has had to correct twice (`B2.4-L6-01`, `B3.2-L6-03`), and it
+    /// belongs where a suite cannot forget it.
+    ///
+    /// `what` names the kind of plan, for the failure message only.
+    pub async fn apply_plan(&self, set: &schemaic_core::ddl::ChangeSet, what: &str) {
+        assert!(
+            !set.changes.is_empty(),
+            "{}: the {what} draft proposed no change at all — the test changed nothing",
+            self.target.name
+        );
+        let stmts = set.emit();
+        assert!(
+            !stmts.is_empty(),
+            "{}: {:?} emitted no statements",
+            self.target.name,
+            set.changes
+        );
+        self.db
+            .run_ddl(&self.database, &stmts, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}: the {what} plan failed at statement {} of {stmts:?}: {}",
+                    self.target.name, e.at, e.message
+                )
+            });
     }
 
     /// Run one statement against the scratch database and return its result.

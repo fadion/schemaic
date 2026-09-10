@@ -478,28 +478,7 @@ async fn seed_view(scratch: &Scratch, body: &str) {
 /// Diff the view draft, emit it, run it — the view editor's own path.
 async fn apply_view(scratch: &Scratch, current: &TableInfo, draft: &ViewDraft, target: &Target) {
     let set = ddl::diff_view(current, draft, target.engine.dialect());
-    assert!(
-        !set.changes.is_empty(),
-        "{}: the view draft proposed no change — the test changed nothing",
-        target.name
-    );
-    let stmts = set.emit();
-    assert!(
-        !stmts.is_empty(),
-        "{}: {:?} emitted no statements",
-        target.name,
-        set.changes
-    );
-    scratch
-        .db
-        .run_ddl(&scratch.database, &stmts, CancellationToken::new())
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: the view plan failed at statement {} of {stmts:?}: {}",
-                target.name, e.at, e.message
-            )
-        });
+    scratch.apply_plan(&set, "view").await;
 }
 
 async fn view_of(scratch: &Scratch) -> TableInfo {
