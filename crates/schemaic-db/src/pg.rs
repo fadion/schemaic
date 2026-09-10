@@ -1033,14 +1033,13 @@ pub(crate) async fn run_statement(
     // both are per-column answers, and re-deriving either per cell would put a
     // string split in the path of every one of up to 200k x N reads.
     let chunk_capacity = dest.chunk_capacity();
-    let mut grid: Option<(ResultBuilder, Vec<CellKind>)> =
-        prepared_cols.filter(|c| !c.is_empty()).map(|c| {
-            let kinds = cell_kinds(&type_names_of(&c));
-            (
-                ResultBuilder::with_capacity(c.clone(), chunk_capacity),
-                kinds,
-            )
-        });
+    let mut grid: Option<(ResultBuilder, Vec<CellKind>)> = result_columns(
+        prepared_cols.as_deref(),
+        // No row has arrived yet, so this arm is only reachable with prepared
+        // columns; the fallback is applied at the first row below.
+        None,
+    )
+    .map(|(cols, kinds)| (ResultBuilder::with_capacity(cols, chunk_capacity), kinds));
     let mut affected: u64 = 0;
     let mut truncated = false;
     // How many row-returning result sets the stream has announced. A simple query
@@ -1070,16 +1069,9 @@ pub(crate) async fn run_statement(
         match msg.map_err(|e| db_err(&e))? {
             SimpleQueryMessage::Row(r) => {
                 let (builder, kinds) = grid.get_or_insert_with(|| {
-                    let cols: Vec<Column> = r
-                        .columns()
-                        .iter()
-                        .map(|c| Column {
-                            name: c.name().to_string(),
-                            type_name: String::new(),
-                            origin: None,
-                        })
-                        .collect();
-                    let kinds = cell_kinds(&type_names_of(&cols));
+                    let names: Vec<&str> = r.columns().iter().map(|c| c.name()).collect();
+                    let (cols, kinds) =
+                        result_columns(None, Some(&names)).expect("a row names its columns");
                     (ResultBuilder::with_capacity(cols, chunk_capacity), kinds)
                 });
                 if builder.row_count() >= row_cap {
@@ -1153,6 +1145,53 @@ pub(crate) async fn run_statement(
     builder.set_truncated(truncated);
     builder.set_elapsed(start.elapsed().as_millis());
     Ok(builder.finish())
+}
+
+/// **Which columns a result set is read under, and the cell kinds that
+/// follow from them.**
+///
+/// `PREPARE`'s columns when it gave any, so a zero-row `SELECT` still reports
+/// its columns and every cell is parsed by its real type. Otherwise the first
+/// row names them — *names only*, because a `RowDescription` over the simple
+/// query protocol carries no type this crate reads — which is the arm for an
+/// unpreparable statement that still returns rows. `None` means neither: a
+/// DML/DDL/utility statement, which reports affected rows and not a grid.
+///
+/// **Extracted so the decision has a seam.** The three coupled pieces of
+/// state behind it — the prepared columns, the `RowDescription` fallback, and
+/// the result-set counter — decide whether a `bytea` renders as `<n bytes>` or
+/// dumps its whole hex encoding into a cell, and none of them had a test on
+/// any tier. The bug that put the counter there is written up at the loop:
+/// a second set's rows pushed through the first set's columns and kinds.
+///
+/// **The fallback arm is lossy and knowingly so**, which is the whole of
+/// B9.1-L1-03: `type_name` is empty, so `cell_kinds` answers
+/// `type_is_binary("") == false` and `num_kind("")`, and a `bytea` in that arm
+/// is read as text. It is reached whenever the *first* statement of a
+/// multi-statement string returns no rows — `SET`, `BEGIN`, `ANALYZE`, a
+/// `DELETE` without `RETURNING` — because `first_statement` describes that one
+/// and it prepares to zero columns. Fixing it means describing the first
+/// *row-returning* statement, or re-describing by set index here; either way
+/// this is where the answer would change, and `the_columns_a_result_is_read_
+/// under` is the test that would flip.
+fn result_columns(
+    prepared: Option<&[Column]>,
+    from_row: Option<&[&str]>,
+) -> Option<(Vec<Column>, Vec<CellKind>)> {
+    let cols: Vec<Column> = match (prepared.filter(|c| !c.is_empty()), from_row) {
+        (Some(c), _) => c.to_vec(),
+        (None, Some(names)) => names
+            .iter()
+            .map(|n| Column {
+                name: (*n).to_string(),
+                type_name: String::new(),
+                origin: None,
+            })
+            .collect(),
+        (None, None) => return None,
+    };
+    let kinds = cell_kinds(&type_names_of(&cols));
+    Some((cols, kinds))
 }
 
 /// The per-column type names the text-cell parser keys on, in column order.
@@ -4650,6 +4689,80 @@ mod tests {
                 "{internal}: the differ would see a type change that is not one"
             );
         }
+    }
+
+    /// **Which columns a PostgreSQL result is read under — the decision that
+    /// had no test on any tier and no seam to write one against.**
+    ///
+    /// It settles whether a `bytea` renders as `<n bytes>` or dumps its whole
+    /// hex encoding into a cell, and the loop's own comment records the bug
+    /// that put its third piece of state there — a second result set's rows
+    /// pushed through the first set's columns and kinds, so a `bytea` in set
+    /// two was read under set one's `INT4`. `pg.rs` sat at 39% line coverage
+    /// with nothing naming `run_statement`, `sets`, `RowDescription` or the
+    /// fallback, and the eight blob tests in the live tier all run a single
+    /// statement.
+    #[test]
+    fn the_columns_a_result_is_read_under() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            origin: None,
+        };
+
+        // PREPARE answered: its columns and its types, so the binary flag is
+        // right and a zero-row SELECT still reports its columns.
+        let prepared = [col("id", "INTEGER"), col("photo", "BYTEA")];
+        let (cols, kinds) = result_columns(Some(&prepared), None).expect("prepared columns");
+        assert_eq!(
+            cols.iter()
+                .map(|c| (c.name.as_str(), c.type_name.as_str()))
+                .collect::<Vec<_>>(),
+            [("id", "INTEGER"), ("photo", "BYTEA")]
+        );
+        assert!(
+            kinds[1].binary,
+            "a prepared bytea must render as a placeholder"
+        );
+
+        // A row arriving with no prepared columns still beats nothing: the
+        // names come from the `RowDescription`.
+        let (cols, kinds) =
+            result_columns(None, Some(&["id", "photo"])).expect("a row names its columns");
+        assert_eq!(
+            cols.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            ["id", "photo"]
+        );
+
+        // **And this is B9.1-L1-03, asserted as the answer it gives today.**
+        // The simple-query `RowDescription` carries no type this crate reads,
+        // so `type_name` is empty and `cell_kinds` answers "not binary" — the
+        // arm reached whenever the *first* statement of a multi-statement
+        // string returns no rows (`SET`, `BEGIN`, a `DELETE` without
+        // `RETURNING`). A 40 MB blob becomes an 80 MB cell there.
+        //
+        // Pinned rather than left silent so the fix has something that flips:
+        // when `run_statement` describes the first *row-returning* statement,
+        // this line becomes `binary: true` and this comment goes.
+        assert!(
+            cols.iter().all(|c| c.type_name.is_empty()),
+            "the fallback knows no types — that is the defect, not the design"
+        );
+        assert!(
+            !kinds[1].binary,
+            "B9.1-L1-03: if this now holds, the fallback has learned its types \
+             and the bug is fixed — assert `binary` and delete this arm"
+        );
+
+        // Neither: DML/DDL/utility, which reports affected rows and no grid.
+        assert!(result_columns(None, None).is_none());
+        // An empty prepared list is *not* an answer — it is what a `SET`
+        // prepares to, and taking it would give a grid with no columns.
+        assert!(result_columns(Some(&[]), None).is_none());
+        assert!(
+            result_columns(Some(&[]), Some(&["id"])).is_some(),
+            "an empty prepare falls through to the row, it does not veto it"
+        );
     }
 
     /// `pg_type_name(&Type::BYTEA)` is what the cell renderer gates on, so if
