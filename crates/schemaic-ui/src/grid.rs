@@ -1905,6 +1905,75 @@ fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
 }
 
 /// Copy the current selection to the clipboard as TSV (a lone cell → raw value).
+/// **Hand the keyboard back when `flag` goes true → false.**
+///
+/// A panel-level bar over the grid — Find, Go to row, the row view/edit panel —
+/// closes by flipping a flag. Floem then disposes the child scope, the focused
+/// field with it, and clears `app_state.focus` **silently**: no `FocusLost`,
+/// no `FocusGained`, and the grid answers no key at all until the user clicks a
+/// cell. Not the arrows, not Ctrl+F, not Ctrl+Enter, not the F6 that would get
+/// into the toolbar ring.
+///
+/// So closing one is not the bar's job to finish — the bar is often built a
+/// level up, where `focus_id` does not exist — and it is not optional. It was
+/// discharged twice, forty lines apart, in two byte-identical copies, and not
+/// at all for `edit_row_open`, which has five closers (Escape, the header ✕, a
+/// successful Save, the "nothing changed" close, and the Escape route out of an
+/// `ENUM` picker). Three copies is where the rule wants one function, so that a
+/// fourth flag cannot be added without one.
+///
+/// **The true→false edge is the point**, not the false value: the effect's
+/// build-time run must not steal focus from whatever the user is actually
+/// typing in.
+///
+/// `back` says what handing back *means*, because the three do not agree.
+/// Find and Go-to-row request `focus_id` immediately; the row panel goes
+/// through [`refocus_grid`], which reads the id inside a deferred tick — its
+/// Save route is `CommitDone::FullReran`, which rebuilds the body, and that is
+/// precisely the case `refocus_grid`'s doc describes an immediately-captured id
+/// getting wrong.
+fn hand_back_on_close(flag: RwSignal<bool>, back: Rc<dyn Fn()>) {
+    create_effect(move |was_open: Option<bool>| {
+        let open = flag.get();
+        if was_open == Some(true) && !open {
+            (back)();
+        }
+        open
+    });
+}
+
+/// The grid body's rebuild key: sort state, frozen column, and **how many**
+/// pending new rows there are.
+///
+/// **A memo, not the bare closure it used to be.** `dyn_container` does not
+/// dedup — `create_updater`'s `UpdaterEffect::run` calls `on_change` on every
+/// notification, whether or not the computed value moved (floem_reactive
+/// 0.2.0, `effect.rs`) — and `new_rows` takes *shape-preserving* writes: every
+/// `stage_new` / `stage_new_many` / `stage_new_bytes` patches a value inside a
+/// row's map and leaves the vector's length alone. So filling a pending row
+/// cell by cell, which is the documented Tab/Enter gesture, tore both panes,
+/// the header and the `win`/`body_h` memos down per cell and re-ran
+/// `compute_order` over the whole result: measured 14.3 ms per keystroke at
+/// the default 200,000-row cap on a numeric sort, before the rebuild it sits
+/// inside, and each rebuild also republishes `gs.order` and so re-fires the
+/// selection aggregate and restarts the find-count rescan.
+///
+/// A memo *does* compare on `PartialEq`, which is the whole difference. It
+/// covers all three terms rather than only the length: `add_cloned_rows`'
+/// batching becomes an optimisation instead of the only defence, and a `sort`
+/// or `frozen` write that lands on the value already there stops rebuilding
+/// too.
+///
+/// Generic in the row type so the composition can be tested with no window —
+/// see `body_key_tests`. Only the count is read, and only `Vec::len` is called.
+fn body_rebuild_key<T: 'static>(
+    sort: RwSignal<SortState>,
+    frozen: RwSignal<Option<usize>>,
+    new_rows: RwSignal<Vec<T>>,
+) -> Memo<(SortState, Option<usize>, usize)> {
+    create_memo(move |_| (sort.get(), frozen.get(), new_rows.with(Vec::len)))
+}
+
 /// Wrap every action in `entries` — submenus included, to any depth — so it
 /// runs only while `alive()` still answers true. The teardown half of
 /// [`GridState::open_menu`]; see that doc for why the guard lives at the door.
@@ -3882,10 +3951,11 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // The body rebuilds on every sort/freeze/new-row change, so the ring is cloned
     // per build rather than captured once.
     let strip_for_body = strip.clone();
+    let body_key = body_rebuild_key(sort, gs.frozen, gs.new_rows);
     let grid = dyn_container(
         // Rebuild on sort / freeze change, and when the number of pending new rows
         // changes (adding/removing a row extends the virtual-stack length).
-        move || (sort.get(), gs.frozen.get(), gs.new_rows.with(|v| v.len())),
+        move || body_key.get(),
         move |(sort_val, frozen_col, new_len)| {
             let strip_entry = strip_for_body.clone();
             let rs = gs.rs.get_untracked();
@@ -4244,17 +4314,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // `results_section`, where `focus_id` doesn't exist.
     //
     // Only on a true→false edge, so the build-time run doesn't steal focus from
-    // whatever the user is actually typing in.
-    create_effect(move |was_open: Option<bool>| {
-        let open = gs.find_open.get();
-        if was_open == Some(true)
-            && !open
-            && let Some(f) = gs.focus_id.get_untracked()
-        {
+    // whatever the user is actually typing in — see `hand_back_on_close`.
+    let focus_now: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(f) = gs.focus_id.get_untracked() {
             f.request_focus();
         }
-        open
     });
+    hand_back_on_close(gs.find_open, focus_now.clone());
     // Go to row (Ctrl+G). The popup bumps `goto_step` on Enter; the jump is here
     // because the row count is, and it counts what the gutter *numbers*, so
     // "row N" means the same thing typed as it does read.
@@ -4420,16 +4486,18 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     one_bar_at_a_time(gs.find_open, gs.goto_open);
     // And hand the keyboard back when the goto popup closes, for the same reason
     // the find bar does above.
-    create_effect(move |was_open: Option<bool>| {
-        let open = gs.goto_open.get();
-        if was_open == Some(true)
-            && !open
-            && let Some(f) = gs.focus_id.get_untracked()
-        {
-            f.request_focus();
-        }
-        open
-    });
+    hand_back_on_close(gs.goto_open, focus_now);
+    // **The third bar over the grid, and it had no hand-back at all.** Right-click
+    // a cell → View, press Escape: `scalar_editor`'s `on_escape` only flips this
+    // flag, floem disposes the panel's autofocused field, and the grid answered no
+    // key until a click. Four more closers reach the same state — the header ✕, a
+    // successful Save, the "nothing changed" close, and Escape out of an
+    // `ENUM`/`SET` picker, whose one cleanup is `close_picker`.
+    //
+    // Through `refocus_grid` rather than the immediate request the two bars above
+    // use: the Save route is `CommitDone::FullReran`, which rebuilds the body, so
+    // the id read now is very often already gone by the time it would be used.
+    hand_back_on_close(gs.edit_row_open, Rc::new(move || refocus_grid(gs)));
 
     // Match count for the `pos/total` readout. The full grid scan is potentially
     // expensive (a String per cell), so it's DEBOUNCED off the keystroke path: each
@@ -9965,6 +10033,106 @@ mod popup_channel_gate {
     }
 }
 
+/// What the grid body's rebuild key does when a pending row is *filled* rather
+/// than added.
+#[cfg(test)]
+mod body_key_tests {
+    use super::*;
+    use floem::reactive::Scope;
+
+    /// Count how many times a subscriber of the key runs. That subscriber
+    /// stands for the `dyn_container` builder, which rebuilds both panes, the
+    /// header and two memos, and re-runs `compute_order` over the whole result
+    /// — 14.3 ms at 200,000 rows on a sorted column.
+    fn runs_of(key: Memo<(SortState, Option<usize>, usize)>) -> Rc<std::cell::Cell<u32>> {
+        let n = Rc::new(std::cell::Cell::new(0u32));
+        let c = n.clone();
+        create_effect(move |_| {
+            let _ = key.get();
+            c.set(c.get() + 1);
+        });
+        n
+    }
+
+    /// **Staging a cell into an existing pending row must not rebuild the
+    /// grid.** This is the gesture the finding is about: ＋ Row, then Tab
+    /// through the columns filling them in. Every one of those writes patches
+    /// a map inside `new_rows` and leaves its length alone.
+    ///
+    /// Asserted through `body_rebuild_key` itself rather than over a bare
+    /// `create_memo`, because the bug was never in the memo — it was in what
+    /// the key *was* at the call site.
+    #[test]
+    fn filling_a_pending_row_cell_by_cell_rebuilds_nothing() {
+        let scope = Scope::new();
+        let sort: RwSignal<SortState> = scope.create_rw_signal(Some((2, true)));
+        let frozen = scope.create_rw_signal(Some(0usize));
+        // One pending row, whose contents are patched in place.
+        let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(vec![Vec::new()]);
+        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows));
+        assert_eq!(runs.get(), 1, "the builder's first run");
+
+        for col in 0..10u8 {
+            new_rows.update(|v| v[0].push(col));
+        }
+        assert_eq!(
+            runs.get(),
+            1,
+            "ten staged cells rebuilt the grid {} times",
+            runs.get() - 1
+        );
+
+        // A write that lands on the value already there is not news either.
+        sort.set(Some((2, true)));
+        frozen.set(Some(0));
+        assert_eq!(runs.get(), 1, "a no-op sort/freeze write rebuilt the grid");
+
+        // **And the same key spelled the way it was.** `dyn_container` takes a
+        // closure and does not dedup — `UpdaterEffect::run` calls `on_change`
+        // on every notification whatever the value — so the bare read rebuilt
+        // once per staged cell. A plain effect is the same shape, and this is
+        // what makes the assertion above a fix rather than an observation.
+        let bare = Rc::new(std::cell::Cell::new(0u32));
+        let c = bare.clone();
+        create_effect(move |_| {
+            let _ = (sort.get(), frozen.get(), new_rows.with(Vec::len));
+            c.set(c.get() + 1);
+        });
+        for col in 0..10u8 {
+            new_rows.update(|v| v[0].push(col));
+        }
+        assert_eq!(
+            bare.get(),
+            11,
+            "the unfixed key: one rebuild per staged cell"
+        );
+        assert_eq!(runs.get(), 1, "the memo absorbed all ten");
+    }
+
+    /// **And the rebuilds that must still happen, do.** A key that dedups
+    /// everything is the other way to pass the test above.
+    #[test]
+    fn adding_a_row_or_changing_the_sort_still_rebuilds() {
+        let scope = Scope::new();
+        let sort: RwSignal<SortState> = scope.create_rw_signal(None);
+        let frozen = scope.create_rw_signal(None);
+        let new_rows: RwSignal<Vec<Vec<u8>>> = scope.create_rw_signal(Vec::new());
+        let runs = runs_of(body_rebuild_key(sort, frozen, new_rows));
+        assert_eq!(runs.get(), 1);
+
+        new_rows.update(|v| v.push(Vec::new())); // ＋ Row
+        assert_eq!(runs.get(), 2, "adding a pending row must rebuild");
+        sort.set(Some((1, false))); // a header click
+        assert_eq!(runs.get(), 3, "a sort change must rebuild");
+        frozen.set(Some(0)); // freeze the first column
+        assert_eq!(runs.get(), 4, "a freeze toggle must rebuild");
+        new_rows.update(|v| {
+            v.pop();
+        }); // discard the pending row
+        assert_eq!(runs.get(), 5, "removing a pending row must rebuild");
+    }
+}
+
 /// The behaviour the gate above only *locates*: what a menu entry does when the
 /// grid behind it is gone.
 #[cfg(test)]
@@ -11355,6 +11523,64 @@ mod one_bar_tests {
         assert!(!find.get_untracked());
         assert!(!goto.get_untracked());
         scope.dispose();
+    }
+
+    /// **Closing a panel-level bar hands the keyboard back**, and only on the
+    /// true→false edge.
+    ///
+    /// Floem clears `app_state.focus` silently when a focused view is removed,
+    /// so a bar that closes without this leaves the grid answering no key at
+    /// all until the user clicks a cell. `edit_row_open` — the row view/edit
+    /// panel — had no hand-back of any kind, where Find and Go-to-row each had
+    /// their own copy of these five lines.
+    #[test]
+    fn closing_a_bar_hands_the_keyboard_back_but_opening_one_does_not() {
+        let scope = Scope::new();
+        let open = scope.create_rw_signal(false);
+        let backs = Rc::new(std::cell::Cell::new(0u32));
+        let c = backs.clone();
+        hand_back_on_close(open, Rc::new(move || c.set(c.get() + 1)));
+
+        // The effect's own first run must not claim the keyboard: the grid is
+        // built while the user may be typing somewhere else entirely.
+        assert_eq!(backs.get(), 0, "the build-time run handed focus back");
+
+        open.set(true);
+        assert_eq!(backs.get(), 0, "opening a bar is not a hand-back");
+        open.set(false);
+        assert_eq!(backs.get(), 1, "closing it is");
+
+        // Every closer counts, and a redundant write is not a close.
+        open.set(false);
+        assert_eq!(backs.get(), 1, "a no-op write handed the keyboard back");
+        open.set(true);
+        open.set(false);
+        assert_eq!(backs.get(), 2, "the second close");
+
+        scope.dispose();
+    }
+
+    /// **The grid's three bars are all wired to it.** The behaviour above is
+    /// only worth anything at a call site, and the finding was a *missing* call
+    /// — `grep edit_row_open` returned thirteen sites and no `request_focus`,
+    /// no `hand_keyboard_back`, no `refocus_grid`. A fourth panel-level flag
+    /// added without one is the same bug again.
+    #[test]
+    fn find_goto_and_the_row_panel_each_register_a_hand_back() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("grid.rs"),
+        )
+        .expect("grid.rs");
+        let body = crate::source_gate::production_code(&src);
+        for flag in ["gs.find_open", "gs.goto_open", "gs.edit_row_open"] {
+            assert!(
+                body.contains(&format!("hand_back_on_close({flag},")),
+                "{flag} closes without handing the keyboard back — the grid then \
+                 answers no key at all until the user clicks a cell"
+            );
+        }
     }
 }
 
