@@ -4568,8 +4568,37 @@ pub fn join_condition(
         .filter(|(_, p)| p.0 > join_at)
         .min_by_key(|(_, p)| p.0)
         .map(|(r, _)| r.clone())?;
+    // **Not a table found inside the joined subquery.**
+    // `table_refs_with_pos` is a flat scan that descends into parentheses by
+    // design, so "the first table reference after `JOIN`" is the *subquery's*
+    // first table whenever the join target is a derived one. That offered
+    // `orders.customer_id = c.id` for
+    // `FROM customers c JOIN (SELECT * FROM orders) x ON |`, which MariaDB
+    // 10.11.14 answers `ERROR 1054: Unknown column 'orders.customer_id' in
+    // 'ON'` — the relation being joined is `x`. The nested form was worse: it
+    // proposed an alias that exists only inside the subquery.
+    //
+    // A derived table has no FK edges of its own, so `None` is the whole right
+    // answer here.
+    //
+    // Asked of the caret's **scope** rather than of a `(` between the two
+    // offsets: with a nested join inside the subquery the last `JOIN` before
+    // the `ON` is the *inner* one, so there is no paren in between and the
+    // proposal was an alias that exists only inside the subquery.
+    // `statement_scope` tracks paren scoping (an empty `ON` never parses, so
+    // this is `lexer_scope`'s answer), and it is the same set `join_targets`
+    // has always used.
+    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+    let in_scope = |r: &TableRef| {
+        scope
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(&r.name) && s.alias == r.alias)
+    };
+    if !in_scope(&joined) {
+        return None;
+    }
     // Pair it with each other in-scope table; first FK match wins.
-    for (other, _) in &refs {
+    for other in &scope {
         if other.name.eq_ignore_ascii_case(&joined.name) && other.alias == joined.alias {
             continue;
         }
@@ -8615,6 +8644,37 @@ mod tests {
         join_targets(sql, 0, sql.len(), sql.len(), &cat, dialect)
     }
 
+    /// **The FK auto-join does not fill an `ON` from inside the subquery it is
+    /// joining.**
+    ///
+    /// `table_refs_with_pos` descends into parentheses by design, so "the first
+    /// table reference after `JOIN`" was the *subquery's* first table whenever
+    /// the join target was a derived one: `orders.customer_id = c.id` for
+    /// `FROM customers c JOIN (SELECT * FROM orders) x ON |`, which MariaDB
+    /// 10.11.14 answers `ERROR 1054: Unknown column 'orders.customer_id' in
+    /// 'ON'`. A derived table has no FK edges of its own, so `None` is the
+    /// right answer.
+    #[test]
+    fn the_auto_join_declines_a_derived_table() {
+        for sql in [
+            "SELECT * FROM customers c JOIN (SELECT * FROM orders) x ON ",
+            // The nested form proposed an alias that exists only inside the
+            // subquery.
+            "SELECT * FROM customers c JOIN (SELECT id FROM line_items l JOIN orders o ON l.order_id = o.id) x ON ",
+        ] {
+            assert_eq!(join_at(sql, sql.len()), None, "{sql}");
+        }
+        // The ordinary case is unmoved, including an `ON` whose *expression*
+        // is parenthesised elsewhere in the statement.
+        let sql = "SELECT * FROM orders o JOIN customers c ON ";
+        assert_eq!(
+            join_at(sql, sql.len()).as_deref(),
+            Some("o.customer_id = c.id")
+        );
+        let sql = "SELECT * FROM orders o WHERE (o.id > 1) AND o.id IN (1) ";
+        assert_eq!(join_at(sql, sql.len()), None);
+    }
+
     /// **The typo checker measured against another engine's function list.**
     ///
     /// `FUNCTIONS`' own doc calls it "the authoritative catalog of
@@ -9140,9 +9200,36 @@ mod tests {
         // Reading both quote styles must not make a generic phrase win. MySQL's
         // `in 'field list'` is skipped as before, and a double-quoted phrase
         // that isn't in the statement simply doesn't match.
+        //
+        // **This test used to be byte-identical to
+        // `db_error_locates_unknown_column` thirty lines above** — same
+        // statement, same message, same assertion, and no double quote anywhere
+        // in it, which is the thing it is named for. So the arm it claims to
+        // guard could be deleted with it green. The two cases below are the
+        // ones the name describes.
         let sql = "SELECT salery FROM employees";
         let d = db_error_diagnostic(sql, 0, sql.len(), "Unknown column 'salery' in 'field list'");
         assert_eq!(&sql[d.range.0..d.range.1], "salery");
+
+        // A PostgreSQL message whose quoted runs are *phrase then object*: the
+        // squiggle has to land on the column, not on the relation and not on the
+        // first quoted run.
+        let sql = "SELECT nosuchcol FROM t";
+        let d = db_error_diagnostic(
+            sql,
+            0,
+            sql.len(),
+            r#"column "nosuchcol" of relation "t" does not exist"#,
+        );
+        assert_eq!(&sql[d.range.0..d.range.1], "nosuchcol");
+
+        // A double-quoted **phrase** that is not in the statement must be
+        // skipped rather than matched — the failure the both-quote-styles arm
+        // could have introduced. Nothing findable is left, so the fallback
+        // underlines the leading token.
+        let sql = "SELECT salery FROM employees";
+        let d = db_error_diagnostic(sql, 0, sql.len(), r#"error in "field list""#);
+        assert_eq!(&sql[d.range.0..d.range.1], "SELECT");
     }
 
     #[test]
