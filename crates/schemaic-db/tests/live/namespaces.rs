@@ -355,3 +355,120 @@ pub async fn a_sequence_cannot_be_owned_across_namespaces(target: &'static Targe
 
     scratch.teardown().await;
 }
+
+/// **Two namespaces in one result — the collapse this module's doc opens with,
+/// which nothing in the tier could reproduce.**
+///
+/// Every other test here reads from one namespace at a time, so
+/// `analyze_edit` builds exactly one group and the namespace terms in the key
+/// are load-bearing for nothing. On both MySQL legs it is worse than that:
+/// `Scratch::exec_in` scopes the connection to the alt *database*, so stamping
+/// each column's origin with the connection's current database instead of the
+/// wire packet's per-column value produces the identical answer and every
+/// assertion still holds. One line of `db/lib.rs` could be regressed and only
+/// the PostgreSQL leg would notice.
+///
+/// `core::edit`'s `same_table_name_in_two_schemas_stays_two_edit_tables` does
+/// pin the grouping — over `ColumnOrigin`s written out by hand, which is
+/// exactly the composition `Scratch::edit_model`'s own doc says a live test
+/// exists to go beyond. This is where the two halves meet.
+///
+/// The untouched row is the assertion that matters. `label` is in both tables
+/// (see [`seed_both`]) precisely so a write aimed at the wrong namespace
+/// **succeeds**: the statement runs, one row is affected, the 1-row net is
+/// satisfied, and the wrong table changed.
+pub async fn a_join_across_namespaces_stays_two_tables(target: &'static Target) {
+    let mut scratch = Scratch::create(target, "ns_join").await;
+    let alt = seed_both(&mut scratch).await;
+
+    let here = scratch.qualified("orders");
+    let there = scratch.qualified_in(&alt, "orders");
+    let (_, model) = scratch
+        .edit_model(&format!(
+            "SELECT a.id AS a_id, a.label AS a_label, b.id AS b_id, b.label AS b_label \
+             FROM {here} a JOIN {there} b ON a.id = b.id"
+        ))
+        .await;
+
+    let mut seen: Vec<(String, Option<String>)> = (0..2)
+        .map(|i| {
+            let t = model.table(i).unwrap_or_else(|| {
+                panic!(
+                    "{}: the join resolved to fewer than two writable tables — \
+                     the two namespaces collapsed into one",
+                    target.name
+                )
+            });
+            assert_eq!(t.table, "orders", "{}: unexpected table", target.name);
+            (t.database.clone(), t.schema.clone())
+        })
+        .collect();
+    seen.sort();
+    let mut want = vec![
+        (
+            scratch.namespace_ref().database.clone(),
+            scratch.namespace_ref().schema.clone(),
+        ),
+        (alt.database.clone(), alt.schema.clone()),
+    ];
+    want.sort();
+    assert_eq!(
+        seen, want,
+        "{}: the two sides of the join do not carry their own namespaces",
+        target.name
+    );
+    assert!(
+        model.table(2).is_none(),
+        "{}: a two-table join produced a third group",
+        target.name
+    );
+
+    // Write to the alt side through the identity the model resolved, and check
+    // the *other* namespace's row is still what it was.
+    let alt_table = (0..2)
+        .filter_map(|i| model.table(i))
+        .find(|t| t.database == alt.database && t.schema == alt.schema)
+        .unwrap_or_else(|| panic!("{}: the alt side is not writable", target.name));
+    scratch
+        .db
+        .commit_writes(
+            &GridWrite {
+                updates: vec![RowEdit {
+                    database: alt_table.database.clone(),
+                    schema: alt_table.schema.clone(),
+                    table: alt_table.table.clone(),
+                    set: vec![("label".to_string(), CellEdit::Text("moved".to_string()))],
+                    key: vec![("id".to_string(), Value::Int(1))],
+                }],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}: the write failed: {e}", target.name));
+
+    assert_eq!(
+        cell(
+            &scratch,
+            &alt,
+            &format!("SELECT label FROM {there} WHERE id = 1")
+        )
+        .await,
+        "moved",
+        "{}: the row the write named did not change",
+        target.name
+    );
+    assert_eq!(
+        cell(
+            &scratch,
+            &scratch.namespace_ref(),
+            &format!("SELECT label FROM {here} WHERE id = 1")
+        )
+        .await,
+        "here",
+        "{}: the other namespace's table was written to",
+        target.name
+    );
+
+    scratch.teardown().await;
+}
